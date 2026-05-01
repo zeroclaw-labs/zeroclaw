@@ -211,6 +211,7 @@ pub fn all_tools(
         agents,
         fallback_api_key,
         root_config,
+        None,
     )
 }
 
@@ -230,6 +231,11 @@ pub fn all_tools_with_runtime(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
+    // Optional shared SopEngine. When Some, the SOP tools share this
+    // engine (so runs started via webhook/MQTT are visible to in-agent
+    // sop_status / sop_advance). When None, a fresh engine is created
+    // and reloaded — fine for self-contained agent runs.
+    external_sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(
@@ -384,13 +390,16 @@ pub fn all_tools_with_runtime(
 
     // SOP engine + tools.
     //
-    // Always registered. SopEngine.reload() returns an empty vec when the
-    // sops directory is missing, so deployments without SOPs incur no
-    // overhead beyond an Arc<Mutex<SopEngine>> allocation.
+    // Prefer a caller-supplied engine (e.g. the gateway shares its
+    // `AppState.sop_engine` so runs started by `POST /sop/*` are visible
+    // to in-agent `sop_status` / `sop_advance`). Otherwise spin up a
+    // fresh engine and reload — fine for self-contained agent runs.
     {
-        let mut engine = crate::sop::SopEngine::new(root_config.sop.clone());
-        engine.reload(workspace_dir);
-        let sop_engine = Arc::new(std::sync::Mutex::new(engine));
+        let sop_engine = external_sop_engine.unwrap_or_else(|| {
+            let mut engine = crate::sop::SopEngine::new(root_config.sop.clone());
+            engine.reload(workspace_dir);
+            Arc::new(std::sync::Mutex::new(engine))
+        });
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));

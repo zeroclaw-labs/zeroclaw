@@ -322,6 +322,11 @@ pub struct AppState {
     /// One daemon serves at most one user (by design), so a single global
     /// history vector is sufficient — no session id needed.
     pub api_chat_history: Arc<Mutex<Vec<crate::providers::ChatMessage>>>,
+    /// Shared SOP engine. Used by `POST /sop/*` to dispatch events
+    /// directly into the engine, and shared with the agent loop's tool
+    /// list so runs are visible to in-agent `sop_status` / `sop_advance`
+    /// without crossing process boundaries.
+    pub sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -391,6 +396,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
+    // Shared SOP engine: lives in AppState and is shared with the agent
+    // loop's tool list, so runs started via `POST /sop/*` are visible to
+    // in-agent `sop_status` / `sop_advance` calls.
+    let sop_engine = {
+        let mut engine = crate::sop::SopEngine::new(config.sop.clone());
+        engine.reload(&config.workspace_dir);
+        Arc::new(std::sync::Mutex::new(engine))
+    };
+
     let tools_registry_raw = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -405,6 +419,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        Some(Arc::clone(&sop_engine)),
     );
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
@@ -654,6 +669,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         event_tx,
         shutdown_tx,
         api_chat_history: Arc::new(Mutex::new(Vec::new())),
+        sop_engine: Arc::clone(&sop_engine),
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -673,6 +689,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
+        .route("/sop/{*rest}", post(handle_sop_webhook))
         .route("/api/chat", post(handle_api_chat))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
@@ -1187,6 +1204,149 @@ async fn handle_webhook(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
     }
+}
+
+/// POST /sop/{*rest} — SOP-only event endpoint.
+///
+/// Routes incoming events into the shared `SopEngine`. No LLM fallback —
+/// returns 404 if no SOP trigger matches the request path.
+///
+/// Auth/rate-limit/idempotency contract mirrors `/webhook`:
+/// - Bearer token via `Authorization: Bearer <token>` (when pairing required)
+/// - Optional `X-Webhook-Secret` header
+/// - Optional `X-Idempotency-Key` for client-side dedup
+///
+/// The path under `/sop/` is forwarded to the engine as the trigger
+/// path. Body (if present, JSON) is forwarded as the event payload.
+async fn handle_sop_webhook(
+    State(state): State<AppState>,
+    axum::extract::Path(rest): axum::extract::Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    let trigger_path = format!("/sop/{rest}");
+
+    // ── Rate limit ──
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("/sop/* rate limit exceeded");
+        let err = serde_json::json!({
+            "error": "Too many SOP webhook requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
+    // ── Bearer token auth (pairing) ──
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            tracing::warn!("SOP webhook: rejected — not paired / invalid bearer token");
+            let err = serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            });
+            return (StatusCode::UNAUTHORIZED, Json(err));
+        }
+    }
+
+    // ── Optional X-Webhook-Secret ──
+    if let Some(ref secret_hash) = state.webhook_secret_hash {
+        let header_hash = headers
+            .get("X-Webhook-Secret")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(hash_webhook_secret);
+        match header_hash {
+            Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
+            _ => {
+                tracing::warn!("SOP webhook: rejected — invalid or missing X-Webhook-Secret");
+                let err = serde_json::json!({
+                    "error": "Unauthorized — invalid or missing X-Webhook-Secret header"
+                });
+                return (StatusCode::UNAUTHORIZED, Json(err));
+            }
+        }
+    }
+
+    // ── Idempotency (optional) — namespaced by path so /sop/* keys
+    //   do not collide with /webhook keys. ──
+    if let Some(idempotency_key) = headers
+        .get("X-Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let namespaced = format!("sop:{idempotency_key}");
+        if !state.idempotency_store.record_if_new(&namespaced) {
+            tracing::info!("SOP webhook duplicate ignored (idempotency key: {idempotency_key})");
+            let body = serde_json::json!({
+                "status": "duplicate",
+                "idempotent": true,
+                "message": "Request already processed for this idempotency key",
+                "path": trigger_path,
+            });
+            return (StatusCode::OK, Json(body));
+        }
+    }
+
+    // ── Build SopEvent ──
+    let payload_str = body.and_then(|Json(v)| serde_json::to_string(&v).ok());
+    let event = crate::sop::SopEvent {
+        source: crate::sop::SopTriggerSource::Webhook,
+        topic: Some(trigger_path.clone()),
+        payload: payload_str,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+
+    // ── Dispatch ──
+    let audit = crate::sop::SopAuditLogger::new(Arc::clone(&state.mem));
+    let results = crate::sop::dispatch::dispatch_sop_event(&state.sop_engine, &audit, event).await;
+
+    // ── Map results → response ──
+    use crate::sop::dispatch::DispatchResult;
+    let started: Vec<&str> = results
+        .iter()
+        .filter_map(|r| match r {
+            DispatchResult::Started { sop_name, .. } => Some(sop_name.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    if started.is_empty() && results.iter().all(|r| matches!(r, DispatchResult::NoMatch)) {
+        tracing::info!("SOP webhook: no SOP matched path {trigger_path}");
+        let err = serde_json::json!({
+            "error": "No SOP matched",
+            "path": trigger_path,
+        });
+        return (StatusCode::NOT_FOUND, Json(err));
+    }
+
+    let skipped: Vec<serde_json::Value> = results
+        .iter()
+        .filter_map(|r| match r {
+            DispatchResult::Skipped { sop_name, reason } => Some(serde_json::json!({
+                "sop": sop_name,
+                "reason": reason,
+            })),
+            _ => None,
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "status": "accepted",
+        "matched_sops": started,
+        "skipped": skipped,
+        "source": "sop_webhook",
+        "path": trigger_path,
+    });
+    (StatusCode::OK, Json(body))
 }
 
 /// POST /api/chat — Bearer-authenticated chat that runs the full agent
@@ -1989,6 +2149,9 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+                crate::config::SopConfig::default(),
+            ))),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2040,6 +2203,9 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+                crate::config::SopConfig::default(),
+            ))),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2416,6 +2582,9 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+                crate::config::SopConfig::default(),
+            ))),
         };
 
         let mut headers = HeaderMap::new();
@@ -2482,6 +2651,9 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+                crate::config::SopConfig::default(),
+            ))),
         };
 
         let headers = HeaderMap::new();
@@ -2560,6 +2732,9 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+                crate::config::SopConfig::default(),
+            ))),
         };
 
         let response = handle_webhook(
@@ -2610,6 +2785,9 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+                crate::config::SopConfig::default(),
+            ))),
         };
 
         let mut headers = HeaderMap::new();
@@ -2665,6 +2843,9 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+                crate::config::SopConfig::default(),
+            ))),
         };
 
         let mut headers = HeaderMap::new();
@@ -2725,6 +2906,9 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+                crate::config::SopConfig::default(),
+            ))),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2781,6 +2965,9 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             api_chat_history: Arc::new(Mutex::new(Vec::new())),
+            sop_engine: Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+                crate::config::SopConfig::default(),
+            ))),
         };
 
         let mut headers = HeaderMap::new();
