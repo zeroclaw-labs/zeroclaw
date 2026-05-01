@@ -193,7 +193,7 @@
 |---|---|
 | Tauri desktop | Install rustls crypto provider to prevent crash (#5997); replace PNG-as-ICO with a real Windows ICO to unblock Win11 builds (#5966) |
 | Telegram | Forward `message_thread_id` in `request_approval` (#5970); skip auto-injected topic-root reply context in forum topics (#5969) |
-| Skills (config) | Allow prompts inside `[skill]` TOML section (#5972) |
+| Skills (config) | Allow prompts inside `[skill]` TOML section (#5972); reject unknown fields in `[skill]` block to surface silent typo drops (#6128); relocate SkillForge provenance to a sibling `[forge]` table and surface `SKILL.toml` parse failures via `tracing::warn` instead of swallowing them silently (#6210) |
 | Providers | Gemini/OpenRouter tool-call compatibility + `google_workspace` schema clarity (#5975); MiniMax native tool calling enabled (#6027); Bedrock omits temperature for Opus 4.7 (#6144); Groq native tools disabled where misbehaving (#5848); coalesce adjacent assistant turns in `strip_native_tool_messages` (#5829); abort OpenRouter stream task when consumer drops (#5830) |
 | CI | `nextest` now runs across all workspace crates (#6197); CNAME persisted on every Pages deploy (#6142) |
 | Bulk revert recovery | Recover 4 small fixes lost in bulk revert c3ff635 (#6169) |
@@ -217,6 +217,119 @@
 | Windows | Fix `setup.bat` issues (#6137); unbreak `cargo test` and add self-update target triples (#6050) |
 | rag-pdf | Unbreak `--features rag-pdf` end-to-end and restore Windows tests (#6076) |
 | Security | `rustls-webpki` v0.103.13 (#6011); `rand` patches + `picomatch` ReDoS (#5971); cargo update + deny.toml audit (#6152) |
+
+---
+
+## Breaking Changes
+
+### Config schema (V1 → V2)
+
+The provider section of `config.toml` has a new layout. V1 configs are still loaded and
+automatically understood, but the recommended path is to run the migration:
+
+```sh
+zeroclaw config migrate
+```
+
+This rewrites your config to V2 in-place. The old format will continue to work in this
+release but will not be supported indefinitely.
+
+### `zeroclaw props` deprecated
+
+Use `zeroclaw config` instead. The `props` subcommand still works and will not be
+removed in this release, but it will emit a deprecation notice.
+
+### `zeroclaw onboard` defaults to TUI
+
+`zeroclaw onboard` now launches the ratatui TUI backend by default. Users who were
+relying on the old terminal-prompt behavior should pass `--cli` explicitly. The
+previous `--tui` flag is accepted for one release as a deprecated no-op and emits a
+warning pointing at the new default. In non-TTY environments (piped output, CI without
+`--quick`) onboarding automatically falls back to the terminal-prompt backend.
+
+### Slack `channel_id` deprecated
+
+Use `channel_ids` (a list) in the Slack config block. `channel_id` (singular) still
+works but is deprecated in V2.
+
+### `[skill]` block in SKILL.toml rejects unknown fields; SkillForge provenance moves to `[forge]`
+
+Three coordinated changes that ship together so the strictness in #6128 is
+safe for users with `auto_integrate = true`:
+
+**1. `[skill]` is strict.** The `SkillMeta` struct backing the `[skill]` block of
+`SKILL.toml` now carries `#[serde(deny_unknown_fields)]`. Previously, unrecognised
+keys inside `[skill]` were silently dropped during deserialization — a typo in a
+field name would be accepted without error while the intended value was ignored.
+This is the bug class tracked in #6128, identified as a follow-up to the
+`SkillManifest` parsing refactor in #5972.
+
+Any `SKILL.toml` whose `[skill]` block contains a key not defined in the current
+schema will now fail to load with a descriptive serde error. Example:
+
+```toml
+[skill]
+name = "my-skill"
+descriptin = "Fixes a common issue"  # typo — was silently ignored, now an error
+```
+
+There is no per-field opt-out. The strictness is intentional: a skill that loads
+with a silently-dropped typo is harder to debug than one that fails loudly.
+Operators must correct or remove unrecognised fields from the `[skill]` block of
+their `SKILL.toml` before upgrading.
+
+**2. SkillForge provenance moves to a top-level `[forge]` table.** The SkillForge
+integrator (`auto_integrate = true`) previously emitted `source`, `owner`,
+`language`, `license`, `stars`, `updated_at` and the sub-tables
+`[skill.requirements]` / `[skill.metadata]` directly inside `[skill]`. With
+`SkillMeta` now strict, those keys would be rejected — every auto-integrated
+skill would fail to load. The integrator now emits a sibling top-level `[forge]`
+table instead, with `[forge.requirements]` and `[forge.metadata]` underneath.
+This keeps the runtime's canonical skill identity contract (`SkillMeta`) decoupled
+from the integrator's emit format (FND-001 §4.2 dependency rule). `[forge]` is
+optional on hand-authored skills and also strict (`deny_unknown_fields`) so
+typos in the provenance namespace surface the same way typos in `[skill]` do.
+
+**3. `SKILL.toml` parse failures are now logged.** The skill loader at both
+`load_skills_from_directory` and `load_open_skills_from_directory` previously
+swallowed every error from `load_skill_toml` silently. With `[skill]` now strict,
+that swallow would have flipped the failure mode from "field value silently
+ignored" to "skill silently never loads." Both sites now emit a structured
+`tracing::warn!` with `path` and `err` fields when a `SKILL.toml` fails to
+deserialize, so an operator running `RUST_LOG=warn zeroclaw` can identify the
+offending file.
+
+#### Migration for users with `auto_integrate = true`
+
+If you have `SKILL.toml` files on disk that were generated by SkillForge before
+this release, run the bundled migration script to move the provenance fields
+from `[skill]` into the new `[forge]` table layout. The script is idempotent —
+re-running it on already-migrated files is a no-op. Dry-run by default; pass
+`--apply` to write changes:
+
+```sh
+# Inspect the planned changes (dry-run):
+python3 scripts/migrate-skill-toml.py ~/.zeroclaw/workspace/skills
+
+# Apply the migration in place:
+python3 scripts/migrate-skill-toml.py ~/.zeroclaw/workspace/skills --apply
+```
+
+The script can also target a single file (`scripts/migrate-skill-toml.py
+path/to/skill/SKILL.toml --apply`) and uses standard library only (Python 3.8+,
+no `tomli` / `tomli_w` required). Hand-authored `SKILL.toml` files without
+SkillForge provenance are left untouched.
+
+If you do not run the migration before upgrading, auto-integrated skills will
+fail to load and the failure will surface as a `tracing::warn` line naming the
+offending path.
+
+### Workspace crate boundaries
+
+If you have any code that depends directly on internal ZeroClaw crate paths (e.g. for
+embedding or testing), the crate structure has changed significantly. Refer to
+`AGENTS.md` for the current crate map and stability tiers. `zeroclaw-api` is the stable
+extension point — all other crates are Beta or Experimental.
 
 ---
 
