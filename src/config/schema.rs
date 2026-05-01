@@ -232,6 +232,10 @@ pub struct Config {
     /// Text-to-Speech configuration (`[tts]`).
     #[serde(default)]
     pub tts: TtsConfig,
+
+    /// Standard Operating Procedures engine (`[sop]`).
+    #[serde(default)]
+    pub sop: SopConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -2218,6 +2222,70 @@ impl Default for WebhookAuditConfig {
     }
 }
 
+// ── SOP engine configuration ───────────────────────────────────
+
+/// Standard Operating Procedures engine configuration (`[sop]`).
+///
+/// The `default_execution_mode` field uses the `SopExecutionMode` type from
+/// `sop::types` (re-exported via `sop::SopExecutionMode`). To avoid circular
+/// module references, config stores it using the same enum definition.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SopConfig {
+    /// Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).
+    /// Falls back to `<workspace>/sops` when omitted.
+    #[serde(default)]
+    pub sops_dir: Option<String>,
+
+    /// Default execution mode for SOPs that omit `execution_mode`.
+    /// Values: `auto`, `supervised` (default), `step_by_step`,
+    /// `priority_based`, `deterministic`.
+    #[serde(default = "default_sop_execution_mode")]
+    pub default_execution_mode: String,
+
+    /// Maximum total concurrent SOP runs across all SOPs.
+    #[serde(default = "default_sop_max_concurrent_total")]
+    pub max_concurrent_total: usize,
+
+    /// Approval timeout in seconds. When a run waits for approval longer than
+    /// this, Critical/High-priority SOPs auto-approve; others stay waiting.
+    /// Set to 0 to disable timeout.
+    #[serde(default = "default_sop_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+
+    /// Maximum number of finished runs kept in memory for status queries.
+    /// Oldest runs are evicted when over capacity. 0 = unlimited.
+    #[serde(default = "default_sop_max_finished_runs")]
+    pub max_finished_runs: usize,
+}
+
+fn default_sop_execution_mode() -> String {
+    "supervised".to_string()
+}
+
+fn default_sop_max_concurrent_total() -> usize {
+    4
+}
+
+fn default_sop_approval_timeout_secs() -> u64 {
+    300
+}
+
+fn default_sop_max_finished_runs() -> usize {
+    100
+}
+
+impl Default for SopConfig {
+    fn default() -> Self {
+        Self {
+            sops_dir: None,
+            default_execution_mode: default_sop_execution_mode(),
+            max_concurrent_total: default_sop_max_concurrent_total(),
+            approval_timeout_secs: default_sop_approval_timeout_secs(),
+            max_finished_runs: default_sop_max_finished_runs(),
+        }
+    }
+}
+
 // ── Autonomy / Security ──────────────────────────────────────────
 
 /// Autonomy and security policy configuration (`[autonomy]` section).
@@ -3901,6 +3969,7 @@ impl Default for Config {
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            sop: SopConfig::default(),
         }
     }
 }
@@ -5944,6 +6013,7 @@ default_temperature = 0.7
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            sop: SopConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -6140,6 +6210,7 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            sop: SopConfig::default(),
         };
 
         config.save().await.unwrap();

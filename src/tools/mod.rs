@@ -54,6 +54,11 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod sop_advance;
+pub mod sop_approve;
+pub mod sop_execute;
+pub mod sop_list;
+pub mod sop_status;
 pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;
@@ -103,6 +108,20 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
+// SOP tool re-exports — registration into ToolRegistry lands when
+// SopEngine instantiation is wired into the agent/daemon (separate PR).
+// Until then the tool types must remain reachable for downstream
+// consumers and tests, hence the explicit allow.
+#[allow(unused_imports)]
+pub use sop_advance::SopAdvanceTool;
+#[allow(unused_imports)]
+pub use sop_approve::SopApproveTool;
+#[allow(unused_imports)]
+pub use sop_execute::SopExecuteTool;
+#[allow(unused_imports)]
+pub use sop_list::SopListTool;
+#[allow(unused_imports)]
+pub use sop_status::SopStatusTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
