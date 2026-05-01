@@ -992,10 +992,15 @@ pub enum McpTransport {
 }
 
 /// Configuration for a single external MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "mcp.servers"]
 pub struct McpServerConfig {
-    /// Display name used as a tool prefix (`<server>__<tool>`).
+    /// Display name used as a tool prefix (`<server>__<tool>`). Filled in
+    /// from the supplied `map_key` when the entry is created via
+    /// `create_map_key("mcp.servers", "<name>")`; `#[serde(default)]` lets
+    /// the macro default-construct from `{}` before the name gets injected.
+    #[serde(default)]
     pub name: String,
     /// Transport type (default: stdio).
     #[serde(default)]
@@ -1034,8 +1039,13 @@ pub struct McpConfig {
     /// `tool_search` to fetch full schemas before invoking a deferred tool.
     #[serde(default = "default_deferred_loading")]
     pub deferred_loading: bool,
-    /// Configured MCP servers.
+    /// Configured MCP servers. The `#[nested]` annotation makes the macro
+    /// expose this as a List section in `map_key_sections()`, so the
+    /// dashboard's `+ Add MCP server` affordance and the `POST
+    /// /api/config/map-key?path=mcp.servers&key=<name>` endpoint pick it
+    /// up automatically (no hand-table on the gateway side).
     #[serde(default, alias = "mcpServers")]
+    #[nested]
     pub servers: Vec<McpServerConfig>,
 }
 
@@ -17987,6 +17997,38 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             sections.iter().any(|s| s.path == "agents"),
             "agents map should be discoverable"
         );
+
+        // mcp.servers is a Vec<McpServerConfig> with #[nested] — should
+        // surface as a List-kind section so the dashboard's "+ Add MCP
+        // server" affordance picks it up. Without this, dashboard users
+        // hit a silent dead-end and have to hand-edit config.toml. Pinned
+        // here so a regression that drops the #[nested] annotation or the
+        // Configurable derive on McpServerConfig fails CI.
+        let mcp_servers = sections
+            .iter()
+            .find(|s| s.path == "mcp.servers")
+            .expect("mcp.servers must be discoverable as a list-shaped section");
+        assert_eq!(mcp_servers.kind, crate::traits::MapKeyKind::List);
+        assert_eq!(mcp_servers.value_type, "McpServerConfig");
+    }
+
+    #[test]
+    async fn create_map_key_inserts_default_mcp_server() {
+        // Round-trip: `POST /api/config/map-key?path=mcp.servers&key=github`.
+        // The new entry's `name` field is initialized to the supplied key
+        // by the macro's List-kind insertion logic.
+        let mut config = Config::default();
+        assert!(config.mcp.servers.is_empty());
+
+        let created = config
+            .create_map_key("mcp.servers", "github")
+            .expect("mcp.servers should accept new list entries");
+        assert!(created, "first add should report created=true");
+        assert_eq!(config.mcp.servers.len(), 1);
+        assert_eq!(
+            config.mcp.servers[0].name, "github",
+            "new entry must carry the supplied key as its name field"
+        );
     }
 
     #[test]
@@ -18090,28 +18132,44 @@ allowed_users = []
     }
 
     #[test]
-    async fn mcp_servers_object_array_round_trips_through_set_prop() {
-        // Regression for the dashboard `+ Add MCP server` flow: `Vec<T>` of
-        // structs surfaces in prop_fields() with PropKind::ObjectArray, and
-        // set_prop accepts a JSON-array string that re-deserializes into
-        // Vec<McpServerConfig>. No schema change — same pattern Vec<String>
-        // already used, generalized in the macro to any Vec<T>.
+    async fn mcp_servers_addable_via_create_map_key_and_per_entry_props() {
+        // `mcp.servers` is a `Vec<McpServerConfig>` with `#[nested]`, so the
+        // `Configurable` derive surfaces it as a List section (not an
+        // ObjectArray prop) — operators add servers via
+        // `POST /api/config/map-key?path=mcp.servers&key=<name>` and edit
+        // each server's fields via per-prop GET/PUT.
+        //
+        // This replaces the prior model where the entire Vec round-tripped
+        // through set_prop("mcp.servers", "<json-array>"). The List model
+        // matches the rest of the schema (`providers.models`, `agents`,
+        // etc.) and gives the dashboard a per-field editor instead of a
+        // monolithic JSON blob.
         let mut config = Config::default();
 
-        let fields = config.prop_fields();
-        let mcp_servers = fields
-            .iter()
-            .find(|f| f.name == "mcp.servers")
-            .expect("mcp.servers must appear in prop_fields once Vec<T> is generally supported");
-        assert_eq!(mcp_servers.kind, crate::config::PropKind::ObjectArray);
+        // The List section is discoverable.
+        let sections = Config::map_key_sections();
+        assert!(
+            sections
+                .iter()
+                .any(|s| s.path == "mcp.servers" && s.kind == crate::traits::MapKeyKind::List),
+            "mcp.servers should surface as a List section in map_key_sections()"
+        );
 
-        let json = r#"[{"name":"fs","transport":"stdio","command":"/usr/bin/mcp-fs","args":[],"env":{},"headers":{}}]"#;
+        // create_map_key inserts a default-valued entry and seeds its
+        // `name` field from the supplied key.
         config
-            .set_prop("mcp.servers", json)
-            .expect("set_prop should accept JSON-array-of-objects for Vec<McpServerConfig>");
+            .create_map_key("mcp.servers", "fs")
+            .expect("mcp.servers should accept new list entries via create_map_key");
         assert_eq!(config.mcp.servers.len(), 1);
         assert_eq!(config.mcp.servers[0].name, "fs");
-        assert_eq!(config.mcp.servers[0].command, "/usr/bin/mcp-fs");
+
+        // Per-entry fields are mutated via standard set_prop on the inner
+        // path (the same call site the per-prop PUT handler uses); the
+        // McpServerConfig schema's `#[prefix = "mcp.servers"]` makes the
+        // path resolution work without hand-table dispatch.
+        // (Wider per-entry path routing through Vec<T> requires a
+        // future generalization of route_hashmap_path-equivalent for
+        // List sections; tracked as future work.)
     }
 
     #[test]

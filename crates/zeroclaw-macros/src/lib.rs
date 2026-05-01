@@ -511,6 +511,68 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     });
                 }
+            } else if let Some(vec_inner_ty) = extract_vec_inner(&field.ty) {
+                // ── Nested Vec<T> ──
+                // Vec doesn't implement Configurable, so we cannot delegate
+                // get_prop / set_prop / secret_fields / prop_fields /
+                // init_defaults to the field directly. The list-section
+                // emission below handles `+ Add` and per-entry creation;
+                // per-prop access to elements happens through the schema's
+                // natural-key routing once entries are inserted.
+                //
+                // Intentionally NO push to nested_collect / nested_set /
+                // nested_encrypt / nested_decrypt / nested_prop_fields /
+                // nested_get_prop / nested_set_prop / nested_prop_is_secret
+                // / init_defaults_ops / map_key_recurse / create_map_key_recurse
+                // for Vec<T> + #[nested] — all those call methods Vec doesn't
+                // have.
+                let vec_inner_name = vec_inner_ty.to_token_stream().to_string();
+                let field_doc = extract_doc(&field.attrs);
+                let vec_field_name_lit = snake_to_kebab(&field_ident.to_string());
+                map_key_section_entries.push(quote! {
+                    out.push(crate::config::MapKeySection {
+                        path: {
+                            let prefix = Self::configurable_prefix();
+                            let s = if prefix.is_empty() {
+                                #vec_field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #vec_field_name_lit)
+                            };
+                            Box::leak(s.into_boxed_str())
+                        },
+                        kind: crate::config::MapKeyKind::List,
+                        value_type: #vec_inner_name,
+                        description: #field_doc,
+                    });
+                });
+                create_map_key_arms.push(quote! {
+                    {
+                        let prefix = Self::configurable_prefix();
+                        let expected = if prefix.is_empty() {
+                            #vec_field_name_lit.to_string()
+                        } else {
+                            format!("{prefix}.{}", #vec_field_name_lit)
+                        };
+                        if section_path == expected {
+                            let value: #vec_inner_ty = serde_json::from_value(
+                                serde_json::json!({}),
+                            ).map_err(|e| format!(
+                                "default-construct {} failed: {e}",
+                                stringify!(#vec_inner_ty)
+                            ))?;
+                            self.#field_ident.push(value);
+                            let new_idx = self.#field_ident.len() - 1;
+                            let inner_prefix = <#vec_inner_ty>::configurable_prefix();
+                            let _ = self.#field_ident[new_idx].set_prop(
+                                &format!("{inner_prefix}.name"), map_key,
+                            );
+                            let _ = self.#field_ident[new_idx].set_prop(
+                                &format!("{inner_prefix}.hint"), map_key,
+                            );
+                            return Ok(true);
+                        }
+                    }
+                });
             } else {
                 nested_collect.push(quote! {
                     fields.extend(self.#field_ident.secret_fields());
@@ -569,57 +631,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
 
-                // Vec<T> with #[nested]: T is Configurable; surface as a
-                // List section + emit a push-with-default arm.
-                if let Some(vec_inner_ty) = extract_vec_inner(&field.ty) {
-                    let vec_inner_name = vec_inner_ty.to_token_stream().to_string();
-                    let field_doc = extract_doc(&field.attrs);
-                    let vec_field_name_lit = snake_to_kebab(&field_ident.to_string());
-                    map_key_section_entries.push(quote! {
-                        out.push(crate::config::MapKeySection {
-                            path: {
-                                let prefix = Self::configurable_prefix();
-                                let s = if prefix.is_empty() {
-                                    #vec_field_name_lit.to_string()
-                                } else {
-                                    format!("{prefix}.{}", #vec_field_name_lit)
-                                };
-                                Box::leak(s.into_boxed_str())
-                            },
-                            kind: crate::config::MapKeyKind::List,
-                            value_type: #vec_inner_name,
-                            description: #field_doc,
-                        });
-                    });
-                    create_map_key_arms.push(quote! {
-                        {
-                            let prefix = Self::configurable_prefix();
-                            let expected = if prefix.is_empty() {
-                                #vec_field_name_lit.to_string()
-                            } else {
-                                format!("{prefix}.{}", #vec_field_name_lit)
-                            };
-                            if section_path == expected {
-                                let value: #vec_inner_ty = serde_json::from_value(
-                                    serde_json::json!({}),
-                                ).map_err(|e| format!(
-                                    "default-construct {} failed: {e}",
-                                    stringify!(#vec_inner_ty)
-                                ))?;
-                                self.#field_ident.push(value);
-                                let new_idx = self.#field_ident.len() - 1;
-                                let inner_prefix = <#vec_inner_ty>::configurable_prefix();
-                                let _ = self.#field_ident[new_idx].set_prop(
-                                    &format!("{inner_prefix}.name"), map_key,
-                                );
-                                let _ = self.#field_ident[new_idx].set_prop(
-                                    &format!("{inner_prefix}.hint"), map_key,
-                                );
-                                return Ok(true);
-                            }
-                        }
-                    });
-                }
+                // Vec<T> handling moved to its own `else if extract_vec_inner`
+                // branch above so the per-prop method dispatch (set_prop,
+                // get_prop, secret_fields, …) is skipped — Vec<T> doesn't
+                // implement those methods.
             }
 
             continue; // nested fields handled above
