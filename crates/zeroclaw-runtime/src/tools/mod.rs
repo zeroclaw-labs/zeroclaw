@@ -393,8 +393,13 @@ pub fn all_tools_with_runtime(
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
     ];
 
-    // Register discord_search if discord_history channel is configured
-    if root_config.channels.discord_history.is_some() {
+    // Register discord_search if discord archive is enabled
+    if root_config
+        .channels
+        .discord
+        .as_ref()
+        .is_some_and(|d| d.archive)
+    {
         match zeroclaw_memory::SqliteMemory::new_named(workspace_dir, "discord") {
             Ok(discord_mem) => {
                 tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));

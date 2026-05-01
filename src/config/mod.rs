@@ -87,6 +87,8 @@ mod tests {
             enabled: true,
             bot_token: "token".into(),
             guild_ids: vec!["123".into()],
+            channel_ids: vec![],
+            archive: false,
             allowed_users: vec![],
             listen_to_bots: false,
             interrupt_on_new_message: false,

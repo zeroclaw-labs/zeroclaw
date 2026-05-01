@@ -320,6 +320,70 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
+    // V3: Fold [channels.discord-history] into [channels.discord].
+    // discord-history was a separate channel type that archived ALL messages.
+    // V3 merges it into discord with `archive = true`.
+    for key in &["channels_config", "channels"] {
+        if let Some(toml::Value::Table(channels)) = table.get_mut(*key) {
+            // Pull the discord-history block out (try both hyphen and underscore).
+            let dh = channels
+                .remove("discord-history")
+                .or_else(|| channels.remove("discord_history"));
+            if let Some(toml::Value::Table(mut dh_table)) = dh {
+                // Migrate discord-history's own guild_id to guild_ids.
+                if let Some(toml::Value::String(gid)) = dh_table.remove("guild_id")
+                    && !gid.is_empty()
+                    && gid != "*"
+                {
+                    let ids = dh_table
+                        .entry("guild_ids")
+                        .or_insert_with(|| toml::Value::Array(Vec::new()));
+                    if let toml::Value::Array(arr) = ids
+                        && !arr.iter().any(|v| v.as_str() == Some(gid.as_str()))
+                    {
+                        arr.push(toml::Value::String(gid));
+                    }
+                }
+                // Drop fields that no longer exist on discord config.
+                dh_table.remove("store_dms");
+                dh_table.remove("respond_to_dms");
+
+                if let Some(toml::Value::Table(discord)) = channels.get_mut("discord") {
+                    // Both blocks present: fold archive flag + channel_ids into discord.
+                    let dh_token = dh_table
+                        .get("bot_token")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let dc_token = discord
+                        .get("bot_token")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !dh_token.is_empty() && dh_token != dc_token {
+                        tracing::warn!(
+                            "v2→v3 migration: [channels.discord-history] has a different \
+                             bot_token than [channels.discord]. Discarding discord-history \
+                             config; re-configure archive manually under [channels.discord]."
+                        );
+                    } else {
+                        discord.insert("archive".to_string(), toml::Value::Boolean(true));
+                        // Merge channel_ids from discord-history if discord has none.
+                        if let Some(dh_ids) = dh_table.remove("channel_ids")
+                            && discord.get("channel_ids").is_none()
+                        {
+                            discord.insert("channel_ids".to_string(), dh_ids);
+                        }
+                    }
+                } else {
+                    // Only discord-history exists: promote it to discord with archive=true.
+                    dh_table.insert("archive".to_string(), toml::Value::Boolean(true));
+                    channels.insert("discord".to_string(), toml::Value::Table(dh_table));
+                }
+            }
+        }
+    }
+
     // Rename legacy `channels_config` key to `channels`
     if table.contains_key("channels_config")
         && !table.contains_key("channels")

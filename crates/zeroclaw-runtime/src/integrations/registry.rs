@@ -926,7 +926,7 @@ mod tests {
         config.channels.matrix = Some(MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
-            access_token: "tok".into(),
+            access_token: Some("tok".into()),
             user_id: None,
             device_id: None,
             allowed_users: vec![],

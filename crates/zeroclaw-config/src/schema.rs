@@ -6512,9 +6512,6 @@ pub struct ChannelsConfig {
     /// Discord bot channel configuration.
     #[nested]
     pub discord: Option<DiscordConfig>,
-    /// Discord history channel — logs ALL messages and forwards @mentions to agent.
-    #[nested]
-    pub discord_history: Option<DiscordHistoryConfig>,
     /// Slack bot channel configuration.
     #[nested]
     pub slack: Option<SlackConfig>,
@@ -6805,7 +6802,6 @@ impl Default for ChannelsConfig {
             cli: true,
             telegram: None,
             discord: None,
-            discord_history: None,
             slack: None,
             mattermost: None,
             webhook: None,
@@ -6954,6 +6950,17 @@ pub struct DiscordConfig {
     /// singular field.
     #[serde(default)]
     pub guild_ids: Vec<String>,
+    /// Channel IDs to watch. Empty = watch every channel the bot can see.
+    /// Used by the archive sidecar (when `archive = true`) and by the
+    /// in-channel filter when set.
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
+    /// When true, the channel opens a sidecar `discord.db` SQLite memory
+    /// backend, archives every non-bot message it sees, and registers the
+    /// `discord_search` tool against it. Default: false. Folded in from
+    /// the legacy `[channels.discord-history]` block.
+    #[serde(default)]
+    pub archive: bool,
     /// Allowed Discord user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
@@ -7001,46 +7008,6 @@ impl ChannelConfig for DiscordConfig {
     }
     fn desc() -> &'static str {
         "connect your bot"
-    }
-}
-
-/// Discord history channel — logs ALL messages to discord.db and forwards @mentions to the agent.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.discord-history"]
-pub struct DiscordHistoryConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Discord bot token (from Discord Developer Portal).
-    #[secret]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub bot_token: String,
-    /// Optional guild (server) ID to restrict logging to a single guild.
-    pub guild_id: Option<String>,
-    /// Allowed Discord user IDs. Empty = allow all (open logging).
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
-    /// Discord channel IDs to watch. Empty = watch all channels.
-    #[serde(default)]
-    pub channel_ids: Vec<String>,
-    /// When true (default), store Direct Messages in discord.db.
-    #[serde(default = "default_true")]
-    pub store_dms: bool,
-    /// When true (default), respond to @mentions in Direct Messages.
-    #[serde(default = "default_true")]
-    pub respond_to_dms: bool,
-    /// Per-channel proxy URL (http, https, socks5, socks5h).
-    #[serde(default)]
-    pub proxy_url: Option<String>,
-}
-
-impl ChannelConfig for DiscordHistoryConfig {
-    fn name() -> &'static str {
-        "Discord History"
-    }
-    fn desc() -> &'static str {
-        "log all messages and forward @mentions"
     }
 }
 
@@ -7260,10 +7227,12 @@ pub struct MatrixConfig {
     pub enabled: bool,
     /// Matrix homeserver URL (e.g. `"https://matrix.org"`).
     pub homeserver: String,
-    /// Matrix access token for the bot account.
+    /// Matrix access token for the bot account. When unset, the channel
+    /// falls back to password login using `user_id` + `password`.
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub access_token: String,
+    #[serde(default)]
+    pub access_token: Option<String>,
     /// Optional Matrix user ID (e.g. `"@bot:matrix.org"`).
     #[serde(default)]
     pub user_id: Option<String>,
@@ -11996,7 +11965,6 @@ auto_save = true
                     approval_timeout_secs: default_telegram_approval_timeout_secs(),
                 }),
                 discord: None,
-                discord_history: None,
                 slack: None,
                 mattermost: None,
                 webhook: None,
@@ -12914,6 +12882,8 @@ default_temperature = 0.7
             enabled: true,
             bot_token: "discord-token".into(),
             guild_ids: vec!["12345".into()],
+            channel_ids: vec![],
+            archive: false,
             allowed_users: vec![],
             listen_to_bots: false,
             interrupt_on_new_message: false,
@@ -12937,6 +12907,8 @@ default_temperature = 0.7
             enabled: true,
             bot_token: "tok".into(),
             guild_ids: Vec::new(),
+            channel_ids: vec![],
+            archive: false,
             allowed_users: vec![],
             listen_to_bots: false,
             interrupt_on_new_message: false,
@@ -12994,7 +12966,7 @@ default_temperature = 0.7
         let mc = MatrixConfig {
             enabled: true,
             homeserver: "https://matrix.org".into(),
-            access_token: "syt_token_abc".into(),
+            access_token: Some("syt_token_abc".into()),
             user_id: Some("@bot:matrix.org".into()),
             device_id: Some("DEVICE123".into()),
             allowed_users: vec!["@user:matrix.org".into()],
@@ -13013,7 +12985,7 @@ default_temperature = 0.7
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.homeserver, "https://matrix.org");
-        assert_eq!(parsed.access_token, "syt_token_abc");
+        assert_eq!(parsed.access_token.as_deref(), Some("syt_token_abc"));
         assert_eq!(parsed.user_id.as_deref(), Some("@bot:matrix.org"));
         assert_eq!(parsed.device_id.as_deref(), Some("DEVICE123"));
         assert_eq!(
@@ -13028,7 +13000,7 @@ default_temperature = 0.7
         let mc = MatrixConfig {
             enabled: true,
             homeserver: "https://synapse.local:8448".into(),
-            access_token: "tok".into(),
+            access_token: Some("tok".into()),
             user_id: None,
             device_id: None,
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
@@ -13144,7 +13116,6 @@ allowed_users = ["@u:matrix.org"]
             cli: true,
             telegram: None,
             discord: None,
-            discord_history: None,
             slack: None,
             mattermost: None,
             webhook: None,
@@ -13155,7 +13126,7 @@ allowed_users = ["@u:matrix.org"]
             matrix: Some(MatrixConfig {
                 enabled: true,
                 homeserver: "https://m.org".into(),
-                access_token: "tok".into(),
+                access_token: Some("tok".into()),
                 user_id: None,
                 device_id: None,
                 allowed_users: vec!["@u:m".into()],
@@ -13528,7 +13499,6 @@ bot_token = "xoxb-tok"
             cli: true,
             telegram: None,
             discord: None,
-            discord_history: None,
             slack: None,
             mattermost: None,
             webhook: None,
@@ -17186,7 +17156,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
-            access_token: "tok".into(),
+            access_token: Some("tok".into()),
             user_id: None,
             device_id: None,
             allowed_users: vec![],
@@ -17218,7 +17188,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
-            access_token: String::new(),
+            access_token: None,
             user_id: None,
             device_id: None,
             allowed_users: vec![],
@@ -17243,7 +17213,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
-            access_token: "old".into(),
+            access_token: Some("old".into()),
             user_id: None,
             device_id: None,
             allowed_users: vec![],
@@ -17261,7 +17231,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         };
         mx.set_secret("channels.matrix.access-token", "new-token".into())
             .unwrap();
-        assert_eq!(mx.access_token, "new-token");
+        assert_eq!(mx.access_token.as_deref(), Some("new-token"));
     }
 
     #[test]
@@ -17269,7 +17239,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
-            access_token: "tok".into(),
+            access_token: Some("tok".into()),
             user_id: None,
             device_id: None,
             allowed_users: vec![],
@@ -17312,7 +17282,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix = Some(MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
-            access_token: "mx-tok".into(),
+            access_token: Some("mx-tok".into()),
             user_id: None,
             device_id: None,
             allowed_users: vec![],
@@ -17341,7 +17311,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix = Some(MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
-            access_token: "old".into(),
+            access_token: Some("old".into()),
             user_id: None,
             device_id: None,
             allowed_users: vec![],
@@ -17361,7 +17331,16 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config
             .set_secret("channels.matrix.access-token", "new".into())
             .unwrap();
-        assert_eq!(config.channels.matrix.as_ref().unwrap().access_token, "new");
+        assert_eq!(
+            config
+                .channels
+                .matrix
+                .as_ref()
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("new")
+        );
     }
 
     #[test]
@@ -17370,7 +17349,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix = Some(MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
-            access_token: "old".into(),
+            access_token: Some("old".into()),
             user_id: None,
             device_id: None,
             allowed_users: vec![],
@@ -17390,8 +17369,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             .set_secret("channels.matrix.access-token", "sk-test".into())
             .unwrap();
         assert_eq!(
-            config.channels.matrix.as_ref().unwrap().access_token,
-            "sk-test"
+            config
+                .channels
+                .matrix
+                .as_ref()
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("sk-test")
         );
     }
 
@@ -17413,7 +17398,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
-            access_token: "plaintext-token".into(),
+            access_token: Some("plaintext-token".into()),
             user_id: None,
             device_id: None,
             allowed_users: vec![],
@@ -17432,12 +17417,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
         // Encrypt
         mx.encrypt_secrets(&store).unwrap();
-        assert!(crate::secrets::SecretStore::is_encrypted(&mx.access_token));
-        assert_ne!(mx.access_token, "plaintext-token");
+        assert!(crate::secrets::SecretStore::is_encrypted(
+            mx.access_token.as_deref().unwrap_or_default()
+        ));
+        assert_ne!(mx.access_token.as_deref(), Some("plaintext-token"));
 
         // Decrypt
         mx.decrypt_secrets(&store).unwrap();
-        assert_eq!(mx.access_token, "plaintext-token");
+        assert_eq!(mx.access_token.as_deref(), Some("plaintext-token"));
     }
 
     #[test]
@@ -17448,7 +17435,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
-            access_token: "plaintext-token".into(),
+            access_token: Some("plaintext-token".into()),
             user_id: None,
             device_id: None,
             allowed_users: vec![],
@@ -17481,7 +17468,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
-            access_token: "plaintext-token".into(),
+            access_token: Some("plaintext-token".into()),
             user_id: None,
             device_id: None,
             allowed_users: vec![],
@@ -17500,7 +17487,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
         mx.encrypt_secrets(&store).unwrap();
         // With encryption disabled, value should stay plaintext
-        assert_eq!(mx.access_token, "plaintext-token");
+        assert_eq!(mx.access_token.as_deref(), Some("plaintext-token"));
     }
 
     // ── Property method tests ──
@@ -17509,7 +17496,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
-            access_token: "tok".into(),
+            access_token: Some("tok".into()),
             user_id: Some("@bot:m.org".into()),
             device_id: None,
             allowed_users: vec![],

@@ -55,7 +55,7 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:clawdtalk` | `clawdtalk.rs` |
 | `channel:cli` | `cli.rs` |
 | `channel:dingtalk` | `dingtalk.rs` |
-| `channel:discord` | `discord.rs`, `discord_history.rs` |
+| `channel:discord` | `discord.rs` |
 | `channel:email` | `email_channel.rs`, `gmail_push.rs` |
 | `channel:imessage` | `imessage.rs` |
 | `channel:irc` | `irc.rs` |

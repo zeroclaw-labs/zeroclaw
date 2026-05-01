@@ -20,6 +20,13 @@ pub struct DiscordChannel {
     bot_token: String,
     /// Empty = listen across all guilds the bot is invited to.
     guild_ids: Vec<String>,
+    /// Empty = watch every channel; non-empty = restrict the bot to listed
+    /// channel IDs (for both interaction and archive).
+    channel_ids: Vec<String>,
+    /// When set, every non-bot message that passes the channel filter is
+    /// archived to a sidecar SQLite memory backend (`discord.db`). The
+    /// `discord_search` tool reads from this when registered.
+    archive_memory: Option<std::sync::Arc<dyn zeroclaw_memory::Memory>>,
     allowed_users: Vec<String>,
     listen_to_bots: bool,
     mention_only: bool,
@@ -61,6 +68,8 @@ impl DiscordChannel {
         Self {
             bot_token,
             guild_ids,
+            channel_ids: vec![],
+            archive_memory: None,
             allowed_users,
             listen_to_bots,
             mention_only,
@@ -129,6 +138,16 @@ impl DiscordChannel {
     /// Set the stall-watchdog timeout (0 = disabled).
     pub fn with_stall_timeout(mut self, secs: u64) -> Self {
         self.stall_timeout_secs = secs;
+        self
+    }
+
+    pub fn with_channel_ids(mut self, ids: Vec<String>) -> Self {
+        self.channel_ids = ids;
+        self
+    }
+
+    pub fn with_archive_memory(mut self, mem: std::sync::Arc<dyn zeroclaw_memory::Memory>) -> Self {
+        self.archive_memory = Some(mem);
         self
     }
 
@@ -1004,6 +1023,8 @@ impl Channel for DiscordChannel {
         });
 
         let guild_filter = self.guild_ids.clone();
+        let channel_filter = self.channel_ids.clone();
+        let archive_memory = self.archive_memory.clone();
 
         // --- Stall watchdog --------------------------------------------------
         let watchdog = if self.stall_timeout_secs > 0 {
@@ -1134,6 +1155,77 @@ impl Channel for DiscordChannel {
                             && !guild_filter.iter().any(|allowed| allowed == g)
                         {
                             continue;
+                        }
+                    }
+
+                    // Channel allowlist. Empty = watch every channel.
+                    if !channel_filter.is_empty() {
+                        let msg_channel = d
+                            .get("channel_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        if !channel_filter.iter().any(|c| c == msg_channel) {
+                            continue;
+                        }
+                    }
+
+                    // Archive every non-bot message to discord.db when enabled.
+                    if let Some(ref archive_mem) = archive_memory {
+                        let archive_channel_id =
+                            d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
+                        let is_dm_event = d.get("guild_id").is_none();
+                        let username = d
+                            .get("author")
+                            .and_then(|a| a.get("username"))
+                            .and_then(|u| u.as_str())
+                            .unwrap_or(author_id);
+                        let content_raw =
+                            d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        let archive_msg_id =
+                            d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                        if !content_raw.is_empty() {
+                            let ts = chrono::Utc::now().to_rfc3339();
+                            let channel_display =
+                                if is_dm_event { "dm" } else { archive_channel_id };
+                            let atts = d
+                                .get("attachments")
+                                .and_then(|a| a.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|a| a.get("url").and_then(|u| u.as_str()))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default();
+                            let mut mem_content = format!(
+                                "@{username} in #{channel_display} at {ts}: {content_raw}"
+                            );
+                            if !atts.is_empty() {
+                                mem_content.push_str(&format!(" [attachments: {atts}]"));
+                            }
+                            let mem_key = if archive_msg_id.is_empty() {
+                                format!("discord_{}", Uuid::new_v4())
+                            } else {
+                                format!("discord_{archive_msg_id}")
+                            };
+                            let session = if archive_channel_id.is_empty() {
+                                None
+                            } else {
+                                Some(archive_channel_id)
+                            };
+                            if let Err(e) = archive_mem
+                                .store(
+                                    &mem_key,
+                                    &mem_content,
+                                    zeroclaw_memory::MemoryCategory::Custom(
+                                        "discord".to_string(),
+                                    ),
+                                    session,
+                                )
+                                .await
+                            {
+                                tracing::warn!("discord: archive store failed: {e}");
+                            }
                         }
                     }
 

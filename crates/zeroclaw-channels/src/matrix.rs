@@ -752,7 +752,11 @@ mod client {
         if let Some(pw) = config.password.as_deref().filter(|s| !s.is_empty()) {
             return password_login(client, config, pw).await;
         }
-        if !config.access_token.is_empty() {
+        if config
+            .access_token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty())
+        {
             return access_token_login(client, config).await;
         }
         bail!("matrix login requires either access_token or user_id+password")
@@ -799,7 +803,10 @@ mod client {
                 device_id: device_id.into(),
             },
             tokens: SessionTokens {
-                access_token: config.access_token.clone(),
+                access_token: config
+                    .access_token
+                    .clone()
+                    .ok_or_else(|| anyhow!("matrix.access_token is required for token login"))?,
                 refresh_token: None,
             },
         };
@@ -2305,7 +2312,15 @@ impl MatrixChannel {
         if config.homeserver.trim().is_empty() {
             bail!("matrix: `homeserver` is required");
         }
-        if config.access_token.trim().is_empty() && config.password.is_none() {
+        let has_token = config
+            .access_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty());
+        let has_password = config
+            .password
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        if !has_token && !has_password {
             bail!("matrix: configure either `access_token` or `password`");
         }
         Ok(Self {
@@ -3144,7 +3159,7 @@ mod tests {
             MatrixConfig {
                 enabled: true,
                 homeserver: "https://m.org".into(),
-                access_token: String::new(),
+                access_token: None,
                 user_id: user_id.map(String::from),
                 device_id: None,
                 allowed_users: vec![],

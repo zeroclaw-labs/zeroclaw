@@ -60,7 +60,6 @@
   - changed-files:
       - any-glob-to-any-file:
           - "src/channels/discord.rs"
-          - "src/channels/discord_history.rs"
 
 "channel:email":
   - changed-files:

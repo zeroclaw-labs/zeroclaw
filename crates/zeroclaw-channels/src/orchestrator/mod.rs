@@ -26,7 +26,6 @@ pub use crate::bluesky::BlueskyChannel;
 pub use crate::clawdtalk::ClawdTalkChannel;
 pub use crate::dingtalk::DingTalkChannel;
 pub use crate::discord::DiscordChannel;
-pub use crate::discord_history::DiscordHistoryChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::email_channel::EmailChannel;
 #[cfg(feature = "channel-email")]
@@ -4058,6 +4057,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     dc.listen_to_bots,
                     dc.mention_only,
                 )
+                .with_channel_ids(dc.channel_ids.clone())
                 .with_streaming(
                     dc.stream_mode,
                     dc.draft_update_interval_ms,
@@ -4374,25 +4374,6 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 mc.poll_interval_secs,
             )))
         }
-        "discord_history" | "discord-history" => {
-            let dh = config
-                .channels
-                .discord_history
-                .as_ref()
-                .context("Discord History channel is not configured")?;
-            let discord_mem =
-                zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "discord")
-                    .context("Discord History: failed to open discord.db")?;
-            Ok(Arc::new(DiscordHistoryChannel::new(
-                dh.bot_token.clone(),
-                dh.guild_id.clone(),
-                dh.allowed_users.clone(),
-                dh.channel_ids.clone(),
-                Arc::new(discord_mem),
-                dh.store_dms,
-                dh.respond_to_dms,
-            )))
-        }
         "imessage" => {
             let im = config
                 .channels
@@ -4434,7 +4415,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, voice-call"
+            email, gmail_push, irc, twitter, mochat, imessage, line, voice-call"
         ),
     }
 }
@@ -4516,58 +4497,41 @@ fn collect_configured_channels(
 
     if let Some(ref dc) = config.channels.discord {
         if dc.enabled {
+            let mut discord_ch = DiscordChannel::new(
+                dc.bot_token.clone(),
+                dc.guild_ids.clone(),
+                dc.allowed_users.clone(),
+                dc.listen_to_bots,
+                dc.mention_only,
+            )
+            .with_channel_ids(dc.channel_ids.clone())
+            .with_streaming(
+                dc.stream_mode,
+                dc.draft_update_interval_ms,
+                dc.multi_message_delay_ms,
+            )
+            .with_proxy_url(dc.proxy_url.clone())
+            .with_transcription(config.transcription.clone())
+            .with_stall_timeout(dc.stall_timeout_secs)
+            .with_approval_timeout_secs(dc.approval_timeout_secs);
+            if dc.archive {
+                match zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "discord") {
+                    Ok(mem) => {
+                        discord_ch = discord_ch.with_archive_memory(std::sync::Arc::new(mem));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "discord: archive enabled but failed to open discord.db: {e}"
+                        );
+                    }
+                }
+            }
             channels.push(ConfiguredChannel {
                 display_name: "Discord",
-                channel: Arc::new(
-                    DiscordChannel::new(
-                        dc.bot_token.clone(),
-                        dc.guild_ids.clone(),
-                        dc.allowed_users.clone(),
-                        dc.listen_to_bots,
-                        dc.mention_only,
-                    )
-                    .with_streaming(
-                        dc.stream_mode,
-                        dc.draft_update_interval_ms,
-                        dc.multi_message_delay_ms,
-                    )
-                    .with_proxy_url(dc.proxy_url.clone())
-                    .with_transcription(config.transcription.clone())
-                    .with_stall_timeout(dc.stall_timeout_secs)
-                    .with_approval_timeout_secs(dc.approval_timeout_secs),
-                ),
+                channel: Arc::new(discord_ch),
             });
         } else {
             tracing::info!("Discord channel configured but disabled (enabled = false)");
-        }
-    }
-
-    if let Some(ref dh) = config.channels.discord_history {
-        if dh.enabled {
-            match zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "discord") {
-                Ok(discord_mem) => {
-                    channels.push(ConfiguredChannel {
-                        display_name: "Discord History",
-                        channel: Arc::new(
-                            DiscordHistoryChannel::new(
-                                dh.bot_token.clone(),
-                                dh.guild_id.clone(),
-                                dh.allowed_users.clone(),
-                                dh.channel_ids.clone(),
-                                Arc::new(discord_mem),
-                                dh.store_dms,
-                                dh.respond_to_dms,
-                            )
-                            .with_proxy_url(dh.proxy_url.clone()),
-                        ),
-                    });
-                }
-                Err(e) => {
-                    tracing::error!("discord_history: failed to open discord.db: {e}");
-                }
-            }
-        } else {
-            tracing::info!("Discord History channel configured but disabled (enabled = false)");
         }
     }
 
@@ -5919,7 +5883,8 @@ pub async fn deliver_announcement(
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
-            );
+            )
+            .with_channel_ids(dc.channel_ids.clone());
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
                 .await?;
         }

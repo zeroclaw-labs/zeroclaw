@@ -567,6 +567,63 @@ allowed_users = ["u1"]
 }
 
 #[test]
+fn discord_history_only_becomes_discord_with_archive() {
+    let config = migrate(
+        r#"
+[channels.discord-history]
+bot_token = "histtok"
+channel_ids = ["c1", "c2"]
+allowed_users = ["u1"]
+"#,
+    );
+
+    assert!(config.channels.discord.is_some());
+    let dc = config.channels.discord.as_ref().unwrap();
+    assert!(dc.archive);
+    assert_eq!(dc.bot_token, "histtok");
+    assert_eq!(dc.channel_ids, vec!["c1".to_string(), "c2".to_string()]);
+}
+
+#[test]
+fn discord_history_and_discord_same_token_sets_archive() {
+    let config = migrate(
+        r#"
+[channels.discord]
+bot_token = "tok"
+guild_id = "g1"
+
+[channels.discord-history]
+bot_token = "tok"
+channel_ids = ["c1"]
+"#,
+    );
+
+    let dc = config.channels.discord.as_ref().unwrap();
+    assert!(dc.archive);
+    assert_eq!(dc.channel_ids, vec!["c1".to_string()]);
+    assert_eq!(dc.guild_ids, vec!["g1".to_string()]);
+}
+
+#[test]
+fn discord_history_different_token_discarded_with_warning() {
+    let config = migrate(
+        r#"
+[channels.discord]
+bot_token = "tok-a"
+
+[channels.discord-history]
+bot_token = "tok-b"
+channel_ids = ["c1"]
+"#,
+    );
+
+    let dc = config.channels.discord.as_ref().unwrap();
+    // Different bot_token: archive should NOT be set automatically.
+    assert!(!dc.archive);
+    assert!(dc.channel_ids.is_empty());
+}
+
+#[test]
 fn signal_group_id_migrates_to_group_ids() {
     let config = migrate(
         r#"
