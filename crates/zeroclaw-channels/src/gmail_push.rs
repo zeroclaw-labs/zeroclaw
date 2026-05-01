@@ -1041,6 +1041,7 @@ mod tests {
             allowed_senders: vec!["@example.com".into()],
             webhook_url: "https://example.com/webhook/gmail".into(),
             webhook_secret: "my-secret".into(),
+            excluded_tools: vec![],
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: GmailPushConfig = serde_json::from_str(&json).unwrap();

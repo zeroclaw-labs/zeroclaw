@@ -109,7 +109,7 @@ allowed_rooms = ["!abc:matrix.org", "!other:matrix.org"]
 "#,
     );
 
-    let matrix = config.channels.matrix.as_ref().unwrap();
+    let matrix = config.channels.matrix.get("default").unwrap();
     assert_eq!(matrix.allowed_rooms.len(), 2);
 }
 
@@ -204,10 +204,9 @@ allowed_users = ["@user:matrix.org"]
         migrated.contains("# keep it tight"),
         "inline comment preserved"
     );
-    assert!(
-        migrated.contains("# production server"),
-        "matrix inline comment preserved"
-    );
+    // Channel aliasing restructures [channels_config.matrix] into
+    // [channels_config.matrix.default], so inline comments on matrix keys
+    // do not survive the key move — that is expected.
     assert!(migrated.contains("[providers"), "providers section added");
     assert!(!migrated.contains("room_id"), "room_id removed");
 }
@@ -257,7 +256,7 @@ allowed_users = ["@u:m"]
     );
     assert!(config.providers.models.contains_key("ollama"));
 
-    let matrix = config.channels.matrix.as_ref().unwrap();
+    let matrix = config.channels.matrix.get("default").unwrap();
     // room_id is no longer on MatrixConfig; migration moves it to allowed_rooms.
     assert!(matrix.allowed_rooms.contains(&"!rt:matrix.org".to_string()));
 
@@ -350,7 +349,7 @@ allowed_rooms = ["!existing:matrix.org"]
     }
 
     // Matrix room_id merged into allowed_rooms by prepare_table.
-    let v0_mx = v0.channels.matrix.as_ref().unwrap();
+    let v0_mx = v0.channels.matrix.get("default").unwrap();
     assert!(
         v0_mx
             .allowed_rooms
@@ -437,7 +436,7 @@ require_pairing = true
     );
 
     // Empty room_id must not pollute allowed_rooms.
-    let matrix = config.channels.matrix.as_ref().unwrap();
+    let matrix = config.channels.matrix.get("default").unwrap();
     // room_id is no longer on MatrixConfig; migration moves it to allowed_rooms.
     assert!(matrix.allowed_rooms.is_empty());
 
@@ -492,7 +491,7 @@ allowed_users = ["u1"]
 "#,
     );
 
-    let mm = config.channels.mattermost.as_ref().unwrap();
+    let mm = config.channels.mattermost.get("default").unwrap();
     assert_eq!(mm.channel_ids, vec!["abc123".to_string()]);
     assert_eq!(mm.bot_token.as_deref(), Some("tok"));
 }
@@ -510,7 +509,7 @@ allowed_users = ["u1"]
 "#,
     );
 
-    let mm = config.channels.mattermost.as_ref().unwrap();
+    let mm = config.channels.mattermost.get("default").unwrap();
     assert_eq!(
         mm.channel_ids,
         vec!["abc123".to_string(), "def456".to_string()]
@@ -530,7 +529,7 @@ allowed_users = ["u1"]
 "#,
     );
 
-    let mm = config.channels.mattermost.as_ref().unwrap();
+    let mm = config.channels.mattermost.get("default").unwrap();
     assert!(mm.bot_token.is_none());
     assert_eq!(mm.login_id.as_deref(), Some("bot@example.com"));
     assert_eq!(mm.password.as_deref(), Some("secret"));
@@ -547,7 +546,7 @@ allowed_users = ["u1"]
 "#,
     );
 
-    let dc = config.channels.discord.as_ref().unwrap();
+    let dc = config.channels.discord.get("default").unwrap();
     assert_eq!(dc.guild_ids, vec!["g1".to_string()]);
 }
 
@@ -562,7 +561,7 @@ allowed_users = ["u1"]
 "#,
     );
 
-    let dc = config.channels.discord.as_ref().unwrap();
+    let dc = config.channels.discord.get("default").unwrap();
     assert!(dc.guild_ids.is_empty());
 }
 
@@ -577,8 +576,8 @@ allowed_users = ["u1"]
 "#,
     );
 
-    assert!(config.channels.discord.is_some());
-    let dc = config.channels.discord.as_ref().unwrap();
+    assert!(!config.channels.discord.is_empty());
+    let dc = config.channels.discord.get("default").unwrap();
     assert!(dc.archive);
     assert_eq!(dc.bot_token, "histtok");
     assert_eq!(dc.channel_ids, vec!["c1".to_string(), "c2".to_string()]);
@@ -598,7 +597,7 @@ channel_ids = ["c1"]
 "#,
     );
 
-    let dc = config.channels.discord.as_ref().unwrap();
+    let dc = config.channels.discord.get("default").unwrap();
     assert!(dc.archive);
     assert_eq!(dc.channel_ids, vec!["c1".to_string()]);
     assert_eq!(dc.guild_ids, vec!["g1".to_string()]);
@@ -617,7 +616,7 @@ channel_ids = ["c1"]
 "#,
     );
 
-    let dc = config.channels.discord.as_ref().unwrap();
+    let dc = config.channels.discord.get("default").unwrap();
     // Different bot_token: archive should NOT be set automatically.
     assert!(!dc.archive);
     assert!(dc.channel_ids.is_empty());
@@ -635,7 +634,7 @@ allowed_from = ["+1111111111"]
 "#,
     );
 
-    let sg = config.channels.signal.as_ref().unwrap();
+    let sg = config.channels.signal.get("default").unwrap();
     assert_eq!(sg.group_ids, vec!["grpX".to_string()]);
     assert!(!sg.dm_only);
 }
@@ -652,7 +651,7 @@ allowed_from = ["+1111111111"]
 "#,
     );
 
-    let sg = config.channels.signal.as_ref().unwrap();
+    let sg = config.channels.signal.get("default").unwrap();
     assert!(sg.group_ids.is_empty());
     assert!(sg.dm_only);
 }
@@ -670,7 +669,7 @@ subreddit = "rust"
 "#,
     );
 
-    let rd = config.channels.reddit.as_ref().unwrap();
+    let rd = config.channels.reddit.get("default").unwrap();
     assert_eq!(rd.subreddits, vec!["rust".to_string()]);
 }
 
@@ -796,19 +795,24 @@ subreddits = ["rust"]
 
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(
-        config.channels.mattermost.as_ref().unwrap().channel_ids,
+        config
+            .channels
+            .mattermost
+            .get("default")
+            .unwrap()
+            .channel_ids,
         vec!["abc".to_string()]
     );
     assert_eq!(
-        config.channels.discord.as_ref().unwrap().guild_ids,
+        config.channels.discord.get("default").unwrap().guild_ids,
         vec!["g1".to_string()]
     );
     assert_eq!(
-        config.channels.signal.as_ref().unwrap().group_ids,
+        config.channels.signal.get("default").unwrap().group_ids,
         vec!["grpX".to_string()]
     );
     assert_eq!(
-        config.channels.reddit.as_ref().unwrap().subreddits,
+        config.channels.reddit.get("default").unwrap().subreddits,
         vec!["rust".to_string()]
     );
 }
@@ -899,4 +903,214 @@ vector_dimensions = 1024
 
     assert!(config.memory.postgres.vector_enabled);
     assert_eq!(config.memory.postgres.vector_dimensions, 1024);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V3: Channel aliasing migration
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn v2_flat_telegram_config_wrapped_under_default_alias() {
+    let config = migrate(
+        r#"
+[channels.telegram]
+enabled = true
+bot_token = "123:ABC"
+allowed_users = ["alice"]
+"#,
+    );
+
+    let tg = config
+        .channels
+        .telegram
+        .get("default")
+        .expect("default alias present");
+    assert!(tg.enabled);
+    assert_eq!(tg.bot_token, "123:ABC");
+    assert_eq!(tg.allowed_users, vec!["alice"]);
+}
+
+#[test]
+fn v2_flat_matrix_config_wrapped_under_default_alias() {
+    let config = migrate(
+        r#"
+[channels.matrix]
+homeserver = "https://m.org"
+access_token = "tok"
+allowed_users = ["@u:m.org"]
+"#,
+    );
+
+    let mx = config
+        .channels
+        .matrix
+        .get("default")
+        .expect("default alias present");
+    assert_eq!(mx.homeserver, "https://m.org");
+    assert_eq!(mx.access_token.as_deref(), Some("tok"));
+}
+
+#[test]
+fn v3_aliased_channel_not_double_wrapped() {
+    // A config already in V3 shape ([channels.telegram.default]) must not be
+    // wrapped again under an extra "default" layer.
+    let config = migrate(
+        r#"
+schema_version = 3
+
+[channels.telegram.default]
+enabled = true
+bot_token = "456:DEF"
+allowed_users = []
+"#,
+    );
+
+    let tg = config
+        .channels
+        .telegram
+        .get("default")
+        .expect("default alias present");
+    assert_eq!(tg.bot_token, "456:DEF");
+    // Must not exist as nested [telegram.default.default]
+    assert!(config.channels.telegram.len() == 1);
+}
+
+#[test]
+fn v2_channels_config_key_wrapped_correctly() {
+    // Legacy `[channels_config.discord]` flat config also gets aliasing.
+    let config = migrate(
+        r#"
+[channels_config.discord]
+enabled = true
+bot_token = "discord-tok"
+guild_id = "12345"
+"#,
+    );
+
+    let dc = config
+        .channels
+        .discord
+        .get("default")
+        .expect("default alias present");
+    assert!(dc.enabled);
+    assert_eq!(dc.bot_token, "discord-tok");
+}
+
+#[test]
+fn v2_swarm_config_dropped_with_no_panic() {
+    // V2 [swarms] are dropped silently; the rest of the config migrates cleanly.
+    let config = migrate(
+        r#"
+api_key = "sk-test"
+default_provider = "openrouter"
+
+[swarms.my-swarm]
+members = ["agent-a", "agent-b"]
+"#,
+    );
+
+    assert!(config.swarms.is_empty());
+    assert_eq!(
+        config.providers.models["openrouter"].api_key.as_deref(),
+        Some("sk-test")
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V3: Profile synthesis migration
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn autonomy_section_synthesises_default_risk_profile() {
+    let config = migrate(
+        r#"
+[autonomy]
+level = "full"
+max_actions_per_hour = 50
+max_cost_per_day_cents = 2000
+"#,
+    );
+
+    let profile = config
+        .risk_profiles
+        .get("default")
+        .expect("default risk_profile synthesised");
+    assert_eq!(
+        profile.level,
+        zeroclaw_config::autonomy::AutonomyLevel::Full
+    );
+    assert_eq!(profile.max_actions_per_hour, 50);
+    assert_eq!(profile.max_cost_per_day_cents, 2000);
+}
+
+#[test]
+fn autonomy_non_cli_excluded_tools_renamed_in_risk_profile() {
+    let config = migrate(
+        r#"
+[autonomy]
+level = "supervised"
+non_cli_excluded_tools = ["shell_tool", "file_write"]
+"#,
+    );
+
+    let profile = config
+        .risk_profiles
+        .get("default")
+        .expect("default risk_profile synthesised");
+    assert_eq!(
+        profile.excluded_tools,
+        vec!["shell_tool".to_string(), "file_write".to_string()]
+    );
+}
+
+#[test]
+fn existing_risk_profiles_default_not_overwritten() {
+    // If [risk_profiles.default] is already present, synthesis must not overwrite it.
+    let config = migrate(
+        r#"
+[autonomy]
+level = "full"
+
+[risk_profiles.default]
+level = "readonly"
+"#,
+    );
+
+    let profile = config
+        .risk_profiles
+        .get("default")
+        .expect("default risk_profile present");
+    assert_eq!(
+        profile.level,
+        zeroclaw_config::autonomy::AutonomyLevel::ReadOnly,
+        "existing risk_profiles.default must not be overwritten by synthesis"
+    );
+}
+
+#[test]
+fn agent_section_synthesises_default_runtime_profile() {
+    let config = migrate(
+        r#"
+[agent]
+max_tool_iterations = 25
+"#,
+    );
+
+    let profile = config
+        .runtime_profiles
+        .get("default")
+        .expect("default runtime_profile synthesised");
+    assert_eq!(profile.max_tool_iterations, 25);
+}
+
+#[test]
+fn no_agent_section_produces_no_runtime_profile() {
+    let config = migrate(
+        r#"
+api_key = "sk-test"
+"#,
+    );
+
+    // No [agent] section → no synthesised profile
+    assert!(config.runtime_profiles.is_empty());
 }

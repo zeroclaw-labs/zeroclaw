@@ -2986,6 +2986,7 @@ mod tests {
             receive_mode: LarkReceiveMode::default(),
             port: None,
             proxy_url: None,
+            excluded_tools: vec![],
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -3010,6 +3011,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            excluded_tools: vec![],
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -3046,6 +3048,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            excluded_tools: vec![],
         };
 
         let ch = LarkChannel::from_config(&cfg);
@@ -3072,6 +3075,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            excluded_tools: vec![],
         };
 
         let ch = LarkChannel::from_lark_config(&cfg);
@@ -3096,6 +3100,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            excluded_tools: vec![],
         };
 
         let ch = LarkChannel::from_feishu_config(&cfg);
@@ -3120,6 +3125,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
+            excluded_tools: vec![],
         };
 
         let cfg_false = FeishuConfig {
@@ -3332,6 +3338,7 @@ mod tests {
             receive_mode: zeroclaw_config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            excluded_tools: vec![],
         };
         let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
         assert_eq!(

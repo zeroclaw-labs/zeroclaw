@@ -217,6 +217,49 @@ pub(crate) fn scalar_to_vec(section: &mut toml::Table, old_key: &str, new_key: &
     }
 }
 
+/// All channel type keys recognised in V2 `[channels]` that the aliasing
+/// migration wraps into `[channels.<type>.default]`.
+const CHANNEL_TYPES: &[&str] = &[
+    "telegram",
+    "discord",
+    "slack",
+    "mattermost",
+    "webhook",
+    "imessage",
+    "matrix",
+    "signal",
+    "whatsapp",
+    "linq",
+    "wati",
+    "nextcloud_talk",
+    "email",
+    "gmail_push",
+    "irc",
+    "lark",
+    "line",
+    "feishu",
+    "dingtalk",
+    "wecom",
+    "wechat",
+    "qq",
+    "twitter",
+    "mochat",
+    "nostr",
+    "clawdtalk",
+    "reddit",
+    "bluesky",
+    "voice_call",
+    "voice_wake",
+    "voice_duplex",
+    "mqtt",
+];
+
+/// Return true if this TOML table is a V2 flat channel config (has at least one
+/// non-table leaf value at the top level). V3 alias maps contain only sub-tables.
+fn is_flat_channel_config(t: &toml::Table) -> bool {
+    t.values().any(|v| !matches!(v, toml::Value::Table(_)))
+}
+
 /// Pre-deserialization table migration for nested field changes that
 /// `#[serde(flatten)]` cannot capture (e.g. removing a field from a nested
 /// struct and moving its value elsewhere).
@@ -344,6 +387,84 @@ pub fn prepare_table(table: &mut toml::Table) {
             }
         }
     }
+
+    // V3: Wrap V2 flat channel configs in a "default" alias.
+    // V2: [channels.discord] has flat fields (bot_token, enabled, …).
+    // V3: [channels.discord.default] nests those fields one level deeper.
+    // Detection: a V2 config has at least one non-table leaf at the top of the
+    // channel-type table. A V3 config has only sub-tables (alias entries).
+    for channels_key in &["channels_config", "channels"] {
+        if let Some(toml::Value::Table(channels)) = table.get_mut(*channels_key) {
+            for ch_type in CHANNEL_TYPES {
+                if let Some(toml::Value::Table(ch_table)) = channels.get(*ch_type)
+                    && is_flat_channel_config(ch_table)
+                {
+                    let ch_table_clone = ch_table.clone();
+                    let mut alias_map = toml::Table::new();
+                    alias_map.insert("default".to_string(), toml::Value::Table(ch_table_clone));
+                    channels.insert(ch_type.to_string(), toml::Value::Table(alias_map));
+                }
+            }
+        }
+    }
+
+    // V3: Synthesize [risk_profiles.default] from [autonomy] if not already present.
+    // Copies all policy fields and renames `non_cli_excluded_tools` → `excluded_tools`.
+    if let Some(toml::Value::Table(autonomy)) = table.get("autonomy").cloned() {
+        let risk_profiles = table
+            .entry("risk_profiles")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(profiles) = risk_profiles
+            && !profiles.contains_key("default")
+        {
+            let mut profile = autonomy.clone();
+            if let Some(v) = profile.remove("non_cli_excluded_tools") {
+                profile.insert("excluded_tools".to_string(), v);
+            }
+            profiles.insert("default".to_string(), toml::Value::Table(profile));
+        }
+    }
+
+    // V3: Synthesize [runtime_profiles.default] from [agent] if not already present.
+    // Copies execution-relevant fields; provider/model must be set manually.
+    let agent_snapshot = if let Some(toml::Value::Table(agent)) = table.get("agent") {
+        Some(agent.clone())
+    } else {
+        None
+    };
+    if let Some(agent) = agent_snapshot {
+        let runtime_profiles = table
+            .entry("runtime_profiles")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(profiles) = runtime_profiles
+            && !profiles.contains_key("default")
+        {
+            let mut profile = toml::Table::new();
+            for key in &["max_tool_iterations", "parallel_tools", "tool_dispatcher"] {
+                if let Some(v) = agent.get(*key).cloned() {
+                    profile.insert(key.to_string(), v);
+                }
+            }
+            if !profile.is_empty() {
+                profiles.insert("default".to_string(), toml::Value::Table(profile));
+            }
+        }
+    }
+
+    // V3: Drop V2 [swarms.*] configs. The V3 swarm shape is incompatible and
+    // the migration cannot safely synthesize V3 from V2 swarm definitions.
+    // Operators must redefine swarms in the V3 shape after upgrading.
+    if let Some(toml::Value::Table(swarms)) = table.get("swarms")
+        && !swarms.is_empty()
+    {
+        tracing::warn!(
+            "v2→v3 migration: dropping {} swarm configuration(s). \
+             V3 swarms use a new shape — redefine them under [swarms.<alias>] \
+             after upgrading.",
+            swarms.len(),
+        );
+    }
+    table.remove("swarms");
 
     // Rename legacy `channels_config` key to `channels`
     if table.contains_key("channels_config")

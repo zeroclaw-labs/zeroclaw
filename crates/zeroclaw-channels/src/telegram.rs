@@ -620,10 +620,10 @@ impl TelegramChannel {
 
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
         let mut config = Self::load_config_without_env().await?;
-        let Some(telegram) = config.channels.telegram.as_mut() else {
+        let Some(telegram) = config.channels.telegram.get_mut("default") else {
             anyhow::bail!(
-                "Missing [channels.telegram] section in config.toml. \
-                Add bot_token and allowed_users under [channels.telegram], \
+                "Missing [channels.telegram.default] section in config.toml. \
+                Add bot_token and allowed_users under [channels.telegram.default], \
                 or run `zeroclaw onboard --channels-only` to configure interactively"
             );
         };

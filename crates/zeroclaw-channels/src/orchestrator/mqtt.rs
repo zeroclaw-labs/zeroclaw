@@ -135,6 +135,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("qos must be 0, 1, or 2"));
@@ -152,6 +153,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("mqtt://"));
@@ -169,6 +171,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("at least one topic"));
@@ -186,6 +189,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("client_id must not be empty"));
@@ -203,6 +207,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         assert!(config.validate().is_ok());
     }
@@ -219,6 +224,7 @@ mod tests {
             password: None,
             use_tls: true,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("use_tls is true"));
@@ -236,6 +242,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("mqtts://"));
@@ -253,6 +260,7 @@ mod tests {
             password: None,
             use_tls: true,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         assert!(config.validate().is_ok());
     }

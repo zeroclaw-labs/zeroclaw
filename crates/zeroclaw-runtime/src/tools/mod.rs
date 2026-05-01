@@ -397,7 +397,7 @@ pub fn all_tools_with_runtime(
     if root_config
         .channels
         .discord
-        .as_ref()
+        .get("default")
         .is_some_and(|d| d.archive)
     {
         match zeroclaw_memory::SqliteMemory::new_named(workspace_dir, "discord") {

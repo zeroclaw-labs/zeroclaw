@@ -1708,7 +1708,7 @@ mod tests {
         let tg = cfg
             .channels
             .telegram
-            .as_ref()
+            .get("default")
             .expect("telegram subsection should be initialized");
         assert_eq!(tg.bot_token, "stub-tg-token");
         assert!(
@@ -1744,7 +1744,7 @@ mod tests {
         let mc = cfg
             .channels
             .mochat
-            .as_ref()
+            .get("default")
             .expect("mochat subsection should be initialized");
         assert!(mc.enabled, "mochat enabled should round-trip via set_prop");
         assert_eq!(mc.api_url, "http://mochat-test:8080/v1");

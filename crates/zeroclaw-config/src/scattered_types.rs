@@ -376,6 +376,11 @@ pub struct EmailConfig {
     pub default_subject: String,
     #[serde(default = "default_max_attachment_bytes")]
     pub max_attachment_bytes: usize,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 impl ChannelConfig for EmailConfig {
@@ -405,6 +410,7 @@ impl Default for EmailConfig {
             allowed_senders: Vec::new(),
             default_subject: default_subject(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: Vec::new(),
         }
     }
 }
@@ -431,6 +437,11 @@ pub struct GmailPushConfig {
     pub webhook_url: String,
     #[serde(default)]
     pub webhook_secret: String,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 impl ChannelConfig for GmailPushConfig {
@@ -452,6 +463,7 @@ impl Default for GmailPushConfig {
             allowed_senders: Vec::new(),
             webhook_url: String::new(),
             webhook_secret: String::new(),
+            excluded_tools: Vec::new(),
         }
     }
 }
@@ -471,6 +483,11 @@ pub struct ClawdTalkConfig {
     #[serde(default)]
     #[secret]
     pub webhook_secret: Option<String>,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 impl ChannelConfig for ClawdTalkConfig {
@@ -537,6 +554,11 @@ pub struct VoiceCallConfig {
     pub max_call_duration_secs: u64,
     #[serde(default)]
     pub webhook_base_url: Option<String>,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 impl Default for VoiceCallConfig {
@@ -553,6 +575,7 @@ impl Default for VoiceCallConfig {
             tts_voice: None,
             max_call_duration_secs: default_max_call_duration(),
             webhook_base_url: None,
+            excluded_tools: Vec::new(),
         }
     }
 }

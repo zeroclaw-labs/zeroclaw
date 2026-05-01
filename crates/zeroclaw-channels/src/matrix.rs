@@ -3174,6 +3174,7 @@ mod tests {
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
                 ack_reactions: true,
+                excluded_tools: vec![],
             }
         }
 

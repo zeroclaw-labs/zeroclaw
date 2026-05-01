@@ -528,6 +528,7 @@ mod tests {
             tts_voice: None,
             max_call_duration_secs: 3600,
             webhook_base_url: Some("https://tunnel.example.com".into()),
+            excluded_tools: vec![],
         }
     }
 

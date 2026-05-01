@@ -348,6 +348,7 @@ mod tests {
             from_number: "+15551234567".to_string(),
             allowed_destinations: vec!["+1555".to_string()],
             webhook_secret: None,
+            excluded_tools: vec![],
         }
     }
 

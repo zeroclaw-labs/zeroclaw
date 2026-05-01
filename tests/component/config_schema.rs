@@ -438,24 +438,24 @@ fn config_multiple_channels_coexist() {
     let toml_str = r#"
 default_temperature = 0.7
 
-[channels.telegram]
+[channels.telegram.default]
 bot_token = "test_token"
 allowed_users = ["zeroclaw_user"]
 
-[channels.discord]
+[channels.discord.default]
 bot_token = "test_token"
 "#;
     let parsed: Config = toml::from_str(toml_str).expect("multi-channel config should parse");
-    assert!(parsed.channels.telegram.is_some());
-    assert!(parsed.channels.discord.is_some());
-    assert!(parsed.channels.slack.is_none());
+    assert!(!parsed.channels.telegram.is_empty());
+    assert!(!parsed.channels.discord.is_empty());
+    assert!(parsed.channels.slack.is_empty());
 }
 
 #[test]
 fn config_nested_optional_sections_default_when_absent() {
     let toml_str = "default_temperature = 0.7\n";
     let parsed: Config = toml::from_str(toml_str).expect("minimal TOML should parse");
-    assert!(parsed.channels.telegram.is_none());
+    assert!(parsed.channels.telegram.is_empty());
     assert!(!parsed.composio.enabled);
     assert!(parsed.composio.api_key.is_none());
     assert!(parsed.browser.enabled);
@@ -470,13 +470,13 @@ fn config_channels_default_cli_enabled() {
 #[test]
 fn config_channels_all_optional_channels_none_by_default() {
     let channels = ChannelsConfig::default();
-    assert!(channels.telegram.is_none());
-    assert!(channels.discord.is_none());
-    assert!(channels.slack.is_none());
-    assert!(channels.matrix.is_none());
-    assert!(channels.lark.is_none());
-    assert!(channels.feishu.is_none());
-    assert!(channels.webhook.is_none());
+    assert!(channels.telegram.is_empty());
+    assert!(channels.discord.is_empty());
+    assert!(channels.slack.is_empty());
+    assert!(channels.matrix.is_empty());
+    assert!(channels.lark.is_empty());
+    assert!(channels.feishu.is_empty());
+    assert!(channels.webhook.is_empty());
 }
 
 #[test]
@@ -498,7 +498,7 @@ fn config_channels_without_cli_field() {
     let toml_str = r#"
 default_temperature = 0.7
 
-[channels.matrix]
+[channels.matrix.default]
 homeserver = "https://matrix.example.com"
 access_token = "syt_test_token"
 allowed_rooms = ["!abc123:example.com"]
@@ -510,7 +510,7 @@ allowed_users = ["@user:example.com"]
         parsed.channels.cli,
         "cli should default to true when omitted"
     );
-    assert!(parsed.channels.matrix.is_some());
+    assert!(!parsed.channels.matrix.is_empty());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -523,14 +523,14 @@ fn config_toplevel_cli_section_with_whatsapp_parses() {
     let toml_str = r#"
 [cli]
 
-[channels.whatsapp]
+[channels.whatsapp.default]
 session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
 allowed_numbers = ["*"]
 "#;
     let parsed: Config = toml::from_str(toml_str)
         .expect("top-level [cli] section with [channels.whatsapp] should parse");
-    assert!(parsed.channels.whatsapp.is_some());
-    let wa = parsed.channels.whatsapp.unwrap();
+    assert!(!parsed.channels.whatsapp.is_empty());
+    let wa = parsed.channels.whatsapp.get("default").unwrap();
     assert_eq!(
         wa.session_path.as_deref(),
         Some("~/.zeroclaw/state/whatsapp-web/session.db")
@@ -541,13 +541,13 @@ allowed_numbers = ["*"]
 #[test]
 fn config_only_whatsapp_channel_parses() {
     let toml_str = r#"
-[channels.whatsapp]
+[channels.whatsapp.default]
 session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
 allowed_numbers = ["*"]
 "#;
     let parsed: Config =
         toml::from_str(toml_str).expect("config with only whatsapp channel should parse");
-    assert!(parsed.channels.whatsapp.is_some());
+    assert!(!parsed.channels.whatsapp.is_empty());
     assert!(
         parsed.channels.cli,
         "cli should default to true when omitted"
@@ -560,21 +560,21 @@ fn config_channels_explicit_cli_true_with_whatsapp() {
 [channels]
 cli = true
 
-[channels.whatsapp]
+[channels.whatsapp.default]
 session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
 allowed_numbers = ["*"]
 "#;
     let parsed: Config =
         toml::from_str(toml_str).expect("explicit channels.cli=true with whatsapp should parse");
     assert!(parsed.channels.cli);
-    assert!(parsed.channels.whatsapp.is_some());
+    assert!(!parsed.channels.whatsapp.is_empty());
 }
 
 #[test]
 fn config_empty_parses_with_all_defaults() {
     let config = migrate("");
     assert!(config.channels.cli);
-    assert!(config.channels.whatsapp.is_none());
+    assert!(config.channels.whatsapp.is_empty());
     assert!(
         (config
             .providers

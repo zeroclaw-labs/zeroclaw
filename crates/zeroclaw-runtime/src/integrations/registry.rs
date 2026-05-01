@@ -14,7 +14,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Bot API — long-polling",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels.telegram.is_some() {
+                if !c.channels.telegram.is_empty() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -26,7 +26,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Servers, channels & DMs",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels.discord.is_some() {
+                if !c.channels.discord.is_empty() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -38,7 +38,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Workspace apps via Web API",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels.slack.is_some() {
+                if !c.channels.slack.is_empty() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -50,7 +50,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "HTTP endpoint for triggers",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels.webhook.is_some() {
+                if !c.channels.webhook.is_empty() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -62,7 +62,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Meta Cloud API via webhook",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels.whatsapp.is_some() {
+                if !c.channels.whatsapp.is_empty() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -74,7 +74,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Privacy-focused via signal-cli",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels.signal.is_some() {
+                if !c.channels.signal.is_empty() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -86,7 +86,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "macOS AppleScript bridge",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels.imessage.is_some() {
+                if !c.channels.imessage.is_empty() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -104,7 +104,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Matrix protocol (Element)",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels.matrix.is_some() {
+                if !c.channels.matrix.is_empty() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -140,7 +140,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "DingTalk Stream Mode",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels.dingtalk.is_some() {
+                if !c.channels.dingtalk.is_empty() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -152,7 +152,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Tencent QQ Bot SDK",
             category: IntegrationCategory::Chat,
             status_fn: |c| {
-                if c.channels.qq.is_some() {
+                if !c.channels.qq.is_empty() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -753,7 +753,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "IMAP/SMTP email channel",
             category: IntegrationCategory::Social,
             status_fn: |c| {
-                if c.channels.email.is_some() {
+                if !c.channels.email.is_empty() {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -869,18 +869,22 @@ mod tests {
     #[test]
     fn telegram_active_when_configured() {
         let mut config = Config::default();
-        config.channels.telegram = Some(TelegramConfig {
-            enabled: true,
-            bot_token: "123:ABC".into(),
-            allowed_users: vec!["user".into()],
-            stream_mode: StreamMode::default(),
-            draft_update_interval_ms: 1000,
-            interrupt_on_new_message: false,
-            mention_only: false,
-            ack_reactions: None,
-            proxy_url: None,
-            approval_timeout_secs: 120,
-        });
+        config.channels.telegram.insert(
+            "default".to_string(),
+            TelegramConfig {
+                enabled: true,
+                bot_token: "123:ABC".into(),
+                allowed_users: vec!["user".into()],
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: 1000,
+                interrupt_on_new_message: false,
+                mention_only: false,
+                ack_reactions: None,
+                proxy_url: None,
+                approval_timeout_secs: 120,
+                excluded_tools: vec![],
+            },
+        );
         let entries = all_integrations();
         let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();
         assert!(matches!((tg.status_fn)(&config), IntegrationStatus::Active));
@@ -900,10 +904,14 @@ mod tests {
     #[test]
     fn imessage_active_when_configured() {
         let mut config = Config::default();
-        config.channels.imessage = Some(IMessageConfig {
-            enabled: true,
-            allowed_contacts: vec!["*".into()],
-        });
+        config.channels.imessage.insert(
+            "default".to_string(),
+            IMessageConfig {
+                enabled: true,
+                allowed_contacts: vec!["*".into()],
+                excluded_tools: vec![],
+            },
+        );
         let entries = all_integrations();
         let im = entries.iter().find(|e| e.name == "iMessage").unwrap();
         assert!(matches!((im.status_fn)(&config), IntegrationStatus::Active));
@@ -923,25 +931,29 @@ mod tests {
     #[test]
     fn matrix_active_when_configured() {
         let mut config = Config::default();
-        config.channels.matrix = Some(MatrixConfig {
-            enabled: true,
-            homeserver: "https://m.org".into(),
-            access_token: Some("tok".into()),
-            user_id: None,
-            device_id: None,
-            allowed_users: vec![],
-            allowed_rooms: vec!["!r:m".into()],
-            interrupt_on_new_message: false,
-            stream_mode: zeroclaw_config::schema::StreamMode::default(),
-            draft_update_interval_ms: 1500,
-            multi_message_delay_ms: 800,
-            recovery_key: None,
-            password: None,
-            mention_only: false,
-            approval_timeout_secs: 300,
-            reply_in_thread: true,
-            ack_reactions: true,
-        });
+        config.channels.matrix.insert(
+            "default".to_string(),
+            MatrixConfig {
+                enabled: true,
+                homeserver: "https://m.org".into(),
+                access_token: Some("tok".into()),
+                user_id: None,
+                device_id: None,
+                allowed_users: vec![],
+                allowed_rooms: vec!["!r:m".into()],
+                interrupt_on_new_message: false,
+                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                draft_update_interval_ms: 1500,
+                multi_message_delay_ms: 800,
+                recovery_key: None,
+                password: None,
+                mention_only: false,
+                approval_timeout_secs: 300,
+                reply_in_thread: true,
+                ack_reactions: true,
+                excluded_tools: vec![],
+            },
+        );
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();
         assert!(matches!((mx.status_fn)(&config), IntegrationStatus::Active));

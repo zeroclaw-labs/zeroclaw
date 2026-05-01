@@ -81,6 +81,7 @@ mod tests {
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
+            excluded_tools: vec![],
         };
 
         let discord = DiscordConfig {
@@ -99,6 +100,7 @@ mod tests {
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
+            excluded_tools: vec![],
         };
 
         let lark = LarkConfig {
@@ -113,6 +115,7 @@ mod tests {
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
+            excluded_tools: vec![],
         };
         let feishu = FeishuConfig {
             enabled: true,
@@ -125,6 +128,7 @@ mod tests {
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
+            excluded_tools: vec![],
         };
 
         let nextcloud_talk = NextcloudTalkConfig {
@@ -135,6 +139,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             proxy_url: None,
             bot_name: None,
+            excluded_tools: vec![],
         };
 
         assert_eq!(telegram.allowed_users.len(), 1);

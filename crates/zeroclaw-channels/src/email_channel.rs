@@ -752,6 +752,7 @@ mod tests {
             allowed_senders: vec!["allowed@example.com".to_string()],
             default_subject: "Custom Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: vec![],
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
@@ -777,6 +778,7 @@ mod tests {
             allowed_senders: vec!["*".to_string()],
             default_subject: "Test Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: vec![],
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
@@ -1027,6 +1029,7 @@ mod tests {
             allowed_senders: vec!["allowed@example.com".to_string()],
             default_subject: "Serialization Test".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: vec![],
         };
 
         let json = serde_json::to_string(&config).unwrap();
