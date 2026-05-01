@@ -64,6 +64,48 @@ if [[ -f "$TAURI_CONF" ]]; then
   changed=$((changed + 1))
 fi
 
+# ── Workspace Cargo.toml ───────────────────────────────────────────
+# Bumps [workspace.package] version (the root version inherited by every child
+# crate via `version.workspace = true`) and the version pins on every path dep
+# in [workspace.dependencies], skipping aardvark* which tracks an independent
+# version.
+echo "Workspace Cargo.toml..."
+ROOT_CARGO="$REPO_ROOT/Cargo.toml"
+if [[ -f "$ROOT_CARGO" ]]; then
+  before="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
+  # [workspace.package] version — first bare `version = "..."` line in the file
+  sed -i -E '0,/^version = "[^"]+"/s||version = "'"$VERSION"'"|' "$ROOT_CARGO" 2>/dev/null \
+    || sed -i '' -E '/^version = "[^"]+"/{s//version = "'"$VERSION"'"/;:a;n;ba;}' "$ROOT_CARGO"
+  # [workspace.dependencies] path-dep version pins, skipping aardvark*
+  sed -i -E '/path = "crates\/aardvark/!s|(path = "crates/[^"]+", version = ")[^"]+(")|\1'"$VERSION"'\2|' "$ROOT_CARGO" 2>/dev/null \
+    || sed -i '' -E '/path = "crates\/aardvark/!s|(path = "crates/[^"]+", version = ")[^"]+(")|\1'"$VERSION"'\2|' "$ROOT_CARGO"
+  after="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
+  if [[ "$before" != "$after" ]]; then
+    echo "  updated: Cargo.toml ([workspace.package] + [workspace.dependencies])"
+    changed=$((changed + 1))
+  fi
+fi
+
+# ── Cargo.lock (workspace crates only) ─────────────────────────────
+# Re-resolves only the workspace member entries so their lockfile versions
+# track the new [workspace.package] / [workspace.dependencies] values. External
+# deps that happen to share a version string are left alone.
+echo "Cargo.lock..."
+ROOT_LOCK="$REPO_ROOT/Cargo.lock"
+if [[ -f "$ROOT_LOCK" ]] && command -v cargo >/dev/null 2>&1; then
+  before="$(sha256sum "$ROOT_LOCK" | awk '{print $1}')"
+  ( cd "$REPO_ROOT" && cargo update --workspace --offline >/dev/null 2>&1 ) \
+    || ( cd "$REPO_ROOT" && cargo update --workspace >/dev/null 2>&1 ) \
+    || echo "  warn: cargo update --workspace failed; review Cargo.lock manually"
+  after="$(sha256sum "$ROOT_LOCK" | awk '{print $1}')"
+  if [[ "$before" != "$after" ]]; then
+    echo "  updated: Cargo.lock"
+    changed=$((changed + 1))
+  fi
+elif [[ -f "$ROOT_LOCK" ]]; then
+  echo "  skip: cargo not on PATH; Cargo.lock not refreshed"
+fi
+
 # ── Marketplace: Dokploy ───────────────────────────────────────────
 echo "Marketplace templates..."
 bump "marketplace/dokploy/meta-entry.json" \
