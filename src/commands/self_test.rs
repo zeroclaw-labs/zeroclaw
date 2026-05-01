@@ -211,7 +211,10 @@ fn check_version() -> CheckResult {
 fn resolve_probe_host(configured: &str) -> (&str, Option<&str>) {
     match configured {
         "0.0.0.0" => ("127.0.0.1", Some("0.0.0.0")),
-        "[::]" | "::" => ("[::1]", Some(configured)),
+        // Normalise both shapes to bracketed form for the display URL so the
+        // unbracketed `::` doesn't yield `http://:::42617` (three colons,
+        // invalid URL). The probe target stays `[::1]`.
+        "[::]" | "::" => ("[::1]", Some("[::]")),
         other => (other, None),
     }
 }
@@ -302,5 +305,72 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
             "websocket",
             format!("handshake failed at {display_url}: {e}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_probe_url, resolve_probe_host};
+
+    #[test]
+    fn resolve_probe_host_ipv4_wildcard() {
+        assert_eq!(
+            resolve_probe_host("0.0.0.0"),
+            ("127.0.0.1", Some("0.0.0.0"))
+        );
+    }
+
+    #[test]
+    fn resolve_probe_host_ipv6_wildcard_bracketed() {
+        assert_eq!(resolve_probe_host("[::]"), ("[::1]", Some("[::]")));
+    }
+
+    #[test]
+    fn resolve_probe_host_ipv6_wildcard_unbracketed_normalises_to_brackets() {
+        // Regression: previously returned `Some("::")`, which `format_probe_url`
+        // would render as `http://:::42617/...` (three colons, invalid URL).
+        assert_eq!(resolve_probe_host("::"), ("[::1]", Some("[::]")));
+    }
+
+    #[test]
+    fn resolve_probe_host_concrete_host_passthrough() {
+        assert_eq!(resolve_probe_host("127.0.0.1"), ("127.0.0.1", None));
+        assert_eq!(
+            resolve_probe_host("example.internal"),
+            ("example.internal", None)
+        );
+    }
+
+    #[test]
+    fn format_probe_url_ipv4_wildcard_shows_both() {
+        assert_eq!(
+            format_probe_url("http", "0.0.0.0", 42617, "/health"),
+            "http://0.0.0.0:42617/health (probed via http://127.0.0.1:42617)"
+        );
+    }
+
+    #[test]
+    fn format_probe_url_ipv6_wildcard_unbracketed_shows_valid_url() {
+        // Regression: was `http://:::42617/health`, now `http://[::]:42617/health`.
+        assert_eq!(
+            format_probe_url("http", "::", 42617, "/health"),
+            "http://[::]:42617/health (probed via http://[::1]:42617)"
+        );
+    }
+
+    #[test]
+    fn format_probe_url_ipv6_wildcard_bracketed_shows_valid_url() {
+        assert_eq!(
+            format_probe_url("http", "[::]", 42617, "/health"),
+            "http://[::]:42617/health (probed via http://[::1]:42617)"
+        );
+    }
+
+    #[test]
+    fn format_probe_url_concrete_host_no_probe_suffix() {
+        assert_eq!(
+            format_probe_url("ws", "127.0.0.1", 42617, "/ws/chat"),
+            "ws://127.0.0.1:42617/ws/chat"
+        );
     }
 }
