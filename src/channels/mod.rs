@@ -3735,6 +3735,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
                     config.hooks.builtin.webhook_audit.clone(),
                 )));
             }
+            if config.hooks.builtin.sop_approval_notifier.enabled {
+                runner.register(Box::new(
+                    crate::hooks::builtin::SopApprovalNotifierHook::new(
+                        config.hooks.builtin.sop_approval_notifier.clone(),
+                    ),
+                ));
+            }
             Some(Arc::new(runner))
         } else {
             None

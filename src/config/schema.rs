@@ -2175,6 +2175,14 @@ pub struct BuiltinHooksConfig {
     /// that matches one of `tool_patterns`.
     #[serde(default)]
     pub webhook_audit: WebhookAuditConfig,
+    /// Configuration for the SOP approval-notifier hook.
+    ///
+    /// When enabled, observes `sop_advance` / `sop_execute` / `sop_approve`
+    /// tool returns; if a run lands in `WaitingApproval` status, POSTs a
+    /// signed message to a Feishu (Lark) custom-bot webhook so the relevant
+    /// PM/PI gets a chat notification with the run id and step number.
+    #[serde(default)]
+    pub sop_approval_notifier: SopApprovalNotifierConfig,
 }
 
 /// Configuration for the webhook-audit builtin hook.
@@ -2220,6 +2228,34 @@ impl Default for WebhookAuditConfig {
             max_args_bytes: default_max_args_bytes(),
         }
     }
+}
+
+/// Configuration for the SOP approval-notifier builtin hook.
+///
+/// Pushes a chat notification to a Feishu (Lark) custom-bot webhook when an
+/// SOP run lands in `WaitingApproval` status, so the relevant PM/PI gets a
+/// real-time alert with the `run_id` and step number to act on.
+///
+/// The hook observes the post-tool-call event for `sop_advance`,
+/// `sop_execute`, and `sop_approve` tools. It does not modify tool results.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SopApprovalNotifierConfig {
+    /// Enable the SOP approval-notifier hook. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Feishu custom-bot webhook URL (e.g.
+    /// `https://open.feishu.cn/open-apis/bot/v2/hook/<id>`).
+    #[serde(default)]
+    pub webhook_url: String,
+    /// Optional Feishu custom-bot signing secret. When set, every POST is
+    /// signed with HMAC-SHA256 over `<timestamp>\n<secret>` per Feishu spec
+    /// to prevent webhook URL leaks from being exploited.
+    #[serde(default)]
+    pub secret: String,
+    /// Optional trailing line appended to the notification card. Useful for
+    /// `<at user_id="ou_xxx">` mentions or routing hints. Default: empty.
+    #[serde(default)]
+    pub mention_text: String,
 }
 
 // ── SOP engine configuration ───────────────────────────────────
