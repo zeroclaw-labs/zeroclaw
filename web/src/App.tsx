@@ -53,7 +53,7 @@ export class ErrorBoundary extends Component<
     if (this.state.error) {
       return (
         <div className="p-6">
-          <div className="card p-6 w-full max-w-lg" style={{ borderColor: 'rgba(239, 68, 68, 0.3)' }}>
+          <div className="card p-6 w-full max-w-lg" style={{ borderColor: 'var(--color-status-error-alpha-30)' }}>
             <h2 className="text-lg font-semibold mb-2" style={{ color: 'var(--color-status-error)' }}>
               Something went wrong
             </h2>

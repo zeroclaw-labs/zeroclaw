@@ -71,6 +71,15 @@ pub const MAX_BODY_SIZE: usize = 65_536;
 /// Default request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 
+/// Default request timeout for `POST /api/cron/{id}/run` (10 minutes).
+///
+/// Manually-triggered cron jobs run synchronously inside the request handler
+/// and frequently exceed the 30s gateway-wide default — agent jobs in
+/// particular can take minutes to complete a full reasoning loop. Capping at
+/// 10 minutes keeps the route from hanging indefinitely while still allowing
+/// realistic workloads to finish.
+pub const LONG_RUNNING_REQUEST_TIMEOUT_SECS: u64 = 600;
+
 /// Read gateway request timeout from `ZEROCLAW_GATEWAY_TIMEOUT_SECS` env var
 /// at runtime, falling back to [`REQUEST_TIMEOUT_SECS`].
 ///
@@ -82,6 +91,18 @@ pub fn gateway_request_timeout_secs() -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(REQUEST_TIMEOUT_SECS)
+}
+
+/// Read manual cron-run request timeout from
+/// `ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS` at runtime, falling back to
+/// [`LONG_RUNNING_REQUEST_TIMEOUT_SECS`]. Long-running jobs (e.g. agent prompts that
+/// invoke tools) can comfortably exceed the 30s gateway-wide default, so the
+/// `/api/cron/{id}/run` route gets its own timeout layer.
+pub fn gateway_long_running_request_timeout_secs() -> u64 {
+    std::env::var("ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(LONG_RUNNING_REQUEST_TIMEOUT_SECS)
 }
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
@@ -422,6 +443,7 @@ pub async fn run_gateway(
     // the daemon's wait loop reacts via `subscribe()` and tears down to
     // re-init. Cross-platform replacement for the SIGUSR1 hack.
     reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    canvas_store: Option<CanvasStore>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
@@ -486,7 +508,12 @@ pub async fn run_gateway(
         (None, None)
     };
 
-    let canvas_store = tools::CanvasStore::new();
+    // Reuse the daemon-supplied canvas store when present so channel-
+    // server agents (Telegram/Discord/Slack) push frames into the same
+    // store the gateway's WebSocket and REST endpoints serve (#5356).
+    // Standalone gateway invocations (no daemon supervisor) fall back
+    // to a fresh store.
+    let canvas_store = canvas_store.unwrap_or_default();
 
     let (
         mut tools_registry_raw,
@@ -1041,6 +1068,9 @@ pub async fn run_gateway(
             delete(api::handle_api_cron_delete).patch(api::handle_api_cron_patch),
         )
         .route("/api/cron/{id}/runs", get(api::handle_api_cron_runs))
+        // Note: `/api/cron/{id}/run` is registered on a separate router below
+        // with a longer TimeoutLayer — manual cron triggers run the job
+        // synchronously and routinely exceed the 30s gateway-wide default.
         .route("/api/integrations", get(api::handle_api_integrations))
         .route(
             "/api/integrations/settings",
@@ -1137,12 +1167,27 @@ pub async fn run_gateway(
         .route("/_app/{*path}", get(static_files::handle_static))
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(gateway_request_timeout_secs()),
         ));
+
+    // Manual cron-trigger route lives on its own sub-router so it can opt out
+    // of the 30s gateway-wide TimeoutLayer. Layers attached here travel with
+    // the route through `merge`, so only this endpoint sees the longer
+    // timeout.
+    let cron_run_router: Router = Router::new()
+        .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
+        .with_state(state)
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(gateway_long_running_request_timeout_secs()),
+        ));
+
+    let inner = inner.merge(cron_run_router);
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -2460,6 +2505,18 @@ mod tests {
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS") };
         assert_eq!(gateway_request_timeout_secs(), 30);
+    }
+
+    #[test]
+    fn long_running_request_timeout_default_is_ten_minutes() {
+        assert_eq!(LONG_RUNNING_REQUEST_TIMEOUT_SECS, 600);
+    }
+
+    #[test]
+    fn long_running_request_timeout_falls_back_to_default() {
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS") };
+        assert_eq!(gateway_long_running_request_timeout_secs(), 600);
     }
 
     #[test]

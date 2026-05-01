@@ -37,6 +37,14 @@
   --color-status-warning: #ffaa00;
   --color-status-error: #ff4466;
   --color-status-info: #0080ff;
+  /* Status color alpha helpers (for backgrounds/borders) */
+  --color-status-error-alpha-08: color-mix(in srgb, var(--color-status-error) 8%, transparent);
+  --color-status-error-alpha-20: color-mix(in srgb, var(--color-status-error) 20%, transparent);
+  --color-status-error-alpha-30: color-mix(in srgb, var(--color-status-error) 30%, transparent);
+  --color-status-success-alpha-08: color-mix(in srgb, var(--color-status-success) 8%, transparent);
+  --color-status-success-alpha-20: color-mix(in srgb, var(--color-status-success) 20%, transparent);
+  --color-status-warning-alpha-05: color-mix(in srgb, var(--color-status-warning) 5%, transparent);
+  --color-status-warning-alpha-20: color-mix(in srgb, var(--color-status-warning) 20%, transparent);
   /* Backgrounds */
   --pc-bg-base: #1e1e24;
   --pc-bg-surface: #232329;
@@ -558,7 +566,7 @@ code, kbd, pre {
   top: 0;
   z-index: 1;
   /* Match glass-card background so rows do not bleed through on scroll */
-  background: linear-gradient(135deg, rgba(13, 13, 32, 0.95), rgba(5, 5, 16, 0.90));
+  background: var(--pc-bg-surface);
   backdrop-filter: blur(8px);
 }
 

@@ -62,7 +62,7 @@ export default function Integrations() {
   if (error) {
     return (
     <div className="p-6 animate-fade-in">
-      <div className="rounded-2xl border p-4" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
+      <div className="rounded-2xl border p-4" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
         {t('integrations.load_error')}: {error}
       </div>
     </div>

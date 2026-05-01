@@ -226,8 +226,14 @@ pub fn default_tools_with_runtime(
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
         Box::new(FileEditTool::new(security.clone())),
-        Box::new(GlobSearchTool::new(security.clone())),
-        Box::new(ContentSearchTool::new(security)),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
+            security,
+        )),
     ]
 }
 
@@ -335,7 +341,7 @@ pub fn all_tools_with_runtime(
 ) {
     let has_shell_access = runtime.has_shell_access();
     let runtime_kind = root_config.runtime.kind.as_str();
-    let sandbox = create_sandbox(&root_config.security, runtime_kind);
+    let sandbox = create_sandbox(&root_config.security, runtime_kind, Some(workspace_dir));
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
@@ -348,8 +354,14 @@ pub fn all_tools_with_runtime(
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
-        Arc::new(GlobSearchTool::new(security.clone())),
-        Arc::new(ContentSearchTool::new(security.clone())),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
         Arc::new(CronAddTool::new(config.clone(), security.clone())),
         Arc::new(CronListTool::new(config.clone())),
         Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
