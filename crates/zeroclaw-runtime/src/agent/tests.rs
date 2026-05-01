@@ -801,9 +801,12 @@ async fn turn_preserves_text_alongside_tool_calls() {
         "Expected non-empty final response after mixed text+tool"
     );
 
-    // The intermediate text should be in history
+    // The intermediate text should be preserved with its tool calls, not as a
+    // separate assistant chat entry that would create consecutive assistants.
     let has_intermediate = agent.history().iter().any(|msg| match msg {
-        ConversationMessage::Chat(c) => c.role == "assistant" && c.content.contains("Let me check"),
+        ConversationMessage::AssistantToolCalls { text, .. } => text
+            .as_deref()
+            .is_some_and(|content| content.contains("Let me check")),
         _ => false,
     });
     assert!(has_intermediate, "Intermediate text should be in history");

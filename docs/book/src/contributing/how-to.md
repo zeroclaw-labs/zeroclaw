@@ -31,8 +31,8 @@ The key checkpoints:
 
 - `cargo fmt` clean (checked in CI)
 - `cargo clippy -D warnings` clean (checked in CI)
-- No dead code — if it's unused, delete it, don't `#[allow(dead_code)]` it
-- Error handling: `anyhow::Result` at binary boundaries, typed errors in library crates. No `unwrap()` / `expect()` in production code paths — propagate with `?` or convert to a typed error
+- No unused production code — delete it, wire it into behavior, or track a follow-up issue. Do not silence it with underscore prefixes or `#[allow(dead_code)]`; reserve underscore names for required but intentionally unused API, trait, or callback parameters.
+- Error handling: `anyhow::Result` at binary boundaries, typed errors in library crates. No `unwrap()` / `expect()` in production code paths — propagate with `?` or document the invariant that makes panic impossible.
 - Minimal dependencies — every dep adds to binary size; weigh the trade before adding one
 - Trait-first — define the trait in `zeroclaw-api`, then implement in the right edge crate
 - Security by default — allowlists, not blocklists. New external surface defaults closed
@@ -42,7 +42,7 @@ The key checkpoints:
 ## Testing
 
 - Unit tests co-located with the code (`mod tests`)
-- Integration tests in `tests/` — run via `cargo nextest run --locked`
+- Integration tests in `tests/` and crate-local unit tests — run via `cargo nextest run --locked --workspace --exclude zeroclaw-desktop`
 - Feature-gated code needs feature-gated tests
 - Don't mock the database for tests that exercise schema or SQL — integration tests must hit a real SQLite
 

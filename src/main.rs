@@ -1478,7 +1478,8 @@ async fn main() -> Result<()> {
                     info!("🔄 Restarting ZeroClaw Gateway on {addr}");
 
                     // Try to gracefully shutdown existing gateway via admin endpoint
-                    match shutdown_gateway(&host, port).await {
+                    match shutdown_gateway(&host, port, config.gateway.path_prefix.as_deref()).await
+                    {
                         Ok(()) => {
                             info!("   ✓ Existing gateway on {addr} shut down gracefully");
                             // Poll until the port is free (connection refused) or timeout
@@ -1514,7 +1515,9 @@ async fn main() -> Result<()> {
 
                     // Fetch live pairing code from running gateway
                     // If --new is specified, generate a fresh pairing code
-                    match fetch_paircode(host, port, new).await {
+                    match fetch_paircode(host, port, config.gateway.path_prefix.as_deref(), new)
+                        .await
+                    {
                         Ok(Some(code)) => {
                             println!("🔐 Gateway pairing is enabled.");
                             println!();
@@ -1596,6 +1599,38 @@ async fn main() -> Result<()> {
             } else {
                 info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
             }
+
+            #[cfg(target_os = "linux")]
+            {
+                use zeroclaw_config::schema::SandboxBackend;
+                let sandbox_docker =
+                    matches!(config.security.sandbox.backend, SandboxBackend::Docker);
+                let runtime_docker_mem = config.runtime.kind == "docker"
+                    && config
+                        .runtime
+                        .docker
+                        .memory_limit_mb
+                        .is_some_and(|mb| mb > 0);
+                if (sandbox_docker || runtime_docker_mem)
+                    && !zeroclaw_runtime::security::linux_memcg_available()
+                {
+                    let which = match (sandbox_docker, runtime_docker_mem) {
+                        (true, true) => {
+                            "security.sandbox.backend = \"docker\" and runtime.kind = \"docker\""
+                        }
+                        (true, false) => "security.sandbox.backend = \"docker\"",
+                        _ => "runtime.kind = \"docker\"",
+                    };
+                    warn!(
+                        "Docker memory limits are configured but the Linux kernel has no memcg support. \
+                         Affected config: {which}. \
+                         Consequence: --memory limits are silently ignored; agents can OOM the host. \
+                         Fix: add 'cgroup_memory=1 cgroup_enable=memory' to /boot/firmware/cmdline.txt \
+                         (Raspberry Pi) or enable CONFIG_MEMCG in your kernel, then reboot."
+                    );
+                }
+            }
+
             // Wire CLI channel for interactive mode
             #[cfg(feature = "agent-runtime")]
             zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
@@ -1623,18 +1658,40 @@ async fn main() -> Result<()> {
                 },
             ));
 
+            // Single canvas store shared between the gateway HTTP / WebSocket
+            // surface and the channel-server agents so canvas frames pushed
+            // from Telegram / Discord / Slack reach the same subscribers the
+            // web UI serves. Without this, channels build an orphaned
+            // CanvasStore::default() and frames are silently dropped (#5356).
+            let canvas_store = zeroclaw_runtime::tools::CanvasStore::new();
+            let canvas_store_for_gateway = canvas_store.clone();
+            let canvas_store_for_channels = canvas_store.clone();
+
             let subsystems = daemon::DaemonSubsystems {
                 #[cfg(feature = "gateway")]
-                gateway_start: Some(Box::new(|host, port, config, tx| {
+                gateway_start: Some(Box::new(move |host, port, config, tx| {
+                    let canvas_store = canvas_store_for_gateway.clone();
                     Box::pin(async move {
-                        Box::pin(zeroclaw_gateway::run_gateway(&host, port, config, tx)).await
+                        Box::pin(zeroclaw_gateway::run_gateway(
+                            &host,
+                            port,
+                            config,
+                            tx,
+                            Some(canvas_store),
+                        ))
+                        .await
                     })
                 })),
                 #[cfg(not(feature = "gateway"))]
                 gateway_start: None,
-                channels_start: Some(Box::new(|config| {
+                channels_start: Some(Box::new(move |config| {
+                    let canvas_store = canvas_store_for_channels.clone();
                     Box::pin(async move {
-                        Box::pin(zeroclaw_channels::orchestrator::start_channels(config)).await
+                        Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                            config,
+                            Some(canvas_store),
+                        ))
+                        .await
                     })
                 })),
                 mqtt_start: Some(Box::new(|mqtt_config| {
@@ -1894,7 +1951,7 @@ async fn main() -> Result<()> {
         },
 
         Commands::Channel { channel_command } => match channel_command {
-            ChannelCommands::Start => Box::pin(channels::start_channels(config)).await,
+            ChannelCommands::Start => Box::pin(channels::start_channels(config, None)).await,
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
         },
@@ -2617,8 +2674,8 @@ fn log_gateway_start(host: &str, port: u16) {
 
 /// Gracefully shutdown a running gateway via the admin endpoint.
 #[cfg(feature = "agent-runtime")]
-async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
-    let url = format!("http://{host}:{port}/admin/shutdown");
+async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> Result<()> {
+    let url = gateway_admin_url(host, port, path_prefix, "/admin/shutdown");
     let client = reqwest::Client::new();
 
     match client
@@ -2639,12 +2696,17 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
 /// Fetch the current pairing code from a running gateway.
 /// If `new` is true, generates a fresh pairing code via POST request.
 #[cfg(feature = "agent-runtime")]
-async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<String>> {
+async fn fetch_paircode(
+    host: &str,
+    port: u16,
+    path_prefix: Option<&str>,
+    new: bool,
+) -> Result<Option<String>> {
     let client = reqwest::Client::new();
 
     let response = if new {
         // Generate a new pairing code via POST
-        let url = format!("http://{host}:{port}/admin/paircode/new");
+        let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new");
         client
             .post(&url)
             .timeout(std::time::Duration::from_secs(5))
@@ -2652,7 +2714,7 @@ async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<Strin
             .await
     } else {
         // Get existing pairing code via GET
-        let url = format!("http://{host}:{port}/admin/paircode");
+        let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode");
         client
             .get(&url)
             .timeout(std::time::Duration::from_secs(5))
@@ -2682,6 +2744,12 @@ async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<Strin
         .get("pairing_code")
         .and_then(|v| v.as_str())
         .map(String::from))
+}
+
+#[cfg(feature = "agent-runtime")]
+fn gateway_admin_url(host: &str, port: u16, path_prefix: Option<&str>, admin_path: &str) -> String {
+    let prefix = path_prefix.unwrap_or("");
+    format!("http://{host}:{port}{prefix}{admin_path}")
 }
 
 // ─── Generic Pending OAuth Login ────────────────────────────────────────────
@@ -3382,7 +3450,7 @@ async fn run_gateway_if_enabled(
     config: zeroclaw::config::Config,
     tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 ) -> anyhow::Result<()> {
-    Box::pin(gateway::run_gateway(host, port, config, tx)).await
+    Box::pin(gateway::run_gateway(host, port, config, tx, None)).await
 }
 
 #[cfg(not(feature = "gateway"))]
@@ -3423,6 +3491,24 @@ mod tests {
         assert!(
             has_model_flag,
             "onboard help should include --model for quick setup overrides"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_admin_url_uses_unprefixed_admin_path_by_default() {
+        assert_eq!(
+            gateway_admin_url("127.0.0.1", 42617, None, "/admin/paircode"),
+            "http://127.0.0.1:42617/admin/paircode"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_admin_url_prepends_configured_path_prefix() {
+        assert_eq!(
+            gateway_admin_url("localhost", 42617, Some("/zeroclaw"), "/admin/paircode/new"),
+            "http://localhost:42617/zeroclaw/admin/paircode/new"
         );
     }
 

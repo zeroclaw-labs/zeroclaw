@@ -352,7 +352,7 @@ function OverviewTab({
             </h2>
           </div>
           <div className="grid grid-cols-2 gap-3">
-            {Object.entries(status.health.components).length === 0 ? (
+            {!status.health?.components || Object.entries(status.health.components).length === 0 ? (
               <p
                 className="text-sm col-span-2"
                 style={{ color: "var(--pc-text-faint)" }}

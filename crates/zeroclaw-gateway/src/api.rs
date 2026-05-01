@@ -786,6 +786,37 @@ pub async fn handle_api_cli_tools(
     Json(serde_json::json!({"cli_tools": tools})).into_response()
 }
 
+/// GET /api/channels — list configured channels with status
+pub async fn handle_api_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let channels: Vec<serde_json::Value> = config
+        .channels
+        .channels()
+        .into_iter()
+        .filter(|(_, present)| *present)
+        .map(|(ch, _)| {
+            serde_json::json!({
+                "name": ch.name(),
+                "type": ch.name(),
+                "enabled": true,
+                "status": "active",
+                "message_count": 0,
+                "last_message_at": null,
+                "health": "healthy",
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "channels": channels })).into_response()
+}
+
 /// GET /api/health — component health snapshot
 pub async fn handle_api_health(
     State(state): State<AppState>,
@@ -1383,6 +1414,23 @@ pub async fn handle_api_session_delete(
     };
 
     let session_key = format!("gw_{id}");
+
+    // If a turn is in flight for this session, cancel it and evict the entry
+    // from `cancel_tokens` here rather than leaving the WebSocket handler's
+    // post-`tokio::join!` cleanup (`ws.rs:535`) as the only path. Without
+    // this, deleting a session mid-turn leaks the map entry until the
+    // streaming task happens to wake up — and on a process crash the
+    // entry is lost entirely (#5835).
+    let token = state
+        .cancel_tokens
+        .lock()
+        .expect("cancel_tokens lock poisoned")
+        .remove(&session_key);
+    if let Some(token) = token {
+        token.cancel();
+        tracing::info!(session_key, "cancelled in-flight turn for deleted session");
+    }
+
     match backend.delete_session(&session_key) {
         Ok(true) => Json(serde_json::json!({"deleted": true, "session_id": id})).into_response(),
         Ok(false) => (

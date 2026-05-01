@@ -303,7 +303,7 @@ async fn run_agent_job(
                     if ctx.is_empty() {
                         String::new()
                     } else {
-                        format!("[Memory context]\n{ctx}\n\n")
+                        format!("[Memory context]\n{ctx}\n[/Memory context]\n\n")
                     }
                 }
                 _ => String::new(),
