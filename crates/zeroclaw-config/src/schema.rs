@@ -597,6 +597,19 @@ pub struct ModelProviderConfig {
     /// Example: `provider_extra = { provider = { only = ["Anthropic"] } }`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_extra: Option<serde_json::Value>,
+    /// Per-model pricing for cost tracking, USD per 1M tokens.
+    ///
+    /// Free-form key/value map. Keys are user-defined model identifiers; an
+    /// optional `.input` / `.output` suffix encodes pricing dimension when
+    /// the operator wants to split rates. A bare key without a suffix is
+    /// used as a flat per-token rate when neither dimension is specified.
+    /// Default is empty: cost tracking falls back to "unknown" rates and
+    /// only token usage is recorded.
+    ///
+    /// Example: `pricing = { opus = 15.0, sonnet = 3.0 }`
+    /// Or split: `pricing = { "opus.input" = 15.0, "opus.output" = 75.0 }`
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pricing: HashMap<String, f64>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -1973,10 +1986,6 @@ pub struct CostConfig {
     #[serde(default)]
     pub allow_override: bool,
 
-    /// Per-model pricing (USD per 1M tokens)
-    #[serde(default)]
-    pub prices: std::collections::HashMap<String, ModelPricing>,
-
     /// Cost enforcement behavior when budget limits are approached or exceeded.
     #[serde(default)]
     #[nested]
@@ -2017,19 +2026,6 @@ impl Default for CostEnforcementConfig {
     }
 }
 
-/// Per-model pricing entry (USD per 1M tokens).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct ModelPricing {
-    /// Input price per 1M tokens
-    #[serde(default)]
-    pub input: f64,
-
-    /// Output price per 1M tokens
-    #[serde(default)]
-    pub output: f64,
-}
-
 fn default_daily_limit() -> f64 {
     10.0
 }
@@ -2054,86 +2050,9 @@ impl Default for CostConfig {
             monthly_limit_usd: default_monthly_limit(),
             warn_at_percent: default_warn_percent(),
             allow_override: false,
-            prices: get_default_pricing(),
             enforcement: CostEnforcementConfig::default(),
         }
     }
-}
-
-/// Default pricing for popular models (USD per 1M tokens)
-fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
-    let mut prices = std::collections::HashMap::new();
-
-    // Anthropic models
-    prices.insert(
-        "anthropic/claude-sonnet-4-20250514".into(),
-        ModelPricing {
-            input: 3.0,
-            output: 15.0,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-opus-4-20250514".into(),
-        ModelPricing {
-            input: 15.0,
-            output: 75.0,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-3.5-sonnet".into(),
-        ModelPricing {
-            input: 3.0,
-            output: 15.0,
-        },
-    );
-    prices.insert(
-        "anthropic/claude-3-haiku".into(),
-        ModelPricing {
-            input: 0.25,
-            output: 1.25,
-        },
-    );
-
-    // OpenAI models
-    prices.insert(
-        "openai/gpt-4o".into(),
-        ModelPricing {
-            input: 5.0,
-            output: 15.0,
-        },
-    );
-    prices.insert(
-        "openai/gpt-4o-mini".into(),
-        ModelPricing {
-            input: 0.15,
-            output: 0.60,
-        },
-    );
-    prices.insert(
-        "openai/o1-preview".into(),
-        ModelPricing {
-            input: 15.0,
-            output: 60.0,
-        },
-    );
-
-    // Google models
-    prices.insert(
-        "google/gemini-2.0-flash".into(),
-        ModelPricing {
-            input: 0.10,
-            output: 0.40,
-        },
-    );
-    prices.insert(
-        "google/gemini-1.5-pro".into(),
-        ModelPricing {
-            input: 1.25,
-            output: 5.0,
-        },
-    );
-
-    prices
 }
 
 // ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
@@ -10425,6 +10344,19 @@ impl Config {
                 validate_temperature(temp).map_err(|e| {
                     anyhow::anyhow!("providers.models.{profile_name}.temperature: {e}")
                 })?;
+            }
+
+            for (key, value) in &profile.pricing {
+                if value.is_nan() {
+                    anyhow::bail!(
+                        "providers.models.{profile_name}.pricing.{key}: value must not be NaN"
+                    );
+                }
+                if *value < 0.0 {
+                    anyhow::bail!(
+                        "providers.models.{profile_name}.pricing.{key}: value must be >= 0.0 (got {value})"
+                    );
+                }
             }
         }
 

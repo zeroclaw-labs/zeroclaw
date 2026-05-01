@@ -618,6 +618,93 @@ subreddit = "rust"
 }
 
 #[test]
+fn cost_prices_dropped_during_v2_to_v3() {
+    let config = migrate(
+        r#"
+[cost.prices."anthropic/claude-opus-4-20250514"]
+input = 15.0
+output = 75.0
+
+[cost.prices."openai/gpt-4o-mini"]
+input = 0.15
+output = 0.6
+"#,
+    );
+
+    assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
+    // The Cost config still loads, just without the dropped prices field.
+    assert!(config.cost.enabled);
+}
+
+#[test]
+fn pricing_lives_on_model_provider_config() {
+    let config = migrate(
+        r#"
+schema_version = 3
+
+[providers]
+fallback = "openrouter"
+
+[providers.models.openrouter]
+api_key = "sk-or-..."
+pricing = { opus = 15.0, sonnet = 3.0 }
+"#,
+    );
+
+    let entry = &config.providers.models["openrouter"];
+    assert_eq!(entry.pricing.get("opus").copied(), Some(15.0));
+    assert_eq!(entry.pricing.get("sonnet").copied(), Some(3.0));
+}
+
+#[test]
+fn pricing_split_dimensions() {
+    let config = migrate(
+        r#"
+schema_version = 3
+
+[providers]
+fallback = "anthropic"
+
+[providers.models.anthropic]
+api_key = "sk-ant"
+pricing = { "opus.input" = 15.0, "opus.output" = 75.0 }
+"#,
+    );
+
+    let entry = &config.providers.models["anthropic"];
+    assert_eq!(entry.pricing.get("opus.input").copied(), Some(15.0));
+    assert_eq!(entry.pricing.get("opus.output").copied(), Some(75.0));
+}
+
+#[test]
+fn pricing_validation_rejects_negative() {
+    let config = migrate(
+        r#"
+schema_version = 3
+
+[providers]
+fallback = "openrouter"
+
+[providers.models.openrouter]
+api_key = "sk"
+pricing = { opus = -1.0 }
+"#,
+    );
+    let err = config
+        .validate()
+        .expect_err("negative pricing must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("pricing.opus"),
+        "error should name the field: {msg}"
+    );
+    assert!(
+        msg.contains(">= 0.0"),
+        "error should describe the constraint: {msg}"
+    );
+}
+
+#[test]
 fn already_v3_channel_plurality_unchanged() {
     // A config already at V3 with the new shapes should round-trip cleanly.
     let config = migrate(

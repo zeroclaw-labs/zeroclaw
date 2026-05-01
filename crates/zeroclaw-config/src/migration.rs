@@ -327,6 +327,38 @@ pub fn prepare_table(table: &mut toml::Table) {
     {
         table.insert("channels".to_string(), val);
     }
+
+    // V3: Drop the global `[cost.prices.*]` table. Pricing now lives on each
+    // `[providers.models.<provider>.<alias>]` block. The global-hash key
+    // (`"<provider>/<model>"`) does not carry the user's alias path, so no
+    // automatic remapping is attempted; emit one INFO log per dropped entry
+    // so operators can paste the values under the correct alias.
+    if let Some(toml::Value::Table(cost)) = table.get_mut("cost")
+        && let Some(toml::Value::Table(prices)) = cost.remove("prices")
+    {
+        for (model, entry) in prices {
+            let (input, output) = match &entry {
+                toml::Value::Table(t) => (
+                    t.get("input")
+                        .and_then(toml::Value::as_float)
+                        .unwrap_or(0.0),
+                    t.get("output")
+                        .and_then(toml::Value::as_float)
+                        .unwrap_or(0.0),
+                ),
+                _ => (0.0, 0.0),
+            };
+            tracing::info!(
+                model = %model,
+                input = input,
+                output = output,
+                "v2→v3 migration: dropping cost.prices.{model} (input={input}, \
+                 output={output}). Pricing now lives under \
+                 [providers.models.<provider>.<alias>.pricing] — re-enter the \
+                 values under the alias that uses this model."
+            );
+        }
+    }
 }
 
 // ── File-level migration (comment-preserving) ───────────────────────────────
