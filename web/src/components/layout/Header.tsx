@@ -177,8 +177,8 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
             className="h-9 px-3 rounded-xl text-xs transition-all flex items-center gap-1.5"
             style={{ color: 'var(--pc-text-muted)', background: 'transparent', border: 'none', cursor: 'pointer' }}
             onMouseEnter={(e) => {
-              e.currentTarget.style.color = '#f87171';
-              e.currentTarget.style.background = 'rgba(239, 68, 68, 0.08)';
+              e.currentTarget.style.color = 'var(--color-status-error)';
+              e.currentTarget.style.background = 'var(--color-status-error-alpha-08)';
             }}
             onMouseLeave={(e) => {
               e.currentTarget.style.color = 'var(--pc-text-muted)';

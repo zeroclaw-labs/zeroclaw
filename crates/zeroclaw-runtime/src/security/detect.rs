@@ -70,7 +70,15 @@ pub fn create_sandbox(
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Docker => {
-            if let Ok(sandbox) = super::docker::DockerSandbox::new() {
+            let result = if let Some(ws) = workspace_dir {
+                super::docker::DockerSandbox::with_workspace(
+                    super::docker::DockerSandbox::default_image(),
+                    ws.to_path_buf(),
+                )
+            } else {
+                super::docker::DockerSandbox::new()
+            };
+            if let Ok(sandbox) = result {
                 return Arc::new(sandbox);
             }
             tracing::warn!("Docker requested but not available, falling back to application-layer");
@@ -101,10 +109,7 @@ pub fn create_sandbox(
 /// When `runtime_kind` is `"native"` the caller has explicitly opted out of
 /// container wrapping, so Docker is excluded from consideration even if it is
 /// installed on the host.
-fn detect_best_sandbox(
-    runtime_kind: &str,
-    #[allow(unused_variables)] workspace_dir: Option<&Path>,
-) -> Arc<dyn Sandbox> {
+fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<dyn Sandbox> {
     let skip_docker = runtime_kind == "native";
 
     #[cfg(target_os = "linux")]
@@ -150,7 +155,15 @@ fn detect_best_sandbox(
     // container wrapping, and forcing Docker would break Python skills (Alpine
     // has no python3) and workspace access on resource-constrained hosts.
     if !skip_docker {
-        if let Ok(sandbox) = super::docker::DockerSandbox::probe() {
+        let docker_result = if let Some(ws) = workspace_dir {
+            super::docker::DockerSandbox::with_workspace(
+                super::docker::DockerSandbox::default_image(),
+                ws.to_path_buf(),
+            )
+        } else {
+            super::docker::DockerSandbox::probe()
+        };
+        if let Ok(sandbox) = docker_result {
             tracing::info!("Docker sandbox enabled");
             return Arc::new(sandbox);
         }
