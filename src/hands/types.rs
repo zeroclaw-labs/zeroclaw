@@ -124,7 +124,8 @@ impl HandContext {
         }
 
         // Merge new knowledge (HashSet handles deduplication automatically)
-        self.learned_facts.extend(run.knowledge_added.iter().cloned());
+        self.learned_facts
+            .extend(run.knowledge_added.iter().cloned());
 
         // Insert at the front (most-recent first)
         self.history.insert(0, run);
