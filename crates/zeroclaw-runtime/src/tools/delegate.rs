@@ -1298,6 +1298,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                channels: Vec::new(),
             },
         );
         agents.insert(
@@ -1316,6 +1317,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                channels: Vec::new(),
             },
         );
         agents
@@ -1473,6 +1475,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            channels: Vec::new(),
         }
     }
 
@@ -1589,6 +1592,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                channels: Vec::new(),
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1703,6 +1707,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                channels: Vec::new(),
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1744,6 +1749,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                channels: Vec::new(),
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -2033,6 +2039,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            channels: Vec::new(),
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2087,6 +2094,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            channels: Vec::new(),
         };
 
         struct MockShellTool;
@@ -2158,6 +2166,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            channels: Vec::new(),
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2187,6 +2196,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            channels: Vec::new(),
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2221,6 +2231,7 @@ mod tests {
             agentic_timeout_secs: Some(600),
             skills_directory: None,
             memory_namespace: None,
+            channels: Vec::new(),
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2277,6 +2288,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                channels: Vec::new(),
             },
         );
         let err = config.validate().unwrap_err();
@@ -2305,6 +2317,7 @@ mod tests {
                 agentic_timeout_secs: Some(0),
                 skills_directory: None,
                 memory_namespace: None,
+                channels: Vec::new(),
             },
         );
         let err = config.validate().unwrap_err();
@@ -2333,6 +2346,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                channels: Vec::new(),
             },
         );
         let err = config.validate().unwrap_err();
@@ -2361,6 +2375,7 @@ mod tests {
                 agentic_timeout_secs: Some(5000),
                 skills_directory: None,
                 memory_namespace: None,
+                channels: Vec::new(),
             },
         );
         let err = config.validate().unwrap_err();
@@ -2389,6 +2404,7 @@ mod tests {
                 agentic_timeout_secs: Some(3600),
                 skills_directory: None,
                 memory_namespace: None,
+                channels: Vec::new(),
             },
         );
         assert!(config.validate().is_ok());
@@ -2413,6 +2429,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                channels: Vec::new(),
             },
         );
         assert!(config.validate().is_ok());
@@ -2446,6 +2463,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: Some("skills/code-review".to_string()),
             memory_namespace: None,
+            channels: Vec::new(),
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2493,6 +2511,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            channels: Vec::new(),
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];

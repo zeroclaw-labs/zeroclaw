@@ -388,6 +388,20 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
+    // Read non_cli_excluded_tools before the wrap so we can propagate it to
+    // each channel alias's excluded_tools field. The flat autonomy field does
+    // not survive V3 — it becomes a per-channel filter instead.
+    let excluded_tools_for_channels: Option<toml::Value> =
+        if let Some(toml::Value::Table(autonomy)) = table.get("autonomy") {
+            autonomy.get("non_cli_excluded_tools").cloned()
+        } else {
+            None
+        };
+
+    // Collect V2 channel→agent bindings so they can be inverted onto agents
+    // after the aliasing wrap. Stored as (channel_type, agent_alias) pairs.
+    let mut agent_bindings: Vec<(String, String)> = Vec::new();
+
     // V3: Wrap V2 flat channel configs in a "default" alias.
     // V2: [channels.discord] has flat fields (bot_token, enabled, …).
     // V3: [channels.discord.default] nests those fields one level deeper.
@@ -399,17 +413,50 @@ pub fn prepare_table(table: &mut toml::Table) {
                 if let Some(toml::Value::Table(ch_table)) = channels.get(*ch_type)
                     && is_flat_channel_config(ch_table)
                 {
-                    let ch_table_clone = ch_table.clone();
+                    let mut ch_clone = ch_table.clone();
+                    // Strip V2 agent binding before wrapping; collect for inversion below.
+                    if let Some(toml::Value::String(agent_alias)) = ch_clone.remove("agent") {
+                        agent_bindings.push((ch_type.to_string(), agent_alias));
+                    }
+                    // Propagate non_cli_excluded_tools to channel-side excluded_tools.
+                    if let Some(ref tools) = excluded_tools_for_channels {
+                        ch_clone
+                            .entry("excluded_tools".to_string())
+                            .or_insert_with(|| tools.clone());
+                    }
                     let mut alias_map = toml::Table::new();
-                    alias_map.insert("default".to_string(), toml::Value::Table(ch_table_clone));
+                    alias_map.insert("default".to_string(), toml::Value::Table(ch_clone));
                     channels.insert(ch_type.to_string(), toml::Value::Table(alias_map));
                 }
             }
         }
     }
 
+    // V3: Binding inversion — write channels = ["<type>.default"] onto each agent
+    // that was bound to a channel via the V2 channels.<type>.agent field.
+    // Only updates agents that already exist in the table; does not create skeletons
+    // (an agent without provider/model cannot deserialize as DelegateAgentConfig).
+    if !agent_bindings.is_empty()
+        && let Some(toml::Value::Table(agents)) = table.get_mut("agents")
+    {
+        for (ch_type, agent_alias) in &agent_bindings {
+            if let Some(toml::Value::Table(agent_table)) = agents.get_mut(agent_alias) {
+                let ch_list = agent_table
+                    .entry("channels".to_string())
+                    .or_insert_with(|| toml::Value::Array(Vec::new()));
+                if let toml::Value::Array(arr) = ch_list {
+                    let binding = format!("{}.default", ch_type);
+                    if !arr.iter().any(|v| v.as_str() == Some(binding.as_str())) {
+                        arr.push(toml::Value::String(binding));
+                    }
+                }
+            }
+        }
+    }
+
     // V3: Synthesize [risk_profiles.default] from [autonomy] if not already present.
-    // Copies all policy fields and renames `non_cli_excluded_tools` → `excluded_tools`.
+    // non_cli_excluded_tools is propagated to per-channel excluded_tools above;
+    // it does not survive in the risk profile.
     if let Some(toml::Value::Table(autonomy)) = table.get("autonomy").cloned() {
         let risk_profiles = table
             .entry("risk_profiles")
@@ -418,9 +465,7 @@ pub fn prepare_table(table: &mut toml::Table) {
             && !profiles.contains_key("default")
         {
             let mut profile = autonomy.clone();
-            if let Some(v) = profile.remove("non_cli_excluded_tools") {
-                profile.insert("excluded_tools".to_string(), v);
-            }
+            profile.remove("non_cli_excluded_tools");
             profiles.insert("default".to_string(), toml::Value::Table(profile));
         }
     }

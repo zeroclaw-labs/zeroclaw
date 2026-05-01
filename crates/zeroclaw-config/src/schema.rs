@@ -721,6 +721,10 @@ pub struct DelegateAgentConfig {
     /// preventing cross-contamination with memory from other agents.
     #[serde(default)]
     pub memory_namespace: Option<String>,
+    /// Channel aliases this agent handles (e.g. `["telegram.default", "discord.work"]`).
+    /// Populated by migration from V2 `channels.<type>.agent = "<alias>"` bindings.
+    #[serde(default)]
+    pub channels: Vec<String>,
 }
 
 fn default_delegate_timeout_secs() -> u64 {
@@ -1584,6 +1588,11 @@ pub struct AgentConfig {
     /// behavior). Default: `2`.
     #[serde(default = "default_keep_tool_context_turns")]
     pub keep_tool_context_turns: usize,
+
+    /// Channel aliases this agent handles (e.g. `["telegram.default", "discord.work"]`).
+    /// Populated by migration from V2 `channels.<type>.agent = "<alias>"` bindings.
+    #[serde(default)]
+    pub channels: Vec<String>,
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1634,6 +1643,7 @@ impl Default for AgentConfig {
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            channels: Vec::new(),
         }
     }
 }
@@ -13084,6 +13094,7 @@ default_temperature = 0.7
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                channels: Vec::new(),
             },
         );
 

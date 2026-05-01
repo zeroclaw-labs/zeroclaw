@@ -1044,7 +1044,8 @@ max_cost_per_day_cents = 2000
 }
 
 #[test]
-fn autonomy_non_cli_excluded_tools_renamed_in_risk_profile() {
+fn autonomy_non_cli_excluded_tools_not_in_risk_profile() {
+    // non_cli_excluded_tools propagates to channel-side excluded_tools, not risk_profiles.
     let config = migrate(
         r#"
 [autonomy]
@@ -1057,9 +1058,87 @@ non_cli_excluded_tools = ["shell_tool", "file_write"]
         .risk_profiles
         .get("default")
         .expect("default risk_profile synthesised");
+    assert!(
+        profile.excluded_tools.is_empty(),
+        "non_cli_excluded_tools must not appear in risk_profiles.default.excluded_tools"
+    );
+}
+
+#[test]
+fn non_cli_excluded_tools_propagated_to_channel_excluded_tools() {
+    let config = migrate(
+        r#"
+[autonomy]
+non_cli_excluded_tools = ["shell_tool", "file_write"]
+
+[channels.telegram]
+bot_token = "123:ABC"
+allowed_users = ["alice"]
+"#,
+    );
+
+    let tg = config
+        .channels
+        .telegram
+        .get("default")
+        .expect("default telegram alias present");
     assert_eq!(
-        profile.excluded_tools,
-        vec!["shell_tool".to_string(), "file_write".to_string()]
+        tg.excluded_tools,
+        vec!["shell_tool".to_string(), "file_write".to_string()],
+        "non_cli_excluded_tools must propagate to channel excluded_tools"
+    );
+}
+
+#[test]
+fn v2_channel_agent_field_stripped_from_alias() {
+    // The V2 `agent` binding on a channel block must not survive into the
+    // wrapped [channels.<type>.default] table.
+    let config = migrate(
+        r#"
+[agents.myagent]
+provider = "anthropic"
+model = "claude-opus"
+
+[channels.telegram]
+bot_token = "tok"
+agent = "myagent"
+allowed_users = ["alice"]
+"#,
+    );
+
+    // The channel alias must parse cleanly (no unknown field panic).
+    let tg = config
+        .channels
+        .telegram
+        .get("default")
+        .expect("default telegram alias present");
+    assert_eq!(tg.bot_token, "tok");
+}
+
+#[test]
+fn v2_channel_agent_inverted_onto_agent_channels_list() {
+    // V2 channels.<type>.agent = "<alias>" is inverted: agents.<alias>.channels
+    // gains "<type>.default" after migration.
+    let config = migrate(
+        r#"
+[agents.worker]
+provider = "anthropic"
+model = "claude-opus"
+
+[channels.telegram]
+bot_token = "tok"
+agent = "worker"
+allowed_users = ["alice"]
+"#,
+    );
+
+    let agent = config
+        .agents
+        .get("worker")
+        .expect("agent 'worker' must exist");
+    assert!(
+        agent.channels.contains(&"telegram.default".to_string()),
+        "agent.channels must contain 'telegram.default' after binding inversion"
     );
 }
 
