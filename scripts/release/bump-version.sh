@@ -64,6 +64,22 @@ if [[ -f "$TAURI_CONF" ]]; then
   changed=$((changed + 1))
 fi
 
+# ── Workspace path dependencies (Cargo.toml) ───────────────────────
+# Bumps version pins on every path dep in [workspace.dependencies], skipping
+# aardvark* (which tracks its own independent version).
+echo "Workspace path deps..."
+ROOT_CARGO="$REPO_ROOT/Cargo.toml"
+if [[ -f "$ROOT_CARGO" ]]; then
+  before="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
+  sed -i -E '/path = "crates\/aardvark/!s|(path = "crates/[^"]+", version = ")[^"]+(")|\1'"$VERSION"'\2|' "$ROOT_CARGO" 2>/dev/null \
+    || sed -i '' -E '/path = "crates\/aardvark/!s|(path = "crates/[^"]+", version = ")[^"]+(")|\1'"$VERSION"'\2|' "$ROOT_CARGO"
+  after="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
+  if [[ "$before" != "$after" ]]; then
+    echo "  updated: Cargo.toml ([workspace.dependencies] path deps)"
+    changed=$((changed + 1))
+  fi
+fi
+
 # ── Marketplace: Dokploy ───────────────────────────────────────────
 echo "Marketplace templates..."
 bump "marketplace/dokploy/meta-entry.json" \
