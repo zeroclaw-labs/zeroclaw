@@ -2,11 +2,72 @@
 
 > **Status**: Design proposal · awaiting implementation PRs
 > **Author**: Kimjaechol + Claude Opus 4.7
-> **Date**: 2026-05-02
+> **Date**: 2026-05-02 (rev. 2026-05-02 — distribution scope clarified)
 > **Scope**: `src/vault/domain*` + `scripts/build_domain_*.py` + `docs/operations-runbook.md`
 > **Non-goals**: changes to `brain.db` (user's private vault — untouched);
 > changes to the cross-schema query layer (`unified_search`, `graph_query`)
-> beyond a single `meta` read.
+> beyond a single `meta` read; **publishing the legal corpus from the
+> general-public MoA registry** (see §0).
+
+---
+
+## 0. Distribution Policy — General-Public MoA vs. Specialized Forks
+
+This is a **MoA core platform** feature, not a feature exclusive to any
+one specialty. The protocol (manifest v2 + delta chain + weekly poll)
+ships in the general-public MoA build. **What ships in it does not**.
+
+| Build                                | Domain DB infrastructure | Bundled / pollable corpus |
+|--------------------------------------|--------------------------|---------------------------|
+| **General-public MoA** (this repo)   | ✅ code present          | ❌ no corpus, no registry URL configured |
+| **lawpro** (planned fork)            | ✅ code present          | ✅ `korean-legal` registry pre-configured |
+| **medpro** (later fork)              | ✅ code present          | ✅ `korean-medical` registry pre-configured |
+
+Concretely, in the general-public MoA build:
+
+- The code (`vault/domain*`, `vault domain install|update|...` CLI,
+  weekly poll, apply-delta) is fully present and tested.
+- `[domain].registry_url` defaults to **empty** in `config.toml`. With
+  no registry URL, `vault domain update` exits as a no-op and the
+  weekly cron task does nothing. No corpus is downloaded, no R2 is
+  contacted, no UI surface for "Update legal corpus" is shown.
+- A user who wants legal data gets it by either (a) switching to the
+  lawpro app or (b) manually pointing `[domain].registry_url` at a
+  third-party manifest they trust. The platform does not preconfigure
+  one for them.
+- Settings UI in the general-public app does not mention "legal" or
+  "judicial" as terms; the domain section only appears if a registry
+  is configured.
+
+The lawpro fork takes the same codebase, sets
+`[domain].registry_url = "https://r2.example.com/moa/domain/korean-legal.manifest.json"`
+in its bundled config, enables the corpus-related Settings panel, and
+ships the existing law-specific tools (`tools/vault_graph`,
+`vault::legal::*`, lawpro document creation skills under
+`.claude/skills/document_skills/...`) that are already gated behind the
+fork's build flags / .gitignore rules.
+
+This means:
+
+- **Operator-side publication tooling** (`build_domain_db_fast.py`,
+  `build_domain_delta.py`, `vault domain publish`, `publish-delta`,
+  `stamp-baseline`) lives in this repo because it's needed by both the
+  operator-of-MoA persona and the operator-of-lawpro persona, and
+  duplicating it across forks invites drift. But the operator running
+  the general-public MoA registry has no corpus to publish; the binary
+  and scripts are simply available for forks that do.
+- **Client-side update logic** is a single code path used by both
+  builds. The only difference is whether `[domain].registry_url` is
+  set in the bundled config.
+- **Tests** in this repo cover the protocol end-to-end with a mock
+  legal corpus fixture (no real legal data). The lawpro fork adds an
+  integration test against its real registry; that test does not run
+  here.
+
+**Why infrastructure here, corpus there**: keeping the protocol in
+core means lawpro/medpro forks rebase against MoA without diverging
+on a 1,500 LOC subsystem. Keeping the corpus out means the general
+public MoA app stays small, generic, and free of legal data on disk.
 
 ---
 
@@ -272,15 +333,23 @@ deltas are cumulative — see §2.1) and:
 
 ### 3.4 Schedule
 
-Default: client wakes once per week (Sunday 03:00 local) and runs the
-update. Override via `[domain].update_cron` in `config.toml`. A
-manual `vault domain update` always works regardless of schedule and
-is what we expose in the UI's "Check for updates" button.
+Client wakes once per week (default: Sunday 03:00 local) and runs the
+update **only if `[domain].registry_url` is set**. Override the cron
+via `[domain].update_cron` in `config.toml`. A manual
+`vault domain update` always works the same way — when no registry is
+configured it prints "no domain registry configured (skipped)" and
+exits 0.
 
-The operator's publication cadence is **independent**. The client
-polls every week; the operator publishes when there is something to
-publish, which in practice means "occasionally" — empty weeks resolve
-to AlreadyCurrent and zero bytes downloaded.
+The operator's publication cadence is **independent**. A configured
+client polls every week; the operator publishes when there is
+something to publish, which in practice means "occasionally" — empty
+weeks resolve to AlreadyCurrent and zero bytes downloaded.
+
+**General-public MoA**: ships with `[domain].registry_url` empty (see
+§0). The weekly task is registered but no-ops on every wake-up. No
+network traffic, no UI surprise. The user has to opt in by editing
+config or by switching to a specialized fork (lawpro / medpro) whose
+bundled config points at a real manifest URL.
 
 ---
 
@@ -415,11 +484,18 @@ Three sequential PRs, each individually merge-able and testable.
 - `vault/schema.rs` — `CREATE TABLE IF NOT EXISTS meta` migration.
 - `vault/domain.rs` — `read_meta()` / `write_meta()` helpers.
 - `domain_cli.rs install` — write meta on full install.
-- Tests: v2 parse, v1 fallback, meta round-trip, install populates meta.
+- `config/schema.rs` — `[domain].registry_url: Option<String>` with
+  default `None`; `domain_cli.rs update` short-circuits to a friendly
+  no-op when unset. **The general-public MoA ships with this unset
+  (§0); lawpro/medpro forks override it in their bundled config.**
+- Tests: v2 parse, v1 fallback, meta round-trip, install populates
+  meta, `update` with no `registry_url` exits 0 silently and touches
+  no files.
 
 **Approx**: ~250 LOC + ~150 LOC tests. Ships behind no flag — pure
-data-model groundwork. Client behaviour unchanged (no delta path
-yet).
+data-model groundwork. Client behaviour unchanged from a user
+perspective (no corpus configured ⇒ nothing happens; corpus
+configured ⇒ existing v1 install path still works until PR 2).
 
 ### PR 2 — Apply-delta path (client)
 
@@ -470,25 +546,36 @@ Total budget across the three PRs: ~1,500 LOC + ~800 LOC tests.
    default `true`, expose in Settings.
 5. **Telemetry** — log update outcomes (full / delta / already-current
    / failed) to existing observability sink? Recommend yes, no PII.
+   The general-public build's no-op branch (§0, §3.4) should not log
+   anything at all — silence is part of the contract.
+6. **Fork-time config flip** — should lawpro's bundled config also
+   gate the `tools/vault_graph` and `vault::legal::*` *runtime*
+   surface so the general-public build doesn't expose legal-specific
+   tools to its agent loop? Recommend yes, but that work is part of
+   the lawpro fork bring-up, not this PR series.
 
 ---
 
 ## 9. Acceptance Criteria
 
-- [ ] Client polling on a manifest with `deltas: []` and a matching
-      installed `current_version` performs **zero** body downloads
-      (only the manifest GET).
-- [ ] Client one baseline behind downloads exactly the latest delta
-      and arrives at `current_version == manifest.version`.
-- [ ] Client on a stale baseline downloads the new baseline (one
-      bundle, no deltas yet) and arrives correctly.
+- [ ] **General-public MoA build** with `[domain].registry_url`
+      unset: weekly cron fires, hits the no-op branch, makes zero
+      network requests, leaves the filesystem untouched. No domain
+      Settings panel is visible in the UI.
+- [ ] **Configured client** polling on a manifest with `deltas: []`
+      and a matching installed `current_version` performs **zero**
+      body downloads (only the manifest GET).
+- [ ] Configured client one baseline behind downloads exactly the
+      latest delta and arrives at `current_version == manifest.version`.
+- [ ] Configured client on a stale baseline downloads the new
+      baseline (one bundle, no deltas yet) and arrives correctly.
 - [ ] Operator publishing a delta on top of an unchanged baseline
       produces a manifest a v2 client accepts and a v1 client refuses
       cleanly (no corruption, just an error).
 - [ ] Mid-apply process kill leaves the prior `current_version`
       intact and the next poll recovers.
-- [ ] Annual baseline cut: every existing client moves to the new
-      baseline on its next weekly poll.
+- [ ] Annual baseline cut: every existing configured client moves to
+      the new baseline on its next weekly poll.
 
 ---
 
