@@ -57,6 +57,8 @@ pub use crate::voice_call::VoiceCallChannel;
 pub use crate::voice_wake::VoiceWakeChannel;
 pub use crate::wati::WatiChannel;
 pub use crate::webhook::WebhookChannel;
+#[cfg(feature = "channel-wechat")]
+pub use crate::wechat::WeChatChannel;
 pub use crate::wecom::WeComChannel;
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
@@ -617,6 +619,14 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
                [VIDEO:<path-or-url>], [VOICE:<path-or-url>]\n\
              - Voice supports .wav, .mp3, .silk formats only. Other audio formats use [DOCUMENT:]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
+        "wechat" => Some(
+            "When responding on WeChat:\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
+               [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - Use absolute local paths when sending generated files whenever possible.\n",
         ),
         _ => None,
     }
@@ -4238,6 +4248,27 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 wc.allowed_users.clone(),
             )))
         }
+        #[cfg(feature = "channel-wechat")]
+        "wechat" => {
+            let wc = config
+                .channels
+                .wechat
+                .as_ref()
+                .context("WeChat channel is not configured")?;
+            Ok(Arc::new(
+                WeChatChannel::new(
+                    wc.allowed_users.clone(),
+                    wc.api_base_url.clone(),
+                    wc.cdn_base_url.clone(),
+                    wc.state_dir.as_ref().map(std::path::PathBuf::from),
+                )?
+                .with_workspace_dir(config.workspace_dir.clone()),
+            ))
+        }
+        #[cfg(not(feature = "channel-wechat"))]
+        "wechat" => {
+            anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
+        }
         "nextcloud_talk" | "nextcloud-talk" => {
             let nc = config
                 .channels
@@ -4313,6 +4344,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 nickserv_password: irc_cfg.nickserv_password.clone(),
                 sasl_password: irc_cfg.sasl_password.clone(),
                 verify_tls: irc_cfg.verify_tls.unwrap_or(true),
+                mention_only: irc_cfg.mention_only,
             })))
         }
         "twitter" => {
@@ -4549,6 +4581,7 @@ fn collect_configured_channels(
                     )
                     .with_thread_replies(sl.thread_replies.unwrap_or(true))
                     .with_group_reply_policy(sl.mention_only, Vec::new())
+                    .with_strict_mention_in_thread(sl.strict_mention_in_thread)
                     .with_workspace_dir(config.workspace_dir.clone())
                     .with_markdown_blocks(sl.use_markdown_blocks)
                     .with_proxy_url(sl.proxy_url.clone())
@@ -4824,6 +4857,7 @@ fn collect_configured_channels(
                     nickserv_password: irc.nickserv_password.clone(),
                     sasl_password: irc.sasl_password.clone(),
                     verify_tls: irc.verify_tls.unwrap_or(true),
+                    mention_only: irc.mention_only,
                 })),
             });
         } else {
@@ -4983,6 +5017,41 @@ fn collect_configured_channels(
         } else {
             tracing::info!("WeCom channel configured but disabled (enabled = false)");
         }
+    }
+
+    #[cfg(feature = "channel-wechat")]
+    if let Some(ref wechat) = config.channels.wechat {
+        if wechat.enabled {
+            match WeChatChannel::new(
+                wechat.allowed_users.clone(),
+                wechat.api_base_url.clone(),
+                wechat.cdn_base_url.clone(),
+                wechat.state_dir.as_ref().map(std::path::PathBuf::from),
+            ) {
+                Ok(channel) => {
+                    channels.push(ConfiguredChannel {
+                        display_name: "WeChat",
+                        channel: Arc::new(channel.with_workspace_dir(config.workspace_dir.clone())),
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "WeChat channel configuration is invalid; skipping WeChat {matrix_skip_context}: {err}"
+                    );
+                }
+            }
+        } else {
+            tracing::info!("WeChat channel configured but disabled (enabled = false)");
+        }
+    }
+
+    #[cfg(not(feature = "channel-wechat"))]
+    if let Some(ref wechat) = config.channels.wechat
+        && wechat.enabled
+    {
+        tracing::warn!(
+            "WeChat channel is configured but this build was compiled without `channel-wechat`; skipping WeChat {matrix_skip_context}."
+        );
     }
 
     if let Some(ref ct) = config.channels.clawdtalk {
@@ -5153,7 +5222,10 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
-pub async fn start_channels(config: Config) -> Result<()> {
+pub async fn start_channels(
+    config: Config,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_from_config(&config);
@@ -5252,7 +5324,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .fallback_provider()
             .and_then(|e| e.api_key.as_deref()),
         &config,
-        None,
+        // Share the gateway's canvas store so frames pushed from
+        // channel-side agents reach the same WebSocket subscribers and
+        // REST snapshots the gateway serves (#5356). When `None`, the
+        // tool registry creates an orphaned store that nothing can
+        // observe — the original silent-failure shape.
+        canvas_store,
     );
 
     // Wire MCP tools into the registry before freezing — non-fatal.
@@ -5863,6 +5940,27 @@ pub async fn deliver_announcement(
             );
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
                 .await?;
+        }
+        #[cfg(feature = "channel-wechat")]
+        "wechat" => {
+            let wc = config
+                .channels
+                .wechat
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("wechat channel not configured"))?;
+            let ch = WeChatChannel::new(
+                wc.allowed_users.clone(),
+                wc.api_base_url.clone(),
+                wc.cdn_base_url.clone(),
+                wc.state_dir.as_ref().map(std::path::PathBuf::from),
+            )?
+            .with_workspace_dir(config.workspace_dir.clone());
+            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
+                .await?;
+        }
+        #[cfg(not(feature = "channel-wechat"))]
+        "wechat" => {
+            anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }

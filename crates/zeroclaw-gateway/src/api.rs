@@ -403,6 +403,108 @@ pub async fn handle_api_cron_runs(
     }
 }
 
+/// POST /api/cron/:id/run — trigger a cron job manually
+pub async fn handle_api_cron_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    let job = match zeroclaw_runtime::cron::get_job(&config, &id) {
+        Ok(job) => job,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Cron job not found: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let started_at = chrono::Utc::now();
+    let (mut success, output) =
+        zeroclaw_runtime::cron::scheduler::execute_job_now(&config, &job).await;
+    let finished_at = chrono::Utc::now();
+    let duration_ms = (finished_at - started_at).num_milliseconds();
+
+    if job.delivery.mode.eq_ignore_ascii_case("announce")
+        && let (Some(channel), Some(target)) =
+            (job.delivery.channel.as_deref(), job.delivery.to.as_deref())
+        && let Err(e) = zeroclaw_runtime::cron::scheduler::deliver_announcement(
+            &config, channel, target, &output,
+        )
+        .await
+    {
+        if job.delivery.best_effort {
+            tracing::warn!(
+                job_id = %job.id,
+                error = %e,
+                "manual cron trigger delivery failed (best_effort)"
+            );
+        } else {
+            tracing::warn!(
+                job_id = %job.id,
+                error = %e,
+                "manual cron trigger delivery failed"
+            );
+            success = false;
+        }
+    }
+
+    let status = if success { "ok" } else { "error" };
+    if let Err(e) = zeroclaw_runtime::cron::record_run(
+        &config,
+        &job.id,
+        started_at,
+        finished_at,
+        status,
+        Some(&output),
+        duration_ms,
+    ) {
+        tracing::warn!(
+            job_id = %job.id,
+            error = %e,
+            "manual cron trigger: failed to persist run history",
+        );
+    }
+    if let Err(e) =
+        zeroclaw_runtime::cron::record_last_run(&config, &job.id, finished_at, success, &output)
+    {
+        tracing::warn!(
+            job_id = %job.id,
+            error = %e,
+            "manual cron trigger: failed to update last_run state",
+        );
+    }
+
+    // Broadcast the result so dashboard/SSE clients refresh in real time,
+    // matching the scheduler's automatic-execution behavior.
+    let _ = state.event_tx.send(serde_json::json!({
+        "type": "cron_result",
+        "job_id": job.id,
+        "success": success,
+        "output": output,
+        "manual": true,
+        "timestamp": finished_at.to_rfc3339(),
+    }));
+
+    Json(serde_json::json!({
+        "status": status,
+        "job_id": job.id,
+        "success": success,
+        "output": output,
+        "duration_ms": duration_ms,
+        "started_at": started_at.to_rfc3339(),
+        "finished_at": finished_at.to_rfc3339(),
+    }))
+    .into_response()
+}
+
 /// PATCH /api/cron/:id — update an existing cron job
 pub async fn handle_api_cron_patch(
     State(state): State<AppState>,
@@ -784,6 +886,37 @@ pub async fn handle_api_cli_tools(
     let tools = zeroclaw_tools::cli_discovery::discover_cli_tools(&[], &[]);
 
     Json(serde_json::json!({"cli_tools": tools})).into_response()
+}
+
+/// GET /api/channels — list configured channels with status
+pub async fn handle_api_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let channels: Vec<serde_json::Value> = config
+        .channels
+        .channels()
+        .into_iter()
+        .filter(|(_, present)| *present)
+        .map(|(ch, _)| {
+            serde_json::json!({
+                "name": ch.name(),
+                "type": ch.name(),
+                "enabled": true,
+                "status": "active",
+                "message_count": 0,
+                "last_message_at": null,
+                "health": "healthy",
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "channels": channels })).into_response()
 }
 
 /// GET /api/health — component health snapshot
@@ -1383,6 +1516,23 @@ pub async fn handle_api_session_delete(
     };
 
     let session_key = format!("gw_{id}");
+
+    // If a turn is in flight for this session, cancel it and evict the entry
+    // from `cancel_tokens` here rather than leaving the WebSocket handler's
+    // post-`tokio::join!` cleanup (`ws.rs:535`) as the only path. Without
+    // this, deleting a session mid-turn leaks the map entry until the
+    // streaming task happens to wake up — and on a process crash the
+    // entry is lost entirely (#5835).
+    let token = state
+        .cancel_tokens
+        .lock()
+        .expect("cancel_tokens lock poisoned")
+        .remove(&session_key);
+    if let Some(token) = token {
+        token.cancel();
+        tracing::info!(session_key, "cancelled in-flight turn for deleted session");
+    }
+
     match backend.delete_session(&session_key) {
         Ok(true) => Json(serde_json::json!({"deleted": true, "session_id": id})).into_response(),
         Ok(false) => (
@@ -2382,5 +2532,74 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn cron_api_run_executes_shell_job_and_records_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.lock().clone(),
+            None,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello-from-manual-trigger",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        let response =
+            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
+                .await
+                .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["success"], true);
+        assert_eq!(json["job_id"], job.id);
+        assert!(
+            json["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("hello-from-manual-trigger")
+        );
+
+        let runs = zeroclaw_runtime::cron::list_runs(&state.config.lock().clone(), &job.id, 10)
+            .expect("runs listed");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn cron_api_run_returns_not_found_for_unknown_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+
+        let response = handle_api_cron_run(
+            State(state),
+            HeaderMap::new(),
+            Path("does-not-exist".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

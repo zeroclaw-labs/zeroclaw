@@ -47,7 +47,11 @@ const PROVIDER_OPTIONS = [
   { value: 'litellm', label: 'LiteLLM' },
 ];
 
-// Models grouped by provider. Newest models listed first.
+// Models grouped by provider. Newest models listed first. OpenRouter
+// `:free` variants are tagged "(Free)" so the dropdown surfaces the
+// no-cost options that are otherwise indistinguishable from paid model
+// IDs (#6070). The `:free` suffix is OpenRouter's canonical free-tier
+// marker — labelling here matches whatever the provider exposes.
 const MODELS_BY_PROVIDER: Record<string, { value: string; label: string }[]> = {
   openrouter: [
     { value: 'anthropic/claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
@@ -67,6 +71,17 @@ const MODELS_BY_PROVIDER: Record<string, { value: string; label: string }[]> = {
     { value: 'meta-llama/llama-4-70b', label: 'Llama 4 70B' },
     { value: 'mistralai/devstral-2', label: 'Devstral 2' },
     { value: 'qwen/qwen-3.6-plus-preview', label: 'Qwen 3.6 Plus Preview' },
+    // ── Free tier (`:free` suffix on OpenRouter) ───────────────────
+    { value: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B (Free)' },
+    { value: 'qwen/qwen3-coder:free', label: 'Qwen 3 Coder (Free)' },
+    { value: 'qwen/qwen3-next-80b-a3b-instruct:free', label: 'Qwen 3 Next 80B (Free)' },
+    { value: 'google/gemma-3-27b-it:free', label: 'Gemma 3 27B IT (Free)' },
+    { value: 'deepseek/deepseek-r1:free', label: 'DeepSeek R1 (Free)' },
+    { value: 'openai/gpt-oss-120b:free', label: 'GPT-OSS 120B (Free)' },
+    { value: 'openai/gpt-oss-20b:free', label: 'GPT-OSS 20B (Free)' },
+    { value: 'z-ai/glm-4.5-air:free', label: 'GLM 4.5 Air (Free)' },
+    { value: 'minimax/minimax-m2.5:free', label: 'MiniMax M2.5 (Free)' },
+    { value: 'nousresearch/hermes-3-llama-3.1-405b:free', label: 'Hermes 3 Llama 3.1 405B (Free)' },
   ],
   anthropic: [
     { value: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
@@ -148,18 +163,35 @@ const MODELS_BY_PROVIDER: Record<string, { value: string; label: string }[]> = {
   ],
 };
 
+// Read the per-provider model entry from the [providers.models.<name>] table.
+function readProviderModel(config: Record<string, unknown>, provider: string): string {
+  const providers = config.providers as Record<string, unknown> | undefined;
+  const models = providers?.models as Record<string, unknown> | undefined;
+  const entry = models?.[provider] as Record<string, unknown> | undefined;
+  return (entry?.model as string) ?? '';
+}
+
 export default function GeneralSection({ config, onUpdate }: Props) {
-  const provider = (config.default_provider as string) ?? 'openrouter';
+  // The runtime reads [providers].fallback and [providers.models.<name>].model.
+  // Older builds of this form wrote top-level `default_provider` / `default_model`
+  // which the runtime ignored, so saves silently no-op'd. See #6047.
+  const providers = config.providers as Record<string, unknown> | undefined;
+  const provider = (providers?.fallback as string) ?? 'openrouter';
   const modelOptions = MODELS_BY_PROVIDER[provider];
-  const currentModel = (config.default_model as string) ?? '';
+  const currentModel = readProviderModel(config, provider);
 
   // When provider changes, auto-select the first model for that provider
   const handleProviderChange = (v: string) => {
-    onUpdate('default_provider', v);
+    onUpdate('providers.fallback', v);
     const models = MODELS_BY_PROVIDER[v];
-    if (models && models.length > 0) {
-      onUpdate('default_model', models[0]!.value);
+    const existing = readProviderModel(config, v);
+    if (!existing && models && models.length > 0) {
+      onUpdate(`providers.models.${v}.model`, models[0]!.value);
     }
+  };
+
+  const handleModelChange = (v: string) => {
+    onUpdate(`providers.models.${provider}.model`, v);
   };
 
   return (
@@ -179,7 +211,7 @@ export default function GeneralSection({ config, onUpdate }: Props) {
         {modelOptions ? (
           <Select
             value={modelOptions.some((o) => o.value === currentModel) ? currentModel : ''}
-            onChange={(v) => onUpdate('default_model', v)}
+            onChange={handleModelChange}
             options={[
               ...(currentModel && !modelOptions.some((o) => o.value === currentModel)
                 ? [{ value: currentModel, label: currentModel }]
@@ -191,7 +223,7 @@ export default function GeneralSection({ config, onUpdate }: Props) {
           <input
             type="text"
             value={currentModel}
-            onChange={(e) => onUpdate('default_model', e.target.value)}
+            onChange={(e) => handleModelChange(e.target.value)}
             placeholder="model name"
             className="input-electric text-sm px-3 py-1.5 w-52 font-mono"
           />

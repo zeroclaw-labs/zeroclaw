@@ -352,7 +352,7 @@ function OverviewTab({
             </h2>
           </div>
           <div className="grid grid-cols-2 gap-3">
-            {Object.entries(status.health.components).length === 0 ? (
+            {!status.health?.components || Object.entries(status.health.components).length === 0 ? (
               <p
                 className="text-sm col-span-2"
                 style={{ color: "var(--pc-text-faint)" }}
@@ -468,7 +468,7 @@ function SessionsTab() {
     return (
       <div
         className="rounded-2xl border p-4"
-        style={{ background: "rgba(239, 68, 68, 0.08)", borderColor: "rgba(239, 68, 68, 0.2)", color: "#f87171" }}
+        style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}
       >
         {t("dashboard.load_sessions_error")}: {error}
       </div>
@@ -651,7 +651,7 @@ function ChannelsTab() {
     return (
       <div
         className="rounded-2xl border p-4"
-        style={{ background: "rgba(239, 68, 68, 0.08)", borderColor: "rgba(239, 68, 68, 0.2)", color: "#f87171" }}
+        style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}
       >
         {t("dashboard.load_channels_error")}: {error}
       </div>
@@ -802,7 +802,7 @@ export default function Dashboard() {
   if (error) {
     return (
       <div className="p-6 animate-fade-in">
-        <div className="rounded-2xl border p-4" style={{ background: "rgba(239, 68, 68, 0.08)", borderColor: "rgba(239, 68, 68, 0.2)", color: "#f87171", }}>
+        <div className="rounded-2xl border p-4" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
           {t("dashboard.load_error")}: {error}
         </div>
       </div>

@@ -80,13 +80,13 @@ export default function Config() {
       </div>
 
       {/* Sensitive fields note */}
-      <div className="flex items-start gap-3 rounded-2xl p-4 border flex-shrink-0" style={{ borderColor: 'rgba(255, 170, 0, 0.2)', background: 'rgba(255, 170, 0, 0.05)' }}>
+      <div className="flex items-start gap-3 rounded-2xl p-4 border flex-shrink-0" style={{ borderColor: 'var(--color-status-warning-alpha-20)', background: 'var(--color-status-warning-alpha-05)' }}>
         <ShieldAlert className="h-5 w-5 flex-shrink-0 mt-0.5" style={{ color: 'var(--color-status-warning)' }} />
         <div>
           <p className="text-sm font-medium" style={{ color: 'var(--color-status-warning)' }}>
             {t('config.sensitive_title')}
           </p>
-          <p className="text-sm mt-0.5" style={{ color: 'rgba(255, 170, 0, 0.7)' }}>
+          <p className="text-sm mt-0.5" style={{ color: 'var(--color-status-warning)', opacity: 0.7 }}>
             {t('config.sensitive_hint')}
           </p>
         </div>
@@ -94,7 +94,7 @@ export default function Config() {
 
       {/* Success message */}
       {success && (
-        <div className="flex items-center gap-2 rounded-xl p-3 border animate-fade-in flex-shrink-0" style={{ borderColor: 'rgba(0, 230, 138, 0.2)', background: 'rgba(0, 230, 138, 0.06)' }}>
+        <div className="flex items-center gap-2 rounded-xl p-3 border animate-fade-in flex-shrink-0" style={{ borderColor: 'var(--color-status-success-alpha-20)', background: 'var(--color-status-success-alpha-08)' }}>
           <CheckCircle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-status-success)' }} />
           <span className="text-sm" style={{ color: 'var(--color-status-success)' }}>{success}</span>
         </div>
@@ -102,7 +102,7 @@ export default function Config() {
 
       {/* Error / parse error message */}
       {(error || parseError) && (
-        <div className="flex items-center gap-2 rounded-xl p-3 border animate-fade-in flex-shrink-0" style={{ borderColor: 'rgba(239, 68, 68, 0.2)', background: 'rgba(239, 68, 68, 0.06)' }}>
+        <div className="flex items-center gap-2 rounded-xl p-3 border animate-fade-in flex-shrink-0" style={{ borderColor: 'var(--color-status-error-alpha-20)', background: 'var(--color-status-error-alpha-08)' }}>
           <AlertTriangle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-status-error)' }} />
           <span className="text-sm" style={{ color: 'var(--color-status-error)' }}>{error || parseError}</span>
         </div>

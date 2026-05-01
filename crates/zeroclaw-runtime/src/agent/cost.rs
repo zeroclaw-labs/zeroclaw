@@ -1,9 +1,20 @@
 use crate::cost::CostTracker;
 use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use zeroclaw_config::schema::ModelPricing;
 
 // ── Cost tracking via task-local ──
+
+/// Per-scope token/cost accumulator. Records pushed by
+/// `record_tool_loop_cost_usage` alongside the shared `CostTracker` so the
+/// wrapping code can read out the total for *this* call after the scope
+/// exits, without racing concurrent requests sharing the same tracker.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct TurnUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+}
 
 /// Context for cost tracking within the tool call loop.
 /// Scoped via `tokio::task_local!` at call sites (channels, gateway).
@@ -11,6 +22,7 @@ use zeroclaw_config::schema::ModelPricing;
 pub struct ToolLoopCostTrackingContext {
     pub tracker: Arc<CostTracker>,
     pub prices: Arc<std::collections::HashMap<String, ModelPricing>>,
+    pub turn_usage: Arc<Mutex<TurnUsage>>,
 }
 
 impl ToolLoopCostTrackingContext {
@@ -18,7 +30,20 @@ impl ToolLoopCostTrackingContext {
         tracker: Arc<CostTracker>,
         prices: Arc<std::collections::HashMap<String, ModelPricing>>,
     ) -> Self {
-        Self { tracker, prices }
+        Self {
+            tracker,
+            prices,
+            turn_usage: Arc::new(Mutex::new(TurnUsage::default())),
+        }
+    }
+
+    /// Snapshot the per-scope usage. Wrapping code calls this after the
+    /// scoped future completes to populate observer-event annotations.
+    pub fn snapshot_turn_usage(&self) -> TurnUsage {
+        self.turn_usage
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or_default()
     }
 }
 
@@ -76,6 +101,12 @@ pub fn record_tool_loop_cost_usage(
             model,
             "Failed to record cost tracking usage: {error}"
         );
+    }
+
+    if let Ok(mut usage) = ctx.turn_usage.lock() {
+        usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
+        usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
+        usage.cost_usd += cost_usage.cost_usd;
     }
 
     Some((cost_usage.total_tokens, cost_usage.cost_usd))
