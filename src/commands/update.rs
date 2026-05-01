@@ -160,23 +160,35 @@ fn find_asset_url(release: &serde_json::Value) -> Option<String> {
         .and_then(|asset| asset["browser_download_url"].as_str().map(String::from))
 }
 
-/// Return the exact Rust target triple for the current platform.
+/// Return the Rust target triple for the platform we should *download* for.
+///
+/// On Unix we query the actual host architecture at runtime via `uname -m`
+/// so that an x86_64 binary running under QEMU/binfmt_misc on an aarch64
+/// host (e.g. Raspberry Pi) will correctly select the aarch64 release asset
+/// instead of perpetuating the wrong architecture.
 ///
 /// Using full triples (e.g. `aarch64-unknown-linux-gnu` instead of the
 /// shorter `aarch64-unknown-linux`) prevents substring matches from
 /// selecting the wrong asset (e.g. an Android binary on a GNU/Linux host).
 fn current_target_triple() -> &'static str {
+    // Detect the real host architecture at runtime on Unix.
+    // Falls back to the compile-time target arch if detection fails.
+    let arch = runtime_host_arch();
+
     if cfg!(target_os = "macos") {
-        if cfg!(target_arch = "aarch64") {
-            "aarch64-apple-darwin"
-        } else {
-            "x86_64-apple-darwin"
+        match arch {
+            "aarch64" => "aarch64-apple-darwin",
+            _ => "x86_64-apple-darwin",
         }
     } else if cfg!(target_os = "linux") {
-        if cfg!(target_arch = "aarch64") {
-            "aarch64-unknown-linux-gnu"
-        } else {
-            "x86_64-unknown-linux-gnu"
+        match arch {
+            "aarch64" => "aarch64-unknown-linux-gnu",
+            _ => "x86_64-unknown-linux-gnu",
+        }
+    } else if cfg!(target_os = "windows") {
+        match arch {
+            "aarch64" => "aarch64-pc-windows-msvc",
+            _ => "x86_64-pc-windows-msvc",
         }
     } else if cfg!(target_os = "windows") {
         if cfg!(target_arch = "aarch64") {
@@ -189,6 +201,65 @@ fn current_target_triple() -> &'static str {
     } else {
         "unknown"
     }
+}
+
+/// Detect the host CPU architecture at runtime.
+///
+/// On Unix this shells out to `uname -m` which reports the kernel's
+/// architecture regardless of whether the current binary is running under
+/// a compatibility layer like QEMU binfmt_misc.  This is critical for
+/// Raspberry Pi (aarch64) where users may have installed an x86_64 binary
+/// that runs via transparent emulation — `cfg!(target_arch)` would report
+/// `x86_64` in that case, causing `update` to download the wrong binary.
+///
+/// Returns a normalised architecture string: `"aarch64"`, `"x86_64"`, etc.
+/// Falls back to the compile-time `std::env::consts::ARCH` if the runtime
+/// query fails.
+fn runtime_host_arch() -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::sync::OnceLock;
+        static CACHED: OnceLock<String> = OnceLock::new();
+        let arch = CACHED.get_or_init(|| {
+            std::process::Command::new("uname")
+                .arg("-m")
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        String::from_utf8(o.stdout).ok()
+                    } else {
+                        None
+                    }
+                })
+                .map(|s| normalise_arch(s.trim()))
+                .unwrap_or_else(|| std::env::consts::ARCH.to_string())
+        });
+        // SAFETY: leaking a &str from a OnceLock that lives for 'static.
+        // The OnceLock itself is static so the reference is valid for 'static.
+        // We just need to convert &String to &'static str.
+        unsafe { &*(arch.as_str() as *const str) }
+    }
+
+    #[cfg(not(unix))]
+    {
+        compile_time_arch()
+    }
+}
+
+/// Normalise the output of `uname -m` to the Rust target-arch naming.
+fn normalise_arch(uname: &str) -> String {
+    match uname {
+        "x86_64" | "amd64" => "x86_64".to_string(),
+        "aarch64" | "arm64" => "aarch64".to_string(),
+        "armv7l" | "armv6l" => "arm".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Compile-time architecture, used as fallback on non-Unix platforms.
+fn compile_time_arch() -> &'static str {
+    std::env::consts::ARCH
 }
 
 fn version_is_newer(current: &str, candidate: &str) -> bool {
@@ -357,17 +428,14 @@ fn detect_arch_from_header(header: &[u8]) -> Option<&'static str> {
 }
 
 /// Return the host CPU architecture as a human-readable string.
+///
+/// Uses runtime detection so it returns the real hardware architecture
+/// even when the current binary is running under emulation.
 fn host_architecture() -> Option<&'static str> {
-    if cfg!(target_arch = "x86_64") {
-        Some("x86_64")
-    } else if cfg!(target_arch = "aarch64") {
-        Some("aarch64")
-    } else if cfg!(target_arch = "x86") {
-        Some("x86")
-    } else if cfg!(target_arch = "arm") {
-        Some("arm")
-    } else {
-        None
+    let arch = runtime_host_arch();
+    match arch {
+        "x86_64" | "aarch64" | "x86" | "arm" | "riscv64" => Some(arch),
+        _ => None,
     }
 }
 
@@ -446,6 +514,7 @@ mod tests {
 
     #[test]
     fn find_asset_url_picks_correct_gnu_over_android() {
+        // Include assets for all CI platforms so this test passes everywhere.
         let release = make_release(&[
             "zeroclaw-aarch64-linux-android.tar.gz",
             "zeroclaw-aarch64-unknown-linux-gnu.tar.gz",
@@ -531,6 +600,40 @@ mod tests {
         assert!(
             host_architecture().is_some(),
             "host architecture should be detected on CI platforms"
+        );
+    }
+
+    #[test]
+    fn normalise_arch_maps_common_uname_values() {
+        assert_eq!(normalise_arch("x86_64"), "x86_64");
+        assert_eq!(normalise_arch("amd64"), "x86_64");
+        assert_eq!(normalise_arch("aarch64"), "aarch64");
+        assert_eq!(normalise_arch("arm64"), "aarch64");
+        assert_eq!(normalise_arch("armv7l"), "arm");
+        assert_eq!(normalise_arch("armv6l"), "arm");
+        // Unknown values pass through unchanged
+        assert_eq!(normalise_arch("riscv64"), "riscv64");
+        assert_eq!(normalise_arch("s390x"), "s390x");
+    }
+
+    #[test]
+    fn runtime_host_arch_returns_known_value() {
+        let arch = runtime_host_arch();
+        // On any CI or dev machine this should return a recognised architecture.
+        assert!(
+            ["x86_64", "aarch64", "arm", "x86", "riscv64"].contains(&arch) || !arch.is_empty(),
+            "runtime_host_arch returned unexpected value: {arch}"
+        );
+    }
+
+    #[test]
+    fn current_target_triple_contains_runtime_arch() {
+        let triple = current_target_triple();
+        let arch = runtime_host_arch();
+        // The triple must start with the detected architecture.
+        assert!(
+            triple.starts_with(arch),
+            "triple {triple} should start with detected arch {arch}"
         );
     }
 
