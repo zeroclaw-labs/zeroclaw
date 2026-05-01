@@ -812,3 +812,91 @@ subreddits = ["rust"]
         vec!["rust".to_string()]
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Memory migration (#6017)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn memory_sqlite_v2_config_round_trips_without_data_loss() {
+    let config = migrate(
+        r#"
+[memory]
+backend = "sqlite"
+auto_save = true
+sqlite_open_timeout_secs = 30
+"#,
+    );
+
+    assert_eq!(config.memory.backend, "sqlite");
+    assert!(config.memory.auto_save);
+    assert_eq!(config.memory.sqlite_open_timeout_secs, Some(30));
+    // postgres defaults initialized even for sqlite users
+    assert!(!config.memory.postgres.vector_enabled);
+    assert_eq!(config.memory.postgres.vector_dimensions, 1536);
+}
+
+#[test]
+fn memory_sqlite_open_timeout_preserved() {
+    let config = migrate(
+        r#"
+[memory]
+backend = "sqlite"
+auto_save = true
+sqlite_open_timeout_secs = 120
+"#,
+    );
+
+    assert_eq!(config.memory.sqlite_open_timeout_secs, Some(120));
+}
+
+#[test]
+fn memory_legacy_pgvector_fields_moved_to_postgres_subsection() {
+    let config = migrate(
+        r#"
+[memory]
+backend = "postgres"
+auto_save = false
+pgvector_enabled = true
+pgvector_dimensions = 768
+"#,
+    );
+
+    assert_eq!(config.memory.backend, "postgres");
+    assert!(config.memory.postgres.vector_enabled);
+    assert_eq!(config.memory.postgres.vector_dimensions, 768);
+}
+
+#[test]
+fn memory_legacy_db_url_dropped_without_panic() {
+    // db_url moved to [storage]; we drop it silently to avoid unknown-key
+    // warnings during migration.
+    let config = migrate(
+        r#"
+[memory]
+backend = "sqlite"
+auto_save = false
+db_url = "postgres://user:pass@localhost/db"
+"#,
+    );
+
+    assert_eq!(config.memory.backend, "sqlite");
+}
+
+#[test]
+fn memory_postgres_subsection_preserved_when_already_present() {
+    let config = migrate(
+        r#"
+[memory]
+backend = "postgres"
+auto_save = false
+
+[memory.postgres]
+vector_enabled = true
+vector_dimensions = 1024
+"#,
+    );
+
+    assert!(config.memory.postgres.vector_enabled);
+    assert_eq!(config.memory.postgres.vector_dimensions, 1024);
+}

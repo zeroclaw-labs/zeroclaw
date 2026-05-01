@@ -191,6 +191,32 @@ impl V1Compat {
     }
 }
 
+/// Move a scalar string field into a `Vec<String>` field on the same TOML table.
+///
+/// Removes `old_key` from `section`. If the value is non-empty and not `"*"`,
+/// appends it to `new_key` (creating the array if absent), deduplicating in
+/// place. `"*"` wildcards and empty strings are silently dropped — they had
+/// no meaningful plural equivalent.
+///
+/// This is the canonical typed transformation path for scalar→vec field
+/// renames in the migration system. All compound-field shape changes in
+/// `prepare_table` should call this helper rather than inlining the pattern.
+pub(crate) fn scalar_to_vec(section: &mut toml::Table, old_key: &str, new_key: &str) {
+    if let Some(toml::Value::String(val)) = section.remove(old_key)
+        && !val.is_empty()
+        && val != "*"
+    {
+        let arr = section
+            .entry(new_key.to_string())
+            .or_insert_with(|| toml::Value::Array(Vec::new()));
+        if let toml::Value::Array(vec) = arr
+            && !vec.iter().any(|v| v.as_str() == Some(val.as_str()))
+        {
+            vec.push(toml::Value::String(val));
+        }
+    }
+}
+
 /// Pre-deserialization table migration for nested field changes that
 /// `#[serde(flatten)]` cannot capture (e.g. removing a field from a nested
 /// struct and moving its value elsewhere).
@@ -201,18 +227,8 @@ pub fn prepare_table(table: &mut toml::Table) {
     for key in &["channels_config", "channels"] {
         if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
             && let Some(toml::Value::Table(matrix)) = channels.get_mut("matrix")
-            && let Some(toml::Value::String(room_id)) = matrix.remove("room_id")
-            && !room_id.is_empty()
         {
-            let rooms = matrix
-                .entry("allowed_rooms")
-                .or_insert_with(|| toml::Value::Array(Vec::new()));
-            if let toml::Value::Array(arr) = rooms {
-                let already_present = arr.iter().any(|v| v.as_str() == Some(room_id.as_str()));
-                if !already_present {
-                    arr.push(toml::Value::String(room_id));
-                }
-            }
+            scalar_to_vec(matrix, "room_id", "allowed_rooms");
         }
     }
 
@@ -220,19 +236,8 @@ pub fn prepare_table(table: &mut toml::Table) {
     for key in &["channels_config", "channels"] {
         if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
             && let Some(toml::Value::Table(slack)) = channels.get_mut("slack")
-            && let Some(toml::Value::String(channel_id)) = slack.remove("channel_id")
-            && !channel_id.is_empty()
-            && channel_id != "*"
         {
-            let ids = slack
-                .entry("channel_ids")
-                .or_insert_with(|| toml::Value::Array(Vec::new()));
-            if let toml::Value::Array(arr) = ids {
-                let already_present = arr.iter().any(|v| v.as_str() == Some(channel_id.as_str()));
-                if !already_present {
-                    arr.push(toml::Value::String(channel_id));
-                }
-            }
+            scalar_to_vec(slack, "channel_id", "channel_ids");
         }
     }
 
@@ -240,19 +245,8 @@ pub fn prepare_table(table: &mut toml::Table) {
     for key in &["channels_config", "channels"] {
         if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
             && let Some(toml::Value::Table(mattermost)) = channels.get_mut("mattermost")
-            && let Some(toml::Value::String(channel_id)) = mattermost.remove("channel_id")
-            && !channel_id.is_empty()
-            && channel_id != "*"
         {
-            let ids = mattermost
-                .entry("channel_ids")
-                .or_insert_with(|| toml::Value::Array(Vec::new()));
-            if let toml::Value::Array(arr) = ids {
-                let already_present = arr.iter().any(|v| v.as_str() == Some(channel_id.as_str()));
-                if !already_present {
-                    arr.push(toml::Value::String(channel_id));
-                }
-            }
+            scalar_to_vec(mattermost, "channel_id", "channel_ids");
         }
     }
 
@@ -260,19 +254,8 @@ pub fn prepare_table(table: &mut toml::Table) {
     for key in &["channels_config", "channels"] {
         if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
             && let Some(toml::Value::Table(discord)) = channels.get_mut("discord")
-            && let Some(toml::Value::String(guild_id)) = discord.remove("guild_id")
-            && !guild_id.is_empty()
-            && guild_id != "*"
         {
-            let ids = discord
-                .entry("guild_ids")
-                .or_insert_with(|| toml::Value::Array(Vec::new()));
-            if let toml::Value::Array(arr) = ids {
-                let already_present = arr.iter().any(|v| v.as_str() == Some(guild_id.as_str()));
-                if !already_present {
-                    arr.push(toml::Value::String(guild_id));
-                }
-            }
+            scalar_to_vec(discord, "guild_id", "guild_ids");
         }
     }
 
@@ -305,18 +288,8 @@ pub fn prepare_table(table: &mut toml::Table) {
     for key in &["channels_config", "channels"] {
         if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
             && let Some(toml::Value::Table(reddit)) = channels.get_mut("reddit")
-            && let Some(toml::Value::String(subreddit)) = reddit.remove("subreddit")
-            && !subreddit.is_empty()
         {
-            let subs = reddit
-                .entry("subreddits")
-                .or_insert_with(|| toml::Value::Array(Vec::new()));
-            if let toml::Value::Array(arr) = subs {
-                let already_present = arr.iter().any(|v| v.as_str() == Some(subreddit.as_str()));
-                if !already_present {
-                    arr.push(toml::Value::String(subreddit));
-                }
-            }
+            scalar_to_vec(reddit, "subreddit", "subreddits");
         }
     }
 
@@ -331,19 +304,7 @@ pub fn prepare_table(table: &mut toml::Table) {
                 .or_else(|| channels.remove("discord_history"));
             if let Some(toml::Value::Table(mut dh_table)) = dh {
                 // Migrate discord-history's own guild_id to guild_ids.
-                if let Some(toml::Value::String(gid)) = dh_table.remove("guild_id")
-                    && !gid.is_empty()
-                    && gid != "*"
-                {
-                    let ids = dh_table
-                        .entry("guild_ids")
-                        .or_insert_with(|| toml::Value::Array(Vec::new()));
-                    if let toml::Value::Array(arr) = ids
-                        && !arr.iter().any(|v| v.as_str() == Some(gid.as_str()))
-                    {
-                        arr.push(toml::Value::String(gid));
-                    }
-                }
+                scalar_to_vec(&mut dh_table, "guild_id", "guild_ids");
                 // Drop fields that no longer exist on discord config.
                 dh_table.remove("store_dms");
                 dh_table.remove("respond_to_dms");
@@ -421,6 +382,33 @@ pub fn prepare_table(table: &mut toml::Table) {
                  [providers.models.<provider>.<alias>.pricing] — re-enter the \
                  values under the alias that uses this model."
             );
+        }
+    }
+
+    // V3: Migrate legacy top-level [memory] pgvector fields to [memory.postgres].
+    // PR #4714 removed the Postgres backend, stripping pgvector_enabled,
+    // pgvector_dimensions, and db_url from [memory]. PR #6015 re-introduced
+    // them under [memory.postgres]. Configs that still carry the old top-level
+    // keys are moved here so nothing is silently dropped.
+    if let Some(toml::Value::Table(memory)) = table.get_mut("memory") {
+        let pg_enabled = memory.remove("pgvector_enabled");
+        let pg_dims = memory.remove("pgvector_dimensions");
+        // db_url moved to [storage]; we only drop it here to avoid an
+        // unknown-key warning — operators should set it under [storage].
+        let _ = memory.remove("db_url");
+
+        if pg_enabled.is_some() || pg_dims.is_some() {
+            let postgres = memory
+                .entry("postgres")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if let toml::Value::Table(pg) = postgres {
+                if let Some(v) = pg_enabled {
+                    pg.entry("vector_enabled").or_insert(v);
+                }
+                if let Some(v) = pg_dims {
+                    pg.entry("vector_dimensions").or_insert(v);
+                }
+            }
         }
     }
 }
