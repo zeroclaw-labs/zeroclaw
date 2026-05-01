@@ -267,8 +267,4 @@
 
 ---
 
-<<<<<<< HEAD
-*Full diff: `git log v0.6.9..HEAD --oneline`*
-=======
 *Full diff: `git log v0.7.3..v0.7.4 --oneline`*
->>>>>>> master
