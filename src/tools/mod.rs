@@ -108,19 +108,10 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
-// SOP tool re-exports — registration into ToolRegistry lands when
-// SopEngine instantiation is wired into the agent/daemon (separate PR).
-// Until then the tool types must remain reachable for downstream
-// consumers and tests, hence the explicit allow.
-#[allow(unused_imports)]
 pub use sop_advance::SopAdvanceTool;
-#[allow(unused_imports)]
 pub use sop_approve::SopApproveTool;
-#[allow(unused_imports)]
 pub use sop_execute::SopExecuteTool;
-#[allow(unused_imports)]
 pub use sop_list::SopListTool;
-#[allow(unused_imports)]
 pub use sop_status::SopStatusTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -390,6 +381,22 @@ pub fn all_tools_with_runtime(
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+
+    // SOP engine + tools.
+    //
+    // Always registered. SopEngine.reload() returns an empty vec when the
+    // sops directory is missing, so deployments without SOPs incur no
+    // overhead beyond an Arc<Mutex<SopEngine>> allocation.
+    {
+        let mut engine = crate::sop::SopEngine::new(root_config.sop.clone());
+        engine.reload(workspace_dir);
+        let sop_engine = Arc::new(std::sync::Mutex::new(engine));
+        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
+    }
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
