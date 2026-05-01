@@ -108,6 +108,15 @@ pub fn parse_article(s: &str) -> Option<(u32, Option<u32>)> {
     Some((num, sub))
 }
 
+/// Human-readable display form: `민법 제750조` / `근로기준법 제43조의2`.
+/// Used for readable composite aliases in case slug (적용법조 인덱스).
+pub fn statute_display(law_name: &str, num: u32, sub: Option<u32>) -> String {
+    match sub {
+        Some(s) if s > 0 => format!("{} 제{}조의{}", law_name.trim(), num, s),
+        _ => format!("{} 제{}조", law_name.trim(), num),
+    }
+}
+
 /// Common human-readable alias forms for a statute article, for
 /// `vault_aliases`. Keep conservative — aliases are UNIQUE globally so
 /// collisions matter.

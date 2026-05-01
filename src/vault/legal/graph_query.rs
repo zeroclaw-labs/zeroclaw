@@ -1212,6 +1212,377 @@ fn build_label(slug: &str, kind: NodeKind, fm: &HashMap<String, String>) -> Stri
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// 쟁점 분석 (Issue Analysis) — 적용법조 그래프 기반 핵심 쟁점 식별
+// ═══════════════════════════════════════════════════════════════════
+//
+// 변호사의 판례 검색 워크플로를 코드로 구현:
+//
+//   1. 키워드 → 판례 검색
+//   2. 판례의 적용법조를 노드로 삼아 관련 판례 그래프를 확장
+//   3. 그래프에서 연결 밀도(degree centrality)가 높은 법조 = 핵심 쟁점 적용법조
+//   4. 연결 밀도가 낮은 법조 = 부수적 쟁점 (추가 공격방어방법 탐색 후보)
+//   5. 연결 노드가 집중되는 판례 = 리딩 판결
+//
+// "범용 법조" 필터: 형법 제37조(경합범) 등 거의 모든 사건에 형식적으로
+// 적용되는 조항은 높은 degree에도 불구하고 쟁점 가치가 낮다.
+// `BOILERPLATE_STATUTES` 목록으로 제외하거나 감점한다.
+
+/// Statutes that are procedurally applied to a large fraction of cases
+/// but rarely constitute the substantive legal issue. These are
+/// penalised (not removed) in centrality scoring so they don't crowd
+/// out actual issue statutes.
+///
+/// Maintained as a const list. If the list grows, migrate to a DB
+/// tag (`tag_type = 'boilerplate'`) for easier maintenance.
+pub const BOILERPLATE_STATUTES: &[&str] = &[
+    // 형법 — 경합범/누범/작량감경/집행유예 등
+    "statute::형법::37",   // 경합범
+    "statute::형법::38",   // 경합범 처리
+    "statute::형법::39",   // 판결을 받지 않은 경합범 처리
+    "statute::형법::40",   // 상상적경합
+    "statute::형법::35",   // 누범
+    "statute::형법::53",   // 작량감경
+    "statute::형법::55",   // 법률상감경
+    "statute::형법::62",   // 집행유예
+    "statute::형법::57",   // 판결선고전 구금일수 산입
+    "statute::형법::70",   // 노역장유치
+    // 형사소송법 — 절차 조항
+    "statute::형사소송법::334",  // 구속기간
+    "statute::형사소송법::369",  // 항소
+    "statute::형사소송법::383",  // 상고이유
+    "statute::형사소송법::396",  // 파기자판
+    // 민사소송법 — 절차 조항
+    "statute::민사소송법::288",  // 증명 불필요 사실
+    "statute::민사소송법::217",  // 자유심증주의
+    // 소송촉진등에관한특례법
+    "statute::소송촉진등에관한특례법::3",  // 지연이자
+];
+
+/// A statute node with its degree centrality in the issue graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueStatute {
+    /// Canonical slug, e.g. `statute::민법::750`.
+    pub slug: String,
+    /// Human label, e.g. `민법 제750조(불법행위의 내용)`.
+    pub label: String,
+    pub law_name: String,
+    pub article_key: String,
+    /// Raw count of distinct cases citing this statute within the analysis scope.
+    pub citing_case_count: usize,
+    /// Centrality score (0.0–1.0). Higher = more central = more likely core issue.
+    /// Boilerplate statutes are penalised by halving their raw score.
+    pub centrality: f64,
+    /// Classification derived from centrality ranking.
+    pub issue_tier: IssueTier,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueTier {
+    /// Core issue — highest centrality, most cases converge on this statute.
+    Core,
+    /// Supporting issue — moderate centrality, relevant but not central.
+    Supporting,
+    /// Peripheral — low centrality, potential supplementary attack/defence angle.
+    Peripheral,
+    /// Boilerplate — procedural/formal statute, not a substantive issue.
+    Boilerplate,
+}
+
+/// A case node ranked by how many issue-statutes it connects to.
+/// Cases that cite many core-issue statutes are leading-case candidates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankedCase {
+    pub slug: String,
+    pub case_number: String,
+    pub case_name: Option<String>,
+    pub court_name: Option<String>,
+    pub verdict_date: Option<String>,
+    /// Number of core + supporting issue statutes this case cites.
+    pub issue_statute_count: usize,
+    /// Sum of centrality scores of cited statutes → proxy for "leading-ness".
+    pub leading_score: f64,
+}
+
+/// Full issue-analysis result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueAnalysis {
+    /// Statutes ranked by centrality (core → supporting → peripheral → boilerplate).
+    pub statutes: Vec<IssueStatute>,
+    /// Cases ranked by leading_score (highest = most likely leading case).
+    pub cases: Vec<RankedCase>,
+    /// Total cases in the analysis scope.
+    pub total_cases: usize,
+    /// Total distinct statutes found.
+    pub total_statutes: usize,
+}
+
+/// Analyse the issue-statute graph starting from a set of seed cases.
+///
+/// This implements the 변호사 워크플로:
+///   1. From seed cases, collect all cited statutes (참조조문 edges).
+///   2. For each statute, find all cases that cite it (reverse lookup).
+///   3. For the expanded case set, collect their statutes again (2-hop).
+///   4. Score statutes by degree centrality (citing_case_count / total_cases).
+///   5. Classify into core / supporting / peripheral / boilerplate tiers.
+///   6. Score cases by sum of centrality of their cited statutes → leading cases.
+///
+/// `max_hops`: number of statute→case→statute expansion rounds (1 = direct, 2 = one expansion).
+/// `max_cases`: cap on total cases to prevent runaway on broad statutes.
+pub fn issue_analysis(
+    conn: &Connection,
+    seed_case_slugs: &[String],
+    max_hops: usize,
+    max_cases: usize,
+) -> Result<IssueAnalysis> {
+    let max_hops = max_hops.min(3); // safety cap
+    let max_cases = max_cases.min(5000);
+
+    // ── Phase 1: Expand the case↔statute graph ──
+    // statute_slug → set of case_slugs that cite it
+    let mut statute_to_cases: HashMap<String, HashSet<String>> = HashMap::new();
+    // case_slug → set of statute_slugs it cites
+    let mut case_to_statutes: HashMap<String, HashSet<String>> = HashMap::new();
+    // Frontier of case slugs to expand
+    let mut case_frontier: HashSet<String> = seed_case_slugs.iter().cloned().collect();
+    let mut all_cases: HashSet<String> = case_frontier.clone();
+
+    for _hop in 0..max_hops {
+        // For each case in the frontier, find its statute citations.
+        let mut new_statutes: HashSet<String> = HashSet::new();
+        for case_slug in &case_frontier {
+            let statutes = case_cited_statutes(conn, case_slug)?;
+            for s in &statutes {
+                statute_to_cases
+                    .entry(s.clone())
+                    .or_default()
+                    .insert(case_slug.clone());
+                new_statutes.insert(s.clone());
+            }
+            case_to_statutes
+                .entry(case_slug.clone())
+                .or_default()
+                .extend(statutes);
+        }
+
+        // For each newly discovered statute, find all citing cases.
+        let mut next_frontier: HashSet<String> = HashSet::new();
+        for statute_slug in &new_statutes {
+            let citing = statute_citing_cases(conn, statute_slug, max_cases)?;
+            for c in &citing {
+                statute_to_cases
+                    .entry(statute_slug.clone())
+                    .or_default()
+                    .insert(c.clone());
+                case_to_statutes
+                    .entry(c.clone())
+                    .or_default()
+                    .insert(statute_slug.clone());
+                if !all_cases.contains(c) {
+                    next_frontier.insert(c.clone());
+                    all_cases.insert(c.clone());
+                }
+            }
+            if all_cases.len() >= max_cases {
+                break;
+            }
+        }
+
+        case_frontier = next_frontier;
+        if case_frontier.is_empty() || all_cases.len() >= max_cases {
+            break;
+        }
+    }
+
+    let total_cases = all_cases.len().max(1);
+    let total_statutes = statute_to_cases.len();
+
+    // ── Phase 2: Score statutes by degree centrality ──
+    let is_boilerplate =
+        |slug: &str| BOILERPLATE_STATUTES.iter().any(|b| slug == *b);
+
+    let mut issue_statutes: Vec<IssueStatute> = Vec::with_capacity(total_statutes);
+    for (slug, cases) in &statute_to_cases {
+        let raw_centrality = cases.len() as f64 / total_cases as f64;
+        let centrality = if is_boilerplate(slug) {
+            raw_centrality * 0.1 // 90% penalty for boilerplate
+        } else {
+            raw_centrality
+        };
+
+        // Hydrate label from DB.
+        let (label, law_name, article_key) = match get_node(conn, slug)? {
+            Some(n) => (
+                n.label,
+                n.law_name.unwrap_or_default(),
+                n.article_key.unwrap_or_default(),
+            ),
+            None => (slug.clone(), String::new(), String::new()),
+        };
+
+        issue_statutes.push(IssueStatute {
+            slug: slug.clone(),
+            label,
+            law_name,
+            article_key,
+            citing_case_count: cases.len(),
+            centrality,
+            issue_tier: IssueTier::Peripheral, // placeholder, assigned below
+        });
+    }
+
+    // Sort by centrality descending.
+    issue_statutes.sort_by(|a, b| b.centrality.partial_cmp(&a.centrality).unwrap());
+
+    // ── Phase 3: Classify tiers ──
+    // Thresholds are relative to the highest non-boilerplate centrality.
+    let max_centrality = issue_statutes
+        .iter()
+        .filter(|s| !is_boilerplate(&s.slug))
+        .map(|s| s.centrality)
+        .fold(0.0_f64, f64::max);
+
+    for s in &mut issue_statutes {
+        if is_boilerplate(&s.slug) {
+            s.issue_tier = IssueTier::Boilerplate;
+        } else if max_centrality > 0.0 {
+            let ratio = s.centrality / max_centrality;
+            if ratio >= 0.5 {
+                s.issue_tier = IssueTier::Core;
+            } else if ratio >= 0.15 {
+                s.issue_tier = IssueTier::Supporting;
+            } else {
+                s.issue_tier = IssueTier::Peripheral;
+            }
+        }
+    }
+
+    // ── Phase 4: Score cases → leading case identification ──
+    // A case's "leading score" = sum of centrality of all core+supporting
+    // issue statutes it cites. Higher score → more issue-rich → more likely
+    // to be the leading judgment.
+    let centrality_map: HashMap<&str, f64> = issue_statutes
+        .iter()
+        .map(|s| (s.slug.as_str(), s.centrality))
+        .collect();
+
+    let mut ranked_cases: Vec<RankedCase> = Vec::with_capacity(all_cases.len());
+    for case_slug in &all_cases {
+        let statutes = case_to_statutes.get(case_slug.as_str());
+        let (issue_count, leading_score) = statutes
+            .map(|ss| {
+                let mut count = 0usize;
+                let mut score = 0.0f64;
+                for s in ss {
+                    if let Some(&c) = centrality_map.get(s.as_str()) {
+                        // Only count non-boilerplate
+                        if !is_boilerplate(s) {
+                            count += 1;
+                            score += c;
+                        }
+                    }
+                }
+                (count, score)
+            })
+            .unwrap_or((0, 0.0));
+
+        // Hydrate case metadata.
+        let (case_number, case_name, court_name, verdict_date) = match get_node(conn, case_slug)? {
+            Some(n) => (
+                n.case_number.unwrap_or_else(|| case_slug.clone()),
+                n.case_name,
+                n.court_name,
+                n.verdict_date,
+            ),
+            None => (case_slug.clone(), None, None, None),
+        };
+
+        ranked_cases.push(RankedCase {
+            slug: case_slug.clone(),
+            case_number,
+            case_name,
+            court_name,
+            verdict_date,
+            issue_statute_count: issue_count,
+            leading_score,
+        });
+    }
+
+    // Sort by leading_score descending, then by verdict_date descending for ties.
+    ranked_cases.sort_by(|a, b| {
+        b.leading_score
+            .partial_cmp(&a.leading_score)
+            .unwrap()
+            .then_with(|| {
+                b.verdict_date
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(a.verdict_date.as_deref().unwrap_or(""))
+            })
+    });
+
+    Ok(IssueAnalysis {
+        statutes: issue_statutes,
+        cases: ranked_cases,
+        total_cases,
+        total_statutes,
+    })
+}
+
+// ── Helpers for issue_analysis ──
+
+/// Find all statute slugs cited by a case (outbound `cites` edges).
+fn case_cited_statutes(conn: &Connection, case_slug: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for schema in active_schemas(conn) {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT l.target_raw FROM {schema}.vault_links l
+             JOIN {schema}.vault_documents d ON d.id = l.source_doc_id
+             WHERE d.title = ?1 AND l.display_text = 'cites'
+               AND l.target_raw LIKE 'statute::%'"
+        ))?;
+        let rows = stmt.query_map(params![case_slug], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Find all case slugs that cite a given statute (reverse lookup via vault_links).
+fn statute_citing_cases(
+    conn: &Connection,
+    statute_slug: &str,
+    max_results: usize,
+) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for schema in active_schemas(conn) {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT d.title FROM {schema}.vault_links l
+             JOIN {schema}.vault_documents d ON d.id = l.source_doc_id
+             WHERE l.target_raw = ?1 AND l.display_text = 'cites'
+               AND d.doc_type = 'case'
+             LIMIT ?2"
+        ))?;
+        let remaining = max_results.saturating_sub(out.len());
+        let rows = stmt.query_map(params![statute_slug, remaining as i64], |r| {
+            r.get::<_, String>(0)
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+        if out.len() >= max_results {
+            break;
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
