@@ -17965,6 +17965,27 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
+    async fn prop_is_secret_routes_through_hashmap_keyed_paths() {
+        // Regression: the macro's HashMap<String, T> arm previously passed the
+        // full materialised path (e.g. `providers.models.openrouter.api-key`)
+        // straight to the inner type's `prop_is_secret`, which then matched on
+        // its own configurable_prefix and returned false. Result: the CLI's
+        // `config set --json` and the gateway's PropResponse both took the
+        // non-secret branch and emitted `{value}` instead of `{populated}` for
+        // any secret on a map-keyed nested type.
+        assert!(Config::prop_is_secret(
+            "providers.models.openrouter.api-key"
+        ));
+        assert!(Config::prop_is_secret("providers.models.default.api-key"));
+        assert!(!Config::prop_is_secret(
+            "providers.models.openrouter.endpoint"
+        ));
+        assert!(!Config::prop_is_secret(
+            "providers.models.openrouter.context-window"
+        ));
+    }
+
+    #[test]
     async fn enum_variants_callback_returns_values() {
         let mx = test_matrix_config();
         let fields = mx.prop_fields();
