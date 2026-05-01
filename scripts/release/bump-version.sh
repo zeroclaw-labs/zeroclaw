@@ -64,18 +64,24 @@ if [[ -f "$TAURI_CONF" ]]; then
   changed=$((changed + 1))
 fi
 
-# ── Workspace path dependencies (Cargo.toml) ───────────────────────
-# Bumps version pins on every path dep in [workspace.dependencies], skipping
-# aardvark* (which tracks its own independent version).
-echo "Workspace path deps..."
+# ── Workspace Cargo.toml ───────────────────────────────────────────
+# Bumps [workspace.package] version (the root version inherited by every child
+# crate via `version.workspace = true`) and the version pins on every path dep
+# in [workspace.dependencies], skipping aardvark* which tracks an independent
+# version.
+echo "Workspace Cargo.toml..."
 ROOT_CARGO="$REPO_ROOT/Cargo.toml"
 if [[ -f "$ROOT_CARGO" ]]; then
   before="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
+  # [workspace.package] version — first bare `version = "..."` line in the file
+  sed -i -E '0,/^version = "[^"]+"/s||version = "'"$VERSION"'"|' "$ROOT_CARGO" 2>/dev/null \
+    || sed -i '' -E '/^version = "[^"]+"/{s//version = "'"$VERSION"'"/;:a;n;ba;}' "$ROOT_CARGO"
+  # [workspace.dependencies] path-dep version pins, skipping aardvark*
   sed -i -E '/path = "crates\/aardvark/!s|(path = "crates/[^"]+", version = ")[^"]+(")|\1'"$VERSION"'\2|' "$ROOT_CARGO" 2>/dev/null \
     || sed -i '' -E '/path = "crates\/aardvark/!s|(path = "crates/[^"]+", version = ")[^"]+(")|\1'"$VERSION"'\2|' "$ROOT_CARGO"
   after="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
   if [[ "$before" != "$after" ]]; then
-    echo "  updated: Cargo.toml ([workspace.dependencies] path deps)"
+    echo "  updated: Cargo.toml ([workspace.package] + [workspace.dependencies])"
     changed=$((changed + 1))
   fi
 fi
