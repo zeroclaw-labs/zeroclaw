@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -38,11 +40,11 @@ pub struct Hand {
     pub max_history: usize,
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
-fn default_max_runs() -> usize {
+const fn default_max_runs() -> usize {
     100
 }
 
@@ -92,9 +94,9 @@ pub struct HandContext {
     /// Past runs, most-recent first, capped at `Hand::max_history`
     #[serde(default)]
     pub history: Vec<HandRun>,
-    /// Persistent facts learned across runs
+    /// Persistent facts learned across runs (deduplicated via HashSet)
     #[serde(default)]
-    pub learned_facts: Vec<String>,
+    pub learned_facts: HashSet<String>,
     /// Timestamp of the last completed run
     pub last_run: Option<DateTime<Utc>>,
     /// Total number of successful runs
@@ -108,7 +110,7 @@ impl HandContext {
         Self {
             hand_name: hand_name.to_string(),
             history: Vec::new(),
-            learned_facts: Vec::new(),
+            learned_facts: HashSet::new(),
             last_run: None,
             total_runs: 0,
         }
@@ -121,12 +123,8 @@ impl HandContext {
             self.last_run = run.finished_at;
         }
 
-        // Merge new knowledge
-        for fact in &run.knowledge_added {
-            if !self.learned_facts.contains(fact) {
-                self.learned_facts.push(fact.clone());
-            }
-        }
+        // Merge new knowledge (HashSet handles deduplication automatically)
+        self.learned_facts.extend(run.knowledge_added.iter().cloned());
 
         // Insert at the front (most-recent first)
         self.history.insert(0, run);
@@ -274,7 +272,8 @@ every_ms = 3600000
         assert_eq!(ctx.total_runs, 1);
         assert!(ctx.last_run.is_some());
         assert_eq!(ctx.history.len(), 1);
-        assert_eq!(ctx.learned_facts, vec!["learned-fact-A"]);
+        assert_eq!(ctx.learned_facts.len(), 1);
+        assert!(ctx.learned_facts.contains("learned-fact-A"));
     }
 
     #[test]
@@ -328,7 +327,8 @@ every_ms = 3600000
         assert_eq!(parsed.hand_name, "scanner");
         assert_eq!(parsed.total_runs, 1);
         assert_eq!(parsed.history.len(), 1);
-        assert_eq!(parsed.learned_facts, vec!["learned-fact-A"]);
+        assert_eq!(parsed.learned_facts.len(), 1);
+        assert!(parsed.learned_facts.contains("learned-fact-A"));
     }
 
     #[test]

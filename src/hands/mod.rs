@@ -179,7 +179,8 @@ every_ms = 60000
         assert_eq!(loaded.hand_name, "test-hand");
         assert_eq!(loaded.total_runs, 1);
         assert_eq!(loaded.history.len(), 1);
-        assert_eq!(loaded.learned_facts, vec!["learned something"]);
+        assert_eq!(loaded.learned_facts.len(), 1);
+        assert!(loaded.learned_facts.contains("learned something"));
     }
 
     #[test]
