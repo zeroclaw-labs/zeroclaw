@@ -17,6 +17,7 @@ pub mod schema;
 pub mod secrets;
 pub mod traits;
 pub mod typed_value;
+pub mod validation_warnings;
 pub mod workspace;
 
 /// Shim module so `Configurable` derive macro's generated `crate::config::*` paths resolve.

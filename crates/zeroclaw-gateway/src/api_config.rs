@@ -97,14 +97,28 @@ pub struct PatchOpResult {
 pub struct PatchResponse {
     pub saved: bool,
     pub results: Vec<PatchOpResult>,
+    /// Non-fatal validation warnings against the post-save config state.
+    /// Empty when nothing is flagged. Surfaces what the CLI prints on
+    /// stderr so dashboard callers see the same signal — e.g.
+    /// `providers.fallback` referencing a non-existent provider returns
+    /// HTTP 200 with the save committed, plus a `dangling_provider_fallback`
+    /// warning here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<zeroclaw_config::validation_warnings::ValidationWarning>,
 }
 
-/// Response for a non-secret GET.
+/// Response for a non-secret GET / PUT / DELETE.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct PropResponse {
     pub path: String,
     pub value: serde_json::Value,
+    /// Non-fatal validation warnings against the current config state.
+    /// On GET this surfaces warnings present in the loaded config; on PUT
+    /// this surfaces warnings against the post-save state. Empty when
+    /// nothing is flagged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<zeroclaw_config::validation_warnings::ValidationWarning>,
 }
 
 /// Response for a secret GET / PUT / DELETE — never carries the value or its
@@ -420,9 +434,11 @@ pub async fn handle_prop_get(
             // For typed-value fidelity, callers should hit OPTIONS to learn
             // the type and parse client-side. Future iterations can route
             // typed values through serde directly.
+            let warnings = config.collect_warnings();
             axum::Json(PropResponse {
                 path: q.path,
                 value: serde_json::Value::String(value_str),
+                warnings,
             })
             .into_response()
         }
@@ -464,6 +480,11 @@ pub async fn handle_prop_put(
     }
 
     let config_path = new_config.config_path.clone();
+    // Collect non-fatal validation warnings against the post-save state
+    // before the config is moved into persist_and_swap. Warnings here are
+    // the same signal `validate()` emits via `tracing::warn!` — surfaced
+    // structured so dashboard callers see what CLI users see on stderr.
+    let warnings = new_config.collect_warnings();
     if let Err(e) = persist_and_swap(&state, new_config).await {
         return error_response(e);
     }
@@ -486,6 +507,7 @@ pub async fn handle_prop_put(
         axum::Json(PropResponse {
             path: body.path,
             value: serde_json::Value::String(value_str),
+            warnings,
         })
         .into_response()
     }
@@ -522,6 +544,7 @@ pub async fn handle_prop_delete(
         return error_response(ConfigApiError::from_validation(e).with_path(&q.path));
     }
 
+    let warnings = new_config.collect_warnings();
     if let Err(e) = persist_and_swap(&state, new_config).await {
         return error_response(e);
     }
@@ -536,6 +559,7 @@ pub async fn handle_prop_delete(
         axum::Json(PropResponse {
             path: q.path,
             value: serde_json::Value::Null,
+            warnings,
         })
         .into_response()
     }
@@ -937,6 +961,11 @@ pub async fn handle_patch(
         .collect();
 
     let config_path = working.config_path.clone();
+    // Collect non-fatal validation warnings against the post-save state
+    // before working is moved into persist_and_swap. Same signal as
+    // `tracing::warn!` from `validate()`, surfaced structured so dashboard
+    // callers see it.
+    let warnings = working.collect_warnings();
     if let Err(e) = persist_and_swap(&state, working).await {
         return error_response(e);
     }
@@ -952,6 +981,7 @@ pub async fn handle_patch(
     axum::Json(PatchResponse {
         saved: true,
         results,
+        warnings,
     })
     .into_response()
 }
@@ -1415,6 +1445,45 @@ mod tests {
             json_to_setprop_string(&serde_json::json!("10.0.0.1"), Some(PropKind::String))
                 .expect("coerce string");
         assert_eq!(actual, want_typed);
+    }
+
+    #[test]
+    fn collect_warnings_surfaces_dangling_provider_fallback() {
+        // Pin the contract that drives the WARN-visibility fix: a config
+        // where `providers.fallback` references a key not present in
+        // `providers.models` returns a structured warning with a stable
+        // code, suitable for inclusion in PUT/PATCH/GET responses.
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.set_prop("providers.fallback", "nonexistent")
+            .expect("set_prop fallback");
+
+        let warnings = cfg.collect_warnings();
+        let dangling = warnings
+            .iter()
+            .find(|w| w.code == "dangling_provider_fallback")
+            .expect("expected dangling_provider_fallback warning");
+        assert_eq!(dangling.path, "providers.fallback");
+        assert!(
+            dangling.message.contains("nonexistent"),
+            "warning message should name the dangling key, got {:?}",
+            dangling.message
+        );
+    }
+
+    #[test]
+    fn collect_warnings_empty_when_fallback_unset() {
+        // Default config has no `providers.fallback` set → no dangling
+        // warning (the check is gated on `Some(fallback_key)`). Pin the
+        // negative case so a regression that always-emits the warning
+        // gets caught.
+        let cfg = zeroclaw_config::schema::Config::default();
+        let warnings = cfg.collect_warnings();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "dangling_provider_fallback"),
+            "default config should have no dangling-fallback warning, got {warnings:?}"
+        );
     }
 
     #[test]

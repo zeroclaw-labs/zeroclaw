@@ -10232,6 +10232,38 @@ impl Config {
         }
     }
 
+    /// Collect non-fatal validation warnings — config that loads and
+    /// validates successfully (`validate()` returns `Ok(())`) but will fail
+    /// at runtime because of a logical inconsistency the schema cannot
+    /// enforce structurally.
+    ///
+    /// Called by `validate()` (which emits each warning via `tracing::warn!`
+    /// for log visibility) and by the gateway HTTP API (which returns the
+    /// structured list in `PropResponse` / `PatchResponse` so dashboard
+    /// callers see the same signal the CLI sees on stderr).
+    ///
+    /// Adding a new warning: append a check here, pick a stable `code`,
+    /// and document the code in `validation_warnings.rs`.
+    pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
+        use crate::validation_warnings::ValidationWarning;
+        let mut warnings = Vec::new();
+
+        // providers.fallback references a key not present in providers.models
+        if let Some(ref fallback_key) = self.providers.fallback
+            && !self.providers.models.contains_key(fallback_key)
+        {
+            warnings.push(ValidationWarning::new(
+                "dangling_provider_fallback",
+                format!(
+                    "providers.fallback references '{fallback_key}' which does not exist in providers.models; provider resolution will fail at runtime"
+                ),
+                "providers.fallback",
+            ));
+        }
+
+        warnings
+    }
+
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch
@@ -10520,15 +10552,13 @@ impl Config {
             }
         }
 
-        // Providers — fallback reference check
-        if let Some(ref fallback_key) = self.providers.fallback
-            && !self.providers.models.contains_key(fallback_key)
-        {
-            tracing::warn!(
-                "providers.fallback references '{}' which does not exist in providers.models; \
-                 provider resolution will fail at runtime",
-                fallback_key
-            );
+        // Non-fatal validation warnings: surfaced both via tracing (CLI sees
+        // on stderr) and via Config::collect_warnings (gateway HTTP returns
+        // structured to dashboard callers). Single source of truth lives in
+        // collect_warnings; emit each one to tracing here so the existing
+        // log behavior is preserved.
+        for w in self.collect_warnings() {
+            tracing::warn!(path = %w.path, code = %w.code, "{}", w.message);
         }
 
         // Ollama cloud-routing safety checks

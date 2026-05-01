@@ -186,10 +186,32 @@ export function getHealth(): Promise<HealthSnapshot> {
 // removed; the gateway no longer exposes those endpoints.
 // ---------------------------------------------------------------------------
 
+/**
+ * One non-fatal validation warning surfaced after a successful save —
+ * config that loads and validates structurally but will fail at agent
+ * runtime because of a logical inconsistency (e.g. `providers.fallback`
+ * referencing a key not present in `providers.models`). Matches the
+ * `tracing::warn!` signal the CLI shows on stderr; surfaced structured so
+ * the dashboard can render it next to the offending field.
+ */
+export interface ValidationWarning {
+  /** Stable machine-readable identifier (e.g. `'dangling_provider_fallback'`). */
+  code: string;
+  /** Human-readable description suitable for direct display. */
+  message: string;
+  /** Dotted property path the warning concerns (e.g. `'providers.fallback'`). */
+  path: string;
+}
+
 export interface PropResponse {
   path: string;
   value?: unknown;
   populated?: boolean;
+  /**
+   * Non-fatal validation warnings against the current config state. Empty
+   * (or absent) when nothing is flagged.
+   */
+  warnings?: ValidationWarning[];
 }
 
 export interface ListResponseEntry {
@@ -243,6 +265,11 @@ export interface PatchOpResult {
 export interface PatchResponse {
   saved: boolean;
   results: PatchOpResult[];
+  /**
+   * Non-fatal validation warnings against the post-save config state.
+   * Empty (or absent) when nothing is flagged.
+   */
+  warnings?: ValidationWarning[];
 }
 
 export interface ConfigApiError {
