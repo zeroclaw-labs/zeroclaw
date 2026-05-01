@@ -15,6 +15,11 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::schema::{DelegateAgentConfig, DelegateToolConfig};
 use zeroclaw_memory::{Memory, NamespacedMemory};
 use zeroclaw_providers::{self, ChatMessage, Provider};
+use zeroclaw_tools::memory_export::MemoryExportTool;
+use zeroclaw_tools::memory_forget::MemoryForgetTool;
+use zeroclaw_tools::memory_purge::MemoryPurgeTool;
+use zeroclaw_tools::memory_recall::MemoryRecallTool;
+use zeroclaw_tools::memory_store::MemoryStoreTool;
 
 /// Fallback temperature for sub-agent tool loops when the delegate config
 /// leaves it unset; matches the longstanding agentic default that balances
@@ -209,7 +214,6 @@ impl DelegateTool {
     /// Wrap memory with namespace isolation if configured for the given agent.
     /// Returns the namespaced memory if memory_namespace is set, otherwise returns
     /// the original memory.
-    #[allow(dead_code)] // WIP: will be used when delegate agents support memory
     fn get_agent_memory(&self, agent_config: &DelegateAgentConfig) -> Option<Arc<dyn Memory>> {
         self.memory.as_ref().map(|mem| {
             if let Some(namespace) = &agent_config.memory_namespace {
@@ -218,6 +222,53 @@ impl DelegateTool {
                 mem.clone()
             }
         })
+    }
+
+    /// Build the effective tool registry for an agentic sub-agent.
+    ///
+    /// Most tools can safely reuse the parent/root tool instances. Memory tools
+    /// are special because delegate agents may have a `memory_namespace`; those
+    /// tools must be rebuilt against the namespaced memory wrapper so stores and
+    /// recalls are isolated per agent.
+    fn build_agentic_sub_tools(
+        &self,
+        agent_config: &DelegateAgentConfig,
+        allowed: &std::collections::HashSet<&str>,
+    ) -> Vec<Box<dyn Tool>> {
+        let agent_memory = self.get_agent_memory(agent_config);
+        let parent_tools = self.parent_tools.read();
+        parent_tools
+            .iter()
+            .filter(|tool| allowed.contains(tool.name()))
+            .filter(|tool| tool.name() != "delegate")
+            .map(|tool| {
+                if let Some(memory) = agent_memory.as_ref() {
+                    match tool.name() {
+                        "memory_store" => {
+                            Box::new(MemoryStoreTool::new(memory.clone(), self.security.clone()))
+                                as Box<dyn Tool>
+                        }
+                        "memory_recall" => {
+                            Box::new(MemoryRecallTool::new(memory.clone())) as Box<dyn Tool>
+                        }
+                        "memory_forget" => {
+                            Box::new(MemoryForgetTool::new(memory.clone(), self.security.clone()))
+                                as Box<dyn Tool>
+                        }
+                        "memory_export" => {
+                            Box::new(MemoryExportTool::new(memory.clone())) as Box<dyn Tool>
+                        }
+                        "memory_purge" => {
+                            Box::new(MemoryPurgeTool::new(memory.clone(), self.security.clone()))
+                                as Box<dyn Tool>
+                        }
+                        _ => Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>,
+                    }
+                } else {
+                    Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
+                }
+            })
+            .collect()
     }
 
     /// Directory where background delegate results are stored.
@@ -1117,15 +1168,7 @@ impl DelegateTool {
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
-        let sub_tools: Vec<Box<dyn Tool>> = {
-            let parent_tools = self.parent_tools.read();
-            parent_tools
-                .iter()
-                .filter(|tool| allowed.contains(tool.name()))
-                .filter(|tool| tool.name() != "delegate")
-                .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
-                .collect()
-        };
+        let sub_tools = self.build_agentic_sub_tools(agent_config, &allowed);
 
         if sub_tools.is_empty() {
             return Ok(ToolResult {
@@ -1918,6 +1961,118 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("provider boom")
+        );
+    }
+
+    struct MemoryStoreRecallThenFinalProvider;
+
+    #[async_trait]
+    impl Provider for MemoryStoreRecallThenFinalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let tool_messages = request.messages.iter().filter(|m| m.role == "tool").count();
+            match tool_messages {
+                0 => Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_store".to_string(),
+                        name: "memory_store".to_string(),
+                        arguments: "{\"key\":\"delegate-memory-test\",\"content\":\"stored by namespaced delegate\",\"category\":\"core\"}".to_string(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                }),
+                1 => Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_recall".to_string(),
+                        name: "memory_recall".to_string(),
+                        arguments: "{\"query\":\"delegate-memory-test\",\"limit\":5}".to_string(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                }),
+                _ => Ok(ChatResponse {
+                    text: Some("memory complete".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_memory_tools_use_delegate_namespace() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new(temp_dir.path()).unwrap());
+        let security = test_security();
+
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "model-test".to_string(),
+            system_prompt: Some("You are agentic.".to_string()),
+            api_key: Some("delegate-test-credential".to_string()),
+            temperature: Some(0.2),
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["memory_store".to_string(), "memory_recall".to_string()],
+            max_iterations: 10,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+            skills_directory: None,
+            memory_namespace: Some("test-agent-ns".to_string()),
+        };
+
+        let tool = DelegateTool::new(HashMap::new(), None, security.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
+                Arc::new(MemoryRecallTool::new(memory.clone())),
+            ])))
+            .with_memory(memory.clone());
+
+        let provider = MemoryStoreRecallThenFinalProvider;
+        let result = tool
+            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .await
+            .unwrap();
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert!(result.output.contains("memory complete"));
+
+        let namespaced_results = memory
+            .recall_namespaced("test-agent-ns", "delegate-memory-test", 5, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(namespaced_results.len(), 1);
+        assert_eq!(
+            namespaced_results[0].content,
+            "stored by namespaced delegate"
+        );
+
+        let default_results = memory
+            .recall_namespaced("default", "delegate-memory-test", 5, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            default_results.is_empty(),
+            "expected no default-namespace memories, got {}",
+            default_results.len()
         );
     }
 
