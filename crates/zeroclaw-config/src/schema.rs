@@ -7030,8 +7030,11 @@ pub struct DiscordConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bot_token: String,
-    /// Optional guild (server) ID to restrict the bot to a single guild.
-    pub guild_id: Option<String>,
+    /// Guild (server) IDs to restrict the bot to. Empty = listen across all
+    /// guilds the bot is invited to. Migrated from the legacy `guild_id`
+    /// singular field.
+    #[serde(default)]
+    pub guild_ids: Vec<String>,
     /// Allowed Discord user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
@@ -7215,12 +7218,28 @@ pub struct MattermostConfig {
     pub enabled: bool,
     /// Mattermost server URL (e.g. `"https://mattermost.example.com"`).
     pub url: String,
-    /// Mattermost bot access token.
+    /// Mattermost bot access token. When unset, the channel falls back to
+    /// the login flow using `login_id` + `password`.
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub bot_token: String,
-    /// Optional channel ID to restrict the bot to a single channel.
-    pub channel_id: Option<String>,
+    #[serde(default)]
+    pub bot_token: Option<String>,
+    /// Login ID (email or username) for the password login flow. Used only
+    /// when `bot_token` is unset; both `login_id` and `password` must be
+    /// set together.
+    #[serde(default)]
+    pub login_id: Option<String>,
+    /// Account password for the login flow. Used only when `bot_token` is
+    /// unset; both `login_id` and `password` must be set together.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Channel IDs to restrict the bot to. Empty = listen across all
+    /// accessible channels. Migrated from the legacy `channel_id` singular
+    /// field.
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
     /// Allowed Mattermost user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
@@ -7400,12 +7419,17 @@ pub struct SignalConfig {
     pub http_url: String,
     /// E.164 phone number of the signal-cli account (e.g. "+1234567890").
     pub account: String,
-    /// Optional group ID to filter messages.
-    /// - `None` or omitted: accept all messages (DMs and groups)
-    /// - `"dm"`: only accept direct messages
-    /// - Specific group ID: only accept messages from that group
+    /// Group IDs to filter messages. Empty = accept all messages (DMs and
+    /// groups). When non-empty, only messages from listed groups are
+    /// accepted (DMs are still accepted unless `dm_only` flips the policy
+    /// to DMs-only). Migrated from the legacy `group_id` singular field.
     #[serde(default)]
-    pub group_id: Option<String>,
+    pub group_ids: Vec<String>,
+    /// When true, only accept direct messages and ignore all group traffic.
+    /// Mutually exclusive with `group_ids` (which is ignored when this is
+    /// set). Migrated from the legacy `group_id = "dm"` sentinel.
+    #[serde(default)]
+    pub dm_only: bool,
     /// Allowed sender phone numbers (E.164) or "*" for all.
     #[serde(default)]
     pub allowed_from: Vec<String>,
@@ -8816,10 +8840,11 @@ pub struct RedditConfig {
     pub refresh_token: String,
     /// Reddit bot username (without `u/` prefix).
     pub username: String,
-    /// Optional subreddit to filter messages (without `r/` prefix).
-    /// When set, only messages from this subreddit are processed.
+    /// Subreddits to filter messages (without `r/` prefix). Empty = accept
+    /// from any subreddit the bot has access to. Migrated from the legacy
+    /// `subreddit` singular field.
     #[serde(default)]
-    pub subreddit: Option<String>,
+    pub subreddits: Vec<String>,
 }
 
 impl ChannelConfig for RedditConfig {
@@ -12956,7 +12981,7 @@ default_temperature = 0.7
         let dc = DiscordConfig {
             enabled: true,
             bot_token: "discord-token".into(),
-            guild_id: Some("12345".into()),
+            guild_ids: vec!["12345".into()],
             allowed_users: vec![],
             listen_to_bots: false,
             interrupt_on_new_message: false,
@@ -12971,15 +12996,15 @@ default_temperature = 0.7
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.bot_token, "discord-token");
-        assert_eq!(parsed.guild_id.as_deref(), Some("12345"));
+        assert_eq!(parsed.guild_ids, vec!["12345".to_string()]);
     }
 
     #[test]
-    async fn discord_config_optional_guild() {
+    async fn discord_config_empty_guild_ids() {
         let dc = DiscordConfig {
             enabled: true,
             bot_token: "tok".into(),
-            guild_id: None,
+            guild_ids: Vec::new(),
             allowed_users: vec![],
             listen_to_bots: false,
             interrupt_on_new_message: false,
@@ -12993,7 +13018,7 @@ default_temperature = 0.7
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
-        assert!(parsed.guild_id.is_none());
+        assert!(parsed.guild_ids.is_empty());
     }
 
     // ── iMessage / Matrix config ────────────────────────────
@@ -13128,7 +13153,8 @@ allowed_users = ["@u:matrix.org"]
             enabled: true,
             http_url: "http://127.0.0.1:8686".into(),
             account: "+1234567890".into(),
-            group_id: Some("group123".into()),
+            group_ids: vec!["group123".into()],
+            dm_only: false,
             allowed_from: vec!["+1111111111".into()],
             ignore_attachments: true,
             ignore_stories: false,
@@ -13139,7 +13165,8 @@ allowed_users = ["@u:matrix.org"]
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.http_url, "http://127.0.0.1:8686");
         assert_eq!(parsed.account, "+1234567890");
-        assert_eq!(parsed.group_id.as_deref(), Some("group123"));
+        assert_eq!(parsed.group_ids, vec!["group123".to_string()]);
+        assert!(!parsed.dm_only);
         assert_eq!(parsed.allowed_from.len(), 1);
         assert!(parsed.ignore_attachments);
         assert!(!parsed.ignore_stories);
@@ -13151,7 +13178,8 @@ allowed_users = ["@u:matrix.org"]
             enabled: true,
             http_url: "http://localhost:8080".into(),
             account: "+9876543210".into(),
-            group_id: None,
+            group_ids: Vec::new(),
+            dm_only: true,
             allowed_from: vec!["*".into()],
             ignore_attachments: false,
             ignore_stories: true,
@@ -13162,7 +13190,8 @@ allowed_users = ["@u:matrix.org"]
         let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.http_url, "http://localhost:8080");
         assert_eq!(parsed.account, "+9876543210");
-        assert!(parsed.group_id.is_none());
+        assert!(parsed.group_ids.is_empty());
+        assert!(parsed.dm_only);
         assert!(parsed.ignore_stories);
     }
 
@@ -13170,7 +13199,8 @@ allowed_users = ["@u:matrix.org"]
     async fn signal_config_defaults() {
         let json = r#"{"http_url":"http://127.0.0.1:8686","account":"+1234567890"}"#;
         let parsed: SignalConfig = serde_json::from_str(json).unwrap();
-        assert!(parsed.group_id.is_none());
+        assert!(parsed.group_ids.is_empty());
+        assert!(!parsed.dm_only);
         assert!(parsed.allowed_from.is_empty());
         assert!(!parsed.ignore_attachments);
         assert!(!parsed.ignore_stories);

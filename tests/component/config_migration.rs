@@ -215,7 +215,7 @@ allowed_users = ["@user:matrix.org"]
 #[test]
 fn migrate_file_returns_none_when_current() {
     let raw = r#"
-schema_version = 2
+schema_version = 3
 
 [providers]
 fallback = "openrouter"
@@ -474,4 +474,197 @@ require_pairing = true
     re_config
         .validate()
         .expect("migrated file should also pass validation");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V3 channel field plurality
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn mattermost_channel_id_migrates_to_channel_ids() {
+    let config = migrate(
+        r#"
+[channels.mattermost]
+url = "https://mm.example.com"
+bot_token = "tok"
+channel_id = "abc123"
+allowed_users = ["u1"]
+"#,
+    );
+
+    let mm = config.channels.mattermost.as_ref().unwrap();
+    assert_eq!(mm.channel_ids, vec!["abc123".to_string()]);
+    assert_eq!(mm.bot_token.as_deref(), Some("tok"));
+}
+
+#[test]
+fn mattermost_channel_id_deduped_when_channel_ids_present() {
+    let config = migrate(
+        r#"
+[channels.mattermost]
+url = "https://mm.example.com"
+bot_token = "tok"
+channel_id = "abc123"
+channel_ids = ["abc123", "def456"]
+allowed_users = ["u1"]
+"#,
+    );
+
+    let mm = config.channels.mattermost.as_ref().unwrap();
+    assert_eq!(
+        mm.channel_ids,
+        vec!["abc123".to_string(), "def456".to_string()]
+    );
+}
+
+#[test]
+fn mattermost_bot_token_optional_with_login_credentials() {
+    let config = migrate(
+        r#"
+[channels.mattermost]
+url = "https://mm.example.com"
+login_id = "bot@example.com"
+password = "secret"
+channel_ids = ["abc"]
+allowed_users = ["u1"]
+"#,
+    );
+
+    let mm = config.channels.mattermost.as_ref().unwrap();
+    assert!(mm.bot_token.is_none());
+    assert_eq!(mm.login_id.as_deref(), Some("bot@example.com"));
+    assert_eq!(mm.password.as_deref(), Some("secret"));
+}
+
+#[test]
+fn discord_guild_id_migrates_to_guild_ids() {
+    let config = migrate(
+        r#"
+[channels.discord]
+bot_token = "tok"
+guild_id = "g1"
+allowed_users = ["u1"]
+"#,
+    );
+
+    let dc = config.channels.discord.as_ref().unwrap();
+    assert_eq!(dc.guild_ids, vec!["g1".to_string()]);
+}
+
+#[test]
+fn discord_guild_id_wildcard_skipped() {
+    let config = migrate(
+        r#"
+[channels.discord]
+bot_token = "tok"
+guild_id = "*"
+allowed_users = ["u1"]
+"#,
+    );
+
+    let dc = config.channels.discord.as_ref().unwrap();
+    assert!(dc.guild_ids.is_empty());
+}
+
+#[test]
+fn signal_group_id_migrates_to_group_ids() {
+    let config = migrate(
+        r#"
+[channels.signal]
+http_url = "http://127.0.0.1:8686"
+account = "+1234567890"
+group_id = "grpX"
+allowed_from = ["+1111111111"]
+"#,
+    );
+
+    let sg = config.channels.signal.as_ref().unwrap();
+    assert_eq!(sg.group_ids, vec!["grpX".to_string()]);
+    assert!(!sg.dm_only);
+}
+
+#[test]
+fn signal_group_id_dm_sentinel_migrates_to_dm_only() {
+    let config = migrate(
+        r#"
+[channels.signal]
+http_url = "http://127.0.0.1:8686"
+account = "+1234567890"
+group_id = "dm"
+allowed_from = ["+1111111111"]
+"#,
+    );
+
+    let sg = config.channels.signal.as_ref().unwrap();
+    assert!(sg.group_ids.is_empty());
+    assert!(sg.dm_only);
+}
+
+#[test]
+fn reddit_subreddit_migrates_to_subreddits() {
+    let config = migrate(
+        r#"
+[channels.reddit]
+client_id = "cid"
+client_secret = "csec"
+refresh_token = "rt"
+username = "bot"
+subreddit = "rust"
+"#,
+    );
+
+    let rd = config.channels.reddit.as_ref().unwrap();
+    assert_eq!(rd.subreddits, vec!["rust".to_string()]);
+}
+
+#[test]
+fn already_v3_channel_plurality_unchanged() {
+    // A config already at V3 with the new shapes should round-trip cleanly.
+    let config = migrate(
+        r#"
+schema_version = 3
+
+[channels.mattermost]
+url = "https://mm.example.com"
+bot_token = "tok"
+channel_ids = ["abc"]
+allowed_users = ["u1"]
+
+[channels.discord]
+bot_token = "tok"
+guild_ids = ["g1"]
+allowed_users = ["u1"]
+
+[channels.signal]
+http_url = "http://127.0.0.1:8686"
+account = "+1234567890"
+group_ids = ["grpX"]
+allowed_from = ["+1111111111"]
+
+[channels.reddit]
+client_id = "cid"
+client_secret = "csec"
+refresh_token = "rt"
+username = "bot"
+subreddits = ["rust"]
+"#,
+    );
+
+    assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
+    assert_eq!(
+        config.channels.mattermost.as_ref().unwrap().channel_ids,
+        vec!["abc".to_string()]
+    );
+    assert_eq!(
+        config.channels.discord.as_ref().unwrap().guild_ids,
+        vec!["g1".to_string()]
+    );
+    assert_eq!(
+        config.channels.signal.as_ref().unwrap().group_ids,
+        vec!["grpX".to_string()]
+    );
+    assert_eq!(
+        config.channels.reddit.as_ref().unwrap().subreddits,
+        vec!["rust".to_string()]
+    );
 }

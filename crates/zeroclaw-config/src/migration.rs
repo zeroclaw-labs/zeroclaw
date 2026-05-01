@@ -35,7 +35,7 @@ use toml_edit::DocumentMut;
 
 use super::schema::ModelProviderConfig;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Top-level keys from V1 that are consumed by V1Compat during migration.
 /// Used by the unknown-key detector to suppress false "unknown key" warnings.
@@ -231,6 +231,90 @@ pub fn prepare_table(table: &mut toml::Table) {
                 let already_present = arr.iter().any(|v| v.as_str() == Some(channel_id.as_str()));
                 if !already_present {
                     arr.push(toml::Value::String(channel_id));
+                }
+            }
+        }
+    }
+
+    // V3: Migrate channels.mattermost.channel_id → channels.mattermost.channel_ids
+    for key in &["channels_config", "channels"] {
+        if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
+            && let Some(toml::Value::Table(mattermost)) = channels.get_mut("mattermost")
+            && let Some(toml::Value::String(channel_id)) = mattermost.remove("channel_id")
+            && !channel_id.is_empty()
+            && channel_id != "*"
+        {
+            let ids = mattermost
+                .entry("channel_ids")
+                .or_insert_with(|| toml::Value::Array(Vec::new()));
+            if let toml::Value::Array(arr) = ids {
+                let already_present = arr.iter().any(|v| v.as_str() == Some(channel_id.as_str()));
+                if !already_present {
+                    arr.push(toml::Value::String(channel_id));
+                }
+            }
+        }
+    }
+
+    // V3: Migrate channels.discord.guild_id → channels.discord.guild_ids
+    for key in &["channels_config", "channels"] {
+        if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
+            && let Some(toml::Value::Table(discord)) = channels.get_mut("discord")
+            && let Some(toml::Value::String(guild_id)) = discord.remove("guild_id")
+            && !guild_id.is_empty()
+            && guild_id != "*"
+        {
+            let ids = discord
+                .entry("guild_ids")
+                .or_insert_with(|| toml::Value::Array(Vec::new()));
+            if let toml::Value::Array(arr) = ids {
+                let already_present = arr.iter().any(|v| v.as_str() == Some(guild_id.as_str()));
+                if !already_present {
+                    arr.push(toml::Value::String(guild_id));
+                }
+            }
+        }
+    }
+
+    // V3: Migrate channels.signal.group_id → channels.signal.{group_ids, dm_only}
+    // The legacy field overloaded a sentinel "dm" for DMs-only mode; split that
+    // into a typed bool.
+    for key in &["channels_config", "channels"] {
+        if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
+            && let Some(toml::Value::Table(signal)) = channels.get_mut("signal")
+            && let Some(toml::Value::String(group_id)) = signal.remove("group_id")
+            && !group_id.is_empty()
+        {
+            if group_id == "dm" {
+                signal.insert("dm_only".to_string(), toml::Value::Boolean(true));
+            } else {
+                let ids = signal
+                    .entry("group_ids")
+                    .or_insert_with(|| toml::Value::Array(Vec::new()));
+                if let toml::Value::Array(arr) = ids {
+                    let already_present = arr.iter().any(|v| v.as_str() == Some(group_id.as_str()));
+                    if !already_present {
+                        arr.push(toml::Value::String(group_id));
+                    }
+                }
+            }
+        }
+    }
+
+    // V3: Migrate channels.reddit.subreddit → channels.reddit.subreddits
+    for key in &["channels_config", "channels"] {
+        if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
+            && let Some(toml::Value::Table(reddit)) = channels.get_mut("reddit")
+            && let Some(toml::Value::String(subreddit)) = reddit.remove("subreddit")
+            && !subreddit.is_empty()
+        {
+            let subs = reddit
+                .entry("subreddits")
+                .or_insert_with(|| toml::Value::Array(Vec::new()));
+            if let toml::Value::Array(arr) = subs {
+                let already_present = arr.iter().any(|v| v.as_str() == Some(subreddit.as_str()));
+                if !already_present {
+                    arr.push(toml::Value::String(subreddit));
                 }
             }
         }
