@@ -2,17 +2,12 @@
 
 > The first patch release on top of the v0.7.x workspace foundation. v0.7.4 lands a
 > clean-room Matrix rewrite, a Mozilla Fluent i18n pipeline with multi-locale docs, a
-> ground-up rewrite of the onboarding flow, recovers the WeChat iLink Bot channel, and
-> adds HMAC tool-execution receipts. Around 110 commits from 36 contributors covering
+> ground-up rewrite of the CLI/TUI onboarding flow, recovers the WeChat iLink Bot channel. Around 110 commits from 36 contributors covering
 > channels, providers, web dashboard, security, and developer experience.
 
 ---
 
 ## Highlights
-
-- **Matrix channel rewritten** — A clean-room reimplementation on `matrix-rust-sdk 0.16`
-  replaces the long-running patch pile. E2EE auto-verification of `allowed_users` is
-  preserved, and the channel is markedly simpler to operate (#6112).
 
 - **Multi-locale docs and i18n pipeline** — A Mozilla Fluent-based i18n pipeline now
   drives a multi-locale mdBook, alongside a comprehensive docs overhaul (#5788). Header
@@ -23,9 +18,6 @@
   idempotent, and DRY (#5960). It picks up a generic OpenAI-compatible `/v1/models`
   fallback for unknown providers (#6056) and uses container-aware URLs for local AI
   providers running in Docker (#5552).
-
-- **HMAC tool-execution receipts** — Each tool run now produces a tamper-evident receipt
-  that the agent can use to detect hallucinated tool output (#5168).
 
 - **Session management surface** — New `SessionResetTool`, `SessionDeleteTool`, and
   `SessionsCurrentTool` give the agent first-class control over its own sessions
@@ -41,6 +33,10 @@
 
 - **PostgreSQL memory backend** — Memory can now be persisted to PostgreSQL via a new
   `memory-postgres` backend.
+
+- **Matrix channel rewritten** — A clean-room reimplementation on `matrix-rust-sdk 0.16`
+  replaces the long-running patch pile. E2EE auto-verification of `allowed_users` is
+  preserved, and the channel is markedly simpler to operate (#6112).
 
 ---
 
@@ -60,7 +56,6 @@
 
 ### Agent & Runtime
 
-- HMAC tool-execution receipts let the agent detect tool-output hallucination (#5168).
 - `prune_history` Phase 1 now treats mixed-protection tool groups as atomic, preventing
   partial pruning that left the conversation in an invalid state (#5828).
 - Self-heals orphaned `tool_result` blocks on session load and on compaction (#5853).
@@ -103,10 +98,6 @@
 
 - `SessionResetTool` and `SessionDeleteTool` for in-agent session management (#5696).
 - `SessionsCurrentTool` exposes the active session identity (#6033).
-- Skills: registry-based bare-name install (#6045); review-session skill ships and
-  retires the old `github-pr-review` skill (#5910); pr-review-session skill
-  deidentified with milestone-alignment checks (#6023); changelog-generation skill and
-  protocol reference (#5819).
 
 ### Plugins
 
@@ -169,7 +160,6 @@
 - ZeroClaw Maturity Framework ratified and committed (#5911).
 - Manual release runbook (#5920).
 - AGENTS code-style rules clarified (#6163).
-- mdBook header links point to the upstream repo (#6124).
 
 ### Installation & Distribution
 
