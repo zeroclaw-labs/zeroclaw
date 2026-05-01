@@ -86,6 +86,26 @@ if [[ -f "$ROOT_CARGO" ]]; then
   fi
 fi
 
+# ── Cargo.lock (workspace crates only) ─────────────────────────────
+# Re-resolves only the workspace member entries so their lockfile versions
+# track the new [workspace.package] / [workspace.dependencies] values. External
+# deps that happen to share a version string are left alone.
+echo "Cargo.lock..."
+ROOT_LOCK="$REPO_ROOT/Cargo.lock"
+if [[ -f "$ROOT_LOCK" ]] && command -v cargo >/dev/null 2>&1; then
+  before="$(sha256sum "$ROOT_LOCK" | awk '{print $1}')"
+  ( cd "$REPO_ROOT" && cargo update --workspace --offline >/dev/null 2>&1 ) \
+    || ( cd "$REPO_ROOT" && cargo update --workspace >/dev/null 2>&1 ) \
+    || echo "  warn: cargo update --workspace failed; review Cargo.lock manually"
+  after="$(sha256sum "$ROOT_LOCK" | awk '{print $1}')"
+  if [[ "$before" != "$after" ]]; then
+    echo "  updated: Cargo.lock"
+    changed=$((changed + 1))
+  fi
+elif [[ -f "$ROOT_LOCK" ]]; then
+  echo "  skip: cargo not on PATH; Cargo.lock not refreshed"
+fi
+
 # ── Marketplace: Dokploy ───────────────────────────────────────────
 echo "Marketplace templates..."
 bump "marketplace/dokploy/meta-entry.json" \
