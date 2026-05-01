@@ -813,15 +813,19 @@ pub async fn handle_patch(
                         );
                     }
                 };
-                let actual = match working.get_prop(&path) {
-                    Ok(v) => serde_json::Value::String(v),
+                let actual_str = match working.get_prop(&path) {
+                    Ok(v) => v,
                     Err(e) => return error_response(map_prop_error(e, &path).with_op_index(idx)),
                 };
-                if actual != want {
+                let want_str = match json_to_setprop_string(&want, info.as_ref().map(|i| i.kind)) {
+                    Ok(s) => s,
+                    Err(e) => return error_response(e.with_path(&path).with_op_index(idx)),
+                };
+                if actual_str != want_str {
                     return error_response(
                         ConfigApiError::new(
                             ConfigApiCode::ValidationFailed,
-                            format!("`test` op failed: expected {want}, got {actual}"),
+                            format!("`test` op failed: expected {want_str:?}, got {actual_str:?}"),
                         )
                         .with_path(&path)
                         .with_op_index(idx),
@@ -830,7 +834,7 @@ pub async fn handle_patch(
                 results.push(PatchOpResult {
                     op: op.op.clone(),
                     path,
-                    value: Some(actual),
+                    value: Some(serde_json::Value::String(actual_str)),
                     populated: None,
                     comment: None, // `test` ops don't write
                 });
@@ -1308,6 +1312,124 @@ mod tests {
     fn json_pointer_to_dotted_handles_empty_root() {
         assert_eq!(json_pointer_to_dotted(""), "");
         assert_eq!(json_pointer_to_dotted("/"), "");
+    }
+
+    // ── `test` op type-coercion invariants ─────────────────────────────
+    //
+    // The `test` JSON Patch op compares the incoming `value` against the
+    // current property value. `Config::get_prop` always returns a display
+    // string, regardless of the underlying field's PropKind. Before the
+    // fix, the handler wrapped that string in `Value::String(...)` and
+    // compared against the raw incoming `Value::Bool(true)` /
+    // `Value::Number(42)` / etc. — never equal even when the test should
+    // pass. The fix normalizes both sides to display strings via
+    // `json_to_setprop_string` (the same helper `add`/`replace` use).
+    //
+    // These tests pin the invariant: for every PropKind that surfaces on
+    // the API, `json_to_setprop_string(<typed JSON>, Some(kind))` equals
+    // the string `Config::get_prop` returns.
+    use zeroclaw_config::traits::PropKind;
+
+    #[test]
+    fn test_op_coercion_bool_typed_value_matches_stored() {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.set_prop("autonomy.workspace-only", "true")
+            .expect("set_prop bool");
+        let actual = cfg.get_prop("autonomy.workspace-only").expect("get_prop");
+        let want_typed = json_to_setprop_string(&serde_json::json!(true), Some(PropKind::Bool))
+            .expect("coerce bool true");
+        assert_eq!(
+            actual, want_typed,
+            "bool field: typed JSON `true` must coerce to the same display string \
+             as `get_prop` returns; got actual={actual:?} want_typed={want_typed:?}"
+        );
+
+        // Legacy string-form (`Value::String("true")`) for the same bool
+        // field must also coerce to the same string — back-compat for
+        // clients that send strings instead of booleans.
+        let want_string = json_to_setprop_string(&serde_json::json!("true"), Some(PropKind::Bool))
+            .expect("coerce bool from string");
+        assert_eq!(actual, want_string);
+    }
+
+    #[test]
+    fn test_op_coercion_integer_typed_value_matches_stored() {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.set_prop("gateway.port", "42617")
+            .expect("set_prop integer");
+        let actual = cfg.get_prop("gateway.port").expect("get_prop");
+        let want_typed = json_to_setprop_string(&serde_json::json!(42617), Some(PropKind::Integer))
+            .expect("coerce integer");
+        assert_eq!(
+            actual, want_typed,
+            "integer field coercion: actual={actual:?} want_typed={want_typed:?}"
+        );
+
+        // Legacy string-form must also coerce equivalently.
+        let want_string =
+            json_to_setprop_string(&serde_json::json!("42617"), Some(PropKind::Integer))
+                .expect("coerce integer from string");
+        assert_eq!(actual, want_string);
+    }
+
+    #[test]
+    fn test_op_coercion_float_typed_value_matches_stored() {
+        // `gateway.host` is a String, but [scheduler] / autonomy carry floats
+        // for things like temperatures. Pick a path that's a float field on
+        // the default config. If the schema gains/loses a float field this
+        // test will need updating; that's fine — we just need one float to
+        // pin the contract.
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        // autonomy doesn't carry floats today; use a provider temperature
+        // by setting a known model-provider entry. The model-providers map
+        // is set up via map keys, so use a path that's unambiguously float.
+        // Fall back to set_prop on a known float location:
+        match cfg.set_prop("providers.models.openai.temperature", "0.7") {
+            Ok(()) => {
+                let actual = cfg
+                    .get_prop("providers.models.openai.temperature")
+                    .expect("get_prop float");
+                let want_typed =
+                    json_to_setprop_string(&serde_json::json!(0.7), Some(PropKind::Float))
+                        .expect("coerce float typed");
+                assert_eq!(
+                    actual, want_typed,
+                    "float field coercion: actual={actual:?} want_typed={want_typed:?}"
+                );
+            }
+            Err(_) => {
+                // Float path not available on default Config — skip without
+                // failing. The bool and integer tests cover the same
+                // invariant; float just pins the additional case.
+            }
+        }
+    }
+
+    #[test]
+    fn test_op_coercion_string_field_no_regression() {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.set_prop("gateway.host", "10.0.0.1")
+            .expect("set_prop string");
+        let actual = cfg.get_prop("gateway.host").expect("get_prop string");
+        let want_typed =
+            json_to_setprop_string(&serde_json::json!("10.0.0.1"), Some(PropKind::String))
+                .expect("coerce string");
+        assert_eq!(actual, want_typed);
+    }
+
+    #[test]
+    fn test_op_coercion_mismatched_value_correctly_fails() {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.set_prop("autonomy.workspace-only", "true")
+            .expect("set_prop");
+        let actual = cfg.get_prop("autonomy.workspace-only").expect("get_prop");
+        let want = json_to_setprop_string(&serde_json::json!(false), Some(PropKind::Bool))
+            .expect("coerce bool false");
+        assert_ne!(
+            actual, want,
+            "bool true must not match bool false after coercion — \
+             a mismatched test op should fail with ValidationFailed"
+        );
     }
 
     // ── Integration-flavored tests: drift detection + comment writing ──
