@@ -1,0 +1,125 @@
+name: Pub Docker Standard
+
+# Standard GitHub-hosted runner variant of the Docker publish workflow.
+# Complements pub-docker-img.yml (Blacksmith runners) with ubuntu-latest runners
+# using official Docker actions, usable without Blacksmith infrastructure.
+#
+# Actions source policy: docker/* is already allowlisted.
+# SHA pinning: deferred to Phase 2 per docs/actions-source-policy.md.
+
+on:
+    push:
+        branches: [main]
+        tags: ["v*"]
+        paths:
+            - "Dockerfile"
+            - ".dockerignore"
+            - "Cargo.toml"
+            - "Cargo.lock"
+            - "rust-toolchain.toml"
+            - "src/**"
+            - "crates/**"
+            - "benches/**"
+            - "firmware/**"
+            - "dev/config.template.toml"
+            - ".github/workflows/pub-docker-standard.yml"
+    pull_request:
+        branches: [main]
+        paths:
+            - "Dockerfile"
+            - ".dockerignore"
+            - "docker-compose.yml"
+            - "rust-toolchain.toml"
+            - "dev/config.template.toml"
+            - ".github/workflows/pub-docker-standard.yml"
+    workflow_dispatch:
+
+concurrency:
+    group: docker-standard-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: true
+
+env:
+    REGISTRY: ghcr.io
+    IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+    pr-smoke:
+        name: PR Docker Smoke (Standard)
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        permissions:
+            contents: read
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Build smoke image
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  push: false
+                  provenance: false
+                  sbom: false
+                  tags: zeroclaw-pr-smoke:latest
+                  target: release
+                  platforms: linux/arm64,linux/amd64
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+
+    publish:
+        name: Build and Push Docker Image (Standard)
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
+        runs-on: ubuntu-latest
+        timeout-minutes: 60
+        permissions:
+            contents: read
+            packages: write
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Log in to Container Registry
+              uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+              with:
+                  registry: ${{ env.REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Compute tags
+              id: meta
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  IMAGE="${REGISTRY}/${IMAGE_NAME}"
+                  SHA_TAG="${IMAGE}:sha-${GITHUB_SHA::12}"
+
+                  if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+                    TAG_NAME="${GITHUB_REF#refs/tags/}"
+                    TAGS="${IMAGE}:${TAG_NAME},${SHA_TAG}"
+                  elif [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+                    TAGS="${IMAGE}:latest,${SHA_TAG}"
+                  else
+                    BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+                    BRANCH_NAME="${BRANCH_NAME//\//-}"
+                    TAGS="${IMAGE}:${BRANCH_NAME},${SHA_TAG}"
+                  fi
+
+                  echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+            - name: Build and push Docker image
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  push: true
+                  tags: ${{ steps.meta.outputs.tags }}
+                  target: release
+                  platforms: linux/arm64,linux/amd64
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max

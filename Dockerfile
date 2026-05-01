@@ -8,18 +8,34 @@ RUN npm ci --ignore-scripts 2>/dev/null || npm install --ignore-scripts
 COPY web/ .
 RUN npm run build
 
+# ── Builder platform arg ───────────────────────────────────────
+# BUILDPLATFORM: the runner's native platform (linux/amd64 on GitHub Actions).
+# BuildKit injects this automatically from --platform.
+ARG BUILDPLATFORM=linux/amd64
+
 # ── Stage 1: Build ────────────────────────────────────────────
-FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS builder
+# Builder runs on the host platform (amd64) and cross-compiles when TARGETARCH != host.
+FROM --platform=$BUILDPLATFORM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS builder
 
 WORKDIR /app
 ARG ZEROCLAW_CARGO_FEATURES="channel-lark,whatsapp-web"
+ARG TARGETARCH
 
-# Install build dependencies
+# Install build dependencies; add cross-compilation tools only for arm64.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y \
-        pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+    apt-get update && \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+        dpkg --add-architecture arm64 && \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            pkg-config gcc-aarch64-linux-gnu libc6-dev-arm64-cross && \
+        rustup target add aarch64-unknown-linux-gnu; \
+    else \
+        apt-get install -y --no-install-recommends \
+            pkg-config; \
+    fi && \
+    rm -rf /var/lib/apt/lists/*
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
@@ -43,10 +59,18 @@ RUN mkdir -p src benches apps/tauri/src \
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+      export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+             PKG_CONFIG_ALLOW_CROSS=1 \
+             PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig; \
+      RUST_TARGET=aarch64-unknown-linux-gnu; \
     else \
-      cargo build --release --locked; \
+      RUST_TARGET=x86_64-unknown-linux-gnu; \
+    fi && \
+    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
+      cargo build --profile dist --locked --features "$ZEROCLAW_CARGO_FEATURES" --target "$RUST_TARGET"; \
+    else \
+      cargo build --profile dist --locked --target "$RUST_TARGET"; \
     fi
 RUN rm -rf src benches
 
@@ -58,16 +82,28 @@ RUN touch src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    rm -rf target/release/.fingerprint/zeroclawlabs-* \
-           target/release/deps/zeroclawlabs-* \
-           target/release/incremental/zeroclawlabs-* && \
-    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+      export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+             PKG_CONFIG_ALLOW_CROSS=1 \
+             PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig; \
+      RUST_TARGET=aarch64-unknown-linux-gnu; \
     else \
-      cargo build --release --locked; \
+      RUST_TARGET=x86_64-unknown-linux-gnu; \
     fi && \
-    cp target/release/zeroclaw /app/zeroclaw && \
-    strip /app/zeroclaw
+    rm -rf target/"$RUST_TARGET"/dist/.fingerprint/zeroclawlabs-* \
+           target/"$RUST_TARGET"/dist/deps/zeroclawlabs-* \
+           target/"$RUST_TARGET"/dist/incremental/zeroclawlabs-* && \
+    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
+      cargo build --profile dist --locked --features "$ZEROCLAW_CARGO_FEATURES" --target "$RUST_TARGET"; \
+    else \
+      cargo build --profile dist --locked --target "$RUST_TARGET"; \
+    fi && \
+    cp target/"$RUST_TARGET"/dist/zeroclaw /app/zeroclaw && \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+      aarch64-linux-gnu-strip /app/zeroclaw; \
+    else \
+      strip /app/zeroclaw; \
+    fi
 RUN size=$(stat -c%s /app/zeroclaw) && \
     if [ "$size" -lt 1000000 ]; then echo "ERROR: binary too small (${size} bytes), likely dummy build artifact" && exit 1; fi
 
