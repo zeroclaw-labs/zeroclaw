@@ -65,3 +65,6 @@ model_pricing.toml
 !.claude/skills/document_skills/pptx/
 !.claude/skills/document_skills/hwpx/
 !.claude/skills/document_skills/CATEGORY_STRUCTURE.md
+
+# Local design / UI screenshot working folder (Korean: 디자인_캡처사진)
+디자인_캡처사진/
