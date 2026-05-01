@@ -335,7 +335,7 @@ impl InterruptOnNewMessageConfig {
 #[derive(Clone)]
 struct ChannelCostTrackingState {
     tracker: Arc<zeroclaw_runtime::cost::CostTracker>,
-    prices: Arc<HashMap<String, zeroclaw_config::schema::ModelPricing>>,
+    model_provider_pricing: Arc<zeroclaw_runtime::agent::cost::ModelProviderPricing>,
 }
 
 #[derive(Clone)]
@@ -3125,7 +3125,7 @@ async fn process_channel_message(
     let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
         zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
             state.tracker,
-            state.prices,
+            state.model_provider_pricing,
         )
     });
     let llm_call_start = Instant::now();
@@ -5765,9 +5765,18 @@ pub async fn start_channels(
             config.cost.clone(),
             &config.workspace_dir,
         )
-        .map(|tracker| ChannelCostTrackingState {
-            tracker,
-            prices: Arc::new(config.cost.prices.clone()),
+        .map(|tracker| {
+            let pricing: zeroclaw_runtime::agent::cost::ModelProviderPricing = config
+                .providers
+                .models
+                .iter()
+                .filter(|(_, profile)| !profile.pricing.is_empty())
+                .map(|(name, profile)| (name.clone(), profile.pricing.clone()))
+                .collect();
+            ChannelCostTrackingState {
+                tracker,
+                model_provider_pricing: Arc::new(pricing),
+            }
         }),
         pacing: config.pacing.clone(),
         max_tool_result_chars: config.agent.max_tool_result_chars,

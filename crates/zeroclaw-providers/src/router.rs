@@ -5,7 +5,27 @@ use super::traits::{
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use std::collections::HashMap;
-use zeroclaw_config::schema::ModelPricing;
+
+/// Score a model against a user-keyed pricing map. Sums any entry matching
+/// the model directly, plus optional `.input` and `.output` dimension keys.
+/// Returns `None` when nothing matches.
+fn score_model(pricing: &HashMap<String, f64>, model: &str) -> Option<f64> {
+    let mut total = 0.0;
+    let mut matched = false;
+    if let Some(v) = pricing.get(model) {
+        total += *v;
+        matched = true;
+    }
+    if let Some(v) = pricing.get(&format!("{model}.input")) {
+        total += *v;
+        matched = true;
+    }
+    if let Some(v) = pricing.get(&format!("{model}.output")) {
+        total += *v;
+        matched = true;
+    }
+    matched.then_some(total)
+}
 
 /// A single route: maps a task hint to a provider + model combo.
 #[derive(Debug, Clone)]
@@ -84,7 +104,7 @@ impl RouterProvider {
     pub fn resolve_cost_optimized(
         &self,
         model: &str,
-        prices: &HashMap<String, ModelPricing>,
+        model_provider_pricing: &HashMap<String, HashMap<String, f64>>,
         required_vision: bool,
         required_tools: bool,
     ) -> (usize, String) {
@@ -108,8 +128,12 @@ impl RouterProvider {
                 }
             }
 
-            if let Some(pricing) = prices.get(route_model) {
-                let total_cost = pricing.input + pricing.output;
+            let Some((model_provider_name, _)) = self.providers.get(*idx) else {
+                continue;
+            };
+            if let Some(pricing) = model_provider_pricing.get(model_provider_name)
+                && let Some(total_cost) = score_model(pricing, route_model)
+            {
                 candidates.push((*idx, route_model.clone(), total_cost));
             }
         }
@@ -151,14 +175,16 @@ impl RouterProvider {
 }
 
 /// A cost-optimized routing strategy that selects the cheapest qualifying
-/// provider from the route table based on `ModelPricing` data.
+/// provider from the route table based on per-provider pricing maps.
 ///
-/// This wraps pricing config and capability requirements, scoring candidates
-/// by their combined input + output cost per 1M tokens.
+/// Pricing is keyed by provider name (the alias under
+/// `[providers.models.<provider>.<alias>]`); each provider's pricing map
+/// holds user-defined keys (model identifiers, optionally suffixed with
+/// `.input` / `.output`) mapped to USD-per-1M-token rates.
 #[derive(Debug, Clone)]
 pub struct CostOptimizedStrategy {
-    /// Per-model pricing data (keyed by model name).
-    pub prices: HashMap<String, ModelPricing>,
+    /// Per-provider pricing data (provider name → user-keyed pricing map).
+    pub model_provider_pricing: HashMap<String, HashMap<String, f64>>,
     /// Whether the request requires vision support.
     pub required_vision: bool,
     /// Whether the request requires native tool support.
@@ -166,10 +192,11 @@ pub struct CostOptimizedStrategy {
 }
 
 impl CostOptimizedStrategy {
-    /// Create a new cost-optimized strategy with the given pricing data.
-    pub fn new(prices: HashMap<String, ModelPricing>) -> Self {
+    /// Create a new cost-optimized strategy with the given per-provider
+    /// pricing data.
+    pub fn new(model_provider_pricing: HashMap<String, HashMap<String, f64>>) -> Self {
         Self {
-            prices,
+            model_provider_pricing,
             required_vision: false,
             required_tools: false,
         }
@@ -187,10 +214,11 @@ impl CostOptimizedStrategy {
         self
     }
 
-    /// Score a model by total cost (input + output per 1M tokens).
-    /// Returns `None` if no pricing data is available for the model.
-    pub fn score(&self, model: &str) -> Option<f64> {
-        self.prices.get(model).map(|p| p.input + p.output)
+    /// Score a route by summing pricing entries that match the model.
+    /// Returns `None` if no pricing data is available for the route.
+    pub fn score(&self, model_provider_name: &str, model: &str) -> Option<f64> {
+        let pricing = self.model_provider_pricing.get(model_provider_name)?;
+        score_model(pricing, model)
     }
 }
 
@@ -748,11 +776,16 @@ mod tests {
         }
     }
 
-    fn make_pricing(entries: Vec<(&str, f64, f64)>) -> HashMap<String, ModelPricing> {
-        entries
-            .into_iter()
-            .map(|(model, input, output)| (model.to_string(), ModelPricing { input, output }))
-            .collect()
+    /// Build a per-model-provider pricing map for tests. Each tuple is
+    /// `(provider_name, model, input_per_mtok, output_per_mtok)`.
+    fn make_pricing(entries: Vec<(&str, &str, f64, f64)>) -> HashMap<String, HashMap<String, f64>> {
+        let mut map: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        for (provider, model, input, output) in entries {
+            let inner = map.entry(provider.to_string()).or_default();
+            inner.insert(format!("{model}.input"), input);
+            inner.insert(format!("{model}.output"), output);
+        }
+        map
     }
 
     #[test]
@@ -785,7 +818,10 @@ mod tests {
         ];
         let router = RouterProvider::new(providers, routes, "default-model".into());
 
-        let prices = make_pricing(vec![("big-model", 15.0, 75.0), ("small-model", 0.25, 1.25)]);
+        let prices = make_pricing(vec![
+            ("expensive", "big-model", 15.0, 75.0),
+            ("cheap", "small-model", 0.25, 1.25),
+        ]);
 
         let (idx, model) =
             router.resolve_cost_optimized("hint:cost-optimized", &prices, false, false);
@@ -824,8 +860,8 @@ mod tests {
         let router = RouterProvider::new(providers, routes, "default-model".into());
 
         let prices = make_pricing(vec![
-            ("cheap-model", 0.10, 0.40),
-            ("vision-model", 3.0, 15.0),
+            ("no-vision", "cheap-model", 0.10, 0.40),
+            ("has-vision", "vision-model", 3.0, 15.0),
         ]);
 
         // With vision required, the cheap model (no vision) is filtered out
@@ -864,8 +900,8 @@ mod tests {
         let router = RouterProvider::new(providers, routes, "default-model".into());
 
         let prices = make_pricing(vec![
-            ("basic-model", 0.10, 0.40),
-            ("tools-model", 5.0, 15.0),
+            ("no-tools", "basic-model", 0.10, 0.40),
+            ("has-tools", "tools-model", 5.0, 15.0),
         ]);
 
         // With tools required, the basic model (no tools) is filtered out
@@ -881,7 +917,7 @@ mod tests {
         );
 
         // Empty pricing map — no matches possible
-        let prices: HashMap<String, ModelPricing> = HashMap::new();
+        let prices: HashMap<String, HashMap<String, f64>> = HashMap::new();
         let (idx, model) =
             router.resolve_cost_optimized("hint:cost-optimized", &prices, false, false);
         assert_eq!(idx, 0);
@@ -903,7 +939,7 @@ mod tests {
         )];
         let router = RouterProvider::new(providers, routes, "default-model".into());
 
-        let prices = make_pricing(vec![("the-model", 1.0, 2.0)]);
+        let prices = make_pricing(vec![("only", "the-model", 1.0, 2.0)]);
 
         let (idx, model) = router.resolve_cost_optimized("hint:cheapest", &prices, false, false);
         assert_eq!(idx, 0);
@@ -952,9 +988,9 @@ mod tests {
         let router = RouterProvider::new(providers, routes, "default-model".into());
 
         let prices = make_pricing(vec![
-            ("model-a", 10.0, 50.0), // total: 60
-            ("model-b", 0.15, 0.60), // total: 0.75 (cheapest)
-            ("model-c", 3.0, 15.0),  // total: 18
+            ("p1", "model-a", 10.0, 50.0), // total: 60
+            ("p2", "model-b", 0.15, 0.60), // total: 0.75 (cheapest)
+            ("p3", "model-c", 3.0, 15.0),  // total: 18
         ]);
 
         let (idx, model) =
@@ -965,12 +1001,25 @@ mod tests {
 
     #[test]
     fn cost_optimized_strategy_score() {
-        let prices = make_pricing(vec![("cheap", 0.10, 0.40), ("expensive", 15.0, 75.0)]);
+        let prices = make_pricing(vec![
+            ("cheap-provider", "cheap-model", 0.10, 0.40),
+            ("expensive-provider", "expensive-model", 15.0, 75.0),
+        ]);
         let strategy = CostOptimizedStrategy::new(prices);
 
-        assert!((strategy.score("cheap").unwrap() - 0.50).abs() < f64::EPSILON);
-        assert!((strategy.score("expensive").unwrap() - 90.0).abs() < f64::EPSILON);
-        assert!(strategy.score("unknown").is_none());
+        assert!(
+            (strategy.score("cheap-provider", "cheap-model").unwrap() - 0.50).abs() < f64::EPSILON
+        );
+        assert!(
+            (strategy
+                .score("expensive-provider", "expensive-model")
+                .unwrap()
+                - 90.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(strategy.score("cheap-provider", "unknown").is_none());
+        assert!(strategy.score("unknown-provider", "cheap-model").is_none());
     }
 
     #[tokio::test]

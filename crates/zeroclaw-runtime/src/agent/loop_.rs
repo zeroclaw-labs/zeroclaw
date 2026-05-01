@@ -2481,7 +2481,14 @@ pub async fn run(
     let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
         crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.workspace_dir)
             .map(|tracker| {
-                ToolLoopCostTrackingContext::new(tracker, Arc::new(config.cost.prices.clone()))
+                let pricing: crate::agent::cost::ModelProviderPricing = config
+                    .providers
+                    .models
+                    .iter()
+                    .filter(|(_, profile)| !profile.pricing.is_empty())
+                    .map(|(name, profile)| (name.clone(), profile.pricing.clone()))
+                    .collect();
+                ToolLoopCostTrackingContext::new(tracker, Arc::new(pricing))
             });
 
     // ── Execute ──────────────────────────────────────────────────
@@ -7301,7 +7308,6 @@ Let me check the result."#;
         use crate::cost::CostTracker;
         use crate::observability::noop::NoopObserver;
         use std::collections::HashMap;
-        use zeroclaw_config::schema::ModelPricing;
 
         let provider = ScriptedProvider {
             responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
@@ -7318,22 +7324,17 @@ Let me check the result."#;
         };
         let observer = NoopObserver;
         let workspace = tempfile::TempDir::new().unwrap();
-        let mut cost_config = zeroclaw_config::schema::CostConfig {
+        let cost_config = zeroclaw_config::schema::CostConfig {
             enabled: true,
             ..zeroclaw_config::schema::CostConfig::default()
         };
-        cost_config.prices = HashMap::from([(
-            "mock-model".to_string(),
-            ModelPricing {
-                input: 3.0,
-                output: 15.0,
-            },
-        )]);
         let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
-        let ctx = ToolLoopCostTrackingContext::new(
-            Arc::clone(&tracker),
-            Arc::new(cost_config.prices.clone()),
-        );
+        let mut model_pricing: HashMap<String, f64> = HashMap::new();
+        model_pricing.insert("mock-model.input".to_string(), 3.0);
+        model_pricing.insert("mock-model.output".to_string(), 15.0);
+        let mut pricing: crate::agent::cost::ModelProviderPricing = HashMap::new();
+        pricing.insert("mock-provider".to_string(), model_pricing);
+        let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing));
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = TOOL_LOOP_COST_TRACKING_CONTEXT
@@ -7390,7 +7391,6 @@ Let me check the result."#;
         use crate::cost::CostTracker;
         use crate::observability::noop::NoopObserver;
         use std::collections::HashMap;
-        use zeroclaw_config::schema::ModelPricing;
 
         let provider = ScriptedProvider::from_text_responses(vec!["should not reach this"]);
         let observer = NoopObserver;
@@ -7412,16 +7412,12 @@ Let me check the result."#;
             ))
             .unwrap();
 
-        let ctx = ToolLoopCostTrackingContext::new(
-            Arc::clone(&tracker),
-            Arc::new(HashMap::from([(
-                "mock-model".to_string(),
-                ModelPricing {
-                    input: 1.0,
-                    output: 1.0,
-                },
-            )])),
-        );
+        let mut model_pricing: HashMap<String, f64> = HashMap::new();
+        model_pricing.insert("mock-model.input".to_string(), 1.0);
+        model_pricing.insert("mock-model.output".to_string(), 1.0);
+        let mut pricing: crate::agent::cost::ModelProviderPricing = HashMap::new();
+        pricing.insert("mock-provider".to_string(), model_pricing);
+        let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing));
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let err = TOOL_LOOP_COST_TRACKING_CONTEXT

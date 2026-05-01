@@ -1,24 +1,35 @@
 use crate::cost::CostTracker;
 use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
+use std::collections::HashMap;
 use std::sync::Arc;
-use zeroclaw_config::schema::ModelPricing;
 
 // ── Cost tracking via task-local ──
+
+/// Per-model-provider pricing snapshot consumed by the cost tracker.
+///
+/// Outer key: model-provider alias (e.g. `openrouter`, `anthropic`,
+/// `azure-openai`). Inner key: user-defined model identifier, optionally
+/// suffixed with `.input` / `.output` to encode pricing dimension. Values
+/// are USD per 1M tokens.
+pub type ModelProviderPricing = HashMap<String, HashMap<String, f64>>;
 
 /// Context for cost tracking within the tool call loop.
 /// Scoped via `tokio::task_local!` at call sites (channels, gateway).
 #[derive(Clone)]
 pub struct ToolLoopCostTrackingContext {
     pub tracker: Arc<CostTracker>,
-    pub prices: Arc<std::collections::HashMap<String, ModelPricing>>,
+    pub model_provider_pricing: Arc<ModelProviderPricing>,
 }
 
 impl ToolLoopCostTrackingContext {
     pub fn new(
         tracker: Arc<CostTracker>,
-        prices: Arc<std::collections::HashMap<String, ModelPricing>>,
+        model_provider_pricing: Arc<ModelProviderPricing>,
     ) -> Self {
-        Self { tracker, prices }
+        Self {
+            tracker,
+            model_provider_pricing,
+        }
     }
 }
 
@@ -26,10 +37,44 @@ tokio::task_local! {
     pub static TOOL_LOOP_COST_TRACKING_CONTEXT: Option<ToolLoopCostTrackingContext>;
 }
 
+/// Resolve `(input, output)` per-1M-token rates for a given model on a given
+/// model-provider's pricing map. Lookup order:
+///
+/// 1. Dimension-specific keys: `{model}.input` / `{model}.output`.
+/// 2. Bare model key as a flat fallback applied to whichever dimension
+///    didn't match in step 1.
+/// 3. The model alias path's last segment (`.../suffix`) tried under the
+///    same rules.
+///
+/// Returns `(0.0, 0.0)` if no entry matches; the caller logs a one-shot
+/// debug message in that case.
+fn resolve_rates(pricing: &HashMap<String, f64>, model: &str) -> (f64, f64) {
+    let try_lookup = |key: &str| -> Option<(Option<f64>, Option<f64>)> {
+        let input = pricing.get(&format!("{key}.input")).copied();
+        let output = pricing.get(&format!("{key}.output")).copied();
+        let flat = pricing.get(key).copied();
+        if input.is_none() && output.is_none() && flat.is_none() {
+            None
+        } else {
+            Some((input.or(flat), output.or(flat)))
+        }
+    };
+
+    if let Some((input, output)) = try_lookup(model) {
+        return (input.unwrap_or(0.0), output.unwrap_or(0.0));
+    }
+    if let Some((_, suffix)) = model.rsplit_once('/')
+        && let Some((input, output)) = try_lookup(suffix)
+    {
+        return (input.unwrap_or(0.0), output.unwrap_or(0.0));
+    }
+    (0.0, 0.0)
+}
+
 /// Record token usage from an LLM response via the task-local cost tracker.
 /// Returns `(total_tokens, cost_usd)` on success, `None` when not scoped or no usage.
 pub fn record_tool_loop_cost_usage(
-    provider_name: &str,
+    model_provider_name: &str,
     model: &str,
     usage: &zeroclaw_providers::traits::TokenUsage,
 ) -> Option<(u64, f64)> {
@@ -44,27 +89,18 @@ pub fn record_tool_loop_cost_usage(
         .try_with(Clone::clone)
         .ok()
         .flatten()?;
-    // 3-tier model pricing lookup: direct name → provider/model → suffix after last `/`
-    let pricing = ctx
-        .prices
-        .get(model)
-        .or_else(|| ctx.prices.get(&format!("{provider_name}/{model}")))
-        .or_else(|| {
-            model
-                .rsplit_once('/')
-                .and_then(|(_, suffix)| ctx.prices.get(suffix))
-        });
-    let cost_usage = CostTokenUsage::new(
-        model,
-        input_tokens,
-        output_tokens,
-        pricing.map_or(0.0, |entry| entry.input),
-        pricing.map_or(0.0, |entry| entry.output),
-    );
 
-    if pricing.is_none() {
+    let pricing = ctx.model_provider_pricing.get(model_provider_name);
+    let (input_rate, output_rate) = pricing
+        .map(|map| resolve_rates(map, model))
+        .unwrap_or((0.0, 0.0));
+
+    let cost_usage =
+        CostTokenUsage::new(model, input_tokens, output_tokens, input_rate, output_rate);
+
+    if pricing.is_none() || (input_rate == 0.0 && output_rate == 0.0) {
         tracing::debug!(
-            provider = provider_name,
+            model_provider = model_provider_name,
             model,
             "Cost tracking recorded token usage with zero pricing (no pricing entry found)"
         );
@@ -72,7 +108,7 @@ pub fn record_tool_loop_cost_usage(
 
     if let Err(error) = ctx.tracker.record_usage(cost_usage.clone()) {
         tracing::warn!(
-            provider = provider_name,
+            model_provider = model_provider_name,
             model,
             "Failed to record cost tracking usage: {error}"
         );
