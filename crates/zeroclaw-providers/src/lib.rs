@@ -1792,6 +1792,23 @@ struct FallbackResolution {
     base_url: Option<String>,
 }
 
+/// True when `name` matches a registered provider's canonical name or one
+/// of its aliases (case-insensitive), per `list_providers()` — the same
+/// catalogue the onboarding flow and `create_provider_with_url_and_options`
+/// dispatch consult. Used by `resolve_fallback_provider` to decide whether
+/// a `[providers.models.<name>] { base_url = ... }` profile should keep
+/// its named-provider dispatch (recognized name) or be promoted to a
+/// `custom:<url>` shorthand (unrecognized name).
+fn is_known_provider(name: &str) -> bool {
+    list_providers().iter().any(|info| {
+        info.name.eq_ignore_ascii_case(name)
+            || info
+                .aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(name))
+    })
+}
+
 fn resolve_fallback_provider(
     fallback_name: &str,
     providers_config: Option<&zeroclaw_config::providers::ProvidersConfig>,
@@ -1826,14 +1843,25 @@ fn resolve_fallback_provider(
         name
     } else if !provider_name.starts_with("custom:")
         && !provider_name.starts_with("anthropic-custom:")
+        && !is_known_provider(provider_name)
         && let Some(ref url) = base_url
     {
-        // Profile carries a base_url and no name override. Promote to the
+        // Profile carries a base_url, no name override, AND the profile key
+        // does not match a registered provider name or alias. Promote to the
         // same custom:<url> shape that `apply_named_model_provider_profile`
         // produces for the primary path, so a fallback like
         // `[providers.models.local] { base_url = ... }` is accepted by the
         // factory instead of being dropped as `Unknown provider`. Mirrors
         // schema.rs::apply_named_model_provider_profile for consistency.
+        //
+        // Recognized providers (ollama, xai/grok, anthropic, etc.) keep their
+        // name so `create_provider_with_url_and_options(name, key, Some(url),
+        // ...)` routes through the provider-specific factory, which already
+        // knows how to honor `base_url` for that provider. Without the
+        // is_known_provider gate, named profiles like
+        // `[providers.models.ollama] { base_url = ... }` would be reduced to
+        // `custom:<url>` and lose provider-specific behavior (#5803, #6092
+        // review thread).
         format!("custom:{url}")
     } else {
         provider_name.to_string()
@@ -3990,6 +4018,72 @@ mod tests {
             resolution.base_url.as_deref(),
             Some("http://192.168.2.4:11434")
         );
+    }
+
+    #[test]
+    fn resolve_fallback_named_ollama_with_base_url_keeps_named_dispatch() {
+        // Regression for Audacity88's review on #6092: a profile keyed on a
+        // recognized provider name (here, "ollama") that supplies a base_url
+        // and no name override must NOT be reduced to `custom:<url>`. The
+        // ollama factory has its own URL handling — promotion would route
+        // through the generic OpenAI-compatible custom provider and lose
+        // provider-specific behavior.
+        let cfg = make_providers_config(vec![(
+            "ollama",
+            zeroclaw_config::schema::ModelProviderConfig {
+                base_url: Some("http://192.168.2.4:11434".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let resolution = resolve_fallback_provider("ollama", Some(&cfg));
+        assert_eq!(
+            resolution.actual_provider_name, "ollama",
+            "named-provider profile must keep its dispatch name when only base_url is set"
+        );
+        assert_eq!(
+            resolution.base_url.as_deref(),
+            Some("http://192.168.2.4:11434"),
+            "base_url must still flow through to the named-provider factory"
+        );
+    }
+
+    #[test]
+    fn resolve_fallback_named_xai_alias_with_base_url_keeps_named_dispatch() {
+        // Regression for Audacity88's review on #6092: aliases of recognized
+        // providers (here `grok` is an alias of `xai`) must also retain their
+        // named-provider dispatch when only base_url is set.
+        let cfg = make_providers_config(vec![(
+            "grok",
+            zeroclaw_config::schema::ModelProviderConfig {
+                api_key: Some("xai-test".to_string()),
+                base_url: Some("https://api.x.ai/v1".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let resolution = resolve_fallback_provider("grok", Some(&cfg));
+        assert_eq!(
+            resolution.actual_provider_name, "grok",
+            "alias of a recognized provider must keep its dispatch name"
+        );
+        assert_eq!(resolution.api_key.as_deref(), Some("xai-test"));
+        assert_eq!(resolution.base_url.as_deref(), Some("https://api.x.ai/v1"));
+    }
+
+    #[test]
+    fn is_known_provider_recognizes_canonical_and_aliases() {
+        assert!(is_known_provider("ollama"));
+        assert!(is_known_provider("openrouter"));
+        assert!(is_known_provider("anthropic"));
+        // Aliases
+        assert!(is_known_provider("grok")); // alias of xai
+        assert!(is_known_provider("codex")); // alias of openai-codex
+        // Case-insensitive
+        assert!(is_known_provider("Ollama"));
+        assert!(is_known_provider("OPENROUTER"));
+        // Negative
+        assert!(!is_known_provider("local"));
+        assert!(!is_known_provider("my-local"));
+        assert!(!is_known_provider("definitely-not-a-provider"));
     }
 
     #[test]
