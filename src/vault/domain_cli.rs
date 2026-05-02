@@ -200,9 +200,237 @@ pub async fn update(config: &Config) -> Result<()> {
         );
         return Ok(());
     };
-    // PR 1 still routes update → install (full re-download). PR 2
-    // replaces this with the manifest-v2 decision tree.
-    install(config, &url).await
+
+    // Detect the manifest's schema_version once and dispatch. v1
+    // manifests still flow through the legacy `install` path (full
+    // re-download every time). v2 manifests route through the
+    // decision tree from docs/domain-db-incremental-design.md §3.
+    let raw = fetch_manifest_text(&url)
+        .await
+        .with_context(|| format!("fetching manifest {url}"))?;
+    let schema_version = serde_json::from_str::<ManifestVersionPeek>(&raw)
+        .map(|p| p.schema_version)
+        .unwrap_or(0);
+
+    match schema_version {
+        1 => {
+            // v1: same as `install`. The user opted in by setting a
+            // registry_url, so a full download is the contract.
+            install(config, &url).await
+        }
+        2 => update_v2(config, &url, &raw).await,
+        n => anyhow::bail!(
+            "unsupported manifest.schema_version {n}; this build understands 1 or 2"
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ManifestVersionPeek {
+    schema_version: u32,
+}
+
+async fn fetch_manifest_text(url_or_path: &str) -> Result<String> {
+    if url_or_path.starts_with("http://") || url_or_path.starts_with("https://") {
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("zeroclaw/", env!("CARGO_PKG_VERSION")))
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .context("building reqwest client for manifest peek")?;
+        let res = client
+            .get(url_or_path)
+            .send()
+            .await
+            .with_context(|| format!("GET {url_or_path}"))?;
+        if !res.status().is_success() {
+            anyhow::bail!(
+                "manifest fetch failed: HTTP {} from {url_or_path}",
+                res.status().as_u16()
+            );
+        }
+        Ok(res.text().await?)
+    } else {
+        Ok(std::fs::read_to_string(url_or_path)
+            .with_context(|| format!("reading manifest file {url_or_path}"))?)
+    }
+}
+
+async fn update_v2(config: &Config, manifest_url: &str, manifest_raw: &str) -> Result<()> {
+    use super::domain_delta::{self, UpdateOutcome};
+    use super::domain_manifest::DomainManifestV2;
+
+    let manifest: DomainManifestV2 = serde_json::from_str(manifest_raw)
+        .with_context(|| format!("parsing v2 manifest from {manifest_url}"))?;
+    domain_manifest::validate_v2(&manifest).context("validating v2 manifest")?;
+
+    println!(
+        "{} {} v{} (baseline {}, {} delta(s))",
+        style("vault domain update:").bold().cyan(),
+        manifest.name,
+        manifest.version,
+        manifest.baseline.version,
+        manifest.deltas.len()
+    );
+
+    let installed = domain::read_meta(&config.workspace_dir)
+        .context("reading installed domain.db meta")?;
+
+    match domain_delta::decide(&manifest, &installed) {
+        UpdateOutcome::AlreadyCurrent => {
+            println!(
+                "  {} already at v{} (no bytes to download)",
+                style("✓").green(),
+                manifest.version
+            );
+            Ok(())
+        }
+        UpdateOutcome::FullInstall => full_install_v2(config, &manifest).await,
+        UpdateOutcome::ApplyDelta { delta_index } => {
+            apply_delta_outcome(config, &manifest, delta_index).await
+        }
+    }
+}
+
+async fn full_install_v2(config: &Config, manifest: &super::domain_manifest::DomainManifestV2) -> Result<()> {
+    use super::domain_manifest::{BundleSpec, DomainManifest, ManifestStats};
+
+    println!(
+        "  {} full install of baseline v{} ({} bytes)",
+        style("→").cyan(),
+        manifest.baseline.version,
+        manifest.baseline.size_bytes
+    );
+
+    // Reuse the v1 download_bundle path by adapting the baseline
+    // into a v1-shaped manifest. That avoids duplicating the
+    // download/sha gate, and the staging file lands in the same
+    // place either way.
+    let v1_shaped = DomainManifest {
+        schema_version: 1,
+        name: manifest.name.clone(),
+        version: manifest.baseline.version.clone(),
+        generated_at: manifest.generated_at.clone(),
+        generator: manifest.generator.clone(),
+        bundle: BundleSpec {
+            url: manifest.baseline.url.clone(),
+            sha256: manifest.baseline.sha256.clone(),
+            size_bytes: manifest.baseline.size_bytes,
+            compression: "none".into(),
+        },
+        stats: manifest.baseline.stats.clone(),
+    };
+
+    let staging_dir = config.workspace_dir.join("memory");
+    let staging = domain_manifest::download_bundle(&v1_shaped, &staging_dir)
+        .await
+        .context("downloading + verifying baseline bundle")?;
+    println!("  {} sha256 verified", style("✓").green());
+
+    let placed = domain::install_from(&config.workspace_dir, &staging)?;
+    let _ = std::fs::remove_file(&staging);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    domain::write_baseline_meta(
+        &placed,
+        &manifest.baseline.version,
+        &manifest.baseline.sha256,
+        now,
+    )
+    .context("stamping baseline meta on installed domain.db")?;
+
+    // After the baseline, if the manifest also carries deltas the
+    // installed `current_version` ended up at `baseline.version`,
+    // not the chain head. Apply the latest delta in the same run so
+    // the user reaches `manifest.version` in one update.
+    if let Some(latest) = manifest.deltas.last() {
+        println!(
+            "  {} catching up via latest delta v{} ({} bytes)",
+            style("→").cyan(),
+            latest.version,
+            latest.size_bytes
+        );
+        let staging = super::domain_delta::download_delta(latest, &staging_dir)
+            .await
+            .context("downloading + verifying latest delta")?;
+        let now2 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let report = super::domain_delta::apply_delta(
+            &config.workspace_dir,
+            &staging,
+            &manifest.baseline.version,
+            &latest.version,
+            now2,
+        )?;
+        let _ = std::fs::remove_file(&staging);
+        println!(
+            "  {} applied v{} → v{} (+{} upserts, -{} deletes)",
+            style("✓").green(),
+            report.previous_version,
+            report.new_version,
+            report.upserted_documents,
+            report.deleted_documents
+        );
+    }
+
+    let info = domain::info(&config.workspace_dir)?;
+    println!(
+        "  {} {} docs, {} links, {} bytes",
+        style("ready:").bold().green(),
+        info.vault_documents_count,
+        info.vault_links_count,
+        info.size_bytes
+    );
+    Ok(())
+}
+
+async fn apply_delta_outcome(
+    config: &Config,
+    manifest: &super::domain_manifest::DomainManifestV2,
+    delta_index: usize,
+) -> Result<()> {
+    let delta = manifest
+        .deltas
+        .get(delta_index)
+        .ok_or_else(|| anyhow::anyhow!("delta_index {delta_index} out of range"))?;
+    println!(
+        "  {} applying latest delta v{} ({} bytes)",
+        style("→").cyan(),
+        delta.version,
+        delta.size_bytes
+    );
+
+    let staging_dir = config.workspace_dir.join("memory");
+    let staging = super::domain_delta::download_delta(delta, &staging_dir)
+        .await
+        .context("downloading + verifying delta")?;
+    println!("  {} sha256 verified", style("✓").green());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let report = super::domain_delta::apply_delta(
+        &config.workspace_dir,
+        &staging,
+        &manifest.baseline.version,
+        &delta.version,
+        now,
+    )?;
+    let _ = std::fs::remove_file(&staging);
+
+    println!(
+        "  {} v{} → v{} (+{} upserts, -{} deletes)",
+        style("ready:").bold().green(),
+        report.previous_version,
+        report.new_version,
+        report.upserted_documents,
+        report.deleted_documents
+    );
+    Ok(())
 }
 
 pub async fn swap(config: &Config, manifest_src: &str) -> Result<()> {
