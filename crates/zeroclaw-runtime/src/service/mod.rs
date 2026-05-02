@@ -8,6 +8,39 @@ use zeroclaw_config::schema::Config;
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
 
+/// Default Linux service base name. Named instances derive theirs from
+/// the active config-dir; this is the fallback when no convention matches.
+const DEFAULT_SERVICE_BASE: &str = "zeroclaw";
+
+/// Derive the systemd unit base name (without `.service`) from the active
+/// config. Mirrors the convention used by named-instance setups: a
+/// config-dir of `~/.zeroclaw-foo/` → unit `zeroclaw-foo.service`. A
+/// default config-dir (or any unrecognized name) → `zeroclaw.service`.
+/// See #6227.
+pub fn linux_service_base(config: &Config) -> String {
+    config
+        .config_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+        .map(|name| name.trim_start_matches('.'))
+        .filter(|stripped| {
+            // Only honor the convention if the directory actually maps to
+            // ZeroClaw — anything else falls back to the default unit name
+            // so we don't synthesize bogus units from arbitrary paths.
+            *stripped == DEFAULT_SERVICE_BASE
+                || stripped
+                    .strip_prefix(DEFAULT_SERVICE_BASE)
+                    .is_some_and(|rest| rest.starts_with('-') && rest.len() > 1)
+        })
+        .map(String::from)
+        .unwrap_or_else(|| DEFAULT_SERVICE_BASE.to_string())
+}
+
+fn linux_systemd_unit(config: &Config) -> String {
+    format!("{}.service", linux_service_base(config))
+}
+
 /// Supported init systems for service management
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InitSystem {
@@ -90,14 +123,21 @@ fn windows_task_name() -> &'static str {
 }
 
 /// Returns whether the ZeroClaw daemon service is currently running.
-pub fn is_running() -> bool {
+///
+/// On Linux, the unit name is derived from the active config-dir so
+/// named instances (e.g. `~/.zeroclaw-foo/` → `zeroclaw-foo.service`)
+/// report status accurately instead of always pointing at the default
+/// `zeroclaw.service`. See #6227.
+pub fn is_running(config: &Config) -> bool {
     if cfg!(target_os = "macos") {
+        let _ = config;
         run_capture(Command::new("launchctl").arg("list"))
             .map(|out| out.lines().any(|l| l.contains(SERVICE_LABEL)))
             .unwrap_or(false)
     } else if cfg!(target_os = "linux") {
-        is_running_linux()
+        is_running_linux(config)
     } else if cfg!(target_os = "windows") {
+        let _ = config;
         run_capture(Command::new("schtasks").args([
             "/Query",
             "/TN",
@@ -108,19 +148,22 @@ pub fn is_running() -> bool {
         .map(|out| out.contains("Running"))
         .unwrap_or(false)
     } else {
+        let _ = config;
         false
     }
 }
 
-fn is_running_linux() -> bool {
+fn is_running_linux(config: &Config) -> bool {
+    let unit = linux_systemd_unit(config);
+    let base = linux_service_base(config);
     // Try systemd first, then OpenRC — mirrors detect_init_system() order
-    if run_capture(Command::new("systemctl").args(["--user", "is-active", "zeroclaw.service"]))
+    if run_capture(Command::new("systemctl").args(["--user", "is-active", &unit]))
         .map(|out| out.trim() == "active")
         .unwrap_or(false)
     {
         return true;
     }
-    run_capture(Command::new("rc-service").args(["zeroclaw", "status"]))
+    run_capture(Command::new("rc-service").args([&base, "status"]))
         .map(|out| out.contains("started"))
         .unwrap_or(false)
 }
@@ -155,7 +198,7 @@ pub fn start(config: &Config, init_system: InitSystem) -> Result<()> {
         Ok(())
     } else if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        start_linux(resolved)
+        start_linux(config, resolved)
     } else if cfg!(target_os = "windows") {
         let _ = config;
         run_checked(Command::new("schtasks").args(["/Run", "/TN", windows_task_name()]))?;
@@ -167,14 +210,16 @@ pub fn start(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
-fn start_linux(init_system: InitSystem) -> Result<()> {
+fn start_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
+            let unit = linux_systemd_unit(config);
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "start", "zeroclaw.service"]))?;
+            run_checked(Command::new("systemctl").args(["--user", "start", &unit]))?;
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["zeroclaw", "start"]))?;
+            let base = linux_service_base(config);
+            run_checked(Command::new("rc-service").args([&base, "start"]))?;
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -196,7 +241,7 @@ pub fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
         Ok(())
     } else if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        stop_linux(resolved)
+        stop_linux(config, resolved)
     } else if cfg!(target_os = "windows") {
         let _ = config;
         let task_name = windows_task_name();
@@ -209,14 +254,15 @@ pub fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
-fn stop_linux(init_system: InitSystem) -> Result<()> {
+fn stop_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let _ =
-                run_checked(Command::new("systemctl").args(["--user", "stop", "zeroclaw.service"]));
+            let unit = linux_systemd_unit(config);
+            let _ = run_checked(Command::new("systemctl").args(["--user", "stop", &unit]));
         }
         InitSystem::Openrc => {
-            let _ = run_checked(Command::new("rc-service").args(["zeroclaw", "stop"]));
+            let base = linux_service_base(config);
+            let _ = run_checked(Command::new("rc-service").args([&base, "stop"]));
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -234,7 +280,7 @@ pub fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
 
     if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        return restart_linux(resolved);
+        return restart_linux(config, resolved);
     }
 
     if cfg!(target_os = "windows") {
@@ -247,14 +293,16 @@ pub fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
     anyhow::bail!("Service management is supported on macOS and Linux only")
 }
 
-fn restart_linux(init_system: InitSystem) -> Result<()> {
+fn restart_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
+            let unit = linux_systemd_unit(config);
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "restart", "zeroclaw.service"]))?;
+            run_checked(Command::new("systemctl").args(["--user", "restart", &unit]))?;
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["zeroclaw", "restart"]))?;
+            let base = linux_service_base(config);
+            run_checked(Command::new("rc-service").args([&base, "restart"]))?;
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -314,20 +362,18 @@ pub fn status(config: &Config, init_system: InitSystem) -> Result<()> {
 fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let out = run_capture(Command::new("systemctl").args([
-                "--user",
-                "is-active",
-                "zeroclaw.service",
-            ]))
-            .unwrap_or_else(|_| "unknown".into());
+            let unit = linux_systemd_unit(config);
+            let out = run_capture(Command::new("systemctl").args(["--user", "is-active", &unit]))
+                .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
             println!("Unit: {}", linux_service_file(config)?.display());
         }
         InitSystem::Openrc => {
-            let out = run_capture(Command::new("rc-service").args(["zeroclaw", "status"]))
+            let base = linux_service_base(config);
+            let out = run_capture(Command::new("rc-service").args([&base, "status"]))
                 .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
-            println!("Unit: /etc/init.d/zeroclaw");
+            println!("Unit: /etc/init.d/{base}");
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -1351,12 +1397,8 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
-    let _ = config;
-    Ok(home
-        .join(".config")
-        .join("systemd")
-        .join("user")
-        .join("zeroclaw.service"))
+    let unit = linux_systemd_unit(config);
+    Ok(home.join(".config").join("systemd").join("user").join(unit))
 }
 
 fn run_checked(command: &mut Command) -> Result<()> {
@@ -1689,5 +1731,101 @@ mod tests {
             }
             _ => panic!("Expected Logs variant"),
         }
+    }
+}
+
+// Pure-function tests for the unit-name derivation introduced for #6227.
+// Lives in a separate non-gated module so it runs under plain
+// `cargo test -p zeroclaw-runtime` — the older `mod tests` above is
+// gated behind `zeroclaw_root_crate` because it references symbols from
+// the binary crate, but these tests only need `Config` + the helpers.
+#[cfg(test)]
+mod unit_name_tests {
+    use super::*;
+
+    fn config_with_dir(dir: &str) -> Config {
+        Config {
+            config_path: PathBuf::from(format!("{dir}/config.toml")),
+            ..Config::default()
+        }
+    }
+
+    /// Regression test for #6227 — when `--config-dir` points at a named
+    /// instance (`~/.zeroclaw-foo/`), the systemd unit name must follow
+    /// the same convention (`zeroclaw-foo.service`) instead of the
+    /// hardcoded default. Before the fix, named instances were always
+    /// reported as stopped because `is_running` queried `zeroclaw.service`
+    /// regardless of which instance the CLI was pointed at.
+    #[test]
+    fn derives_named_instance_from_config_dir() {
+        let config = config_with_dir("/home/user/.zeroclaw-p100-104");
+        assert_eq!(linux_service_base(&config), "zeroclaw-p100-104");
+        assert_eq!(linux_systemd_unit(&config), "zeroclaw-p100-104.service");
+    }
+
+    #[test]
+    fn uses_default_for_default_config_dir() {
+        let config = config_with_dir("/home/user/.zeroclaw");
+        assert_eq!(linux_service_base(&config), "zeroclaw");
+        assert_eq!(linux_systemd_unit(&config), "zeroclaw.service");
+    }
+
+    /// Config dirs that don't follow the `zeroclaw[-NAME]` convention
+    /// (with or without a leading dot) fall back to the default unit name
+    /// rather than synthesizing a possibly-bogus unit. A user with
+    /// `--config-dir /tmp/scratch` does not get `scratch.service` — they
+    /// get `zeroclaw.service` and the status check is best-effort against
+    /// the default unit, matching pre-#6227 behavior for any
+    /// non-conventional layout.
+    #[test]
+    fn falls_back_for_non_zeroclaw_dirs() {
+        for dir in [
+            "/tmp/scratch",
+            "/home/user/somewhere-else",
+            "/home/user/.zeroclawx", // close-but-not-prefixed; "x" is not "-..."
+            "/home/user/.zeroclaw-", // trailing dash with empty instance name
+            "/home/user/zeroclaw-",  // same, without the dot
+        ] {
+            let config = config_with_dir(dir);
+            let derived = linux_service_base(&config);
+            assert_eq!(
+                derived, "zeroclaw",
+                "non-conventional config dir {dir:?} should yield default \
+                 unit, got {derived:?}",
+            );
+        }
+    }
+
+    /// `~/zeroclaw-prod/` (no leading dot) is also a valid named instance
+    /// — some users prefer non-hidden config dirs. The convention applies
+    /// to the dir name's leading-dot-stripped form, so both
+    /// `.zeroclaw-prod` and `zeroclaw-prod` map to `zeroclaw-prod.service`.
+    #[test]
+    fn derives_named_instance_without_leading_dot() {
+        let config = config_with_dir("/home/user/zeroclaw-prod");
+        assert_eq!(linux_service_base(&config), "zeroclaw-prod");
+    }
+
+    #[test]
+    fn handles_pathless_config() {
+        let config = Config {
+            config_path: PathBuf::from("config.toml"),
+            ..Config::default()
+        };
+        assert_eq!(linux_service_base(&config), "zeroclaw");
+    }
+
+    #[test]
+    fn linux_service_file_named_instance_path() {
+        // `linux_service_file` should now respect the derived unit name
+        // rather than always returning `zeroclaw.service`. The macOS host
+        // running this test won't have `~/.config/systemd/user/` populated,
+        // but the path generation itself is OS-agnostic.
+        let config = config_with_dir("/home/user/.zeroclaw-prod");
+        let path = linux_service_file(&config).expect("home dir resolves");
+        assert!(
+            path.to_string_lossy().ends_with("zeroclaw-prod.service"),
+            "named instance must produce zeroclaw-prod.service, got {path:?}",
+        );
     }
 }

@@ -1883,7 +1883,7 @@ async fn main() -> Result<()> {
             );
             println!("🛡️  Autonomy:      {:?}", config.autonomy.level);
             println!("⚙️  Runtime:       {}", config.runtime.kind);
-            if service::is_running() {
+            if service::is_running(&config) {
                 println!("🟢 Service:       running");
             } else {
                 println!("🔴 Service:       stopped");
