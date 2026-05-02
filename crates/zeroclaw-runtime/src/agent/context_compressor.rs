@@ -376,9 +376,7 @@ impl ContextCompressor {
         }
 
         // Splice: head + [SUMMARY] + tail
-        let summary_msg = ChatMessage::assistant(format!(
-            "[CONTEXT SUMMARY \u{2014} {message_count} earlier messages compressed]\n\n{summary}"
-        ));
+        let summary_msg = build_summary_message(&history[start..end], &summary, message_count);
         history.splice(start..end, std::iter::once(summary_msg));
 
         // Repair orphaned tool pairs
@@ -503,6 +501,46 @@ fn truncate_chars(s: &str, max: usize) -> String {
     let mut result = s[..end].to_string();
     result.push_str("...");
     result
+}
+
+/// Construct the synthesized assistant message that replaces a compressed
+/// range. When the compressed range contains an assistant turn with
+/// `reasoning_content` (a thinking-mode response from providers like
+/// DeepSeek V4), embed the most recent such payload in the summary as a
+/// JSON-encoded `{content, reasoning_content}` body — matching the shape
+/// `build_native_assistant_history` already produces — so the next request
+/// to the provider passes its reasoning round-trip check. See #6269.
+fn build_summary_message(
+    compressed: &[ChatMessage],
+    summary: &str,
+    message_count: usize,
+) -> ChatMessage {
+    let summary_text = format!(
+        "[CONTEXT SUMMARY \u{2014} {message_count} earlier messages compressed]\n\n{summary}"
+    );
+
+    let last_reasoning = compressed
+        .iter()
+        .rev()
+        .filter(|m| m.role == "assistant")
+        .find_map(|m| {
+            serde_json::from_str::<serde_json::Value>(&m.content)
+                .ok()
+                .and_then(|v| {
+                    v.get("reasoning_content")
+                        .and_then(|rc| rc.as_str().map(ToString::to_string))
+                })
+        });
+
+    if let Some(rc) = last_reasoning {
+        let payload = serde_json::json!({
+            "content": summary_text,
+            "reasoning_content": rc,
+        });
+        ChatMessage::assistant(payload.to_string())
+    } else {
+        ChatMessage::assistant(summary_text)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -829,5 +867,90 @@ mod tests {
         let mut history = vec![msg("tool", &big)];
         let saved = compressor.fast_trim_tool_results(&mut history);
         assert_eq!(saved, 0);
+    }
+
+    /// When the compressed range has no thinking-mode reasoning_content,
+    /// the synthesized summary is plain text — same as before #6269.
+    #[test]
+    fn build_summary_message_uses_plain_text_when_no_reasoning() {
+        let compressed = vec![
+            msg("user", "what's the weather"),
+            msg("assistant", "it's sunny"),
+        ];
+        let out = build_summary_message(&compressed, "weather chat", 2);
+        assert_eq!(out.role, "assistant");
+        assert!(out.content.starts_with("[CONTEXT SUMMARY"));
+        assert!(out.content.contains("weather chat"));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out.content).is_err(),
+            "plain-text summary must not parse as JSON"
+        );
+    }
+
+    /// Regression test for #6269 — when an assistant message in the
+    /// compressed range carries `reasoning_content` (thinking-mode replay
+    /// payload), the synthesized summary preserves it via JSON-encoded
+    /// content matching `build_native_assistant_history`'s shape.
+    /// Without this, providers that require reasoning round-trip
+    /// (DeepSeek V4 thinking) reject every post-compression request.
+    #[test]
+    fn build_summary_message_preserves_reasoning_content_when_present() {
+        let assistant_with_reasoning = serde_json::json!({
+            "content": "let me look",
+            "reasoning_content": "user wants weather; need to check",
+        })
+        .to_string();
+        let compressed = vec![
+            msg("user", "what's the weather"),
+            msg("assistant", &assistant_with_reasoning),
+        ];
+
+        let out = build_summary_message(&compressed, "weather chat", 2);
+        assert_eq!(out.role, "assistant");
+        let parsed: serde_json::Value = serde_json::from_str(&out.content)
+            .expect("summary must be JSON when reasoning_content is preserved");
+        assert!(
+            parsed["content"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("[CONTEXT SUMMARY")),
+            "summary text belongs in `content`",
+        );
+        assert_eq!(
+            parsed["reasoning_content"].as_str(),
+            Some("user wants weather; need to check"),
+            "must carry reasoning_content from the most recent compressed assistant turn",
+        );
+    }
+
+    /// When multiple compressed assistant turns have reasoning_content,
+    /// the most recent one survives — this matches DeepSeek's protocol
+    /// expectation that the *immediately prior* assistant turn's
+    /// reasoning is what gets replayed.
+    #[test]
+    fn build_summary_message_picks_last_reasoning_content() {
+        let earlier = serde_json::json!({
+            "content": "first answer",
+            "reasoning_content": "EARLIER reasoning",
+        })
+        .to_string();
+        let later = serde_json::json!({
+            "content": "second answer",
+            "reasoning_content": "LATER reasoning",
+        })
+        .to_string();
+        let compressed = vec![
+            msg("user", "q1"),
+            msg("assistant", &earlier),
+            msg("user", "q2"),
+            msg("assistant", &later),
+        ];
+
+        let out = build_summary_message(&compressed, "two-turn chat", 4);
+        let parsed: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(
+            parsed["reasoning_content"].as_str(),
+            Some("LATER reasoning"),
+            "must pick the most recent reasoning_content, not the earliest",
+        );
     }
 }
