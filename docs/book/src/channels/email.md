@@ -74,6 +74,66 @@ Outbound sends still go via SMTP — configure an `smtp` block in this channel t
 
 ---
 
+## InboxAPI skill
+
+Use the InboxAPI skill when you already have an InboxAPI mailbox and want ZeroClaw to operate on it without configuring IMAP and SMTP directly inside ZeroClaw.
+
+This is the recommended Phase 1 InboxAPI integration path:
+
+```bash
+zeroclaw skills install inboxapi
+```
+
+### Operator setup
+
+1. Install the InboxAPI CLI:
+
+```bash
+npm install -g @inboxapi/cli
+```
+
+2. Authenticate once:
+
+```bash
+inboxapi login
+```
+
+3. Restart or re-open the agent session so the newly installed skill is visible to the model.
+
+### What the skill supports
+
+- Search inbox messages by sender, subject, and date.
+- Read single messages and full thread context.
+- Summarize recent mail for triage.
+- Send new outbound mail.
+- Reply in-thread through InboxAPI using the original message id.
+- Forward mail and fetch attachments on demand.
+
+The skill intentionally keeps InboxAPI as the source of truth for thread identity and delivery semantics. For replies, it uses `send-reply --message-id ...` instead of reconstructing SMTP threading inside ZeroClaw.
+
+### Optional MCP tool path
+
+If you want direct InboxAPI tools in ZeroClaw in addition to the skill prompt, register the InboxAPI CLI as a stdio MCP server:
+
+```toml
+[mcp]
+enabled = true
+
+[[mcp.servers]]
+name = "inboxapi"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@inboxapi/cli"]
+```
+
+That exposes InboxAPI tool calls through the runtime's normal MCP surface while keeping the same underlying account and auth flow.
+
+### When not to use it
+
+Use the native email channels above when you want ZeroClaw to own inbound polling or push delivery directly. Use the InboxAPI skill when you want a lighter operator path that reuses an existing InboxAPI mailbox and preserves InboxAPI-specific reply semantics.
+
+---
+
 ## Reply threading
 
 Both email channels thread replies using `In-Reply-To` and `References` headers so conversations stay grouped in whatever client the sender uses.
