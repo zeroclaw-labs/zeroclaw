@@ -17,6 +17,7 @@
 //! gate, and wire it into [`start_channels`] here. See `AGENTS.md` §7.2 for the
 //! full change playbook.
 
+#[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
 pub mod media_pipeline;
 pub mod mqtt;
@@ -837,18 +838,26 @@ fn resolved_default_provider(config: &Config) -> String {
         .unwrap_or_else(|| "openrouter".to_string())
 }
 
-fn resolved_default_model(config: &Config) -> String {
+fn resolved_default_model(config: &Config) -> anyhow::Result<String> {
     config
         .providers
         .fallback_provider()
         .and_then(|e| e.model.clone())
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model configured: providers.fallback = {:?} resolves with no model, \
+                 and no [[providers.models.*]] entry has a `model` field set. \
+                 Configure at least one [providers.models.<name>] model = \"...\" \
+                 or define a [[model_routes]] hint.",
+                config.providers.fallback
+            )
+        })
 }
 
-fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
-    ChannelRuntimeDefaults {
+fn runtime_defaults_from_config(config: &Config) -> anyhow::Result<ChannelRuntimeDefaults> {
+    Ok(ChannelRuntimeDefaults {
         default_provider: resolved_default_provider(config),
-        model: resolved_default_model(config),
+        model: resolved_default_model(config)?,
         temperature: config
             .providers
             .fallback_provider()
@@ -863,7 +872,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
             .fallback_provider()
             .and_then(|e| e.base_url.clone()),
         reliability: config.reliability.clone(),
-    }
+    })
 }
 
 fn runtime_config_path(ctx: &ChannelRuntimeContext) -> Option<PathBuf> {
@@ -962,7 +971,7 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
     }
 
     parsed.apply_env_overrides();
-    Ok(runtime_defaults_from_config(&parsed))
+    runtime_defaults_from_config(&parsed)
 }
 
 async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
@@ -5222,7 +5231,10 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
-pub async fn start_channels(config: Config) -> Result<()> {
+pub async fn start_channels(
+    config: Config,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_from_config(&config);
@@ -5257,7 +5269,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         store.insert(
             config.config_path.clone(),
             RuntimeConfigState {
-                defaults: runtime_defaults_from_config(&config),
+                defaults: runtime_defaults_from_config(&config)?,
                 last_applied_stamp: initial_stamp,
             },
         );
@@ -5271,7 +5283,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let model = resolved_default_model(&config);
+    let model = resolved_default_model(&config)?;
     let temperature = config
         .providers
         .fallback_provider()
@@ -5321,7 +5333,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .fallback_provider()
             .and_then(|e| e.api_key.as_deref()),
         &config,
-        None,
+        // Share the gateway's canvas store so frames pushed from
+        // channel-side agents reach the same WebSocket subscribers and
+        // REST snapshots the gateway serves (#5356). When `None`, the
+        // tool registry creates an orphaned store that nothing can
+        // observe — the original silent-failure shape.
+        canvas_store,
     );
 
     // Wire MCP tools into the registry before freezing — non-fatal.

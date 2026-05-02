@@ -44,6 +44,43 @@ use std::path::PathBuf;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
+/// Decorate the value at `path` in `config.toml` with a leading `# {comment}`
+/// line, preserving any non-comment whitespace. Mirrors the gateway's
+/// `apply_comments`. Best-effort — silently bails on parse errors so a
+/// successful set isn't downgraded to a failure for a metadata problem.
+async fn apply_comment_inline(
+    config_path: &std::path::Path,
+    path: &str,
+    comment: &str,
+) -> Result<()> {
+    zeroclaw_config::comment_writer::apply_comments(
+        config_path,
+        &[(path.to_string(), comment.to_string())],
+    )
+    .await
+    .context("failed to write comment annotation")
+}
+
+/// Coerce a JSON value into the string form `Config::set_prop` accepts.
+///
+/// Thin wrapper over the shared `zeroclaw_config::typed_value::coerce_for_set_prop`
+/// helper that the gateway PATCH/PUT endpoints use. Looking up a path's
+/// declared `PropKind` requires a `Config` reference, which the patch handler
+/// has — so this looks the kind up against the live config and forwards.
+fn json_value_to_setprop_string(
+    value: &serde_json::Value,
+    config: &Config,
+    path: &str,
+) -> Result<String> {
+    let kind = config
+        .prop_fields()
+        .into_iter()
+        .find(|f| f.name == path)
+        .map(|f| f.kind);
+    zeroclaw_config::typed_value::coerce_for_set_prop(value, kind)
+        .map_err(|e| anyhow::anyhow!("{}", e.message))
+}
+
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
     config::schema::validate_temperature(t)
@@ -722,6 +759,8 @@ enum OnboardSection {
     Hardware,
     /// Public tunnel provider (cloudflare, ngrok, tailscale, …).
     Tunnel,
+    /// Edit the markdown files that shape your agent (SOUL, IDENTITY, USER, …).
+    Personality,
 }
 
 /// Stub enum that mirrors the old `props` subcommands so clap can still parse
@@ -797,6 +836,7 @@ fn resolve_onboard_target(
         OnboardSection::Memory => Section::Memory,
         OnboardSection::Hardware => Section::Hardware,
         OnboardSection::Tunnel => Section::Tunnel,
+        OnboardSection::Personality => Section::Personality,
     });
 
     let target = explicit_section
@@ -830,8 +870,15 @@ enum PluginCommands {
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
-    /// Dump the full configuration JSON Schema to stdout
-    Schema,
+    /// Dump the full configuration JSON Schema to stdout. With `--path`, returns
+    /// the schema fragment for that property only — same payload `OPTIONS
+    /// /api/config/prop?path=...` returns over HTTP.
+    Schema {
+        /// Property path to scope the schema dump (e.g. `providers.fallback`).
+        /// Without it, dumps the whole-config schema.
+        #[arg(long)]
+        path: Option<String>,
+    },
     /// List all config properties with current values
     List {
         /// Filter by path prefix (e.g. "channels.telegram")
@@ -845,6 +892,9 @@ enum ConfigCommands {
     Get {
         /// Property path (e.g. channels.telegram.mention-only)
         path: String,
+        /// Emit a structured JSON envelope ({path, value} or {path, populated}) instead of plain text.
+        #[arg(long)]
+        json: bool,
     },
     /// Set a config property (secret fields auto-prompt for masked input)
     Set {
@@ -855,14 +905,40 @@ enum ConfigCommands {
         /// Skip interactive prompts — require value on command line, accept raw strings for enums
         #[arg(long)]
         no_interactive: bool,
+        /// Optional comment to write alongside the value in TOML (preserves through future edits).
+        #[arg(long)]
+        comment: Option<String>,
+        /// Emit a structured JSON envelope on success.
+        #[arg(long)]
+        json: bool,
     },
     /// Initialize unconfigured sections with defaults (enabled=false)
     Init {
         /// Section prefix (e.g. channels.matrix). Omit to init all.
         section: Option<String>,
+        /// Emit a structured JSON envelope ({initialized: [...]}) instead of plain text.
+        #[arg(long)]
+        json: bool,
     },
     /// Migrate config.toml to the current schema version on disk (preserves comments)
-    Migrate,
+    Migrate {
+        /// Emit a structured JSON envelope ({migrated, backup_path?, schema_version}) instead of plain text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply a JSON Patch (RFC 6902) document atomically. Mirrors `PATCH /api/config`.
+    ///
+    /// Reads operations from the given file, or from stdin when path is `-` or omitted.
+    /// Supported ops: `add`, `replace`, `remove`, `test`. `move` and `copy` are rejected.
+    Patch {
+        /// Path to a JSON Patch document, or `-` for stdin (default).
+        input: Option<String>,
+        /// Print results as JSON (one object per applied op) instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the API explorer URL (plus a hint if the daemon isn't running).
+    Docs,
     /// Print matching property paths for shell completion (hidden)
     #[command(hide = true)]
     Complete {
@@ -1413,6 +1489,28 @@ async fn main() -> Result<()> {
     }
 
     #[cfg(feature = "agent-runtime")]
+    {
+        // Wire cron delivery to the channels orchestrator. Registered before
+        // dispatch so that *any* command path that may execute cron jobs —
+        // `daemon`, `gateway start`, or a one-shot `cron run` — has a working
+        // delivery handler. Previously this lived only inside the daemon
+        // branch, which left `zeroclaw gateway start` unable to deliver
+        // manually-triggered cron announcements ("no delivery handler
+        // registered"). `register_delivery_fn` is idempotent (backed by
+        // `OnceLock::set`), so calling it once here is safe.
+        zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
+            |config, channel, target, output| {
+                Box::pin(async move {
+                    zeroclaw_channels::orchestrator::deliver_announcement(
+                        &config, &channel, &target, &output,
+                    )
+                    .await
+                })
+            },
+        ));
+    }
+
+    #[cfg(feature = "agent-runtime")]
     match cli.command {
         Commands::Onboard { .. }
         | Commands::Completions { .. }
@@ -1466,7 +1564,8 @@ async fn main() -> Result<()> {
             if let Some(timeout) = session_timeout {
                 acp_config.session_timeout_secs = timeout;
             }
-            let server = channels::acp_server::AcpServer::new(config, acp_config);
+            let server =
+                std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config));
             server.run().await
         }
 
@@ -1645,52 +1744,94 @@ async fn main() -> Result<()> {
                 })
             }));
 
-            // Wire cron delivery to the channels orchestrator
-            #[cfg(feature = "agent-runtime")]
-            zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
-                |config, channel, target, output| {
-                    Box::pin(async move {
-                        zeroclaw_channels::orchestrator::deliver_announcement(
-                            &config, &channel, &target, &output,
-                        )
-                        .await
-                    })
-                },
-            ));
+            // Cron delivery is registered earlier (before the command match)
+            // so it works for both `daemon` and `gateway start`.
 
-            let subsystems = daemon::DaemonSubsystems {
-                #[cfg(feature = "gateway")]
-                gateway_start: Some(Box::new(|host, port, config, tx| {
-                    Box::pin(async move {
-                        Box::pin(zeroclaw_gateway::run_gateway(&host, port, config, tx)).await
-                    })
-                })),
-                #[cfg(not(feature = "gateway"))]
-                gateway_start: None,
-                channels_start: Some(Box::new(|config| {
-                    Box::pin(async move {
-                        Box::pin(zeroclaw_channels::orchestrator::start_channels(config)).await
-                    })
-                })),
-                mqtt_start: Some(Box::new(|mqtt_config| {
-                    Box::pin(async move {
-                        use std::sync::{Arc, Mutex};
-                        use zeroclaw_config::schema::SopConfig;
-                        use zeroclaw_memory::NoneMemory;
-                        use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
+            // Single canvas store shared between the gateway HTTP / WebSocket
+            // surface and the channel-server agents so canvas frames pushed
+            // from Telegram / Discord / Slack reach the same subscribers the
+            // web UI serves. Without this, channels build an orphaned
+            // CanvasStore::default() and frames are silently dropped (#5356).
+            let canvas_store = zeroclaw_runtime::tools::CanvasStore::new();
+            let canvas_store_for_gateway = canvas_store.clone();
+            let canvas_store_for_channels = canvas_store.clone();
 
-                        let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
-                        let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory)));
-                        zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
-                            &mqtt_config,
-                            engine,
-                            audit,
-                        )
-                        .await
-                    })
-                })),
-            };
-            Box::pin(daemon::run(config, host, port, subsystems)).await
+            // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
+            // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload on SIGUSR1
+            // (loop re-reads config from disk and re-runs). The PID stays
+            // the same across reloads — only the in-process subsystems
+            // tear down + re-instantiate.
+            let mut current_config = config;
+            loop {
+                // Per-iteration clones so the subsystem closures (which
+                // `move`-capture) don't consume the outer bindings on the
+                // first iteration; reload would otherwise see a moved value.
+                let canvas_store_for_gateway = canvas_store_for_gateway.clone();
+                let canvas_store_for_channels = canvas_store_for_channels.clone();
+                let subsystems = daemon::DaemonSubsystems {
+                    #[cfg(feature = "gateway")]
+                    gateway_start: Some(Box::new(move |host, port, config, tx, reload_tx| {
+                        let canvas_store = canvas_store_for_gateway.clone();
+                        Box::pin(async move {
+                            Box::pin(zeroclaw_gateway::run_gateway(
+                                &host,
+                                port,
+                                config,
+                                tx,
+                                reload_tx,
+                                Some(canvas_store),
+                            ))
+                            .await
+                        })
+                    })),
+                    #[cfg(not(feature = "gateway"))]
+                    gateway_start: None,
+                    channels_start: Some(Box::new(move |config| {
+                        let canvas_store = canvas_store_for_channels.clone();
+                        Box::pin(async move {
+                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                                config,
+                                Some(canvas_store),
+                            ))
+                            .await
+                        })
+                    })),
+                    mqtt_start: Some(Box::new(|mqtt_config| {
+                        Box::pin(async move {
+                            use std::sync::{Arc, Mutex};
+                            use zeroclaw_config::schema::SopConfig;
+                            use zeroclaw_memory::NoneMemory;
+                            use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
+
+                            let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
+                            let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory)));
+                            zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
+                                &mqtt_config,
+                                engine,
+                                audit,
+                            )
+                            .await
+                        })
+                    })),
+                };
+                let exit = Box::pin(daemon::run(
+                    current_config.clone(),
+                    host.clone(),
+                    port,
+                    subsystems,
+                ))
+                .await?;
+                match exit {
+                    daemon::DaemonExit::Shutdown => break,
+                    daemon::DaemonExit::Reload => {
+                        info!("🔄 Daemon reload — re-reading config from disk");
+                        current_config = Box::pin(Config::load_or_init()).await?;
+                        current_config.apply_env_overrides();
+                        // Continue loop: fresh subsystems with the new config.
+                    }
+                }
+            }
+            Ok(())
         }
 
         Commands::Status { format } => {
@@ -1929,7 +2070,7 @@ async fn main() -> Result<()> {
         },
 
         Commands::Channel { channel_command } => match channel_command {
-            ChannelCommands::Start => Box::pin(channels::start_channels(config)).await,
+            ChannelCommands::Start => Box::pin(channels::start_channels(config, None)).await,
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
         },
@@ -2133,12 +2274,31 @@ async fn main() -> Result<()> {
         }
 
         Commands::Config { config_command } => match config_command {
-            ConfigCommands::Schema => {
+            ConfigCommands::Schema { path } => {
                 let schema = schemars::schema_for!(config::Config);
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
-                );
+                let value = match path.as_deref() {
+                    None => {
+                        serde_json::to_value(&schema).context("failed to serialize JSON Schema")?
+                    }
+                    Some(prop_path) => {
+                        let full = serde_json::to_value(&schema)
+                            .context("failed to serialize JSON Schema")?;
+                        // Embed the requested path so consumers see the same hint
+                        // shape that OPTIONS /api/config/prop returns. Per-path
+                        // subtree extraction is a follow-up that walks the schema
+                        // by JSON Pointer; for now we attach the hint and return
+                        // the whole-config schema, mirroring the HTTP behavior.
+                        let mut out = full;
+                        if let serde_json::Value::Object(ref mut map) = out {
+                            map.insert(
+                                "x-zeroclaw-requested-path".into(),
+                                serde_json::Value::String(prop_path.into()),
+                            );
+                        }
+                        out
+                    }
+                };
+                println!("{}", serde_json::to_string_pretty(&value)?);
                 Ok(())
             }
             ConfigCommands::List { filter, secrets } => {
@@ -2168,23 +2328,58 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
-            ConfigCommands::Get { path } => {
+            ConfigCommands::Get { path, json } => {
                 if Config::prop_is_secret(&path) {
                     let entries = config.prop_fields();
-                    let is_set = entries
+                    let populated = entries
                         .iter()
                         .find(|e| e.name == path)
                         .map(|e| e.display_value != "<unset>")
                         .unwrap_or(false);
-                    if is_set {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "path": path,
+                                "populated": populated,
+                            }))?
+                        );
+                    } else if populated {
                         println!("{path} is set (encrypted secret \u{2014} value not displayed)");
                     } else {
                         println!("{path} is not set (encrypted secret)");
                     }
                 } else {
                     match config.get_prop(&path) {
-                        Ok(value) => println!("{value}"),
-                        Err(e) => anyhow::bail!("{e}"),
+                        Ok(value) => {
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "path": path,
+                                        "value": value,
+                                    }))?
+                                );
+                            } else {
+                                println!("{value}");
+                            }
+                        }
+                        Err(e) => {
+                            // Classify the anyhow string into a stable code so
+                            // the CLI's --json envelope matches the HTTP shape.
+                            // Same single-source-of-truth helper the gateway
+                            // uses; never hardcode a code at the call site.
+                            let api_err =
+                                zeroclaw_config::api_error::ConfigApiError::from_validation(
+                                    anyhow::anyhow!("{e}"),
+                                )
+                                .with_path(&path);
+                            if json {
+                                eprintln!("{}", serde_json::to_string_pretty(&api_err)?);
+                                std::process::exit(1);
+                            }
+                            anyhow::bail!("{e}");
+                        }
                     }
                 }
                 Ok(())
@@ -2193,6 +2388,8 @@ async fn main() -> Result<()> {
                 path,
                 value,
                 no_interactive,
+                comment,
+                json,
             } => {
                 if no_interactive {
                     let val = value.ok_or_else(|| {
@@ -2276,12 +2473,37 @@ async fn main() -> Result<()> {
                     }
                 }
                 config.save().await?;
-                println!("{path} updated.");
+                if let Some(c) = comment.as_ref()
+                    && !c.is_empty()
+                {
+                    apply_comment_inline(&config.config_path, &path, c).await?;
+                }
+                if json {
+                    let envelope = if Config::prop_is_secret(&path) {
+                        serde_json::json!({"path": path, "populated": true})
+                    } else {
+                        let value_str = config.get_prop(&path).unwrap_or_default();
+                        serde_json::json!({"path": path, "value": value_str})
+                    };
+                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                } else {
+                    println!("{path} updated.");
+                }
                 Ok(())
             }
-            ConfigCommands::Init { section } => {
-                let initialized = config.init_defaults(section.as_deref());
-                if initialized.is_empty() {
+            ConfigCommands::Init { section, json } => {
+                let initialized: Vec<String> = config
+                    .init_defaults(section.as_deref())
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                if !initialized.is_empty() {
+                    config.save().await?;
+                }
+                if json {
+                    let envelope = serde_json::json!({"initialized": initialized});
+                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                } else if initialized.is_empty() {
                     println!("All sections already configured.");
                 } else {
                     println!(
@@ -2291,12 +2513,11 @@ async fn main() -> Result<()> {
                     for name in &initialized {
                         println!("  {name}");
                     }
-                    config.save().await?;
                     println!("\nRun `zeroclaw config list` to review, then set required fields.");
                 }
                 Ok(())
             }
-            ConfigCommands::Migrate => {
+            ConfigCommands::Migrate { json } => {
                 let raw = tokio::fs::read_to_string(&config.config_path)
                     .await
                     .context("Failed to read config file")?;
@@ -2308,15 +2529,210 @@ async fn main() -> Result<()> {
                             .context("Failed to create config backup")?;
                         tokio::fs::write(&config.config_path, &migrated).await?;
                         let to = crate::config::migration::CURRENT_SCHEMA_VERSION;
-                        println!("Backed up to {}", backup_path.display());
-                        println!(
-                            "Migrated {} to schema version {to}.",
-                            config.config_path.display()
-                        );
+                        if json {
+                            let envelope = serde_json::json!({
+                                "migrated": true,
+                                "backup_path": backup_path.display().to_string(),
+                                "schema_version": to,
+                            });
+                            println!("{}", serde_json::to_string_pretty(&envelope)?);
+                        } else {
+                            println!("Backed up to {}", backup_path.display());
+                            println!(
+                                "Migrated {} to schema version {to}.",
+                                config.config_path.display()
+                            );
+                        }
                     }
                     None => {
-                        println!("Config already at current schema version.");
+                        if json {
+                            let envelope = serde_json::json!({
+                                "migrated": false,
+                                "schema_version": crate::config::migration::CURRENT_SCHEMA_VERSION,
+                            });
+                            println!("{}", serde_json::to_string_pretty(&envelope)?);
+                        } else {
+                            println!("Config already at current schema version.");
+                        }
                     }
+                }
+                Ok(())
+            }
+            ConfigCommands::Patch { input, json } => {
+                let body = match input.as_deref() {
+                    None | Some("-") => {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        std::io::stdin()
+                            .read_to_string(&mut buf)
+                            .context("Failed to read JSON Patch from stdin")?;
+                        buf
+                    }
+                    Some(path) => tokio::fs::read_to_string(path)
+                        .await
+                        .with_context(|| format!("Failed to read JSON Patch from {path}"))?,
+                };
+
+                let ops: Vec<serde_json::Value> = serde_json::from_str(body.trim())
+                    .context("JSON Patch body must be a JSON array of operations")?;
+
+                let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
+
+                for (idx, op) in ops.iter().enumerate() {
+                    let op_name = op
+                        .get("op")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("op[{idx}]: missing `op` field"))?;
+                    let raw_path = op
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("op[{idx}]: missing `path` field"))?;
+                    let path = if let Some(stripped) = raw_path.strip_prefix('/') {
+                        stripped.replace('/', ".")
+                    } else {
+                        raw_path.to_string()
+                    };
+                    let is_secret = Config::prop_is_secret(&path);
+
+                    let result_entry: serde_json::Value = match op_name {
+                        "add" | "replace" => {
+                            let value = op.get("value").ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "op[{idx}] `{op_name}` on `{path}`: missing `value` field"
+                                )
+                            })?;
+                            let value_str = json_value_to_setprop_string(value, &config, &path)?;
+                            config.set_prop(&path, &value_str).with_context(|| {
+                                format!("op[{idx}] `{op_name}` on `{path}` failed")
+                            })?;
+                            if is_secret {
+                                serde_json::json!({
+                                    "op": op_name,
+                                    "path": path,
+                                    "populated": !value_str.is_empty(),
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "op": op_name,
+                                    "path": path,
+                                    "value": value_str,
+                                })
+                            }
+                        }
+                        "remove" => {
+                            config.set_prop(&path, "").with_context(|| {
+                                format!("op[{idx}] `remove` on `{path}` failed")
+                            })?;
+                            if is_secret {
+                                serde_json::json!({
+                                    "op": "remove",
+                                    "path": path,
+                                    "populated": false,
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "op": "remove",
+                                    "path": path,
+                                    "value": serde_json::Value::Null,
+                                })
+                            }
+                        }
+                        "test" => {
+                            if is_secret {
+                                anyhow::bail!(
+                                    "op[{idx}] `test` on `{path}`: secret_test_forbidden \
+                                     \u{2014} test ops are not allowed against secret paths"
+                                );
+                            }
+                            let want = op.get("value").ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "op[{idx}] `test` on `{path}`: missing `value` field"
+                                )
+                            })?;
+                            let actual = config.get_prop(&path).with_context(|| {
+                                format!("op[{idx}] `test` on `{path}` failed to read current value")
+                            })?;
+                            let want_str = match want {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            if actual != want_str {
+                                anyhow::bail!(
+                                    "op[{idx}] `test` on `{path}` failed: \
+                                     expected {want_str}, got {actual}"
+                                );
+                            }
+                            serde_json::json!({
+                                "op": "test",
+                                "path": path,
+                                "value": actual,
+                            })
+                        }
+                        "move" | "copy" => {
+                            anyhow::bail!(
+                                "op[{idx}] `{op_name}` on `{path}`: op_not_supported \
+                                 \u{2014} move/copy require a reference graph that is not built yet"
+                            );
+                        }
+                        other => {
+                            anyhow::bail!("op[{idx}] unknown JSON Patch operation `{other}`");
+                        }
+                    };
+                    results.push(result_entry);
+                }
+
+                config
+                    .validate()
+                    .context("validation failed after applying patch \u{2014} no changes saved")?;
+                config.save().await?;
+
+                if json {
+                    let body = serde_json::json!({"saved": true, "results": results});
+                    println!("{}", serde_json::to_string_pretty(&body)?);
+                } else {
+                    println!("Applied {} operation(s):", results.len());
+                    for entry in &results {
+                        let op = entry.get("op").and_then(|v| v.as_str()).unwrap_or("?");
+                        let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                        if let Some(populated) = entry.get("populated").and_then(|v| v.as_bool()) {
+                            let lock = "\u{1f512}";
+                            let label = if populated { "set" } else { "unset" };
+                            println!("  {op:<8} {path}  {lock} ({label})");
+                        } else {
+                            let value = entry
+                                .get("value")
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "null".to_string());
+                            println!("  {op:<8} {path} = {value}");
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ConfigCommands::Docs => {
+                let port = config.gateway.port;
+                let host = if config.gateway.host == "[::]" || config.gateway.host == "0.0.0.0" {
+                    "127.0.0.1".to_string()
+                } else {
+                    config.gateway.host.clone()
+                };
+                let url = format!("http://{host}:{port}/api/docs");
+
+                let health = format!("http://{host}:{port}/health");
+                let daemon_running = reqwest::Client::new()
+                    .get(&health)
+                    .timeout(std::time::Duration::from_secs(2))
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false);
+
+                println!("{url}");
+                if !daemon_running {
+                    eprintln!(
+                        "Note: gateway does not appear to be running at {host}:{port}. \
+                         Start it with `zeroclaw daemon start` to load the explorer."
+                    );
                 }
                 Ok(())
             }
@@ -3428,7 +3844,11 @@ async fn run_gateway_if_enabled(
     config: zeroclaw::config::Config,
     tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 ) -> anyhow::Result<()> {
-    Box::pin(gateway::run_gateway(host, port, config, tx)).await
+    // Standalone gateway (no daemon supervisor): pass None for reload_tx so
+    // /admin/reload returns 503 with a clear "no supervisor; restart
+    // manually" message, and None for canvas_store so the gateway falls
+    // back to its own default.
+    Box::pin(gateway::run_gateway(host, port, config, tx, None, None)).await
 }
 
 #[cfg(not(feature = "gateway"))]
