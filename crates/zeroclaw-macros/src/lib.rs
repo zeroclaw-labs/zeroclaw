@@ -138,6 +138,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let mut nested_encrypt = Vec::new();
     let mut nested_decrypt = Vec::new();
 
+    // ── MaskSecrets codegen accumulators ──
+    let mut mask_ops = Vec::new();
+    let mut restore_ops = Vec::new();
+
     // ── Property codegen accumulators ──
     let mut prop_field_entries = Vec::new();
     let mut prop_names: Vec<String> = Vec::new();
@@ -173,6 +177,18 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             let category_lit = &category;
 
             if is_vec_string {
+                // Vec<String> with #[secret]: mask each element
+                mask_ops.push(quote! {
+                    for element in &mut self.#field_ident {
+                        crate::traits::mask_required_secret(element);
+                    }
+                });
+                restore_ops.push(quote! {
+                    for (element, cur) in self.#field_ident.iter_mut().zip(current.#field_ident.iter()) {
+                        crate::traits::restore_required_secret(element, cur);
+                    }
+                });
+
                 // Vec<String> with #[secret]: iterate elements for encrypt/decrypt
                 secret_field_entries.push(quote! {
                     crate::config::SecretFieldInfo {
@@ -198,6 +214,13 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
             } else if is_option {
+                mask_ops.push(quote! {
+                    crate::traits::mask_optional_secret(&mut self.#field_ident);
+                });
+                restore_ops.push(quote! {
+                    crate::traits::restore_optional_secret(&mut self.#field_ident, &current.#field_ident);
+                });
+
                 secret_field_entries.push(quote! {
                     crate::config::SecretFieldInfo {
                         name: #full_name_lit,
@@ -229,6 +252,13 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
             } else {
+                mask_ops.push(quote! {
+                    crate::traits::mask_required_secret(&mut self.#field_ident);
+                });
+                restore_ops.push(quote! {
+                    crate::traits::restore_required_secret(&mut self.#field_ident, &current.#field_ident);
+                });
+
                 secret_field_entries.push(quote! {
                     crate::config::SecretFieldInfo {
                         name: #full_name_lit,
@@ -260,6 +290,14 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             let hashmap_value_ty = extract_hashmap_value_type(&field.ty);
 
             if let Some(value_ty) = hashmap_value_ty {
+                // HashMap<String, T: MaskSecrets> — blanket impl handles iteration
+                mask_ops.push(quote! {
+                    crate::traits::MaskSecrets::mask_secrets(&mut self.#field_ident);
+                });
+                restore_ops.push(quote! {
+                    crate::traits::MaskSecrets::restore_secrets_from(&mut self.#field_ident, &current.#field_ident);
+                });
+
                 // HashMap<String, T> with #[nested]: iterate values for secret ops
                 nested_collect.push(quote! {
                     for inner in self.#field_ident.values() {
@@ -355,6 +393,15 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
                 continue;
             } else if is_option {
+                mask_ops.push(quote! {
+                    if let Some(inner) = &mut self.#field_ident { inner.mask_secrets(); }
+                });
+                restore_ops.push(quote! {
+                    if let Some(inner) = &mut self.#field_ident {
+                        if let Some(cur) = &current.#field_ident { inner.restore_secrets_from(cur); }
+                    }
+                });
+
                 nested_collect.push(quote! {
                     if let Some(inner) = &self.#field_ident {
                         fields.extend(inner.secret_fields());
@@ -446,6 +493,13 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 });
                 nested_decrypt.push(quote! {
                     self.#field_ident.decrypt_secrets(store)?;
+                });
+
+                mask_ops.push(quote! {
+                    self.#field_ident.mask_secrets();
+                });
+                restore_ops.push(quote! {
+                    self.#field_ident.restore_secrets_from(&current.#field_ident);
                 });
 
                 // ── Nested property delegation (non-Option) ──
@@ -654,6 +708,15 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 let mut initialized: Vec<&'static str> = Vec::new();
                 #(#init_defaults_ops)*
                 initialized
+            }
+        }
+
+        impl crate::traits::MaskSecrets for #struct_name {
+            fn mask_secrets(&mut self) {
+                #(#mask_ops)*
+            }
+            fn restore_secrets_from(&mut self, current: &Self) {
+                #(#restore_ops)*
             }
         }
     };

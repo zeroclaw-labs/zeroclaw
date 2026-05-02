@@ -97,6 +97,63 @@ impl std::fmt::Debug for PropFieldInfo {
     }
 }
 
+/// Mask and restore secret fields on config structs.
+///
+/// Automatically implemented by `#[derive(Configurable)]` for any struct that
+/// has fields annotated with `#[secret]` or `#[nested]`. A blanket impl covers
+/// `HashMap<String, T: MaskSecrets>` so the trait propagates through alias maps
+/// without any per-type boilerplate.
+pub trait MaskSecrets {
+    fn mask_secrets(&mut self);
+    fn restore_secrets_from(&mut self, current: &Self);
+}
+
+impl<T: MaskSecrets> MaskSecrets for std::collections::HashMap<String, T> {
+    fn mask_secrets(&mut self) {
+        for v in self.values_mut() {
+            v.mask_secrets();
+        }
+    }
+    fn restore_secrets_from(&mut self, current: &Self) {
+        for (k, v) in self.iter_mut() {
+            if let Some(cur) = current.get(k) {
+                v.restore_secrets_from(cur);
+            }
+        }
+    }
+}
+
+pub const MASKED_SECRET: &str = "***MASKED***";
+
+pub fn is_masked_secret(value: &str) -> bool {
+    value == MASKED_SECRET
+}
+
+pub fn mask_optional_secret(value: &mut Option<String>) {
+    if value.is_some() {
+        *value = Some(MASKED_SECRET.to_string());
+    }
+}
+
+pub fn mask_required_secret(value: &mut String) {
+    if !value.is_empty() {
+        *value = MASKED_SECRET.to_string();
+    }
+}
+
+#[allow(clippy::ref_option)]
+pub fn restore_optional_secret(value: &mut Option<String>, current: &Option<String>) {
+    if value.as_deref().is_some_and(is_masked_secret) {
+        *value = current.clone();
+    }
+}
+
+pub fn restore_required_secret(value: &mut String, current: &str) {
+    if is_masked_secret(value) {
+        *value = current.to_string();
+    }
+}
+
 /// The trait for describing a channel
 pub trait ChannelConfig {
     /// human-readable name

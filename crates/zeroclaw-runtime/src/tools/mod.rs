@@ -887,7 +887,12 @@ pub fn all_tools_with_runtime(
         .with_multimodal_config(root_config.multimodal.clone())
         .with_delegate_config(root_config.delegate.clone())
         .with_workspace_dir(workspace_dir.to_path_buf())
-        .with_memory(memory.clone());
+        .with_memory(memory.clone())
+        .with_providers_models(root_config.providers.models.clone())
+        .with_risk_profiles(root_config.risk_profiles.clone())
+        .with_runtime_profiles(root_config.runtime_profiles.clone())
+        .with_skill_bundles(root_config.skill_bundles.clone())
+        .with_memory_namespaces(root_config.memory_namespaces.clone());
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };

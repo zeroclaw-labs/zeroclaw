@@ -10,7 +10,10 @@ use axum::{
 };
 use serde::Deserialize;
 
-const MASKED_SECRET: &str = "***MASKED***";
+use zeroclaw_config::traits::{
+    MASKED_SECRET, MaskSecrets, is_masked_secret, mask_optional_secret, mask_required_secret,
+    restore_optional_secret, restore_required_secret,
+};
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -934,40 +937,11 @@ pub async fn handle_api_health(
 
 // ── Helpers ─────────────────────────────────────────────────────
 
-fn is_masked_secret(value: &str) -> bool {
-    value == MASKED_SECRET
-}
-
-fn mask_optional_secret(value: &mut Option<String>) {
-    if value.is_some() {
-        *value = Some(MASKED_SECRET.to_string());
-    }
-}
-
-fn mask_required_secret(value: &mut String) {
-    if !value.is_empty() {
-        *value = MASKED_SECRET.to_string();
-    }
-}
-
 fn mask_vec_secrets(values: &mut [String]) {
     for value in values.iter_mut() {
         if !value.is_empty() {
             *value = MASKED_SECRET.to_string();
         }
-    }
-}
-
-#[allow(clippy::ref_option)]
-fn restore_optional_secret(value: &mut Option<String>, current: &Option<String>) {
-    if value.as_deref().is_some_and(is_masked_secret) {
-        *value = current.clone();
-    }
-}
-
-fn restore_required_secret(value: &mut String, current: &str) {
-    if is_masked_secret(value) {
-        *value = current.to_string();
     }
 }
 
@@ -1138,74 +1112,7 @@ fn mask_sensitive_fields(
         mask_optional_secret(&mut route.api_key);
     }
 
-    if let Some(telegram) = masked.channels.telegram.get_mut("default") {
-        mask_required_secret(&mut telegram.bot_token);
-    }
-    if let Some(discord) = masked.channels.discord.get_mut("default") {
-        mask_required_secret(&mut discord.bot_token);
-    }
-    if let Some(slack) = masked.channels.slack.get_mut("default") {
-        mask_required_secret(&mut slack.bot_token);
-        mask_optional_secret(&mut slack.app_token);
-    }
-    if let Some(mattermost) = masked.channels.mattermost.get_mut("default") {
-        mask_optional_secret(&mut mattermost.bot_token);
-        mask_optional_secret(&mut mattermost.password);
-    }
-    if let Some(webhook) = masked.channels.webhook.get_mut("default") {
-        mask_optional_secret(&mut webhook.secret);
-    }
-    if let Some(matrix) = masked.channels.matrix.get_mut("default") {
-        mask_optional_secret(&mut matrix.access_token);
-    }
-    if let Some(whatsapp) = masked.channels.whatsapp.get_mut("default") {
-        mask_optional_secret(&mut whatsapp.access_token);
-        mask_optional_secret(&mut whatsapp.app_secret);
-        mask_optional_secret(&mut whatsapp.verify_token);
-    }
-    if let Some(linq) = masked.channels.linq.get_mut("default") {
-        mask_required_secret(&mut linq.api_token);
-        mask_optional_secret(&mut linq.signing_secret);
-    }
-    if let Some(nextcloud) = masked.channels.nextcloud_talk.get_mut("default") {
-        mask_required_secret(&mut nextcloud.app_token);
-        mask_optional_secret(&mut nextcloud.webhook_secret);
-    }
-    if let Some(wati) = masked.channels.wati.get_mut("default") {
-        mask_required_secret(&mut wati.api_token);
-    }
-    if let Some(irc) = masked.channels.irc.get_mut("default") {
-        mask_optional_secret(&mut irc.server_password);
-        mask_optional_secret(&mut irc.nickserv_password);
-        mask_optional_secret(&mut irc.sasl_password);
-    }
-    if let Some(lark) = masked.channels.lark.get_mut("default") {
-        mask_required_secret(&mut lark.app_secret);
-        mask_optional_secret(&mut lark.encrypt_key);
-        mask_optional_secret(&mut lark.verification_token);
-    }
-    if let Some(feishu) = masked.channels.feishu.get_mut("default") {
-        mask_required_secret(&mut feishu.app_secret);
-        mask_optional_secret(&mut feishu.encrypt_key);
-        mask_optional_secret(&mut feishu.verification_token);
-    }
-    if let Some(dingtalk) = masked.channels.dingtalk.get_mut("default") {
-        mask_required_secret(&mut dingtalk.client_secret);
-    }
-    if let Some(qq) = masked.channels.qq.get_mut("default") {
-        mask_required_secret(&mut qq.app_secret);
-    }
-    #[cfg(feature = "channel-nostr")]
-    if let Some(nostr) = masked.channels.nostr.get_mut("default") {
-        mask_required_secret(&mut nostr.private_key);
-    }
-    if let Some(clawdtalk) = masked.channels.clawdtalk.get_mut("default") {
-        mask_required_secret(&mut clawdtalk.api_key);
-        mask_optional_secret(&mut clawdtalk.webhook_secret);
-    }
-    if let Some(email) = masked.channels.email.get_mut("default") {
-        mask_required_secret(&mut email.password);
-    }
+    masked.channels.mask_secrets();
     mask_optional_secret(&mut masked.transcription.api_key);
     masked
 }
@@ -1261,140 +1168,7 @@ fn restore_masked_sensitive_fields(
         &current.providers.embedding_routes,
     );
 
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.telegram.get_mut("default"),
-        current.channels.telegram.get("default"),
-    ) {
-        restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.discord.get_mut("default"),
-        current.channels.discord.get("default"),
-    ) {
-        restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.slack.get_mut("default"),
-        current.channels.slack.get("default"),
-    ) {
-        restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
-        restore_optional_secret(&mut incoming_ch.app_token, &current_ch.app_token);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.mattermost.get_mut("default"),
-        current.channels.mattermost.get("default"),
-    ) {
-        restore_optional_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
-        restore_optional_secret(&mut incoming_ch.password, &current_ch.password);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.webhook.get_mut("default"),
-        current.channels.webhook.get("default"),
-    ) {
-        restore_optional_secret(&mut incoming_ch.secret, &current_ch.secret);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.matrix.get_mut("default"),
-        current.channels.matrix.get("default"),
-    ) {
-        restore_optional_secret(&mut incoming_ch.access_token, &current_ch.access_token);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.whatsapp.get_mut("default"),
-        current.channels.whatsapp.get("default"),
-    ) {
-        restore_optional_secret(&mut incoming_ch.access_token, &current_ch.access_token);
-        restore_optional_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
-        restore_optional_secret(&mut incoming_ch.verify_token, &current_ch.verify_token);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.linq.get_mut("default"),
-        current.channels.linq.get("default"),
-    ) {
-        restore_required_secret(&mut incoming_ch.api_token, &current_ch.api_token);
-        restore_optional_secret(&mut incoming_ch.signing_secret, &current_ch.signing_secret);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.nextcloud_talk.get_mut("default"),
-        current.channels.nextcloud_talk.get("default"),
-    ) {
-        restore_required_secret(&mut incoming_ch.app_token, &current_ch.app_token);
-        restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.wati.get_mut("default"),
-        current.channels.wati.get("default"),
-    ) {
-        restore_required_secret(&mut incoming_ch.api_token, &current_ch.api_token);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.irc.get_mut("default"),
-        current.channels.irc.get("default"),
-    ) {
-        restore_optional_secret(
-            &mut incoming_ch.server_password,
-            &current_ch.server_password,
-        );
-        restore_optional_secret(
-            &mut incoming_ch.nickserv_password,
-            &current_ch.nickserv_password,
-        );
-        restore_optional_secret(&mut incoming_ch.sasl_password, &current_ch.sasl_password);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.lark.get_mut("default"),
-        current.channels.lark.get("default"),
-    ) {
-        restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
-        restore_optional_secret(&mut incoming_ch.encrypt_key, &current_ch.encrypt_key);
-        restore_optional_secret(
-            &mut incoming_ch.verification_token,
-            &current_ch.verification_token,
-        );
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.feishu.get_mut("default"),
-        current.channels.feishu.get("default"),
-    ) {
-        restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
-        restore_optional_secret(&mut incoming_ch.encrypt_key, &current_ch.encrypt_key);
-        restore_optional_secret(
-            &mut incoming_ch.verification_token,
-            &current_ch.verification_token,
-        );
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.dingtalk.get_mut("default"),
-        current.channels.dingtalk.get("default"),
-    ) {
-        restore_required_secret(&mut incoming_ch.client_secret, &current_ch.client_secret);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.qq.get_mut("default"),
-        current.channels.qq.get("default"),
-    ) {
-        restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
-    }
-    #[cfg(feature = "channel-nostr")]
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.nostr.get_mut("default"),
-        current.channels.nostr.get("default"),
-    ) {
-        restore_required_secret(&mut incoming_ch.private_key, &current_ch.private_key);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.clawdtalk.get_mut("default"),
-        current.channels.clawdtalk.get("default"),
-    ) {
-        restore_required_secret(&mut incoming_ch.api_key, &current_ch.api_key);
-        restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels.email.get_mut("default"),
-        current.channels.email.get("default"),
-    ) {
-        restore_required_secret(&mut incoming_ch.password, &current_ch.password);
-    }
+    incoming.channels.restore_secrets_from(&current.channels);
     restore_optional_secret(
         &mut incoming.transcription.api_key,
         &current.transcription.api_key,
