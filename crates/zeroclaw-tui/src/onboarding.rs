@@ -22,7 +22,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
-use zeroclaw_config::traits::{Answer, OnboardUi, SelectItem};
+use zeroclaw_config::traits::{Answer, OnboardUi, SecretPromptAnswer, SelectItem};
 
 use crate::theme;
 use crate::widgets::{BANNER_HEIGHT, Banner, InputPrompt};
@@ -417,6 +417,85 @@ impl OnboardUi for RatatuiUi {
                 KeyEvent {
                     code: KeyCode::Esc, ..
                 } => return Ok(Answer::Back),
+                KeyEvent {
+                    code: KeyCode::Backspace,
+                    ..
+                } => {
+                    buffer.pop();
+                }
+                KeyEvent {
+                    code: KeyCode::Char(c),
+                    ..
+                } => buffer.push(c),
+                _ => {}
+            }
+        }
+    }
+
+    async fn secret_with_action(
+        &mut self,
+        prompt: &str,
+        _has_current: bool,
+        action_hint: &str,
+    ) -> Result<SecretPromptAnswer> {
+        let mut buffer = String::new();
+        loop {
+            let section = self.section.clone();
+            let subsection = self.subsection.clone();
+            let help = self.help.clone();
+            let log_lines: Vec<LogLine> = self
+                .log
+                .iter()
+                .map(|l| LogLine {
+                    level: match l.level {
+                        LogLevel::Status => LogLevel::Status,
+                        LogLevel::Warn => LogLevel::Warn,
+                    },
+                    text: l.text.clone(),
+                })
+                .collect();
+            let input = buffer.clone();
+            let hints = if action_hint.is_empty() {
+                HINTS_SECRET.to_string()
+            } else {
+                format!("Enter=save  Tab={action_hint}  Esc=back  (input hidden)")
+            };
+            self.terminal.draw(|frame| {
+                let r = layout(frame.area(), help.as_deref(), 3);
+                render_banner(frame, r.banner);
+                render_breadcrumb(
+                    frame,
+                    r.breadcrumb,
+                    section.as_deref(),
+                    subsection.as_deref(),
+                );
+                render_log(frame, r.log, &log_lines);
+                render_help(frame, r.help, help.as_deref());
+                frame.render_widget(
+                    InputPrompt {
+                        label: prompt,
+                        input: &input,
+                        masked: true,
+                    },
+                    r.input,
+                );
+                render_hints(frame, r.hints, &hints);
+            })?;
+            match wait_key()? {
+                KeyEvent {
+                    code: KeyCode::Enter,
+                    ..
+                } if buffer.is_empty() => return Ok(SecretPromptAnswer::Value(None)),
+                KeyEvent {
+                    code: KeyCode::Enter,
+                    ..
+                } => return Ok(SecretPromptAnswer::Value(Some(buffer))),
+                KeyEvent {
+                    code: KeyCode::Tab, ..
+                } if !action_hint.is_empty() => return Ok(SecretPromptAnswer::Action),
+                KeyEvent {
+                    code: KeyCode::Esc, ..
+                } => return Ok(SecretPromptAnswer::Back),
                 KeyEvent {
                     code: KeyCode::Backspace,
                     ..

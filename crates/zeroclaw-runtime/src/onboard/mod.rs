@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use zeroclaw_config::schema::Config;
-use zeroclaw_config::traits::{Answer, OnboardUi, PropKind, SelectItem};
+use zeroclaw_config::traits::{Answer, OnboardUi, PropKind, SecretPromptAnswer, SelectItem};
 
 use crate::agent::personality::EDITABLE_PERSONALITY_FILES;
 use crate::agent::personality_templates::{TemplateContext, render as render_personality};
@@ -704,6 +704,155 @@ async fn workspace(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
     Ok(Nav::Done)
 }
 
+fn provider_uses_auth_login(provider: &str) -> bool {
+    let normalized = provider.trim().to_ascii_lowercase().replace('-', "_");
+    matches!(normalized.as_str(), "openai_codex" | "codex")
+}
+
+fn preferred_auth_provider_arg(provider: &str) -> &'static str {
+    let normalized = provider.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "openai_codex" | "codex" => "openai-codex",
+        _ => "<name>",
+    }
+}
+
+#[async_trait::async_trait]
+trait ProviderAuthActions: Send + Sync {
+    async fn openai_codex_browser_login(&self, cfg: &Config, ui: &mut dyn OnboardUi) -> Result<()>;
+}
+
+struct RealProviderAuthActions;
+
+#[async_trait::async_trait]
+impl ProviderAuthActions for RealProviderAuthActions {
+    async fn openai_codex_browser_login(&self, cfg: &Config, ui: &mut dyn OnboardUi) -> Result<()> {
+        run_openai_codex_browser_login(cfg, ui).await
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BrowserOpenCommand {
+    program: &'static str,
+    args: Vec<String>,
+}
+
+fn browser_open_command(url: &str) -> BrowserOpenCommand {
+    #[cfg(windows)]
+    {
+        BrowserOpenCommand {
+            program: "rundll32",
+            args: vec!["url.dll,FileProtocolHandler".to_string(), url.to_string()],
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        BrowserOpenCommand {
+            program: "open",
+            args: vec![url.to_string()],
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        BrowserOpenCommand {
+            program: "xdg-open",
+            args: vec![url.to_string()],
+        }
+    }
+}
+
+fn try_open_browser(url: &str) -> bool {
+    let command = browser_open_command(url);
+    std::process::Command::new(command.program)
+        .args(command.args)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+async fn run_openai_codex_browser_login(cfg: &Config, ui: &mut dyn OnboardUi) -> Result<()> {
+    let auth_service = zeroclaw_providers::auth::AuthService::from_config(cfg);
+    let client = reqwest::Client::new();
+    let pkce = zeroclaw_providers::auth::openai_oauth::generate_pkce_state();
+    let authorize_url = zeroclaw_providers::auth::openai_oauth::build_authorize_url(&pkce);
+
+    if try_open_browser(&authorize_url) {
+        ui.status("Opened OpenAI authorization in your browser.");
+    } else {
+        ui.warn("Could not open a browser automatically. Open this URL manually:");
+        ui.status(&authorize_url);
+    }
+    ui.status("Waiting for callback at http://localhost:1455/auth/callback ...");
+
+    let code = zeroclaw_providers::auth::openai_oauth::receive_loopback_code(
+        &pkce.state,
+        Duration::from_secs(180),
+    )
+    .await?;
+    let token_set =
+        zeroclaw_providers::auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce)
+            .await?;
+    let account_id = zeroclaw_providers::auth::openai_oauth::extract_account_id_from_jwt(
+        &token_set.access_token,
+    );
+
+    auth_service
+        .store_openai_tokens("default", token_set, account_id, true)
+        .await?;
+    ui.status("OpenAI Codex browser login saved.");
+    Ok(())
+}
+
+async fn provider_auth_phase(
+    cfg: &mut Config,
+    ui: &mut dyn OnboardUi,
+    picked: &str,
+    display_name: &str,
+    api_key_path: &str,
+    auth_actions: &dyn ProviderAuthActions,
+) -> Result<Nav> {
+    if !provider_uses_auth_login(picked) {
+        return prompt_field(cfg, ui, api_key_path, None).await;
+    }
+
+    let field = cfg
+        .prop_fields()
+        .into_iter()
+        .find(|f| f.name == api_key_path)
+        .ok_or_else(|| anyhow::anyhow!("unknown config field: {api_key_path}"))?;
+    let has_current = !field.display_value.is_empty() && field.display_value != "<unset>";
+    let mut help = field.description.to_string();
+    if !help.is_empty() {
+        help.push('\n');
+    }
+    let provider_arg = preferred_auth_provider_arg(picked);
+    help.push_str(&format!(
+        "{display_name} can also sign in with OpenAI in your browser. \
+         Press Tab to start browser login, or run: zeroclaw auth login --provider {provider_arg}."
+    ));
+    if has_current {
+        help.push_str("\nCurrent: stored. Enter to keep.");
+    }
+    ui.note(&help);
+
+    match ui
+        .secret_with_action("api-key", has_current, "browser login")
+        .await?
+    {
+        SecretPromptAnswer::Back => Ok(Nav::Back),
+        SecretPromptAnswer::Action => {
+            auth_actions.openai_codex_browser_login(cfg, ui).await?;
+            Ok(Nav::Done)
+        }
+        SecretPromptAnswer::Value(Some(value)) => {
+            if !value.trim().is_empty() {
+                persist(cfg, api_key_path, &value).await?;
+            }
+            Ok(Nav::Done)
+        }
+        SecretPromptAnswer::Value(None) => Ok(Nav::Done),
+    }
+}
+
 async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<Nav> {
     ui.heading(1, "Providers");
     if flags.provider.is_none() && flags.api_key.is_none() && flags.model.is_none() {
@@ -843,7 +992,10 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         // provider subsection so the panel reads "Providers › Authentication".
         if flags.api_key.is_none() {
             ui.heading(2, &format!("{display_name} › Authentication"));
-            match prompt_field(cfg, ui, &api_key_path, None).await? {
+            let auth_actions = RealProviderAuthActions;
+            match provider_auth_phase(cfg, ui, &picked, display_name, &api_key_path, &auth_actions)
+                .await?
+            {
                 Nav::Back => {
                     if flags.provider.is_some() {
                         return Ok(Nav::Back);
@@ -1354,9 +1506,34 @@ mod tests {
     use axum::http::{StatusCode, header};
     use axum::routing::get;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
     use tokio::net::TcpListener;
     use zeroclaw_config::schema::{Config, ModelProviderConfig};
+
+    #[derive(Default)]
+    struct RecordingProviderAuthActions {
+        openai_codex_browser_login_calls: AtomicUsize,
+    }
+
+    impl RecordingProviderAuthActions {
+        fn openai_codex_browser_login_calls(&self) -> usize {
+            self.openai_codex_browser_login_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderAuthActions for RecordingProviderAuthActions {
+        async fn openai_codex_browser_login(
+            &self,
+            _cfg: &Config,
+            _ui: &mut dyn OnboardUi,
+        ) -> Result<()> {
+            self.openai_codex_browser_login_calls
+                .fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     /// Build a `Config` whose `config_path` / `workspace_dir` live inside a
     /// temp directory, so `save()` touches only the scratch tree.
@@ -1743,6 +1920,74 @@ mod tests {
                 .iter()
                 .any(|s| s == "providers"),
             "providers section should mark completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn providers_openai_codex_flags_skip_api_key_prompt() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+
+        let flags = Flags {
+            provider: Some("openai-codex".into()),
+            model: Some("gpt-5.5".into()),
+            ..Default::default()
+        };
+        let mut ui = QuickUi::new();
+        run(&mut cfg, &mut ui, Section::Providers, &flags)
+            .await
+            .unwrap();
+
+        assert_eq!(cfg.providers.fallback.as_deref(), Some("openai-codex"));
+        let model_cfg = cfg
+            .providers
+            .models
+            .get("openai-codex")
+            .expect("openai-codex entry should be seeded");
+        assert_eq!(model_cfg.model.as_deref(), Some("gpt-5.5"));
+        assert!(
+            model_cfg.api_key.is_none(),
+            "OpenAI Codex should authenticate through auth login, not an API key prompt"
+        );
+    }
+
+    #[test]
+    fn openai_codex_auth_prompt_uses_existing_provider_name() {
+        assert_eq!(preferred_auth_provider_arg("openai_codex"), "openai-codex");
+        assert_eq!(preferred_auth_provider_arg("openai-codex"), "openai-codex");
+    }
+
+    #[tokio::test]
+    async fn provider_auth_openai_codex_tab_runs_browser_login_without_api_key() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        cfg.providers
+            .models
+            .entry("openai-codex".into())
+            .or_default();
+        let mut ui = QuickUi::new().with("api-key", "<tab>");
+        let auth_actions = RecordingProviderAuthActions::default();
+
+        let nav = provider_auth_phase(
+            &mut cfg,
+            &mut ui,
+            "openai-codex",
+            "OpenAI Codex (OAuth)",
+            "providers.models.openai-codex.api-key",
+            &auth_actions,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(nav, Nav::Done);
+        assert_eq!(auth_actions.openai_codex_browser_login_calls(), 1);
+        assert!(
+            cfg.providers
+                .models
+                .get("openai-codex")
+                .and_then(|entry| entry.api_key.as_deref())
+                .is_none(),
+            "browser login should save an auth profile, not write api-key"
         );
     }
 

@@ -3362,6 +3362,47 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
     }
 }
 
+#[cfg(feature = "agent-runtime")]
+#[derive(Debug, PartialEq, Eq)]
+struct BrowserOpenCommand {
+    program: &'static str,
+    args: Vec<String>,
+}
+
+#[cfg(feature = "agent-runtime")]
+fn browser_open_command(url: &str) -> BrowserOpenCommand {
+    #[cfg(windows)]
+    {
+        BrowserOpenCommand {
+            program: "rundll32",
+            args: vec!["url.dll,FileProtocolHandler".to_string(), url.to_string()],
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        BrowserOpenCommand {
+            program: "open",
+            args: vec![url.to_string()],
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        BrowserOpenCommand {
+            program: "xdg-open",
+            args: vec![url.to_string()],
+        }
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn try_open_browser(url: &str) -> bool {
+    let command = browser_open_command(url);
+    std::process::Command::new(command.program)
+        .args(command.args)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 #[allow(clippy::too_many_lines)]
 #[cfg(feature = "agent-runtime")]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
@@ -3429,7 +3470,12 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                     };
                     save_pending_oauth_login(config, &pending)?;
 
-                    println!("Open this URL in your browser and authorize access:");
+                    if try_open_browser(&authorize_url) {
+                        println!("Opened authorization URL in your browser.");
+                        println!("If it did not open, use this URL:");
+                    } else {
+                        println!("Open this URL in your browser and authorize access:");
+                    }
                     println!("{authorize_url}");
                     println!();
 
@@ -3524,7 +3570,12 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                     save_pending_oauth_login(config, &pending)?;
 
                     let authorize_url = auth::openai_oauth::build_authorize_url(&pkce);
-                    println!("Open this URL in your browser and authorize access:");
+                    if try_open_browser(&authorize_url) {
+                        println!("Opened authorization URL in your browser.");
+                        println!("If it did not open, use this URL:");
+                    } else {
+                        println!("Open this URL in your browser and authorize access:");
+                    }
                     println!("{authorize_url}");
                     println!();
                     println!("Waiting for callback at http://localhost:1455/auth/callback ...");
@@ -3942,6 +3993,77 @@ mod tests {
             }
             other => panic!("expected onboard command, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn auth_login_cli_parses_openai_codex_provider() {
+        let cli = Cli::try_parse_from(["zeroclaw", "auth", "login", "--provider", "openai-codex"])
+            .expect("auth login invocation should parse");
+
+        match cli.command {
+            Commands::Auth {
+                auth_command:
+                    AuthCommands::Login {
+                        provider,
+                        profile,
+                        device_code,
+                        import,
+                    },
+            } => {
+                assert_eq!(provider, "openai-codex");
+                assert_eq!(profile, "default");
+                assert!(!device_code);
+                assert!(import.is_none());
+            }
+            other => panic!("expected auth login command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn models_auth_login_cli_is_not_supported() {
+        assert!(
+            Cli::try_parse_from([
+                "zeroclaw",
+                "models",
+                "auth",
+                "login",
+                "--provider",
+                "openai-codex",
+            ])
+            .is_err(),
+            "auth is a top-level profile command, not a models subcommand"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn browser_open_command_uses_platform_launcher() {
+        let command = browser_open_command("https://auth.openai.com/oauth/authorize");
+
+        #[cfg(windows)]
+        {
+            assert_eq!(command.program, "rundll32");
+            assert_eq!(
+                command.args.first().map(String::as_str),
+                Some("url.dll,FileProtocolHandler")
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(command.program, "open");
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert_eq!(command.program, "xdg-open");
+        }
+        assert!(
+            command
+                .args
+                .iter()
+                .any(|arg| arg == "https://auth.openai.com/oauth/authorize")
+        );
     }
 
     #[test]

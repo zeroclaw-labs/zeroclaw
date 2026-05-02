@@ -191,6 +191,18 @@ pub enum Answer<T> {
     Back,
 }
 
+/// Result of a secret prompt that can also expose one shortcut action
+/// (for example, Tab = browser OAuth login).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretPromptAnswer {
+    /// New secret entered, or `None` when the user kept/skipped the value.
+    Value(Option<String>),
+    /// The backend's back key was pressed.
+    Back,
+    /// The prompt's shortcut action was requested.
+    Action,
+}
+
 /// Prompt-surface the onboard orchestrator drives.
 ///
 /// Async is deliberate: the orchestrator is already async (Config::load_or_init,
@@ -222,6 +234,20 @@ pub trait OnboardUi: Send {
         prompt: &str,
         has_current: bool,
     ) -> anyhow::Result<Answer<Option<String>>>;
+
+    /// Secret prompt with one optional shortcut action. Backends that cannot
+    /// capture the shortcut may fall back to the regular secret prompt.
+    async fn secret_with_action(
+        &mut self,
+        prompt: &str,
+        has_current: bool,
+        _action_hint: &str,
+    ) -> anyhow::Result<SecretPromptAnswer> {
+        match self.secret(prompt, has_current).await? {
+            Answer::Value(value) => Ok(SecretPromptAnswer::Value(value)),
+            Answer::Back => Ok(SecretPromptAnswer::Back),
+        }
+    }
 
     async fn select(
         &mut self,

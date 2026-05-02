@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use zeroclaw_config::traits::{Answer, OnboardUi, SelectItem};
+use zeroclaw_config::traits::{Answer, OnboardUi, SecretPromptAnswer, SelectItem};
 
 #[derive(Debug, Default)]
 pub struct QuickUi {
@@ -93,6 +93,23 @@ impl OnboardUi for QuickUi {
         }
     }
 
+    async fn secret_with_action(
+        &mut self,
+        prompt: &str,
+        has_current: bool,
+        action_hint: &str,
+    ) -> Result<SecretPromptAnswer> {
+        match (self.lookup(prompt), has_current) {
+            (Some(value), _) if value == "<tab>" => Ok(SecretPromptAnswer::Action),
+            (Some(value), _) => Ok(SecretPromptAnswer::Value(Some(value))),
+            (None, true) => Ok(SecretPromptAnswer::Value(None)),
+            (None, false) if !action_hint.is_empty() => Ok(SecretPromptAnswer::Value(None)),
+            (None, false) => {
+                bail!("quick mode: secret {prompt:?} is required but no value was supplied")
+            }
+        }
+    }
+
     async fn select(
         &mut self,
         prompt: &str,
@@ -133,5 +150,22 @@ impl OnboardUi for QuickUi {
 
     fn warn(&mut self, msg: &str) {
         eprintln!("⚠️  {msg}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn secret_with_action_returns_action_for_tab_script() {
+        let mut ui = QuickUi::new().with("api-key", "<tab>");
+
+        let answer = ui
+            .secret_with_action("api-key", false, "OpenAI browser login")
+            .await
+            .unwrap();
+
+        assert_eq!(answer, SecretPromptAnswer::Action);
     }
 }
