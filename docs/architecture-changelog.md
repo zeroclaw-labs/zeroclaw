@@ -7,6 +7,60 @@
 
 ---
 
+## v8 — 2026-05-02 (Domain DB Incremental Update Protocol)
+
+**Headline**: 매니페스트 v2 + cumulative delta chain + 1년 베이스라인
+컷팅으로 도메인 코퍼스(법령/판례/의학 등)를 0바이트 fast path 포함
+세 결과(`FullInstall` / `AlreadyCurrent` / `ApplyDelta`)로 배포.
+일반인 MoA는 인프라만 두고 lawpro/medpro fork에서만 실제 코퍼스를
+번들.
+
+**Entry points** (in main ARCHITECTURE.md):
+- §6G "Domain DB Incremental Update Protocol" 신규 섹션 추가 —
+  데이터 모델 (manifest v2, delta SQLite + `vault_deletes`,
+  `domain.db.meta`), 결정 트리, distribution policy (일반인 vs
+  fork), Plan ↔ Code 추적 매트릭스 16항목, Acceptance Criteria
+  7/7 green, 테스트 341/341, ZeroClaw/일반 RAG와의 차이, out-of-scope
+  4항목.
+- §6D Vault 의 lifecycle 보강(코퍼스 절반의 운영자 측 배포 채널) —
+  `brain.db` 동기화는 §3 Patent 1 그대로, `domain.db` 배포만 §6G가 담당.
+
+**Shipped tracks (PRs merged into `main`)**:
+
+| PR | Commits | Summary |
+| --- | --- | --- |
+| #222 | `d5ec8413..96ab2fce` | `domain-db-build` clean-up — 적용법조 그래프 쿼리, 도메인 DB 빌드 Python 스크립트 7종, Tauri windows 스키마, gitignore 정리 |
+| #223 | `8a0321bb` (PR 1) + `81e4bd9a` (PR 2) | Manifest v2 데이터 모델 + `meta` 테이블 + `[domain].registry_url` + 클라이언트 결정 트리 + apply-delta 트랜잭션 |
+| #224 | `1d813806` (PR 3) | 운영자 빌더 (`scripts/build_domain_delta.py`) + `stamp-baseline`/`publish-v2`/`publish-delta` CLI + 운영자 runbook + e2e 라운드트립 테스트 |
+
+**Implementation surface**:
+- Rust 신규: `src/vault/domain_delta.rs` (~870 LOC, decide + apply +
+  download + ensure + stamp)
+- Rust 갱신: `src/vault/{domain, domain_manifest, domain_cli, schema}.rs`,
+  `src/config/schema.rs`, `src/onboard/wizard.rs`
+- Python 신규: `scripts/build_domain_delta.py` (~270 LOC, ATTACH 기반
+  schema clone)
+- 문서 신규: `docs/domain-db-incremental-design.md` (505 LOC, 정식 설계)
+- 문서 갱신: `docs/operations-runbook.md` "Domain DB Publication" 섹션
+  (lawpro/medpro fork 한정 운영자 절차)
+
+**Test totals after merge**:
+
+```
+vault::* (sweep)        341/341 ✅  (8.77s, 0 회귀)
+  vault::domain          16/16
+  vault::domain_manifest 20/20
+  vault::domain_delta    14/14  (신규)
+  vault::domain_cli      15/15
+```
+
+**Acceptance criteria** (`docs/domain-db-incremental-design.md` §9):
+모든 7개 항목 자동 테스트로 검증 — 일반인 build의 0 네트워크 보장,
+0 바이트 fast path, 1주~11주 catch-up, baseline cut, mid-apply
+crash safety, 운영자 chain head bump 무결성.
+
+---
+
 ## v7.0 — 2026-04-18 (SLM-First Gatekeeper + Advisor Strategy + On-device Executor)
 
 **Headline**: Gemma 4 SLM 1차 응답 + 이용자 최고사양 LLM 을 PLAN/REVIEW/ADVISE advisor 로 호출 + Phase 3 SLM-as-executor tool loop.
