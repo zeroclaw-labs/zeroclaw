@@ -95,7 +95,7 @@ pub struct V1Compat {
 }
 
 impl V1Compat {
-    /// Consume self, migrating old fields into the current Config layout.
+    /// Consume self, running each versioned migration step in order.
     pub fn into_config(mut self) -> super::schema::Config {
         let from = self.config.schema_version;
         let needs_migration = from < CURRENT_SCHEMA_VERSION || self.has_legacy_fields();
@@ -104,13 +104,12 @@ impl V1Compat {
             return self.config;
         }
 
-        // V1 → V2: move old top-level provider fields into providers.models.
         if from < 2 || self.has_legacy_fields() {
-            self.migrate_providers();
+            self.v1_to_v2();
         }
-
-        // V2 → V3: TOML-level transforms already applied by prepare_table().
-        // Nothing left to do in-memory for V2→V3.
+        if from < 3 {
+            v2_to_v3(&mut self.config);
+        }
 
         self.config.schema_version = CURRENT_SCHEMA_VERSION;
 
@@ -139,7 +138,7 @@ impl V1Compat {
             || !self.embedding_routes.is_empty()
     }
 
-    fn migrate_providers(&mut self) {
+    fn v1_to_v2(&mut self) {
         // First, move old model_providers entries into providers.models.
         // V1 top-level entries use bare type keys ("anthropic"); insert under "default" alias.
         for (key, profile) in std::mem::take(&mut self.model_providers) {
@@ -305,6 +304,10 @@ fn is_flat_channel_config(t: &toml::Table) -> bool {
 fn is_flat_provider_config(t: &toml::Table) -> bool {
     t.values().any(|v| !matches!(v, toml::Value::Table(_)))
 }
+
+/// V2 → V3 in-memory migration. TOML-level transforms run in `prepare_table`
+/// before deserialization; add post-deserialization work here as needed.
+fn v2_to_v3(_config: &mut super::schema::Config) {}
 
 /// Pre-deserialization table migration for nested field changes that
 /// `#[serde(flatten)]` cannot capture (e.g. removing a field from a nested
