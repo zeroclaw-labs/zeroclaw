@@ -316,6 +316,16 @@ pub enum MigrateCommands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Generate a canonical mock config for a given schema version (useful for migration testing)
+    Generate {
+        /// Schema version to generate (any supported version of the schema)
+        version: u32,
+
+        /// Write to this path instead of printing to stdout
+        #[arg(long, short)]
+        output: Option<std::path::PathBuf>,
+    },
 }
 
 /// Cron subcommands

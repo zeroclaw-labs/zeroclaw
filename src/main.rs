@@ -1319,6 +1319,23 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // migrate generate needs no config — handle it before load_or_init.
+    if let Commands::Migrate {
+        migrate_command: MigrateCommands::Generate { version, output },
+    } = &cli.command
+    {
+        let toml = zeroclaw_config::migration::generate_fixture(*version)?;
+        match output {
+            Some(path) => {
+                std::fs::write(path, &toml)
+                    .with_context(|| format!("failed to write to {}", path.display()))?;
+                println!("wrote v{version} fixture to {}", path.display());
+            }
+            None => print!("{toml}"),
+        }
+        return Ok(());
+    }
+
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
     #[cfg(feature = "agent-runtime")]

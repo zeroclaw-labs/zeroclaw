@@ -123,6 +123,108 @@ impl V1Compat {
         self.config
     }
 
+    /// Construct a fully-populated V1 mock for fixture generation.
+    fn mock() -> Self {
+        let mut model_providers = HashMap::new();
+        model_providers.insert(
+            "myprovider".to_string(),
+            ModelProviderConfig {
+                model: Some("my-model".into()),
+                api_key: Some("sk-example".into()),
+                temperature: Some(0.7),
+                ..Default::default()
+            },
+        );
+        Self {
+            config: super::schema::Config::default(),
+            api_key: Some("sk-example".into()),
+            default_provider: Some("myprovider".into()),
+            default_model: Some("my-model".into()),
+            default_temperature: Some(0.7),
+            model_providers,
+            api_url: None,
+            api_path: None,
+            provider_timeout_secs: None,
+            provider_max_tokens: None,
+            extra_headers: None,
+            model_routes: vec![],
+            embedding_routes: vec![],
+        }
+    }
+
+    /// Serialize self back into a `toml::Table` using the V1 field layout
+    /// (top-level keys, `model_providers`, no `schema_version`).
+    fn snapshot_v1(&self) -> toml::Table {
+        let mut t = toml::Table::new();
+        if let Some(v) = &self.api_key {
+            t.insert("api_key".into(), toml::Value::String(v.clone()));
+        }
+        if let Some(v) = &self.default_provider {
+            t.insert("default_provider".into(), toml::Value::String(v.clone()));
+        }
+        if let Some(v) = &self.default_model {
+            t.insert("default_model".into(), toml::Value::String(v.clone()));
+        }
+        if let Some(v) = self.default_temperature {
+            t.insert("default_temperature".into(), toml::Value::Float(v));
+        }
+        if !self.model_providers.is_empty() {
+            let providers_table: toml::Table = self
+                .model_providers
+                .iter()
+                .filter_map(|(k, v)| {
+                    toml::to_string(v).ok()
+                        .and_then(|s| toml::from_str::<toml::Table>(&s).ok())
+                        .map(|pt| (k.clone(), toml::Value::Table(pt)))
+                })
+                .collect();
+            t.insert("model_providers".into(), toml::Value::Table(providers_table));
+        }
+        self.insert_agent_memory(&mut t);
+        t
+    }
+
+    fn snapshot_v2(&self) -> toml::Table {
+        let mut t = toml::Table::new();
+        t.insert("schema_version".into(), toml::Value::Integer(2));
+        let mut providers = toml::Table::new();
+        if let Some(fallback) = self.config.providers.fallback.first() {
+            let bare = fallback.split_once('.').map_or(fallback.as_str(), |(t, _)| t);
+            providers.insert("fallback".into(), toml::Value::String(bare.to_string()));
+        }
+        let models: toml::Table = self.config.providers.models.iter()
+            .filter_map(|(type_key, alias_map)| {
+                alias_map.get("default")
+                    .and_then(|p| toml::to_string(p).ok())
+                    .and_then(|s| toml::from_str::<toml::Table>(&s).ok())
+                    .map(|pt| (type_key.clone(), toml::Value::Table(pt)))
+            })
+            .collect();
+        if !models.is_empty() {
+            providers.insert("models".into(), toml::Value::Table(models));
+        }
+        t.insert("providers".into(), toml::Value::Table(providers));
+        self.insert_agent_memory(&mut t);
+        t
+    }
+
+    fn snapshot_current(&self) -> toml::Table {
+        toml::from_str(&toml::to_string(&self.config).unwrap_or_default()).unwrap_or_default()
+    }
+
+    fn insert_agent_memory(&self, t: &mut toml::Table) {
+        if let Ok(s) = toml::to_string(&self.config.agent) {
+            if let Ok(agent_t) = toml::from_str::<toml::Table>(&s) {
+                t.insert("agent".into(), toml::Value::Table(agent_t));
+            }
+        }
+        if let Ok(s) = toml::to_string(&self.config.memory) {
+            if let Ok(mem_t) = toml::from_str::<toml::Table>(&s) {
+                t.insert("memory".into(), toml::Value::Table(mem_t));
+            }
+        }
+    }
+
     fn has_legacy_fields(&self) -> bool {
         self.api_key.is_some()
             || self.api_url.is_some()
@@ -1139,6 +1241,41 @@ fn values_equal(edit: &toml_edit::Value, toml: &toml::Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// Generate a canonical mock config for the given schema version by constructing
+/// a V1Compat mock in code and running the migration chain up to `version`.
+/// Returns an error if `version` is not a supported schema version.
+pub fn generate_fixture(version: u32) -> Result<String> {
+    type MigrateFn = fn(&mut V1Compat);
+    type SnapshotFn = fn(&V1Compat) -> toml::Table;
+
+    // Each entry: (version, migration to run to reach this version, how to serialize it).
+    // Migrations are cumulative — each step runs only if `version >= target`.
+    // To add a new version: append one line.
+    let steps: &[(u32, MigrateFn, SnapshotFn)] = &[
+        (1, |_| {}, V1Compat::snapshot_v1),
+        (2, |c| c.v1_to_v2(), V1Compat::snapshot_v2),
+        (CURRENT_SCHEMA_VERSION, |c| v2_to_v3(&mut c.config), V1Compat::snapshot_current),
+    ];
+
+    let max = steps.iter().map(|&(v, _, _)| v).max().unwrap_or(0);
+    if version < 1 || version > max {
+        return Err(anyhow::anyhow!(
+            "unsupported schema version {version}; supported versions are 1–{max}"
+        ));
+    }
+
+    let mut compat = V1Compat::mock();
+    let mut snapshot: SnapshotFn = V1Compat::snapshot_current;
+    for &(target, migrate, serialize) in steps {
+        if version >= target {
+            migrate(&mut compat);
+            snapshot = serialize;
+        }
+    }
+    compat.config.schema_version = version;
+    toml::to_string_pretty(&snapshot(&compat)).context("failed to serialize fixture")
 }
 
 /// Convert a `toml::Value` to a `toml_edit::Value`.
