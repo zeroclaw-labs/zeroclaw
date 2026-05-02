@@ -13,10 +13,12 @@
 //! ## How to add a new migration step
 //!
 //! 1. Bump [`CURRENT_SCHEMA_VERSION`].
-//! 2. If the legacy field was on `V1Compat`, update `migrate_providers()` (or the
-//!    relevant `V1Compat` method) to move the value into the new location.
-//! 3. For changes between V2+ layouts, add a `fn vN_to_vM(&mut Config)` and call
-//!    it from `into_config()` after the schema-version check.
+//! 2. Add structural TOML-level rewrites to `prepare_table()` (shape changes that
+//!    must happen before serde deserialization).
+//! 3. Add a `fn vN_to_vM(config: &mut Config)` for any in-memory work that can
+//!    only run after deserialization, and gate it in `into_config()` on `from < M`.
+//!    V1 fields are the exception — they live on `V1Compat` and are handled by
+//!    `migrate_providers()`, gated on `from < 2 || has_legacy_fields()`.
 //! 4. Add a test in `tests/component/config_migration.rs`:
 //!    - Deserialize a TOML string with the old layout.
 //!    - Assert the migrated `Config` has values in the new locations.
@@ -102,7 +104,14 @@ impl V1Compat {
             return self.config;
         }
 
-        self.migrate_providers();
+        // V1 → V2: move old top-level provider fields into providers.models.
+        if from < 2 || self.has_legacy_fields() {
+            self.migrate_providers();
+        }
+
+        // V2 → V3: TOML-level transforms already applied by prepare_table().
+        // Nothing left to do in-memory for V2→V3.
+
         self.config.schema_version = CURRENT_SCHEMA_VERSION;
 
         tracing::info!(
