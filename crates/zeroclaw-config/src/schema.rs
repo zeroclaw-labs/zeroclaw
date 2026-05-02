@@ -7090,6 +7090,21 @@ pub struct DiscordConfig {
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// When true, skip the LLM reply-intent precheck entirely and always proceed
+    /// to the main response. Saves one full LLM round-trip per message.
+    ///
+    /// Safe to enable when `mention_only = true` (the mention gate already ensures
+    /// the message is addressed to the bot). Defaults to false.
+    #[serde(default)]
+    pub skip_reply_intent_precheck: bool,
+    /// Model to use for the reply-intent precheck classification call.
+    /// Defaults to the active route model when unset.
+    ///
+    /// Set to a cheaper/faster model (e.g. `anthropic/claude-haiku-4-5` or
+    /// `openai/gpt-4o-mini`) to reduce precheck cost without affecting the
+    /// main response quality.
+    #[serde(default)]
+    pub reply_intent_model: Option<String>,
 }
 
 impl ChannelConfig for DiscordConfig {

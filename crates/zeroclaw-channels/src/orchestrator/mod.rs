@@ -375,6 +375,12 @@ struct ChannelRuntimeContext {
     query_classification: zeroclaw_config::schema::QueryClassificationConfig,
     ack_reactions: bool,
     show_tool_calls: bool,
+    /// When true, skip the LLM reply-intent precheck and always proceed to the
+    /// main response. Saves one full LLM round-trip per inbound message.
+    skip_reply_intent_precheck: bool,
+    /// Model override for the reply-intent precheck classification call.
+    /// When `None`, falls back to the active route model.
+    reply_intent_model: Option<String>,
     session_store: Option<Arc<zeroclaw_infra::session_store::SessionStore>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
@@ -2897,15 +2903,26 @@ async fn process_channel_message(
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
-    let reply_intent = classify_channel_reply_intent(
-        active_provider.as_ref(),
-        history[0].content.as_str(),
-        &history,
-        route.model.as_str(),
-        runtime_defaults.temperature,
-    )
-    .await
-    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+    // Skip the precheck entirely when configured to do so (e.g. when
+    // `mention_only = true` already guarantees the message is addressed to
+    // the bot, making a classification call redundant).
+    let reply_intent = if ctx.skip_reply_intent_precheck {
+        AssistantChannelOutcome::Reply(String::new())
+    } else {
+        let precheck_model = ctx
+            .reply_intent_model
+            .as_deref()
+            .unwrap_or(route.model.as_str());
+        classify_channel_reply_intent(
+            active_provider.as_ref(),
+            history[0].content.as_str(),
+            &history,
+            precheck_model,
+            runtime_defaults.temperature,
+        )
+        .await
+        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
+    };
 
     if let AssistantChannelOutcome::NoReply { kind, reason } = reply_intent {
         let history_response = AssistantChannelOutcome::NoReply {
@@ -5739,6 +5756,17 @@ pub async fn start_channels(
         query_classification: config.query_classification.clone(),
         ack_reactions: config.channels.ack_reactions,
         show_tool_calls: config.channels.show_tool_calls,
+        skip_reply_intent_precheck: config
+            .channels
+            .discord
+            .as_ref()
+            .map(|dc| dc.skip_reply_intent_precheck || dc.mention_only)
+            .unwrap_or(false),
+        reply_intent_model: config
+            .channels
+            .discord
+            .as_ref()
+            .and_then(|dc| dc.reply_intent_model.clone()),
         session_store: if config.channels.session_persistence {
             match zeroclaw_infra::session_store::SessionStore::new(&config.workspace_dir) {
                 Ok(store) => {
@@ -6333,6 +6361,8 @@ mod tests {
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -6459,6 +6489,8 @@ mod tests {
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -6542,6 +6574,8 @@ mod tests {
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -6642,6 +6676,8 @@ mod tests {
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: Some(Arc::clone(&store)),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -7243,6 +7279,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -7335,6 +7373,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -7441,6 +7481,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -7532,6 +7574,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -7633,6 +7677,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -7755,6 +7801,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -7858,6 +7906,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -7976,6 +8026,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -8079,6 +8131,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -8175,6 +8229,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -8397,6 +8453,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -8511,6 +8569,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -8635,6 +8695,8 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -8774,6 +8836,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -8882,6 +8946,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -8971,6 +9037,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -9060,6 +9128,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -9855,6 +9925,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -10001,6 +10073,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -10188,6 +10262,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -10306,6 +10382,8 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -10930,6 +11008,8 @@ This is an example JSON object for profile settings."#;
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -11028,6 +11108,8 @@ This is an example JSON object for profile settings."#;
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -11158,6 +11240,8 @@ This is an example JSON object for profile settings."#;
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -11336,6 +11420,8 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -11458,6 +11544,8 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -11572,6 +11660,8 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -11706,6 +11796,8 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
@@ -12022,6 +12114,8 @@ This is an example JSON object for profile settings."#;
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            skip_reply_intent_precheck: false,
+            reply_intent_model: None,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::AutonomyConfig::default(),
