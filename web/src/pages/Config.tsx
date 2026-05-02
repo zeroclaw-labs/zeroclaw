@@ -23,7 +23,13 @@ import {
 import FieldForm from '../components/onboard/FieldForm';
 import ReloadDaemonButton from '../components/onboard/ReloadDaemonButton';
 import SectionPicker from '../components/onboard/SectionPicker';
-import { tWithFallback } from '../lib/i18n';
+import {
+  t,
+  tConfigGroupLabel,
+  tConfigPickerItemLabel,
+  tConfigSectionLabel,
+  tWithFallback,
+} from '../lib/i18n';
 
 // Personality pulls in CodeMirror + markdown rendering (~270KB gzipped).
 // Lazy-load so the cost isn't paid until the user opens that section.
@@ -79,6 +85,15 @@ const GROUP_ORDER = [
 function localizedSectionHelp(section: SectionInfo): string {
   return tWithFallback(`config.section.${section.key}.help`, section.help);
 }
+
+function localizedSectionLabel(section: SectionInfo): string {
+  return tConfigSectionLabel(section.key, section.label);
+}
+
+function localizedPickerItemLabel(sectionKey: string, item: PickerItem): string {
+  return tConfigPickerItemLabel(sectionKey, item.key, item.label);
+}
+
 export default function Config() {
   // `/config/:section` preserves the active section in the URL so a page
   // refresh lands the user back on whichever section they were editing.
@@ -261,7 +276,7 @@ export default function Config() {
                   className="px-4 pt-4 pb-1.5 text-xs font-semibold uppercase tracking-wider"
                   style={{ color: 'var(--pc-text-secondary)' }}
                 >
-                  {groupName}
+                  {tConfigGroupLabel(groupName)}
                 </div>
                 {items.map((s) => (
                   <button
@@ -283,7 +298,7 @@ export default function Config() {
                           : '2px solid transparent',
                     }}
                   >
-                    <span>{s.label}</span>
+                    <span>{localizedSectionLabel(s)}</span>
                     {s.key === activeKey && <ChevronRight className="h-3.5 w-3.5" />}
                   </button>
                 ))}
@@ -304,7 +319,7 @@ export default function Config() {
                 className="text-sm flex items-center gap-1.5 flex-wrap"
                 style={{ color: 'var(--pc-text-muted)' }}
               >
-                <span style={{ color: 'var(--pc-text-secondary)' }}>Config</span>
+                <span style={{ color: 'var(--pc-text-secondary)' }}>{t('nav.config')}</span>
                 <ChevronRight className="h-3 w-3" />
                 <span
                   style={{
@@ -316,13 +331,13 @@ export default function Config() {
                   }}
                   onClick={() => setMode({ kind: 'section-overview' })}
                 >
-                  {activeSection.label}
+                  {localizedSectionLabel(activeSection)}
                 </span>
                 {mode.kind === 'form' && (
                   <>
                     <ChevronRight className="h-3 w-3" />
                     <span style={{ color: 'var(--pc-accent)', fontWeight: 600 }}>
-                      {mode.item.label}
+                      {localizedPickerItemLabel(activeSection.key, mode.item)}
                     </span>
                   </>
                 )}
@@ -335,10 +350,10 @@ export default function Config() {
                 <Link
                   to="/onboard"
                   className="btn-secondary inline-flex items-center gap-1.5 text-xs px-3 py-1.5"
-                  title="Walk the first-run onboarding wizard again"
+                  title={t('config.run_onboarding_title')}
                 >
                   <Sparkles className="h-3.5 w-3.5" />
-                  Run onboarding again
+                  {t('config.run_onboarding_again')}
                 </Link>
                 <ReloadDaemonButton
                   onReloaded={() => {
@@ -390,7 +405,7 @@ export default function Config() {
               <FieldForm
                 key={reloadKey}
                 prefix={activeSection.key}
-                title={activeSection.label}
+                title={localizedSectionLabel(activeSection)}
                 onSaved={fetchDrift}
                 drift={drifted}
               />
@@ -410,7 +425,7 @@ export default function Config() {
                   className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
                 >
                   <ArrowLeft className="h-4 w-4" />
-                  Back to {activeSection.label}
+                  {t('common.back')} {localizedSectionLabel(activeSection)}
                 </button>
                 <SectionPicker
                   sectionKey={activeSection.key}
@@ -427,12 +442,12 @@ export default function Config() {
                   className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
                 >
                   <ArrowLeft className="h-4 w-4" />
-                  Back to {activeSection.label}
+                  {t('common.back')} {localizedSectionLabel(activeSection)}
                 </button>
                 <FieldForm
                   key={reloadKey}
                   prefix={mode.fieldsPrefix}
-                  title={mode.item.label}
+                  title={localizedPickerItemLabel(activeSection.key, mode.item)}
                   onSaved={fetchDrift}
                   drift={drifted}
                 />
@@ -466,8 +481,10 @@ function PageDriftBanner({
     >
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <span style={{ color: 'var(--pc-text-primary)' }}>
-          ⚠ {drifted.length} path{drifted.length === 1 ? '' : 's'} differ
-          {drifted.length === 1 ? 's' : ''} from on-disk
+          ⚠ {tWithFallback('config.drift.banner', '{count} paths differ from on-disk').replace(
+            '{count}',
+            String(drifted.length),
+          )}
         </span>
         <ReloadDaemonButton onReloaded={onReloaded} />
       </div>
@@ -481,14 +498,17 @@ function PageDriftBanner({
             {d.secret && (
               <span style={{ color: 'var(--pc-text-faint)' }}>
                 {' '}
-                (secret — values not shown)
+                ({t('config.drift.secret_values_hidden')})
               </span>
             )}
           </li>
         ))}
         {drifted.length > 6 && (
           <li style={{ color: 'var(--pc-text-faint)' }}>
-            …and {drifted.length - 6} more
+            {tWithFallback('config.drift.more', '…and {count} more').replace(
+              '{count}',
+              String(drifted.length - 6),
+            )}
           </li>
         )}
       </ul>
@@ -522,7 +542,7 @@ function SectionOverview({ section, onAdd, onEdit }: SectionOverviewProps) {
           className="btn-electric flex items-center gap-2 text-sm px-3 py-2 flex-shrink-0"
         >
           <Plus className="h-4 w-4" />
-          Add
+          {t('common.add')}
         </button>
       </div>
       {/* The picker handles fetching, filtering, click. Treat onPick as
@@ -608,8 +628,9 @@ function ConfiguredOnlyPicker({ section, onEdit }: ConfiguredOnlyPickerProps) {
         className="surface-panel p-8 text-center text-sm"
         style={{ color: 'var(--pc-text-muted)' }}
       >
-        Nothing configured under <strong>{section.label}</strong> yet. Click{' '}
-        <strong>+ Add</strong> to get started.
+        {tWithFallback('config.overview.empty_prefix', 'Nothing configured under')}{' '}
+        <strong>{localizedSectionLabel(section)}</strong>{' '}
+        {tWithFallback('config.overview.empty_suffix', 'yet. Click + Add to get started.')}
       </div>
     );
   }
@@ -636,7 +657,7 @@ function ConfiguredOnlyPicker({ section, onEdit }: ConfiguredOnlyPickerProps) {
                   : e instanceof Error
                   ? e.message
                   : String(e);
-              alert(`Couldn't open ${item.label}: ${msg}`);
+              alert(`${t('config.open_error')} ${localizedPickerItemLabel(section.key, item)}: ${msg}`);
             }
           }}
           className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:opacity-90"
@@ -646,7 +667,7 @@ function ConfiguredOnlyPicker({ section, onEdit }: ConfiguredOnlyPickerProps) {
               className="text-sm font-medium"
               style={{ color: 'var(--pc-text-primary)' }}
             >
-              {item.label}
+              {localizedPickerItemLabel(section.key, item)}
             </div>
             <code
               className="block text-xs mt-0.5"

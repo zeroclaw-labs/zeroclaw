@@ -37,7 +37,7 @@ import {
   type ValidationWarning,
 } from '../../lib/api';
 import { fuzzyFilter } from '../../lib/fuzzy';
-import { tConfigDescription } from '../../lib/i18n';
+import { t, tConfigDescription, tConfigLabel, tConfigPlaceholder } from '../../lib/i18n';
 
 interface FieldFormProps {
   /** Dotted prefix to fetch fields under, e.g. `providers.models.anthropic`. */
@@ -84,6 +84,13 @@ function rendererFor(
 
 function fieldShortLabel(entry: ListResponseEntry): string {
   return entry.path.split('.').pop()!.replace(/[-_]/g, ' ');
+}
+
+function formatMessage(template: string, values: Record<string, string | number>): string {
+  return Object.entries(values).reduce(
+    (out, [key, value]) => out.split(`{${key}}`).join(String(value)),
+    template,
+  );
 }
 
 function defaultInputValue(entry: ListResponseEntry): string {
@@ -275,7 +282,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
 
     try {
       const resp = await patchConfig(ops);
-      setSavedAt(`Saved ${resp.results.length} field(s).`);
+      setSavedAt(formatMessage(t('config.fields.saved'), { count: resp.results.length }));
       setWarnings(resp.warnings ?? []);
       await reload();
       onSaved?.();
@@ -394,9 +401,9 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
           type="text"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          placeholder={`Filter ${entries.length} fields — fuzzy match on name or path`}
+          placeholder={formatMessage(t('config.fields.filter_placeholder'), { count: entries.length })}
           className="input-electric w-full px-3 py-2 text-sm"
-          aria-label="Filter fields"
+          aria-label={t('config.fields.filter_aria')}
         />
       )}
 
@@ -405,7 +412,8 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
           className="surface-panel p-6 text-center text-sm"
           style={{ color: 'var(--pc-text-muted)' }}
         >
-          No fields under <code style={{ color: 'var(--pc-text-faint)' }}>{prefix}</code>.
+          {formatMessage(t('config.fields.empty_under'), { prefix })}
+          <code style={{ color: 'var(--pc-text-faint)' }}>{prefix}</code>.
         </div>
       ) : (
         <form
@@ -421,7 +429,8 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
               className="px-4 py-6 text-sm text-center"
               style={{ color: 'var(--pc-text-muted)' }}
             >
-              No fields match <code style={{ color: 'var(--pc-text-faint)' }}>{filter}</code>.
+              {formatMessage(t('config.fields.no_match'), { filter })}
+              <code style={{ color: 'var(--pc-text-faint)' }}>{filter}</code>.
             </div>
           ) : null}
           {visibleEntries.map((f) => (
@@ -470,7 +479,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
               }}
             >
               <div className="font-medium mb-1">
-                ⚠ {warnings.length} warning{warnings.length === 1 ? '' : 's'}:
+                ⚠ {formatMessage(t('config.fields.warning_count'), { count: warnings.length })}
               </div>
               <ul className="list-disc pl-5 space-y-1">
                 {warnings.map((w) => (
@@ -494,11 +503,11 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
                 </span>
               ) : unsavedCount > 0 ? (
                 <span style={{ color: 'var(--pc-text-secondary)' }}>
-                  {unsavedCount} unsaved {unsavedCount === 1 ? 'change' : 'changes'}
+                  {formatMessage(t('config.fields.unsaved_count'), { count: unsavedCount })}
                 </span>
               ) : (
                 <span style={{ color: 'var(--pc-text-faint)' }}>
-                  No unsaved changes
+                  {t('config.fields.no_unsaved_changes')}
                 </span>
               )}
             </div>
@@ -509,7 +518,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
               className="btn-electric flex items-center gap-2 text-sm px-4 py-2 flex-shrink-0"
             >
               <Save className="h-4 w-4" />
-              {saving ? 'Saving…' : 'Save'}
+              {saving ? t('common.saving') : t('common.save')}
             </button>
           </div>
         </div>
@@ -541,6 +550,7 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
   const [providerModels, setProviderModels] = useState<string[] | null>(null);
   const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
   const isProviderModelField = /^providers\.models\.[^.]+\.model$/.test(entry.path);
+  const label = tConfigLabel(entry.path, fieldShortLabel(entry));
 
   useEffect(() => {
     if (!isProviderModelField) return;
@@ -570,21 +580,27 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
           <label
-            className="block text-sm font-medium font-mono break-all"
+            className="block text-sm font-medium break-all"
             style={{ color: 'var(--pc-text-primary)' }}
             htmlFor={entry.path}
             title={entry.type_hint}
           >
-            {entry.path}
+            {label}
             {entry.is_secret && (
               <span
                 className="ml-2 text-xs font-sans"
                 style={{ color: 'var(--pc-text-muted)' }}
               >
-                🔒 {entry.populated ? 'set' : 'unset'}
+                🔒 {entry.populated ? t('config.fields.secret_set') : t('config.fields.secret_unset')}
               </span>
             )}
           </label>
+          <code
+            className="block text-[11px] mt-0.5 break-all"
+            style={{ color: 'var(--pc-text-faint)' }}
+          >
+            {entry.path}
+          </code>
           {description && (
             <p
               className="text-xs mt-0.5"
@@ -599,7 +615,7 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
           <button
             type="button"
             onClick={onDelete}
-            title="Reset to default / unset"
+            title={t('config.fields.reset_title')}
             className="btn-icon flex-shrink-0"
           >
             <Trash2 className="h-4 w-4" />
@@ -615,8 +631,8 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
             onChange={(e) => onChange(e.target.value)}
             className="input-electric w-full px-3 py-2 text-sm appearance-none cursor-pointer"
           >
-            <option value="true">true</option>
-            <option value="false">false</option>
+            <option value="true">{t('common.yes')}</option>
+            <option value="false">{t('common.no')}</option>
           </select>
         ) : renderer === 'select' ? (
           <select
@@ -640,7 +656,7 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
               value={value}
               onChange={(e) => onChange(e.target.value)}
               className="input-electric w-full px-3 py-2 text-sm"
-              placeholder="Pick from list or type a model name"
+              placeholder={tConfigPlaceholder(entry.path, t('config.placeholder.provider_model'))}
             />
             <datalist id={`models-${entry.path}`}>
               {providerModels.map((m) => (
@@ -656,15 +672,14 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
               value={value}
               onChange={(e) => onChange(e.target.value)}
               className="input-electric w-full px-3 py-2 text-sm"
-              placeholder="Type a model identifier (catalog unreachable)"
+              placeholder={t('config.placeholder.provider_model_unreachable')}
             />
             <p
               className="text-xs"
               style={{ color: 'var(--pc-text-muted)' }}
             >
-              Could not fetch model catalog for this provider. Type the
-              identifier from your provider's docs (e.g.{' '}
-              <code>claude-sonnet-4-5-20251101</code>).
+              {t('config.fields.model_catalog_unreachable')}{' '}
+              <code>claude-sonnet-4-5-20251101</code>.
             </p>
           </>
         ) : isProviderModelField && providerModels === null ? (
@@ -675,14 +690,14 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
               value={value}
               onChange={(e) => onChange(e.target.value)}
               className="input-electric w-full px-3 py-2 text-sm"
-              placeholder="Fetching models…"
+              placeholder={t('config.placeholder.fetching_models')}
               disabled
             />
             <p
               className="text-xs"
               style={{ color: 'var(--pc-text-muted)' }}
             >
-              Fetching available models from the provider's catalog…
+              {t('config.fields.fetching_models')}
             </p>
           </>
         ) : renderer === 'array' ? (
@@ -717,8 +732,8 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
             placeholder={
               renderer === 'secret'
                 ? entry.populated
-                  ? 'Leave blank to keep current value'
-                  : 'Enter value'
+                  ? t('config.placeholder.secret_keep')
+                  : t('config.placeholder.secret_enter')
                 : ''
             }
           />
@@ -728,7 +743,7 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
           type="text"
           value={comment}
           onChange={(e) => onCommentChange(e.target.value)}
-          placeholder="Optional comment (why?)"
+          placeholder={t('config.placeholder.comment')}
           className="input-electric w-full px-3 py-1.5 text-xs"
           style={{ color: 'var(--pc-text-secondary)' }}
         />
@@ -779,8 +794,8 @@ function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEd
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
-          {rows.length} {rows.length === 1 ? 'entry' : 'entries'}
-          {isOptional && rows.length === 0 ? ' — saves as null' : null}
+          {formatMessage(t('config.fields.entry_count'), { count: rows.length })}
+          {isOptional && rows.length === 0 ? ` — ${t('config.fields.saves_as_null')}` : null}
         </span>
         <div
           className="inline-flex rounded-md overflow-hidden border text-xs"
@@ -796,7 +811,7 @@ function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEd
             }}
             aria-pressed={mode === 'rows'}
           >
-            <ListIcon className="h-3 w-3" /> Rows
+            <ListIcon className="h-3 w-3" /> {t('config.fields.rows_mode')}
           </button>
           <button
             type="button"
@@ -808,7 +823,7 @@ function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEd
             }}
             aria-pressed={mode === 'text'}
           >
-            <TypeIcon className="h-3 w-3" /> Text
+            <TypeIcon className="h-3 w-3" /> {t('config.fields.text_mode')}
           </button>
         </div>
       </div>
@@ -820,7 +835,7 @@ function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEd
               className="text-xs italic px-1 py-2"
               style={{ color: 'var(--pc-text-faint)' }}
             >
-              No entries. Click "+ Add" to add one.
+              {t('config.fields.no_entries_add')}
             </p>
           ) : (
             <ul className="space-y-1.5" id={inputId}>
@@ -831,12 +846,12 @@ function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEd
                     value={row}
                     onChange={(e) => setRow(i, e.target.value)}
                     className="input-electric flex-1 px-3 py-1.5 text-sm"
-                    placeholder="empty"
+                    placeholder={t('config.placeholder.empty')}
                   />
                   <button
                     type="button"
                     onClick={() => removeRow(i)}
-                    title="Remove this entry"
+                    title={t('config.fields.remove_entry')}
                     className="btn-icon flex-shrink-0"
                   >
                     <Trash2 className="h-4 w-4" />
@@ -850,7 +865,7 @@ function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEd
             onClick={addRow}
             className="btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1"
           >
-            <Plus className="h-3 w-3" /> Add
+            <Plus className="h-3 w-3" /> {t('common.add')}
           </button>
         </>
       ) : (
@@ -860,7 +875,7 @@ function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEd
           value={value}
           onChange={(e) => onChange(e.target.value)}
           className="input-electric w-full px-3 py-2 text-sm font-mono resize-y"
-          placeholder='["value1", "value2"]'
+          placeholder={t('config.placeholder.array_json')}
         />
       )}
     </div>
@@ -928,7 +943,7 @@ function ObjectArrayEditor({ inputId, value, onChange, elementProps }: ObjectArr
     return (
       <div className="space-y-1.5">
         <p className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-          Element shape unavailable from schema; edit raw JSON below.
+          {t('config.fields.raw_json_fallback')}
         </p>
         <textarea
           id={inputId}
@@ -936,7 +951,7 @@ function ObjectArrayEditor({ inputId, value, onChange, elementProps }: ObjectArr
           value={value || '[]'}
           onChange={(e) => onChange(e.target.value)}
           className="input-electric w-full px-3 py-2 text-sm font-mono resize-y"
-          placeholder='[{"key": "value"}]'
+          placeholder={t('config.placeholder.object_array_json')}
         />
       </div>
     );
@@ -946,19 +961,19 @@ function ObjectArrayEditor({ inputId, value, onChange, elementProps }: ObjectArr
     <div className="space-y-2" id={inputId}>
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
-          {rows.length} {rows.length === 1 ? 'entry' : 'entries'}
+          {formatMessage(t('config.fields.entry_count'), { count: rows.length })}
         </span>
         <button
           type="button"
           onClick={addRow}
           className="btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1"
         >
-          <Plus className="h-3 w-3" /> Add
+          <Plus className="h-3 w-3" /> {t('common.add')}
         </button>
       </div>
       {rows.length === 0 ? (
         <p className="text-xs italic px-1 py-2" style={{ color: 'var(--pc-text-faint)' }}>
-          No entries. Click "+ Add" to create one.
+          {t('config.fields.no_entries_create')}
         </p>
       ) : (
         <ul className="space-y-3">
@@ -980,7 +995,7 @@ function ObjectArrayEditor({ inputId, value, onChange, elementProps }: ObjectArr
                 <button
                   type="button"
                   onClick={() => removeRow(rowIdx)}
-                  title="Remove this entry"
+                  title={t('config.fields.remove_entry')}
                   className="btn-icon"
                 >
                   <Trash2 className="h-4 w-4" />
@@ -1015,6 +1030,7 @@ function ObjectArrayField({
   onChange: (next: unknown) => void;
 }) {
   const description = tConfigDescription(`${parentPath}.${meta.key}`, meta.description);
+  const label = tConfigLabel(`${parentPath}.${meta.key}`, meta.label);
   const display = (() => {
     if (rawValue === null || rawValue === undefined) return '';
     if (typeof rawValue === 'string') return rawValue;
@@ -1024,10 +1040,10 @@ function ObjectArrayField({
   return (
     <div>
       <label className="block text-xs font-mono" style={{ color: 'var(--pc-text-secondary)' }}>
-        {meta.key}
+        {label}
         {meta.optional && (
           <span className="ml-1.5 text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
-            optional
+            {t('config.fields.optional')}
           </span>
         )}
       </label>
@@ -1042,8 +1058,8 @@ function ObjectArrayField({
           onChange={(e) => onChange(e.target.value === 'true')}
           className="input-electric w-full px-2 py-1 mt-1 text-sm appearance-none cursor-pointer"
         >
-          <option value="true">true</option>
-          <option value="false">false</option>
+          <option value="true">{t('common.yes')}</option>
+          <option value="false">{t('common.no')}</option>
         </select>
       ) : meta.kind === 'enum' && meta.enumVariants ? (
         <select
@@ -1161,7 +1177,7 @@ function KeyValueChipEditor({
     <div className="space-y-1.5 mt-1">
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
-          {pairs.length} {pairs.length === 1 ? 'entry' : 'entries'}
+          {formatMessage(t('config.fields.entry_count'), { count: pairs.length })}
         </span>
         <div
           className="inline-flex rounded-md overflow-hidden border text-xs"
@@ -1177,7 +1193,7 @@ function KeyValueChipEditor({
             }}
             aria-pressed={mode === 'rows'}
           >
-            <ListIcon className="h-3 w-3" /> Rows
+            <ListIcon className="h-3 w-3" /> {t('config.fields.rows_mode')}
           </button>
           <button
             type="button"
@@ -1189,7 +1205,7 @@ function KeyValueChipEditor({
             }}
             aria-pressed={mode === 'text'}
           >
-            <TypeIcon className="h-3 w-3" /> Text
+            <TypeIcon className="h-3 w-3" /> {t('config.fields.text_mode')}
           </button>
         </div>
       </div>
@@ -1216,13 +1232,13 @@ function KeyValueChipEditor({
             }
           }}
           className="input-electric w-full px-3 py-2 text-sm font-mono resize-y"
-          placeholder='{"key": "value"}'
+          placeholder={t('config.placeholder.object_json')}
         />
       ) : (
         <>
           {pairs.length === 0 ? (
             <p className="text-[11px] italic" style={{ color: 'var(--pc-text-faint)' }}>
-              No entries.
+              {t('config.fields.no_entries')}
             </p>
           ) : (
             <ul className="space-y-1">
@@ -1233,7 +1249,7 @@ function KeyValueChipEditor({
                     value={k}
                     onChange={(e) => setKey(i, e.target.value)}
                     className="input-electric flex-1 px-2 py-1 text-sm font-mono"
-                    placeholder="key"
+                    placeholder={t('config.placeholder.key')}
                   />
                   <span style={{ color: 'var(--pc-text-faint)' }}>=</span>
                   <input
@@ -1241,12 +1257,12 @@ function KeyValueChipEditor({
                     value={v}
                     onChange={(e) => setValue(i, e.target.value)}
                     className="input-electric flex-1 px-2 py-1 text-sm"
-                    placeholder="value"
+                    placeholder={t('config.placeholder.value')}
                   />
                   <button
                     type="button"
                     onClick={() => removeAt(i)}
-                    title="Remove this entry"
+                    title={t('config.fields.remove_entry')}
                     className="btn-icon flex-shrink-0"
                   >
                     <Trash2 className="h-4 w-4" />
@@ -1260,7 +1276,7 @@ function KeyValueChipEditor({
             onClick={() => onChange([...pairs, ['', '']])}
             className="btn-secondary text-xs px-2.5 py-1 inline-flex items-center gap-1"
           >
-            <Plus className="h-3 w-3" /> Add
+            <Plus className="h-3 w-3" /> {t('common.add')}
           </button>
         </>
       )}
@@ -1279,7 +1295,7 @@ function DriftDiff({ drift }: { drift: DriftEntry }) {
         className="text-xs mt-1 inline-flex items-center gap-1"
         style={{ color: 'var(--color-status-warning, #f5b400)' }}
       >
-        ⚠ secret value differs from on-disk
+        ⚠ {t('config.drift.secret_differs')}
       </p>
     );
   }
@@ -1291,11 +1307,11 @@ function DriftDiff({ drift }: { drift: DriftEntry }) {
       style={{ color: 'var(--color-status-warning, #f5b400)' }}
     >
       <span>
-        in-memory:{' '}
+        {t('config.drift.in_memory')}:{' '}
         <code style={{ color: 'var(--pc-text-secondary)' }}>{inMem}</code>
       </span>
       <span>
-        on-disk:{' '}
+        {t('config.drift.on_disk')}:{' '}
         <code style={{ color: 'var(--pc-text-secondary)' }}>{onDisk}</code>
       </span>
     </div>
@@ -1311,4 +1327,3 @@ function formatDriftValue(value: unknown): string {
     return String(value);
   }
 }
-
