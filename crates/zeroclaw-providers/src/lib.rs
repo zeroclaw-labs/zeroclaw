@@ -20,7 +20,6 @@ pub mod anthropic;
 pub mod auth;
 pub mod azure_openai;
 pub mod bedrock;
-pub mod claude_code;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
@@ -1459,7 +1458,6 @@ fn create_provider_with_url_and_options(
             AuthStyle::Bearer,
         ))),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
-        "claude-code" => Ok(Box::new(claude_code::ClaudeCodeProvider::new())),
         "gemini-cli" => Ok(Box::new(gemini_cli::GeminiCliProvider::new())),
         "kilocli" | "kilo" => Ok(Box::new(kilocli::KiloCliProvider::new())),
         "lmstudio" | "lm-studio" => {
@@ -2194,12 +2192,6 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             display_name: "GitHub Copilot",
             aliases: &["github-copilot"],
             local: false,
-        },
-        ProviderInfo {
-            name: "claude-code",
-            display_name: "Claude Code (CLI)",
-            aliases: &[],
-            local: true,
         },
         ProviderInfo {
             name: "gemini-cli",
@@ -3078,11 +3070,6 @@ mod tests {
     }
 
     #[test]
-    fn factory_claude_code() {
-        assert!(create_provider("claude-code", None).is_ok());
-    }
-
-    #[test]
     fn factory_gemini_cli() {
         assert!(create_provider("gemini-cli", None).is_ok());
     }
@@ -3445,7 +3432,6 @@ mod tests {
             "perplexity",
             "cohere",
             "copilot",
-            "claude-code",
             "gemini-cli",
             "kilocli",
             "nvidia",
