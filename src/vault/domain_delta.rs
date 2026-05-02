@@ -26,7 +26,7 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 use super::domain;
-use super::domain_manifest::{self, DeltaSpec, DomainManifestV2};
+use super::domain_manifest::{DeltaSpec, DomainManifestV2};
 
 /// Outcome of `apply_delta` so the CLI can report what changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,62 +207,148 @@ fn apply_inside_tx(
     conn.execute_batch("BEGIN")?;
     let outcome = (|| -> Result<ApplyDeltaReport> {
         // ── Upserts ───────────────────────────────────────────────
-        // Each table is `INSERT OR REPLACE` keyed by uuid where the
-        // schema has it (vault_documents) and by `(doc_id, …)` for
-        // the auxiliary tables. Auxiliary tables use INSERT OR IGNORE
-        // because the apply re-derives them from the new doc rows
-        // — duplicates are fine.
+        //
+        // **uuid is the natural identity, NOT id.**
+        //
+        // The baseline builder allocates `vault_documents.id` via
+        // SQLite AUTOINCREMENT, so the same logical document can land
+        // on a different id every time the corpus is rebuilt. If we
+        // copied the delta's id into main verbatim, an `INSERT OR
+        // REPLACE (id,...)` would clobber whatever main row currently
+        // sits at that primary-key slot — not the row carrying the
+        // matching uuid. That would silently corrupt unrelated
+        // documents.
+        //
+        // The fix:
+        //   1. Upsert vault_documents using uuid as the conflict key,
+        //      letting main keep its own id allocation. Existing rows
+        //      get content/checksum/etc. updated; new uuids get a
+        //      fresh main-side id.
+        //   2. Build a temp mapping `delta_id → main_id` keyed on uuid.
+        //   3. Apply auxiliary-table rows by remapping their delta-side
+        //      `doc_id` / `source_doc_id` through that table.
+        //
+        // The temp table is scoped to this connection and dropped on
+        // commit, so it stays invisible to anyone else.
         let upserted_documents: i64 = conn.query_row(
             "SELECT COUNT(*) FROM delta.vault_documents",
             [],
             |r| r.get(0),
         )?;
+        // (1) uuid-keyed upsert. We deliberately omit `id` from the
+        // INSERT column list so SQLite assigns a fresh main-side id
+        // for new uuids and the existing id sticks for known uuids.
         conn.execute(
-            "INSERT OR REPLACE INTO main.vault_documents
-              (id, uuid, title, content, html_content, source_type,
+            "INSERT INTO main.vault_documents
+              (uuid, title, content, html_content, source_type,
                source_device_id, original_path, checksum, doc_type,
                char_count, created_at, updated_at,
                embedding_model, embedding_dim, embedding_provider,
                embedding_version, embedding_created_at)
-             SELECT id, uuid, title, content, html_content, source_type,
+             SELECT uuid, title, content, html_content, source_type,
                     source_device_id, original_path, checksum, doc_type,
                     char_count, created_at, updated_at,
                     embedding_model, embedding_dim, embedding_provider,
                     embedding_version, embedding_created_at
-               FROM delta.vault_documents",
+               FROM delta.vault_documents
+             WHERE TRUE
+             ON CONFLICT(uuid) DO UPDATE SET
+                title              = excluded.title,
+                content            = excluded.content,
+                html_content       = excluded.html_content,
+                source_type        = excluded.source_type,
+                source_device_id   = excluded.source_device_id,
+                original_path      = excluded.original_path,
+                checksum           = excluded.checksum,
+                doc_type           = excluded.doc_type,
+                char_count         = excluded.char_count,
+                updated_at         = excluded.updated_at,
+                embedding_model    = excluded.embedding_model,
+                embedding_dim      = excluded.embedding_dim,
+                embedding_provider = excluded.embedding_provider,
+                embedding_version  = excluded.embedding_version,
+                embedding_created_at = excluded.embedding_created_at",
             [],
         )?;
-        // Auxiliary tables — copy across by source_doc_id / doc_id.
-        // The delta is expected to carry only rows attached to the
-        // documents it upserted, so we don't pre-clear anything.
+
+        // (2) delta_id → main_id mapping for every uuid the delta touched.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.delta_id_map;
+             CREATE TEMP TABLE delta_id_map AS
+               SELECT d.id AS delta_id, m.id AS main_id, d.uuid AS uuid
+                 FROM delta.vault_documents AS d
+                 JOIN main.vault_documents AS m USING (uuid);",
+        )?;
+
+        // (3) Auxiliary tables — copy via remapped doc_id. Pre-clear
+        // any prior rows attached to the touched documents so the
+        // delta acts as the source of truth for those docs (no stale
+        // links/aliases/tags hanging around from a previous version).
         conn.execute(
-            "INSERT OR REPLACE INTO main.vault_links
-              (id, source_doc_id, target_raw, target_doc_id, display_text,
+            "DELETE FROM main.vault_links
+              WHERE source_doc_id IN (SELECT main_id FROM temp.delta_id_map)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO main.vault_links
+              (source_doc_id, target_raw, target_doc_id, display_text,
                link_type, context, line_number, is_resolved)
-             SELECT id, source_doc_id, target_raw, target_doc_id, display_text,
-                    link_type, context, line_number, is_resolved
-               FROM delta.vault_links",
+             SELECT map.main_id, l.target_raw, l.target_doc_id, l.display_text,
+                    l.link_type, l.context, l.line_number, l.is_resolved
+               FROM delta.vault_links AS l
+               JOIN temp.delta_id_map AS map ON map.delta_id = l.source_doc_id",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM main.vault_aliases
+              WHERE doc_id IN (SELECT main_id FROM temp.delta_id_map)",
             [],
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO main.vault_aliases (doc_id, alias)
-             SELECT doc_id, alias FROM delta.vault_aliases",
+             SELECT map.main_id, a.alias
+               FROM delta.vault_aliases AS a
+               JOIN temp.delta_id_map AS map ON map.delta_id = a.doc_id",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM main.vault_frontmatter
+              WHERE doc_id IN (SELECT main_id FROM temp.delta_id_map)",
             [],
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO main.vault_frontmatter (doc_id, key, value)
-             SELECT doc_id, key, value FROM delta.vault_frontmatter",
+             SELECT map.main_id, f.key, f.value
+               FROM delta.vault_frontmatter AS f
+               JOIN temp.delta_id_map AS map ON map.delta_id = f.doc_id",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM main.vault_tags
+              WHERE doc_id IN (SELECT main_id FROM temp.delta_id_map)",
             [],
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO main.vault_tags (doc_id, tag_name, tag_type)
-             SELECT doc_id, tag_name, tag_type FROM delta.vault_tags",
+             SELECT map.main_id, t.tag_name, t.tag_type
+               FROM delta.vault_tags AS t
+               JOIN temp.delta_id_map AS map ON map.delta_id = t.doc_id",
             [],
         )?;
-        // vault_embeddings is best-effort — older deltas may omit it.
+        // vault_embeddings is best-effort — older deltas may omit the
+        // table itself. Best-effort means: a missing table on the
+        // delta side is fine, but a wrong remap on a present table
+        // would be a bug, so we still go through the mapping table.
         let _ = conn.execute(
-            "INSERT OR REPLACE INTO main.vault_embeddings (doc_id, embedding, dim)
-             SELECT doc_id, embedding, dim FROM delta.vault_embeddings",
+            "DELETE FROM main.vault_embeddings
+              WHERE doc_id IN (SELECT main_id FROM temp.delta_id_map)",
+            [],
+        );
+        let _ = conn.execute(
+            "INSERT INTO main.vault_embeddings (doc_id, embedding, dim)
+             SELECT map.main_id, e.embedding, e.dim
+               FROM delta.vault_embeddings AS e
+               JOIN temp.delta_id_map AS map ON map.delta_id = e.doc_id",
             [],
         );
 
@@ -313,6 +399,9 @@ fn apply_inside_tx(
             [],
         )?;
 
+        // Drop the temp mapping so it doesn't outlive the tx.
+        let _ = conn.execute_batch("DROP TABLE IF EXISTS temp.delta_id_map;");
+
         // ── Bookkeeping ───────────────────────────────────────────
         domain::write_delta_meta_on_conn(conn, new_current_version, now_unix)?;
 
@@ -333,6 +422,8 @@ fn apply_inside_tx(
         }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
+            // Make sure no half-built temp table survives a failed apply.
+            let _ = conn.execute_batch("DROP TABLE IF EXISTS temp.delta_id_map;");
             Err(e)
         }
     }
@@ -849,6 +940,204 @@ mod tests {
         let staging = download_delta(&delta, tmp.path()).await.unwrap();
         assert!(staging.exists());
         assert_eq!(std::fs::read(&staging).unwrap(), bytes);
+    }
+
+    /// Regression for the id-nondeterminism bug: a delta whose row
+    /// `id` collides with a *different* main row must not corrupt
+    /// the unrelated main row. Specifically — main has uuid-1 at id=1
+    /// and uuid-doomed at id=2; the delta upserts uuid-1 with id=99
+    /// (matching the operator's freshly rebuilt corpus where uuid-1
+    /// happens to land at row 99). The apply must keep main's id=1
+    /// for uuid-1 and leave id=2 (uuid-doomed) untouched, not silently
+    /// replace either. Without the uuid-keyed upsert this test fails
+    /// because INSERT OR REPLACE clobbers main.id=99 (which doesn't
+    /// exist, fine) AND would resurrect/overwrite id=1 inconsistently.
+    #[test]
+    fn apply_delta_handles_nondeterministic_delta_ids() {
+        let (tmp, domain_path) = fresh_workspace_with_baseline("2026.01.15");
+        let delta_path = tmp.path().join("delta.sqlite");
+        ensure_delta_schema(&delta_path).unwrap();
+
+        // Operator rebuilt the corpus and uuid-1 landed at id=99 this
+        // time. The delta also brings a brand-new uuid-fresh at id=42
+        // — both numbers chosen to NOT collide with main's existing
+        // (id=1, id=2) so we can detect any cross-contamination.
+        let conn = Connection::open(&delta_path).unwrap();
+        conn.execute(
+            "INSERT INTO vault_documents
+               (id, uuid, title, content, source_type, source_device_id,
+                checksum, char_count, created_at, updated_at)
+             VALUES (99, 'uuid-1','statute::민법::750','rebuilt content',
+                     'local_file','dev','rebuilt-cs',5,1,2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vault_documents
+               (id, uuid, title, content, source_type, source_device_id,
+                checksum, char_count, created_at, updated_at)
+             VALUES (42, 'uuid-fresh','statute::상법::5','brand new',
+                     'local_file','dev','fresh-cs',5,1,2)",
+            [],
+        )
+        .unwrap();
+        // Aliases keyed by the delta-side doc_id (99 and 42).
+        conn.execute(
+            "INSERT INTO vault_aliases (doc_id, alias) VALUES (99, '민법 제750조-rebuilt')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vault_aliases (doc_id, alias) VALUES (42, '상법 제5조')",
+            [],
+        )
+        .unwrap();
+        stamp_delta_meta(&conn, "2026.01.22", "2026.01.15", &"0".repeat(64)).unwrap();
+        drop(conn);
+
+        let report =
+            apply_delta(tmp.path(), &delta_path, "2026.01.15", "2026.01.22", 2_000).unwrap();
+        assert_eq!(report.upserted_documents, 2);
+
+        let conn = Connection::open(&domain_path).unwrap();
+        // uuid-1 must keep its original id=1, with rebuilt content.
+        let id_for_uuid1: i64 = conn
+            .query_row(
+                "SELECT id FROM vault_documents WHERE uuid = 'uuid-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            id_for_uuid1, 1,
+            "main-side id for uuid-1 must be preserved; got {id_for_uuid1}"
+        );
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM vault_documents WHERE uuid = 'uuid-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "rebuilt content");
+
+        // uuid-doomed at id=2 must be UNTOUCHED — the delta neither
+        // upserts nor deletes it, so it should still be there. (It
+        // would only disappear if the test threaded it through
+        // vault_deletes, which it does not.)
+        let doomed_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vault_documents WHERE uuid = 'uuid-doomed' AND id = 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            doomed_count, 1,
+            "uuid-doomed at id=2 must be untouched by the delta"
+        );
+
+        // The new uuid-fresh row gets a freshly allocated main id —
+        // not 42 (the delta's id). Could be any value SQLite hands out.
+        let fresh_id: i64 = conn
+            .query_row(
+                "SELECT id FROM vault_documents WHERE uuid = 'uuid-fresh'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(fresh_id > 0);
+        // Aliases must be remapped to the main-side ids.
+        let rebuilt_alias_id: i64 = conn
+            .query_row(
+                "SELECT doc_id FROM vault_aliases WHERE alias = '민법 제750조-rebuilt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rebuilt_alias_id, 1, "alias for uuid-1 must point at main id=1");
+        let fresh_alias_id: i64 = conn
+            .query_row(
+                "SELECT doc_id FROM vault_aliases WHERE alias = '상법 제5조'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fresh_alias_id, fresh_id,
+            "alias for uuid-fresh must point at the freshly allocated main id"
+        );
+    }
+
+    /// Aliases attached to a delta-touched document must be replaced,
+    /// not merged. This is the "delta is the source of truth for the
+    /// docs it touches" rule. Old stale aliases of uuid-1 (e.g. if
+    /// the prior baseline had `민법 제750조` and the rebuilt corpus
+    /// dropped that alias) must disappear after the delta is applied.
+    #[test]
+    fn apply_delta_replaces_aliases_for_touched_documents() {
+        let (tmp, domain_path) = fresh_workspace_with_baseline("2026.01.15");
+        // fresh_workspace_with_baseline put alias '민법 제750조' on uuid-1.
+        let conn = Connection::open(&domain_path).unwrap();
+        let pre: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vault_aliases WHERE alias = '민법 제750조'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pre, 1);
+        drop(conn);
+
+        let delta_path = tmp.path().join("delta.sqlite");
+        ensure_delta_schema(&delta_path).unwrap();
+        let conn = Connection::open(&delta_path).unwrap();
+        // Delta upserts uuid-1 with a different alias set (no '민법 제750조').
+        conn.execute(
+            "INSERT INTO vault_documents
+               (id, uuid, title, content, source_type, source_device_id,
+                checksum, char_count, created_at, updated_at)
+             VALUES (5, 'uuid-1','statute::민법::750','revised',
+                     'local_file','dev','rev-cs',5,1,2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vault_aliases (doc_id, alias) VALUES (5, '민법 제750조 (개정)')",
+            [],
+        )
+        .unwrap();
+        stamp_delta_meta(&conn, "2026.01.22", "2026.01.15", &"0".repeat(64)).unwrap();
+        drop(conn);
+
+        apply_delta(tmp.path(), &delta_path, "2026.01.15", "2026.01.22", 2_000).unwrap();
+
+        let conn = Connection::open(&domain_path).unwrap();
+        let stale: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vault_aliases WHERE alias = '민법 제750조'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "stale alias must be cleared by the delta");
+        let revised: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vault_aliases WHERE alias = '민법 제750조 (개정)'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(revised, 1);
+        // uuid-doomed's alias survives — it's untouched by the delta.
+        let untouched: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vault_aliases WHERE alias = '구법 제1조'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(untouched, 1);
     }
 
     #[tokio::test]

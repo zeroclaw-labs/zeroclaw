@@ -399,7 +399,9 @@ fn validate_baseline(b: &BaselineSpec) -> Result<()> {
 }
 
 fn is_lower_hex_64(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+    s.len() == 64
+        && s.chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
 }
 
 async fn read_manifest_text(url_or_path: &str) -> Result<String> {
@@ -664,6 +666,22 @@ mod tests {
         m.baseline.sha256 = "deadbeef".into();
         let err = validate_v2(&m).unwrap_err();
         assert!(err.to_string().contains("baseline.sha256"));
+    }
+
+    #[test]
+    fn validate_v2_rejects_uppercase_hex_sha() {
+        // Manifest spec says lower-case hex; uppercase A-F must be
+        // rejected so operator tooling uses the canonical form.
+        let mut m = good_v2_manifest_no_deltas();
+        m.baseline.sha256 = "A".repeat(64);
+        assert!(validate_v2(&m).is_err());
+        // Also for deltas.
+        let mut m = good_v2_manifest_no_deltas();
+        let mut d = good_delta("2026.01.22");
+        d.sha256 = "DEADBEEF".to_string() + &"0".repeat(56);
+        m.deltas.push(d);
+        m.version = "2026.01.22".into();
+        assert!(validate_v2(&m).is_err());
     }
 
     #[test]

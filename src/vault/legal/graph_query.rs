@@ -1432,8 +1432,14 @@ pub fn issue_analysis(
         });
     }
 
-    // Sort by centrality descending.
-    issue_statutes.sort_by(|a, b| b.centrality.partial_cmp(&a.centrality).unwrap());
+    // Sort by centrality descending. NaN-safe: any NaN compares as
+    // Equal, sinking it to the end of an otherwise-ordered list
+    // rather than panicking.
+    issue_statutes.sort_by(|a, b| {
+        b.centrality
+            .partial_cmp(&a.centrality)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // ── Phase 3: Classify tiers ──
     // Thresholds are relative to the highest non-boilerplate centrality.
@@ -1513,7 +1519,7 @@ pub fn issue_analysis(
     ranked_cases.sort_by(|a, b| {
         b.leading_score
             .partial_cmp(&a.leading_score)
-            .unwrap()
+            .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
                 b.verdict_date
                     .as_deref()
