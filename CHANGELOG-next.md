@@ -220,7 +220,7 @@
 | Docs | mdBook header links point to upstream repo (#6124) |
 | Install | Prompt for pre-built vs source, default to pre-built on `curl | bash` (#5968) |
 | Docker | Include web dashboard in release image (#5996) and Dockerfile.debian local-dev image (#6025) |
-| Windows | Fix `setup.bat` issues (#6137); unbreak `cargo test` and add self-update target triples (#6050) |
+| Windows | Fix `setup.bat` issues (#6137); unbreak `cargo test` and add self-update target triples (#6050); unbreak `zeroclaw-hardware` full build by anchoring embedded firmware paths at the repo root and fixing slice iteration on non-Linux/macOS targets (#6280) |
 | rag-pdf | Unbreak `--features rag-pdf` end-to-end and restore Windows tests (#6076) |
 | Security | `rustls-webpki` v0.103.13 (#6011); `rand` patches + `picomatch` ReDoS (#5971); cargo update + deny.toml audit (#6152) |
 
