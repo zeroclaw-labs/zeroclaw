@@ -33,6 +33,8 @@ Last refreshed: **February 28, 2026**.
 
 - [getting-started/README.md](getting-started/README.md)
 - [getting-started/macos-update-uninstall.md](getting-started/macos-update-uninstall.md)
+- [getting-started/multi-platform-build-guide.md](getting-started/multi-platform-build-guide.md) — Windows / macOS / Android / iOS personal-install build recipes
+- [getting-started/multi-platform-build-guide.ko.md](getting-started/multi-platform-build-guide.ko.md) — 위 가이드의 한국어 사이드 사본
 - [one-click-bootstrap.md](one-click-bootstrap.md)
 - [docker-setup.md](docker-setup.md)
 - [android-setup.md](android-setup.md)
