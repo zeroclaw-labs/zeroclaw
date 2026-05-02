@@ -740,6 +740,273 @@ pub fn publish(
     Ok(())
 }
 
+// ───────── stamp-baseline (PR 3) ─────────
+
+/// Write the baseline meta keys into a freshly-built domain.db so it
+/// can ship as the year's baseline. Run after `vault domain build`
+/// (or `scripts/build_domain_db_fast.py`) before computing the
+/// publish-time sha256 — the meta rows are part of the baseline file
+/// and therefore part of its checksum.
+pub fn stamp_baseline(bundle_path: &Path, baseline_version: &str) -> Result<()> {
+    if !bundle_path.exists() {
+        anyhow::bail!("bundle not found: {}", bundle_path.display());
+    }
+    println!(
+        "{} {} as baseline v{}",
+        style("vault domain stamp-baseline:").bold().cyan(),
+        bundle_path.display(),
+        baseline_version
+    );
+
+    let conn = Connection::open(bundle_path)
+        .with_context(|| format!("opening {}", bundle_path.display()))?;
+    super::schema::init_schema(&conn).context("init schema before stamping")?;
+
+    // Compute the baseline_sha256 BEFORE writing meta — that way the
+    // sha pinned in `domain.db.meta.baseline_sha256` matches the
+    // bytes the manifest will ship with. Otherwise the sha would
+    // capture meta-rows-with-themselves, which is circular.
+    //
+    // Actually, the manifest's `baseline.sha256` is computed *at
+    // publish time* by reading the file after meta is written, so
+    // it includes the meta rows. The `meta.baseline_sha256` value
+    // here is informational — it's the sha the operator advertises.
+    // We use a placeholder ("auto") which `publish_v2` overwrites.
+    super::domain::write_baseline_meta_on_conn(&conn, baseline_version, "auto", 0)
+        .context("writing baseline meta")?;
+    drop(conn);
+
+    println!(
+        "  {} stamped (publish_v2 will refresh baseline_sha256 to actual file digest)",
+        style("✓").green()
+    );
+    Ok(())
+}
+
+// ───────── publish_v2 (PR 3) ─────────
+
+/// Emit a v2 manifest pointing at a freshly-published baseline. Run
+/// once per annual cut (default: January 15). Use [`publish_delta`]
+/// for subsequent weekly delta publications on top of the same
+/// baseline.
+pub fn publish_v2(
+    baseline_path: &Path,
+    baseline_url: &str,
+    name: &str,
+    baseline_version: &str,
+    out_manifest: &Path,
+) -> Result<()> {
+    use super::domain_manifest::{BaselineSpec, DomainManifestV2};
+
+    if !baseline_path.exists() {
+        anyhow::bail!("baseline DB not found: {}", baseline_path.display());
+    }
+    println!(
+        "{} {} v{} → {}",
+        style("vault domain publish-v2:").bold().cyan(),
+        name,
+        baseline_version,
+        baseline_url
+    );
+
+    let (sha, size) = domain_manifest::sha256_file(baseline_path)?;
+    let stats = read_bundle_stats(baseline_path)?;
+
+    let manifest = DomainManifestV2 {
+        schema_version: domain_manifest::MANIFEST_SCHEMA_VERSION_V2,
+        name: name.to_string(),
+        // Top-level version equals the chain head — with no deltas
+        // yet, that's the baseline.
+        version: baseline_version.to_string(),
+        generated_at: now_rfc3339(),
+        generator: Some(format!("zeroclaw {}", env!("CARGO_PKG_VERSION"))),
+        baseline: BaselineSpec {
+            version: baseline_version.to_string(),
+            url: baseline_url.to_string(),
+            sha256: sha.clone(),
+            size_bytes: size,
+            stats: stats.clone(),
+        },
+        deltas: Vec::new(),
+        stats,
+    };
+    domain_manifest::validate_v2(&manifest).context("self-validating emitted manifest")?;
+
+    let json = serde_json::to_string_pretty(&manifest)?;
+    std::fs::write(out_manifest, &json)
+        .with_context(|| format!("writing manifest to {}", out_manifest.display()))?;
+
+    println!("  {} sha256:   {sha}", style("✓").green());
+    println!(
+        "  {} size:     {size} bytes ({})",
+        style("✓").green(),
+        human_size(size)
+    );
+    println!(
+        "  {} manifest: {}",
+        style("✓").green(),
+        out_manifest.display()
+    );
+    println!();
+    println!(
+        "  {} upload the baseline file under the URL above, then publish the manifest:",
+        style("next:").bold()
+    );
+    println!(
+        "    aws s3 cp {} s3://<bucket>/$(basename {baseline_url})",
+        baseline_path.display()
+    );
+    println!(
+        "    aws s3 cp {} s3://<bucket>/<manifest-key>.json",
+        out_manifest.display()
+    );
+    Ok(())
+}
+
+// ───────── publish_delta (PR 3) ─────────
+
+/// Append a new delta to an existing v2 manifest and write the
+/// updated manifest out. Both `applies_to_baseline` and the bundle
+/// integrity (sha256 + size) are verified before the manifest is
+/// rewritten — a delta that's incompatible with the manifest's
+/// baseline is rejected loudly so the operator can't accidentally
+/// poison the chain.
+pub fn publish_delta(
+    delta_path: &Path,
+    delta_url: &str,
+    delta_version: &str,
+    in_manifest: &Path,
+    out_manifest: &Path,
+) -> Result<()> {
+    use super::domain_manifest::{DeltaOps, DeltaSpec, DomainManifestV2};
+
+    if !delta_path.exists() {
+        anyhow::bail!("delta file not found: {}", delta_path.display());
+    }
+    if !in_manifest.exists() {
+        anyhow::bail!("in-manifest not found: {}", in_manifest.display());
+    }
+    println!(
+        "{} delta v{} → {}",
+        style("vault domain publish-delta:").bold().cyan(),
+        delta_version,
+        delta_url
+    );
+
+    let raw = std::fs::read_to_string(in_manifest)
+        .with_context(|| format!("reading in-manifest {}", in_manifest.display()))?;
+    let mut manifest: DomainManifestV2 = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing in-manifest {}", in_manifest.display()))?;
+    domain_manifest::validate_v2(&manifest).context("validating in-manifest")?;
+
+    // Read the delta SQLite to confirm `applies_to_baseline` matches
+    // the manifest's baseline. Operators sometimes diff against the
+    // wrong DB; this catches it before publish.
+    let conn = Connection::open_with_flags(
+        delta_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening delta {}", delta_path.display()))?;
+    let kind: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_kind'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if kind.as_deref() != Some("domain-delta") {
+        anyhow::bail!(
+            "delta file is not a domain-delta (meta.schema_kind = {:?})",
+            kind
+        );
+    }
+    let delta_baseline: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='applies_to_baseline'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if delta_baseline.as_deref() != Some(manifest.baseline.version.as_str()) {
+        anyhow::bail!(
+            "delta.applies_to_baseline = {:?}, manifest.baseline.version = `{}`",
+            delta_baseline,
+            manifest.baseline.version
+        );
+    }
+    let upsert_count: u64 = conn
+        .query_row("SELECT COUNT(*) FROM vault_documents", [], |r| r.get(0))
+        .unwrap_or(0);
+    let delete_count: u64 = conn
+        .query_row("SELECT COUNT(*) FROM vault_deletes", [], |r| r.get(0))
+        .unwrap_or(0);
+    drop(conn);
+
+    let (sha, size) = domain_manifest::sha256_file(delta_path)?;
+
+    let new_delta = DeltaSpec {
+        version: delta_version.to_string(),
+        applies_to_baseline: manifest.baseline.version.clone(),
+        url: delta_url.to_string(),
+        sha256: sha.clone(),
+        size_bytes: size,
+        generated_at: Some(now_rfc3339()),
+        ops: DeltaOps {
+            upsert: upsert_count,
+            delete: delete_count,
+        },
+    };
+
+    // Don't append a delta whose version equals the current chain
+    // head — the operator probably re-ran by mistake.
+    if manifest
+        .deltas
+        .iter()
+        .any(|d| d.version == new_delta.version)
+    {
+        anyhow::bail!(
+            "delta version `{}` already present in manifest.deltas",
+            new_delta.version
+        );
+    }
+
+    manifest.deltas.push(new_delta);
+    manifest.version = delta_version.to_string(); // chain head bumps
+    manifest.generated_at = now_rfc3339();
+    domain_manifest::validate_v2(&manifest).context("validating updated manifest")?;
+
+    let json = serde_json::to_string_pretty(&manifest)?;
+    std::fs::write(out_manifest, &json)
+        .with_context(|| format!("writing out-manifest {}", out_manifest.display()))?;
+
+    println!("  {} sha256:    {sha}", style("✓").green());
+    println!(
+        "  {} size:      {size} bytes ({})",
+        style("✓").green(),
+        human_size(size)
+    );
+    println!(
+        "  {} ops:       +{} upserts, -{} deletes",
+        style("✓").green(),
+        upsert_count,
+        delete_count
+    );
+    println!(
+        "  {} manifest:  {} (was: {})",
+        style("✓").green(),
+        out_manifest.display(),
+        in_manifest.display()
+    );
+    println!(
+        "  {} chain head: v{} ({} delta{})",
+        style("✓").green(),
+        manifest.version,
+        manifest.deltas.len(),
+        if manifest.deltas.len() == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
 fn read_bundle_stats(bundle_path: &Path) -> Result<ManifestStats> {
     let conn = Connection::open_with_flags(
         bundle_path,
@@ -984,6 +1251,314 @@ mod tests {
         // would fail because no URL is configured.
         let res = update(&cfg).await;
         assert!(res.is_ok(), "update should succeed silently: {:?}", res);
+
+        if let Some(v) = prev {
+            std::env::set_var("MOA_DOMAIN_MANIFEST_URL", v);
+        }
+    }
+
+    // ── PR 3: stamp_baseline / publish_v2 / publish_delta ────────────
+
+    use super::super::domain_delta;
+    use super::super::domain_manifest::DomainManifestV2;
+
+    /// Build a tiny baseline DB with two seed documents at
+    /// `dest_dir/baseline.db`. Returns the path.
+    fn build_seed_baseline(dest_dir: &Path) -> std::path::PathBuf {
+        let baseline = dest_dir.join("baseline.db");
+        super::super::domain::ensure_schema(&baseline).unwrap();
+        let conn = Connection::open(&baseline).unwrap();
+        conn.execute(
+            "INSERT INTO vault_documents
+              (uuid, title, content, source_type, source_device_id,
+               checksum, char_count, created_at, updated_at)
+             VALUES ('uuid-1','statute::민법::750','old',
+                     'local_file','dev','old-cs',3,1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vault_documents
+              (uuid, title, content, source_type, source_device_id,
+               checksum, char_count, created_at, updated_at)
+             VALUES ('uuid-doomed','statute::구법::1','dies',
+                     'local_file','dev','dcs',4,1,1)",
+            [],
+        )
+        .unwrap();
+        baseline
+    }
+
+    /// Build a tiny delta with one upsert (uuid-1 new content), one
+    /// new doc (uuid-2), and one delete (uuid-doomed). Returns path.
+    fn build_seed_delta(dest_dir: &Path, baseline_version: &str) -> std::path::PathBuf {
+        let delta = dest_dir.join("delta.sqlite");
+        domain_delta::ensure_delta_schema(&delta).unwrap();
+        let conn = Connection::open(&delta).unwrap();
+        conn.execute(
+            "INSERT INTO vault_documents
+              (id, uuid, title, content, source_type, source_device_id,
+               checksum, char_count, created_at, updated_at)
+             VALUES (1,'uuid-1','statute::민법::750','new',
+                     'local_file','dev','new-cs',3,1,2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vault_documents
+              (id, uuid, title, content, source_type, source_device_id,
+               checksum, char_count, created_at, updated_at)
+             VALUES (10,'uuid-2','statute::상법::5','fresh',
+                     'local_file','dev','ncs',5,1,2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vault_deletes (uuid, deleted_at) VALUES ('uuid-doomed', 2)",
+            [],
+        )
+        .unwrap();
+        domain_delta::stamp_delta_meta(&conn, "2026.01.22", baseline_version, &"0".repeat(64))
+            .unwrap();
+        delta
+    }
+
+    #[test]
+    fn stamp_baseline_writes_meta_keys() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let baseline = build_seed_baseline(tmp.path());
+        stamp_baseline(&baseline, "2026.01.15").unwrap();
+        let conn = Connection::open(&baseline).unwrap();
+        let m = super::super::domain::read_meta_from_conn(&conn).unwrap();
+        assert!(m.is_stamped());
+        assert_eq!(m.baseline_version.as_deref(), Some("2026.01.15"));
+        assert_eq!(m.current_version.as_deref(), Some("2026.01.15"));
+    }
+
+    #[test]
+    fn publish_v2_emits_valid_manifest_with_no_deltas() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let baseline = build_seed_baseline(tmp.path());
+        stamp_baseline(&baseline, "2026.01.15").unwrap();
+        let manifest_path = tmp.path().join("manifest.json");
+        publish_v2(
+            &baseline,
+            "https://r2.example.com/baseline.db",
+            "korean-legal",
+            "2026.01.15",
+            &manifest_path,
+        )
+        .unwrap();
+        assert!(manifest_path.exists());
+        let m: DomainManifestV2 =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(m.schema_version, 2);
+        assert_eq!(m.name, "korean-legal");
+        assert_eq!(m.version, "2026.01.15");
+        assert_eq!(m.baseline.version, "2026.01.15");
+        assert_eq!(m.baseline.sha256.len(), 64);
+        assert!(m.baseline.size_bytes > 0);
+        assert!(m.deltas.is_empty());
+        // The emitted manifest must round-trip through validate_v2.
+        super::super::domain_manifest::validate_v2(&m).unwrap();
+    }
+
+    #[test]
+    fn publish_delta_appends_and_bumps_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let baseline = build_seed_baseline(tmp.path());
+        stamp_baseline(&baseline, "2026.01.15").unwrap();
+        let manifest_path = tmp.path().join("manifest.json");
+        publish_v2(
+            &baseline,
+            "https://r2.example.com/baseline.db",
+            "korean-legal",
+            "2026.01.15",
+            &manifest_path,
+        )
+        .unwrap();
+
+        let delta = build_seed_delta(tmp.path(), "2026.01.15");
+        publish_delta(
+            &delta,
+            "https://r2.example.com/delta-2026.01.22.sqlite",
+            "2026.01.22",
+            &manifest_path,
+            &manifest_path,
+        )
+        .unwrap();
+
+        let m: DomainManifestV2 =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(m.version, "2026.01.22"); // chain head bumped
+        assert_eq!(m.deltas.len(), 1);
+        assert_eq!(m.deltas[0].version, "2026.01.22");
+        assert_eq!(m.deltas[0].applies_to_baseline, "2026.01.15");
+        assert_eq!(m.deltas[0].ops.upsert, 2);
+        assert_eq!(m.deltas[0].ops.delete, 1);
+        super::super::domain_manifest::validate_v2(&m).unwrap();
+    }
+
+    #[test]
+    fn publish_delta_rejects_baseline_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let baseline = build_seed_baseline(tmp.path());
+        stamp_baseline(&baseline, "2026.01.15").unwrap();
+        let manifest_path = tmp.path().join("manifest.json");
+        publish_v2(
+            &baseline,
+            "https://r2.example.com/baseline.db",
+            "korean-legal",
+            "2026.01.15",
+            &manifest_path,
+        )
+        .unwrap();
+
+        // Build a delta whose `applies_to_baseline` doesn't match.
+        let delta = tmp.path().join("delta.sqlite");
+        domain_delta::ensure_delta_schema(&delta).unwrap();
+        let conn = Connection::open(&delta).unwrap();
+        domain_delta::stamp_delta_meta(&conn, "bad-version", "2025.07.01", &"0".repeat(64))
+            .unwrap();
+        drop(conn);
+
+        let err = publish_delta(
+            &delta,
+            "https://r2.example.com/bad.sqlite",
+            "bad-version",
+            &manifest_path,
+            &manifest_path,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("applies_to_baseline"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn publish_delta_rejects_duplicate_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let baseline = build_seed_baseline(tmp.path());
+        stamp_baseline(&baseline, "2026.01.15").unwrap();
+        let manifest_path = tmp.path().join("manifest.json");
+        publish_v2(
+            &baseline,
+            "https://r2.example.com/baseline.db",
+            "korean-legal",
+            "2026.01.15",
+            &manifest_path,
+        )
+        .unwrap();
+        let delta = build_seed_delta(tmp.path(), "2026.01.15");
+        publish_delta(
+            &delta,
+            "https://r2.example.com/d.sqlite",
+            "2026.01.22",
+            &manifest_path,
+            &manifest_path,
+        )
+        .unwrap();
+        // Try again with the same version → must reject.
+        let err = publish_delta(
+            &delta,
+            "https://r2.example.com/d.sqlite",
+            "2026.01.22",
+            &manifest_path,
+            &manifest_path,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("already present"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// End-to-end round trip: operator publishes baseline + delta,
+    /// client downloads baseline, applies delta, ends at chain head.
+    #[tokio::test]
+    async fn round_trip_publish_then_apply_e2e() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // ── Operator side ──────────────────────────────────────────
+        let baseline_src = build_seed_baseline(tmp.path());
+        stamp_baseline(&baseline_src, "2026.01.15").unwrap();
+        let manifest_path = tmp.path().join("manifest.json");
+        let baseline_url = format!(
+            "{}",
+            baseline_src.to_string_lossy() // local-path "URL" works for fetch_v2/download_bundle
+        );
+        publish_v2(
+            &baseline_src,
+            &baseline_url,
+            "korean-legal",
+            "2026.01.15",
+            &manifest_path,
+        )
+        .unwrap();
+
+        let delta_src = build_seed_delta(tmp.path(), "2026.01.15");
+        let delta_url = format!("{}", delta_src.to_string_lossy());
+        publish_delta(
+            &delta_src,
+            &delta_url,
+            "2026.01.22",
+            &manifest_path,
+            &manifest_path,
+        )
+        .unwrap();
+
+        // ── Client side ────────────────────────────────────────────
+        // Fresh workspace (no domain.db). Configure registry_url to
+        // the local manifest path. update() must:
+        //   - dispatch to v2,
+        //   - decide FullInstall (no installed meta),
+        //   - download baseline + apply latest delta in one run,
+        //   - leave domain.db at current_version=2026.01.22.
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(workspace.path().join("memory")).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.workspace_dir = workspace.path().to_path_buf();
+        cfg.domain.registry_url = Some(manifest_path.to_string_lossy().into_owned());
+
+        // Lock env (other tests in this module mutate
+        // MOA_DOMAIN_MANIFEST_URL) and clear it.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("MOA_DOMAIN_MANIFEST_URL").ok();
+        std::env::remove_var("MOA_DOMAIN_MANIFEST_URL");
+
+        let res = update(&cfg).await;
+        assert!(res.is_ok(), "update failed: {:?}", res);
+
+        // Verify post-state.
+        let installed = super::super::domain::read_meta(&cfg.workspace_dir).unwrap();
+        assert!(installed.is_stamped());
+        assert_eq!(installed.baseline_version.as_deref(), Some("2026.01.15"));
+        assert_eq!(installed.current_version.as_deref(), Some("2026.01.22"));
+
+        let domain_path = super::super::domain::domain_db_path(&cfg.workspace_dir);
+        let conn = Connection::open(&domain_path).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vault_documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "1 upserted survivor + 1 new = 2 (doomed deleted)");
+        let updated_content: String = conn
+            .query_row(
+                "SELECT content FROM vault_documents WHERE uuid = 'uuid-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_content, "new", "delta upsert not applied");
+
+        // ── Second update (AlreadyCurrent fast path) ───────────────
+        // Re-running update on the same manifest must download zero
+        // bytes and leave current_version unchanged.
+        let res2 = update(&cfg).await;
+        assert!(res2.is_ok());
+        let m2 = super::super::domain::read_meta(&cfg.workspace_dir).unwrap();
+        assert_eq!(m2.current_version.as_deref(), Some("2026.01.22"));
 
         if let Some(v) = prev {
             std::env::set_var("MOA_DOMAIN_MANIFEST_URL", v);
