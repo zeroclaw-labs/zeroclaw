@@ -37,6 +37,7 @@ import {
   type ValidationWarning,
 } from '../../lib/api';
 import { fuzzyFilter } from '../../lib/fuzzy';
+import { tConfigDescription } from '../../lib/i18n';
 
 interface FieldFormProps {
   /** Dotted prefix to fetch fields under, e.g. `providers.models.anthropic`. */
@@ -433,7 +434,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
               onCommentChange={(v) => setComments((c) => ({ ...c, [f.path]: v }))}
               error={fieldErrors[f.path]}
               onDelete={showDelete ? () => handleDelete(f.path) : undefined}
-              description={descriptionForPath(schema, f.path)}
+              description={tConfigDescription(f.path, descriptionForPath(schema, f.path))}
               elementProps={
                 f.kind === 'object-array' ? objectArrayElementProps(schema, f.path) : null
               }
@@ -988,6 +989,7 @@ function ObjectArrayEditor({ inputId, value, onChange, elementProps }: ObjectArr
               {elementProps.map((p) => (
                 <ObjectArrayField
                   key={p.key}
+                  parentPath={inputId}
                   meta={p}
                   rawValue={row[p.key]}
                   onChange={(v) => setField(rowIdx, p.key, v)}
@@ -1002,14 +1004,17 @@ function ObjectArrayEditor({ inputId, value, onChange, elementProps }: ObjectArr
 }
 
 function ObjectArrayField({
+  parentPath,
   meta,
   rawValue,
   onChange,
 }: {
+  parentPath: string;
   meta: ObjectArrayPropMeta;
   rawValue: unknown;
   onChange: (next: unknown) => void;
 }) {
+  const description = tConfigDescription(`${parentPath}.${meta.key}`, meta.description);
   const display = (() => {
     if (rawValue === null || rawValue === undefined) return '';
     if (typeof rawValue === 'string') return rawValue;
@@ -1026,9 +1031,9 @@ function ObjectArrayField({
           </span>
         )}
       </label>
-      {meta.description && (
+      {description && (
         <p className="text-[11px] mt-0.5" style={{ color: 'var(--pc-text-muted)' }}>
-          {meta.description}
+          {description}
         </p>
       )}
       {meta.kind === 'bool' ? (

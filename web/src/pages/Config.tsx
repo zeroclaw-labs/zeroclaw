@@ -23,6 +23,7 @@ import {
 import FieldForm from '../components/onboard/FieldForm';
 import ReloadDaemonButton from '../components/onboard/ReloadDaemonButton';
 import SectionPicker from '../components/onboard/SectionPicker';
+import { tWithFallback } from '../lib/i18n';
 
 // Personality pulls in CodeMirror + markdown rendering (~270KB gzipped).
 // Lazy-load so the cost isn't paid until the user opens that section.
@@ -74,6 +75,10 @@ const GROUP_ORDER = [
   'Other',
 ] as const;
 
+
+function localizedSectionHelp(section: SectionInfo): string {
+  return tWithFallback(`config.section.${section.key}.help`, section.help);
+}
 export default function Config() {
   // `/config/:section` preserves the active section in the URL so a page
   // refresh lands the user back on whichever section they were editing.
@@ -409,7 +414,7 @@ export default function Config() {
                 </button>
                 <SectionPicker
                   sectionKey={activeSection.key}
-                  help={activeSection.help}
+                  help={localizedSectionHelp(activeSection)}
                   onPick={(item) => void handlePick(item)}
                   onSkip={() => setMode({ kind: 'section-overview' })}
                 />
@@ -509,7 +514,7 @@ function SectionOverview({ section, onAdd, onEdit }: SectionOverviewProps) {
           className="text-sm"
           style={{ color: 'var(--pc-text-secondary)' }}
         >
-          {section.help}
+          {localizedSectionHelp(section)}
         </p>
         <button
           type="button"
