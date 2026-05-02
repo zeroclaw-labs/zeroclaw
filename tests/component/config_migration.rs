@@ -1391,3 +1391,183 @@ args = ["-y", "@modelcontextprotocol/server-github"]
         vec!["filesystem".to_string(), "github".to_string()]
     );
 }
+
+#[test]
+fn matrix_password_auth_without_access_token() {
+    let config = migrate(
+        r#"
+[channels_config.matrix]
+homeserver = "https://matrix.org"
+user_id = "@bot:matrix.org"
+password = "s3cr3t"
+allowed_users = ["@user:matrix.org"]
+"#,
+    );
+
+    let matrix = config.channels.matrix.get("default").unwrap();
+    assert!(matrix.access_token.is_none());
+    assert_eq!(matrix.password.as_deref(), Some("s3cr3t"));
+    assert_eq!(matrix.user_id.as_deref(), Some("@bot:matrix.org"));
+}
+
+#[test]
+fn minimal_single_agent_install_round_trips() {
+    let config = migrate(
+        r#"
+schema_version = 2
+
+[providers.models.anthropic]
+api_key = "sk-ant"
+model = "claude-opus"
+
+[providers]
+fallback = "anthropic"
+
+[autonomy]
+level = "supervised"
+workspace_only = true
+
+[agent]
+max_tool_iterations = 10
+parallel_tools = true
+"#,
+    );
+
+    assert_eq!(config.schema_version, 3);
+    let rp = config.risk_profiles.get("default").unwrap();
+    assert_eq!(
+        rp.level,
+        zeroclaw_config::autonomy::AutonomyLevel::Supervised
+    );
+    assert!(rp.workspace_only);
+    let rt = config.runtime_profiles.get("default").unwrap();
+    assert_eq!(rt.max_tool_iterations, 10);
+    assert_eq!(rt.parallel_tools, Some(true));
+}
+
+#[test]
+fn multi_agent_install_with_overrides() {
+    let config = migrate(
+        r#"
+schema_version = 2
+
+[providers.models.anthropic]
+api_key = "sk-ant"
+model = "claude-opus"
+
+[providers]
+fallback = "anthropic"
+
+[agent]
+max_tool_iterations = 10
+
+[agents.researcher]
+provider = "anthropic"
+model = "claude-opus"
+max_depth = 2
+timeout_secs = 90
+
+[agents.coder]
+provider = "anthropic"
+model = "claude-sonnet"
+agentic = true
+max_iterations = 50
+"#,
+    );
+
+    assert!(config.risk_profiles.contains_key("researcher"));
+    let risk = config.risk_profiles.get("researcher").unwrap();
+    assert_eq!(risk.max_delegation_depth, 2);
+    assert_eq!(risk.delegation_timeout_secs, Some(90));
+
+    assert!(config.runtime_profiles.contains_key("coder"));
+    let rt = config.runtime_profiles.get("coder").unwrap();
+    assert!(rt.agentic);
+    assert_eq!(rt.max_tool_iterations, 50);
+}
+
+#[test]
+fn multi_channel_binding_inversion() {
+    let config = migrate(
+        r#"
+schema_version = 2
+
+[providers.models.anthropic]
+api_key = "sk-ant"
+model = "claude-opus"
+
+[providers]
+fallback = "anthropic"
+
+[agents.support]
+provider = "anthropic"
+model = "claude-opus"
+
+[channels_config.telegram]
+bot_token = "123:abc"
+agent = "support"
+allowed_users = ["user1"]
+"#,
+    );
+
+    let tg = config.channels.telegram.get("default").unwrap();
+    assert_eq!(tg.bot_token, "123:abc");
+
+    let agent = config.agents.get("support").unwrap();
+    assert!(agent.channels.contains(&"telegram.default".to_string()));
+}
+
+#[test]
+fn non_cli_excluded_tools_channel_filter_resolution() {
+    let config = migrate(
+        r#"
+[channels_config.telegram]
+bot_token = "123:abc"
+allowed_users = ["user1"]
+
+[autonomy]
+non_cli_excluded_tools = ["shell_tool", "file_write"]
+"#,
+    );
+
+    let tg = config.channels.telegram.get("default").unwrap();
+    assert!(tg.excluded_tools.contains(&"shell_tool".to_string()));
+    assert!(tg.excluded_tools.contains(&"file_write".to_string()));
+}
+
+#[test]
+fn per_agent_skills_directory_and_memory_namespace_bundle_synthesis() {
+    let config = migrate(
+        r#"
+[providers.models.anthropic]
+api_key = "sk-ant"
+model = "claude-opus"
+
+[providers]
+fallback = "anthropic"
+
+[agents.writer]
+provider = "anthropic"
+model = "claude-opus"
+skills_directory = "agents/writer/skills"
+memory_namespace = "writer"
+"#,
+    );
+
+    assert!(config.skill_bundles.contains_key("writer"));
+    let bundle = config.skill_bundles.get("writer").unwrap();
+    assert_eq!(bundle.directory.as_deref(), Some("agents/writer/skills"));
+}
+
+#[test]
+fn swarms_v2_dropped() {
+    let config = migrate(
+        r#"
+[swarms.my_swarm]
+strategy = "round_robin"
+members = ["agent_a", "agent_b"]
+"#,
+    );
+
+    assert!(config.swarms.is_empty());
+}
