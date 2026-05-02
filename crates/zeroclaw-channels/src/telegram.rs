@@ -951,6 +951,43 @@ impl TelegramChannel {
             .unwrap_or(false)
     }
 
+    /// Apply the `mention_only` gate to a non-text update (photo / document /
+    /// voice) using its caption as the channel for the mention.
+    ///
+    /// Returns:
+    /// - `Some(None)` — gate does not apply (DM, or `mention_only = false`,
+    ///   or the message is not in a group). The caller should use the raw
+    ///   caption / transcript as-is.
+    /// - `Some(Some(normalized))` — caption mentions the bot; the mention
+    ///   has been stripped and the resulting text is suitable for use as
+    ///   message content.
+    /// - `None` — gated and rejected; the caller must drop the update
+    ///   without performing any expensive work (no download, no
+    ///   transcription).
+    ///
+    /// Voice notes typically arrive without a caption, so under
+    /// `mention_only = true` they are rejected here before transcription
+    /// runs. If a future change wants to honor a verbal mention inside the
+    /// transcript, this gate would need to be split into a pre-download and
+    /// a post-transcription stage. See #6229.
+    fn check_media_mention_gate(
+        &self,
+        message: &serde_json::Value,
+        caption: Option<&str>,
+    ) -> Option<Option<String>> {
+        let is_group = Self::is_group_message(message);
+        if !self.mention_only || !is_group {
+            return Some(caption.map(String::from));
+        }
+        let bot_username_guard = self.bot_username.lock();
+        let bot_username = bot_username_guard.as_ref()?;
+        let caption = caption?;
+        if !Self::contains_bot_mention(caption, bot_username) {
+            return None;
+        }
+        Some(Self::normalize_incoming_content(caption, bot_username))
+    }
+
     fn is_user_allowed(&self, username: &str) -> bool {
         let identity = Self::normalize_identity(username);
         self.allowed_users
@@ -1251,6 +1288,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
+        // Apply mention_only gate before downloading. Photo / document
+        // updates carry no `text` field, so the text-only gate in
+        // `parse_update_message` can never see them and they used to slip
+        // through unconditionally. See #6229.
+        let gated_caption =
+            self.check_media_mention_gate(message, attachment.caption.as_deref())?;
+
         let chat_id = message
             .get("chat")
             .and_then(|chat| chat.get("id"))
@@ -1323,7 +1367,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // pipeline validates vision capability. Non-image files always get
         // [Document:] format regardless of Telegram's classification.
         let mut content = format_attachment_content(attachment.kind, &local_filename, &local_path);
-        if let Some(caption) = &attachment.caption
+        // `gated_caption` is the caption with any bot mention stripped when
+        // `mention_only` applied; otherwise the raw caption (or None).
+        if let Some(caption) = gated_caption.as_deref()
             && !caption.is_empty()
         {
             use std::fmt::Write;
@@ -1383,6 +1429,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         if !self.is_any_user_allowed(identities.iter().copied()) {
+            return None;
+        }
+
+        // Apply mention_only gate before downloading + transcribing. Voice
+        // notes typically have no caption, so under `mention_only = true`
+        // they are rejected here — the bot has no reliable way to know it
+        // was mentioned without first transcribing, and we don't want to
+        // pay that cost for messages that will likely be dropped. See #6229.
+        let voice_caption = message.get("caption").and_then(serde_json::Value::as_str);
+        if self
+            .check_media_mention_gate(message, voice_caption)
+            .is_none()
+        {
             return None;
         }
 
@@ -4435,6 +4494,124 @@ mod tests {
 
         let ch_disabled = TelegramChannel::new("token".into(), vec!["*".into()], false);
         assert!(!ch_disabled.mention_only);
+    }
+
+    fn group_message_with_caption(caption: Option<&str>) -> serde_json::Value {
+        let mut msg = serde_json::json!({
+            "message_id": 1,
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": -1, "type": "group" }
+        });
+        if let Some(c) = caption {
+            msg["caption"] = serde_json::Value::String(c.to_string());
+        }
+        msg
+    }
+
+    /// Regression test for #6229 — when `mention_only = true` and a group
+    /// photo/document arrives without any caption mentioning the bot, the
+    /// gate must reject it. Before the fix, photo/document updates skipped
+    /// the gate entirely (the gate only inspected `message.text`) and the
+    /// bot replied to every photo posted in a group.
+    #[test]
+    fn check_media_mention_gate_rejects_group_media_without_mention() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let no_caption = group_message_with_caption(None);
+        assert!(
+            ch.check_media_mention_gate(&no_caption, None).is_none(),
+            "no caption + mention_only group ⇒ reject"
+        );
+        let unrelated_caption = group_message_with_caption(Some("nice photo"));
+        assert!(
+            ch.check_media_mention_gate(&unrelated_caption, Some("nice photo"))
+                .is_none(),
+            "caption without bot mention + mention_only group ⇒ reject"
+        );
+        let other_bot_caption = group_message_with_caption(Some("hey @otherbot look"));
+        assert!(
+            ch.check_media_mention_gate(&other_bot_caption, Some("hey @otherbot look"))
+                .is_none(),
+            "caption mentioning a different bot ⇒ reject"
+        );
+    }
+
+    /// When the caption mentions the bot, the gate passes and returns the
+    /// caption with the mention stripped — matching the text-message
+    /// behavior of `normalize_incoming_content`.
+    #[test]
+    fn check_media_mention_gate_accepts_and_strips_caption_mention() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let msg = group_message_with_caption(Some("@mybot describe this"));
+        let result = ch.check_media_mention_gate(&msg, Some("@mybot describe this"));
+        assert_eq!(
+            result,
+            Some(Some("describe this".to_string())),
+            "mention should be stripped, remaining caption preserved"
+        );
+    }
+
+    /// `mention_only = true` only applies to groups. DMs always pass with
+    /// the caption preserved verbatim.
+    #[test]
+    fn check_media_mention_gate_passes_dm_unchanged() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        let dm = serde_json::json!({
+            "message_id": 1,
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": 1, "type": "private" },
+            "caption": "hello"
+        });
+        assert_eq!(
+            ch.check_media_mention_gate(&dm, Some("hello")),
+            Some(Some("hello".to_string())),
+            "DM media must always pass with caption verbatim"
+        );
+        let dm_no_caption = serde_json::json!({
+            "message_id": 1,
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": 1, "type": "private" }
+        });
+        assert_eq!(
+            ch.check_media_mention_gate(&dm_no_caption, None),
+            Some(None),
+            "DM media with no caption must pass"
+        );
+    }
+
+    /// When `mention_only = false` the gate is a no-op even in groups.
+    #[test]
+    fn check_media_mention_gate_passes_when_mention_only_disabled() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let group_no_caption = group_message_with_caption(None);
+        assert_eq!(
+            ch.check_media_mention_gate(&group_no_caption, None),
+            Some(None),
+            "mention_only off ⇒ all media pass"
+        );
+    }
+
+    /// Edge case: `mention_only = true` and the bot username has not yet
+    /// been resolved (e.g., `/getMe` hasn't completed). The gate must
+    /// reject in groups rather than fail-open, matching the existing text
+    /// path's behavior at telegram.rs:1640.
+    #[test]
+    fn check_media_mention_gate_rejects_group_when_bot_username_unknown() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        // Do NOT set bot_username — leave it None.
+        let group = group_message_with_caption(Some("@somebody hi"));
+        assert!(
+            ch.check_media_mention_gate(&group, Some("@somebody hi"))
+                .is_none(),
+            "missing bot_username in group must fail closed"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
