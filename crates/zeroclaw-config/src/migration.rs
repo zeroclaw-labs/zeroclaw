@@ -131,11 +131,6 @@ impl V1Compat {
     }
 
     fn migrate_providers(&mut self) {
-        let fallback = self
-            .default_provider
-            .take()
-            .unwrap_or_else(|| "default".into());
-
         // First, move old model_providers entries into providers.models.
         // V1 top-level entries use bare type keys ("anthropic"); insert under "default" alias.
         for (key, profile) in std::mem::take(&mut self.model_providers) {
@@ -148,7 +143,33 @@ impl V1Compat {
                 .or_insert(profile);
         }
 
-        // Then fill gaps in the fallback entry from top-level fields.
+        // Only create a fallback scaffolding entry if there are V1 top-level fields
+        // to migrate into it. If none exist, there is nothing to write and creating
+        // an empty entry would produce an invalid config.
+        let has_v1_fields = self.api_key.is_some()
+            || self.api_url.is_some()
+            || self.api_path.is_some()
+            || self.default_model.is_some()
+            || self.default_temperature.is_some()
+            || self.provider_timeout_secs.is_some()
+            || self.provider_max_tokens.is_some()
+            || self.extra_headers.as_ref().is_some_and(|h| !h.is_empty());
+
+        if !has_v1_fields {
+            if let Some(provider) = self.default_provider.take() {
+                if self.config.providers.fallback.is_none() {
+                    self.config.providers.fallback = Some(provider);
+                }
+            }
+            return;
+        }
+
+        let fallback = self.default_provider.take();
+        let Some(fallback) = fallback.or_else(|| self.config.providers.fallback.clone()) else {
+            return;
+        };
+
+        // Fill gaps in the fallback entry from top-level V1 fields.
         // fallback is a bare type name (e.g. "anthropic"); map to "default" alias in nested map.
         let entry = self
             .config
@@ -187,8 +208,7 @@ impl V1Compat {
         }
 
         if self.config.providers.fallback.is_none() {
-            // V3: fallback reference uses dotted "type.alias" format.
-            self.config.providers.fallback = Some(format!("{fallback}.default"));
+            self.config.providers.fallback = Some(fallback);
         }
 
         // Move routing rules into providers.
@@ -957,28 +977,58 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Migrate legacy top-level [memory] pgvector fields to [memory.postgres].
+    // V3: Migrate legacy top-level [memory] pgvector fields to [memory.postgres]
+    // and db_url to [storage.provider.config].
     // PR #4714 removed the Postgres backend, stripping pgvector_enabled,
     // pgvector_dimensions, and db_url from [memory]. PR #6015 re-introduced
     // them under [memory.postgres]. Configs that still carry the old top-level
     // keys are moved here so nothing is silently dropped.
-    if let Some(toml::Value::Table(memory)) = table.get_mut("memory") {
-        let pg_enabled = memory.remove("pgvector_enabled");
-        let pg_dims = memory.remove("pgvector_dimensions");
-        // db_url moved to [storage]; we only drop it here to avoid an
-        // unknown-key warning — operators should set it under [storage].
-        let _ = memory.remove("db_url");
+    //
+    // Extract all three fields in one pass to release the borrow on `table`
+    // before writing to [storage.provider.config].
+    let (legacy_pg_enabled, legacy_pg_dims, legacy_db_url) =
+        if let Some(toml::Value::Table(memory)) = table.get_mut("memory") {
+            (
+                memory.remove("pgvector_enabled"),
+                memory.remove("pgvector_dimensions"),
+                memory.remove("db_url"),
+            )
+        } else {
+            (None, None, None)
+        };
 
-        if pg_enabled.is_some() || pg_dims.is_some() {
-            let postgres = memory
-                .entry("postgres")
+    if (legacy_pg_enabled.is_some() || legacy_pg_dims.is_some())
+        && let Some(toml::Value::Table(memory)) = table.get_mut("memory")
+    {
+        let postgres = memory
+            .entry("postgres")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(pg) = postgres {
+            if let Some(v) = legacy_pg_enabled {
+                pg.entry("vector_enabled").or_insert(v);
+            }
+            if let Some(v) = legacy_pg_dims {
+                pg.entry("vector_dimensions").or_insert(v);
+            }
+        }
+    }
+
+    // Move db_url to [storage.provider.config].db_url; or_insert ensures we
+    // never overwrite a value the operator already set there.
+    if let Some(url) = legacy_db_url {
+        let storage = table
+            .entry("storage")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(s) = storage {
+            let provider = s
+                .entry("provider")
                 .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-            if let toml::Value::Table(pg) = postgres {
-                if let Some(v) = pg_enabled {
-                    pg.entry("vector_enabled").or_insert(v);
-                }
-                if let Some(v) = pg_dims {
-                    pg.entry("vector_dimensions").or_insert(v);
+            if let toml::Value::Table(p) = provider {
+                let cfg = p
+                    .entry("config")
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                if let toml::Value::Table(c) = cfg {
+                    c.entry("db_url").or_insert(url);
                 }
             }
         }

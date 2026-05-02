@@ -1417,10 +1417,21 @@ pub async fn run(
     if let Some(p) = provider_override {
         effective_config.providers.fallback = Some(p);
     }
-    if let Some(m) = model_override {
-        effective_config.ensure_fallback_provider().model = Some(m);
+    if let Some(fallback) = effective_config.providers.fallback.clone() {
+        if let Some((type_key, alias_key)) = fallback.split_once('.') {
+            if let Some(entry) = effective_config
+                .providers
+                .models
+                .get_mut(type_key)
+                .and_then(|m| m.get_mut(alias_key))
+            {
+                if let Some(m) = model_override {
+                    entry.model = Some(m);
+                }
+                entry.temperature = Some(temperature);
+            }
+        }
     }
-    effective_config.ensure_fallback_provider().temperature = Some(temperature);
 
     let mut agent = Agent::from_config(&effective_config).await?;
 

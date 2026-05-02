@@ -30,6 +30,13 @@ pub struct ProvidersConfig {
 }
 
 impl ProvidersConfig {
+    /// The provider type portion of `fallback` — the part before the first `.`.
+    /// `"anthropic.default"` → `"anthropic"`, `"anthropic"` → `"anthropic"`.
+    pub fn fallback_type(&self) -> Option<&str> {
+        let name = self.fallback.as_deref()?;
+        Some(name.split_once('.').map_or(name, |(t, _)| t))
+    }
+
     pub fn fallback_provider(&self) -> Option<&ModelProviderConfig> {
         let name = self.fallback.as_deref()?;
         if let Some((type_key, alias_key)) = name.split_once('.') {

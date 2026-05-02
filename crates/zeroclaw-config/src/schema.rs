@@ -1,6 +1,5 @@
 use crate::autonomy::AutonomyLevel;
 use crate::domain_matcher::DomainMatcher;
-use crate::provider_aliases::{is_glm_alias, is_zai_alias};
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -11144,100 +11143,8 @@ impl Config {
     }
 
     /// Ensure the fallback provider entry exists, creating it if necessary.
-    pub fn ensure_fallback_provider(&mut self) -> &mut ModelProviderConfig {
-        let fallback = self
-            .providers
-            .fallback
-            .clone()
-            .unwrap_or_else(|| "default.default".into());
-        if self.providers.fallback.is_none() {
-            self.providers.fallback = Some(fallback.clone());
-        }
-        let (type_key, alias_key) = fallback
-            .split_once('.')
-            .map(|(t, a)| (t.to_string(), a.to_string()))
-            .unwrap_or_else(|| (fallback.clone(), "default".to_string()));
-        self.providers
-            .models
-            .entry(type_key)
-            .or_default()
-            .entry(alias_key)
-            .or_default()
-    }
-
     /// Apply environment variable overrides to config
     pub fn apply_env_overrides(&mut self) {
-        // API Key: ZEROCLAW_API_KEY or API_KEY (generic)
-        if let Ok(key) = std::env::var("ZEROCLAW_API_KEY").or_else(|_| std::env::var("API_KEY"))
-            && !key.is_empty()
-        {
-            self.ensure_fallback_provider().api_key = Some(key);
-        }
-        // API Key: GLM_API_KEY overrides when provider is a GLM/Zhipu variant.
-        if self.providers.fallback.as_deref().is_some_and(is_glm_alias)
-            && let Ok(key) = std::env::var("GLM_API_KEY")
-            && !key.is_empty()
-        {
-            self.ensure_fallback_provider().api_key = Some(key);
-        }
-
-        // API Key: ZAI_API_KEY overrides when provider is a Z.AI variant.
-        if self.providers.fallback.as_deref().is_some_and(is_zai_alias)
-            && let Ok(key) = std::env::var("ZAI_API_KEY")
-            && !key.is_empty()
-        {
-            self.ensure_fallback_provider().api_key = Some(key);
-        }
-
-        // Provider override precedence:
-        // 1) ZEROCLAW_PROVIDER always wins when set.
-        // 2) ZEROCLAW_MODEL_PROVIDER/MODEL_PROVIDER (Codex app-server style).
-        // 3) Legacy PROVIDER is honored only when config still uses default provider.
-        if let Ok(provider) = std::env::var("ZEROCLAW_PROVIDER")
-            && !provider.is_empty()
-        {
-            self.providers.fallback = Some(provider);
-        } else if let Ok(provider) =
-            std::env::var("ZEROCLAW_MODEL_PROVIDER").or_else(|_| std::env::var("MODEL_PROVIDER"))
-            && !provider.is_empty()
-        {
-            self.providers.fallback = Some(provider);
-        } else if let Ok(provider) = std::env::var("PROVIDER") {
-            let should_apply_legacy_provider = self
-                .providers
-                .fallback
-                .as_deref()
-                .is_none_or(|configured| configured.trim().eq_ignore_ascii_case("openrouter"));
-            if should_apply_legacy_provider && !provider.is_empty() {
-                self.providers.fallback = Some(provider);
-            }
-        }
-
-        // Model: ZEROCLAW_MODEL or MODEL
-        if let Ok(model) = std::env::var("ZEROCLAW_MODEL").or_else(|_| std::env::var("MODEL"))
-            && !model.is_empty()
-        {
-            self.ensure_fallback_provider().model = Some(model);
-        }
-
-        // Provider HTTP timeout: ZEROCLAW_PROVIDER_TIMEOUT_SECS
-        if let Ok(timeout_secs) = std::env::var("ZEROCLAW_PROVIDER_TIMEOUT_SECS")
-            && let Ok(timeout_secs) = timeout_secs.parse::<u64>()
-            && timeout_secs > 0
-        {
-            self.ensure_fallback_provider().timeout_secs = Some(timeout_secs);
-        }
-
-        // Extra provider headers: ZEROCLAW_EXTRA_HEADERS
-        // Format: "Key:Value,Key2:Value2"
-        // Env var headers override config file headers with the same name.
-        if let Ok(raw) = std::env::var("ZEROCLAW_EXTRA_HEADERS") {
-            let entry = self.ensure_fallback_provider();
-            for header in parse_extra_headers_env(&raw) {
-                entry.extra_headers.insert(header.0, header.1);
-            }
-        }
-
         // Apply named provider profile remapping (Codex app-server compatibility).
         self.apply_named_model_provider_profile();
 
@@ -11327,28 +11234,6 @@ impl Config {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
                 self.gateway.web_dist_dir = Some(trimmed.to_string());
-            }
-        }
-
-        // Temperature: ZEROCLAW_TEMPERATURE
-        if let Ok(temp_str) = std::env::var("ZEROCLAW_TEMPERATURE") {
-            match temp_str.parse::<f64>() {
-                Ok(temp) if TEMPERATURE_RANGE.contains(&temp) => {
-                    self.ensure_fallback_provider().temperature = Some(temp);
-                }
-                Ok(temp) => {
-                    tracing::warn!(
-                        "Ignoring ZEROCLAW_TEMPERATURE={temp}: \
-                         value out of range (expected {}..={})",
-                        TEMPERATURE_RANGE.start(),
-                        TEMPERATURE_RANGE.end()
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "Ignoring ZEROCLAW_TEMPERATURE={temp_str:?}: not a valid number"
-                    );
-                }
             }
         }
 
@@ -13085,11 +12970,11 @@ default_temperature = 0.7
             config_path: dir.join("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = Some("default.default".into());
+        config.providers.fallback = Some("anthropic.default".into());
         config
             .providers
             .models
-            .entry("default".into())
+            .entry("anthropic".into())
             .or_default()
             .insert(
                 "default".to_string(),
@@ -15005,11 +14890,11 @@ model = "primary-model"
             config_path: PathBuf::from("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = Some("default.default".into());
+        config.providers.fallback = Some("anthropic.default".into());
         config
             .providers
             .models
-            .entry("default".into())
+            .entry("anthropic".into())
             .or_default()
             .insert(
                 "default".to_string(),
@@ -17840,11 +17725,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 entry.api_key = Some("test-key".into());
             }
         } else {
-            config.providers.fallback = Some("default.default".into());
+            config.providers.fallback = Some("anthropic.default".into());
             config
                 .providers
                 .models
-                .entry("default".into())
+                .entry("anthropic".into())
                 .or_default()
                 .insert(
                     "default".to_string(),

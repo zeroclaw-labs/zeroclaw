@@ -165,7 +165,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "200+ models, 1 API key",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("openrouter")
+                if c.providers.fallback_type() == Some("openrouter")
                     && c.providers
                         .fallback_provider()
                         .and_then(|e| e.api_key.as_ref())
@@ -182,7 +182,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Claude 3.5/4 Sonnet & Opus",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("anthropic") {
+                if c.providers.fallback_type() == Some("anthropic") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -194,7 +194,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "GPT-4o, GPT-5, o1",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("openai") {
+                if c.providers.fallback_type() == Some("openai") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -270,7 +270,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Local models (Llama, etc.)",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("ollama") {
+                if c.providers.fallback_type() == Some("ollama") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -282,7 +282,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Search-augmented AI",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("perplexity") {
+                if c.providers.fallback_type() == Some("perplexity") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -321,7 +321,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Privacy-first inference (Llama, Opus)",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("venice") {
+                if c.providers.fallback_type() == Some("venice") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -333,7 +333,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Vercel AI Gateway",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("vercel") {
+                if c.providers.fallback_type() == Some("vercel") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -345,7 +345,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Cloudflare AI Gateway",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("cloudflare") {
+                if c.providers.fallback_type() == Some("cloudflare") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -373,7 +373,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Synthetic AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("synthetic") {
+                if c.providers.fallback_type() == Some("synthetic") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -385,7 +385,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Code-focused AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("opencode") {
+                if c.providers.fallback_type() == Some("opencode") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -397,7 +397,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Subsidized Code-focused AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("opencode-go") {
+                if c.providers.fallback_type() == Some("opencode-go") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -461,7 +461,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "AWS managed model access",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("bedrock") {
+                if c.providers.fallback_type() == Some("bedrock") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -489,7 +489,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Ultra-fast LPU inference",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("groq") {
+                if c.providers.fallback_type() == Some("groq") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -501,7 +501,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Open-source model hosting",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("together") {
+                if c.providers.fallback_type() == Some("together") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -513,7 +513,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Fast open-source inference",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("fireworks") {
+                if c.providers.fallback_type() == Some("fireworks") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -525,7 +525,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Affordable open-source inference",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("novita") {
+                if c.providers.fallback_type() == Some("novita") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -537,7 +537,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Command R+ & embeddings",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("cohere") {
+                if c.providers.fallback_type() == Some("cohere") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available

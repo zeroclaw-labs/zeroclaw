@@ -907,19 +907,122 @@ pgvector_dimensions = 768
 }
 
 #[test]
-fn memory_legacy_db_url_dropped_without_panic() {
-    // db_url moved to [storage]; we drop it silently to avoid unknown-key
-    // warnings during migration.
+fn memory_legacy_db_url_moved_to_storage_provider_config() {
     let config = migrate(
         r#"
 [memory]
-backend = "sqlite"
+backend = "postgres"
 auto_save = false
 db_url = "postgres://user:pass@localhost/db"
 "#,
     );
 
-    assert_eq!(config.memory.backend, "sqlite");
+    assert_eq!(config.memory.backend, "postgres");
+    assert_eq!(
+        config.storage.provider.config.db_url.as_deref(),
+        Some("postgres://user:pass@localhost/db"),
+        "db_url must be migrated to [storage.provider.config], not silently dropped"
+    );
+}
+
+#[test]
+fn memory_legacy_db_url_does_not_overwrite_existing_storage_db_url() {
+    let config = migrate(
+        r#"
+[memory]
+backend = "postgres"
+db_url = "postgres://old@host/old"
+
+[storage.provider.config]
+db_url = "postgres://new@host/new"
+"#,
+    );
+
+    assert_eq!(
+        config.storage.provider.config.db_url.as_deref(),
+        Some("postgres://new@host/new"),
+        "existing [storage.provider.config].db_url must not be overwritten"
+    );
+}
+
+#[test]
+fn memory_postgres_pgvector_and_db_url_both_migrated() {
+    let config = migrate(
+        r#"
+[memory]
+backend = "postgres"
+pgvector_enabled = true
+pgvector_dimensions = 1536
+db_url = "postgres://user:pass@host/db"
+"#,
+    );
+
+    assert!(config.memory.postgres.vector_enabled);
+    assert_eq!(config.memory.postgres.vector_dimensions, 1536);
+    assert_eq!(
+        config.storage.provider.config.db_url.as_deref(),
+        Some("postgres://user:pass@host/db")
+    );
+}
+
+#[test]
+fn memory_markdown_backend_round_trips() {
+    let config = migrate(
+        r#"
+[memory]
+backend = "markdown"
+auto_save = true
+"#,
+    );
+
+    assert_eq!(config.memory.backend, "markdown");
+    assert!(config.memory.auto_save);
+}
+
+#[test]
+fn memory_none_backend_round_trips() {
+    let config = migrate(
+        r#"
+[memory]
+backend = "none"
+"#,
+    );
+
+    assert_eq!(config.memory.backend, "none");
+}
+
+#[test]
+fn memory_qdrant_backend_round_trips() {
+    let config = migrate(
+        r#"
+[memory]
+backend = "qdrant"
+
+[memory.qdrant]
+url = "http://localhost:6334"
+collection = "memories"
+"#,
+    );
+
+    assert_eq!(config.memory.backend, "qdrant");
+    assert_eq!(
+        config.memory.qdrant.url.as_deref(),
+        Some("http://localhost:6334")
+    );
+    assert_eq!(config.memory.qdrant.collection, "memories");
+}
+
+#[test]
+fn memory_lucid_backend_round_trips() {
+    let config = migrate(
+        r#"
+[memory]
+backend = "lucid"
+auto_save = false
+"#,
+    );
+
+    assert_eq!(config.memory.backend, "lucid");
 }
 
 #[test]
@@ -1771,4 +1874,124 @@ members = ["agent_a", "agent_b"]
     );
 
     assert!(config.swarms.is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Storage migration
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn storage_provider_config_round_trips() {
+    let config = migrate(
+        r#"
+[storage.provider.config]
+db_url = "postgres://user:pass@host/db"
+schema = "myschema"
+table = "entries"
+connect_timeout_secs = 10
+"#,
+    );
+
+    assert_eq!(
+        config.storage.provider.config.db_url.as_deref(),
+        Some("postgres://user:pass@host/db")
+    );
+    assert_eq!(config.storage.provider.config.schema, "myschema");
+    assert_eq!(config.storage.provider.config.table, "entries");
+    assert_eq!(config.storage.provider.config.connect_timeout_secs, Some(10));
+}
+
+#[test]
+fn storage_defaults_when_absent() {
+    let config = migrate(r#"schema_version = 2"#);
+
+    assert_eq!(config.storage.provider.config.schema, "public");
+    assert_eq!(config.storage.provider.config.table, "memories");
+    assert!(config.storage.provider.config.db_url.is_none());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tunnel migration
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn tunnel_defaults_to_none_when_absent() {
+    let config = migrate(r#"schema_version = 2"#);
+
+    assert_eq!(config.tunnel.provider, "none");
+    assert!(config.tunnel.cloudflare.is_none());
+    assert!(config.tunnel.ngrok.is_none());
+    assert!(config.tunnel.tailscale.is_none());
+}
+
+#[test]
+fn tunnel_cloudflare_config_round_trips() {
+    let config = migrate(
+        r#"
+[tunnel]
+provider = "cloudflare"
+
+[tunnel.cloudflare]
+token = "cf-tunnel-token"
+"#,
+    );
+
+    assert_eq!(config.tunnel.provider, "cloudflare");
+    let cf = config.tunnel.cloudflare.as_ref().unwrap();
+    assert_eq!(cf.token, "cf-tunnel-token");
+}
+
+#[test]
+fn tunnel_ngrok_config_round_trips() {
+    let config = migrate(
+        r#"
+[tunnel]
+provider = "ngrok"
+
+[tunnel.ngrok]
+auth_token = "ngrok-token"
+domain = "my.ngrok.io"
+"#,
+    );
+
+    assert_eq!(config.tunnel.provider, "ngrok");
+    let ng = config.tunnel.ngrok.as_ref().unwrap();
+    assert_eq!(ng.auth_token, "ngrok-token");
+    assert_eq!(ng.domain.as_deref(), Some("my.ngrok.io"));
+}
+
+#[test]
+fn tunnel_tailscale_config_round_trips() {
+    let config = migrate(
+        r#"
+[tunnel]
+provider = "tailscale"
+
+[tunnel.tailscale]
+funnel = true
+hostname = "my-host"
+"#,
+    );
+
+    assert_eq!(config.tunnel.provider, "tailscale");
+    let ts = config.tunnel.tailscale.as_ref().unwrap();
+    assert!(ts.funnel);
+    assert_eq!(ts.hostname.as_deref(), Some("my-host"));
+}
+
+#[test]
+fn tunnel_pinggy_config_round_trips() {
+    let config = migrate(
+        r#"
+[tunnel]
+provider = "pinggy"
+
+[tunnel.pinggy]
+token = "pinggy-token"
+"#,
+    );
+
+    assert_eq!(config.tunnel.provider, "pinggy");
+    let pg = config.tunnel.pinggy.as_ref().unwrap();
+    assert_eq!(pg.token, "pinggy-token");
 }
