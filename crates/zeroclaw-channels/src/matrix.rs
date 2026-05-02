@@ -3256,6 +3256,22 @@ mod tests {
                 PartialFinalizeAction::EditDraft
             );
         }
+
+        #[test]
+        fn text_only_partial_finalize_keeps_editing_draft() {
+            assert_eq!(
+                decide_partial_finalize_action(false, false),
+                PartialFinalizeAction::EditDraft
+            );
+        }
+
+        #[test]
+        fn empty_partial_finalize_without_upload_reports_empty_error() {
+            assert_eq!(
+                decide_partial_finalize_action(true, false),
+                PartialFinalizeAction::EmptyError
+            );
+        }
     }
 
     mod session {
