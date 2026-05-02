@@ -13079,6 +13079,7 @@ dependencies = [
  "tokio",
  "toml 0.8.2",
  "tower-http",
+ "zeroclaw-gateway",
 ]
 
 [[package]]
@@ -13372,6 +13373,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "rustls-pemfile",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -13381,6 +13383,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "toml 1.1.2+spec-1.1.0",
+ "toml_edit 0.25.11+spec-1.1.0",
  "tower",
  "tower-http",
  "tracing",

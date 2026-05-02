@@ -12,6 +12,7 @@ pub mod loop_;
 pub mod loop_detector;
 pub mod memory_loader;
 pub mod personality;
+pub mod personality_templates;
 pub mod prompt;
 pub mod system_prompt;
 pub mod thinking;
