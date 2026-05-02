@@ -6,7 +6,7 @@ use std::fs;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::{ClassificationRule, Config, DelegateAgentConfig, ModelRouteConfig};
+use zeroclaw_config::schema::{ClassificationRule, Config, ModelRouteConfig};
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
@@ -260,21 +260,19 @@ impl ModelRoutingConfigTool {
 
         let mut agents: BTreeMap<String, Value> = BTreeMap::new();
         for (name, agent) in &cfg.agents {
+            let risk = cfg.risk_profiles.get(&agent.risk_profile);
+            let runtime = cfg.runtime_profiles.get(&agent.runtime_profile);
             agents.insert(
                 name.clone(),
                 json!({
-                    "provider": agent.provider,
-                    "model": agent.model,
+                    "model_provider": agent.model_provider,
+                    "risk_profile": agent.risk_profile,
+                    "runtime_profile": agent.runtime_profile,
                     "system_prompt": agent.system_prompt,
-                    "api_key_configured": agent
-                        .api_key
-                        .as_ref()
-                        .is_some_and(|value| !value.trim().is_empty()),
-                    "temperature": agent.temperature,
-                    "max_depth": agent.max_depth,
-                    "agentic": agent.agentic,
-                    "allowed_tools": agent.allowed_tools,
-                    "max_iterations": agent.max_iterations,
+                    "max_delegation_depth": risk.map(|r| r.max_delegation_depth),
+                    "agentic": runtime.map(|r| r.agentic),
+                    "allowed_tools": runtime.map(|r| &r.allowed_tools),
+                    "max_tool_iterations": runtime.map(|r| r.max_tool_iterations),
                 }),
             );
         }
@@ -753,90 +751,80 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        let mut next_agent = cfg
-            .agents
-            .get(&name)
-            .cloned()
-            .unwrap_or(DelegateAgentConfig {
-                provider: provider.clone(),
-                model: model.clone(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: DEFAULT_AGENT_MAX_DEPTH,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
-            });
+        // V3: synthesize providers.models[provider][name] from inline brain params.
+        let model_provider = format!("{provider}.{name}");
+        {
+            let provider_entry = cfg
+                .providers
+                .models
+                .entry(provider.clone())
+                .or_default()
+                .entry(name.clone())
+                .or_default();
+            provider_entry.model = Some(model.clone());
+            match api_key_update {
+                MaybeSet::Set(ref v) => provider_entry.api_key = Some(v.clone()),
+                MaybeSet::Null => provider_entry.api_key = None,
+                MaybeSet::Unset => {}
+            }
+            match temperature_update {
+                MaybeSet::Set(value) => {
+                    if !(0.0..=2.0).contains(&value) {
+                        anyhow::bail!("'temperature' must be between 0.0 and 2.0");
+                    }
+                    provider_entry.temperature = Some(value);
+                }
+                MaybeSet::Null => provider_entry.temperature = None,
+                MaybeSet::Unset => {}
+            }
+        }
 
-        next_agent.provider = provider;
-        next_agent.model = model;
+        // V3: synthesize risk_profiles[name] from max_depth.
+        {
+            let risk = cfg.risk_profiles.entry(name.clone()).or_default();
+            if let MaybeSet::Set(depth) = max_depth_update {
+                if depth == 0 {
+                    anyhow::bail!("'max_depth' must be greater than 0");
+                }
+                risk.max_delegation_depth = depth;
+            } else if risk.max_delegation_depth == 0 {
+                risk.max_delegation_depth = DEFAULT_AGENT_MAX_DEPTH;
+            }
+        }
 
+        // V3: synthesize runtime_profiles[name] from agentic/max_iterations/allowed_tools.
+        {
+            let runtime = cfg.runtime_profiles.entry(name.clone()).or_default();
+            if let Some(agentic) = agentic_update {
+                runtime.agentic = agentic;
+            }
+            if let MaybeSet::Set(iters) = max_iterations_update {
+                if iters == 0 {
+                    anyhow::bail!("'max_iterations' must be greater than 0");
+                }
+                runtime.max_tool_iterations = iters;
+            } else if runtime.max_tool_iterations == 0 {
+                runtime.max_tool_iterations = DEFAULT_AGENT_MAX_ITERATIONS;
+            }
+            if let Some(tools) = allowed_tools_update {
+                runtime.allowed_tools = tools;
+            }
+            if runtime.agentic && runtime.allowed_tools.is_empty() {
+                anyhow::bail!("Agent '{name}' has agentic=true but allowed_tools is empty.");
+            }
+        }
+
+        // Get or create the agent and wire up V3 alias references.
+        let next_agent = cfg.agents.entry(name.clone()).or_default();
+        next_agent.model_provider = model_provider;
+        next_agent.risk_profile = name.clone();
+        next_agent.runtime_profile = name.clone();
         match system_prompt_update {
             MaybeSet::Set(value) => next_agent.system_prompt = Some(value),
             MaybeSet::Null => next_agent.system_prompt = None,
             MaybeSet::Unset => {}
         }
 
-        match api_key_update {
-            MaybeSet::Set(value) => next_agent.api_key = Some(value),
-            MaybeSet::Null => next_agent.api_key = None,
-            MaybeSet::Unset => {}
-        }
-
-        match temperature_update {
-            MaybeSet::Set(value) => {
-                if !(0.0..=2.0).contains(&value) {
-                    anyhow::bail!("'temperature' must be between 0.0 and 2.0");
-                }
-                next_agent.temperature = Some(value);
-            }
-            MaybeSet::Null => next_agent.temperature = None,
-            MaybeSet::Unset => {}
-        }
-
-        match max_depth_update {
-            MaybeSet::Set(value) => next_agent.max_depth = value,
-            MaybeSet::Null => next_agent.max_depth = DEFAULT_AGENT_MAX_DEPTH,
-            MaybeSet::Unset => {}
-        }
-
-        match max_iterations_update {
-            MaybeSet::Set(value) => next_agent.max_iterations = value,
-            MaybeSet::Null => next_agent.max_iterations = DEFAULT_AGENT_MAX_ITERATIONS,
-            MaybeSet::Unset => {}
-        }
-
-        if let Some(agentic) = agentic_update {
-            next_agent.agentic = agentic;
-        }
-
-        if let Some(allowed_tools) = allowed_tools_update {
-            next_agent.allowed_tools = allowed_tools;
-        }
-
-        if next_agent.max_depth == 0 {
-            anyhow::bail!("'max_depth' must be greater than 0");
-        }
-
-        if next_agent.max_iterations == 0 {
-            anyhow::bail!("'max_iterations' must be greater than 0");
-        }
-
-        if next_agent.agentic && next_agent.allowed_tools.is_empty() {
-            anyhow::bail!(
-                "Agent '{name}' has agentic=true but allowed_tools is empty. Set allowed_tools or disable agentic mode."
-            );
-        }
-
-        cfg.agents.insert(name.clone(), next_agent);
         cfg.save().await?;
 
         Ok(ToolResult {

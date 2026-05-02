@@ -628,18 +628,22 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
-    // Delegate agents: provider validity
+    // Delegate agents: provider validity (resolved from model_provider alias)
     let mut agent_names: Vec<_> = config.agents.keys().collect();
     agent_names.sort();
     for name in agent_names {
         let agent = config.agents.get(name).unwrap();
-        if let Some(reason) = provider_validation_error(&agent.provider) {
+        let provider_type = agent
+            .model_provider
+            .split_once('.')
+            .map_or(agent.model_provider.as_str(), |(t, _)| t);
+        if provider_type.is_empty() {
+            continue;
+        }
+        if let Some(reason) = provider_validation_error(provider_type) {
             items.push(DiagItem::warn(
                 cat,
-                format!(
-                    "agent \"{name}\" uses invalid provider \"{}\": {}",
-                    agent.provider, reason
-                ),
+                format!("agent \"{name}\" uses invalid provider \"{provider_type}\": {reason}",),
             ));
         }
     }
@@ -1303,43 +1307,15 @@ mod tests {
         config.agents.insert(
             "zeta".into(),
             zeroclaw_config::schema::DelegateAgentConfig {
-                provider: "totally-fake".into(),
-                model: "model-z".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
+                model_provider: "totally-fake.default".into(),
+                ..Default::default()
             },
         );
         config.agents.insert(
             "alpha".into(),
             zeroclaw_config::schema::DelegateAgentConfig {
-                provider: "totally-fake".into(),
-                model: "model-a".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
+                model_provider: "totally-fake.default".into(),
+                ..Default::default()
             },
         );
 

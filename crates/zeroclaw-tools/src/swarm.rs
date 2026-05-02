@@ -7,10 +7,9 @@ use zeroclaw_api::provider::Provider;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
-use zeroclaw_config::schema::{DelegateAgentConfig, SwarmConfig, SwarmStrategy};
-
-/// Default timeout for individual agent calls within a swarm.
-const SWARM_AGENT_TIMEOUT_SECS: u64 = 120;
+use zeroclaw_config::schema::{
+    DelegateAgentConfig, ModelProviderConfig, SwarmConfig, SwarmStrategy,
+};
 
 /// Tool that orchestrates multiple agents as a swarm. Supports sequential
 /// (pipeline), parallel (fan-out/fan-in), and router (LLM-selected) strategies.
@@ -20,6 +19,7 @@ pub struct SwarmTool {
     security: Arc<SecurityPolicy>,
     fallback_credential: Option<String>,
     provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions,
+    providers_models: Arc<HashMap<String, HashMap<String, ModelProviderConfig>>>,
 }
 
 impl SwarmTool {
@@ -29,6 +29,7 @@ impl SwarmTool {
         fallback_credential: Option<String>,
         security: Arc<SecurityPolicy>,
         provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions,
+        providers_models: HashMap<String, HashMap<String, ModelProviderConfig>>,
     ) -> Self {
         Self {
             swarms: Arc::new(swarms),
@@ -36,7 +37,34 @@ impl SwarmTool {
             security,
             fallback_credential,
             provider_runtime_options,
+            providers_models: Arc::new(providers_models),
         }
+    }
+
+    /// Resolve the model-provider alias into (provider_type, credential, model, temperature).
+    fn resolve_brain(&self, model_provider: &str) -> (String, Option<String>, String, Option<f64>) {
+        if let Some((type_key, alias_key)) = model_provider.split_once('.')
+            && let Some(alias_map) = self.providers_models.get(type_key)
+            && let Some(cfg) = alias_map.get(alias_key)
+        {
+            return (
+                type_key.to_string(),
+                cfg.api_key
+                    .clone()
+                    .or_else(|| self.fallback_credential.clone()),
+                cfg.model.clone().unwrap_or_default(),
+                cfg.temperature,
+            );
+        }
+        let type_key = model_provider
+            .split_once('.')
+            .map_or(model_provider, |(t, _)| t);
+        (
+            type_key.to_string(),
+            self.fallback_credential.clone(),
+            String::new(),
+            None,
+        )
     }
 
     fn create_provider_for_agent(
@@ -44,13 +72,11 @@ impl SwarmTool {
         agent_config: &DelegateAgentConfig,
         agent_name: &str,
     ) -> Result<Box<dyn Provider>, ToolResult> {
-        let credential = agent_config
-            .api_key
-            .clone()
-            .or_else(|| self.fallback_credential.clone());
+        let (provider_type, credential, _model, _temperature) =
+            self.resolve_brain(&agent_config.model_provider);
 
         zeroclaw_providers::create_provider_with_options(
-            &agent_config.provider,
+            &provider_type,
             credential.as_deref(),
             &self.provider_runtime_options,
         )
@@ -58,8 +84,7 @@ impl SwarmTool {
             success: false,
             output: String::new(),
             error: Some(format!(
-                "Failed to create provider '{}' for agent '{agent_name}': {e}",
-                agent_config.provider
+                "Failed to create provider '{provider_type}' for agent '{agent_name}': {e}",
             )),
         })
     }
@@ -71,17 +96,25 @@ impl SwarmTool {
         prompt: &str,
         timeout_secs: u64,
     ) -> Result<String, String> {
-        let provider = self
-            .create_provider_for_agent(agent_config, agent_name)
-            .map_err(|r| r.error.unwrap_or_default())?;
+        let (provider_type, credential, model, temperature) =
+            self.resolve_brain(&agent_config.model_provider);
+
+        let provider = zeroclaw_providers::create_provider_with_options(
+            &provider_type,
+            credential.as_deref(),
+            &self.provider_runtime_options,
+        )
+        .map_err(|e| {
+            format!("Failed to create provider '{provider_type}' for agent '{agent_name}': {e}")
+        })?;
 
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
             provider.chat_with_system(
                 agent_config.system_prompt.as_deref(),
                 prompt,
-                &agent_config.model,
-                agent_config.temperature,
+                &model,
+                temperature,
             ),
         )
         .await;
@@ -134,15 +167,15 @@ impl SwarmTool {
                 format!("[Previous agent output]\n{current_input}\n\n[Original task]\n{prompt}")
             };
 
+            let (provider_type, _credential, model, _temperature) =
+                self.resolve_brain(&agent_config.model_provider);
+
             match self
                 .call_agent(agent_name, agent_config, &agent_prompt, per_agent_timeout)
                 .await
             {
                 Ok(output) => {
-                    results.push(format!(
-                        "[{agent_name} ({}/{})] {output}",
-                        agent_config.provider, agent_config.model
-                    ));
+                    results.push(format!("[{agent_name} ({provider_type}/{model})] {output}",));
                     current_input = output;
                 }
                 Err(e) => {
@@ -192,13 +225,11 @@ impl SwarmTool {
                 }
             };
 
-            let credential = agent_config
-                .api_key
-                .clone()
-                .or_else(|| self.fallback_credential.clone());
+            let (provider_type, credential, model, temperature) =
+                self.resolve_brain(&agent_config.model_provider);
 
             let provider = match zeroclaw_providers::create_provider_with_options(
-                &agent_config.provider,
+                &provider_type,
                 credential.as_deref(),
                 &self.provider_runtime_options,
             ) {
@@ -217,10 +248,7 @@ impl SwarmTool {
             let name = agent_name.clone();
             let prompt_clone = full_prompt.clone();
             let timeout = swarm_config.timeout_secs;
-            let model = agent_config.model.clone();
-            let temperature = agent_config.temperature;
             let system_prompt = agent_config.system_prompt.clone();
-            let provider_name = agent_config.provider.clone();
 
             join_set.spawn(async move {
                 let result = tokio::time::timeout(
@@ -246,7 +274,7 @@ impl SwarmTool {
                     Err(_) => format!("[Timed out after {timeout}s]"),
                 };
 
-                (name, provider_name, model, output)
+                (name, provider_type, model, output)
             });
         }
 
@@ -297,10 +325,9 @@ impl SwarmTool {
                         .system_prompt
                         .as_deref()
                         .unwrap_or("General purpose agent");
-                    format!(
-                        "- {name}: {desc} (provider: {}, model: {})",
-                        cfg.provider, cfg.model
-                    )
+                    let (provider_type, _cred, model, _temp) =
+                        self.resolve_brain(&cfg.model_provider);
+                    format!("- {name}: {desc} (provider: {provider_type}, model: {model})",)
                 })
             })
             .collect();
@@ -319,6 +346,8 @@ impl SwarmTool {
                 });
             }
         };
+
+        let (_, _, first_model, _) = self.resolve_brain(&first_agent_config.model_provider);
 
         let router_provider = self
             .create_provider_for_agent(first_agent_config, first_agent_name)
@@ -339,11 +368,11 @@ impl SwarmTool {
         // not generate a creative rewording.
         const ROUTER_TEMPERATURE: f64 = 0.0;
         let chosen = tokio::time::timeout(
-            Duration::from_secs(SWARM_AGENT_TIMEOUT_SECS),
+            Duration::from_secs(swarm_config.timeout_secs),
             router_provider.chat_with_system(
                 Some("You are a routing assistant. Respond with only the agent name."),
                 &routing_prompt,
-                &first_agent_config.model,
+                &first_model,
                 Some(ROUTER_TEMPERATURE),
             ),
         )
@@ -386,6 +415,8 @@ impl SwarmTool {
             }
         };
 
+        let (provider_type, _, model, _) = self.resolve_brain(&agent_config.model_provider);
+
         let full_prompt = if context.is_empty() {
             prompt.to_string()
         } else {
@@ -404,8 +435,7 @@ impl SwarmTool {
             Ok(output) => Ok(ToolResult {
                 success: true,
                 output: format!(
-                    "[Swarm router — selected '{matched_name}' ({}/{})]\n{output}",
-                    agent_config.provider, agent_config.model
+                    "[Swarm router — selected '{matched_name}' ({provider_type}/{model})]\n{output}",
                 ),
                 error: None,
             }),
@@ -554,48 +584,44 @@ mod tests {
         Arc::new(SecurityPolicy::default())
     }
 
+    fn sample_providers_models() -> HashMap<String, HashMap<String, ModelProviderConfig>> {
+        let mut models: HashMap<String, HashMap<String, ModelProviderConfig>> = HashMap::new();
+        models.entry("ollama".to_string()).or_default().insert(
+            "researcher".to_string(),
+            ModelProviderConfig {
+                model: Some("llama3".to_string()),
+                temperature: Some(0.3),
+                ..Default::default()
+            },
+        );
+        models.entry("openrouter".to_string()).or_default().insert(
+            "writer".to_string(),
+            ModelProviderConfig {
+                model: Some("anthropic/claude-sonnet-4-20250514".to_string()),
+                temperature: Some(0.5),
+                api_key: Some("test-key".to_string()),
+                ..Default::default()
+            },
+        );
+        models
+    }
+
     fn sample_agents() -> HashMap<String, DelegateAgentConfig> {
         let mut agents = HashMap::new();
         agents.insert(
             "researcher".to_string(),
             DelegateAgentConfig {
-                provider: "ollama".to_string(),
-                model: "llama3".to_string(),
                 system_prompt: Some("You are a research assistant.".to_string()),
-                api_key: None,
-                temperature: Some(0.3),
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
+                model_provider: "ollama.researcher".to_string(),
+                ..Default::default()
             },
         );
         agents.insert(
             "writer".to_string(),
             DelegateAgentConfig {
-                provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4-20250514".to_string(),
                 system_prompt: Some("You are a technical writer.".to_string()),
-                api_key: Some("test-key".to_string()),
-                temperature: Some(0.5),
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
+                model_provider: "openrouter.writer".to_string(),
+                ..Default::default()
             },
         );
         agents
@@ -636,15 +662,20 @@ mod tests {
         swarms
     }
 
-    #[test]
-    fn name_and_schema() {
-        let tool = SwarmTool::new(
+    fn make_tool() -> SwarmTool {
+        SwarmTool::new(
             sample_swarms(),
             sample_agents(),
             None,
             test_security(),
             zeroclaw_providers::ProviderRuntimeOptions::default(),
-        );
+            sample_providers_models(),
+        )
+    }
+
+    #[test]
+    fn name_and_schema() {
+        let tool = make_tool();
         assert_eq!(tool.name(), "swarm");
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["swarm"].is_object());
@@ -658,25 +689,13 @@ mod tests {
 
     #[test]
     fn description_not_empty() {
-        let tool = SwarmTool::new(
-            sample_swarms(),
-            sample_agents(),
-            None,
-            test_security(),
-            zeroclaw_providers::ProviderRuntimeOptions::default(),
-        );
+        let tool = make_tool();
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn schema_lists_swarm_names() {
-        let tool = SwarmTool::new(
-            sample_swarms(),
-            sample_agents(),
-            None,
-            test_security(),
-            zeroclaw_providers::ProviderRuntimeOptions::default(),
-        );
+        let tool = make_tool();
         let schema = tool.parameters_schema();
         let desc = schema["properties"]["swarm"]["description"]
             .as_str()
@@ -692,6 +711,7 @@ mod tests {
             None,
             test_security(),
             zeroclaw_providers::ProviderRuntimeOptions::default(),
+            sample_providers_models(),
         );
         let schema = tool.parameters_schema();
         let desc = schema["properties"]["swarm"]["description"]
@@ -702,13 +722,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_swarm_returns_error() {
-        let tool = SwarmTool::new(
-            sample_swarms(),
-            sample_agents(),
-            None,
-            test_security(),
-            zeroclaw_providers::ProviderRuntimeOptions::default(),
-        );
+        let tool = make_tool();
         let result = tool
             .execute(json!({"swarm": "nonexistent", "prompt": "test"}))
             .await
@@ -719,39 +733,21 @@ mod tests {
 
     #[tokio::test]
     async fn missing_swarm_param() {
-        let tool = SwarmTool::new(
-            sample_swarms(),
-            sample_agents(),
-            None,
-            test_security(),
-            zeroclaw_providers::ProviderRuntimeOptions::default(),
-        );
+        let tool = make_tool();
         let result = tool.execute(json!({"prompt": "test"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn missing_prompt_param() {
-        let tool = SwarmTool::new(
-            sample_swarms(),
-            sample_agents(),
-            None,
-            test_security(),
-            zeroclaw_providers::ProviderRuntimeOptions::default(),
-        );
+        let tool = make_tool();
         let result = tool.execute(json!({"swarm": "pipeline"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn blank_swarm_rejected() {
-        let tool = SwarmTool::new(
-            sample_swarms(),
-            sample_agents(),
-            None,
-            test_security(),
-            zeroclaw_providers::ProviderRuntimeOptions::default(),
-        );
+        let tool = make_tool();
         let result = tool
             .execute(json!({"swarm": "  ", "prompt": "test"}))
             .await
@@ -762,13 +758,7 @@ mod tests {
 
     #[tokio::test]
     async fn blank_prompt_rejected() {
-        let tool = SwarmTool::new(
-            sample_swarms(),
-            sample_agents(),
-            None,
-            test_security(),
-            zeroclaw_providers::ProviderRuntimeOptions::default(),
-        );
+        let tool = make_tool();
         let result = tool
             .execute(json!({"swarm": "pipeline", "prompt": "  "}))
             .await
@@ -796,6 +786,7 @@ mod tests {
             None,
             test_security(),
             zeroclaw_providers::ProviderRuntimeOptions::default(),
+            sample_providers_models(),
         );
         let result = tool
             .execute(json!({"swarm": "broken", "prompt": "test"}))
@@ -824,6 +815,7 @@ mod tests {
             None,
             test_security(),
             zeroclaw_providers::ProviderRuntimeOptions::default(),
+            sample_providers_models(),
         );
         let result = tool
             .execute(json!({"swarm": "empty", "prompt": "test"}))
@@ -845,6 +837,7 @@ mod tests {
             None,
             readonly,
             zeroclaw_providers::ProviderRuntimeOptions::default(),
+            sample_providers_models(),
         );
         let result = tool
             .execute(json!({"swarm": "pipeline", "prompt": "test"}))
@@ -872,6 +865,7 @@ mod tests {
             None,
             limited,
             zeroclaw_providers::ProviderRuntimeOptions::default(),
+            sample_providers_models(),
         );
         let result = tool
             .execute(json!({"swarm": "pipeline", "prompt": "test"}))
@@ -907,6 +901,7 @@ mod tests {
             None,
             test_security(),
             zeroclaw_providers::ProviderRuntimeOptions::default(),
+            sample_providers_models(),
         );
         let result = tool
             .execute(json!({"swarm": "seq", "prompt": "test"}))
@@ -935,6 +930,7 @@ mod tests {
             None,
             test_security(),
             zeroclaw_providers::ProviderRuntimeOptions::default(),
+            sample_providers_models(),
         );
         let result = tool
             .execute(json!({"swarm": "par", "prompt": "test"}))
@@ -963,6 +959,7 @@ mod tests {
             None,
             test_security(),
             zeroclaw_providers::ProviderRuntimeOptions::default(),
+            sample_providers_models(),
         );
         let result = tool
             .execute(json!({"swarm": "rout", "prompt": "test"}))

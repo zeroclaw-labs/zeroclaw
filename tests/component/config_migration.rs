@@ -1138,10 +1138,6 @@ provider = "anthropic"
         "anthropic.default",
         "agent with matching provider and no differing brain fields gets model_provider = '<type>.default'"
     );
-    assert!(
-        config.agents["coder"].provider.is_empty(),
-        "old provider field must be stripped"
-    );
 }
 
 #[test]
@@ -1178,10 +1174,6 @@ model = "claude-haiku-4-5"
             .as_deref(),
         Some("claude-haiku-4-5"),
         "per-agent entry must carry the agent's model override"
-    );
-    assert!(
-        config.agents["researcher"].model.is_empty(),
-        "old model field must be stripped"
     );
 }
 

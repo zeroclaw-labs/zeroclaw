@@ -677,64 +677,37 @@ impl Default for DelegateToolConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "delegate-agent"]
 pub struct DelegateAgentConfig {
-    /// Provider name (e.g. "ollama", "openrouter", "anthropic"). Deprecated in V3 — use `model_provider`.
-    #[serde(default)]
-    pub provider: String,
-    /// Model name. Deprecated in V3 — use `model_provider` to resolve model from the provider config.
-    #[serde(default)]
-    pub model: String,
-    /// Optional system prompt for the sub-agent
+    /// Optional system prompt. Deprecated in V3 — move content to `agents/<alias>/AGENTS.md`.
     #[serde(default)]
     pub system_prompt: Option<String>,
-    /// Optional API key override
-    #[serde(default)]
-    #[secret]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_key: Option<String>,
-    /// Temperature override
-    #[serde(default)]
-    pub temperature: Option<f64>,
-    /// Max recursion depth for nested delegation
-    #[serde(default = "default_max_depth")]
-    pub max_depth: u32,
-    /// Enable agentic sub-agent mode (multi-turn tool-call loop).
-    #[serde(default)]
-    pub agentic: bool,
-    /// Allowlist of tool names available to the sub-agent in agentic mode.
-    #[serde(default)]
-    pub allowed_tools: Vec<String>,
-    /// Maximum tool-call iterations in agentic mode.
-    #[serde(default = "default_max_tool_iterations")]
-    pub max_iterations: usize,
-    /// Optional timeout in seconds for non-agentic sub-agent provider calls.
-    /// When `None`, falls back to `[delegate].timeout_secs` (default: 120).
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-    /// Optional timeout in seconds for agentic sub-agent runs.
-    /// When `None`, falls back to `[delegate].agentic_timeout_secs` (default: 300).
-    #[serde(default)]
-    pub agentic_timeout_secs: Option<u64>,
-    /// Optional skills directory path (relative to workspace root) for scoped skill loading.
-    /// When unset or empty, the sub-agent falls back to the default workspace `skills/` directory.
-    #[serde(default)]
-    pub skills_directory: Option<String>,
-    /// Optional memory namespace for isolation.
-    /// When set, the sub-agent's memory operations are isolated to this namespace,
-    /// preventing cross-contamination with memory from other agents.
-    #[serde(default)]
-    pub memory_namespace: Option<String>,
     /// Channel aliases this agent handles (e.g. `["telegram.default", "discord.work"]`).
-    /// Populated by migration from V2 `channels.<type>.agent = "<alias>"` bindings.
     #[serde(default)]
     pub channels: Vec<String>,
-    /// V3: dotted model-provider alias reference (e.g. `"anthropic.default"`).
+    /// V3: dotted model-provider alias (e.g. `"anthropic.default"`).
     /// Resolves through `providers.models.<type>.<alias>` at runtime.
-    /// Takes precedence over the deprecated `provider` field when non-empty.
     #[serde(default)]
     pub model_provider: String,
     /// V3: ordered fallback chain of dotted provider aliases.
     #[serde(default)]
     pub model_provider_fallback: Vec<String>,
+    /// V3: risk profile alias (e.g. `"default"`). Resolves delegation guardrails at runtime.
+    #[serde(default)]
+    pub risk_profile: String,
+    /// V3: runtime profile alias (e.g. `"default"`). Resolves agentic/iteration settings.
+    #[serde(default)]
+    pub runtime_profile: String,
+    /// V3: skill bundle alias. Resolves to `skill_bundles[key].directory` at runtime.
+    #[serde(default)]
+    pub skill_bundle: String,
+    /// V3: knowledge bundle alias.
+    #[serde(default)]
+    pub knowledge_bundle: String,
+    /// V3: MCP bundle alias.
+    #[serde(default)]
+    pub mcp_bundle: String,
+    /// V3: memory namespace alias. Empty string = no namespace isolation.
+    #[serde(default)]
+    pub memory_namespace: String,
 }
 
 fn default_delegate_timeout_secs() -> u64 {
@@ -833,14 +806,6 @@ where
     value
         .map(|raw| normalize_reasoning_effort(&raw).map_err(serde::de::Error::custom))
         .transpose()
-}
-
-fn default_max_depth() -> u32 {
-    3
-}
-
-fn default_max_tool_iterations() -> usize {
-    10
 }
 
 // ── Hardware Config (wizard-driven) ─────────────────────────────
@@ -11154,31 +11119,6 @@ impl Config {
             anyhow::bail!("security.nevis: {msg}");
         }
 
-        // Delegate agent timeouts
-        const MAX_DELEGATE_TIMEOUT_SECS: u64 = 3600;
-        for (name, agent) in &self.agents {
-            if let Some(timeout) = agent.timeout_secs {
-                if timeout == 0 {
-                    anyhow::bail!("agents.{name}.timeout_secs must be greater than 0");
-                }
-                if timeout > MAX_DELEGATE_TIMEOUT_SECS {
-                    anyhow::bail!(
-                        "agents.{name}.timeout_secs exceeds max {MAX_DELEGATE_TIMEOUT_SECS}"
-                    );
-                }
-            }
-            if let Some(timeout) = agent.agentic_timeout_secs {
-                if timeout == 0 {
-                    anyhow::bail!("agents.{name}.agentic_timeout_secs must be greater than 0");
-                }
-                if timeout > MAX_DELEGATE_TIMEOUT_SECS {
-                    anyhow::bail!(
-                        "agents.{name}.agentic_timeout_secs exceeds max {MAX_DELEGATE_TIMEOUT_SECS}"
-                    );
-                }
-            }
-        }
-
         // Transcription
         {
             let dp = self.transcription.default_provider.trim();
@@ -11198,20 +11138,6 @@ impl Config {
         }
         if self.delegate.agentic_timeout_secs == 0 {
             anyhow::bail!("delegate.agentic_timeout_secs must be greater than 0");
-        }
-
-        // Per-agent delegate timeout overrides
-        for (name, agent) in &self.agents {
-            if let Some(t) = agent.timeout_secs
-                && t == 0
-            {
-                anyhow::bail!("agents.{name}.timeout_secs must be greater than 0");
-            }
-            if let Some(t) = agent.agentic_timeout_secs
-                && t == 0
-            {
-                anyhow::bail!("agents.{name}.agentic_timeout_secs must be greater than 0");
-            }
         }
 
         Ok(())
@@ -13194,25 +13120,24 @@ default_temperature = 0.7
             },
         );
 
+        config
+            .providers
+            .models
+            .entry("openrouter".into())
+            .or_default()
+            .insert(
+                "worker".into(),
+                ModelProviderConfig {
+                    api_key: Some("agent-credential".into()),
+                    model: Some("model-test".into()),
+                    ..Default::default()
+                },
+            );
         config.agents.insert(
             "worker".into(),
             DelegateAgentConfig {
-                provider: "openrouter".into(),
-                model: "model-test".into(),
-                system_prompt: None,
-                api_key: Some("agent-credential".into()),
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
+                model_provider: "openrouter.worker".into(),
+                ..Default::default()
             },
         );
 
@@ -13261,8 +13186,13 @@ default_temperature = 0.7
             "brave-credential"
         );
 
-        let worker = stored.agents.get("worker").unwrap();
-        let worker_encrypted = worker.api_key.as_deref().unwrap();
+        let worker_provider = stored
+            .providers
+            .models
+            .get("openrouter")
+            .and_then(|m| m.get("worker"))
+            .unwrap();
+        let worker_encrypted = worker_provider.api_key.as_deref().unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(worker_encrypted));
         assert_eq!(store.decrypt(worker_encrypted).unwrap(), "agent-credential");
 
@@ -18415,21 +18345,31 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let store = crate::secrets::SecretStore::new(dir.path(), true);
 
         let mut config = Config::default();
-        config.agents.insert(
-            "test-agent".into(),
-            DelegateAgentConfig {
-                api_key: Some("secret-key".into()),
-                ..Default::default()
-            },
-        );
+        config
+            .providers
+            .models
+            .entry("openrouter".into())
+            .or_default()
+            .insert(
+                "test".into(),
+                ModelProviderConfig {
+                    api_key: Some("secret-key".into()),
+                    ..Default::default()
+                },
+            );
 
         config.encrypt_secrets(&store).unwrap();
-        let encrypted_key = config.agents["test-agent"].api_key.as_ref().unwrap();
+        let encrypted_key = config.providers.models["openrouter"]["test"]
+            .api_key
+            .as_ref()
+            .unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(encrypted_key));
 
         config.decrypt_secrets(&store).unwrap();
         assert_eq!(
-            config.agents["test-agent"].api_key.as_deref(),
+            config.providers.models["openrouter"]["test"]
+                .api_key
+                .as_deref(),
             Some("secret-key")
         );
     }

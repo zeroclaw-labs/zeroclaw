@@ -904,6 +904,7 @@ pub fn all_tools_with_runtime(
             delegate_fallback_credential,
             security.clone(),
             provider_runtime_options,
+            root_config.providers.models.clone(),
         )));
     }
 
@@ -1215,22 +1216,8 @@ mod tests {
         agents.insert(
             "researcher".to_string(),
             DelegateAgentConfig {
-                provider: "ollama".to_string(),
-                model: "llama3".to_string(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
+                model_provider: "ollama.researcher".to_string(),
+                ..Default::default()
             },
         );
 

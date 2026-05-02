@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::tool::{Tool, ToolResult};
-use zeroclaw_config::schema::{DelegateAgentConfig, DelegateToolConfig};
+use zeroclaw_config::schema::{
+    DelegateAgentConfig, DelegateToolConfig, MemoryNamespaceConfig, ModelProviderConfig,
+    RiskProfileConfig, RuntimeProfileConfig, SkillBundleConfig,
+};
 use zeroclaw_memory::{Memory, NamespacedMemory};
 use zeroclaw_providers::{self, ChatMessage, Provider};
 
@@ -78,6 +81,16 @@ pub struct DelegateTool {
     cancellation_token: CancellationToken,
     /// Optional memory instance for namespace isolation on delegate agents.
     memory: Option<Arc<dyn Memory>>,
+    /// V3: nested model-provider map for brain resolution.
+    providers_models: Arc<HashMap<String, HashMap<String, ModelProviderConfig>>>,
+    /// V3: named risk profiles for delegation depth and timeout resolution.
+    risk_profiles: Arc<HashMap<String, RiskProfileConfig>>,
+    /// V3: named runtime profiles for agentic/tools/iteration resolution.
+    runtime_profiles: Arc<HashMap<String, RuntimeProfileConfig>>,
+    /// V3: named skill bundles for skills-directory resolution.
+    skill_bundles: Arc<HashMap<String, SkillBundleConfig>>,
+    /// V3: named memory namespaces for isolation resolution.
+    memory_namespaces: Arc<HashMap<String, MemoryNamespaceConfig>>,
 }
 
 impl DelegateTool {
@@ -112,6 +125,11 @@ impl DelegateTool {
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
+            providers_models: Arc::new(HashMap::new()),
+            risk_profiles: Arc::new(HashMap::new()),
+            runtime_profiles: Arc::new(HashMap::new()),
+            skill_bundles: Arc::new(HashMap::new()),
+            memory_namespaces: Arc::new(HashMap::new()),
         }
     }
 
@@ -152,6 +170,11 @@ impl DelegateTool {
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
+            providers_models: Arc::new(HashMap::new()),
+            risk_profiles: Arc::new(HashMap::new()),
+            runtime_profiles: Arc::new(HashMap::new()),
+            skill_bundles: Arc::new(HashMap::new()),
+            memory_namespaces: Arc::new(HashMap::new()),
         }
     }
 
@@ -206,14 +229,161 @@ impl DelegateTool {
         self
     }
 
+    /// Attach V3 nested model-provider map for brain resolution.
+    pub fn with_providers_models(
+        mut self,
+        m: HashMap<String, HashMap<String, ModelProviderConfig>>,
+    ) -> Self {
+        self.providers_models = Arc::new(m);
+        self
+    }
+
+    /// Attach V3 risk profiles for depth/timeout resolution.
+    pub fn with_risk_profiles(mut self, m: HashMap<String, RiskProfileConfig>) -> Self {
+        self.risk_profiles = Arc::new(m);
+        self
+    }
+
+    /// Attach V3 runtime profiles for agentic/tools/iteration resolution.
+    pub fn with_runtime_profiles(mut self, m: HashMap<String, RuntimeProfileConfig>) -> Self {
+        self.runtime_profiles = Arc::new(m);
+        self
+    }
+
+    /// Attach V3 skill bundles for skills-directory resolution.
+    pub fn with_skill_bundles(mut self, m: HashMap<String, SkillBundleConfig>) -> Self {
+        self.skill_bundles = Arc::new(m);
+        self
+    }
+
+    /// Attach V3 memory namespaces for isolation resolution.
+    pub fn with_memory_namespaces(mut self, m: HashMap<String, MemoryNamespaceConfig>) -> Self {
+        self.memory_namespaces = Arc::new(m);
+        self
+    }
+
+    /// Resolve `model_provider` ("type.alias") → (provider_type, credential, model, temperature).
+    fn resolve_brain(&self, model_provider: &str) -> (String, Option<String>, String, Option<f64>) {
+        if let Some((type_key, alias_key)) = model_provider.split_once('.')
+            && let Some(alias_map) = self.providers_models.get(type_key)
+            && let Some(cfg) = alias_map.get(alias_key)
+        {
+            return (
+                type_key.to_string(),
+                cfg.api_key
+                    .clone()
+                    .or_else(|| self.fallback_credential.clone()),
+                cfg.model.clone().unwrap_or_default(),
+                cfg.temperature,
+            );
+        }
+        let type_key = model_provider
+            .split_once('.')
+            .map_or(model_provider, |(t, _)| t);
+        (
+            type_key.to_string(),
+            self.fallback_credential.clone(),
+            String::new(),
+            None,
+        )
+    }
+
+    /// Resolve max delegation depth from the named risk profile (default: 3).
+    fn resolve_max_depth(&self, risk_profile: &str) -> u32 {
+        if risk_profile.is_empty() {
+            return 3;
+        }
+        self.risk_profiles
+            .get(risk_profile)
+            .map(|p| p.max_delegation_depth)
+            .filter(|&d| d > 0)
+            .unwrap_or(3)
+    }
+
+    /// Resolve per-call delegation timeout from the named risk profile.
+    fn resolve_delegation_timeout(&self, risk_profile: &str) -> Option<u64> {
+        if risk_profile.is_empty() {
+            return None;
+        }
+        self.risk_profiles
+            .get(risk_profile)
+            .and_then(|p| p.delegation_timeout_secs)
+    }
+
+    /// Resolve agentic run timeout from the named risk profile.
+    fn resolve_agentic_timeout_secs(&self, risk_profile: &str) -> Option<u64> {
+        if risk_profile.is_empty() {
+            return None;
+        }
+        self.risk_profiles
+            .get(risk_profile)
+            .and_then(|p| p.agentic_timeout_secs)
+    }
+
+    /// Resolve agentic mode flag from the named runtime profile (default: false).
+    fn resolve_agentic(&self, runtime_profile: &str) -> bool {
+        if runtime_profile.is_empty() {
+            return false;
+        }
+        self.runtime_profiles
+            .get(runtime_profile)
+            .map(|p| p.agentic)
+            .unwrap_or(false)
+    }
+
+    /// Resolve max tool iterations from the named runtime profile (default: 10).
+    fn resolve_max_iterations(&self, runtime_profile: &str) -> usize {
+        if runtime_profile.is_empty() {
+            return 10;
+        }
+        self.runtime_profiles
+            .get(runtime_profile)
+            .map(|p| p.max_tool_iterations)
+            .filter(|&i| i > 0)
+            .unwrap_or(10)
+    }
+
+    /// Resolve allowed tools list from the named runtime profile.
+    fn resolve_allowed_tools(&self, runtime_profile: &str) -> Vec<String> {
+        if runtime_profile.is_empty() {
+            return Vec::new();
+        }
+        self.runtime_profiles
+            .get(runtime_profile)
+            .map(|p| p.allowed_tools.clone())
+            .unwrap_or_default()
+    }
+
+    /// Resolve skills directory from the named skill bundle.
+    fn resolve_skills_dir(&self, skill_bundle: &str) -> Option<String> {
+        if skill_bundle.is_empty() {
+            return None;
+        }
+        self.skill_bundles
+            .get(skill_bundle)
+            .and_then(|b| b.directory.clone())
+    }
+
+    /// Resolve memory namespace string from the named memory namespace config.
+    fn resolve_memory_ns(&self, memory_namespace: &str) -> Option<String> {
+        if memory_namespace.is_empty() {
+            return None;
+        }
+        self.memory_namespaces
+            .get(memory_namespace)
+            .map(|n| n.namespace.clone())
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(memory_namespace.to_string()))
+    }
+
     /// Wrap memory with namespace isolation if configured for the given agent.
     /// Returns the namespaced memory if memory_namespace is set, otherwise returns
     /// the original memory.
     #[allow(dead_code)] // WIP: will be used when delegate agents support memory
     fn get_agent_memory(&self, agent_config: &DelegateAgentConfig) -> Option<Arc<dyn Memory>> {
         self.memory.as_ref().map(|mem| {
-            if let Some(namespace) = &agent_config.memory_namespace {
-                Arc::new(NamespacedMemory::new(mem.clone(), namespace.clone())) as Arc<dyn Memory>
+            if let Some(ns) = self.resolve_memory_ns(&agent_config.memory_namespace) {
+                Arc::new(NamespacedMemory::new(mem.clone(), ns)) as Arc<dyn Memory>
             } else {
                 mem.clone()
             }
@@ -414,8 +584,14 @@ impl DelegateTool {
             }
         };
 
+        // Resolve V3 profile references
+        let max_depth = self.resolve_max_depth(&agent_config.risk_profile);
+        let (provider_type, credential, model, temperature) =
+            self.resolve_brain(&agent_config.model_provider);
+        let agentic = self.resolve_agentic(&agent_config.runtime_profile);
+
         // Check recursion depth (immutable — set at construction, incremented for sub-agents)
-        if self.depth >= agent_config.max_depth {
+        if self.depth >= max_depth {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -423,7 +599,7 @@ impl DelegateTool {
                     "Delegation depth limit reached ({depth}/{max}). \
                      Cannot delegate further to prevent infinite loops.",
                     depth = self.depth,
-                    max = agent_config.max_depth
+                    max = max_depth
                 )),
             });
         }
@@ -440,16 +616,9 @@ impl DelegateTool {
         }
 
         // Create provider for this agent
-        let provider_credential_owned = agent_config
-            .api_key
-            .clone()
-            .or_else(|| self.fallback_credential.clone());
-        #[allow(clippy::option_as_ref_deref)]
-        let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
-
         let provider: Box<dyn Provider> = match zeroclaw_providers::create_provider_with_options(
-            &agent_config.provider,
-            provider_credential,
+            &provider_type,
+            credential.as_deref(),
             &self.provider_runtime_options,
         ) {
             Ok(p) => p,
@@ -458,8 +627,7 @@ impl DelegateTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!(
-                        "Failed to create provider '{}' for agent '{agent_name}': {e}",
-                        agent_config.provider
+                        "Failed to create provider '{provider_type}' for agent '{agent_name}': {e}"
                     )),
                 });
             }
@@ -473,37 +641,32 @@ impl DelegateTool {
         };
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
-        if agent_config.agentic {
+        if agentic {
             return self
                 .execute_agentic(
                     agent_name,
                     agent_config,
+                    &provider_type,
+                    &model,
                     &*provider,
                     &full_prompt,
-                    agent_config
-                        .temperature
-                        .unwrap_or(DELEGATE_AGENTIC_DEFAULT_TEMPERATURE),
+                    temperature.unwrap_or(DELEGATE_AGENTIC_DEFAULT_TEMPERATURE),
                 )
                 .await;
         }
 
         // Build enriched system prompt for non-agentic sub-agent.
         let enriched_system_prompt =
-            self.build_enriched_system_prompt(agent_config, &[], &self.workspace_dir);
+            self.build_enriched_system_prompt(agent_config, &model, &[], &self.workspace_dir);
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
         // Wrap the provider call in a timeout to prevent indefinite blocking
-        let timeout_secs = agent_config
-            .timeout_secs
+        let timeout_secs = self
+            .resolve_delegation_timeout(&agent_config.risk_profile)
             .unwrap_or(self.delegate_config.timeout_secs);
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            provider.chat_with_system(
-                system_prompt_ref,
-                &full_prompt,
-                &agent_config.model,
-                agent_config.temperature,
-            ),
+            provider.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
         )
         .await;
 
@@ -529,11 +692,7 @@ impl DelegateTool {
 
                 Ok(ToolResult {
                     success: true,
-                    output: format!(
-                        "[Agent '{agent_name}' ({provider}/{model})]\n{rendered}",
-                        provider = agent_config.provider,
-                        model = agent_config.model
-                    ),
+                    output: format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{rendered}",),
                     error: None,
                 })
             }
@@ -578,14 +737,15 @@ impl DelegateTool {
             }
         };
 
-        if self.depth >= agent_config.max_depth {
+        let max_depth = self.resolve_max_depth(&agent_config.risk_profile);
+        if self.depth >= max_depth {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
                     "Delegation depth limit reached ({depth}/{max}).",
                     depth = self.depth,
-                    max = agent_config.max_depth
+                    max = max_depth
                 )),
             });
         }
@@ -645,6 +805,11 @@ impl DelegateTool {
         let workspace_dir = self.workspace_dir.clone();
         let child_token = self.cancellation_token.child_token();
         let task_id_clone = task_id.clone();
+        let providers_models = Arc::clone(&self.providers_models);
+        let risk_profiles = Arc::clone(&self.risk_profiles);
+        let runtime_profiles = Arc::clone(&self.runtime_profiles);
+        let skill_bundles = Arc::clone(&self.skill_bundles);
+        let memory_namespaces = Arc::clone(&self.memory_namespaces);
 
         tokio::spawn(async move {
             // Build an inner DelegateTool for the spawned context
@@ -660,6 +825,11 @@ impl DelegateTool {
                 workspace_dir: workspace_dir.clone(),
                 cancellation_token: child_token.clone(),
                 memory: None,
+                providers_models,
+                risk_profiles,
+                runtime_profiles,
+                skill_bundles,
+                memory_namespaces,
             };
 
             let args_inner = json!({
@@ -804,6 +974,11 @@ impl DelegateTool {
             let agent_name = agent_name.clone();
             let prompt = prompt.to_string();
             let args_clone = args.clone();
+            let providers_models = Arc::clone(&self.providers_models);
+            let risk_profiles = Arc::clone(&self.risk_profiles);
+            let runtime_profiles = Arc::clone(&self.runtime_profiles);
+            let skill_bundles = Arc::clone(&self.skill_bundles);
+            let memory_namespaces = Arc::clone(&self.memory_namespaces);
 
             handles.push(tokio::spawn(async move {
                 let inner = DelegateTool {
@@ -818,6 +993,11 @@ impl DelegateTool {
                     workspace_dir,
                     cancellation_token,
                     memory: None,
+                    providers_models,
+                    risk_profiles,
+                    runtime_profiles,
+                    skill_bundles,
+                    memory_namespaces,
                 };
                 let result = Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await;
                 (agent_name, result)
@@ -1024,14 +1204,13 @@ impl DelegateTool {
     fn build_enriched_system_prompt(
         &self,
         agent_config: &DelegateAgentConfig,
+        model_name: &str,
         sub_tools: &[Box<dyn Tool>],
         workspace_dir: &Path,
     ) -> Option<String> {
         // Resolve skills directory: scoped if configured, otherwise workspace default.
-        let skills_dir = agent_config
-            .skills_directory
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
+        let skills_dir = self
+            .resolve_skills_dir(&agent_config.skill_bundle)
             .map(|dir| workspace_dir.join(dir))
             .unwrap_or_else(|| crate::skills::skills_dir(workspace_dir));
         let skills = crate::skills::load_skills_from_directory(&skills_dir, false);
@@ -1053,7 +1232,7 @@ impl DelegateTool {
         // Build structured operational context using SystemPromptBuilder sections.
         let ctx = PromptContext {
             workspace_dir,
-            model_name: &agent_config.model,
+            model_name,
             tools: sub_tools,
             skills: &skills,
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
@@ -1096,24 +1275,28 @@ impl DelegateTool {
         &self,
         agent_name: &str,
         agent_config: &DelegateAgentConfig,
+        provider_type: &str,
+        model: &str,
         provider: &dyn Provider,
         full_prompt: &str,
         temperature: f64,
     ) -> anyhow::Result<ToolResult> {
-        if agent_config.allowed_tools.is_empty() {
+        let allowed_tools = self.resolve_allowed_tools(&agent_config.runtime_profile);
+
+        if allowed_tools.is_empty() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Agent '{agent_name}' has agentic=true but allowed_tools is empty"
+                    "Agent '{agent_name}' is agentic but runtime_profile '{}' has no allowed_tools",
+                    agent_config.runtime_profile
                 )),
             });
         }
 
-        let allowed = agent_config
-            .allowed_tools
+        let allowed = allowed_tools
             .iter()
-            .map(|name| name.trim())
+            .map(|name: &String| name.trim())
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
@@ -1133,14 +1316,16 @@ impl DelegateTool {
                 output: String::new(),
                 error: Some(format!(
                     "Agent '{agent_name}' has no executable tools after filtering allowlist ({})",
-                    agent_config.allowed_tools.join(", ")
+                    allowed_tools.join(", ")
                 )),
             });
         }
 
+        let max_iterations = self.resolve_max_iterations(&agent_config.runtime_profile);
+
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         let enriched_system_prompt =
-            self.build_enriched_system_prompt(agent_config, &sub_tools, &self.workspace_dir);
+            self.build_enriched_system_prompt(agent_config, model, &sub_tools, &self.workspace_dir);
 
         let mut history = Vec::new();
         if let Some(system_prompt) = enriched_system_prompt.as_ref() {
@@ -1150,8 +1335,8 @@ impl DelegateTool {
 
         let noop_observer = NoopObserver;
 
-        let agentic_timeout_secs = agent_config
-            .agentic_timeout_secs
+        let agentic_timeout_secs = self
+            .resolve_agentic_timeout_secs(&agent_config.risk_profile)
             .unwrap_or(self.delegate_config.agentic_timeout_secs);
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
@@ -1160,15 +1345,15 @@ impl DelegateTool {
                 &mut history,
                 &sub_tools,
                 &noop_observer,
-                &agent_config.provider,
-                &agent_config.model,
+                provider_type,
+                model,
                 temperature,
                 true,
                 None,
                 "delegate",
                 None,
                 &self.multimodal_config,
-                agent_config.max_iterations,
+                max_iterations,
                 Some(self.cancellation_token.child_token()),
                 None,
                 None,
@@ -1198,9 +1383,7 @@ impl DelegateTool {
                 Ok(ToolResult {
                     success: true,
                     output: format!(
-                        "[Agent '{agent_name}' ({provider}/{model}, agentic)]\n{rendered}",
-                        provider = agent_config.provider,
-                        model = agent_config.model
+                        "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{rendered}",
                     ),
                     error: None,
                 })
@@ -1285,43 +1468,16 @@ mod tests {
         agents.insert(
             "researcher".to_string(),
             DelegateAgentConfig {
-                provider: "ollama".to_string(),
-                model: "llama3".to_string(),
                 system_prompt: Some("You are a research assistant.".to_string()),
-                api_key: None,
-                temperature: Some(0.3),
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
+                model_provider: "ollama.researcher".to_string(),
+                ..Default::default()
             },
         );
         agents.insert(
             "coder".to_string(),
             DelegateAgentConfig {
-                provider: "openrouter".to_string(),
-                model: "anthropic/claude-sonnet-4-20250514".to_string(),
-                system_prompt: None,
-                api_key: Some("delegate-test-credential".to_string()),
-                temperature: None,
-                max_depth: 2,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
+                model_provider: "openrouter.coder".to_string(),
+                ..Default::default()
             },
         );
         agents
@@ -1464,25 +1620,44 @@ mod tests {
         }
     }
 
-    fn agentic_config(allowed_tools: Vec<String>, max_iterations: usize) -> DelegateAgentConfig {
+    fn agentic_agent_config() -> DelegateAgentConfig {
         DelegateAgentConfig {
-            provider: "openrouter".to_string(),
-            model: "model-test".to_string(),
             system_prompt: Some("You are agentic.".to_string()),
-            api_key: Some("delegate-test-credential".to_string()),
-            temperature: Some(0.2),
-            max_depth: 3,
-            agentic: true,
-            allowed_tools,
-            max_iterations,
-            timeout_secs: None,
-            agentic_timeout_secs: None,
-            skills_directory: None,
-            memory_namespace: None,
-            channels: Vec::new(),
-            model_provider: String::new(),
-            model_provider_fallback: Vec::new(),
+            model_provider: "openrouter.agentic".to_string(),
+            runtime_profile: "agentic_test".to_string(),
+            ..Default::default()
         }
+    }
+
+    fn agentic_providers_models() -> HashMap<String, HashMap<String, ModelProviderConfig>> {
+        let mut models: HashMap<String, HashMap<String, ModelProviderConfig>> = HashMap::new();
+        models.entry("openrouter".to_string()).or_default().insert(
+            "agentic".to_string(),
+            ModelProviderConfig {
+                model: Some("model-test".to_string()),
+                temperature: Some(0.2),
+                api_key: Some("delegate-test-credential".to_string()),
+                ..Default::default()
+            },
+        );
+        models
+    }
+
+    fn agentic_runtime_profiles(
+        allowed_tools: Vec<String>,
+        max_iterations: usize,
+    ) -> HashMap<String, RuntimeProfileConfig> {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "agentic_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                allowed_tools,
+                max_tool_iterations: max_iterations,
+                ..Default::default()
+            },
+        );
+        profiles
     }
 
     #[test]
@@ -1558,9 +1733,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn depth_limit_per_agent() {
-        // coder has max_depth=2, so depth=2 should be blocked
-        let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), 2);
+    async fn depth_limit_at_default_max() {
+        // Default max_depth is 3; at depth=3 the agent should be blocked.
+        let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), 3);
         let result = tool
             .execute(json!({"agent": "coder", "prompt": "test"}))
             .await
@@ -1585,22 +1760,8 @@ mod tests {
         agents.insert(
             "broken".to_string(),
             DelegateAgentConfig {
-                provider: "totally-invalid-provider".to_string(),
-                model: "model".to_string(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
+                model_provider: "totally-invalid-provider.default".to_string(),
+                ..Default::default()
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1702,22 +1863,8 @@ mod tests {
         agents.insert(
             "tester".to_string(),
             DelegateAgentConfig {
-                provider: "invalid-for-test".to_string(),
-                model: "test-model".to_string(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
+                model_provider: "invalid-for-test.default".to_string(),
+                ..Default::default()
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1746,22 +1893,8 @@ mod tests {
         agents.insert(
             "tester".to_string(),
             DelegateAgentConfig {
-                provider: "invalid-for-test".to_string(),
-                model: "test-model".to_string(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
+                model_provider: "invalid-for-test.default".to_string(),
+                ..Default::default()
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1804,9 +1937,11 @@ mod tests {
     #[tokio::test]
     async fn agentic_mode_rejects_empty_allowed_tools() {
         let mut agents = HashMap::new();
-        agents.insert("agentic".to_string(), agentic_config(Vec::new(), 10));
+        agents.insert("agentic".to_string(), agentic_agent_config());
 
-        let tool = DelegateTool::new(agents, None, test_security());
+        let tool = DelegateTool::new(agents, None, test_security())
+            .with_providers_models(agentic_providers_models())
+            .with_runtime_profiles(agentic_runtime_profiles(Vec::new(), 10));
         let result = tool
             .execute(json!({"agent": "agentic", "prompt": "test"}))
             .await
@@ -1818,19 +1953,23 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("allowed_tools is empty")
+                .contains("has no allowed_tools"),
+            "got: {:?}",
+            result.error
         );
     }
 
     #[tokio::test]
     async fn agentic_mode_rejects_unmatched_allowed_tools() {
         let mut agents = HashMap::new();
-        agents.insert(
-            "agentic".to_string(),
-            agentic_config(vec!["missing_tool".to_string()], 10),
-        );
+        agents.insert("agentic".to_string(), agentic_agent_config());
 
         let tool = DelegateTool::new(agents, None, test_security())
+            .with_providers_models(agentic_providers_models())
+            .with_runtime_profiles(agentic_runtime_profiles(
+                vec!["missing_tool".to_string()],
+                10,
+            ))
             .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
         let result = tool
             .execute(json!({"agent": "agentic", "prompt": "test"}))
@@ -1849,17 +1988,25 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_runs_tool_call_loop_with_filtered_tools() {
-        let config = agentic_config(vec!["echo_tool".to_string()], 10);
-        let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
-            Arc::new(RwLock::new(vec![
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(vec!["echo_tool".to_string()], 10))
+            .with_parent_tools(Arc::new(RwLock::new(vec![
                 Arc::new(EchoTool),
                 Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
-            ])),
-        );
+            ])));
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                0.2,
+            )
             .await
             .unwrap();
 
@@ -1870,18 +2017,26 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
-        let config = agentic_config(vec!["delegate".to_string()], 10);
-        let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
-            Arc::new(RwLock::new(vec![Arc::new(DelegateTool::new(
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(vec!["delegate".to_string()], 10))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(DelegateTool::new(
                 HashMap::new(),
                 None,
                 test_security(),
-            ))])),
-        );
+            ))])));
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                0.2,
+            )
             .await
             .unwrap();
 
@@ -1897,13 +2052,22 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_respects_max_iterations() {
-        let config = agentic_config(vec!["echo_tool".to_string()], 2);
+        let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(vec!["echo_tool".to_string()], 2))
             .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
         let provider = InfiniteToolCallProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                0.2,
+            )
             .await
             .unwrap();
 
@@ -1919,13 +2083,22 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_propagates_provider_errors() {
-        let config = agentic_config(vec!["echo_tool".to_string()], 10);
+        let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(vec!["echo_tool".to_string()], 10))
             .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
         let provider = FailingProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                0.2,
+            )
             .await
             .unwrap();
 
@@ -2013,8 +2186,9 @@ mod tests {
     #[tokio::test]
     async fn mcp_tools_included_in_subagent_tool_list() {
         // Build DelegateTool with NO parent tools initially
-        let config = agentic_config(vec!["mcp_fake".to_string()], 10);
+        let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(vec!["mcp_fake".to_string()], 10))
             .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
 
         // Simulate late MCP tool injection via the shared handle
@@ -2023,7 +2197,15 @@ mod tests {
 
         let provider = McpToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run mcp", 0.2)
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run mcp",
+                0.2,
+            )
             .await
             .unwrap();
 
@@ -2038,22 +2220,9 @@ mod tests {
     #[test]
     fn enriched_prompt_includes_tools_workspace_datetime() {
         let config = DelegateAgentConfig {
-            provider: "openrouter".to_string(),
-            model: "test-model".to_string(),
             system_prompt: Some("You are a code reviewer.".to_string()),
-            api_key: None,
-            temperature: None,
-            max_depth: 3,
-            agentic: true,
-            allowed_tools: vec!["echo_tool".to_string()],
-            max_iterations: 10,
-            timeout_secs: None,
-            agentic_timeout_secs: None,
-            skills_directory: None,
-            memory_namespace: None,
-            channels: Vec::new(),
-            model_provider: String::new(),
-            model_provider_fallback: Vec::new(),
+            model_provider: "openrouter.test".to_string(),
+            ..Default::default()
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2067,7 +2236,7 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .build_enriched_system_prompt(&config, "test-model", &tools, &workspace)
             .unwrap();
 
         assert!(prompt.contains("## Tools"), "should contain tools section");
@@ -2094,24 +2263,7 @@ mod tests {
 
     #[test]
     fn enriched_prompt_includes_shell_policy_when_shell_present() {
-        let config = DelegateAgentConfig {
-            provider: "openrouter".to_string(),
-            model: "test-model".to_string(),
-            system_prompt: None,
-            api_key: None,
-            temperature: None,
-            max_depth: 3,
-            agentic: true,
-            allowed_tools: vec!["shell".to_string()],
-            max_iterations: 10,
-            timeout_secs: None,
-            agentic_timeout_secs: None,
-            skills_directory: None,
-            memory_namespace: None,
-            channels: Vec::new(),
-            model_provider: String::new(),
-            model_provider_fallback: Vec::new(),
-        };
+        let config = DelegateAgentConfig::default();
 
         struct MockShellTool;
         #[async_trait]
@@ -2141,7 +2293,7 @@ mod tests {
             .with_workspace_dir(workspace.to_path_buf());
 
         let prompt = tool
-            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .build_enriched_system_prompt(&config, "test-model", &tools, &workspace)
             .unwrap();
 
         assert!(
@@ -2167,57 +2319,22 @@ mod tests {
     // ── Configurable timeout tests ──────────────────────────────────
 
     #[test]
-    fn default_timeout_values_used_when_config_unset() {
-        let config = DelegateAgentConfig {
-            provider: "ollama".to_string(),
-            model: "llama3".to_string(),
-            system_prompt: None,
-            api_key: None,
-            temperature: None,
-            max_depth: 3,
-            agentic: false,
-            allowed_tools: Vec::new(),
-            max_iterations: 10,
-            timeout_secs: None,
-            agentic_timeout_secs: None,
-            skills_directory: None,
-            memory_namespace: None,
-            channels: Vec::new(),
-            model_provider: String::new(),
-            model_provider_fallback: Vec::new(),
-        };
+    fn delegate_timeout_defaults_come_from_delegate_config() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_delegate_config(DelegateToolConfig::default());
         assert_eq!(
-            config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
-            120
+            tool.delegate_config.timeout_secs,
+            DEFAULT_DELEGATE_TIMEOUT_SECS
         );
         assert_eq!(
-            config
-                .agentic_timeout_secs
-                .unwrap_or(DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS),
-            300
+            tool.delegate_config.agentic_timeout_secs,
+            DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS
         );
     }
 
     #[test]
     fn enriched_prompt_omits_shell_policy_without_shell_tool() {
-        let config = DelegateAgentConfig {
-            provider: "openrouter".to_string(),
-            model: "test-model".to_string(),
-            system_prompt: None,
-            api_key: None,
-            temperature: None,
-            max_depth: 3,
-            agentic: true,
-            allowed_tools: vec!["echo_tool".to_string()],
-            max_iterations: 10,
-            timeout_secs: None,
-            agentic_timeout_secs: None,
-            skills_directory: None,
-            memory_namespace: None,
-            channels: Vec::new(),
-            model_provider: String::new(),
-            model_provider_fallback: Vec::new(),
-        };
+        let config = DelegateAgentConfig::default();
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
         let workspace = std::env::temp_dir();
@@ -2226,7 +2343,7 @@ mod tests {
             .with_workspace_dir(workspace.to_path_buf());
 
         let prompt = tool
-            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .build_enriched_system_prompt(&config, "test-model", &tools, &workspace)
             .unwrap();
 
         assert!(
@@ -2236,234 +2353,13 @@ mod tests {
     }
 
     #[test]
-    fn custom_timeout_values_are_respected() {
-        let config = DelegateAgentConfig {
-            provider: "ollama".to_string(),
-            model: "llama3".to_string(),
-            system_prompt: None,
-            api_key: None,
-            temperature: None,
-            max_depth: 3,
-            agentic: false,
-            allowed_tools: Vec::new(),
-            max_iterations: 10,
-            timeout_secs: Some(60),
-            agentic_timeout_secs: Some(600),
-            skills_directory: None,
-            memory_namespace: None,
-            channels: Vec::new(),
-            model_provider: String::new(),
-            model_provider_fallback: Vec::new(),
-        };
-        assert_eq!(
-            config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
-            60
-        );
-        assert_eq!(
-            config
-                .agentic_timeout_secs
-                .unwrap_or(DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS),
-            600
-        );
-    }
-
-    #[test]
-    fn timeout_deserialization_defaults_to_none() {
-        let toml_str = r#"
-            provider = "ollama"
-            model = "llama3"
-        "#;
-        let config: DelegateAgentConfig = toml::from_str(toml_str).unwrap();
-        assert!(config.timeout_secs.is_none());
-        assert!(config.agentic_timeout_secs.is_none());
-    }
-
-    #[test]
-    fn timeout_deserialization_with_custom_values() {
-        let toml_str = r#"
-            provider = "ollama"
-            model = "llama3"
-            timeout_secs = 45
-            agentic_timeout_secs = 900
-        "#;
-        let config: DelegateAgentConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.timeout_secs, Some(45));
-        assert_eq!(config.agentic_timeout_secs, Some(900));
-    }
-
-    #[test]
-    fn config_validation_rejects_zero_timeout() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.agents.insert(
-            "bad".into(),
-            DelegateAgentConfig {
-                provider: "ollama".into(),
-                model: "llama3".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: Some(0),
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
-            },
-        );
-        let err = config.validate().unwrap_err();
-        assert!(
-            format!("{err}").contains("timeout_secs must be greater than 0"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn config_validation_rejects_zero_agentic_timeout() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.agents.insert(
-            "bad".into(),
-            DelegateAgentConfig {
-                provider: "ollama".into(),
-                model: "llama3".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: Some(0),
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
-            },
-        );
-        let err = config.validate().unwrap_err();
-        assert!(
-            format!("{err}").contains("agentic_timeout_secs must be greater than 0"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn config_validation_rejects_excessive_timeout() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.agents.insert(
-            "bad".into(),
-            DelegateAgentConfig {
-                provider: "ollama".into(),
-                model: "llama3".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: Some(7200),
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
-            },
-        );
-        let err = config.validate().unwrap_err();
-        assert!(
-            format!("{err}").contains("exceeds max 3600"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn config_validation_rejects_excessive_agentic_timeout() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.agents.insert(
-            "bad".into(),
-            DelegateAgentConfig {
-                provider: "ollama".into(),
-                model: "llama3".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: Some(5000),
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
-            },
-        );
-        let err = config.validate().unwrap_err();
-        assert!(
-            format!("{err}").contains("exceeds max 3600"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn config_validation_accepts_max_boundary_timeout() {
+    fn config_validation_accepts_minimal_agent() {
         let mut config = zeroclaw_config::schema::Config::default();
         config.agents.insert(
             "ok".into(),
             DelegateAgentConfig {
-                provider: "ollama".into(),
-                model: "llama3".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: Some(3600),
-                agentic_timeout_secs: Some(3600),
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
-            },
-        );
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn config_validation_accepts_none_timeouts() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.agents.insert(
-            "ok".into(),
-            DelegateAgentConfig {
-                provider: "ollama".into(),
-                model: "llama3".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-                channels: Vec::new(),
-                model_provider: String::new(),
-                model_provider_fallback: Vec::new(),
+                model_provider: "ollama.default".into(),
+                ..Default::default()
             },
         );
         assert!(config.validate().is_ok());
@@ -2484,31 +2380,27 @@ mod tests {
         .unwrap();
 
         let config = DelegateAgentConfig {
-            provider: "openrouter".to_string(),
-            model: "test-model".to_string(),
-            system_prompt: None,
-            api_key: None,
-            temperature: None,
-            max_depth: 3,
-            agentic: true,
-            allowed_tools: vec!["echo_tool".to_string()],
-            max_iterations: 10,
-            timeout_secs: None,
-            agentic_timeout_secs: None,
-            skills_directory: Some("skills/code-review".to_string()),
-            memory_namespace: None,
-            channels: Vec::new(),
-            model_provider: String::new(),
-            model_provider_fallback: Vec::new(),
+            skill_bundle: "code_review".to_string(),
+            ..Default::default()
         };
+
+        let mut skill_bundles = HashMap::new();
+        skill_bundles.insert(
+            "code_review".to_string(),
+            SkillBundleConfig {
+                directory: Some("skills/code-review".to_string()),
+                ..Default::default()
+            },
+        );
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
 
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_skill_bundles(skill_bundles)
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .build_enriched_system_prompt(&config, "test-model", &tools, &workspace)
             .unwrap();
 
         assert!(
@@ -2533,24 +2425,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = DelegateAgentConfig {
-            provider: "openrouter".to_string(),
-            model: "test-model".to_string(),
-            system_prompt: None,
-            api_key: None,
-            temperature: None,
-            max_depth: 3,
-            agentic: true,
-            allowed_tools: vec!["echo_tool".to_string()],
-            max_iterations: 10,
-            timeout_secs: None,
-            agentic_timeout_secs: None,
-            skills_directory: None,
-            memory_namespace: None,
-            channels: Vec::new(),
-            model_provider: String::new(),
-            model_provider_fallback: Vec::new(),
-        };
+        let config = DelegateAgentConfig::default();
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
 
@@ -2558,7 +2433,7 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .build_enriched_system_prompt(&config, "test-model", &tools, &workspace)
             .unwrap();
 
         assert!(
