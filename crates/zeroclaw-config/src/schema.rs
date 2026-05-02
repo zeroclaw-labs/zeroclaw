@@ -7175,10 +7175,14 @@ pub struct SlackConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// Slack bot OAuth token (xoxb-...).
+    /// Slack bot OAuth token (xoxb-...). When omitted from `config.toml`,
+    /// resolved at startup from `ZEROCLAW_SLACK_BOT_TOKEN` then
+    /// `SLACK_BOT_TOKEN`. Channel construction fails with a clear error
+    /// if the token is supplied through neither path. See #6237.
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub bot_token: String,
+    #[serde(default)]
+    pub bot_token: Option<String>,
     /// Slack app-level token for Socket Mode (xapp-...).
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -11464,6 +11468,28 @@ impl Config {
                  implemented; this section is reserved for future use and will be ignored"
             );
         }
+
+        // Slack channel-token env-var fallbacks. Resolved here (after the
+        // file is parsed and all other overrides applied) so a config that
+        // omits `bot_token` entirely still deserializes — channel
+        // construction picks up the env value at startup. See #6237.
+        // ZEROCLAW_-prefixed variants take precedence over the bare names.
+        if let Some(ref mut sl) = self.channels.slack {
+            if sl.bot_token.as_deref().is_none_or(str::is_empty)
+                && let Ok(v) = std::env::var("ZEROCLAW_SLACK_BOT_TOKEN")
+                    .or_else(|_| std::env::var("SLACK_BOT_TOKEN"))
+                && !v.is_empty()
+            {
+                sl.bot_token = Some(v);
+            }
+            if sl.app_token.as_deref().is_none_or(str::is_empty)
+                && let Ok(v) = std::env::var("ZEROCLAW_SLACK_APP_TOKEN")
+                    .or_else(|_| std::env::var("SLACK_APP_TOKEN"))
+                && !v.is_empty()
+            {
+                sl.app_token = Some(v);
+            }
+        }
     }
 
     async fn resolve_config_path_for_save(&self) -> Result<PathBuf> {
@@ -13601,6 +13627,130 @@ allowed_users = ["@u:matrix.org"]
         assert_eq!(parsed.thread_replies, Some(false));
         assert!(!parsed.interrupt_on_new_message);
         assert!(!parsed.mention_only);
+    }
+
+    /// Regression test for #6237 — before the fix, omitting `bot_token`
+    /// from `[channels.slack]` made the entire config file fail to
+    /// deserialize with `missing field 'bot_token'`, blocking startup
+    /// even when `SLACK_BOT_TOKEN` was provided via the environment
+    /// (the env-fallback never ran because deserialization aborted first).
+    #[test]
+    async fn slack_config_deserializes_without_bot_token() {
+        let json = r#"{}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).expect(
+            "SlackConfig must deserialize without bot_token so the env-var \
+             fallback in apply_env_overrides has a chance to populate it",
+        );
+        assert!(parsed.bot_token.is_none());
+        assert!(parsed.app_token.is_none());
+    }
+
+    #[test]
+    async fn slack_config_deserializes_explicit_bot_token() {
+        let json = r#"{"bot_token":"xoxb-from-toml"}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.bot_token.as_deref(), Some("xoxb-from-toml"));
+    }
+
+    /// `apply_env_overrides` populates `bot_token` from `SLACK_BOT_TOKEN`
+    /// when the config field is `None`. This is the path that #6237
+    /// reporters were trying to use — they had `SLACK_BOT_TOKEN` set in
+    /// their environment but the schema rejected the config before the
+    /// override could fire.
+    #[test]
+    async fn slack_apply_env_overrides_populates_bot_token_from_env() {
+        let _env_guard = env_override_lock().await;
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe {
+            std::env::remove_var("ZEROCLAW_SLACK_BOT_TOKEN");
+            std::env::remove_var("ZEROCLAW_SLACK_APP_TOKEN");
+            std::env::remove_var("SLACK_APP_TOKEN");
+            std::env::set_var("SLACK_BOT_TOKEN", "xoxb-from-env");
+        }
+
+        let mut config = Config::default();
+        config.channels.slack = Some(SlackConfig {
+            bot_token: None,
+            ..Default::default()
+        });
+        config.apply_env_overrides();
+
+        assert_eq!(
+            config
+                .channels
+                .slack
+                .as_ref()
+                .and_then(|s| s.bot_token.as_deref()),
+            Some("xoxb-from-env")
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("SLACK_BOT_TOKEN") };
+    }
+
+    /// The `ZEROCLAW_SLACK_BOT_TOKEN` variant takes precedence over
+    /// `SLACK_BOT_TOKEN` so workspace-scoped envs can override a
+    /// generic one set on the host.
+    #[test]
+    async fn slack_apply_env_overrides_prefers_zeroclaw_prefix() {
+        let _env_guard = env_override_lock().await;
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe {
+            std::env::set_var("SLACK_BOT_TOKEN", "xoxb-generic");
+            std::env::set_var("ZEROCLAW_SLACK_BOT_TOKEN", "xoxb-zeroclaw-prefix");
+        }
+
+        let mut config = Config::default();
+        config.channels.slack = Some(SlackConfig {
+            bot_token: None,
+            ..Default::default()
+        });
+        config.apply_env_overrides();
+
+        assert_eq!(
+            config
+                .channels
+                .slack
+                .as_ref()
+                .and_then(|s| s.bot_token.as_deref()),
+            Some("xoxb-zeroclaw-prefix")
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe {
+            std::env::remove_var("SLACK_BOT_TOKEN");
+            std::env::remove_var("ZEROCLAW_SLACK_BOT_TOKEN");
+        }
+    }
+
+    /// `apply_env_overrides` must NOT clobber a config-supplied bot_token,
+    /// otherwise users who set the value in `config.toml` would silently
+    /// have it replaced by an env var they didn't intend to be authoritative.
+    #[test]
+    async fn slack_apply_env_overrides_preserves_config_supplied_bot_token() {
+        let _env_guard = env_override_lock().await;
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("SLACK_BOT_TOKEN", "xoxb-from-env") };
+
+        let mut config = Config::default();
+        config.channels.slack = Some(SlackConfig {
+            bot_token: Some("xoxb-from-toml".to_string()),
+            ..Default::default()
+        });
+        config.apply_env_overrides();
+
+        assert_eq!(
+            config
+                .channels
+                .slack
+                .as_ref()
+                .and_then(|s| s.bot_token.as_deref()),
+            Some("xoxb-from-toml"),
+            "config-supplied bot_token must win over env var"
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("SLACK_BOT_TOKEN") };
     }
 
     #[test]
