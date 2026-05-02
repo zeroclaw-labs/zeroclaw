@@ -120,6 +120,9 @@
 
 - Chat message deletion, clear-all, and a compact mode (#6083).
 - Cron job configuration UI (#5936).
+- Dashboard i18n is now split by locale module, and the Settings / Config
+  surfaces localize labels, helper descriptions, placeholders, badges, and
+  schema-derived config field text with English/schema fallback.
 - Embedded web build for the `pack` bin (#6181).
 - Bug-fix bundle: Overview crash, model save, editor caret, chat CPU usage (#6161).
 - Array-returning API helpers now guard against non-array responses (#6162).
