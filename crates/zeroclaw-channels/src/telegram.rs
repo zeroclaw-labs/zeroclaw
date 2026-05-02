@@ -1437,13 +1437,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // they are rejected here — the bot has no reliable way to know it
         // was mentioned without first transcribing, and we don't want to
         // pay that cost for messages that will likely be dropped. See #6229.
+        // The transcription itself is discarded; we only care whether the
+        // gate returns Some (allowed) vs None (rejected).
         let voice_caption = message.get("caption").and_then(serde_json::Value::as_str);
-        if self
-            .check_media_mention_gate(message, voice_caption)
-            .is_none()
-        {
-            return None;
-        }
+        self.check_media_mention_gate(message, voice_caption)?;
 
         let chat_id = message
             .get("chat")
