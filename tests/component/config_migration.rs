@@ -2001,3 +2001,200 @@ token = "pinggy-token"
     let pg = config.tunnel.pinggy.as_ref().unwrap();
     assert_eq!(pg.token.as_deref(), Some("pinggy-token"));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fixture generation (zeroclaw config generate)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const FIXTURES_DIR: &str = "crates/zeroclaw-config/src/fixtures";
+
+fn fixture_raw(name: &str) -> String {
+    std::fs::read_to_string(format!("{FIXTURES_DIR}/{name}"))
+        .unwrap_or_else(|e| panic!("failed to read {FIXTURES_DIR}/{name}: {e}"))
+}
+
+fn generate(version: u32) -> String {
+    let v1 = fixture_raw("v1.toml");
+    let partial_path = format!("{FIXTURES_DIR}/v{version}.partial.toml");
+    let partial = std::fs::read_to_string(&partial_path).ok();
+    migration::generate_fixture(version, &v1, partial.as_deref())
+        .unwrap_or_else(|e| panic!("generate_fixture({version}) failed: {e}"))
+}
+
+fn parse(toml_str: &str) -> zeroclaw::config::Config {
+    migrate(toml_str)
+}
+
+#[test]
+fn fixture_v1_parses_without_error() {
+    let out = generate(1);
+    // V1 is the raw fixture — parse via the migration pipeline so prepare_table runs.
+    parse(&out);
+}
+
+#[test]
+fn fixture_v1_preserves_raw_field_names() {
+    let out = generate(1);
+    // V1 uses the pre-migration field names — not the V3 aliases.
+    assert!(
+        out.contains("room_id"),
+        "V1 should have room_id, not allowed_rooms"
+    );
+    assert!(
+        out.contains("guild_id"),
+        "V1 should have guild_id, not guild_ids"
+    );
+    assert!(
+        out.contains("subreddit"),
+        "V1 should have subreddit, not subreddits"
+    );
+    assert!(
+        out.contains("channels_config"),
+        "V1 should use channels_config key"
+    );
+    assert!(
+        !out.contains(".default]"),
+        "V1 should not have aliased channel sections"
+    );
+}
+
+#[test]
+fn fixture_v1_has_correct_schema_version() {
+    let out = generate(1);
+    assert!(out.contains("schema_version = 1"));
+}
+
+#[test]
+fn fixture_v2_parses_without_error() {
+    let out = generate(2);
+    parse(&out);
+}
+
+#[test]
+fn fixture_v2_has_correct_schema_version() {
+    let out = generate(2);
+    assert!(out.contains("schema_version = 2"));
+}
+
+#[test]
+fn fixture_v2_has_flat_provider_models() {
+    let out = generate(2);
+    // V2 providers.models is flat: [providers.models.myprovider] not [providers.models.myprovider.default]
+    assert!(
+        out.contains("[providers.models.myprovider]"),
+        "V2 should have flat provider model section"
+    );
+}
+
+#[test]
+fn fixture_v2_provider_fallback_is_string() {
+    let out = generate(2);
+    // V2 fallback is a bare string, not an array.
+    assert!(
+        out.contains("fallback = \"myprovider\""),
+        "V2 fallback should be a string"
+    );
+}
+
+#[test]
+fn fixture_v3_parses_without_error() {
+    let out = generate(3);
+    parse(&out);
+}
+
+#[test]
+fn fixture_v3_has_correct_schema_version() {
+    let out = generate(3);
+    assert!(out.contains(&format!("schema_version = {CURRENT_SCHEMA_VERSION}")));
+}
+
+#[test]
+fn fixture_v3_has_aliased_provider_models() {
+    let out = generate(3);
+    // V3 providers.models is nested: [providers.models.myprovider.default]
+    assert!(
+        out.contains("[providers.models.myprovider.default]"),
+        "V3 should have aliased provider model section"
+    );
+}
+
+#[test]
+fn fixture_v3_provider_fallback_is_array() {
+    let out = generate(3);
+    assert!(
+        out.contains("fallback = [\"myprovider.default\"]"),
+        "V3 fallback should be an array with dotted alias"
+    );
+}
+
+#[test]
+fn fixture_v3_has_aliased_channels() {
+    let out = generate(3);
+    assert!(
+        out.contains("[channels.discord.default]"),
+        "V3 should have aliased channel sections"
+    );
+    assert!(
+        out.contains("[channels.matrix.default]"),
+        "V3 should have aliased matrix channel"
+    );
+}
+
+#[test]
+fn fixture_v3_has_risk_profiles() {
+    let out = generate(3);
+    assert!(
+        out.contains("[risk_profiles.default]"),
+        "V3 should have risk_profiles.default from autonomy migration"
+    );
+}
+
+#[test]
+fn fixture_v3_has_runtime_profiles() {
+    let out = generate(3);
+    assert!(
+        out.contains("[runtime_profiles.default]"),
+        "V3 should have runtime_profiles.default from agent migration"
+    );
+}
+
+#[test]
+fn fixture_v3_does_not_have_legacy_autonomy_section() {
+    let out = generate(3);
+    assert!(
+        !out.contains("\n[autonomy]"),
+        "V3 should not re-emit the legacy [autonomy] section"
+    );
+}
+
+#[test]
+fn fixture_v3_does_not_have_legacy_agent_section() {
+    let out = generate(3);
+    assert!(
+        !out.contains("\n[agent]"),
+        "V3 should not re-emit the legacy [agent] section"
+    );
+}
+
+#[test]
+fn fixture_v2_and_v3_are_comparable_in_size() {
+    let v2 = generate(2);
+    let v3 = generate(3);
+    let v2_lines = v2.lines().count();
+    let v3_lines = v3.lines().count();
+    // V2 and V3 should be within 20% of each other in line count.
+    let ratio = v2_lines as f64 / v3_lines as f64;
+    assert!(
+        ratio > 0.8 && ratio < 1.2,
+        "V2 ({v2_lines} lines) and V3 ({v3_lines} lines) should be comparable in size"
+    );
+}
+
+#[test]
+fn fixture_v3_migrates_to_current_version() {
+    let out = generate(3);
+    // A V3 fixture loaded through the migration pipeline should already be at
+    // current version and require no further migration.
+    let config = parse(&out);
+    assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
+}
