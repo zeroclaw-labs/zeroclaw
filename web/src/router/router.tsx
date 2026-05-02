@@ -11,6 +11,7 @@ import {
   Integrations,
   Logs,
   Memory,
+  Onboard,
   Pairing,
   Tools,
 } from './lazyPages';
@@ -37,11 +38,14 @@ export const Router = () => (
         <Route path="/integrations" element={<Integrations />} />
         <Route path="/memory" element={<Memory />} />
         <Route path="/config" element={<Config />} />
+        <Route path="/config/:section" element={<Config />} />
+        <Route path="/setup/:section" element={<Config />} />
         <Route path="/cost" element={<Cost />} />
         <Route path="/logs" element={<Logs />} />
         <Route path="/doctor" element={<Doctor />} />
         <Route path="/pairing" element={<Pairing />} />
         <Route path="/canvas" element={<Canvas />} />
+        <Route path="/onboard" element={<Onboard />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

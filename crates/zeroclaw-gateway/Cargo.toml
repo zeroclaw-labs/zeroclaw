@@ -13,7 +13,7 @@ zeroclaw-config.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-providers.workspace = true
-zeroclaw-channels = { workspace = true, default-features = true, features = ["channel-email", "channel-telegram"] }
+zeroclaw-channels = { workspace = true, default-features = true, features = ["channel-acp-server", "channel-email", "channel-telegram"] }
 zeroclaw-runtime.workspace = true
 zeroclaw-tools.workspace = true
 zeroclaw-hardware.workspace = true
@@ -34,6 +34,10 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 # Frontend asset MIME type detection (dashboard served from filesystem)
 mime_guess = "2"
 include_dir = { version = "0.7", optional = true }
+
+# Schemars JSON Schema generation for OPTIONS responses; matches the version
+# zeroclaw-config already pulls.
+schemars = { version = "1.2", optional = true }
 
 # Async runtime
 tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "signal"] }
@@ -62,6 +66,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 parking_lot = "0.12"
 toml = "1.0"
+toml_edit = "0.25"
 tracing = { version = "0.1", default-features = false }
 rustls-pemfile = "2"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
@@ -73,10 +78,15 @@ tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 
 [features]
-default = []
+default = ["schema-export"]
 plugins-wasm = ["dep:zeroclaw-plugins"]
 webauthn = ["zeroclaw-runtime/webauthn"]
 observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]
 channel-nostr = ["zeroclaw-channels/channel-nostr"]
 gateway-voice-duplex = []
+# Enables OPTIONS /api/config* responses with the schemars-generated
+# JSON Schema body and the serde-side schemars derives transitively. Defaults
+# on; turning it off omits OPTIONS schema bodies (returns a small placeholder)
+# and saves a bit of build time. Mirrors zeroclaw-config's `schema-export`.
+schema-export = ["zeroclaw-config/schema-export", "dep:schemars"]
 embedded-web = ["dep:include_dir"]

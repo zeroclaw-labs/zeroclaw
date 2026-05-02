@@ -152,6 +152,7 @@ impl Sandbox for LandlockSandbox {
 
 // Stub implementations for non-Linux or when feature is disabled
 #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
+#[derive(Debug)]
 pub struct LandlockSandbox;
 
 #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
