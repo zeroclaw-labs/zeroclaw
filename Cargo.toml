@@ -59,6 +59,11 @@ include = [
 name = "zeroclaw"
 path = "src/main.rs"
 
+[[bin]]
+name = "zeroclaw-acp-bridge"
+path = "src/bin/zeroclaw-acp-bridge.rs"
+required-features = ["acp-bridge"]
+
 [lib]
 name = "zeroclaw"
 path = "src/lib.rs"
@@ -235,6 +240,7 @@ libc = "0.2"
 [features]
 default = [
     "agent-runtime",
+    "acp-bridge",
     "gateway",
     "tui-onboarding",
     "observability-prometheus",
@@ -271,6 +277,7 @@ gateway = [
 ]
 tui-onboarding = ["dep:zeroclaw-tui"]
 schema-export = ["zeroclaw-config/schema-export"]
+acp-bridge = ["dep:tokio-tungstenite"]
 
 # Channels — each forwards directly to zeroclaw-channels (1 hop)
 channel-email = ["zeroclaw-channels/channel-email"]

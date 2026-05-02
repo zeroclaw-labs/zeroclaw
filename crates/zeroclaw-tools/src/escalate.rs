@@ -2,7 +2,7 @@
 //!
 //! Exposes `escalate_to_human` as an agent-callable tool that sends a structured
 //! escalation message to a messaging channel. High/critical urgency escalations
-//! additionally fire a Pushover mobile notification when credentials are available.
+//! additionally notify any channels listed in `[escalation] alert_channels`.
 //! Supports optional blocking mode to wait for a human response.
 
 use crate::ask_user::ChannelMapHandle;
@@ -10,15 +10,12 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
-const PUSHOVER_API_URL: &str = "https://api.pushover.net/1/messages.json";
-const PUSHOVER_REQUEST_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
 const VALID_URGENCY_LEVELS: &[&str] = &["low", "medium", "high", "critical"];
@@ -27,15 +24,15 @@ const VALID_URGENCY_LEVELS: &[&str] = &["low", "medium", "high", "critical"];
 pub struct EscalateToHumanTool {
     security: Arc<SecurityPolicy>,
     channel_map: ChannelMapHandle,
-    workspace_dir: PathBuf,
+    alert_channels: Vec<String>,
 }
 
 impl EscalateToHumanTool {
-    pub fn new(security: Arc<SecurityPolicy>, workspace_dir: PathBuf) -> Self {
+    pub fn new(security: Arc<SecurityPolicy>, alert_channels: Vec<String>) -> Self {
         Self {
             security,
             channel_map: Arc::new(RwLock::new(HashMap::new())),
-            workspace_dir,
+            alert_channels,
         }
     }
 
@@ -69,97 +66,29 @@ impl EscalateToHumanTool {
         lines.join("\n")
     }
 
-    /// Try to read Pushover credentials from .env file. Returns None if unavailable.
-    async fn get_pushover_credentials(&self) -> Option<(String, String)> {
-        let env_path = self.workspace_dir.join(".env");
-        let content = tokio::fs::read_to_string(&env_path).await.ok()?;
-
-        let mut token = None;
-        let mut user_key = None;
-
-        for line in content.lines() {
-            let line = line.trim();
-            if line.starts_with('#') || line.is_empty() {
-                continue;
-            }
-            let line = line.strip_prefix("export ").map(str::trim).unwrap_or(line);
-            if let Some((key, value)) = line.split_once('=') {
-                let key = key.trim();
-                let value = Self::parse_env_value(value);
-
-                if key.eq_ignore_ascii_case("PUSHOVER_TOKEN") {
-                    token = Some(value);
-                } else if key.eq_ignore_ascii_case("PUSHOVER_USER_KEY") {
-                    user_key = Some(value);
-                }
-            }
-        }
-
-        match (token, user_key) {
-            (Some(t), Some(u)) if !t.is_empty() && !u.is_empty() => Some((t, u)),
-            _ => None,
-        }
-    }
-
-    fn parse_env_value(raw: &str) -> String {
-        let raw = raw.trim();
-        let unquoted = if raw.len() >= 2
-            && ((raw.starts_with('"') && raw.ends_with('"'))
-                || (raw.starts_with('\'') && raw.ends_with('\'')))
-        {
-            &raw[1..raw.len() - 1]
-        } else {
-            raw
+    /// Send best-effort alerts to configured alert channels for high/critical urgency.
+    async fn send_alerts(&self, text: &str) {
+        // Collect Arc clones while holding the lock, then drop the guard before awaiting.
+        let targets: Vec<(String, Arc<dyn Channel>)> = {
+            let channels = self.channel_map.read();
+            self.alert_channels
+                .iter()
+                .filter_map(|name| {
+                    if let Some(ch) = channels.get(name) {
+                        Some((name.clone(), Arc::clone(ch)))
+                    } else {
+                        tracing::warn!(
+                            "escalate_to_human: alert channel '{name}' not found in channel map"
+                        );
+                        None
+                    }
+                })
+                .collect()
         };
-        unquoted.split_once(" #").map_or_else(
-            || unquoted.trim().to_string(),
-            |(value, _)| value.trim().to_string(),
-        )
-    }
-
-    /// Send a Pushover notification. Logs but does not fail on error.
-    async fn send_pushover(&self, urgency: &str, summary: &str) {
-        let creds = match self.get_pushover_credentials().await {
-            Some(c) => c,
-            None => {
-                tracing::debug!(
-                    "escalate_to_human: Pushover credentials not available, skipping push notification"
-                );
-                return;
-            }
-        };
-
-        let priority = match urgency {
-            "critical" => 1,
-            "high" => 0,
-            _ => return,
-        };
-
-        let form = reqwest::multipart::Form::new()
-            .text("token", creds.0)
-            .text("user", creds.1)
-            .text("message", summary.to_string())
-            .text("title", "Agent Escalation")
-            .text("priority", priority.to_string());
-
-        let client = zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "tool.escalate_to_human",
-            PUSHOVER_REQUEST_TIMEOUT_SECS,
-            10,
-        );
-
-        match client.post(PUSHOVER_API_URL).multipart(form).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                tracing::info!("escalate_to_human: Pushover notification sent");
-            }
-            Ok(resp) => {
-                tracing::warn!(
-                    "escalate_to_human: Pushover returned status {}",
-                    resp.status()
-                );
-            }
-            Err(e) => {
-                tracing::warn!("escalate_to_human: Pushover request failed: {e}");
+        for (name, ch) in targets {
+            let msg = SendMessage::new(text, "");
+            if let Err(e) = ch.send(&msg).await {
+                tracing::warn!("escalate_to_human: alert to channel '{name}' failed: {e}");
             }
         }
     }
@@ -174,7 +103,7 @@ impl Tool for EscalateToHumanTool {
     fn description(&self) -> &str {
         "Escalate a situation to a human operator with urgency routing. \
          Sends a structured message to the active channel. High/critical urgency \
-         also triggers a Pushover mobile notification when configured. \
+         also notifies any channels listed in `[escalation] alert_channels`. \
          Optionally blocks to wait for a human response."
     }
 
@@ -193,7 +122,7 @@ impl Tool for EscalateToHumanTool {
                 "urgency": {
                     "type": "string",
                     "enum": ["low", "medium", "high", "critical"],
-                    "description": "Urgency level (default: medium). high/critical triggers Pushover notification."
+                    "description": "Urgency level (default: medium). high/critical also notifies alert_channels."
                 },
                 "wait_for_response": {
                     "type": "boolean",
@@ -282,6 +211,24 @@ impl Tool for EscalateToHumanTool {
             (name.clone(), ch.clone())
         };
 
+        // Channels without free-form `listen` support (e.g. ACP today, until
+        // the elicitation RFD lands) can't deliver the human's reply. Fail
+        // fast so the agent can route the escalation differently or proceed
+        // without blocking — the alternative is silently timing out for
+        // `timeout_secs` seconds.
+        // RFD: https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx
+        if wait_for_response && !channel.supports_free_form_ask() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Channel '{channel_name}' cannot receive a free-form reply, \
+                     so `wait_for_response` is unsupported (awaits ACP elicitation RFD). \
+                     Retry with `wait_for_response: false`."
+                )),
+            });
+        }
+
         // Send the escalation message
         let msg = SendMessage::new(&text, "");
         if let Err(e) = channel.send(&msg).await {
@@ -294,9 +241,9 @@ impl Tool for EscalateToHumanTool {
             });
         }
 
-        // Fire Pushover for high/critical urgency (non-blocking, best-effort)
-        if urgency == "high" || urgency == "critical" {
-            self.send_pushover(urgency, &summary).await;
+        // Notify alert channels for high/critical urgency (non-blocking, best-effort)
+        if (urgency == "high" || urgency == "critical") && !self.alert_channels.is_empty() {
+            self.send_alerts(&text).await;
         }
 
         if wait_for_response {
@@ -434,8 +381,7 @@ mod tests {
     }
 
     fn make_tool_with_channels(channels: Vec<(&str, Arc<dyn Channel>)>) -> EscalateToHumanTool {
-        let tool =
-            EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), PathBuf::from("/tmp"));
+        let tool = EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![]);
         let map: HashMap<String, Arc<dyn Channel>> = channels
             .into_iter()
             .map(|(name, ch)| (name.to_string(), ch))
@@ -448,8 +394,7 @@ mod tests {
 
     #[test]
     fn test_tool_metadata() {
-        let tool =
-            EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), PathBuf::from("/tmp"));
+        let tool = EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![]);
         assert_eq!(tool.name(), "escalate_to_human");
         assert!(!tool.description().is_empty());
         assert!(tool.description().to_lowercase().contains("escalat"));
@@ -459,8 +404,7 @@ mod tests {
 
     #[test]
     fn test_parameters_schema() {
-        let tool =
-            EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), PathBuf::from("/tmp"));
+        let tool = EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![]);
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["summary"].is_object());
@@ -611,11 +555,104 @@ mod tests {
         assert!(result.error.as_deref().unwrap().contains("1 seconds"));
     }
 
-    // ── 10. test_pushover_not_required ──
+    /// Stub channel that mirrors ACP's constraint: `send` works, but
+    /// `listen` is unsupported and `supports_free_form_ask` reports false.
+    struct StructuredOnlyChannel {
+        channel_name: String,
+        sent: Arc<RwLock<Vec<String>>>,
+    }
+
+    impl StructuredOnlyChannel {
+        fn new(name: &str) -> Self {
+            Self {
+                channel_name: name.to_string(),
+                sent: Arc::new(RwLock::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Channel for StructuredOnlyChannel {
+        fn name(&self) -> &str {
+            &self.channel_name
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.write().push(message.content.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("listen not supported")
+        }
+
+        fn supports_free_form_ask(&self) -> bool {
+            false
+        }
+    }
 
     #[tokio::test]
-    async fn test_pushover_not_required() {
-        // High urgency without Pushover credentials should still succeed (channel-only)
+    async fn wait_for_response_fails_fast_on_structured_only_channel() {
+        // ACP-shaped channel: can't listen, so wait_for_response must fail
+        // immediately rather than timing out silently.
+        let stub = Arc::new(StructuredOnlyChannel::new("acp"));
+        let stub_clone: Arc<dyn Channel> = stub.clone();
+        let tool = make_tool_with_channels(vec![("acp", stub_clone)]);
+
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(json!({
+                "summary": "Need confirmation",
+                "wait_for_response": true,
+                "timeout_secs": 30,
+            }))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(!result.success, "expected failure, got: {:?}", result);
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("wait_for_response"),
+            "error should mention wait_for_response: {err}"
+        );
+        // Must fail fast — well under the 30s timeout.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "expected fast-fail; took {elapsed:?}"
+        );
+        // No message should have been sent — gate fires before send.
+        assert!(stub.sent.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_blocking_works_on_structured_only_channel() {
+        // The gate must NOT fire when wait_for_response is false — the
+        // escalation message itself goes through `send`, which ACP supports.
+        let stub = Arc::new(StructuredOnlyChannel::new("acp"));
+        let stub_clone: Arc<dyn Channel> = stub.clone();
+        let tool = make_tool_with_channels(vec![("acp", stub_clone)]);
+
+        let result = tool
+            .execute(json!({
+                "summary": "FYI: deploy started",
+                "urgency": "low",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert_eq!(stub.sent.read().len(), 1);
+    }
+
+    // ── 10. test_high_urgency_succeeds_without_alert_channels ──
+
+    #[tokio::test]
+    async fn test_high_urgency_succeeds_without_alert_channels() {
+        // High urgency with no alert_channels configured should still succeed
         let tool = make_tool_with_channels(vec![(
             "test",
             Arc::new(SilentChannel::new("test")) as Arc<dyn Channel>,

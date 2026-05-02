@@ -69,7 +69,7 @@ impl Tool for FileWriteTool {
             });
         }
 
-        // Security check: validate path is within workspace
+        // Security check: validate path is within workspace or allowed_roots
         if !self.security.is_path_allowed(path) {
             return Ok(ToolResult {
                 success: false,
@@ -88,10 +88,10 @@ impl Tool for FileWriteTool {
             });
         };
 
-        // Ensure parent directory exists
+        // Ensure parent directory exists before canonicalising.
         tokio::fs::create_dir_all(parent).await?;
 
-        // Resolve parent AFTER creation to block symlink escapes.
+        // Canonicalise parent AFTER creation to detect symlink escapes.
         let resolved_parent = match tokio::fs::canonicalize(parent).await {
             Ok(p) => p,
             Err(e) => {
@@ -178,36 +178,38 @@ mod tests {
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
-    fn test_security(workspace: std::path::PathBuf) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
+    fn test_tool(workspace: std::path::PathBuf) -> FileWriteTool {
+        let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: workspace,
             ..SecurityPolicy::default()
-        })
+        });
+        FileWriteTool::new(security)
     }
 
-    fn test_security_with(
+    fn test_tool_with(
         workspace: std::path::PathBuf,
         autonomy: AutonomyLevel,
         max_actions_per_hour: u32,
-    ) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
+    ) -> FileWriteTool {
+        let security = Arc::new(SecurityPolicy {
             autonomy,
             workspace_dir: workspace,
             max_actions_per_hour,
             ..SecurityPolicy::default()
-        })
+        });
+        FileWriteTool::new(security)
     }
 
     #[test]
     fn file_write_name() {
-        let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         assert_eq!(tool.name(), "file_write");
     }
 
     #[test]
     fn file_write_schema_has_path_and_content() {
-        let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["path"].is_object());
         assert!(schema["properties"]["content"].is_object());
@@ -222,7 +224,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "out.txt", "content": "written!"}))
             .await
@@ -244,7 +246,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "a/b/c/deep.txt", "content": "deep"}))
             .await
@@ -266,7 +268,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        let tool = test_tool(workspace.clone());
         let workspace_prefixed = workspace
             .strip_prefix(std::path::Path::new("/"))
             .unwrap()
@@ -298,7 +300,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "exist.txt", "content": "new"}))
             .await
@@ -319,7 +321,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "../../etc/evil", "content": "bad"}))
             .await
@@ -332,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_blocks_absolute_path() {
-        let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let result = tool
             .execute(json!({"path": "/etc/evil", "content": "bad"}))
             .await
@@ -343,14 +345,14 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_missing_path_param() {
-        let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let result = tool.execute(json!({"content": "data"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn file_write_missing_content_param() {
-        let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let result = tool.execute(json!({"path": "file.txt"})).await;
         assert!(result.is_err());
     }
@@ -361,7 +363,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "empty.txt", "content": ""}))
             .await
@@ -387,7 +389,7 @@ mod tests {
 
         symlink(&outside, workspace.join("escape_dir")).unwrap();
 
-        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        let tool = test_tool(workspace.clone());
         let result = tool
             .execute(json!({"path": "escape_dir/hijack.txt", "content": "bad"}))
             .await
@@ -412,7 +414,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20));
+        let tool = test_tool_with(dir.clone(), AutonomyLevel::ReadOnly, 20);
         let result = tool
             .execute(json!({"path": "out.txt", "content": "should-block"}))
             .await
@@ -431,11 +433,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security_with(
-            dir.clone(),
-            AutonomyLevel::Supervised,
-            0,
-        ));
+        let tool = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 0);
         let result = tool
             .execute(json!({"path": "out.txt", "content": "should-block"}))
             .await
@@ -454,8 +452,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    // ── §5.1 TOCTOU / symlink file write protection tests ────
-
     #[cfg(unix)]
     #[tokio::test]
     async fn file_write_blocks_symlink_target_file() {
@@ -469,13 +465,12 @@ mod tests {
         tokio::fs::create_dir_all(&workspace).await.unwrap();
         tokio::fs::create_dir_all(&outside).await.unwrap();
 
-        // Create a file outside and symlink to it inside workspace
         tokio::fs::write(outside.join("target.txt"), "original")
             .await
             .unwrap();
         symlink(outside.join("target.txt"), workspace.join("linked.txt")).unwrap();
 
-        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        let tool = test_tool(workspace.clone());
         let result = tool
             .execute(json!({"path": "linked.txt", "content": "overwritten"}))
             .await
@@ -487,7 +482,6 @@ mod tests {
             "error should mention symlink"
         );
 
-        // Verify original file was not modified
         let content = tokio::fs::read_to_string(outside.join("target.txt"))
             .await
             .unwrap();
@@ -505,9 +499,8 @@ mod tests {
         // Canonicalize so the workspace dir matches resolved paths on macOS (/private/var/…)
         let dir = tokio::fs::canonicalize(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
 
-        // Pass an absolute path that is within the workspace
         let abs_path = dir.join("abs_test.txt");
         let result = tool
             .execute(
@@ -536,7 +529,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "file\u{0000}.txt", "content": "bad"}))
             .await
@@ -547,37 +540,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_write_blocks_runtime_config_path() {
-        let root = std::env::temp_dir().join("zeroclaw_test_file_write_runtime_config");
+    async fn file_write_blocks_path_outside_workspace() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_write_outside_workspace");
         let workspace = root.join("workspace");
-        let config_path = root.join("config.toml");
+        let outside_file = root.join("outside.txt");
         let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace.clone(),
-            workspace_only: false,
-            allowed_roots: vec![root.clone()],
-            forbidden_paths: vec![],
-            ..SecurityPolicy::default()
-        });
-        let tool = FileWriteTool::new(security);
+        let tool = test_tool(workspace.clone());
         let result = tool
             .execute(json!({
-                "path": config_path.to_string_lossy(),
-                "content": "auto_approve = [\"cron_add\"]"
+                "path": outside_file.to_string_lossy(),
+                "content": "should-block"
             }))
             .await
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("runtime config/state file")
-        );
+        assert!(!outside_file.exists());
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }

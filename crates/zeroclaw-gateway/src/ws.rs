@@ -28,6 +28,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 /// Optional connection parameters sent as the first WebSocket message.
@@ -49,6 +50,9 @@ struct ConnectParams {
     /// Client capabilities
     #[serde(default)]
     capabilities: Vec<String>,
+    /// Project root / working directory for this session.
+    #[serde(default, alias = "workspaceDir", alias = "workspace_dir")]
+    cwd: Option<String>,
 }
 
 /// The sub-protocol we support for the chat WebSocket.
@@ -63,6 +67,11 @@ pub struct WsQuery {
     pub session_id: Option<String>,
     /// Optional human-readable name for the session.
     pub name: Option<String>,
+    /// Project root / working directory for this session.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default, alias = "workspaceDir", alias = "workspace_dir")]
+    pub workspace_dir: Option<String>,
 }
 
 /// Extract a bearer token from WebSocket-compatible sources.
@@ -142,7 +151,8 @@ pub async fn handle_ws_chat(
 
     let session_id = params.session_id;
     let session_name = params.name;
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, session_name))
+    let session_cwd = params.cwd.or(params.workspace_dir);
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, session_name, session_cwd))
         .into_response()
 }
 
@@ -154,47 +164,28 @@ async fn handle_socket(
     state: AppState,
     session_id: Option<String>,
     session_name: Option<String>,
+    session_cwd: Option<String>,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+    let mut memory_session_id = session_id.clone();
 
-    // Build a persistent Agent for this connection so history is maintained across turns.
+    // Hydrate session metadata from persistence (if available). Agent
+    // construction is deferred until after the optional `connect` frame so the
+    // client can provide a per-session cwd for the security sandbox root.
     let config = state.config.lock().clone();
-    let mut agent = match zeroclaw_runtime::agent::Agent::from_config(&config).await {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!(error = %e, "Agent initialization failed");
-            let err = serde_json::json!({
-                "type": "error",
-                "message": format!("Failed to initialise agent: {e}"),
-                "code": "AGENT_INIT_FAILED"
-            });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
-            let _ = sender
-                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                    code: 1011,
-                    reason: axum::extract::ws::Utf8Bytes::from_static(
-                        "Agent initialization failed",
-                    ),
-                })))
-                .await;
-            return;
-        }
-    };
-    agent.set_memory_session_id(Some(session_id.clone()));
-
-    // Hydrate agent from persisted session (if available)
     let mut resumed = false;
     let mut message_count: usize = 0;
     let mut effective_name: Option<String> = None;
+    let mut stored_messages = Vec::new();
     if let Some(ref backend) = state.session_backend {
         let messages = backend.load(&session_key);
         if !messages.is_empty() {
             message_count = messages.len();
-            agent.seed_history(&messages);
+            stored_messages = messages;
             resumed = true;
         }
         // Set session name if provided (non-empty) on connect
@@ -231,6 +222,7 @@ async fn handle_socket(
     // is a regular `{"type":"message",...}` frame, we fall through and
     // process it immediately (backward-compatible).
     let mut first_msg_fallback: Option<String> = None;
+    let mut requested_cwd = session_cwd;
 
     if let Some(first) = receiver.next().await {
         match first {
@@ -241,11 +233,18 @@ async fn handle_socket(
                             session_id = ?cp.session_id,
                             device_name = ?cp.device_name,
                             capabilities = ?cp.capabilities,
+                            cwd = ?cp.cwd,
                             "WebSocket connect params received"
                         );
-                        // Override session_id if provided in connect params
                         if let Some(sid) = &cp.session_id {
-                            agent.set_memory_session_id(Some(sid.clone()));
+                            memory_session_id = sid.clone();
+                            debug!(
+                                session_id = sid,
+                                "WebSocket connect session override received"
+                            );
+                        }
+                        if cp.cwd.is_some() {
+                            requested_cwd = cp.cwd;
                         }
                         let ack = serde_json::json!({
                             "type": "connected",
@@ -264,6 +263,53 @@ async fn handle_socket(
             Ok(Message::Close(_)) | Err(_) => return,
             _ => {}
         }
+    }
+
+    let session_cwd = match resolve_session_cwd(requested_cwd.as_deref(), &config.workspace_dir) {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            let err = serde_json::json!({
+                "type": "error",
+                "message": e.to_string(),
+                "code": "INVALID_CWD"
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            return;
+        }
+    };
+
+    // Build a persistent Agent for this connection so history is maintained
+    // across turns. The session cwd becomes the security sandbox root; config
+    // workspace remains the daemon data directory.
+    let mut agent = match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd(
+        &config,
+        Some(&session_cwd),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(error = %e, "Agent initialization failed");
+            let err = serde_json::json!({
+                "type": "error",
+                "message": format!("Failed to initialise agent: {e}"),
+                "code": "AGENT_INIT_FAILED"
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            let _ = sender
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 1011,
+                    reason: axum::extract::ws::Utf8Bytes::from_static(
+                        "Agent initialization failed",
+                    ),
+                })))
+                .await;
+            return;
+        }
+    };
+    agent.set_memory_session_id(Some(memory_session_id));
+    if !stored_messages.is_empty() {
+        agent.seed_history(&stored_messages);
     }
 
     // Process the first message if it was not a connect frame
@@ -404,6 +450,17 @@ async fn handle_socket(
             }
         }
     }
+}
+
+fn resolve_session_cwd(
+    requested_cwd: Option<&str>,
+    default_workspace: &Path,
+) -> anyhow::Result<PathBuf> {
+    let cwd = requested_cwd
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_workspace.to_path_buf());
+    std::fs::canonicalize(&cwd)
+        .map_err(|e| anyhow::anyhow!("cwd is not a usable directory ({}): {e}", cwd.display()))
 }
 
 /// Process a single chat message through the agent and send the response.
@@ -754,5 +811,36 @@ mod tests {
             "zeroclaw.v1, bearer.zc_tok, other".parse().unwrap(),
         );
         assert_eq!(extract_ws_token(&headers, None), Some("zc_tok"));
+    }
+
+    #[test]
+    fn resolve_session_cwd_uses_requested_cwd() {
+        let requested = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+
+        let resolved =
+            resolve_session_cwd(Some(requested.path().to_str().unwrap()), fallback.path()).unwrap();
+
+        assert_eq!(resolved, requested.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_session_cwd_uses_default_workspace_without_request() {
+        let fallback = tempfile::tempdir().unwrap();
+
+        let resolved = resolve_session_cwd(None, fallback.path()).unwrap();
+
+        assert_eq!(resolved, fallback.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_session_cwd_rejects_missing_directory() {
+        let fallback = tempfile::tempdir().unwrap();
+        let missing = fallback.path().join("missing");
+
+        let err = resolve_session_cwd(Some(missing.to_str().unwrap()), fallback.path())
+            .expect_err("missing cwd should be rejected");
+
+        assert!(err.to_string().contains("cwd is not a usable directory"));
     }
 }

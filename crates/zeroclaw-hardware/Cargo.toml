@@ -26,6 +26,8 @@ toml = "1.0"
 tracing = { version = "0.1", default-features = false }
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+dialoguer = { version = "0.12", features = ["fuzzy-select"], optional = true }
+console = { version = "0.16", optional = true }
 
 # Optional hardware deps
 nusb = { version = "0.2", default-features = false, optional = true }
@@ -33,8 +35,6 @@ tokio-serial = { version = "5", default-features = false, optional = true }
 probe-rs = { version = "0.31", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 rppal = { version = "0.22", optional = true }
-dialoguer = { version = "0.12", features = ["fuzzy-select"], optional = true }
-console = { version = "0.16", optional = true }
 
 [features]
 default = []

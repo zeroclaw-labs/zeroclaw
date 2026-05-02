@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Smartphone, Trash2 } from 'lucide-react';
-import { getAdminPairCode } from '../lib/api';
+import { getAdminPairCode } from '@/lib/api';
 import { t } from '@/lib/i18n';
 
 interface Device {
@@ -30,7 +30,7 @@ export default function Pairing() {
         setDevices(data.devices || []);
       }
     } catch (err) {
-      setError('Failed to load devices');
+      setError(t('pairing.load_error'));
     } finally {
       setLoading(false);
     }
@@ -61,10 +61,10 @@ export default function Pairing() {
         const data = await res.json();
         setPairingCode(data.pairing_code);
       } else {
-        setError('Failed to generate pairing code');
+        setError(t('pairing.generate_error'));
       }
     } catch (err) {
-      setError('Failed to generate pairing code');
+      setError(t('pairing.generate_error'));
     }
   };
 
@@ -76,9 +76,11 @@ export default function Pairing() {
       });
       if (res.ok) {
         setDevices(devices.filter(d => d.id !== deviceId));
+      } else {
+        setError(t('pairing.revoke_error'));
       }
     } catch (err) {
-      setError('Failed to revoke device');
+      setError(t('pairing.revoke_error'));
     }
   };
 
@@ -106,7 +108,7 @@ export default function Pairing() {
       </div>
 
       {error && (
-        <div className="rounded-xl border p-3 text-sm animate-fade-in" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
+        <div className="rounded-xl border p-3 text-sm animate-fade-in" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
           {error}
           <button onClick={() => setError(null)} className="ml-2 font-bold">×</button>
         </div>

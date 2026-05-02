@@ -1,8 +1,8 @@
 # ACP — Agent Client Protocol
 
-**ACP** is a JSON-RPC 2.0 protocol over stdio that lets editors and IDEs talk to a running ZeroClaw agent as a session host. Newline-delimited JSON — lightweight, streamable, easy to wire to a subprocess.
+**ACP** is a JSON-RPC 2.0 protocol over stdio that lets editors and IDEs drive a running ZeroClaw agent as a session host. Newline-delimited JSON — lightweight, streamable, easy to wire to a subprocess.
 
-Think of it as "LSP for agents": the editor launches `zeroclaw acp`, sends prompts over stdin, receives session updates on stdout.
+Think of it as "LSP for agents": the editor launches `zeroclaw acp`, sends prompts over stdin, and receives session updates on stdout.
 
 ## What you'd use it for
 
@@ -11,9 +11,9 @@ Think of it as "LSP for agents": the editor launches `zeroclaw acp`, sends promp
 - A CI runner that drives the agent programmatically without a full gateway setup
 - Anything that wants agent sessions without HTTP and without binding a port
 
-## Protocol shape
+## Protocol shape — v1
 
-All messages are JSON-RPC 2.0. The server supports these methods:
+All messages are JSON-RPC 2.0 (newline-delimited). ZeroClaw implements **protocol version 1**.
 
 ### `initialize`
 
@@ -22,70 +22,156 @@ Handshake. Returns server capabilities.
 ```json
 → {"jsonrpc":"2.0","id":1,"method":"initialize"}
 ← {"jsonrpc":"2.0","id":1,"result":{
-    "streaming": true,
-    "maxSessions": 10,
-    "sessionTimeoutSecs": 3600,
-    "defaultModel": "claude-haiku-4-5-20251001"   // only if configured
+    "protocolVersion": 1,
+    "agentCapabilities": {
+      "loadSession": false,
+      "promptCapabilities": {"image": false, "audio": false, "embeddedContext": false},
+      "mcpCapabilities": {"http": false, "sse": false},
+      "sessionCapabilities": {}
+    },
+    "agentInfo": {
+      "name": "zeroclaw-acp",
+      "title": "ZeroClaw ACP",
+      "version": "0.7.x"
+    },
+    "authMethods": [],
+    "_meta": {
+      "zeroclaw": {
+        "defaultModel": "anthropic/claude-sonnet-4.6",
+        "maxSessions": 10,
+        "sessionTimeoutSecs": 3600
+      }
+    }
   }}
 ```
+
+`_meta.zeroclaw` carries ZeroClaw-specific extension fields not in the base ACP spec. Clients that only implement the base spec can ignore this object.
+
+The server always responds `protocolVersion: 1`. If you send a client-side `protocolVersion: 0`, you still get `1` back — v0 clients will see parse errors on the new message shapes; see [version compatibility](#version-compatibility) below.
 
 ### `session/new`
 
-Open an isolated agent session.
+Open an isolated agent session. The optional `cwd` parameter (aliases: `workspaceDir`, `workspace_dir`) pins the per-session file-access boundary — it becomes the `workspace_dir` inside the `SecurityPolicy` that all file tools enforce. The agent's persistent data directory (memory, identity, cron) remains the daemon-level `workspace_dir` from config.
 
 ```json
 → {"jsonrpc":"2.0","id":2,"method":"session/new","params":{
-    "cwd": "/path/to/project",
-    "systemPrompt": "You are a careful code reviewer."
+    "cwd": "/path/to/project"
   }}
-← {"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-ab12cd"}}
+← {"jsonrpc":"2.0","id":2,"result":{
+    "sessionId": "s-ab12cd",
+    "workspaceDir": "/path/to/project"
+  }}
 ```
+
+`cwd` is canonicalized on intake — `../` traversal cannot escape the intended root. If `cwd` is omitted, the server uses the daemon's launch directory.
 
 ### `session/prompt`
 
-Send a prompt. The response is a sequence of `session/update` notifications streaming back, terminated by the response to the prompt call.
+Send a prompt. The response is a sequence of `session/update` notifications streaming back, terminated by the `session/prompt` result.
 
 ```json
 → {"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{
     "sessionId": "s-ab12cd",
     "prompt": "Summarise the changes in the last commit."
   }}
-← {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-ab12cd","kind":"text","delta":"The last commit..."}}
-← {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-ab12cd","kind":"text","delta":" introduces..."}}
-← {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-ab12cd","kind":"tool_call","name":"shell","args":{...}}}
-← {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-ab12cd","kind":"tool_result","...": "..."}}
-← {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-ab12cd","kind":"text","delta":"..."}}
-← {"jsonrpc":"2.0","id":3,"result":{"finished":true,"usage":{...}}}
+← {"jsonrpc":"2.0","method":"session/update","params":{
+    "sessionId": "s-ab12cd",
+    "update": {"sessionUpdate": "agent_message_chunk", "content": {"type":"text","text":"The last commit..."}}
+  }}
+← {"jsonrpc":"2.0","method":"session/update","params":{
+    "sessionId": "s-ab12cd",
+    "update": {"sessionUpdate": "tool_call", "toolCallId": "tc-1", "title": "shell",
+               "kind": "execute", "status": "pending", "rawInput": {...}}
+  }}
+← {"jsonrpc":"2.0","method":"session/update","params":{
+    "sessionId": "s-ab12cd",
+    "update": {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1",
+               "status": "finished", "rawOutput": "..."}
+  }}
+← {"jsonrpc":"2.0","id":3,"result":{
+    "sessionId": "s-ab12cd",
+    "stopReason": "end_turn",
+    "content": [{"type": "text", "text": "The last commit introduces..."}]
+  }}
 ```
 
-### `session/stop`
+`stopReason` is `"end_turn"` on normal completion. The `content` array mirrors the final assistant message.
 
-Cleanly end a session.
+### `session/update` notifications (agent → client)
+
+ZeroClaw sends four kinds of `session/update` notification during a prompt turn. The discriminant is the `sessionUpdate` field inside `update`:
+
+| `sessionUpdate` value | When emitted | Key fields |
+|---|---|---|
+| `agent_message_chunk` | Each streaming text token | `content.type = "text"`, `content.text` |
+| `agent_thought_chunk` | Internal reasoning tokens (when enabled) | `content.type = "text"`, `content.text` |
+| `tool_call` | Tool call initiated | `toolCallId`, `title`, `kind`, `status: "pending"`, `rawInput` |
+| `tool_call_update` | Tool call completed | `toolCallId`, `status: "finished"`, `rawOutput`, `content[]` |
+
+`toolCallId` on `tool_call` and `tool_call_update` are stable and correlated — the update completing a call carries the same `toolCallId` as the one that opened it.
+
+The `name` field on `tool_call_update` is a ZeroClaw extension (not required by the base ACP spec). Clients can use it for display; it's safe to ignore.
+
+### `session/request_permission` (agent → client, outbound request)
+
+When a tool requires user approval (via `always_ask` in the autonomy config, or the `ask_user`/`escalate_to_human` tools), ZeroClaw issues a **JSON-RPC request** from agent to client. The client must reply with a result before the tool call proceeds.
+
+```json
+← {"jsonrpc":"2.0","id":"zc-out-0","method":"session/request_permission","params":{
+    "sessionId": "s-ab12cd",
+    "options": [
+      {"optionId": "allow-once",  "name": "Allow once",  "kind": "allow_once"},
+      {"optionId": "allow-always","name": "Always allow","kind": "allow_always"},
+      {"optionId": "reject-once", "name": "Reject",      "kind": "reject_once"}
+    ],
+    "toolCall": {
+      "toolCallId": "approval-...",
+      "title": "Approve shell?",
+      "kind": "execute",
+      "status": "pending",
+      "rawInput": {"tool": "shell", "summary": "git status --short"},
+      "content": [{"type": "content", "content": {"type": "text", "text": "git status --short"}}]
+    }
+  }}
+→ {"jsonrpc":"2.0","id":"zc-out-0","result":{
+    "outcome": {"outcome": "selected", "optionId": "allow-once"}
+  }}
+```
+
+The server-issued id (`"zc-out-N"`) is always a string prefixed `zc-out-` — disjoint from any integer or string ids the client uses for its own requests.
+
+Response shape:
+- `{"outcome": {"outcome": "selected", "optionId": "<id>"}}` — user picked an option
+- `{"outcome": {"outcome": "cancelled"}}` — user dismissed the prompt
+
+If the client never replies (crash, network drop, user closes IDE), the request times out after `sessionTimeoutSecs` and the tool call is denied.
+
+`ask_user` uses the same `session/request_permission` mechanism, mapping the question's `choices` to permission options. Free-form (no-choices) `ask_user` is not supported until the [ACP elicitation RFD](https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx) lands. Calling `ask_user` without `choices` on an ACP session fast-fails with a clear error.
+
+### `session/stop` _(ZeroClaw extension)_
+
+Cleanly end a session. Not in the base ACP spec — ZeroClaw-specific. If a future ACP spec revision adds `session/stop` with different semantics, this will be renamed `_meta/session/stop`.
 
 ```json
 → {"jsonrpc":"2.0","id":4,"method":"session/stop","params":{"sessionId":"s-ab12cd"}}
 ← {"jsonrpc":"2.0","id":4,"result":{"stopped":true}}
 ```
 
-### `session/update` (notification from server)
+### `session/update` (client → server) _(ZeroClaw extension)_
 
-Streaming events. `kind` is one of `text`, `reasoning`, `tool_call`, `tool_result`, `final`.
+ZeroClaw also accepts inbound `session/update` (and the legacy `session/event` alias) notifications from the client for custom event injection. Not in the base ACP spec — ZeroClaw-specific. If the ACP spec later defines an inbound `session/update` with different semantics, this will be renamed `_meta/session/update`.
 
 ## Configuration
 
 ```toml
 [acp]
-enabled = true                    # must be on for `zeroclaw acp` to serve
 max_sessions = 10
-session_timeout_secs = 3600       # kill idle sessions after 1 hour
-default_model = "haiku"           # referenced in `initialize` response; omit to leave client-controlled
+session_timeout_secs = 3600       # idle sessions killed after 1 hour
 ```
 
-If `default_model` is unset, the `initialize` capabilities omit the field entirely — ACP clients are expected to handle the absence by prompting the user.
+When running `zeroclaw acp` as a subprocess, the command starts the server unconditionally. When running as a daemon, the gateway exposes ACP over WebSocket at `/acp` with no additional config required.
 
 ## Running
-
-Two modes:
 
 **As a subprocess (typical IDE integration):**
 
@@ -95,29 +181,35 @@ zeroclaw acp
 
 The binary reads stdin, writes stdout, exits on EOF.
 
-**As a background companion to the service:**
+**As a WebSocket service (daemon mode):**
 
-The running `zeroclaw service` process exposes ACP on the gateway's WebSocket. Point your ACP client at `ws://localhost:42617/acp`.
+Start the daemon normally. The gateway always exposes ACP over WebSocket at the `/acp` endpoint — no extra config flag is required.
 
-## Client libraries
+## Version compatibility
 
-- **Reference implementation** — `examples/acp-client/` in the repo (Rust)
-- **TypeScript** — planned; see the tracking RFC
+ACP v0 clients (using the flat `{streaming, maxSessions, ...}` initialize response and `kind: "text"|"tool_call"` session/update shape) will see deserialization errors on connecting to a v1 server. The discriminants and envelope shapes changed in a breaking way. Upgrade steps:
+
+- Use `sessionUpdate` (not `kind`) to discriminate `session/update` notifications.
+- Parse `session/prompt` results as `{sessionId, stopReason, content}` (not `{finished, usage}`).
+- Implement `session/request_permission` response handling — the approval mechanism moved from a server notification to a client-answered RPC.
+- Drop the `systemPrompt` param from `session/new` — it is not read.
 
 ## Security
 
-ACP inherits the running config's autonomy level. If the binary is configured `Supervised`, session prompts still trigger operator approval for medium-risk tool calls — delivered to the ACP client as a `session/update` with `kind: "approval_request"` that the client must acknowledge.
+ACP inherits the running config's autonomy level. When `[autonomy] level = "supervised"`, medium-risk tool calls trigger approval via the ACP back-channel — a `session/request_permission` outbound request the client must acknowledge. In `full` mode, tool calls execute without approval and `workspace_only` is implicitly disabled (the agent can reach paths outside the session cwd); `forbidden_paths` still apply.
 
-In `Full` (or YOLO) mode, tool calls execute without approval.
+The `cwd` from `session/new` becomes the `SecurityPolicy` workspace boundary used by all file and shell tools for that session. Note: the agent's system prompt currently reflects the daemon's global `workspace_dir` rather than the session `cwd` — this does not affect enforcement, only the directory the model believes it is working in.
 
 ## Code reference
 
-- Server: `crates/zeroclaw-channels/src/orchestrator/acp_server.rs`
-- Capability declaration: `capabilities` object in the `initialize` handler
-- Session handling: `session_manager` in the same module
+- ACP server: `crates/zeroclaw-channels/src/orchestrator/acp_server.rs`
+- ACP back-channel: `crates/zeroclaw-channels/src/acp_channel.rs`
+- Per-session path enforcement: `crates/zeroclaw-config/src/policy.rs` (`SecurityPolicy::from_config`), `crates/zeroclaw-runtime/src/agent/agent.rs` (`from_config_with_session_cwd_and_mcp`)
+- OS-level sandbox detection/backends: `crates/zeroclaw-runtime/src/security/detect.rs`, `landlock.rs`, `bubblewrap.rs`, `seatbelt.rs`
 
 ## See also
 
 - [Channels → Overview](./overview.md)
-- [Tools → MCP](../tools/mcp.md) — the "tool provider" direction (clients providing tools to the agent); ACP is the inverse (clients driving the agent)
+- [Tools → MCP](../tools/mcp.md) — clients providing tools to the agent; ACP is the inverse
+- [Security → Autonomy](../security/autonomy.md)
 - [Security → Overview](../security/overview.md)

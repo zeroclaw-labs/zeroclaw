@@ -14,6 +14,9 @@ use serde::Deserialize;
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::traits::{Answer, OnboardUi, PropKind, SelectItem};
 
+use crate::agent::personality::EDITABLE_PERSONALITY_FILES;
+use crate::agent::personality_templates::{TemplateContext, render as render_personality};
+
 const CUSTOM_OPENAI_COMPAT_LABEL: &str = "Custom OpenAI-compatible endpoint";
 const OPENAI_COMPAT_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -36,6 +39,7 @@ enum SkipNav {
     Back,
 }
 
+pub mod field_visibility;
 pub mod ui;
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +62,46 @@ pub enum Section {
     Memory,
     Hardware,
     Tunnel,
+    Personality,
+}
+
+impl Section {
+    /// Stable string name used in TOML paths (`providers.fallback`, etc.) and
+    /// surfaced over the HTTP CRUD API for grouping prop lists by section.
+    /// `All` has no path representation; returns `None`.
+    pub fn as_path_prefix(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Workspace => Some("workspace"),
+            Self::Providers => Some("providers"),
+            Self::Channels => Some("channels"),
+            Self::Memory => Some("memory"),
+            Self::Hardware => Some("hardware"),
+            Self::Tunnel => Some("tunnel"),
+            Self::Personality => Some("personality"),
+        }
+    }
+
+    /// Map a dotted property path back to its onboarding section by looking
+    /// at the path's first segment. Returns `None` for paths that don't fall
+    /// into any wizard section (e.g. `onboard_state.completed_sections`).
+    ///
+    /// This is the substitute for a `#[onboard_section]` schema attribute —
+    /// the section is implicit in the path, derived once from this table
+    /// rather than duplicated on every field.
+    pub fn from_path(path: &str) -> Option<Self> {
+        let prefix = path.split('.').next()?;
+        match prefix {
+            "workspace" => Some(Self::Workspace),
+            "providers" => Some(Self::Providers),
+            "channels" => Some(Self::Channels),
+            "memory" => Some(Self::Memory),
+            "hardware" => Some(Self::Hardware),
+            "tunnel" => Some(Self::Tunnel),
+            "personality" => Some(Self::Personality),
+            _ => None,
+        }
+    }
 }
 
 /// Runtime knobs sourced from CLI flags. `--quick`/`--tui` select the UI
@@ -108,6 +152,10 @@ pub async fn run(
             let _ = tunnel(cfg, ui, flags).await?;
             Ok(())
         }
+        Section::Personality => {
+            let _ = personality(cfg, ui, flags).await?;
+            Ok(())
+        }
     }
 }
 
@@ -125,6 +173,10 @@ async fn run_all(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Res
             3 => memory(cfg, ui, flags).await?,
             4 => hardware(cfg, ui, flags).await?,
             5 => tunnel(cfg, ui, flags).await?,
+            // Personality lives at the end so the user has answered the
+            // structural questions (workspace, providers, memory, …)
+            // before authoring the markdown files that reference them.
+            6 => personality(cfg, ui, flags).await?,
             _ => return Ok(()),
         };
         match nav {
@@ -332,6 +384,25 @@ async fn prompt_field(
                 }
             }
         }
+        PropKind::ObjectArray => {
+            // Vec<T> of structs (e.g. mcp.servers). The TUI doesn't have
+            // a multi-row sub-form UI; surface this as a JSON-array text
+            // input so the field is at least editable from the CLI. The
+            // dashboard renders these properly via the per-row editor.
+            let prefill = if is_set {
+                Some(current.as_str())
+            } else {
+                default
+            };
+            match ui.string(prompt, prefill).await? {
+                Answer::Back => return Ok(Nav::Back),
+                Answer::Value(new) => {
+                    if (is_set || !new.is_empty()) && new != current {
+                        persist(cfg, name, &new).await?;
+                    }
+                }
+            }
+        }
     }
     Ok(Nav::Done)
 }
@@ -431,6 +502,12 @@ fn section_has_signal(cfg: &Config, section_key: &str) -> bool {
                 .is_some_and(|rest| rest.contains('.'))
         }),
         "hardware" => cfg.hardware.enabled,
+        // Personality has no config-schema fields. The signal is whether
+        // the user has authored any of the editable markdown files in
+        // their workspace.
+        "personality" => EDITABLE_PERSONALITY_FILES
+            .iter()
+            .any(|f| cfg.workspace_dir.join(f).is_file()),
         // Memory's default backend is "sqlite" and Tunnel's is "none" — both
         // are valid user choices indistinguishable from untouched defaults.
         // Marker-only for these two.
@@ -721,13 +798,19 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         // `persist()` carries the entry — defaults included — to disk.
         if is_new_entry {
             let prefix = format!("providers.models.{picked}");
-            for trait_default in provider_trait_defaults(&picked, &prefix) {
-                cfg.set_prop(&trait_default.path, &trait_default.display)?;
-            }
+            field_visibility::apply_provider_trait_defaults(cfg, &picked, &prefix)?;
         }
         if let Some(base_url) = selected_base_url.as_deref() {
             cfg.set_prop(&format!("providers.models.{picked}.base-url"), base_url)?;
         }
+
+        // Persist the picked provider as the runtime fallback so chat
+        // requests actually route to it. Without this, the runtime keeps
+        // the prior fallback (often unset or stale) and the user lands on
+        // "API key not set" for a different provider they didn't pick.
+        // Carried to disk via `persist()` so a Ctrl+C mid-flow keeps the
+        // selection.
+        persist(cfg, "providers.fallback", &picked).await?;
 
         let display_name = entries
             .iter()
@@ -834,79 +917,41 @@ async fn offer_advanced_settings(
         Answer::Value(true) => {}
     }
 
-    let defaults = provider_trait_defaults(provider, prefix);
+    let defaults = provider_trait_defaults_for_prompts(provider, prefix);
 
     // Skipped: `model` (already via prompt_model), `api-key` (explicit auth
     // phase), and fields that only apply to a different provider family
     // (e.g. azure-openai-* when the user picked Anthropic).
     let mut excludes: Vec<&str> = vec!["model", "api-key"];
-    excludes.extend(provider_family_excludes(provider));
+    excludes.extend(field_visibility::provider_family_excludes(provider));
     prompt_fields_under(cfg, ui, prefix, &excludes, &defaults).await
 }
 
-/// Build the `FieldDefault` list for a provider from its trait methods.
-/// Single source of truth: used to pre-populate fresh entries during
-/// onboarding AND to surface defaults in the advanced-settings walk.
-/// A provider handle constructed with `api_key = None` can still answer
-/// the `default_*` questions — they're family-level constants, not
-/// runtime values. If construction fails (unknown / local-only provider),
-/// returns an empty vec and callers fall back to per-field display values.
-fn provider_trait_defaults(provider: &str, prefix: &str) -> Vec<FieldDefault> {
-    let Ok(handle) = zeroclaw_providers::create_provider(provider, None) else {
-        return Vec::new();
-    };
-    let mut v = vec![
-        FieldDefault {
-            path: format!("{prefix}.temperature"),
-            display: handle.default_temperature().to_string(),
-        },
-        FieldDefault {
-            path: format!("{prefix}.max-tokens"),
-            display: handle.default_max_tokens().to_string(),
-        },
-        FieldDefault {
-            path: format!("{prefix}.timeout-secs"),
-            display: handle.default_timeout_secs().to_string(),
-        },
-        FieldDefault {
-            path: format!("{prefix}.wire-api"),
-            display: handle.default_wire_api().to_string(),
-        },
-    ];
-    if let Some(url) = handle.default_base_url() {
-        v.push(FieldDefault {
-            path: format!("{prefix}.base-url"),
-            display: url.to_string(),
-        });
-    }
-    v
-}
-
-/// Exclude fields that don't apply to the selected provider family.
-///
-/// A field absent from this filter is shown for every provider. Grow the
-/// list as provider-specific fields land on `ModelProviderConfig` — the
-/// goal is to keep the advanced walk focused on fields the user might
-/// reasonably want to override for the provider they picked.
-///
-/// Follow-up (#5960 deferral): a `#[configurable(family = "...")]`
-/// attribute on the schema struct would let the `Configurable` derive
-/// emit this filter automatically. This hardcoded list is a pragmatic
-/// stand-in until that lands.
-fn provider_family_excludes(provider: &str) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    // Azure-OpenAI-only deployment routing fields.
-    if provider != "azure_openai" {
-        out.push("azure-openai-resource");
-        out.push("azure-openai-deployment");
-        out.push("azure-openai-api-version");
-    }
-    // OpenAI wire-protocol flavor + Codex auth are OpenAI-family concerns.
-    if !matches!(provider, "openai" | "openai_codex") {
-        out.push("wire-api");
-        out.push("requires-openai-auth");
-    }
-    out
+/// Build the `FieldDefault` list for the prompt walker by walking the
+/// schema fields of `zeroclaw_providers::default_provider_config(provider)`
+/// and rebasing each leaf onto `prefix`. Same source of truth the gateway's
+/// `apply_provider_trait_defaults` uses — schema-driven, no per-field
+/// names to keep in sync.
+fn provider_trait_defaults_for_prompts(provider: &str, prefix: &str) -> Vec<FieldDefault> {
+    let defaults = zeroclaw_providers::default_provider_config(provider);
+    let source_dot = format!(
+        "{}.",
+        zeroclaw_config::schema::ModelProviderConfig::configurable_prefix()
+    );
+    defaults
+        .prop_fields()
+        .into_iter()
+        .filter_map(|field| {
+            let leaf = field.name.strip_prefix(&source_dot)?;
+            if leaf.contains('.') || field.display_value == "<unset>" {
+                return None;
+            }
+            Some(FieldDefault {
+                path: format!("{prefix}.{leaf}"),
+                display: field.display_value,
+            })
+        })
+        .collect()
 }
 
 /// Prompt for the model field using the provider's live model catalog.
@@ -1044,7 +1089,19 @@ async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Re
         let mut options: Vec<SelectItem> = all_channels
             .iter()
             .map(|name| {
-                if configured.contains(name) {
+                // Match the providers picker's two-tier badge: `[active]`
+                // wins when the block exists AND `<channel>.enabled = true`,
+                // otherwise `[configured]` for a present-but-disabled block.
+                // Web `/onboard` renders the same tiers via
+                // `schema_walk_picker` in `crates/zeroclaw-gateway/src/api_onboard.rs`.
+                let is_active = cfg
+                    .get_prop(&format!("channels.{name}.enabled"))
+                    .ok()
+                    .as_deref()
+                    == Some("true");
+                if is_active {
+                    SelectItem::with_badge(name.clone(), "[active]")
+                } else if configured.contains(name) {
                     SelectItem::with_badge(name.clone(), "[configured]")
                 } else {
                     SelectItem::new(name.clone())
@@ -1213,6 +1270,79 @@ async fn tunnel(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Resu
         }
     }
     mark_completed(cfg, "tunnel").await?;
+    Ok(Nav::Done)
+}
+
+/// Personality — open `$EDITOR` on each markdown file the runtime
+/// injects into the system prompt at request time. Files default to
+/// the bundled starter template when they don't yet exist on disk;
+/// the user is free to overwrite or skip per file. Lives at the end
+/// of the flow on purpose: the structural sections (workspace,
+/// providers, memory, …) are answered first so the personality files
+/// can reference whatever was just configured.
+async fn personality(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<Nav> {
+    ui.heading(1, "Personality");
+    match skip_if_configured(
+        cfg,
+        ui,
+        flags,
+        "personality",
+        "Personality",
+        section_has_signal(cfg, "personality"),
+    )
+    .await?
+    {
+        SkipNav::Skip => return Ok(Nav::Done),
+        SkipNav::Back => return Ok(Nav::Back),
+        SkipNav::Enter => {}
+    }
+
+    let template_ctx = TemplateContext {
+        include_memory: cfg.memory.backend.as_str() != "none",
+        ..TemplateContext::default()
+    };
+    let workspace_dir = cfg.workspace_dir.clone();
+
+    loop {
+        // Build the picker fresh on every iteration so badges reflect
+        // the on-disk state after each edit.
+        let mut items: Vec<SelectItem> = EDITABLE_PERSONALITY_FILES
+            .iter()
+            .map(|filename| {
+                let exists = workspace_dir.join(filename).is_file();
+                SelectItem::with_badge(
+                    (*filename).to_string(),
+                    if exists { "saved" } else { "not saved" },
+                )
+            })
+            .collect();
+        items.push(SelectItem::new("Done"));
+
+        match ui.select("Personality file to edit", &items, None).await? {
+            Answer::Back => return Ok(Nav::Back),
+            Answer::Value(idx) if idx == EDITABLE_PERSONALITY_FILES.len() => break,
+            Answer::Value(idx) => {
+                let filename = EDITABLE_PERSONALITY_FILES[idx];
+                let path = workspace_dir.join(filename);
+                let initial = if path.is_file() {
+                    std::fs::read_to_string(&path).unwrap_or_default()
+                } else {
+                    render_personality(filename, &template_ctx).unwrap_or_default()
+                };
+                match ui.editor(&format!("Editing {filename}"), &initial).await? {
+                    Answer::Back => continue,
+                    Answer::Value(content) => {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::write(&path, content)?;
+                    }
+                }
+            }
+        }
+    }
+
+    mark_completed(cfg, "personality").await?;
     Ok(Nav::Done)
 }
 

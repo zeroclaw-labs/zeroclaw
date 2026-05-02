@@ -9,10 +9,10 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 /// Maximum characters per personality file before truncation.
-const MAX_FILE_CHARS: usize = 20_000;
+pub const MAX_FILE_CHARS: usize = 20_000;
 
 /// Well-known personality files loaded from the workspace root.
-const PERSONALITY_FILES: &[&str] = &[
+pub const PERSONALITY_FILES: &[&str] = &[
     "SOUL.md",
     "IDENTITY.md",
     "USER.md",
@@ -20,6 +20,21 @@ const PERSONALITY_FILES: &[&str] = &[
     "TOOLS.md",
     "HEARTBEAT.md",
     "BOOTSTRAP.md",
+    "MEMORY.md",
+];
+
+/// Subset of [`PERSONALITY_FILES`] that the dashboard exposes for
+/// authoring. `BOOTSTRAP.md` is deliberately excluded: it's a
+/// first-run scaffold the agent reads once and deletes, not a file
+/// the user is meant to hand-edit. The runtime still injects it when
+/// it exists on disk.
+pub const EDITABLE_PERSONALITY_FILES: &[&str] = &[
+    "SOUL.md",
+    "IDENTITY.md",
+    "USER.md",
+    "AGENTS.md",
+    "TOOLS.md",
+    "HEARTBEAT.md",
     "MEMORY.md",
 ];
 

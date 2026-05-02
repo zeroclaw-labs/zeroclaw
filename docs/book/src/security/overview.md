@@ -16,13 +16,17 @@ The coarse-grained knob. Three settings:
 
 - **ReadOnly** — the agent can observe (read files, query memory, fetch URLs it's allowed to fetch) but cannot write or execute commands.
 - **Supervised** (default) — low-risk ops run; medium-risk ask the operator; high-risk block.
-- **Full** — no approval gates, but the other layers (workspace, sandbox, commands) still enforce.
+- **Full** — no approval gates; `workspace_only` is implicitly disabled. `forbidden_paths`, `forbidden_commands`, and the OS sandbox still enforce.
 
 Docs: [Autonomy levels](./autonomy.md).
 
 ## 3. Workspace boundary and path rules
 
 The agent operates within a configured workspace directory. `file_read`, `file_write`, and `shell` (for commands that touch the filesystem) refuse paths outside it unless `workspace_only = false`.
+
+**Per-session sandbox roots (ACP and gateway WebSocket):** When a session is opened via ACP (`session/new` with a `cwd` parameter) or via the gateway WebSocket (connect-time `cwd` parameter), that path becomes the `SecurityPolicy` workspace boundary for all file and shell tools for the lifetime of the session. The daemon's global `workspace_dir` remains the data directory for memory, identity, cron, and other persistent state. The model is: `session cwd` = project boundary the agent can touch; `workspace_dir` = where ZeroClaw stores its own files. Note: the agent's system prompt currently reflects the daemon's `workspace_dir` rather than the session `cwd`; enforcement is correct but the model's self-reported location may differ.
+
+**Important:** the `cwd` parameter changes which directory on the **ZeroClaw host** the agent is sandboxed to — it does not affect which machine tools run on. Tool use (shell commands, file reads/writes) always executes on the machine running ZeroClaw. If you connect to a remote ZeroClaw instance over the gateway WebSocket, tool calls operate on the remote machine's filesystem, not on your local machine. For localhost-only deployments this distinction does not matter, but remote setups should account for it.
 
 Beyond the workspace, a `forbidden_paths` list (default: `/etc`, `/sys`, `/boot`, `~/.ssh`, …) is always blocked regardless of workspace setting.
 

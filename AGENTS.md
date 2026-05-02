@@ -147,9 +147,14 @@ Branch/commit/PR rules:
 
 AI coding assistant skills live in `.claude/skills/`. Use the right one:
 
-- `.claude/skills/github-pr-review-session/SKILL.md` — PR review co-pilot. Trigger: `review 1234`, `re-review 1234`, `go through the queue`. Posts as WareWolf-MoonWall.
-- `.claude/skills/changelog-generation/SKILL.md` — generates `CHANGELOG-next.md` between stable tags. Trigger: `generate changelog`, `release notes for v0.7.x`.
-- `.claude/skills/zeroclaw/SKILL.md` — ZeroClaw CLI and gateway API operations. Trigger: anything involving `zeroclaw` binary, gateway API, memory, cron jobs, channels.
+- `.claude/skills/github-pr-review-session/SKILL.md` — PR review co-pilot; assists **you** as the human reviewer. Posts reviews as WareWolf-MoonWall using the RFC feedback taxonomy (🔴/🟡/✅/🔵/🟢). Trigger: `review 1234`, `re-review 1234`, `go through the queue`.
+- `.claude/skills/changelog-generation/SKILL.md` — generates `CHANGELOG-next.md` between stable tags, resolves contributors via GraphQL, feeds the release workflow. Trigger: `generate changelog`, `release notes for v0.7.x`.
+- `.claude/skills/github-issue-triage/SKILL.md` — Issue triage and lifecycle management; manages the backlog, labels, and stale policies. Trigger: `triage issues`, `sweep issues`, `handle issue #N`.
+- `.claude/skills/github-issue/SKILL.md` — Interactively files structured GitHub issues (bug reports or feature requests) using repo templates. Trigger: `file issue`, `report bug`, `feature request`.
+- `.claude/skills/github-pr/SKILL.md` — Opens or updates GitHub PRs, handles validation evidence, and manages PR descriptions. Trigger: `open PR`, `update PR`, `submit for review`.
+- `.claude/skills/skill-creator/SKILL.md` — Framework for creating, testing, evaluating, and optimizing new AI skills. Trigger: `create skill`, `improve skill`, `run skill evals`.
+- `.claude/skills/squash-merge/SKILL.md` — Performs conventional squash-merges into master with preserved commit history. Trigger: `squash-merge #123`, `land #789`.
+- `.claude/skills/zeroclaw/SKILL.md` — Operational guide for interacting with a ZeroClaw agent instance via CLI or API. Trigger: `check agent status`, `manage memory`, `zeroclaw config`.
 - `.claude/skills/systematic-debugging/SKILL.md` — bug/test failure investigation. Trigger: any bug or unexpected behavior.
 - `.claude/skills/test-driven-development/SKILL.md` — TDD workflow. Trigger: implementing features or bugfixes.
 - `.claude/skills/writing-plans/SKILL.md` — write implementation plans. Trigger: multi-step tasks with a spec or requirements.

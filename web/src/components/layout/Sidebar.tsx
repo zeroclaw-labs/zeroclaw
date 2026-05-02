@@ -1,21 +1,27 @@
 import { NavLink } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import {
+  Activity,
+  Brain,
+  Clock,
+  DollarSign,
   LayoutDashboard,
   MessageSquare,
-  Wrench,
-  Clock,
-  Puzzle,
-  Brain,
-  Settings,
-  DollarSign,
-  Activity,
-  Stethoscope,
   Monitor,
+  Puzzle,
+  Settings,
+  Stethoscope,
+  Wrench,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
 
-const navItems = [
+interface NavItem {
+  to: string;
+  icon: typeof LayoutDashboard;
+  labelKey: string;
+}
+
+const navItems: NavItem[] = [
   { to: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
   { to: '/agent', icon: MessageSquare, labelKey: 'nav.agent' },
   { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
@@ -29,14 +35,21 @@ const navItems = [
   { to: '/canvas', icon: Monitor, labelKey: 'nav.canvas' },
 ];
 
+// The 6 onboarding sections (Workspace, Providers, Channels, Memory,
+// Hardware, Tunnel) live under /config now — they're the first group
+// inside the Config explorer's sidebar. The /setup/<section> deep-link
+// route still works for bookmarks, but no top-level nav entries point
+// at it. Run-setup-again link in /config covers the wizard re-entry.
+
 // Shared nav item sub-component — eliminates duplication between mobile & desktop nav
 function SidebarNavItem({ item, showLabel, showTooltip, onClick }: {
-  item: (typeof navItems)[number];
+  item: NavItem;
   showLabel: boolean;
   showTooltip: boolean;
   onClick: () => void;
 }) {
   const { to, icon: Icon, labelKey } = item;
+  const text = t(labelKey);
   return (
     <NavLink
       key={to}
@@ -59,13 +72,13 @@ function SidebarNavItem({ item, showLabel, showTooltip, onClick }: {
       {({ isActive }) => (
         <>
           <Icon className={`h-5 w-5 shrink-0 transition-colors ${isActive ? 'text-(--pc-accent)' : 'group-hover:text-(--pc-accent)'}`} />
-          {showLabel && <span className="whitespace-nowrap">{t(labelKey)}</span>}
+          {showLabel && <span className="whitespace-nowrap">{text}</span>}
           {showTooltip && (
             <span
               className="absolute left-full ml-2 px-2 py-1 rounded-md text-xs whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-9999"
               style={{ background: 'var(--pc-bg-elevated)', color: 'var(--pc-text-primary)', border: '1px solid var(--pc-border)' }}
             >
-              {t(labelKey)}
+              {text}
             </span>
           )}
         </>
@@ -74,6 +87,9 @@ function SidebarNavItem({ item, showLabel, showTooltip, onClick }: {
   );
 }
 
+// Group header label — only shown when the sidebar is expanded. In the
+// collapsed state we render a thin divider instead so the icons stay
+// aligned and the separator is still discoverable.
 interface SidebarProps {
   open: boolean;
   onClose: () => void;
@@ -188,7 +204,7 @@ function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'des
         className="px-5 py-4 border-t text-[10px] uppercase tracking-wider"
         style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
       >
-        ZeroClaw Runtime
+        ZeroClaw Gateway
       </div>
     );
   }
@@ -206,7 +222,7 @@ function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'des
         textAlign: collapsed ? 'center' : 'left',
       }}
     >
-      {!collapsed && 'ZeroClaw Runtime'}
+      {!collapsed && 'ZeroClaw Gateway'}
     </div>
   );
 }
