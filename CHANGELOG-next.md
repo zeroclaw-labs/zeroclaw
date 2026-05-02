@@ -98,6 +98,9 @@
 
 - `SessionResetTool` and `SessionDeleteTool` for in-agent session management (#5696).
 - `SessionsCurrentTool` exposes the active session identity (#6033).
+- First-party `skills/` folder is now the canonical, single-source registry for first-party skills. All previously-separate `zeroclaw-labs/zeroclaw-skills` skills now live in this repo's `skills/` directory. The CLI bare-name resolver (`zeroclaw skills install <name>`) sparse-checks out the `skills/` subtree from `zeroclaw-labs/zeroclaw` (only the requested skill is downloaded — no full repo clone) and the binary still ships with no skills bundled. PRs touching `skills/**` are auto-audited via `.github/workflows/skills-validate.yml`. Old binaries pointing at `zeroclaw-labs/zeroclaw-skills` continue to work; new binaries default to the consolidated layout.
+- **Default skill prompt-injection mode is now `compact`.** Previously `full` (every skill body inlined into the system prompt every turn). Compact mode keeps per-turn token cost flat — only skill names + descriptions sit in the system prompt; bodies are pulled in via `ReadSkillTool` only when the agent decides to use a skill. Users can still opt back into the legacy behavior with `skills.prompt_injection_mode = "full"`. This makes installing many skills cheap.
+- **New skills config knobs:** `skills.enabled` (default `true`) is a master toggle that short-circuits skill loading entirely when `false`. `skills.disabled` (default `[]`) is a per-skill blocklist matched by canonical `name`, so users can disable a shipped or pre-installed skill that biases the agent without uninstalling it from disk. Both are editable via the gateway's per-property CRUD endpoints.
 
 ### Plugins
 

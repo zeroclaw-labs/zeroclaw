@@ -321,6 +321,8 @@
   - changed-files:
       - any-glob-to-any-file:
           - "src/skills/**"
+          - "skills/**"
+          - ".github/workflows/skills-validate.yml"
 
 "tool":
   - changed-files:

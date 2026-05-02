@@ -27,10 +27,15 @@ const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
 const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
 const MAX_CLAWHUB_ZIP_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 
-// ─── Skills registry (zeroclaw-skills) ────────────────────────────────────────
-const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zeroclaw-skills";
-const SKILLS_REGISTRY_DIR_NAME: &str = "skills-registry";
-const SKILLS_REGISTRY_SYNC_MARKER: &str = ".zeroclaw-skills-registry-sync";
+// ─── Skills registry (main zeroclaw repo) ────────────────────────────────────
+//
+// Skills live in the main `zeroclaw` repo under `skills/`. The CLI sparse-checks
+// out only that subdirectory so users don't need to clone the full source
+// tree to install a skill. Layout in the cache mirrors the upstream:
+//   <cache>/skills/<name>/SKILL.md
+const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zeroclaw";
+const SKILLS_REGISTRY_DIR_NAME: &str = "skills-source";
+const SKILLS_REGISTRY_SYNC_MARKER: &str = ".zeroclaw-skills-source-sync";
 const SKILLS_REGISTRY_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24;
 
 /// A skill is a user-defined or community-built capability.
@@ -167,10 +172,19 @@ pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
 }
 
 /// Load skills using runtime config values (preferred at runtime).
+///
+/// Honors two top-level skill config knobs:
+/// - `skills.enabled = false` short-circuits with an empty list (kill switch).
+/// - `skills.disabled = ["name1", "name2"]` filters out matching skills by
+///   their canonical `name` field after loading.
 pub fn load_skills_with_config(
     workspace_dir: &Path,
     config: &zeroclaw_config::schema::Config,
 ) -> Vec<Skill> {
+    if !config.skills.enabled {
+        return Vec::new();
+    }
+
     #[allow(unused_mut)]
     let mut skills = load_skills_with_open_skills_config(
         workspace_dir,
@@ -181,6 +195,11 @@ pub fn load_skills_with_config(
 
     #[cfg(feature = "plugins-wasm")]
     skills.extend(load_plugin_skills_from_config(config));
+
+    if !config.skills.disabled.is_empty() {
+        let blocklist: HashSet<&str> = config.skills.disabled.iter().map(String::as_str).collect();
+        skills.retain(|s| !blocklist.contains(s.name.as_str()));
+    }
 
     skills
 }
@@ -1493,8 +1512,21 @@ fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
             .with_context(|| format!("failed to create registry parent: {}", parent.display()))?;
     }
 
+    // Sparse checkout the `skills/` subtree only. With `--filter=blob:none`
+    // git fetches no file contents until sparse-checkout requests them, so
+    // a first-time install only downloads the skill markdown the user
+    // asked for, not the whole zeroclaw source tree (~hundreds of MB).
+    //
+    // Requires git 2.25+ (released 2020); universal in supported envs.
     let output = Command::new("git")
-        .args(["clone", "--depth", "1", repo_url])
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            "--sparse",
+            repo_url,
+        ])
         .arg(registry_dir)
         .output()
         .context("failed to run git clone for skills registry")?;
@@ -1504,7 +1536,24 @@ fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
         anyhow::bail!("failed to clone skills registry: {stderr}");
     }
 
-    tracing::info!("cloned skills registry to {}", registry_dir.display());
+    let sparse_output = Command::new("git")
+        .arg("-C")
+        .arg(registry_dir)
+        .args(["sparse-checkout", "set", "skills"])
+        .output()
+        .context("failed to run git sparse-checkout for skills registry")?;
+
+    if !sparse_output.status.success() {
+        let stderr = String::from_utf8_lossy(&sparse_output.stderr);
+        // Don't bail — without sparse-checkout the full tree is materialised,
+        // which is wasteful but functionally correct. Surface a warning.
+        tracing::warn!("git sparse-checkout failed (working tree will be full clone): {stderr}");
+    }
+
+    tracing::info!(
+        "cloned skills registry to {} (sparse)",
+        registry_dir.display()
+    );
     mark_skills_registry_synced(registry_dir)?;
     Ok(())
 }
@@ -1816,5 +1865,111 @@ prompts = ["from-skill-section"]
             skill.prompts,
             vec!["from-skill-section".to_string(), "from-root".to_string(),]
         );
+    }
+}
+
+#[cfg(test)]
+mod skills_enabled_tests {
+    use super::*;
+    use tempfile::TempDir;
+    use zeroclaw_config::schema::Config;
+
+    fn make_workspace_with_two_skills(workspace_dir: &Path) {
+        let skills_dir = workspace_dir.join("skills");
+
+        let alpha_dir = skills_dir.join("alpha");
+        std::fs::create_dir_all(&alpha_dir).unwrap();
+        std::fs::write(
+            alpha_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "alpha"
+description = "first probe"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+
+        let beta_dir = skills_dir.join("beta");
+        std::fs::create_dir_all(&beta_dir).unwrap();
+        std::fs::write(
+            beta_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "beta"
+description = "second probe"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+    }
+
+    fn config_with_workspace_skills() -> Config {
+        let mut cfg = Config::default();
+        // Disable open-skills so the test never touches network/filesystem
+        // outside the workspace tmp dir.
+        cfg.skills.open_skills_enabled = false;
+        cfg
+    }
+
+    #[test]
+    fn defaults_load_all_skills() {
+        let tmp = TempDir::new().unwrap();
+        make_workspace_with_two_skills(tmp.path());
+        let cfg = config_with_workspace_skills();
+
+        let skills = load_skills_with_config(tmp.path(), &cfg);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"alpha"), "expected alpha in {:?}", names);
+        assert!(names.contains(&"beta"), "expected beta in {:?}", names);
+    }
+
+    #[test]
+    fn enabled_false_short_circuits_to_empty() {
+        let tmp = TempDir::new().unwrap();
+        make_workspace_with_two_skills(tmp.path());
+        let mut cfg = config_with_workspace_skills();
+        cfg.skills.enabled = false;
+
+        let skills = load_skills_with_config(tmp.path(), &cfg);
+        assert!(
+            skills.is_empty(),
+            "expected no skills when enabled=false, got {:?}",
+            skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn disabled_filters_named_skills() {
+        let tmp = TempDir::new().unwrap();
+        make_workspace_with_two_skills(tmp.path());
+        let mut cfg = config_with_workspace_skills();
+        cfg.skills.disabled = vec!["alpha".to_string()];
+
+        let skills = load_skills_with_config(tmp.path(), &cfg);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !names.contains(&"alpha"),
+            "expected alpha filtered out, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"beta"),
+            "expected beta still present, got {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn disabled_unknown_name_is_a_no_op() {
+        let tmp = TempDir::new().unwrap();
+        make_workspace_with_two_skills(tmp.path());
+        let mut cfg = config_with_workspace_skills();
+        cfg.skills.disabled = vec!["does-not-exist".to_string()];
+
+        let skills = load_skills_with_config(tmp.path(), &cfg);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
     }
 }

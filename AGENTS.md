@@ -119,10 +119,14 @@ Branch/commit/PR rules:
 
 ## Skills
 
-AI coding assistant skills live in `.claude/skills/`. Use the right one for the job:
+Two distinct kinds of skills live in this repo. Don't conflate them.
+
+**AI coding assistant skills** — `.claude/skills/`. Used by Claude Code (or other AI coding agents) when humans are editing this repo. Not loaded by the ZeroClaw runtime.
 
 - `.claude/skills/github-pr-review-session/SKILL.md` — PR review co-pilot; assists **you** as the human reviewer. Posts reviews as WareWolf-MoonWall using the RFC feedback taxonomy (🔴/🟡/✅/🔵/🟢). Trigger: `review 1234`, `re-review 1234`, `go through the queue`.
 - `.claude/skills/changelog-generation/SKILL.md` — generates `CHANGELOG-next.md` between stable tags, resolves contributors via GraphQL, feeds the release workflow. Trigger: `generate changelog`, `release notes for v0.7.x`.
+
+**ZeroClaw runtime skills** — `skills/` (repo root). First-party skills loaded by the agent at runtime. This directory is the canonical registry — the CLI sparse-checks out this subtree from `zeroclaw-labs/zeroclaw` when users run `zeroclaw skills install <name>`. No separate registry repo, no binary bundling, no mirror sync. See [`skills/README.md`](skills/README.md) for the contributor flow, format, and submission checklist.
 
 ## Localization
 

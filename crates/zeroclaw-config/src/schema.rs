@@ -1692,9 +1692,13 @@ impl Default for PacingConfig {
 #[serde(rename_all = "snake_case")]
 pub enum SkillsPromptInjectionMode {
     /// Inline full skill instructions and tool metadata into the system prompt.
-    #[default]
+    /// Higher token cost per turn (≈ full body × N installed skills) but no
+    /// extra tool calls needed for the agent to use a skill.
     Full,
-    /// Inline only compact skill metadata (name/description/location) and load details on demand.
+    /// Inline only compact skill metadata (name/description/location) and load
+    /// details on demand via `ReadSkillTool`. Default — keeps the agent's
+    /// per-turn token cost flat regardless of how many skills are installed.
+    #[default]
     Compact,
 }
 
@@ -1707,10 +1711,22 @@ fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjection
 }
 
 /// Skills loading configuration (`[skills]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "skills"]
 pub struct SkillsConfig {
+    /// Master toggle. When `false`, no skills are loaded into the agent's
+    /// context regardless of what's installed in the workspace skills
+    /// directory. Useful as a kill-switch when debugging agent behavior or
+    /// running on a token-constrained model. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Names of installed skills to skip loading. Useful for disabling a
+    /// shipped or pre-installed skill that biases the agent in a way you
+    /// don't want, without uninstalling it from disk. Match is by the
+    /// skill's canonical `name` (the directory name). Default: empty.
+    #[serde(default)]
+    pub disabled: Vec<String>,
     /// Enable loading and syncing the community open-skills repository.
     /// Default: `false` (opt-in).
     #[serde(default)]
@@ -1724,7 +1740,8 @@ pub struct SkillsConfig {
     #[serde(default)]
     pub allow_scripts: bool,
     /// URL of the skills registry repository for bare-name installs.
-    /// Default: `https://github.com/zeroclaw-labs/zeroclaw-skills`
+    /// Default: `https://github.com/zeroclaw-labs/zeroclaw` (sparse-checks
+    /// out only the `skills/` subtree).
     #[serde(default)]
     pub registry_url: Option<String>,
     /// Controls how skills are injected into the system prompt.
@@ -1739,6 +1756,22 @@ pub struct SkillsConfig {
     #[serde(default)]
     #[nested]
     pub skill_improvement: SkillImprovementConfig,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            disabled: Vec::new(),
+            open_skills_enabled: false,
+            open_skills_dir: None,
+            allow_scripts: false,
+            registry_url: None,
+            prompt_injection_mode: SkillsPromptInjectionMode::default(),
+            skill_creation: SkillCreationConfig::default(),
+            skill_improvement: SkillImprovementConfig::default(),
+        }
+    }
 }
 
 /// Autonomous skill creation configuration (`[skills.skill_creation]` section).
@@ -11835,11 +11868,13 @@ mod tests {
         // V2: no fallback provider by default — set during onboarding.
         assert!(c.providers.fallback.is_none());
         assert!(c.providers.fallback_provider().is_none());
+        assert!(c.skills.enabled);
+        assert!(c.skills.disabled.is_empty());
         assert!(!c.skills.open_skills_enabled);
         assert!(!c.skills.allow_scripts);
         assert_eq!(
             c.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Full
+            SkillsPromptInjectionMode::Compact
         );
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
@@ -14335,7 +14370,7 @@ requires_openai_auth = true
         assert!(config.skills.open_skills_dir.is_none());
         assert_eq!(
             config.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Full
+            SkillsPromptInjectionMode::Compact
         );
 
         // SAFETY: test-only, single-threaded test runner.

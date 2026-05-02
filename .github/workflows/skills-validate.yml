@@ -1,0 +1,99 @@
+name: Skills Validate
+
+# Audits every skill under `skills/` whenever a PR touches the directory.
+# Runs `zeroclaw skills audit <path>` for each skill and fails the check
+# if any skill produces audit findings or fails to parse its manifest.
+#
+# This workflow does not consume any user-controlled string inputs (no PR
+# titles, branch names, commit messages, etc.) inside shell commands, so it
+# is not exposed to the GitHub Actions injection class of vulnerability.
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'skills/**'
+      - '.github/workflows/skills-validate.yml'
+
+concurrency:
+  group: skills-validate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  audit:
+    name: Audit skills/
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+        with:
+          shared-key: skills-validate
+
+      - name: Build zeroclaw binary
+        run: cargo build --bin zeroclaw
+
+      - name: Audit each skill in skills/
+        run: |
+          set -euo pipefail
+          if [ ! -d skills ]; then
+            echo "::warning::skills/ directory missing — nothing to audit"
+            exit 0
+          fi
+
+          failed=0
+          for d in skills/*/; do
+            [ -d "$d" ] || continue
+            name=$(basename "$d")
+            if [ ! -f "$d/SKILL.md" ] && [ ! -f "$d/SKILL.toml" ]; then
+              echo "::warning::skipping $name (no SKILL.md or SKILL.toml)"
+              continue
+            fi
+            echo "::group::Auditing $name"
+            if ! ./target/debug/zeroclaw skills audit "./$d"; then
+              echo "::error file=skills/$name::Audit failed for $name"
+              failed=$((failed + 1))
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::$failed skill(s) failed audit"
+            exit 1
+          fi
+          echo "All skills passed audit."
+
+      - name: Verify install + list round-trip for each skill
+        run: |
+          set -euo pipefail
+          for d in skills/*/; do
+            [ -d "$d" ] || continue
+            name=$(basename "$d")
+            if [ ! -f "$d/SKILL.md" ] && [ ! -f "$d/SKILL.toml" ]; then
+              continue
+            fi
+            echo "::group::Install round-trip $name"
+            ./target/debug/zeroclaw skills install "./$d"
+            ./target/debug/zeroclaw skills list | grep -F "$name" || {
+              echo "::error::$name installed but not visible in skills list"
+              exit 1
+            }
+            ./target/debug/zeroclaw skills remove "$name"
+            echo "::endgroup::"
+          done
+          echo "All skills installed and removed cleanly."
