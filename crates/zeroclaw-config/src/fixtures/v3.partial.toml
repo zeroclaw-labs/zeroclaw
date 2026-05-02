@@ -1,0 +1,62 @@
+# V3 partial fixture — fields with no V1/V2 migration path.
+# Deep-merged on top of the V1-derived V3 config.
+
+[risk_profiles.default]
+level = "supervised"
+workspace_only = true
+allowed_commands = ["git", "cargo", "grep"]
+forbidden_paths = ["/etc", "/sys"]
+max_actions_per_hour = 100
+max_cost_per_day_cents = 500
+require_approval_for_medium_risk = true
+shell_env_passthrough = ["HOME", "PATH", "LANG"]
+shell_timeout_secs = 30
+max_memory_mb = 512
+max_cpu_time_seconds = 60
+max_subprocesses = 16
+memory_monitoring = true
+max_delegation_depth = 3
+
+[risk_profiles.trusted]
+level = "full"
+workspace_only = false
+allowed_commands = []
+forbidden_paths = []
+max_actions_per_hour = 0
+max_cost_per_day_cents = 0
+require_approval_for_medium_risk = false
+block_high_risk_commands = false
+shell_timeout_secs = 120
+
+[runtime_profiles.default]
+model = "my-model"
+temperature = 0.7
+agentic = true
+max_tool_iterations = 10
+max_history_messages = 50
+
+[runtime_profiles.researcher]
+model = "my-alt-model"
+temperature = 0.3
+agentic = true
+max_tool_iterations = 20
+max_history_messages = 100
+parallel_tools = true
+
+[agents.assistant]
+model_provider = "myprovider.default"
+channels = ["matrix.default", "discord.default"]
+
+[agents.researcher]
+model_provider = "myprovider-alt.default"
+channels = ["slack.default"]
+
+[gateway]
+enabled = true
+port = 3000
+host = "127.0.0.1"
+auth_token = "gateway-token-example"
+
+[cost]
+budget_cents_per_day = 1000
+alert_threshold_pct = 80
