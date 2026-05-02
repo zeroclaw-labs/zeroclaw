@@ -1,6 +1,8 @@
 # V3 partial fixture — fields with no V1/V2 migration path.
 # Deep-merged on top of the V1-derived V3 config.
 
+# ── Risk profiles ─────────────────────────────────────────────────────────────
+
 [risk_profiles.default]
 level = "supervised"
 workspace_only = true
@@ -28,6 +30,8 @@ require_approval_for_medium_risk = false
 block_high_risk_commands = false
 shell_timeout_secs = 120
 
+# ── Runtime profiles ──────────────────────────────────────────────────────────
+
 [runtime_profiles.default]
 model = "my-model"
 temperature = 0.7
@@ -43,6 +47,8 @@ max_tool_iterations = 20
 max_history_messages = 100
 parallel_tools = true
 
+# ── Agents ────────────────────────────────────────────────────────────────────
+
 [agents.assistant]
 model_provider = "myprovider.default"
 channels = ["matrix.default", "discord.default"]
@@ -51,12 +57,73 @@ channels = ["matrix.default", "discord.default"]
 model_provider = "myprovider-alt.default"
 channels = ["slack.default"]
 
+# ── Gateway ───────────────────────────────────────────────────────────────────
+
 [gateway]
 enabled = true
 port = 3000
 host = "127.0.0.1"
 auth_token = "gateway-token-example"
+path_prefix = "/api"
+web_dist_dir = "/usr/share/zeroclaw/web"
+
+[gateway.tls]
+enabled = true
+cert_path = "/etc/zeroclaw/tls/cert.pem"
+key_path = "/etc/zeroclaw/tls/key.pem"
+
+# ── Cost ──────────────────────────────────────────────────────────────────────
 
 [cost]
 budget_cents_per_day = 1000
 alert_threshold_pct = 80
+
+# ── Tunnel ────────────────────────────────────────────────────────────────────
+
+[tunnel]
+provider = "tailscale"
+
+[tunnel.tailscale]
+funnel = true
+hostname = "zeroclaw.example.ts.net"
+
+# ── Providers: model + embedding routes ───────────────────────────────────────
+
+[[providers.model_routes]]
+hint = "reasoning"
+provider = "myprovider"
+model = "my-model"
+
+[[providers.model_routes]]
+hint = "fast"
+provider = "myprovider-alt"
+model = "my-alt-model"
+
+[[providers.embedding_routes]]
+hint = "semantic"
+provider = "myprovider"
+model = "text-embedding-3-small"
+dimensions = 1536
+
+# ── Memory backends ───────────────────────────────────────────────────────────
+
+[memory.qdrant]
+url = "http://localhost:6333"
+collection = "zeroclaw_memories"
+api_key = "qdrant-api-key-example"
+
+[memory.postgres]
+vector_enabled = true
+vector_dimensions = 1536
+
+# ── Channels: V3-only fields ──────────────────────────────────────────────────
+
+[channels.matrix.default]
+access_token = "syt_example_token_example"
+device_id = "DEVICE123EXAMPLE"
+recovery_key = "EsXX Abcd Efgh Ijkl Mnop Qrst Uvwx Yz12 3456 7890"
+
+[channels.mattermost.default]
+login_id = "mm-user@example.org"
+password = "mm-password-example"
+thread_replies = true

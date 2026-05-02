@@ -2175,3 +2175,78 @@ fn fixture_v3_migrates_to_current_version() {
     let config = migrate(&out);
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
 }
+
+#[test]
+fn fixture_v3_has_gateway_tls() {
+    let out = generate(3);
+    assert!(
+        out.contains("[gateway.tls]"),
+        "V3 should have gateway.tls section"
+    );
+    assert!(
+        out.contains("cert_path"),
+        "V3 gateway.tls should have cert_path"
+    );
+}
+
+#[test]
+fn fixture_v3_has_tunnel() {
+    let out = generate(3);
+    assert!(out.contains("[tunnel]"), "V3 should have tunnel section");
+    assert!(
+        out.contains("[tunnel.tailscale]"),
+        "V3 should have tunnel.tailscale section"
+    );
+}
+
+#[test]
+fn fixture_v3_has_model_routes() {
+    let out = generate(3);
+    assert!(
+        out.contains("[[providers.model_routes]]"),
+        "V3 should have model_routes entries"
+    );
+    assert!(
+        out.contains("[[providers.embedding_routes]]"),
+        "V3 should have embedding_routes entries"
+    );
+}
+
+#[test]
+fn fixture_v3_has_memory_backends() {
+    let out = generate(3);
+    assert!(
+        out.contains("[memory.qdrant]"),
+        "V3 should have memory.qdrant section"
+    );
+    assert!(
+        out.contains("[memory.postgres]"),
+        "V3 should have memory.postgres section"
+    );
+}
+
+#[test]
+fn fixture_v3_has_matrix_e2ee_fields() {
+    let out = generate(3);
+    assert!(
+        out.contains("access_token"),
+        "V3 matrix channel should have access_token"
+    );
+    assert!(
+        out.contains("recovery_key"),
+        "V3 matrix channel should have recovery_key"
+    );
+    assert!(
+        out.contains("device_id"),
+        "V3 matrix channel should have device_id"
+    );
+}
+
+#[test]
+fn fixture_v3_has_mattermost_login_id() {
+    let out = generate(3);
+    assert!(
+        out.contains("login_id"),
+        "V3 mattermost channel should have login_id"
+    );
+}
