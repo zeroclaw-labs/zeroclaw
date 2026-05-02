@@ -174,7 +174,8 @@ pub async fn install(config: &Config, manifest_src: &str) -> Result<()> {
 /// Resolve the registry URL the client should poll. Order:
 ///   1. `[domain].registry_url` in `config.toml` (the supported way).
 ///   2. `MOA_DOMAIN_MANIFEST_URL` env var (legacy / ops override).
-/// Returns `Ok(None)` when neither is set — the caller is expected to
+///
+/// Returns `None` when neither is set — the caller is expected to
 /// treat that as a friendly no-op (general-public MoA build).
 fn resolve_registry_url(config: &Config) -> Option<String> {
     if let Some(url) = config.domain.registry_url.as_ref() {
@@ -292,7 +293,7 @@ async fn update_v2(config: &Config, manifest_url: &str, manifest_raw: &str) -> R
 }
 
 async fn full_install_v2(config: &Config, manifest: &super::domain_manifest::DomainManifestV2) -> Result<()> {
-    use super::domain_manifest::{BundleSpec, DomainManifest, ManifestStats};
+    use super::domain_manifest::{BundleSpec, DomainManifest};
 
     println!(
         "  {} full install of baseline v{} ({} bytes)",
@@ -606,6 +607,10 @@ enum IngestKind {
     Skipped,
 }
 
+// `async` is preserved because callers `.await` this; the body is
+// sync today but converting it would force an API change at the
+// caller side and is out of scope here.
+#[allow(clippy::unused_async)]
 async fn ingest_one(conn: &Arc<Mutex<Connection>>, path: &Path) -> Result<IngestKind> {
     use crate::vault::legal::{
         encoding, extract_case, extract_statute, ingest_case_to, ingest_statute_to,
@@ -659,7 +664,7 @@ fn walk_markdown(root: &Path) -> Result<Vec<PathBuf>> {
 fn is_markdown(p: &Path) -> bool {
     matches!(
         p.extension().and_then(|s| s.to_str()),
-        Some("md") | Some("markdown") | Some("MD")
+        Some("md" | "markdown" | "MD")
     )
 }
 
@@ -744,9 +749,19 @@ pub fn publish(
 
 /// Write the baseline meta keys into a freshly-built domain.db so it
 /// can ship as the year's baseline. Run after `vault domain build`
-/// (or `scripts/build_domain_db_fast.py`) before computing the
-/// publish-time sha256 — the meta rows are part of the baseline file
-/// and therefore part of its checksum.
+/// (or `scripts/build_domain_db_fast.py`).
+///
+/// `meta.baseline_sha256` is intentionally left empty here. The bundle
+/// file's checksum is **circular** (it would have to include the meta
+/// row that contains itself), so the authoritative sha lives in the
+/// emitted manifest, not in the bundle's meta. `publish_v2` writes the
+/// manifest sha; readers needing the bundle's identity should use the
+/// manifest, not `domain.db.meta.baseline_sha256`.
+///
+/// We document this contract by stamping an empty string here instead
+/// of a placeholder string like `"auto"`, so downstream code that
+/// might one day try to validate the meta sha sees a clearly-empty
+/// value rather than a fake-but-non-empty one.
 pub fn stamp_baseline(bundle_path: &Path, baseline_version: &str) -> Result<()> {
     if !bundle_path.exists() {
         anyhow::bail!("bundle not found: {}", bundle_path.display());
@@ -762,22 +777,12 @@ pub fn stamp_baseline(bundle_path: &Path, baseline_version: &str) -> Result<()> 
         .with_context(|| format!("opening {}", bundle_path.display()))?;
     super::schema::init_schema(&conn).context("init schema before stamping")?;
 
-    // Compute the baseline_sha256 BEFORE writing meta — that way the
-    // sha pinned in `domain.db.meta.baseline_sha256` matches the
-    // bytes the manifest will ship with. Otherwise the sha would
-    // capture meta-rows-with-themselves, which is circular.
-    //
-    // Actually, the manifest's `baseline.sha256` is computed *at
-    // publish time* by reading the file after meta is written, so
-    // it includes the meta rows. The `meta.baseline_sha256` value
-    // here is informational — it's the sha the operator advertises.
-    // We use a placeholder ("auto") which `publish_v2` overwrites.
-    super::domain::write_baseline_meta_on_conn(&conn, baseline_version, "auto", 0)
+    super::domain::write_baseline_meta_on_conn(&conn, baseline_version, "", 0)
         .context("writing baseline meta")?;
     drop(conn);
 
     println!(
-        "  {} stamped (publish_v2 will refresh baseline_sha256 to actual file digest)",
+        "  {} stamped (manifest's baseline.sha256 is authoritative; bundle meta sha left empty)",
         style("✓").green()
     );
     Ok(())

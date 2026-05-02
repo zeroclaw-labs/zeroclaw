@@ -62,10 +62,10 @@ pub fn ensure_schema(path: &Path) -> Result<()> {
 ///
 /// Returns:
 /// - `Ok(true)`  — the file existed and was successfully attached
-/// - `Ok(false)` — no domain.db at the path (no-op; the connection runs
-///                 in single-DB mode against `brain.db` only)
+/// - `Ok(false)` — no domain.db at the path (no-op; the connection
+///   runs in single-DB mode against `brain.db` only)
 /// - `Err(_)`    — the file existed but ATTACH failed (corrupt DB,
-///                 permissions, schema-version mismatch, …)
+///   permissions, schema-version mismatch, …)
 ///
 /// **Idempotent**: calling twice with the same `path` is safe — SQLite
 /// surfaces the second call as `SQLITE_ERROR: database domain is

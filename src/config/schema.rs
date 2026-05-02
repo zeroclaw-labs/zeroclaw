@@ -17528,7 +17528,7 @@ impl Default for SyncConfig {
 // which makes the weekly poll a no-op. Forks (lawpro, medpro) override
 // `registry_url` in their bundled `config.toml`.
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DomainConfig {
     /// HTTP(S) URL of the manifest JSON for this fork's domain corpus.
     /// `None` means "no corpus subscribed" — the entire update path is
@@ -17547,6 +17547,21 @@ pub struct DomainConfig {
     /// the user's home timezone. Empty string disables the cron.
     #[serde(default = "default_domain_update_cron")]
     pub update_cron: String,
+}
+
+// Manually implemented so `Config::default()` matches the serde defaults
+// — otherwise a `[domain]`-less TOML and `Config::default()` would
+// disagree on `auto_update` and `update_cron`. (Derive(Default) fills
+// `bool` with `false` and `String` with `""`, neither of which matches
+// the serde-default fns.)
+impl Default for DomainConfig {
+    fn default() -> Self {
+        Self {
+            registry_url: None,
+            auto_update: default_domain_auto_update(),
+            update_cron: default_domain_update_cron(),
+        }
+    }
 }
 
 fn default_domain_auto_update() -> bool {
