@@ -480,7 +480,7 @@ impl Agent {
             }
         }
 
-        let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
+        let provider_name = config.providers.fallback_type().unwrap_or("openrouter");
 
         let model_name = match fallback_provider_ag
             .and_then(|e| e.model.as_deref())
@@ -1415,30 +1415,27 @@ pub async fn run(
 
     let mut effective_config = config;
     if let Some(p) = provider_override {
-        effective_config.providers.fallback = Some(p);
+        effective_config.providers.fallback = vec![p];
     }
-    if let Some(fallback) = effective_config.providers.fallback.clone() {
-        if let Some((type_key, alias_key)) = fallback.split_once('.') {
-            if let Some(entry) = effective_config
-                .providers
-                .models
-                .get_mut(type_key)
-                .and_then(|m| m.get_mut(alias_key))
-            {
-                if let Some(m) = model_override {
-                    entry.model = Some(m);
-                }
-                entry.temperature = Some(temperature);
-            }
+    if let Some(fallback) = effective_config.providers.fallback.first().cloned()
+        && let Some((type_key, alias_key)) = fallback.split_once('.')
+        && let Some(entry) = effective_config
+            .providers
+            .models
+            .get_mut(type_key)
+            .and_then(|m| m.get_mut(alias_key))
+    {
+        if let Some(m) = model_override {
+            entry.model = Some(m);
         }
+        entry.temperature = Some(temperature);
     }
 
     let mut agent = Agent::from_config(&effective_config).await?;
 
     let provider_name = effective_config
         .providers
-        .fallback
-        .as_deref()
+        .fallback_type()
         .unwrap_or("openrouter")
         .to_string();
     // `Agent::from_config` above has already errored if no model could be resolved,
@@ -1777,7 +1774,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = Some(format!("custom:http://{addr}"));
+        config.providers.fallback = vec![format!("custom:http://{addr}")];
         {
             let entry = config.ensure_fallback_provider();
             entry.api_key = Some("test-key".to_string());

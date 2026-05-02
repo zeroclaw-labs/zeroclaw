@@ -294,7 +294,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Open-source models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if matches!(c.providers.fallback.as_deref(), Some("huggingface" | "hf")) {
+                if matches!(c.providers.fallback_type(), Some("huggingface" | "hf")) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -306,10 +306,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Local model server",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if matches!(
-                    c.providers.fallback.as_deref(),
-                    Some("lmstudio" | "lm-studio")
-                ) {
+                if matches!(c.providers.fallback_type(), Some("lmstudio" | "lm-studio")) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -357,11 +354,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Kimi & Kimi Coding",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers
-                    .fallback
-                    .as_deref()
-                    .is_some_and(is_moonshot_alias)
-                {
+                if c.providers.fallback_type().is_some_and(is_moonshot_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -409,7 +402,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Z.AI inference",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref().is_some_and(is_zai_alias) {
+                if c.providers.fallback_type().is_some_and(is_zai_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -421,7 +414,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "ChatGLM / Zhipu models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref().is_some_and(is_glm_alias) {
+                if c.providers.fallback_type().is_some_and(is_glm_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -433,11 +426,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "MiniMax AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers
-                    .fallback
-                    .as_deref()
-                    .is_some_and(is_minimax_alias)
-                {
+                if c.providers.fallback_type().is_some_and(is_minimax_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -449,7 +438,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Alibaba DashScope Qwen models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.fallback.as_deref().is_some_and(is_qwen_alias) {
+                if c.providers.fallback_type().is_some_and(is_qwen_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -473,11 +462,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Baidu AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers
-                    .fallback
-                    .as_deref()
-                    .is_some_and(is_qianfan_alias)
-                {
+                if c.providers.fallback_type().is_some_and(is_qianfan_alias) {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -1104,7 +1089,7 @@ mod tests {
     fn regional_provider_aliases_activate_expected_ai_integrations() {
         let entries = all_integrations();
         let mut config = Config::default();
-        config.providers.fallback = Some("minimax-cn".to_string());
+        config.providers.fallback = vec!["minimax-cn".to_string()];
 
         let minimax = entries.iter().find(|e| e.name == "MiniMax").unwrap();
         assert!(matches!(
@@ -1112,35 +1097,35 @@ mod tests {
             IntegrationStatus::Active
         ));
 
-        config.providers.fallback = Some("glm-cn".to_string());
+        config.providers.fallback = vec!["glm-cn".to_string()];
         let glm = entries.iter().find(|e| e.name == "GLM").unwrap();
         assert!(matches!(
             (glm.status_fn)(&config),
             IntegrationStatus::Active
         ));
 
-        config.providers.fallback = Some("moonshot-intl".to_string());
+        config.providers.fallback = vec!["moonshot-intl".to_string()];
         let moonshot = entries.iter().find(|e| e.name == "Moonshot").unwrap();
         assert!(matches!(
             (moonshot.status_fn)(&config),
             IntegrationStatus::Active
         ));
 
-        config.providers.fallback = Some("qwen-intl".to_string());
+        config.providers.fallback = vec!["qwen-intl".to_string()];
         let qwen = entries.iter().find(|e| e.name == "Qwen").unwrap();
         assert!(matches!(
             (qwen.status_fn)(&config),
             IntegrationStatus::Active
         ));
 
-        config.providers.fallback = Some("zai-cn".to_string());
+        config.providers.fallback = vec!["zai-cn".to_string()];
         let zai = entries.iter().find(|e| e.name == "Z.AI").unwrap();
         assert!(matches!(
             (zai.status_fn)(&config),
             IntegrationStatus::Active
         ));
 
-        config.providers.fallback = Some("baidu".to_string());
+        config.providers.fallback = vec!["baidu".to_string()];
         let qianfan = entries.iter().find(|e| e.name == "Qianfan").unwrap();
         assert!(matches!(
             (qianfan.status_fn)(&config),

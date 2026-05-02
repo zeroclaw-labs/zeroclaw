@@ -462,7 +462,7 @@ pub async fn run_gateway(
     let fallback = config.providers.fallback_provider();
     let provider: Arc<dyn Provider> =
         Arc::from(zeroclaw_providers::create_resilient_provider_with_options(
-            config.providers.fallback.as_deref().unwrap_or("openrouter"),
+            config.providers.fallback_type().unwrap_or("openrouter"),
             fallback.and_then(|e| e.api_key.as_deref()),
             fallback.and_then(|e| e.base_url.as_deref()),
             &config.reliability,
@@ -1541,9 +1541,9 @@ async fn handle_webhook(
         .config
         .lock()
         .providers
-        .fallback
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
+        .fallback_type()
+        .unwrap_or("unknown")
+        .to_string();
     let model_label = state.model.clone();
     let started_at = Instant::now();
 

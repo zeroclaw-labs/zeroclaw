@@ -419,7 +419,7 @@ async fn skip_if_configured(
 fn section_has_signal(cfg: &Config, section_key: &str) -> bool {
     match section_key {
         "workspace" => cfg.workspace.enabled,
-        "providers" => cfg.providers.fallback.is_some() && !cfg.providers.models.is_empty(),
+        "providers" => !cfg.providers.fallback.is_empty() && !cfg.providers.models.is_empty(),
         // `channels.cli: bool` is a default-true scalar that lives directly
         // under `channels.*`, so a bare `starts_with("channels.")` check
         // fires on every fresh install. Require a nested channel config
@@ -659,7 +659,7 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
     let entries = zeroclaw_providers::list_providers();
 
     loop {
-        let current_fallback = cfg.providers.fallback.clone().unwrap_or_default();
+        let current_fallback = cfg.providers.fallback.first().cloned().unwrap_or_default();
 
         let (picked, selected_base_url) = match &flags.provider {
             Some(forced) => (forced.clone(), None),
@@ -810,7 +810,7 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
             Nav::Done => {}
         }
 
-        if cfg.providers.fallback.as_deref() != Some(picked.as_str()) {
+        if cfg.providers.fallback.first().map(String::as_str) != Some(picked.as_str()) {
             persist(cfg, "providers.fallback", &picked).await?;
         }
 
@@ -1302,7 +1302,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut cfg = test_cfg(&temp);
         assert!(!section_has_signal(&cfg, "providers"));
-        cfg.providers.fallback = Some("anthropic".into());
+        cfg.providers.fallback = vec!["anthropic".into()];
         // A fallback name alone — with an empty models map — isn't a signal:
         // the user could have set it and then wiped the per-model block.
         assert!(!section_has_signal(&cfg, "providers"));
@@ -1559,7 +1559,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(cfg.providers.fallback.as_deref(), Some(provider.as_str()));
+        assert_eq!(
+            cfg.providers.fallback.first().map(String::as_str),
+            Some(provider.as_str())
+        );
         let model_cfg = cfg
             .providers
             .models
@@ -1627,7 +1630,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(cfg.providers.fallback.as_deref(), Some("anthropic"));
+        assert_eq!(
+            cfg.providers.fallback.first().map(String::as_str),
+            Some("anthropic")
+        );
         let model_cfg = cfg
             .providers
             .models

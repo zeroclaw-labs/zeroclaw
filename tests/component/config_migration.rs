@@ -77,7 +77,7 @@ temperature = 0.3
         Some("sk-ant")
     );
     assert_eq!(
-        config.providers.fallback.as_deref(),
+        config.providers.fallback.first().map(String::as_str),
         Some("anthropic.default")
     );
     assert_eq!(
@@ -133,7 +133,7 @@ model = "claude"
 
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(
-        config.providers.fallback.as_deref(),
+        config.providers.fallback.first().map(String::as_str),
         Some("openrouter.default")
     );
     assert_eq!(
@@ -153,7 +153,7 @@ api_key = "sk-orphan"
     );
 
     assert_eq!(
-        config.providers.fallback.as_deref(),
+        config.providers.fallback.first().map(String::as_str),
         Some("default.default")
     );
     assert_eq!(
@@ -178,7 +178,10 @@ model_provider = "ollama"
 "#,
     );
 
-    assert_eq!(config.providers.fallback.as_deref(), Some("ollama.default"));
+    assert_eq!(
+        config.providers.fallback.first().map(String::as_str),
+        Some("ollama.default")
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -259,7 +262,7 @@ allowed_users = ["@u:m"]
     let config = migrate(&migrated_toml);
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(
-        config.providers.fallback.as_deref(),
+        config.providers.fallback.first().map(String::as_str),
         Some("openrouter.default")
     );
     assert_eq!(
@@ -314,7 +317,7 @@ allowed_rooms = ["!existing:matrix.org"]
     );
 
     let mut expected = Config::default();
-    expected.providers.fallback = Some("walk-provider.default".into());
+    expected.providers.fallback = vec!["walk-provider.default".into()];
     let mut main_entry = ModelProviderConfig {
         api_key: Some("walk-key".into()),
         base_url: Some("https://walk.example.com".into()),
@@ -459,7 +462,7 @@ require_pairing = true
 
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(
-        config.providers.fallback.as_deref(),
+        config.providers.fallback.first().map(String::as_str),
         Some("openrouter.default")
     );
     assert_eq!(
@@ -1212,7 +1215,7 @@ api_key = "sk-or"
     );
 
     assert_eq!(
-        config.providers.fallback.as_deref(),
+        config.providers.fallback.first().map(String::as_str),
         Some("openrouter.default"),
         "bare fallback key must be upgraded to dotted form"
     );
@@ -1310,7 +1313,7 @@ model = "claude-opus-4-5"
         Some("sk-ant")
     );
     assert_eq!(
-        config.providers.fallback.as_deref(),
+        config.providers.fallback.first().map(String::as_str),
         Some("anthropic.default"),
         "already-dotted fallback must not be modified"
     );
@@ -1898,7 +1901,10 @@ connect_timeout_secs = 10
     );
     assert_eq!(config.storage.provider.config.schema, "myschema");
     assert_eq!(config.storage.provider.config.table, "entries");
-    assert_eq!(config.storage.provider.config.connect_timeout_secs, Some(10));
+    assert_eq!(
+        config.storage.provider.config.connect_timeout_secs,
+        Some(10)
+    );
 }
 
 #[test]
@@ -1993,5 +1999,5 @@ token = "pinggy-token"
 
     assert_eq!(config.tunnel.provider, "pinggy");
     let pg = config.tunnel.pinggy.as_ref().unwrap();
-    assert_eq!(pg.token, "pinggy-token");
+    assert_eq!(pg.token.as_deref(), Some("pinggy-token"));
 }

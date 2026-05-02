@@ -145,7 +145,7 @@ fn security_full_autonomy_parses() {
 #[test]
 fn security_config_debug_does_not_leak_api_key() {
     let mut config = Config::default();
-    config.providers.fallback = Some("test".into());
+    config.providers.fallback = vec!["test".into()];
     config
         .providers
         .models

@@ -1254,7 +1254,6 @@ async fn main() -> Result<()> {
         }
 
         let mut cfg = Box::pin(Config::load_or_init()).await?;
-        cfg.apply_env_overrides();
 
         let flags = Flags {
             force: *force,
@@ -1322,7 +1321,6 @@ async fn main() -> Result<()> {
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
-    config.apply_env_overrides();
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
     #[cfg(feature = "agent-runtime")]
@@ -1355,14 +1353,14 @@ async fn main() -> Result<()> {
                 let final_temperature = temperature
                     .unwrap_or_else(|| fallback.and_then(|e| e.temperature).unwrap_or(0.7));
                 if let Some(p) = &provider {
-                    config.providers.fallback = Some(p.clone());
+                    config.providers.fallback = vec![p.clone()];
                 }
                 if let Some(m) = &model {
                     config.ensure_fallback_provider().model = Some(m.clone());
                 }
                 config.ensure_fallback_provider().temperature = Some(final_temperature);
 
-                let provider_name = config.providers.fallback.as_deref().unwrap_or("openai");
+                let provider_name = config.providers.fallback_type().unwrap_or("openai");
                 let provider = zeroclaw::providers::create_provider(
                     provider_name,
                     config
@@ -1759,7 +1757,7 @@ async fn main() -> Result<()> {
             println!();
             println!(
                 "🤖 Provider:      {}",
-                config.providers.fallback.as_deref().unwrap_or("openrouter")
+                config.providers.fallback_type().unwrap_or("openrouter")
             );
             println!(
                 "   Model:         {}",
@@ -1904,8 +1902,7 @@ async fn main() -> Result<()> {
             let providers = providers::list_providers();
             let current = config
                 .providers
-                .fallback
-                .as_deref()
+                .fallback_type()
                 .unwrap_or("openrouter")
                 .trim()
                 .to_ascii_lowercase();

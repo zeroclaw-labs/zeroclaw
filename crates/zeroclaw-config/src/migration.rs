@@ -156,16 +156,17 @@ impl V1Compat {
             || self.extra_headers.as_ref().is_some_and(|h| !h.is_empty());
 
         if !has_v1_fields {
-            if let Some(provider) = self.default_provider.take() {
-                if self.config.providers.fallback.is_none() {
-                    self.config.providers.fallback = Some(provider);
-                }
+            if let Some(provider) = self.default_provider.take()
+                && self.config.providers.fallback.is_empty()
+            {
+                self.config.providers.fallback = vec![provider];
             }
             return;
         }
 
         let fallback = self.default_provider.take();
-        let Some(fallback) = fallback.or_else(|| self.config.providers.fallback.clone()) else {
+        let Some(fallback) = fallback.or_else(|| self.config.providers.fallback.first().cloned())
+        else {
             return;
         };
 
@@ -207,8 +208,8 @@ impl V1Compat {
             entry.extra_headers = headers;
         }
 
-        if self.config.providers.fallback.is_none() {
-            self.config.providers.fallback = Some(fallback);
+        if self.config.providers.fallback.is_empty() {
+            self.config.providers.fallback = vec![fallback];
         }
 
         // Move routing rules into providers.

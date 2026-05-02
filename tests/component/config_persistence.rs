@@ -18,7 +18,7 @@ fn config_default_has_expected_provider() {
     let config = Config::default();
     // Default config has no provider until configured
     assert!(
-        config.providers.fallback.is_none() || config.providers.fallback.is_some(),
+        config.providers.fallback.is_empty() || !config.providers.fallback.is_empty(),
         "default config should be constructible"
     );
 }
@@ -134,7 +134,7 @@ fn memory_config_default_vector_keyword_weights_sum_to_one() {
 fn config_toml_roundtrip_preserves_provider() {
     use zeroclaw::config::ModelProviderConfig;
     let mut config = Config::default();
-    config.providers.fallback = Some("deepseek".into());
+    config.providers.fallback = vec!["deepseek".into()];
     config
         .providers
         .models
@@ -154,7 +154,10 @@ fn config_toml_roundtrip_preserves_provider() {
         toml::from_str(&toml_str).expect("TOML should deserialize back");
     let parsed = compat.into_config();
 
-    assert_eq!(parsed.providers.fallback.as_deref(), Some("deepseek"));
+    assert_eq!(
+        parsed.providers.fallback.first().map(String::as_str),
+        Some("deepseek")
+    );
     assert_eq!(
         parsed
             .providers
@@ -217,7 +220,7 @@ fn config_file_write_read_roundtrip() {
     let config_path = tmp.path().join("config.toml");
 
     let mut config = Config::default();
-    config.providers.fallback = Some("mistral".into());
+    config.providers.fallback = vec!["mistral".into()];
     config
         .providers
         .models
@@ -240,7 +243,10 @@ fn config_file_write_read_roundtrip() {
         toml::from_str(&read_back).expect("TOML should parse back");
     let parsed = compat.into_config();
 
-    assert_eq!(parsed.providers.fallback.as_deref(), Some("mistral"));
+    assert_eq!(
+        parsed.providers.fallback.first().map(String::as_str),
+        Some("mistral")
+    );
     assert_eq!(
         parsed
             .providers

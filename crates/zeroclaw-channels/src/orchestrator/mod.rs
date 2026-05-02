@@ -831,9 +831,9 @@ fn resolve_provider_alias(name: &str) -> Option<String> {
 fn resolved_default_provider(config: &Config) -> String {
     config
         .providers
-        .fallback
-        .clone()
-        .unwrap_or_else(|| "openrouter".to_string())
+        .fallback_type()
+        .unwrap_or("openrouter")
+        .to_string()
 }
 
 fn resolved_default_model(config: &Config) -> String {
@@ -960,7 +960,6 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
         }
     }
 
-    parsed.apply_env_overrides();
     Ok(runtime_defaults_from_config(&parsed))
 }
 

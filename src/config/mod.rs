@@ -65,7 +65,7 @@ mod tests {
         let config = Config::default();
 
         // Config::default() no longer has provider cache fields; just verify providers is constructible
-        assert!(config.providers.fallback.is_none() || config.providers.fallback.is_some());
+        assert!(config.providers.fallback.is_empty() || !config.providers.fallback.is_empty());
     }
 
     #[test]

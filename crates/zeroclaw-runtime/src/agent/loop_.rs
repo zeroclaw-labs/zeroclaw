@@ -2247,7 +2247,7 @@ pub async fn run(
     // ── Resolve provider ─────────────────────────────────────────
     let mut provider_name = provider_override
         .as_deref()
-        .or(config.providers.fallback.as_deref())
+        .or(config.providers.fallback_type())
         .unwrap_or("openrouter")
         .to_string();
 
@@ -3224,7 +3224,7 @@ pub async fn process_message(
         }
     }
 
-    let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
+    let provider_name = config.providers.fallback_type().unwrap_or("openrouter");
     let model_name = match fallback_provider_pm
         .and_then(|e| e.model.as_deref())
         .map(str::trim)

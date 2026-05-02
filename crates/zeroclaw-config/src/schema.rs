@@ -1714,14 +1714,6 @@ pub enum SkillsPromptInjectionMode {
     Compact,
 }
 
-fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjectionMode> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "full" => Some(SkillsPromptInjectionMode::Full),
-        "compact" => Some(SkillsPromptInjectionMode::Compact),
-        _ => None,
-    }
-}
-
 /// Skills loading configuration (`[skills]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -5018,22 +5010,6 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
-fn parse_proxy_scope(raw: &str) -> Option<ProxyScope> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "environment" | "env" => Some(ProxyScope::Environment),
-        "zeroclaw" | "internal" | "core" => Some(ProxyScope::Zeroclaw),
-        "services" | "service" => Some(ProxyScope::Services),
-        _ => None,
-    }
-}
-
-fn parse_proxy_enabled(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
 // ── Memory ───────────────────────────────────────────────────
 
 /// Persistent storage configuration (`[storage]` section).
@@ -10110,20 +10086,6 @@ fn normalize_wire_api(raw: &str) -> Option<&'static str> {
     }
 }
 
-fn read_codex_openai_api_key() -> Option<String> {
-    let home = UserDirs::new()?.home_dir().to_path_buf();
-    let auth_path = home.join(".codex").join("auth.json");
-    let raw = std::fs::read_to_string(auth_path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
-
-    parsed
-        .get("OPENAI_API_KEY")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
 /// Ensure that essential bootstrap files exist in the workspace directory.
 ///
 /// When the workspace is created outside of `zeroclaw onboard` (e.g., non-tty
@@ -10303,7 +10265,6 @@ impl Config {
             // Decrypt all #[secret]-annotated fields via Configurable derive
             config.decrypt_secrets(&store)?;
 
-            config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
                 path = %config.config_path.display(),
@@ -10314,7 +10275,7 @@ impl Config {
             );
             Ok(config)
         } else {
-            let mut config = Config {
+            let config = Config {
                 config_path: config_path.clone(),
                 workspace_dir,
                 ..Config::default()
@@ -10328,7 +10289,6 @@ impl Config {
                 let _ = fs::set_permissions(&config_path, Permissions::from_mode(0o600)).await;
             }
 
-            config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
                 path = %config.config_path.display(),
@@ -10341,188 +10301,27 @@ impl Config {
         }
     }
 
-    fn lookup_model_provider_profile(
-        &self,
-        provider_name: &str,
-    ) -> Option<(String, ModelProviderConfig)> {
-        let needle = provider_name.trim();
-        if needle.is_empty() {
-            return None;
-        }
-        // V3: dotted path "type.alias"
-        if let Some((type_key, alias_key)) = needle.split_once('.')
-            && let Some(profile) = self
-                .providers
-                .models
-                .get(type_key)
-                .and_then(|m| m.get(alias_key))
-        {
-            return Some((needle.to_string(), profile.clone()));
-        }
-        // V2 compat: bare type key → look for "default" alias
-        if let Some(profile) = self
+    /// Ensure the fallback provider entry exists, creating it if necessary.
+    pub fn ensure_fallback_provider(&mut self) -> &mut ModelProviderConfig {
+        let fallback = self
             .providers
+            .fallback
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "default.default".into());
+        if self.providers.fallback.is_empty() {
+            self.providers.fallback = vec![fallback.clone()];
+        }
+        let (type_key, alias_key) = fallback
+            .split_once('.')
+            .map(|(t, a)| (t.to_string(), a.to_string()))
+            .unwrap_or_else(|| (fallback.clone(), "default".to_string()));
+        self.providers
             .models
-            .get(needle)
-            .and_then(|m| m.get("default"))
-        {
-            return Some((format!("{needle}.default"), profile.clone()));
-        }
-        None
-    }
-
-    /// Apply Codex-app-server compatibility shims to the resolved fallback provider entry.
-    ///
-    /// Historically this method mutated `self.providers.fallback` to a "canonical" key
-    /// derived from the profile's `name` field, `wire_api`, or `base_url`. That mutation
-    /// caused two problems:
-    ///
-    /// 1. **CLI get/set divergence.** `Config::load_or_init` calls `apply_env_overrides`,
-    ///    which calls this function. After load, `providers.fallback` no longer matched
-    ///    what was on disk, so `zeroclaw config get providers.fallback` returned the
-    ///    rewritten value while the file still had the user's literal value. The next
-    ///    `save()` would then persist the rewrite, silently changing the user's config.
-    /// 2. **Orphaned references.** When the rewrite pointed at a key that did not exist
-    ///    in `providers.models` (e.g. profile had `name = "gemini"` but no
-    ///    `[providers.models.gemini]` entry), runtime `fallback_provider()` lookups
-    ///    returned `None` and downstream code fell through to a hardcoded default model.
-    ///
-    /// The fix: keep `self.providers.fallback` as the literal user-supplied key.
-    /// Propagate the profile's `base_url` / `api_path` / `max_tokens` / `api_key` onto the
-    /// resolved entry as before, and mirror the entry under any canonical alias keys so
-    /// runtime lookups by either name still resolve. The user's `[providers] fallback`
-    /// value is preserved end-to-end through load → save → load.
-    fn apply_named_model_provider_profile(&mut self) {
-        let Some(current_provider) = self.providers.fallback.clone() else {
-            return;
-        };
-
-        let Some((profile_key, profile)) = self.lookup_model_provider_profile(&current_provider)
-        else {
-            return;
-        };
-
-        let base_url = profile
-            .base_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
-
-        {
-            let fallback_provider = self.providers.fallback_provider();
-            let current_url = fallback_provider
-                .and_then(|e| e.base_url.as_deref())
-                .map(str::trim);
-            if current_url.is_none_or(|value| value.is_empty())
-                && let Some(base_url) = base_url.as_ref()
-                && let Some(entry) = self.providers.fallback_provider_mut()
-            {
-                entry.base_url = Some(base_url.clone());
-            }
-        }
-
-        // Propagate api_path from the profile when not already set on fallback entry.
-        {
-            let has_api_path = self
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_path.as_ref())
-                .is_some();
-            if !has_api_path && let Some(ref path) = profile.api_path {
-                let trimmed = path.trim();
-                if !trimmed.is_empty()
-                    && let Some(entry) = self.providers.fallback_provider_mut()
-                {
-                    entry.api_path = Some(trimmed.to_string());
-                }
-            }
-        }
-
-        // Propagate max_tokens from the profile when not already set on fallback entry.
-        {
-            let has_max_tokens = self
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.max_tokens)
-                .is_some();
-            if !has_max_tokens
-                && let Some(max_tokens) = profile.max_tokens
-                && let Some(entry) = self.providers.fallback_provider_mut()
-            {
-                entry.max_tokens = Some(max_tokens);
-            }
-        }
-
-        if profile.requires_openai_auth {
-            let needs_key = self
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_deref())
-                .map(str::trim)
-                .is_none_or(|value| value.is_empty());
-            if needs_key {
-                let codex_key = std::env::var("OPENAI_API_KEY")
-                    .ok()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .or_else(read_codex_openai_api_key);
-                if let Some(codex_key) = codex_key
-                    && let Some(entry) = self.providers.fallback_provider_mut()
-                {
-                    entry.api_key = Some(codex_key);
-                }
-            }
-        }
-
-        let normalized_wire_api = profile.wire_api.as_deref().and_then(normalize_wire_api);
-        let profile_name = profile
-            .name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-
-        // Mirror the resolved entry under any canonical alias keys so that runtime
-        // lookups by the profile-implied name (e.g. wire_api → "openai-codex",
-        // explicit `name = ...`, or `custom:<base_url>`) also resolve. We do NOT
-        // rewrite `providers.fallback` itself: that is the user's literal config
-        // value and must round-trip cleanly through CLI get/set/save.
-        let mut alias_keys: Vec<String> = Vec::new();
-        if normalized_wire_api == Some("responses") {
-            alias_keys.push("openai-codex".to_string());
-        }
-        if let Some(profile_name) = profile_name
-            && !profile_name.eq_ignore_ascii_case(&profile_key)
-        {
-            alias_keys.push(profile_name.to_string());
-        }
-        if let Some(ref base_url) = base_url {
-            alias_keys.push(format!("custom:{base_url}"));
-        }
-
-        for alias in alias_keys {
-            // profile_key is now a dotted "type.alias" key; split to retrieve the entry.
-            let entry = profile_key.split_once('.').and_then(|(type_k, alias_k)| {
-                self.providers.models.get(type_k)?.get(alias_k).cloned()
-            });
-            if let Some(entry) = entry {
-                // Insert alias under its own type bucket with "default" inner alias.
-                // Only insert if no entry exists yet to avoid clobbering explicit config.
-                if !self
-                    .providers
-                    .models
-                    .get(&alias)
-                    .is_some_and(|m| m.contains_key("default"))
-                {
-                    self.providers
-                        .models
-                        .entry(alias)
-                        .or_default()
-                        .entry("default".to_string())
-                        .or_insert(entry);
-                }
-            }
-        }
+            .entry(type_key)
+            .or_default()
+            .entry(alias_key)
+            .or_default()
     }
 
     /// Validate configuration values that would cause runtime failures.
@@ -10743,7 +10542,7 @@ impl Config {
         }
 
         // Providers — fallback reference check
-        if let Some(ref fallback_key) = self.providers.fallback {
+        if let Some(fallback_key) = self.providers.fallback.first() {
             let (type_k, alias_k) = fallback_key
                 .split_once('.')
                 .unwrap_or((fallback_key.as_str(), "default"));
@@ -10764,8 +10563,7 @@ impl Config {
         // Ollama cloud-routing safety checks
         if self
             .providers
-            .fallback
-            .as_deref()
+            .fallback_type()
             .is_some_and(|provider| provider.trim().eq_ignore_ascii_case("ollama"))
             && self
                 .providers
@@ -11140,278 +10938,6 @@ impl Config {
         }
 
         Ok(())
-    }
-
-    /// Ensure the fallback provider entry exists, creating it if necessary.
-    /// Apply environment variable overrides to config
-    pub fn apply_env_overrides(&mut self) {
-        // Apply named provider profile remapping (Codex app-server compatibility).
-        self.apply_named_model_provider_profile();
-
-        // Workspace directory: ZEROCLAW_WORKSPACE
-        if let Ok(workspace) = std::env::var("ZEROCLAW_WORKSPACE")
-            && !workspace.is_empty()
-        {
-            let expanded = expand_tilde_path(&workspace);
-            let (_, workspace_dir) = resolve_config_dir_for_workspace(&expanded);
-            self.workspace_dir = workspace_dir;
-        }
-
-        // Open-skills opt-in flag: ZEROCLAW_OPEN_SKILLS_ENABLED
-        if let Ok(flag) = std::env::var("ZEROCLAW_OPEN_SKILLS_ENABLED")
-            && !flag.trim().is_empty()
-        {
-            match flag.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => self.skills.open_skills_enabled = true,
-                "0" | "false" | "no" | "off" => self.skills.open_skills_enabled = false,
-                _ => tracing::warn!(
-                    "Ignoring invalid ZEROCLAW_OPEN_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
-                ),
-            }
-        }
-
-        // Open-skills directory override: ZEROCLAW_OPEN_SKILLS_DIR
-        if let Ok(path) = std::env::var("ZEROCLAW_OPEN_SKILLS_DIR") {
-            let trimmed = path.trim();
-            if !trimmed.is_empty() {
-                self.skills.open_skills_dir = Some(trimmed.to_string());
-            }
-        }
-
-        // Skills script-file audit override: ZEROCLAW_SKILLS_ALLOW_SCRIPTS
-        if let Ok(flag) = std::env::var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS")
-            && !flag.trim().is_empty()
-        {
-            match flag.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => self.skills.allow_scripts = true,
-                "0" | "false" | "no" | "off" => self.skills.allow_scripts = false,
-                _ => tracing::warn!(
-                    "Ignoring invalid ZEROCLAW_SKILLS_ALLOW_SCRIPTS (valid: 1|0|true|false|yes|no|on|off)"
-                ),
-            }
-        }
-
-        // Skills prompt mode override: ZEROCLAW_SKILLS_PROMPT_MODE
-        if let Ok(mode) = std::env::var("ZEROCLAW_SKILLS_PROMPT_MODE")
-            && !mode.trim().is_empty()
-        {
-            if let Some(parsed) = parse_skills_prompt_injection_mode(&mode) {
-                self.skills.prompt_injection_mode = parsed;
-            } else {
-                tracing::warn!(
-                    "Ignoring invalid ZEROCLAW_SKILLS_PROMPT_MODE (valid: full|compact)"
-                );
-            }
-        }
-
-        // Gateway port: ZEROCLAW_GATEWAY_PORT or PORT
-        if let Ok(port_str) =
-            std::env::var("ZEROCLAW_GATEWAY_PORT").or_else(|_| std::env::var("PORT"))
-            && let Ok(port) = port_str.parse::<u16>()
-        {
-            self.gateway.port = port;
-        }
-
-        // Gateway host: ZEROCLAW_GATEWAY_HOST or HOST
-        if let Ok(host) = std::env::var("ZEROCLAW_GATEWAY_HOST").or_else(|_| std::env::var("HOST"))
-            && !host.is_empty()
-        {
-            self.gateway.host = host;
-        }
-
-        // Allow public bind: ZEROCLAW_ALLOW_PUBLIC_BIND
-        if let Ok(val) = std::env::var("ZEROCLAW_ALLOW_PUBLIC_BIND") {
-            self.gateway.allow_public_bind = val == "1" || val.eq_ignore_ascii_case("true");
-        }
-
-        // Require pairing: ZEROCLAW_REQUIRE_PAIRING
-        if let Ok(val) = std::env::var("ZEROCLAW_REQUIRE_PAIRING") {
-            self.gateway.require_pairing = val == "1" || val.eq_ignore_ascii_case("true");
-        }
-
-        // Web dist dir: ZEROCLAW_WEB_DIST_DIR
-        if let Ok(path) = std::env::var("ZEROCLAW_WEB_DIST_DIR") {
-            let trimmed = path.trim();
-            if !trimmed.is_empty() {
-                self.gateway.web_dist_dir = Some(trimmed.to_string());
-            }
-        }
-
-        // Reasoning override: ZEROCLAW_REASONING_ENABLED or REASONING_ENABLED
-        if let Ok(flag) = std::env::var("ZEROCLAW_REASONING_ENABLED")
-            .or_else(|_| std::env::var("REASONING_ENABLED"))
-        {
-            let normalized = flag.trim().to_ascii_lowercase();
-            match normalized.as_str() {
-                "1" | "true" | "yes" | "on" => self.runtime.reasoning_enabled = Some(true),
-                "0" | "false" | "no" | "off" => self.runtime.reasoning_enabled = Some(false),
-                _ => {}
-            }
-        }
-
-        if let Ok(raw) = std::env::var("ZEROCLAW_REASONING_EFFORT")
-            .or_else(|_| std::env::var("REASONING_EFFORT"))
-            .or_else(|_| std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT"))
-        {
-            match normalize_reasoning_effort(&raw) {
-                Ok(effort) => self.runtime.reasoning_effort = Some(effort),
-                Err(message) => tracing::warn!("Ignoring reasoning effort env override: {message}"),
-            }
-        }
-
-        // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
-        if let Ok(enabled) = std::env::var("ZEROCLAW_WEB_SEARCH_ENABLED")
-            .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
-        {
-            self.web_search.enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
-        }
-
-        // Web search provider: ZEROCLAW_WEB_SEARCH_PROVIDER or WEB_SEARCH_PROVIDER
-        if let Ok(provider) = std::env::var("ZEROCLAW_WEB_SEARCH_PROVIDER")
-            .or_else(|_| std::env::var("WEB_SEARCH_PROVIDER"))
-        {
-            let provider = provider.trim();
-            if !provider.is_empty() {
-                self.web_search.provider = provider.to_string();
-            }
-        }
-
-        // Brave API key: ZEROCLAW_BRAVE_API_KEY or BRAVE_API_KEY
-        if let Ok(api_key) =
-            std::env::var("ZEROCLAW_BRAVE_API_KEY").or_else(|_| std::env::var("BRAVE_API_KEY"))
-        {
-            let api_key = api_key.trim();
-            if !api_key.is_empty() {
-                self.web_search.brave_api_key = Some(api_key.to_string());
-            }
-        }
-
-        // SearXNG instance URL: ZEROCLAW_SEARXNG_INSTANCE_URL or SEARXNG_INSTANCE_URL
-        if let Ok(instance_url) = std::env::var("ZEROCLAW_SEARXNG_INSTANCE_URL")
-            .or_else(|_| std::env::var("SEARXNG_INSTANCE_URL"))
-        {
-            let instance_url = instance_url.trim();
-            if !instance_url.is_empty() {
-                self.web_search.searxng_instance_url = Some(instance_url.to_string());
-            }
-        }
-
-        // Web search max results: ZEROCLAW_WEB_SEARCH_MAX_RESULTS or WEB_SEARCH_MAX_RESULTS
-        if let Ok(max_results) = std::env::var("ZEROCLAW_WEB_SEARCH_MAX_RESULTS")
-            .or_else(|_| std::env::var("WEB_SEARCH_MAX_RESULTS"))
-            && let Ok(max_results) = max_results.parse::<usize>()
-            && (1..=10).contains(&max_results)
-        {
-            self.web_search.max_results = max_results;
-        }
-
-        // Web search timeout: ZEROCLAW_WEB_SEARCH_TIMEOUT_SECS or WEB_SEARCH_TIMEOUT_SECS
-        if let Ok(timeout_secs) = std::env::var("ZEROCLAW_WEB_SEARCH_TIMEOUT_SECS")
-            .or_else(|_| std::env::var("WEB_SEARCH_TIMEOUT_SECS"))
-            && let Ok(timeout_secs) = timeout_secs.parse::<u64>()
-            && timeout_secs > 0
-        {
-            self.web_search.timeout_secs = timeout_secs;
-        }
-
-        // Storage provider key (optional backend override): ZEROCLAW_STORAGE_PROVIDER
-        if let Ok(provider) = std::env::var("ZEROCLAW_STORAGE_PROVIDER") {
-            let provider = provider.trim();
-            if !provider.is_empty() {
-                self.storage.provider.config.provider = provider.to_string();
-            }
-        }
-
-        // Storage connection URL (for remote backends): ZEROCLAW_STORAGE_DB_URL
-        if let Ok(db_url) = std::env::var("ZEROCLAW_STORAGE_DB_URL") {
-            let db_url = db_url.trim();
-            if !db_url.is_empty() {
-                self.storage.provider.config.db_url = Some(db_url.to_string());
-            }
-        }
-
-        // Storage connect timeout: ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS
-        if let Ok(timeout_secs) = std::env::var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS")
-            && let Ok(timeout_secs) = timeout_secs.parse::<u64>()
-            && timeout_secs > 0
-        {
-            self.storage.provider.config.connect_timeout_secs = Some(timeout_secs);
-        }
-        // Proxy enabled flag: ZEROCLAW_PROXY_ENABLED
-        let explicit_proxy_enabled = std::env::var("ZEROCLAW_PROXY_ENABLED")
-            .ok()
-            .as_deref()
-            .and_then(parse_proxy_enabled);
-        if let Some(enabled) = explicit_proxy_enabled {
-            self.proxy.enabled = enabled;
-        }
-
-        // Proxy URLs: ZEROCLAW_* wins, then generic *PROXY vars.
-        let mut proxy_url_overridden = false;
-        if let Ok(proxy_url) =
-            std::env::var("ZEROCLAW_HTTP_PROXY").or_else(|_| std::env::var("HTTP_PROXY"))
-        {
-            self.proxy.http_proxy = normalize_proxy_url_option(Some(&proxy_url));
-            proxy_url_overridden = true;
-        }
-        if let Ok(proxy_url) =
-            std::env::var("ZEROCLAW_HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY"))
-        {
-            self.proxy.https_proxy = normalize_proxy_url_option(Some(&proxy_url));
-            proxy_url_overridden = true;
-        }
-        if let Ok(proxy_url) =
-            std::env::var("ZEROCLAW_ALL_PROXY").or_else(|_| std::env::var("ALL_PROXY"))
-        {
-            self.proxy.all_proxy = normalize_proxy_url_option(Some(&proxy_url));
-            proxy_url_overridden = true;
-        }
-        if let Ok(no_proxy) =
-            std::env::var("ZEROCLAW_NO_PROXY").or_else(|_| std::env::var("NO_PROXY"))
-        {
-            self.proxy.no_proxy = normalize_no_proxy_list(vec![no_proxy]);
-        }
-
-        if explicit_proxy_enabled.is_none()
-            && proxy_url_overridden
-            && self.proxy.has_any_proxy_url()
-        {
-            self.proxy.enabled = true;
-        }
-
-        // Proxy scope and service selectors.
-        if let Ok(scope_raw) = std::env::var("ZEROCLAW_PROXY_SCOPE") {
-            if let Some(scope) = parse_proxy_scope(&scope_raw) {
-                self.proxy.scope = scope;
-            } else {
-                tracing::warn!(
-                    scope = %scope_raw,
-                    "Ignoring invalid ZEROCLAW_PROXY_SCOPE (valid: environment|zeroclaw|services)"
-                );
-            }
-        }
-
-        if let Ok(services_raw) = std::env::var("ZEROCLAW_PROXY_SERVICES") {
-            self.proxy.services = normalize_service_list(vec![services_raw]);
-        }
-
-        if let Err(error) = self.proxy.validate() {
-            tracing::warn!("Invalid proxy configuration ignored: {error}");
-            self.proxy.enabled = false;
-        }
-
-        if self.proxy.enabled && self.proxy.scope == ProxyScope::Environment {
-            self.proxy.apply_to_process_env();
-        }
-
-        set_runtime_proxy_config(self.proxy.clone());
-
-        if self.conversational_ai.enabled {
-            tracing::warn!(
-                "conversational_ai.enabled = true but conversational AI features are not yet \
-                 implemented; this section is reserved for future use and will be ignored"
-            );
-        }
     }
 
     async fn resolve_config_path_for_save(&self) -> Result<PathBuf> {
@@ -11797,7 +11323,7 @@ mod tests {
     async fn config_default_has_sane_values() {
         let c = Config::default();
         // V2: no fallback provider by default — set during onboarding.
-        assert!(c.providers.fallback.is_none());
+        assert!(c.providers.fallback.is_empty());
         assert!(c.providers.fallback_provider().is_none());
         assert!(!c.skills.open_skills_enabled);
         assert!(!c.skills.allow_scripts);
@@ -12161,7 +11687,7 @@ auto_save = true
         let config = Config {
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::ProvidersConfig {
-                fallback: Some("openrouter.default".into()),
+                fallback: vec!["openrouter.default".into()],
                 models: {
                     let mut m = HashMap::new();
                     m.entry("openrouter".to_string())
@@ -12831,7 +12357,7 @@ default_temperature = 0.7
 
         let config_path = dir.join("config.toml");
         let mut providers = crate::providers::ProvidersConfig {
-            fallback: Some("openrouter".into()),
+            fallback: vec!["openrouter".into()],
             ..Default::default()
         };
         providers
@@ -12970,7 +12496,7 @@ default_temperature = 0.7
             config_path: dir.join("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = Some("anthropic.default".into());
+        config.providers.fallback = vec!["anthropic.default".into()];
         config
             .providers
             .models
@@ -13133,7 +12659,7 @@ default_temperature = 0.7
             config_path: config_path.clone(),
             ..Default::default()
         };
-        config.providers.fallback = Some("test.default".into());
+        config.providers.fallback = vec!["test.default".into()];
         config
             .providers
             .models
@@ -14242,113 +13768,9 @@ default_temperature = 0.7
         assert_eq!(parsed.browser.allowed_domains, vec!["*".to_string()]);
     }
 
-    // ── Environment variable overrides (Docker support) ─────────
-
     async fn env_override_lock() -> MutexGuard<'static, ()> {
         static ENV_OVERRIDE_TEST_LOCK: Mutex<()> = Mutex::const_new(());
         ENV_OVERRIDE_TEST_LOCK.lock().await
-    }
-
-    fn clear_proxy_env_test_vars() {
-        for key in [
-            "ZEROCLAW_PROXY_ENABLED",
-            "ZEROCLAW_HTTP_PROXY",
-            "ZEROCLAW_HTTPS_PROXY",
-            "ZEROCLAW_ALL_PROXY",
-            "ZEROCLAW_NO_PROXY",
-            "ZEROCLAW_PROXY_SCOPE",
-            "ZEROCLAW_PROXY_SERVICES",
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "no_proxy",
-        ] {
-            // SAFETY: test-only, single-threaded test runner.
-            unsafe { std::env::remove_var(key) };
-        }
-    }
-
-    #[test]
-    async fn env_override_api_key() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        assert!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_ref())
-                .is_none()
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_API_KEY", "sk-test-env-key") };
-        config.apply_env_overrides();
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_deref()),
-            Some("sk-test-env-key")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_API_KEY") };
-    }
-
-    #[test]
-    async fn env_override_api_key_fallback() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_API_KEY") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("API_KEY", "sk-fallback-key") };
-        config.apply_env_overrides();
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_deref()),
-            Some("sk-fallback-key")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("API_KEY") };
-    }
-
-    #[test]
-    async fn env_override_provider() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_PROVIDER", "anthropic") };
-        config.apply_env_overrides();
-        assert_eq!(config.providers.fallback.as_deref(), Some("anthropic"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
-    }
-
-    #[test]
-    async fn env_override_model_provider_alias() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_MODEL_PROVIDER", "openai-codex") };
-        config.apply_env_overrides();
-        assert_eq!(config.providers.fallback.as_deref(), Some("openai-codex"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_MODEL_PROVIDER") };
     }
 
     #[test]
@@ -14367,7 +13789,7 @@ requires_openai_auth = true
 
         let parsed = parse_test_config(raw);
         assert_eq!(
-            parsed.providers.fallback.as_deref(),
+            parsed.providers.fallback.first().map(String::as_str),
             Some("sub2api.default")
         );
         assert_eq!(
@@ -14388,199 +13810,10 @@ requires_openai_auth = true
     }
 
     #[test]
-    async fn env_override_open_skills_enabled_and_dir() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        assert!(!config.skills.open_skills_enabled);
-        assert!(config.skills.open_skills_dir.is_none());
-        assert_eq!(
-            config.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Full
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "true") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_OPEN_SKILLS_DIR", "/tmp/open-skills") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS", "yes") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "compact") };
-        config.apply_env_overrides();
-
-        assert!(config.skills.open_skills_enabled);
-        assert!(config.skills.allow_scripts);
-        assert_eq!(
-            config.skills.open_skills_dir.as_deref(),
-            Some("/tmp/open-skills")
-        );
-        assert_eq!(
-            config.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Compact
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_OPEN_SKILLS_DIR") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE") };
-    }
-
-    #[test]
-    async fn env_override_open_skills_enabled_invalid_value_keeps_existing_value() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.skills.open_skills_enabled = true;
-        config.skills.allow_scripts = true;
-        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "maybe") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS", "maybe") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "invalid") };
-        config.apply_env_overrides();
-
-        assert!(config.skills.open_skills_enabled);
-        assert!(config.skills.allow_scripts);
-        assert_eq!(
-            config.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Compact
-        );
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE") };
-    }
-
-    #[test]
-    async fn env_override_provider_fallback() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("PROVIDER", "openai") };
-        config.apply_env_overrides();
-        assert_eq!(config.providers.fallback.as_deref(), Some("openai"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("PROVIDER") };
-    }
-
-    #[test]
-    async fn env_override_provider_fallback_does_not_replace_non_default_provider() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.providers.fallback = Some("custom:https://proxy.example.com/v1".to_string());
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("PROVIDER", "openrouter") };
-        config.apply_env_overrides();
-        assert_eq!(
-            config.providers.fallback.as_deref(),
-            Some("custom:https://proxy.example.com/v1")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("PROVIDER") };
-    }
-
-    #[test]
-    async fn env_override_zero_claw_provider_overrides_non_default_provider() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.providers.fallback = Some("custom:https://proxy.example.com/v1".to_string());
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_PROVIDER", "openrouter") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("PROVIDER", "anthropic") };
-        config.apply_env_overrides();
-        assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("PROVIDER") };
-    }
-
-    #[test]
-    async fn env_override_glm_api_key_for_regional_aliases() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.providers.fallback = Some("glm-cn".to_string());
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("GLM_API_KEY", "glm-regional-key") };
-        config.apply_env_overrides();
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_deref()),
-            Some("glm-regional-key")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("GLM_API_KEY") };
-    }
-
-    #[test]
-    async fn env_override_zai_api_key_for_regional_aliases() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.providers.fallback = Some("zai-cn".to_string());
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZAI_API_KEY", "zai-regional-key") };
-        config.apply_env_overrides();
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.as_deref()),
-            Some("zai-regional-key")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZAI_API_KEY") };
-    }
-
-    #[test]
-    async fn env_override_model() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_MODEL", "gpt-4o") };
-        config.apply_env_overrides();
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.model.as_deref()),
-            Some("gpt-4o")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_MODEL") };
-    }
-
-    #[test]
     async fn model_provider_profile_maps_to_custom_endpoint() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.providers.fallback = Some("sub2api".to_string());
+        config.providers.fallback = vec!["sub2api".to_string()];
         config
             .providers
             .models
@@ -14602,11 +13835,13 @@ requires_openai_auth = true
                 },
             );
 
-        config.apply_env_overrides();
         // The user's literal fallback key is preserved; we no longer rewrite it
         // to a canonical alias. This is the round-trip-safe contract that the
         // `zeroclaw config get/set` CLI relies on.
-        assert_eq!(config.providers.fallback.as_deref(), Some("sub2api"));
+        assert_eq!(
+            config.providers.fallback.first().map(String::as_str),
+            Some("sub2api")
+        );
         // The original entry is still stored under its config key.
         assert_eq!(
             config
@@ -14636,7 +13871,7 @@ requires_openai_auth = true
     async fn model_provider_profile_responses_uses_openai_codex_and_openai_key() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.providers.fallback = Some("sub2api".to_string());
+        config.providers.fallback = vec!["sub2api".to_string()];
         config
             .providers
             .models
@@ -14660,14 +13895,16 @@ requires_openai_auth = true
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-codex-key") };
-        config.apply_env_overrides();
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("OPENAI_API_KEY") };
 
         // The user's literal fallback key is preserved; we no longer rewrite it
         // to "openai-codex". The Codex-app-server compatibility shim instead
         // mirrors the resolved entry under that alias key for runtime lookups.
-        assert_eq!(config.providers.fallback.as_deref(), Some("sub2api"));
+        assert_eq!(
+            config.providers.fallback.first().map(String::as_str),
+            Some("sub2api")
+        );
         // The original entry is still stored under its config key.
         let entry = config
             .providers
@@ -14689,62 +13926,6 @@ requires_openai_auth = true
         assert_eq!(aliased.api_key.as_deref(), Some("sk-test-codex-key"));
     }
 
-    /// Regression test for the config CLI get/set divergence bug.
-    ///
-    /// Before the fix, `apply_named_model_provider_profile` rewrote
-    /// `self.providers.fallback` to the profile's `name` field whenever they
-    /// differed. That meant:
-    ///
-    /// - `zeroclaw config get providers.fallback` returned the rewritten value
-    ///   even though the on-disk TOML still held the user's literal key.
-    /// - `zeroclaw config set providers.fallback <new>` would persist `<new>`
-    ///   to disk, but the next load mutated it back in memory, so a subsequent
-    ///   `get` reported a stale value and the daemon's resolver looked up a
-    ///   provider key that did not exist in `[providers.models.*]`.
-    ///
-    /// The fix preserves the literal fallback key end-to-end. The named-profile
-    /// shim now only mirrors the resolved entry under canonical alias keys for
-    /// runtime lookup convenience.
-    #[test]
-    async fn apply_env_overrides_preserves_user_supplied_fallback_key() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        // User configures fallback = "primary" with a profile whose `name` field
-        // differs from the key. This is the exact shape that triggered the bug.
-        config.providers.fallback = Some("primary".to_string());
-        config
-            .providers
-            .models
-            .entry("primary".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
-                    name: Some("alias-name".to_string()),
-                    base_url: Some("https://example.invalid/v1".to_string()),
-                    model: Some("primary-model".to_string()),
-                    ..Default::default()
-                },
-            );
-
-        config.apply_env_overrides();
-
-        // The literal user key must survive. This is what `config get` returns
-        // and what `config set` persists.
-        assert_eq!(
-            config.providers.fallback.as_deref(),
-            Some("primary"),
-            "providers.fallback must preserve the user's literal key after \
-             apply_env_overrides; got {:?}",
-            config.providers.fallback,
-        );
-        // Runtime resolution must still find the entry under the original key.
-        assert!(
-            config.providers.fallback_provider().is_some(),
-            "fallback_provider() must still resolve via the user's literal key",
-        );
-    }
-
     /// Round-trip test for the config CLI: a TOML file with the user's value
     /// must deserialize, apply env overrides, and serialize back to the same
     /// `providers.fallback`. This is the full path that backed the user-visible
@@ -14764,8 +13945,7 @@ base_url = "https://example.invalid/v1"
 model = "primary-model"
 "#;
 
-        let mut config: Config = toml::from_str(toml_in).expect("parse toml");
-        config.apply_env_overrides();
+        let config: Config = toml::from_str(toml_in).expect("parse toml");
 
         // What `config get providers.fallback` returns post-load.
         assert_eq!(
@@ -14802,12 +13982,7 @@ model = "primary-model"
                     ..Default::default()
                 },
             );
-        // Simulate the daemon's load path before the user runs `config set`.
-        config.apply_env_overrides();
-
         config.set_prop("providers.fallback", "primary").unwrap();
-        // Mimic any post-set normalization a future codepath might add.
-        config.apply_env_overrides();
 
         assert_eq!(config.get_prop("providers.fallback").unwrap(), "primary");
     }
@@ -14852,7 +14027,7 @@ model = "primary-model"
         );
 
         // Set fallback to a provider with its own model -> fallback wins.
-        config.providers.fallback = Some("primary".to_string());
+        config.providers.fallback = vec!["primary".to_string()];
         config
             .providers
             .models
@@ -14890,7 +14065,7 @@ model = "primary-model"
             config_path: PathBuf::from("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = Some("anthropic.default".into());
+        config.providers.fallback = vec!["anthropic.default".into()];
         config
             .providers
             .models
@@ -14938,7 +14113,7 @@ model = "primary-model"
     async fn validate_ollama_cloud_model_requires_remote_api_url() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.providers.fallback = Some("ollama".to_string());
+        config.providers.fallback = vec!["ollama".to_string()];
         config
             .providers
             .models
@@ -14964,7 +14139,7 @@ model = "primary-model"
     async fn validate_ollama_cloud_model_accepts_remote_endpoint_and_env_key() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.providers.fallback = Some("ollama".to_string());
+        config.providers.fallback = vec!["ollama".to_string()];
         config
             .providers
             .models
@@ -14993,7 +14168,7 @@ model = "primary-model"
     async fn validate_rejects_unknown_model_provider_wire_api() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.providers.fallback = Some("sub2api".to_string());
+        config.providers.fallback = vec!["sub2api".to_string()];
         config
             .providers
             .models
@@ -15021,42 +14196,6 @@ model = "primary-model"
                 .to_string()
                 .contains("wire_api must be one of: responses, chat_completions")
         );
-    }
-
-    #[test]
-    async fn env_override_model_fallback() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_MODEL") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("MODEL", "anthropic/claude-3.5-sonnet") };
-        config.apply_env_overrides();
-        assert_eq!(
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.model.as_deref()),
-            Some("anthropic/claude-3.5-sonnet")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("MODEL") };
-    }
-
-    #[test]
-    async fn env_override_workspace() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", "/custom/workspace") };
-        config.apply_env_overrides();
-        assert_eq!(config.workspace_dir, PathBuf::from("/custom/workspace"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
     }
 
     #[test]
@@ -15530,163 +14669,9 @@ default_model = "persisted-profile"
     }
 
     #[test]
-    async fn env_override_empty_values_ignored() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        let original_provider = config.providers.fallback.clone();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_PROVIDER", "") };
-        config.apply_env_overrides();
-        assert_eq!(config.providers.fallback, original_provider);
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
-    }
-
-    #[test]
-    async fn env_override_gateway_port() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        assert_eq!(config.gateway.port, 42617);
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_GATEWAY_PORT", "8080") };
-        config.apply_env_overrides();
-        assert_eq!(config.gateway.port, 8080);
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_PORT") };
-    }
-
-    #[test]
-    async fn env_override_port_fallback() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_PORT") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("PORT", "9000") };
-        config.apply_env_overrides();
-        assert_eq!(config.gateway.port, 9000);
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("PORT") };
-    }
-
-    #[test]
-    async fn env_override_gateway_host() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        assert_eq!(config.gateway.host, "127.0.0.1");
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_GATEWAY_HOST", "0.0.0.0") };
-        config.apply_env_overrides();
-        assert_eq!(config.gateway.host, "0.0.0.0");
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_HOST") };
-    }
-
-    #[test]
-    async fn env_override_host_fallback() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_HOST") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("HOST", "0.0.0.0") };
-        config.apply_env_overrides();
-        assert_eq!(config.gateway.host, "0.0.0.0");
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("HOST") };
-    }
-
-    #[test]
-    async fn env_override_require_pairing() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        assert!(config.gateway.require_pairing);
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_REQUIRE_PAIRING", "false") };
-        config.apply_env_overrides();
-        assert!(!config.gateway.require_pairing);
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_REQUIRE_PAIRING", "true") };
-        config.apply_env_overrides();
-        assert!(config.gateway.require_pairing);
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_REQUIRE_PAIRING") };
-    }
-
-    #[test]
-    async fn env_override_temperature() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_TEMPERATURE", "0.5") };
-        config.apply_env_overrides();
-        assert!(
-            (config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7)
-                - 0.5)
-                .abs()
-                < f64::EPSILON
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_TEMPERATURE") };
-    }
-
-    #[test]
-    async fn env_override_temperature_out_of_range_ignored() {
-        let _env_guard = env_override_lock().await;
-        // Clean up any leftover env vars from other tests
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_TEMPERATURE") };
-
-        let mut config = Config::default();
-        let original_temp = config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.temperature)
-            .unwrap_or(0.7);
-
-        // Temperature > 2.0 should be ignored
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_TEMPERATURE", "3.0") };
-        config.apply_env_overrides();
-        assert!(
-            (config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7)
-                - original_temp)
-                .abs()
-                < f64::EPSILON,
-            "Temperature 3.0 should be ignored (out of range)"
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_TEMPERATURE") };
-    }
-
-    #[test]
     async fn validate_rejects_out_of_range_temperature() {
         let mut config = Config::default();
-        config.providers.fallback = Some("test.default".into());
+        config.providers.fallback = vec!["test.default".into()];
         config
             .providers
             .models
@@ -15710,7 +14695,7 @@ default_model = "persisted-profile"
     #[test]
     async fn validate_rejects_negative_temperature() {
         let mut config = Config::default();
-        config.providers.fallback = Some("test.default".into());
+        config.providers.fallback = vec!["test.default".into()];
         config
             .providers
             .models
@@ -15734,7 +14719,7 @@ default_model = "persisted-profile"
     #[test]
     async fn validate_accepts_valid_temperature() {
         let mut config = Config::default();
-        config.providers.fallback = Some("test.default".into());
+        config.providers.fallback = vec!["test.default".into()];
         config
             .providers
             .models
@@ -15752,179 +14737,6 @@ default_model = "persisted-profile"
     }
 
     #[test]
-    async fn env_override_reasoning_enabled() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        assert_eq!(config.runtime.reasoning_enabled, None);
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_REASONING_ENABLED", "false") };
-        config.apply_env_overrides();
-        assert_eq!(config.runtime.reasoning_enabled, Some(false));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_REASONING_ENABLED", "true") };
-        config.apply_env_overrides();
-        assert_eq!(config.runtime.reasoning_enabled, Some(true));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_REASONING_ENABLED") };
-    }
-
-    #[test]
-    async fn env_override_reasoning_invalid_value_ignored() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config.runtime.reasoning_enabled = Some(false);
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_REASONING_ENABLED", "maybe") };
-        config.apply_env_overrides();
-        assert_eq!(config.runtime.reasoning_enabled, Some(false));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_REASONING_ENABLED") };
-    }
-
-    #[test]
-    async fn env_override_reasoning_effort() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        assert_eq!(config.runtime.reasoning_effort, None);
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_REASONING_EFFORT", "HIGH") };
-        config.apply_env_overrides();
-        assert_eq!(config.runtime.reasoning_effort.as_deref(), Some("high"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_REASONING_EFFORT") };
-    }
-
-    #[test]
-    async fn env_override_reasoning_effort_legacy_codex_env() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_CODEX_REASONING_EFFORT", "minimal") };
-        config.apply_env_overrides();
-        assert_eq!(config.runtime.reasoning_effort.as_deref(), Some("minimal"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_CODEX_REASONING_EFFORT") };
-    }
-
-    #[test]
-    async fn env_override_invalid_port_ignored() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        let original_port = config.gateway.port;
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("PORT", "not_a_number") };
-        config.apply_env_overrides();
-        assert_eq!(config.gateway.port, original_port);
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("PORT") };
-    }
-
-    #[test]
-    async fn env_override_web_search_config() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("WEB_SEARCH_ENABLED", "false") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("WEB_SEARCH_PROVIDER", "brave") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("WEB_SEARCH_MAX_RESULTS", "7") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "20") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("BRAVE_API_KEY", "brave-test-key") };
-
-        config.apply_env_overrides();
-
-        assert!(!config.web_search.enabled);
-        assert_eq!(config.web_search.provider, "brave");
-        assert_eq!(config.web_search.max_results, 7);
-        assert_eq!(config.web_search.timeout_secs, 20);
-        assert_eq!(
-            config.web_search.brave_api_key.as_deref(),
-            Some("brave-test-key")
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("WEB_SEARCH_ENABLED") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("WEB_SEARCH_PROVIDER") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("WEB_SEARCH_MAX_RESULTS") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("BRAVE_API_KEY") };
-    }
-
-    #[test]
-    async fn env_override_web_search_invalid_values_ignored() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        let original_max_results = config.web_search.max_results;
-        let original_timeout = config.web_search.timeout_secs;
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("WEB_SEARCH_MAX_RESULTS", "99") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "0") };
-
-        config.apply_env_overrides();
-
-        assert_eq!(config.web_search.max_results, original_max_results);
-        assert_eq!(config.web_search.timeout_secs, original_timeout);
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("WEB_SEARCH_MAX_RESULTS") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS") };
-    }
-
-    #[test]
-    async fn env_override_storage_provider_config() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_STORAGE_PROVIDER", "qdrant") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_STORAGE_DB_URL", "http://localhost:6333") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS", "15") };
-
-        config.apply_env_overrides();
-
-        assert_eq!(config.storage.provider.config.provider, "qdrant");
-        assert_eq!(
-            config.storage.provider.config.db_url.as_deref(),
-            Some("http://localhost:6333")
-        );
-        assert_eq!(
-            config.storage.provider.config.connect_timeout_secs,
-            Some(15)
-        );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_STORAGE_PROVIDER") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_STORAGE_DB_URL") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS") };
-    }
-
-    #[test]
     async fn proxy_config_scope_services_requires_entries_when_enabled() {
         let proxy = ProxyConfig {
             enabled: true,
@@ -15938,78 +14750,6 @@ default_model = "persisted-profile"
 
         let error = proxy.validate().unwrap_err().to_string();
         assert!(error.contains("proxy.scope='services'"));
-    }
-
-    #[test]
-    async fn env_override_proxy_scope_services() {
-        let _env_guard = env_override_lock().await;
-        clear_proxy_env_test_vars();
-
-        let mut config = Config::default();
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_PROXY_ENABLED", "true") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe {
-            std::env::set_var(
-                "ZEROCLAW_PROXY_SERVICES",
-                "provider.openai, tool.http_request",
-            );
-        }
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_PROXY_SCOPE", "services") };
-
-        config.apply_env_overrides();
-
-        assert!(config.proxy.enabled);
-        assert_eq!(config.proxy.scope, ProxyScope::Services);
-        assert_eq!(
-            config.proxy.http_proxy.as_deref(),
-            Some("http://127.0.0.1:7890")
-        );
-        assert!(config.proxy.should_apply_to_service("provider.openai"));
-        assert!(config.proxy.should_apply_to_service("tool.http_request"));
-        assert!(!config.proxy.should_apply_to_service("provider.anthropic"));
-
-        clear_proxy_env_test_vars();
-    }
-
-    #[test]
-    async fn env_override_proxy_scope_environment_applies_process_env() {
-        let _env_guard = env_override_lock().await;
-        clear_proxy_env_test_vars();
-
-        let mut config = Config::default();
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_PROXY_ENABLED", "true") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_PROXY_SCOPE", "environment") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_HTTPS_PROXY", "http://127.0.0.1:7891") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_NO_PROXY", "localhost,127.0.0.1") };
-
-        config.apply_env_overrides();
-
-        assert_eq!(config.proxy.scope, ProxyScope::Environment);
-        assert_eq!(
-            std::env::var("HTTP_PROXY").ok().as_deref(),
-            Some("http://127.0.0.1:7890")
-        );
-        assert_eq!(
-            std::env::var("HTTPS_PROXY").ok().as_deref(),
-            Some("http://127.0.0.1:7891")
-        );
-        assert!(
-            std::env::var("NO_PROXY")
-                .ok()
-                .is_some_and(|value| value.contains("localhost"))
-        );
-
-        clear_proxy_env_test_vars();
     }
 
     #[test]
@@ -17720,12 +16460,12 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     async fn config_tree_traversal_discovers_nested_secrets() {
         let mut config = Config::default();
         // Set api_key on fallback provider
-        if config.providers.fallback.is_some() {
+        if config.providers.fallback.is_empty() {
             if let Some(entry) = config.providers.fallback_provider_mut() {
                 entry.api_key = Some("test-key".into());
             }
         } else {
-            config.providers.fallback = Some("anthropic.default".into());
+            config.providers.fallback = vec!["anthropic.default".into()];
             config
                 .providers
                 .models

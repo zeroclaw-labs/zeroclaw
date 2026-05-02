@@ -809,7 +809,7 @@ mod tests {
     fn handle_initialize_default_model_reflects_configured_provider() {
         use zeroclaw_config::schema::ModelProviderConfig;
         let mut config = Config::default();
-        config.providers.fallback = Some("myprovider.default".to_string());
+        config.providers.fallback = vec!["myprovider.default".to_string()];
         config
             .providers
             .models

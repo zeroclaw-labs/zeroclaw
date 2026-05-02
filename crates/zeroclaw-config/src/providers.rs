@@ -10,10 +10,10 @@ use super::schema::{EmbeddingRouteConfig, ModelProviderConfig, ModelRouteConfig}
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers"]
 pub struct ProvidersConfig {
-    /// Key of the provider entry to use when no route matches.
-    /// Optional — if unset, requests without a matching route fail at runtime.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback: Option<String>,
+    /// Ordered fallback chain of dotted provider aliases.
+    /// First entry is primary; rest are tried in order on failure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<String>,
 
     /// Named model provider profiles: outer key = provider type, inner key = user alias.
     /// V3 shape: `[providers.models.<type>.<alias>]` e.g. `[providers.models.anthropic.default]`.
@@ -30,30 +30,37 @@ pub struct ProvidersConfig {
 }
 
 impl ProvidersConfig {
-    /// The provider type portion of `fallback` — the part before the first `.`.
+    /// The provider type portion of the primary fallback — the part before the first `.`.
     /// `"anthropic.default"` → `"anthropic"`, `"anthropic"` → `"anthropic"`.
     pub fn fallback_type(&self) -> Option<&str> {
-        let name = self.fallback.as_deref()?;
-        Some(name.split_once('.').map_or(name, |(t, _)| t))
+        let name = self.fallback.first()?;
+        Some(name.split_once('.').map_or(name.as_str(), |(t, _)| t))
     }
 
-    pub fn fallback_provider(&self) -> Option<&ModelProviderConfig> {
-        let name = self.fallback.as_deref()?;
+    fn resolve_provider(&self, name: &str) -> Option<&ModelProviderConfig> {
         if let Some((type_key, alias_key)) = name.split_once('.') {
             self.models.get(type_key)?.get(alias_key)
         } else {
-            // V2 compat: bare type key → look for "default" alias
             self.models.get(name)?.get("default")
         }
     }
-    pub fn fallback_provider_mut(&mut self) -> Option<&mut ModelProviderConfig> {
-        let name = self.fallback.clone()?;
+
+    fn resolve_provider_mut(&mut self, name: &str) -> Option<&mut ModelProviderConfig> {
         if let Some((type_key, alias_key)) = name.split_once('.') {
             let alias_owned = alias_key.to_string();
             self.models.get_mut(type_key)?.get_mut(&alias_owned)
         } else {
-            self.models.get_mut(&name)?.get_mut("default")
+            self.models.get_mut(name)?.get_mut("default")
         }
+    }
+
+    pub fn fallback_provider(&self) -> Option<&ModelProviderConfig> {
+        self.resolve_provider(self.fallback.first()?)
+    }
+
+    pub fn fallback_provider_mut(&mut self) -> Option<&mut ModelProviderConfig> {
+        let name = self.fallback.first()?.clone();
+        self.resolve_provider_mut(&name)
     }
 
     /// Return the first concrete `model` string available for use as a default.
@@ -64,8 +71,6 @@ impl ProvidersConfig {
     /// 2. The first entry in `models` (iteration order) that has `model` set.
     ///
     /// Returns `None` only when no provider entry has any model configured at all.
-    /// Callers should treat `None` as a configuration error and surface it rather
-    /// than silently substituting a hardcoded model identifier.
     pub fn resolve_default_model(&self) -> Option<String> {
         if let Some(model) = self
             .fallback_provider()

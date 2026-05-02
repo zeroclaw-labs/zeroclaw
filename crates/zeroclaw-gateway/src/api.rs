@@ -1886,7 +1886,7 @@ mod tests {
     #[test]
     fn masking_keeps_toml_valid_and_preserves_api_keys_type() {
         let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.providers.fallback = Some("default.default".into());
+        cfg.providers.fallback = vec!["default.default".into()];
         cfg.providers
             .models
             .entry("default".into())
@@ -2063,7 +2063,7 @@ mod tests {
             workspace_dir: std::path::PathBuf::from("/tmp/current/workspace"),
             ..Default::default()
         };
-        current.providers.fallback = Some("default.default".into());
+        current.providers.fallback = vec!["default.default".into()];
         current
             .providers
             .models

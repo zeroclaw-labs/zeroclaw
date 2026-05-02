@@ -423,9 +423,9 @@ async fn process_chat_message(
         .config
         .lock()
         .providers
-        .fallback
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
+        .fallback_type()
+        .unwrap_or("unknown")
+        .to_string();
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({

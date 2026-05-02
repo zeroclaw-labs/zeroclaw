@@ -399,16 +399,16 @@ impl ModelRoutingConfigTool {
 
         let fallback_name = match &provider_update {
             MaybeSet::Set(provider) => {
-                cfg.providers.fallback = Some(provider.clone());
+                cfg.providers.fallback = vec![provider.clone()];
                 provider.clone()
             }
             MaybeSet::Null => {
-                cfg.providers.fallback = None;
+                cfg.providers.fallback = vec![];
                 "default".to_string()
             }
-            MaybeSet::Unset => cfg.providers.fallback.clone().unwrap_or_else(|| {
+            MaybeSet::Unset => cfg.providers.fallback.first().cloned().unwrap_or_else(|| {
                 let name = "default".to_string();
-                cfg.providers.fallback = Some(name.clone());
+                cfg.providers.fallback = vec![name.clone()];
                 name
             }),
         };
@@ -448,7 +448,7 @@ impl ModelRoutingConfigTool {
 
         // Probe the new model with a minimal API call to catch invalid model IDs
         // before the channel hot-reload picks up the change.
-        let current_provider = cfg.providers.fallback.clone();
+        let current_provider = cfg.providers.fallback.first().cloned();
         let current_model = cfg
             .providers
             .fallback_provider()
@@ -466,12 +466,12 @@ impl ModelRoutingConfigTool {
                 // Rollback to previous config.
                 cfg.providers.fallback = previous_provider;
                 if let Some(prev_entry) = previous_fallback_provider
-                    && let Some(fb) = cfg.providers.fallback.as_deref()
+                    && let Some(fb) = cfg.providers.fallback.first().cloned()
                 {
                     let (type_k, alias_k) = fb
                         .split_once('.')
                         .map(|(t, a)| (t.to_string(), a.to_string()))
-                        .unwrap_or_else(|| (fb.to_string(), "default".to_string()));
+                        .unwrap_or_else(|| (fb.clone(), "default".to_string()));
                     cfg.providers
                         .models
                         .entry(type_k)

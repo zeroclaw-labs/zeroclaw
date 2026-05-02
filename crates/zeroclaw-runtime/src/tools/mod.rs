@@ -414,9 +414,9 @@ pub fn all_tools_with_runtime(
     {
         let llm_task_provider = root_config
             .providers
-            .fallback
-            .clone()
-            .unwrap_or_else(|| "openrouter".to_string());
+            .fallback_type()
+            .unwrap_or("openrouter")
+            .to_string();
         let llm_task_model = root_config
             .providers
             .fallback_provider()
