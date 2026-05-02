@@ -164,6 +164,13 @@ impl OllamaProvider {
             .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
     }
 
+    fn is_official_cloud_endpoint(&self) -> bool {
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(|h| h.to_ascii_lowercase()))
+            .is_some_and(|host| host == "ollama.com" || host == "api.ollama.com")
+    }
+
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "provider.ollama",
@@ -174,7 +181,11 @@ impl OllamaProvider {
 
     fn resolve_request_details(&self, model: &str) -> anyhow::Result<(String, bool)> {
         let requests_cloud = model.ends_with(":cloud");
-        let normalized_model = model.strip_suffix(":cloud").unwrap_or(model).to_string();
+        let normalized_model = if requests_cloud && self.is_official_cloud_endpoint() {
+            model.strip_suffix(":cloud").unwrap_or(model).to_string()
+        } else {
+            model.to_string()
+        };
 
         if requests_cloud && self.is_local_endpoint() {
             anyhow::bail!(
@@ -183,7 +194,7 @@ impl OllamaProvider {
             );
         }
 
-        if requests_cloud && self.api_key.is_none() {
+        if requests_cloud && self.is_official_cloud_endpoint() && self.api_key.is_none() {
             anyhow::bail!(
                 "Model '{}' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key.",
                 model
