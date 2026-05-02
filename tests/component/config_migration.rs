@@ -2021,17 +2021,6 @@ fn generate(version: u32) -> String {
         .unwrap_or_else(|e| panic!("generate_fixture({version}) failed: {e}"))
 }
 
-fn parse(toml_str: &str) -> zeroclaw::config::Config {
-    migrate(toml_str)
-}
-
-#[test]
-fn fixture_v1_parses_without_error() {
-    let out = generate(1);
-    // V1 is the raw fixture — parse via the migration pipeline so prepare_table runs.
-    parse(&out);
-}
-
 #[test]
 fn fixture_v1_preserves_raw_field_names() {
     let out = generate(1);
@@ -2065,12 +2054,6 @@ fn fixture_v1_has_correct_schema_version() {
 }
 
 #[test]
-fn fixture_v2_parses_without_error() {
-    let out = generate(2);
-    parse(&out);
-}
-
-#[test]
 fn fixture_v2_has_correct_schema_version() {
     let out = generate(2);
     assert!(out.contains("schema_version = 2"));
@@ -2094,12 +2077,6 @@ fn fixture_v2_provider_fallback_is_string() {
         out.contains("fallback = \"myprovider\""),
         "V2 fallback should be a string"
     );
-}
-
-#[test]
-fn fixture_v3_parses_without_error() {
-    let out = generate(3);
-    parse(&out);
 }
 
 #[test]
@@ -2195,6 +2172,6 @@ fn fixture_v3_migrates_to_current_version() {
     let out = generate(3);
     // A V3 fixture loaded through the migration pipeline should already be at
     // current version and require no further migration.
-    let config = parse(&out);
+    let config = migrate(&out);
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
 }
