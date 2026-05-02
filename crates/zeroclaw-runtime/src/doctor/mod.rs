@@ -219,7 +219,16 @@ fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec
         return vec![provider.to_string()];
     }
 
-    config.providers.models.keys().cloned().collect()
+    config
+        .providers
+        .models
+        .iter()
+        .flat_map(|(type_k, alias_map)| {
+            alias_map
+                .keys()
+                .map(move |alias_k| format!("{type_k}.{alias_k}"))
+        })
+        .collect()
 }
 
 pub async fn run_models(
@@ -1066,11 +1075,13 @@ mod tests {
     #[test]
     fn config_validation_catches_bad_temperature() {
         let mut config = Config::default();
-        config.providers.fallback = Some("default".into());
+        config.providers.fallback = Some("default.default".into());
         config
             .providers
             .models
             .entry("default".into())
+            .or_default()
+            .entry("default".to_string())
             .or_default()
             .temperature = Some(5.0);
         let mut items = Vec::new();
@@ -1083,11 +1094,13 @@ mod tests {
     #[test]
     fn config_validation_accepts_valid_temperature() {
         let mut config = Config::default();
-        config.providers.fallback = Some("default".into());
+        config.providers.fallback = Some("default.default".into());
         config
             .providers
             .models
             .entry("default".into())
+            .or_default()
+            .entry("default".to_string())
             .or_default()
             .temperature = Some(0.7);
         let mut items = Vec::new();
@@ -1304,6 +1317,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
         config.agents.insert(
@@ -1323,6 +1338,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
 

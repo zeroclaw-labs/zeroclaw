@@ -5734,8 +5734,12 @@ pub async fn start_channels(
                 .providers
                 .models
                 .iter()
-                .filter(|(_, profile)| !profile.pricing.is_empty())
-                .map(|(name, profile)| (name.clone(), profile.pricing.clone()))
+                .flat_map(|(type_k, alias_map)| {
+                    alias_map.iter().map(move |(alias_k, profile)| {
+                        (format!("{type_k}.{alias_k}"), profile.pricing.clone())
+                    })
+                })
+                .filter(|(_, p)| !p.is_empty())
                 .collect();
             ChannelCostTrackingState {
                 tracker,

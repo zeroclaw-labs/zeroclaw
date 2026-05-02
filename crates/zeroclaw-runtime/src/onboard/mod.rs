@@ -712,8 +712,17 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         // `persist()` for a real value (api_key, model, …) carries it to
         // disk. If the user backs out before any value is set, the back
         // paths drop the entry so it never reaches the file.
-        let is_new_entry = !cfg.providers.models.contains_key(&picked);
-        cfg.providers.models.entry(picked.clone()).or_default();
+        let is_new_entry = !cfg
+            .providers
+            .models
+            .get(&picked)
+            .is_some_and(|m| m.contains_key("default"));
+        cfg.providers
+            .models
+            .entry(picked.clone())
+            .or_default()
+            .entry("default".to_string())
+            .or_default();
 
         // For fresh entries, pre-populate the provider's trait-level defaults
         // into the in-memory entry. Skipped when reconfiguring so existing
@@ -918,7 +927,18 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, provider: &str) 
     let model_path = format!("providers.models.{provider}.model");
     let current = cfg.get_prop(&model_path).unwrap_or_default();
     let is_set = !current.is_empty() && current != "<unset>";
-    let profile = cfg.providers.models.get(provider);
+    // Resolve profile: support both dotted "type.alias" and bare type key → "default" alias.
+    let profile = if let Some((type_k, alias_k)) = provider.split_once('.') {
+        cfg.providers
+            .models
+            .get(type_k)
+            .and_then(|m| m.get(alias_k))
+    } else {
+        cfg.providers
+            .models
+            .get(provider)
+            .and_then(|m| m.get("default"))
+    };
     let api_key = profile.and_then(|entry| entry.api_key.as_deref());
     let configured_base_url = profile.and_then(|entry| entry.base_url.as_deref());
     let discovery_base_url = openai_compat_discovery_base_url(provider, configured_base_url);
@@ -1288,7 +1308,9 @@ mod tests {
         assert!(!section_has_signal(&cfg, "providers"));
         cfg.providers
             .models
-            .insert("anthropic".into(), ModelProviderConfig::default());
+            .entry("anthropic".into())
+            .or_default()
+            .insert("default".to_string(), ModelProviderConfig::default());
         assert!(section_has_signal(&cfg, "providers"));
     }
 
@@ -1542,6 +1564,7 @@ mod tests {
             .providers
             .models
             .get(&provider)
+            .and_then(|m| m.get("default"))
             .expect("custom provider entry should be seeded");
         assert_eq!(model_cfg.api_key.as_deref(), Some("sk-custom-test"));
         assert_eq!(model_cfg.model.as_deref(), Some("qwen-local"));
@@ -1557,14 +1580,18 @@ mod tests {
             None,
         )
         .await;
-        cfg.providers.models.insert(
-            "my-gateway".into(),
-            ModelProviderConfig {
-                api_key: Some("sk-gateway-test".into()),
-                base_url: Some(base_url),
-                ..Default::default()
-            },
-        );
+        cfg.providers
+            .models
+            .entry("my-gateway".into())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    api_key: Some("sk-gateway-test".into()),
+                    base_url: Some(base_url),
+                    ..Default::default()
+                },
+            );
         let mut ui = QuickUi::new().with("Model", "gateway-large");
 
         prompt_model(&mut cfg, &mut ui, "my-gateway").await.unwrap();
@@ -1573,6 +1600,7 @@ mod tests {
             .providers
             .models
             .get("my-gateway")
+            .and_then(|m| m.get("default"))
             .expect("unknown provider entry should remain configured");
         assert_eq!(model_cfg.model.as_deref(), Some("gateway-large"));
     }
@@ -1604,7 +1632,8 @@ mod tests {
             .providers
             .models
             .get("anthropic")
-            .expect("anthropic entry should be seeded");
+            .and_then(|m| m.get("default"))
+            .expect("anthropic.default entry should be seeded");
         assert_eq!(model_cfg.model.as_deref(), Some("claude-opus-4-7"));
         assert_eq!(model_cfg.api_key.as_deref(), Some("sk-ant-test"));
         assert!(

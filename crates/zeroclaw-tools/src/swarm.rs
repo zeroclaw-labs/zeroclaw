@@ -573,6 +573,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
         agents.insert(
@@ -592,6 +594,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
         agents

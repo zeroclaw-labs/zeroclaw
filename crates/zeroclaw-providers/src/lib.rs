@@ -750,14 +750,19 @@ pub fn provider_runtime_options_from_config(
         .map(str::trim)
         .filter(|u| !u.is_empty())
         .and_then(|active_url| {
-            config.providers.models.values().find(|p| {
-                p.base_url
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|u| !u.is_empty())
-                    .map(|u| u.trim_end_matches('/'))
-                    == Some(active_url.trim_end_matches('/'))
-            })
+            config
+                .providers
+                .models
+                .values()
+                .flat_map(|alias_map| alias_map.values())
+                .find(|p| {
+                    p.base_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|u: &&str| !u.is_empty())
+                        .map(|u: &str| u.trim_end_matches('/'))
+                        == Some(active_url.trim_end_matches('/'))
+                })
         })
         .map(|p| p.merge_system_into_user)
         .unwrap_or(false);

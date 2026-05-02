@@ -146,13 +146,18 @@ fn security_full_autonomy_parses() {
 fn security_config_debug_does_not_leak_api_key() {
     let mut config = Config::default();
     config.providers.fallback = Some("test".into());
-    config.providers.models.insert(
-        "test".into(),
-        zeroclaw::config::ModelProviderConfig {
-            api_key: Some("sk-1234567890abcdef".to_string()),
-            ..Default::default()
-        },
-    );
+    config
+        .providers
+        .models
+        .entry("test".into())
+        .or_default()
+        .insert(
+            "default".to_string(),
+            zeroclaw::config::ModelProviderConfig {
+                api_key: Some("sk-1234567890abcdef".to_string()),
+                ..Default::default()
+            },
+        );
 
     let debug_output = format!("{:?}", config);
 

@@ -137,17 +137,26 @@ impl V1Compat {
             .unwrap_or_else(|| "default".into());
 
         // First, move old model_providers entries into providers.models.
-        // These take precedence over top-level fields (more specific).
+        // V1 top-level entries use bare type keys ("anthropic"); insert under "default" alias.
         for (key, profile) in std::mem::take(&mut self.model_providers) {
-            self.config.providers.models.entry(key).or_insert(profile);
+            self.config
+                .providers
+                .models
+                .entry(key)
+                .or_default()
+                .entry("default".to_string())
+                .or_insert(profile);
         }
 
         // Then fill gaps in the fallback entry from top-level fields.
+        // fallback is a bare type name (e.g. "anthropic"); map to "default" alias in nested map.
         let entry = self
             .config
             .providers
             .models
             .entry(fallback.clone())
+            .or_default()
+            .entry("default".to_string())
             .or_default();
 
         if entry.api_key.is_none() {
@@ -178,7 +187,8 @@ impl V1Compat {
         }
 
         if self.config.providers.fallback.is_none() {
-            self.config.providers.fallback = Some(fallback);
+            // V3: fallback reference uses dotted "type.alias" format.
+            self.config.providers.fallback = Some(format!("{fallback}.default"));
         }
 
         // Move routing rules into providers.
@@ -257,6 +267,12 @@ const CHANNEL_TYPES: &[&str] = &[
 /// Return true if this TOML table is a V2 flat channel config (has at least one
 /// non-table leaf value at the top level). V3 alias maps contain only sub-tables.
 fn is_flat_channel_config(t: &toml::Table) -> bool {
+    t.values().any(|v| !matches!(v, toml::Value::Table(_)))
+}
+
+/// Return true if this TOML table is a V2 flat model-provider config (has at least one
+/// non-table leaf value). V3 alias maps contain only sub-tables (one per alias).
+fn is_flat_provider_config(t: &toml::Table) -> bool {
     t.values().any(|v| !matches!(v, toml::Value::Table(_)))
 }
 
@@ -765,6 +781,148 @@ pub fn prepare_table(table: &mut toml::Table) {
         && let Some(val) = table.remove("channels_config")
     {
         table.insert("channels".to_string(), val);
+    }
+
+    // V3: Wrap flat [providers.models.<type>] entries into [providers.models.<type>.default].
+    // Same pattern as channel aliasing. Already-aliased (all-table) entries are skipped.
+    if let Some(toml::Value::Table(providers)) = table.get_mut("providers")
+        && let Some(toml::Value::Table(models)) = providers.get_mut("models")
+    {
+        let type_keys: Vec<String> = models.keys().cloned().collect();
+        for type_key in type_keys {
+            if let Some(toml::Value::Table(entry)) = models.get(&type_key)
+                && is_flat_provider_config(entry)
+            {
+                let flat = entry.clone();
+                let mut alias_map = toml::Table::new();
+                alias_map.insert("default".to_string(), toml::Value::Table(flat));
+                models.insert(type_key, toml::Value::Table(alias_map));
+            }
+        }
+    }
+
+    // V3: Update providers.fallback from "anthropic" → "anthropic.default".
+    if let Some(toml::Value::Table(providers)) = table.get_mut("providers")
+        && let Some(toml::Value::String(fallback)) = providers.get_mut("fallback")
+        && !fallback.contains('.')
+    {
+        *fallback = format!("{fallback}.default");
+    }
+
+    // V3: Synthesize per-agent [providers.models.<type>.<agent>] from inline agent fields.
+    // Agents with inline brain fields that differ from the type's .default get their own alias.
+    // Agents whose inline fields match .default (or are absent) get model_provider = "<type>.default".
+    let agents_snapshot: Vec<(String, toml::Table)> = table
+        .get("agents")
+        .and_then(|v| v.as_table())
+        .map(|agents| {
+            agents
+                .iter()
+                .filter_map(|(alias, val)| val.as_table().map(|t| (alias.clone(), t.clone())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for (agent_alias, agent_table) in &agents_snapshot {
+        let provider_type = match agent_table.get("provider").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => continue,
+        };
+
+        let agent_model = agent_table
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let agent_temp = agent_table.get("temperature").cloned();
+        let agent_api_key = agent_table
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let default_entry: Option<toml::Table> = table
+            .get("providers")
+            .and_then(|v| v.as_table())
+            .and_then(|p| p.get("models"))
+            .and_then(|v| v.as_table())
+            .and_then(|m| m.get(&provider_type))
+            .and_then(|v| v.as_table())
+            .and_then(|alias_map| alias_map.get("default"))
+            .and_then(|v| v.as_table())
+            .cloned();
+
+        let default_model = default_entry
+            .as_ref()
+            .and_then(|t| t.get("model"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let default_api_key = default_entry
+            .as_ref()
+            .and_then(|t| t.get("api_key"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let default_temp = default_entry
+            .as_ref()
+            .and_then(|t| t.get("temperature"))
+            .cloned();
+
+        let model_differs = !agent_model.is_empty() && agent_model != default_model;
+        let api_key_differs = !agent_api_key.is_empty() && agent_api_key != default_api_key;
+        let temp_differs = agent_temp.is_some() && agent_temp != default_temp;
+
+        let (alias_name, needs_new_entry) = if model_differs || api_key_differs || temp_differs {
+            (agent_alias.clone(), true)
+        } else {
+            ("default".to_string(), false)
+        };
+
+        let model_provider_value = format!("{provider_type}.{alias_name}");
+
+        if needs_new_entry {
+            let mut new_entry = default_entry.clone().unwrap_or_default();
+            if !agent_model.is_empty() {
+                new_entry.insert("model".to_string(), toml::Value::String(agent_model));
+            }
+            if !agent_api_key.is_empty() {
+                new_entry.insert("api_key".to_string(), toml::Value::String(agent_api_key));
+            }
+            if let Some(temp) = agent_temp {
+                new_entry.insert("temperature".to_string(), temp);
+            }
+            let providers = table
+                .entry("providers")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if let toml::Value::Table(p) = providers {
+                let models = p
+                    .entry("models")
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                if let toml::Value::Table(m) = models {
+                    let alias_map = m
+                        .entry(provider_type.clone())
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                    if let toml::Value::Table(am) = alias_map {
+                        am.entry(alias_name)
+                            .or_insert_with(|| toml::Value::Table(new_entry));
+                    }
+                }
+            }
+        }
+
+        if let Some(toml::Value::Table(agents)) = table.get_mut("agents")
+            && let Some(toml::Value::Table(at)) = agents.get_mut(agent_alias)
+        {
+            at.insert(
+                "model_provider".to_string(),
+                toml::Value::String(model_provider_value),
+            );
+            at.remove("provider");
+            at.remove("model");
+            at.remove("temperature");
+            at.remove("api_key");
+        }
     }
 
     // V3: Drop the global `[cost.prices.*]` table. Pricing now lives on each

@@ -80,22 +80,22 @@ default_temperature = "hot"
 fn config_out_of_range_temperature_fails() {
     // Temperature validation now happens at the provider level.
     let toml_str = r#"
-[providers.models.test]
+[providers.models.test.default]
 temperature = 99.0
 "#;
     let config: Config = toml::from_str(toml_str).expect("parses");
     // Out-of-range temperature is stored but caught by validate().
-    assert!(config.providers.models["test"].temperature == Some(99.0));
+    assert!(config.providers.models["test"]["default"].temperature == Some(99.0));
 }
 
 #[test]
 fn config_negative_temperature_fails() {
     let toml_str = r#"
-[providers.models.test]
+[providers.models.test.default]
 temperature = -0.5
 "#;
     let config: Config = toml::from_str(toml_str).expect("parses");
-    assert!(config.providers.models["test"].temperature == Some(-0.5));
+    assert!(config.providers.models["test"]["default"].temperature == Some(-0.5));
 }
 
 #[test]

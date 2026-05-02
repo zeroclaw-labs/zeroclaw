@@ -397,12 +397,7 @@ impl ModelRoutingConfigTool {
 
         // Capture previous values for rollback on probe failure.
         let previous_provider = cfg.providers.fallback.clone();
-        let previous_fallback_provider = cfg
-            .providers
-            .fallback
-            .as_deref()
-            .and_then(|name| cfg.providers.models.get(name))
-            .cloned();
+        let previous_fallback_provider = cfg.providers.fallback_provider().cloned();
 
         let fallback_name = match &provider_update {
             MaybeSet::Set(provider) => {
@@ -420,7 +415,17 @@ impl ModelRoutingConfigTool {
             }),
         };
 
-        let entry = cfg.providers.models.entry(fallback_name).or_default();
+        let (type_k, alias_k) = fallback_name
+            .split_once('.')
+            .map(|(t, a)| (t.to_string(), a.to_string()))
+            .unwrap_or_else(|| (fallback_name.clone(), "default".to_string()));
+        let entry = cfg
+            .providers
+            .models
+            .entry(type_k)
+            .or_default()
+            .entry(alias_k)
+            .or_default();
 
         match model_update {
             MaybeSet::Set(model) => entry.model = Some(model),
@@ -465,7 +470,15 @@ impl ModelRoutingConfigTool {
                 if let Some(prev_entry) = previous_fallback_provider
                     && let Some(fb) = cfg.providers.fallback.as_deref()
                 {
-                    cfg.providers.models.insert(fb.to_string(), prev_entry);
+                    let (type_k, alias_k) = fb
+                        .split_once('.')
+                        .map(|(t, a)| (t.to_string(), a.to_string()))
+                        .unwrap_or_else(|| (fb.to_string(), "default".to_string()));
+                    cfg.providers
+                        .models
+                        .entry(type_k)
+                        .or_default()
+                        .insert(alias_k, prev_entry);
                 }
                 cfg.save().await?;
 
@@ -759,6 +772,8 @@ impl ModelRoutingConfigTool {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             });
 
         next_agent.provider = provider;

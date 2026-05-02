@@ -28,7 +28,7 @@ base_url = "https://openrouter.ai/api"
 "#,
     );
 
-    let entry = &config.providers.models["openrouter"];
+    let entry = &config.providers.models["openrouter"]["default"];
     assert_eq!(entry.api_key.as_deref(), Some("sk-test"));
     assert_eq!(entry.base_url.as_deref(), Some("https://openrouter.ai/api"));
 }
@@ -45,7 +45,7 @@ api_key = "sk-from-profile"
 "#,
     );
 
-    let entry = &config.providers.models["openrouter"];
+    let entry = &config.providers.models["openrouter"]["default"];
     assert_eq!(entry.api_key.as_deref(), Some("sk-from-profile"));
 }
 
@@ -76,7 +76,10 @@ temperature = 0.3
             .and_then(|e| e.api_key.as_deref()),
         Some("sk-ant")
     );
-    assert_eq!(config.providers.fallback.as_deref(), Some("anthropic"));
+    assert_eq!(
+        config.providers.fallback.as_deref(),
+        Some("anthropic.default")
+    );
     assert_eq!(
         config
             .providers
@@ -129,9 +132,14 @@ model = "claude"
     );
 
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
-    assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
     assert_eq!(
-        config.providers.models["openrouter"].api_key.as_deref(),
+        config.providers.fallback.as_deref(),
+        Some("openrouter.default")
+    );
+    assert_eq!(
+        config.providers.models["openrouter"]["default"]
+            .api_key
+            .as_deref(),
         Some("sk-test")
     );
 }
@@ -144,9 +152,14 @@ api_key = "sk-orphan"
 "#,
     );
 
-    assert_eq!(config.providers.fallback.as_deref(), Some("default"));
     assert_eq!(
-        config.providers.models["default"].api_key.as_deref(),
+        config.providers.fallback.as_deref(),
+        Some("default.default")
+    );
+    assert_eq!(
+        config.providers.models["default"]["default"]
+            .api_key
+            .as_deref(),
         Some("sk-orphan")
     );
 }
@@ -165,7 +178,7 @@ model_provider = "ollama"
 "#,
     );
 
-    assert_eq!(config.providers.fallback.as_deref(), Some("ollama"));
+    assert_eq!(config.providers.fallback.as_deref(), Some("ollama.default"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -245,9 +258,14 @@ allowed_users = ["@u:m"]
 
     let config = migrate(&migrated_toml);
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
-    assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
     assert_eq!(
-        config.providers.models["openrouter"].api_key.as_deref(),
+        config.providers.fallback.as_deref(),
+        Some("openrouter.default")
+    );
+    assert_eq!(
+        config.providers.models["openrouter"]["default"]
+            .api_key
+            .as_deref(),
         Some("rt-key")
     );
     assert!(config.providers.models.contains_key("ollama"));
@@ -296,8 +314,8 @@ allowed_rooms = ["!existing:matrix.org"]
     );
 
     let mut expected = Config::default();
-    expected.providers.fallback = Some("walk-provider".into());
-    let mut entry = ModelProviderConfig {
+    expected.providers.fallback = Some("walk-provider.default".into());
+    let mut main_entry = ModelProviderConfig {
         api_key: Some("walk-key".into()),
         base_url: Some("https://walk.example.com".into()),
         api_path: Some("/walk/path".into()),
@@ -307,41 +325,59 @@ allowed_rooms = ["!existing:matrix.org"]
         max_tokens: Some(333),
         ..Default::default()
     };
-    entry
+    main_entry
         .extra_headers
         .insert("X-Walk".into(), "walk-header".into());
     expected
         .providers
         .models
-        .insert("walk-provider".into(), entry);
-    expected.providers.models.insert(
-        "other-profile".into(),
-        ModelProviderConfig {
-            base_url: Some("https://other.example.com".into()),
-            name: Some("other".into()),
-            ..Default::default()
-        },
-    );
+        .entry("walk-provider".into())
+        .or_default()
+        .insert("default".to_string(), main_entry);
+    expected
+        .providers
+        .models
+        .entry("other-profile".into())
+        .or_default()
+        .insert(
+            "default".to_string(),
+            ModelProviderConfig {
+                base_url: Some("https://other.example.com".into()),
+                name: Some("other".into()),
+                ..Default::default()
+            },
+        );
     // Provider fields are now resolved directly — no cache needed.
 
     // Compare providers.
     assert_eq!(v0.providers.fallback, expected.providers.fallback);
     assert_eq!(v0.providers.models.len(), expected.providers.models.len());
-    for (key, v0_entry) in &v0.providers.models {
-        let exp = expected
+    for (type_key, v0_alias_map) in &v0.providers.models {
+        let exp_alias_map = expected
             .providers
             .models
-            .get(key)
-            .unwrap_or_else(|| panic!("missing provider entry: {key}"));
-        assert_eq!(v0_entry.api_key, exp.api_key, "{key}");
-        assert_eq!(v0_entry.base_url, exp.base_url, "{key}");
-        assert_eq!(v0_entry.api_path, exp.api_path, "{key}");
-        assert_eq!(v0_entry.model, exp.model, "{key}");
-        assert_eq!(v0_entry.temperature, exp.temperature, "{key}");
-        assert_eq!(v0_entry.timeout_secs, exp.timeout_secs, "{key}");
-        assert_eq!(v0_entry.max_tokens, exp.max_tokens, "{key}");
-        assert_eq!(v0_entry.extra_headers, exp.extra_headers, "{key}");
-        assert_eq!(v0_entry.name, exp.name, "{key}");
+            .get(type_key)
+            .unwrap_or_else(|| panic!("missing provider type: {type_key}"));
+        assert_eq!(
+            v0_alias_map.len(),
+            exp_alias_map.len(),
+            "alias count mismatch for {type_key}"
+        );
+        for (alias_key, v0_entry) in v0_alias_map {
+            let dotted = format!("{type_key}.{alias_key}");
+            let exp = exp_alias_map
+                .get(alias_key)
+                .unwrap_or_else(|| panic!("missing provider alias: {dotted}"));
+            assert_eq!(v0_entry.api_key, exp.api_key, "{dotted}");
+            assert_eq!(v0_entry.base_url, exp.base_url, "{dotted}");
+            assert_eq!(v0_entry.api_path, exp.api_path, "{dotted}");
+            assert_eq!(v0_entry.model, exp.model, "{dotted}");
+            assert_eq!(v0_entry.temperature, exp.temperature, "{dotted}");
+            assert_eq!(v0_entry.timeout_secs, exp.timeout_secs, "{dotted}");
+            assert_eq!(v0_entry.max_tokens, exp.max_tokens, "{dotted}");
+            assert_eq!(v0_entry.extra_headers, exp.extra_headers, "{dotted}");
+            assert_eq!(v0_entry.name, exp.name, "{dotted}");
+        }
     }
 
     // Matrix room_id merged into allowed_rooms by prepare_table.
@@ -422,7 +458,10 @@ require_pairing = true
     let config = migrate(raw);
 
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
-    assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
+    assert_eq!(
+        config.providers.fallback.as_deref(),
+        Some("openrouter.default")
+    );
     assert_eq!(
         config
             .providers
@@ -703,7 +742,7 @@ pricing = { opus = 15.0, sonnet = 3.0 }
 "#,
     );
 
-    let entry = &config.providers.models["openrouter"];
+    let entry = &config.providers.models["openrouter"]["default"];
     assert_eq!(entry.pricing.get("opus").copied(), Some(15.0));
     assert_eq!(entry.pricing.get("sonnet").copied(), Some(3.0));
 }
@@ -723,7 +762,7 @@ pricing = { "opus.input" = 15.0, "opus.output" = 75.0 }
 "#,
     );
 
-    let entry = &config.providers.models["anthropic"];
+    let entry = &config.providers.models["anthropic"]["default"];
     assert_eq!(entry.pricing.get("opus.input").copied(), Some(15.0));
     assert_eq!(entry.pricing.get("opus.output").copied(), Some(75.0));
 }
@@ -1007,8 +1046,178 @@ members = ["agent-a", "agent-b"]
 
     assert!(config.swarms.is_empty());
     assert_eq!(
-        config.providers.models["openrouter"].api_key.as_deref(),
+        config.providers.models["openrouter"]["default"]
+            .api_key
+            .as_deref(),
         Some("sk-test")
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V3: Provider aliasing migration
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn v2_flat_provider_wrapped_under_default_alias() {
+    let config = migrate(
+        r#"
+schema_version = 3
+
+[providers]
+fallback = "anthropic"
+
+[providers.models.anthropic]
+api_key = "sk-ant"
+model = "claude-opus-4-5"
+"#,
+    );
+
+    assert!(
+        config.providers.models.contains_key("anthropic"),
+        "outer key 'anthropic' must exist"
+    );
+    assert!(
+        config.providers.models["anthropic"].contains_key("default"),
+        "inner key 'default' must be created for flat V2 entry"
+    );
+    assert_eq!(
+        config.providers.models["anthropic"]["default"]
+            .api_key
+            .as_deref(),
+        Some("sk-ant")
+    );
+    assert_eq!(
+        config.providers.models["anthropic"]["default"]
+            .model
+            .as_deref(),
+        Some("claude-opus-4-5")
+    );
+}
+
+#[test]
+fn providers_fallback_updated_to_dotted_alias() {
+    let config = migrate(
+        r#"
+schema_version = 3
+
+[providers]
+fallback = "openrouter"
+
+[providers.models.openrouter]
+api_key = "sk-or"
+"#,
+    );
+
+    assert_eq!(
+        config.providers.fallback.as_deref(),
+        Some("openrouter.default"),
+        "bare fallback key must be upgraded to dotted form"
+    );
+}
+
+#[test]
+fn agent_provider_synthesised_into_model_provider_alias() {
+    let config = migrate(
+        r#"
+schema_version = 3
+
+[providers]
+fallback = "anthropic"
+
+[providers.models.anthropic]
+api_key = "sk-ant"
+model = "claude-opus-4-5"
+
+[agents.coder]
+provider = "anthropic"
+"#,
+    );
+
+    assert_eq!(
+        config.agents["coder"].model_provider.as_str(),
+        "anthropic.default",
+        "agent with matching provider and no differing brain fields gets model_provider = '<type>.default'"
+    );
+    assert!(
+        config.agents["coder"].provider.is_empty(),
+        "old provider field must be stripped"
+    );
+}
+
+#[test]
+fn agent_with_unique_model_gets_per_agent_provider_alias() {
+    let config = migrate(
+        r#"
+schema_version = 3
+
+[providers]
+fallback = "anthropic"
+
+[providers.models.anthropic]
+api_key = "sk-ant"
+model = "claude-opus-4-5"
+
+[agents.researcher]
+provider = "anthropic"
+model = "claude-haiku-4-5"
+"#,
+    );
+
+    assert_eq!(
+        config.agents["researcher"].model_provider.as_str(),
+        "anthropic.researcher",
+        "agent with a differing model must get its own alias"
+    );
+    assert!(
+        config.providers.models["anthropic"].contains_key("researcher"),
+        "per-agent alias entry must be created under providers.models.anthropic"
+    );
+    assert_eq!(
+        config.providers.models["anthropic"]["researcher"]
+            .model
+            .as_deref(),
+        Some("claude-haiku-4-5"),
+        "per-agent entry must carry the agent's model override"
+    );
+    assert!(
+        config.agents["researcher"].model.is_empty(),
+        "old model field must be stripped"
+    );
+}
+
+#[test]
+fn already_aliased_providers_not_double_wrapped() {
+    let config = migrate(
+        r#"
+schema_version = 3
+
+[providers]
+fallback = "anthropic.default"
+
+[providers.models.anthropic.default]
+api_key = "sk-ant"
+model = "claude-opus-4-5"
+"#,
+    );
+
+    assert!(
+        config.providers.models["anthropic"].contains_key("default"),
+        "already-aliased entry must survive migration unchanged"
+    );
+    assert!(
+        !config.providers.models["anthropic"].contains_key("model"),
+        "wrapping must not create a spurious 'model' key at the alias level"
+    );
+    assert_eq!(
+        config.providers.models["anthropic"]["default"]
+            .api_key
+            .as_deref(),
+        Some("sk-ant")
+    );
+    assert_eq!(
+        config.providers.fallback.as_deref(),
+        Some("anthropic.default"),
+        "already-dotted fallback must not be modified"
     );
 }
 

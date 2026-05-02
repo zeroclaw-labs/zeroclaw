@@ -15,10 +15,10 @@ pub struct ProvidersConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
 
-    /// Named model provider profiles keyed by id.
+    /// Named model provider profiles: outer key = provider type, inner key = user alias.
+    /// V3 shape: `[providers.models.<type>.<alias>]` e.g. `[providers.models.anthropic.default]`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub models: HashMap<String, ModelProviderConfig>,
+    pub models: HashMap<String, HashMap<String, ModelProviderConfig>>,
 
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -31,13 +31,22 @@ pub struct ProvidersConfig {
 
 impl ProvidersConfig {
     pub fn fallback_provider(&self) -> Option<&ModelProviderConfig> {
-        self.fallback
-            .as_deref()
-            .and_then(|name| self.models.get(name))
+        let name = self.fallback.as_deref()?;
+        if let Some((type_key, alias_key)) = name.split_once('.') {
+            self.models.get(type_key)?.get(alias_key)
+        } else {
+            // V2 compat: bare type key → look for "default" alias
+            self.models.get(name)?.get("default")
+        }
     }
     pub fn fallback_provider_mut(&mut self) -> Option<&mut ModelProviderConfig> {
         let name = self.fallback.clone()?;
-        self.models.get_mut(&name)
+        if let Some((type_key, alias_key)) = name.split_once('.') {
+            let alias_owned = alias_key.to_string();
+            self.models.get_mut(type_key)?.get_mut(&alias_owned)
+        } else {
+            self.models.get_mut(&name)?.get_mut("default")
+        }
     }
 
     /// Return the first concrete `model` string available for use as a default.
@@ -62,6 +71,7 @@ impl ProvidersConfig {
 
         self.models
             .values()
+            .flat_map(|alias_map| alias_map.values())
             .filter_map(|entry| entry.model.as_deref().map(str::trim))
             .find(|m| !m.is_empty())
             .map(ToString::to_string)

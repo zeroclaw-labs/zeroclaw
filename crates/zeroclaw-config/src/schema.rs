@@ -677,9 +677,11 @@ impl Default for DelegateToolConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "delegate-agent"]
 pub struct DelegateAgentConfig {
-    /// Provider name (e.g. "ollama", "openrouter", "anthropic")
+    /// Provider name (e.g. "ollama", "openrouter", "anthropic"). Deprecated in V3 — use `model_provider`.
+    #[serde(default)]
     pub provider: String,
-    /// Model name
+    /// Model name. Deprecated in V3 — use `model_provider` to resolve model from the provider config.
+    #[serde(default)]
     pub model: String,
     /// Optional system prompt for the sub-agent
     #[serde(default)]
@@ -725,6 +727,14 @@ pub struct DelegateAgentConfig {
     /// Populated by migration from V2 `channels.<type>.agent = "<alias>"` bindings.
     #[serde(default)]
     pub channels: Vec<String>,
+    /// V3: dotted model-provider alias reference (e.g. `"anthropic.default"`).
+    /// Resolves through `providers.models.<type>.<alias>` at runtime.
+    /// Takes precedence over the deprecated `provider` field when non-empty.
+    #[serde(default)]
+    pub model_provider: String,
+    /// V3: ordered fallback chain of dotted provider aliases.
+    #[serde(default)]
+    pub model_provider_fallback: Vec<String>,
 }
 
 fn default_delegate_timeout_secs() -> u64 {
@@ -10375,12 +10385,26 @@ impl Config {
         if needle.is_empty() {
             return None;
         }
-
-        self.providers
+        // V3: dotted path "type.alias"
+        if let Some((type_key, alias_key)) = needle.split_once('.')
+            && let Some(profile) = self
+                .providers
+                .models
+                .get(type_key)
+                .and_then(|m| m.get(alias_key))
+        {
+            return Some((needle.to_string(), profile.clone()));
+        }
+        // V2 compat: bare type key → look for "default" alias
+        if let Some(profile) = self
+            .providers
             .models
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(needle))
-            .map(|(name, profile)| (name.clone(), profile.clone()))
+            .get(needle)
+            .and_then(|m| m.get("default"))
+        {
+            return Some((format!("{needle}.default"), profile.clone()));
+        }
+        None
     }
 
     /// Apply Codex-app-server compatibility shims to the resolved fallback provider entry.
@@ -10513,10 +10537,26 @@ impl Config {
         }
 
         for alias in alias_keys {
-            if !self.providers.models.contains_key(&alias)
-                && let Some(entry) = self.providers.models.get(&profile_key).cloned()
-            {
-                self.providers.models.insert(alias, entry);
+            // profile_key is now a dotted "type.alias" key; split to retrieve the entry.
+            let entry = profile_key.split_once('.').and_then(|(type_k, alias_k)| {
+                self.providers.models.get(type_k)?.get(alias_k).cloned()
+            });
+            if let Some(entry) = entry {
+                // Insert alias under its own type bucket with "default" inner alias.
+                // Only insert if no entry exists yet to avoid clobbering explicit config.
+                if !self
+                    .providers
+                    .models
+                    .get(&alias)
+                    .is_some_and(|m| m.contains_key("default"))
+                {
+                    self.providers
+                        .models
+                        .entry(alias)
+                        .or_default()
+                        .entry("default".to_string())
+                        .or_insert(entry);
+                }
             }
         }
     }
@@ -10659,90 +10699,102 @@ impl Config {
             }
         }
 
-        for (profile_key, profile) in &self.providers.models {
-            let profile_name = profile_key.trim();
-            if profile_name.is_empty() {
-                anyhow::bail!("model_providers contains an empty profile name");
+        for (type_key, alias_map) in &self.providers.models {
+            if type_key.trim().is_empty() {
+                anyhow::bail!("model_providers contains an empty provider type name");
             }
+            for (alias_key, profile) in alias_map {
+                let profile_name = format!("{type_key}.{alias_key}");
 
-            let has_name = profile
-                .name
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty());
-            let has_base_url = profile
-                .base_url
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty());
+                let has_name = profile
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty());
+                let has_base_url = profile
+                    .base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty());
 
-            // Entries created by migration from top-level fields use the provider
-            // name as the map key and may not have explicit `name` or `base_url`
-            // (the provider factory resolves known names). Only reject entries that
-            // have no identifying information at all.
-            let has_api_key = profile
-                .api_key
-                .as_deref()
-                .is_some_and(|v| !v.trim().is_empty());
-            let has_model = profile
-                .model
-                .as_deref()
-                .is_some_and(|v| !v.trim().is_empty());
-            if !has_name && !has_base_url && !has_api_key && !has_model {
-                anyhow::bail!(
-                    "providers.models.{profile_name} must define at least one of `name`, `base_url`, `api_key`, or `model`"
-                );
-            }
-
-            if let Some(base_url) = profile.base_url.as_deref().map(str::trim)
-                && !base_url.is_empty()
-            {
-                let parsed = reqwest::Url::parse(base_url).with_context(|| {
-                    format!("model_providers.{profile_name}.base_url is not a valid URL")
-                })?;
-                if !matches!(parsed.scheme(), "http" | "https") {
-                    anyhow::bail!("model_providers.{profile_name}.base_url must use http/https");
-                }
-            }
-
-            if let Some(wire_api) = profile.wire_api.as_deref().map(str::trim)
-                && !wire_api.is_empty()
-                && normalize_wire_api(wire_api).is_none()
-            {
-                anyhow::bail!(
-                    "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions"
-                );
-            }
-
-            if let Some(temp) = profile.temperature {
-                validate_temperature(temp).map_err(|e| {
-                    anyhow::anyhow!("providers.models.{profile_name}.temperature: {e}")
-                })?;
-            }
-
-            for (key, value) in &profile.pricing {
-                if value.is_nan() {
+                // Entries created by migration from top-level fields use the provider
+                // type as the map key and may not have explicit `name` or `base_url`
+                // (the provider factory resolves known names). Only reject entries that
+                // have no identifying information at all.
+                let has_api_key = profile
+                    .api_key
+                    .as_deref()
+                    .is_some_and(|v| !v.trim().is_empty());
+                let has_model = profile
+                    .model
+                    .as_deref()
+                    .is_some_and(|v| !v.trim().is_empty());
+                if !has_name && !has_base_url && !has_api_key && !has_model {
                     anyhow::bail!(
-                        "providers.models.{profile_name}.pricing.{key}: value must not be NaN"
+                        "providers.models.{profile_name} must define at least one of `name`, `base_url`, `api_key`, or `model`"
                     );
                 }
-                if *value < 0.0 {
+
+                if let Some(base_url) = profile.base_url.as_deref().map(str::trim)
+                    && !base_url.is_empty()
+                {
+                    let parsed = reqwest::Url::parse(base_url).with_context(|| {
+                        format!("model_providers.{profile_name}.base_url is not a valid URL")
+                    })?;
+                    if !matches!(parsed.scheme(), "http" | "https") {
+                        anyhow::bail!(
+                            "model_providers.{profile_name}.base_url must use http/https"
+                        );
+                    }
+                }
+
+                if let Some(wire_api) = profile.wire_api.as_deref().map(str::trim)
+                    && !wire_api.is_empty()
+                    && normalize_wire_api(wire_api).is_none()
+                {
                     anyhow::bail!(
-                        "providers.models.{profile_name}.pricing.{key}: value must be >= 0.0 (got {value})"
+                        "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions"
                     );
+                }
+
+                if let Some(temp) = profile.temperature {
+                    validate_temperature(temp).map_err(|e| {
+                        anyhow::anyhow!("providers.models.{profile_name}.temperature: {e}")
+                    })?;
+                }
+
+                for (key, value) in &profile.pricing {
+                    if value.is_nan() {
+                        anyhow::bail!(
+                            "providers.models.{profile_name}.pricing.{key}: value must not be NaN"
+                        );
+                    }
+                    if *value < 0.0 {
+                        anyhow::bail!(
+                            "providers.models.{profile_name}.pricing.{key}: value must be >= 0.0 (got {value})"
+                        );
+                    }
                 }
             }
         }
 
         // Providers — fallback reference check
-        if let Some(ref fallback_key) = self.providers.fallback
-            && !self.providers.models.contains_key(fallback_key)
-        {
-            tracing::warn!(
-                "providers.fallback references '{}' which does not exist in providers.models; \
-                 provider resolution will fail at runtime",
-                fallback_key
-            );
+        if let Some(ref fallback_key) = self.providers.fallback {
+            let (type_k, alias_k) = fallback_key
+                .split_once('.')
+                .unwrap_or((fallback_key.as_str(), "default"));
+            if !self
+                .providers
+                .models
+                .get(type_k)
+                .is_some_and(|m| m.contains_key(alias_k))
+            {
+                tracing::warn!(
+                    "providers.fallback references '{}' which does not exist in providers.models; \
+                     provider resolution will fail at runtime",
+                    fallback_key
+                );
+            }
         }
 
         // Ollama cloud-routing safety checks
@@ -11171,11 +11223,20 @@ impl Config {
             .providers
             .fallback
             .clone()
-            .unwrap_or_else(|| "default".into());
+            .unwrap_or_else(|| "default.default".into());
         if self.providers.fallback.is_none() {
             self.providers.fallback = Some(fallback.clone());
         }
-        self.providers.models.entry(fallback).or_default()
+        let (type_key, alias_key) = fallback
+            .split_once('.')
+            .map(|(t, a)| (t.to_string(), a.to_string()))
+            .unwrap_or_else(|| (fallback.clone(), "default".to_string()));
+        self.providers
+            .models
+            .entry(type_key)
+            .or_default()
+            .entry(alias_key)
+            .or_default()
     }
 
     /// Apply environment variable overrides to config
@@ -12289,19 +12350,21 @@ auto_save = true
         let config = Config {
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::ProvidersConfig {
-                fallback: Some("openrouter".into()),
+                fallback: Some("openrouter.default".into()),
                 models: {
                     let mut m = HashMap::new();
-                    m.insert(
-                        "openrouter".into(),
-                        ModelProviderConfig {
-                            api_key: Some("sk-test-key".into()),
-                            model: Some("gpt-4o".into()),
-                            temperature: Some(0.5),
-                            timeout_secs: Some(120),
-                            ..Default::default()
-                        },
-                    );
+                    m.entry("openrouter".to_string())
+                        .or_insert_with(HashMap::new)
+                        .insert(
+                            "default".to_string(),
+                            ModelProviderConfig {
+                                api_key: Some("sk-test-key".into()),
+                                model: Some("gpt-4o".into()),
+                                temperature: Some(0.5),
+                                timeout_secs: Some(120),
+                                ..Default::default()
+                            },
+                        );
                     m
                 },
                 model_routes: Vec::new(),
@@ -12960,16 +13023,20 @@ default_temperature = 0.7
             fallback: Some("openrouter".into()),
             ..Default::default()
         };
-        providers.models.insert(
-            "openrouter".into(),
-            ModelProviderConfig {
-                api_key: Some("sk-roundtrip".into()),
-                model: Some("test-model".into()),
-                temperature: Some(0.9),
-                timeout_secs: Some(120),
-                ..Default::default()
-            },
-        );
+        providers
+            .models
+            .entry("openrouter".into())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    api_key: Some("sk-roundtrip".into()),
+                    model: Some("test-model".into()),
+                    temperature: Some(0.9),
+                    timeout_secs: Some(120),
+                    ..Default::default()
+                },
+            );
         let config = Config {
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
@@ -13059,7 +13126,7 @@ default_temperature = 0.7
         let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
         let compat: crate::migration::V1Compat = toml::from_str(&contents).unwrap();
         let loaded = compat.into_config();
-        let entry = &loaded.providers.models["openrouter"];
+        let entry = &loaded.providers.models["openrouter"]["default"];
         assert!(
             entry
                 .api_key
@@ -13092,14 +13159,19 @@ default_temperature = 0.7
             config_path: dir.join("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = Some("default".into());
-        config.providers.models.insert(
-            "default".into(),
-            ModelProviderConfig {
-                api_key: Some("root-credential".into()),
-                ..Default::default()
-            },
-        );
+        config.providers.fallback = Some("default.default".into());
+        config
+            .providers
+            .models
+            .entry("default".into())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    api_key: Some("root-credential".into()),
+                    ..Default::default()
+                },
+            );
         // Provider fields are now resolved directly — no cache needed.
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
@@ -13139,6 +13211,8 @@ default_temperature = 0.7
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
 
@@ -13156,7 +13230,8 @@ default_temperature = 0.7
             .providers
             .models
             .get("default")
-            .and_then(|m| m.api_key.as_deref())
+            .and_then(|m| m.get("default"))
+            .and_then(|e| e.api_key.as_deref())
             .unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(root_encrypted));
         assert_eq!(store.decrypt(root_encrypted).unwrap(), "root-credential");
@@ -13243,18 +13318,29 @@ default_temperature = 0.7
             config_path: config_path.clone(),
             ..Default::default()
         };
-        config.providers.fallback = Some("test".into());
-        config.providers.models.insert(
-            "test".into(),
-            ModelProviderConfig {
-                model: Some("model-a".into()),
-                ..Default::default()
-            },
-        );
+        config.providers.fallback = Some("test.default".into());
+        config
+            .providers
+            .models
+            .entry("test".into())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    model: Some("model-a".into()),
+                    ..Default::default()
+                },
+            );
         config.save().await.unwrap();
         assert!(config_path.exists());
 
-        config.providers.models.get_mut("test").unwrap().model = Some("model-b".into());
+        config
+            .providers
+            .models
+            .get_mut("test")
+            .and_then(|m| m.get_mut("default"))
+            .unwrap()
+            .model = Some("model-b".into());
         config.save().await.unwrap();
 
         let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
@@ -14465,7 +14551,10 @@ requires_openai_auth = true
 "#;
 
         let parsed = parse_test_config(raw);
-        assert_eq!(parsed.providers.fallback.as_deref(), Some("sub2api"));
+        assert_eq!(
+            parsed.providers.fallback.as_deref(),
+            Some("sub2api.default")
+        );
         assert_eq!(
             parsed
                 .providers
@@ -14477,6 +14566,7 @@ requires_openai_auth = true
             .providers
             .models
             .get("sub2api")
+            .and_then(|m| m.get("default"))
             .expect("profile should exist");
         assert_eq!(profile.wire_api.as_deref(), Some("responses"));
         assert!(profile.requires_openai_auth);
@@ -14676,21 +14766,26 @@ requires_openai_auth = true
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         config.providers.fallback = Some("sub2api".to_string());
-        config.providers.models.insert(
-            "sub2api".to_string(),
-            ModelProviderConfig {
-                name: Some("sub2api".to_string()),
-                base_url: Some("https://api.tonsof.blue/v1".to_string()),
-                wire_api: None,
-                requires_openai_auth: false,
-                azure_openai_resource: None,
-                azure_openai_deployment: None,
-                azure_openai_api_version: None,
-                api_path: None,
-                max_tokens: None,
-                ..Default::default()
-            },
-        );
+        config
+            .providers
+            .models
+            .entry("sub2api".to_string())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    name: Some("sub2api".to_string()),
+                    base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    wire_api: None,
+                    requires_openai_auth: false,
+                    azure_openai_resource: None,
+                    azure_openai_deployment: None,
+                    azure_openai_api_version: None,
+                    api_path: None,
+                    max_tokens: None,
+                    ..Default::default()
+                },
+            );
 
         config.apply_env_overrides();
         // The user's literal fallback key is preserved; we no longer rewrite it
@@ -14703,6 +14798,7 @@ requires_openai_auth = true
                 .providers
                 .models
                 .get("sub2api")
+                .and_then(|m| m.get("default"))
                 .and_then(|e| e.base_url.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
@@ -14714,6 +14810,7 @@ requires_openai_auth = true
                 .providers
                 .models
                 .get("custom:https://api.tonsof.blue/v1")
+                .and_then(|m| m.get("default"))
                 .and_then(|e| e.base_url.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
@@ -14725,21 +14822,26 @@ requires_openai_auth = true
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         config.providers.fallback = Some("sub2api".to_string());
-        config.providers.models.insert(
-            "sub2api".to_string(),
-            ModelProviderConfig {
-                name: Some("sub2api".to_string()),
-                base_url: Some("https://api.tonsof.blue".to_string()),
-                wire_api: Some("responses".to_string()),
-                requires_openai_auth: true,
-                azure_openai_resource: None,
-                azure_openai_deployment: None,
-                azure_openai_api_version: None,
-                api_path: None,
-                max_tokens: None,
-                ..Default::default()
-            },
-        );
+        config
+            .providers
+            .models
+            .entry("sub2api".to_string())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    name: Some("sub2api".to_string()),
+                    base_url: Some("https://api.tonsof.blue".to_string()),
+                    wire_api: Some("responses".to_string()),
+                    requires_openai_auth: true,
+                    azure_openai_resource: None,
+                    azure_openai_deployment: None,
+                    azure_openai_api_version: None,
+                    api_path: None,
+                    max_tokens: None,
+                    ..Default::default()
+                },
+            );
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-codex-key") };
@@ -14756,7 +14858,8 @@ requires_openai_auth = true
             .providers
             .models
             .get("sub2api")
-            .expect("sub2api entry");
+            .and_then(|m| m.get("default"))
+            .expect("sub2api.default entry");
         assert_eq!(entry.base_url.as_deref(), Some("https://api.tonsof.blue"));
         assert_eq!(entry.api_key.as_deref(), Some("sk-test-codex-key"));
         // The entry is mirrored under the "openai-codex" alias so any code
@@ -14765,7 +14868,8 @@ requires_openai_auth = true
             .providers
             .models
             .get("openai-codex")
-            .expect("openai-codex alias entry");
+            .and_then(|m| m.get("default"))
+            .expect("openai-codex.default alias entry");
         assert_eq!(aliased.base_url.as_deref(), Some("https://api.tonsof.blue"));
         assert_eq!(aliased.api_key.as_deref(), Some("sk-test-codex-key"));
     }
@@ -14793,15 +14897,20 @@ requires_openai_auth = true
         // User configures fallback = "primary" with a profile whose `name` field
         // differs from the key. This is the exact shape that triggered the bug.
         config.providers.fallback = Some("primary".to_string());
-        config.providers.models.insert(
-            "primary".to_string(),
-            ModelProviderConfig {
-                name: Some("alias-name".to_string()),
-                base_url: Some("https://example.invalid/v1".to_string()),
-                model: Some("primary-model".to_string()),
-                ..Default::default()
-            },
-        );
+        config
+            .providers
+            .models
+            .entry("primary".to_string())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    name: Some("alias-name".to_string()),
+                    base_url: Some("https://example.invalid/v1".to_string()),
+                    model: Some("primary-model".to_string()),
+                    ..Default::default()
+                },
+            );
 
         config.apply_env_overrides();
 
@@ -14829,12 +14938,12 @@ requires_openai_auth = true
     async fn fallback_round_trips_through_load_apply_serialize() {
         let _env_guard = env_override_lock().await;
         let toml_in = r#"
-schema_version = 1
+schema_version = 3
 
 [providers]
 fallback = "primary"
 
-[providers.models.primary]
+[providers.models.primary.default]
 name = "alias-name"
 base_url = "https://example.invalid/v1"
 model = "primary-model"
@@ -14865,14 +14974,19 @@ model = "primary-model"
     async fn set_prop_then_get_prop_round_trips_for_fallback() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.providers.models.insert(
-            "primary".to_string(),
-            ModelProviderConfig {
-                name: Some("alias-name".to_string()),
-                model: Some("primary-model".to_string()),
-                ..Default::default()
-            },
-        );
+        config
+            .providers
+            .models
+            .entry("primary".to_string())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    name: Some("alias-name".to_string()),
+                    model: Some("primary-model".to_string()),
+                    ..Default::default()
+                },
+            );
         // Simulate the daemon's load path before the user runs `config set`.
         config.apply_env_overrides();
 
@@ -14899,17 +15013,24 @@ model = "primary-model"
         config
             .providers
             .models
-            .insert("secondary".to_string(), ModelProviderConfig::default());
+            .entry("secondary".to_string())
+            .or_default()
+            .insert("default".to_string(), ModelProviderConfig::default());
         assert_eq!(config.providers.resolve_default_model(), None);
 
         // Add an entry with a model -> first-available wins when no fallback.
-        config.providers.models.insert(
-            "tertiary".to_string(),
-            ModelProviderConfig {
-                model: Some("tertiary-model".to_string()),
-                ..Default::default()
-            },
-        );
+        config
+            .providers
+            .models
+            .entry("tertiary".to_string())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    model: Some("tertiary-model".to_string()),
+                    ..Default::default()
+                },
+            );
         assert_eq!(
             config.providers.resolve_default_model().as_deref(),
             Some("tertiary-model"),
@@ -14917,13 +15038,18 @@ model = "primary-model"
 
         // Set fallback to a provider with its own model -> fallback wins.
         config.providers.fallback = Some("primary".to_string());
-        config.providers.models.insert(
-            "primary".to_string(),
-            ModelProviderConfig {
-                model: Some("primary-model".to_string()),
-                ..Default::default()
-            },
-        );
+        config
+            .providers
+            .models
+            .entry("primary".to_string())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    model: Some("primary-model".to_string()),
+                    ..Default::default()
+                },
+            );
         assert_eq!(
             config.providers.resolve_default_model().as_deref(),
             Some("primary-model"),
@@ -14949,14 +15075,19 @@ model = "primary-model"
             config_path: PathBuf::from("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = Some("default".into());
-        config.providers.models.insert(
-            "default".into(),
-            ModelProviderConfig {
-                temperature: Some(0.5),
-                ..Default::default()
-            },
-        );
+        config.providers.fallback = Some("default.default".into());
+        config
+            .providers
+            .models
+            .entry("default".into())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    temperature: Some(0.5),
+                    ..Default::default()
+                },
+            );
         // Provider fields are now resolved directly — no cache needed.
         config.save().await.unwrap();
 
@@ -14993,15 +15124,20 @@ model = "primary-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         config.providers.fallback = Some("ollama".to_string());
-        config.providers.models.insert(
-            "ollama".to_string(),
-            ModelProviderConfig {
-                model: Some("glm-5:cloud".to_string()),
-                base_url: None,
-                api_key: Some("ollama-key".to_string()),
-                ..Default::default()
-            },
-        );
+        config
+            .providers
+            .models
+            .entry("ollama".to_string())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    model: Some("glm-5:cloud".to_string()),
+                    base_url: None,
+                    api_key: Some("ollama-key".to_string()),
+                    ..Default::default()
+                },
+            );
 
         let error = config.validate().expect_err("expected validation to fail");
         assert!(error.to_string().contains(
@@ -15014,15 +15150,20 @@ model = "primary-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         config.providers.fallback = Some("ollama".to_string());
-        config.providers.models.insert(
-            "ollama".to_string(),
-            ModelProviderConfig {
-                model: Some("glm-5:cloud".to_string()),
-                base_url: Some("https://ollama.com/api".to_string()),
-                api_key: None,
-                ..Default::default()
-            },
-        );
+        config
+            .providers
+            .models
+            .entry("ollama".to_string())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    model: Some("glm-5:cloud".to_string()),
+                    base_url: Some("https://ollama.com/api".to_string()),
+                    api_key: None,
+                    ..Default::default()
+                },
+            );
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("OLLAMA_API_KEY", "ollama-env-key") };
@@ -15038,21 +15179,26 @@ model = "primary-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         config.providers.fallback = Some("sub2api".to_string());
-        config.providers.models.insert(
-            "sub2api".to_string(),
-            ModelProviderConfig {
-                name: Some("sub2api".to_string()),
-                base_url: Some("https://api.tonsof.blue/v1".to_string()),
-                wire_api: Some("ws".to_string()),
-                requires_openai_auth: false,
-                azure_openai_resource: None,
-                azure_openai_deployment: None,
-                azure_openai_api_version: None,
-                api_path: None,
-                max_tokens: None,
-                ..Default::default()
-            },
-        );
+        config
+            .providers
+            .models
+            .entry("sub2api".to_string())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    name: Some("sub2api".to_string()),
+                    base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    wire_api: Some("ws".to_string()),
+                    requires_openai_auth: false,
+                    azure_openai_resource: None,
+                    azure_openai_deployment: None,
+                    azure_openai_api_version: None,
+                    api_path: None,
+                    max_tokens: None,
+                    ..Default::default()
+                },
+            );
 
         let error = config.validate().expect_err("expected validation failure");
         assert!(
@@ -15725,15 +15871,20 @@ default_model = "persisted-profile"
     #[test]
     async fn validate_rejects_out_of_range_temperature() {
         let mut config = Config::default();
-        config.providers.fallback = Some("test".into());
-        config.providers.models.insert(
-            "test".into(),
-            ModelProviderConfig {
-                name: Some("test-provider".into()),
-                temperature: Some(99.0),
-                ..Default::default()
-            },
-        );
+        config.providers.fallback = Some("test.default".into());
+        config
+            .providers
+            .models
+            .entry("test".into())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    name: Some("test-provider".into()),
+                    temperature: Some(99.0),
+                    ..Default::default()
+                },
+            );
         let err = config.validate().unwrap_err();
         assert!(
             err.to_string().contains("temperature"),
@@ -15744,15 +15895,20 @@ default_model = "persisted-profile"
     #[test]
     async fn validate_rejects_negative_temperature() {
         let mut config = Config::default();
-        config.providers.fallback = Some("test".into());
-        config.providers.models.insert(
-            "test".into(),
-            ModelProviderConfig {
-                name: Some("test-provider".into()),
-                temperature: Some(-0.5),
-                ..Default::default()
-            },
-        );
+        config.providers.fallback = Some("test.default".into());
+        config
+            .providers
+            .models
+            .entry("test".into())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    name: Some("test-provider".into()),
+                    temperature: Some(-0.5),
+                    ..Default::default()
+                },
+            );
         let err = config.validate().unwrap_err();
         assert!(
             err.to_string().contains("temperature"),
@@ -15763,15 +15919,20 @@ default_model = "persisted-profile"
     #[test]
     async fn validate_accepts_valid_temperature() {
         let mut config = Config::default();
-        config.providers.fallback = Some("test".into());
-        config.providers.models.insert(
-            "test".into(),
-            ModelProviderConfig {
-                name: Some("test-provider".into()),
-                temperature: Some(0.7),
-                ..Default::default()
-            },
-        );
+        config.providers.fallback = Some("test.default".into());
+        config
+            .providers
+            .models
+            .entry("test".into())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    name: Some("test-provider".into()),
+                    temperature: Some(0.7),
+                    ..Default::default()
+                },
+            );
         assert!(config.validate().is_ok());
     }
 
@@ -17744,19 +17905,24 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     async fn config_tree_traversal_discovers_nested_secrets() {
         let mut config = Config::default();
         // Set api_key on fallback provider
-        if let Some(name) = config.providers.fallback.clone() {
-            if let Some(entry) = config.providers.models.get_mut(&name) {
+        if config.providers.fallback.is_some() {
+            if let Some(entry) = config.providers.fallback_provider_mut() {
                 entry.api_key = Some("test-key".into());
             }
         } else {
-            config.providers.fallback = Some("default".into());
-            config.providers.models.insert(
-                "default".into(),
-                ModelProviderConfig {
-                    api_key: Some("test-key".into()),
-                    ..Default::default()
-                },
-            );
+            config.providers.fallback = Some("default.default".into());
+            config
+                .providers
+                .models
+                .entry("default".into())
+                .or_default()
+                .insert(
+                    "default".to_string(),
+                    ModelProviderConfig {
+                        api_key: Some("test-key".into()),
+                        ..Default::default()
+                    },
+                );
         }
         config.channels.matrix.insert(
             "default".to_string(),

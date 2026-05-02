@@ -1130,8 +1130,10 @@ fn mask_sensitive_fields(
     }
 
     // Mask providers
-    for model in masked.providers.models.values_mut() {
-        mask_optional_secret(&mut model.api_key);
+    for alias_map in masked.providers.models.values_mut() {
+        for model in alias_map.values_mut() {
+            mask_optional_secret(&mut model.api_key);
+        }
     }
     for route in &mut masked.providers.model_routes {
         mask_optional_secret(&mut route.api_key);
@@ -1408,9 +1410,13 @@ fn restore_masked_sensitive_fields(
     );
 
     // Restore api_keys inside providers.models entries.
-    for (name, incoming_entry) in &mut incoming.providers.models {
-        if let Some(current_entry) = current.providers.models.get(name) {
-            restore_optional_secret(&mut incoming_entry.api_key, &current_entry.api_key);
+    for (type_key, incoming_alias_map) in &mut incoming.providers.models {
+        if let Some(current_alias_map) = current.providers.models.get(type_key) {
+            for (alias_key, incoming_entry) in incoming_alias_map {
+                if let Some(current_entry) = current_alias_map.get(alias_key) {
+                    restore_optional_secret(&mut incoming_entry.api_key, &current_entry.api_key);
+                }
+            }
         }
     }
 }
@@ -1889,14 +1895,18 @@ mod tests {
     #[test]
     fn masking_keeps_toml_valid_and_preserves_api_keys_type() {
         let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.providers.fallback = Some("default".into());
-        cfg.providers.models.insert(
-            "default".into(),
-            zeroclaw_config::schema::ModelProviderConfig {
-                api_key: Some("sk-live-123".to_string()),
-                ..Default::default()
-            },
-        );
+        cfg.providers.fallback = Some("default.default".into());
+        cfg.providers
+            .models
+            .entry("default".into())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("sk-live-123".to_string()),
+                    ..Default::default()
+                },
+            );
         // Provider fields are now resolved directly — no cache needed.
         cfg.reliability.api_keys = vec!["rk-1".to_string(), "rk-2".to_string()];
         cfg.gateway.paired_tokens = vec!["pair-token-1".to_string()];
@@ -1980,7 +1990,8 @@ mod tests {
                 .providers
                 .models
                 .get("default")
-                .and_then(|m| m.api_key.as_deref()),
+                .and_then(|m| m.get("default"))
+                .and_then(|e| e.api_key.as_deref()),
             Some(MASKED_SECRET)
         );
         assert_eq!(
@@ -2061,14 +2072,19 @@ mod tests {
             workspace_dir: std::path::PathBuf::from("/tmp/current/workspace"),
             ..Default::default()
         };
-        current.providers.fallback = Some("default".into());
-        current.providers.models.insert(
-            "default".into(),
-            zeroclaw_config::schema::ModelProviderConfig {
-                api_key: Some("real-key".to_string()),
-                ..Default::default()
-            },
-        );
+        current.providers.fallback = Some("default.default".into());
+        current
+            .providers
+            .models
+            .entry("default".into())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("real-key".to_string()),
+                    ..Default::default()
+                },
+            );
         current.reliability.api_keys = vec!["r1".to_string(), "r2".to_string()];
         current.gateway.paired_tokens = vec!["pair-1".to_string(), "pair-2".to_string()];
         current.tunnel.cloudflare = Some(zeroclaw_config::schema::CloudflareTunnelConfig {

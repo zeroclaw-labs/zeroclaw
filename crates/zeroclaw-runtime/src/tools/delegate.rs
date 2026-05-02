@@ -1299,6 +1299,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
         agents.insert(
@@ -1318,6 +1320,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
         agents
@@ -1476,6 +1480,8 @@ mod tests {
             skills_directory: None,
             memory_namespace: None,
             channels: Vec::new(),
+            model_provider: String::new(),
+            model_provider_fallback: Vec::new(),
         }
     }
 
@@ -1593,6 +1599,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1708,6 +1716,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1750,6 +1760,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -2040,6 +2052,8 @@ mod tests {
             skills_directory: None,
             memory_namespace: None,
             channels: Vec::new(),
+            model_provider: String::new(),
+            model_provider_fallback: Vec::new(),
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2095,6 +2109,8 @@ mod tests {
             skills_directory: None,
             memory_namespace: None,
             channels: Vec::new(),
+            model_provider: String::new(),
+            model_provider_fallback: Vec::new(),
         };
 
         struct MockShellTool;
@@ -2167,6 +2183,8 @@ mod tests {
             skills_directory: None,
             memory_namespace: None,
             channels: Vec::new(),
+            model_provider: String::new(),
+            model_provider_fallback: Vec::new(),
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2197,6 +2215,8 @@ mod tests {
             skills_directory: None,
             memory_namespace: None,
             channels: Vec::new(),
+            model_provider: String::new(),
+            model_provider_fallback: Vec::new(),
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2232,6 +2252,8 @@ mod tests {
             skills_directory: None,
             memory_namespace: None,
             channels: Vec::new(),
+            model_provider: String::new(),
+            model_provider_fallback: Vec::new(),
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2289,6 +2311,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
         let err = config.validate().unwrap_err();
@@ -2318,6 +2342,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
         let err = config.validate().unwrap_err();
@@ -2347,6 +2373,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
         let err = config.validate().unwrap_err();
@@ -2376,6 +2404,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
         let err = config.validate().unwrap_err();
@@ -2405,6 +2435,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
         assert!(config.validate().is_ok());
@@ -2430,6 +2462,8 @@ mod tests {
                 skills_directory: None,
                 memory_namespace: None,
                 channels: Vec::new(),
+                model_provider: String::new(),
+                model_provider_fallback: Vec::new(),
             },
         );
         assert!(config.validate().is_ok());
@@ -2464,6 +2498,8 @@ mod tests {
             skills_directory: Some("skills/code-review".to_string()),
             memory_namespace: None,
             channels: Vec::new(),
+            model_provider: String::new(),
+            model_provider_fallback: Vec::new(),
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2512,6 +2548,8 @@ mod tests {
             skills_directory: None,
             memory_namespace: None,
             channels: Vec::new(),
+            model_provider: String::new(),
+            model_provider_fallback: Vec::new(),
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];

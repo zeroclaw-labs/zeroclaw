@@ -809,14 +809,19 @@ mod tests {
     fn handle_initialize_default_model_reflects_configured_provider() {
         use zeroclaw_config::schema::ModelProviderConfig;
         let mut config = Config::default();
-        config.providers.fallback = Some("myprovider".to_string());
-        config.providers.models.insert(
-            "myprovider".to_string(),
-            ModelProviderConfig {
-                model: Some("llama3.2".to_string()),
-                ..Default::default()
-            },
-        );
+        config.providers.fallback = Some("myprovider.default".to_string());
+        config
+            .providers
+            .models
+            .entry("myprovider".to_string())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    model: Some("llama3.2".to_string()),
+                    ..Default::default()
+                },
+            );
         let server = AcpServer::new(config, AcpServerConfig::default());
         let result = server.handle_initialize(&serde_json::json!({})).unwrap();
         assert_eq!(result["capabilities"]["defaultModel"], "llama3.2");
