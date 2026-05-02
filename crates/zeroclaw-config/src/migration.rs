@@ -949,6 +949,47 @@ pub fn prepare_table(table: &mut toml::Table) {
         table.insert("channels".to_string(), val);
     }
 
+    // V3: Rename any "claude-code" model-provider type key to "anthropic".
+    // The claude-code provider is removed in V3; the Anthropic provider handles OAuth
+    // tokens (sk-ant-oat01- prefix) natively, so no credential change is needed.
+    // Also rewrite providers.fallback entries and old top-level default_provider field.
+    if let Some(toml::Value::Table(providers)) = table.get_mut("providers") {
+        if let Some(toml::Value::Table(models)) = providers.get_mut("models")
+            && let Some(entry) = models.remove("claude-code")
+        {
+            tracing::info!(
+                "v2→v3 migration: moving [providers.models.claude-code] to \
+                 [providers.models.anthropic.claude-code]. The anthropic provider \
+                 supports OAuth tokens (sk-ant-oat01-) natively."
+            );
+            let alias_map = models
+                .entry("anthropic".to_string())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if let toml::Value::Table(alias_map) = alias_map {
+                alias_map.entry("claude-code".to_string()).or_insert(entry);
+            }
+        }
+        if let Some(toml::Value::Array(fallback)) = providers.get_mut("fallback") {
+            for entry in fallback.iter_mut() {
+                if let toml::Value::String(s) = entry
+                    && (s == "claude-code" || s.starts_with("claude-code."))
+                {
+                    *s = "anthropic.claude-code".to_string();
+                }
+            }
+        }
+        if let Some(toml::Value::String(s)) = providers.get_mut("fallback")
+            && (s == "claude-code" || s.starts_with("claude-code."))
+        {
+            *s = "anthropic.claude-code".to_string();
+        }
+    }
+    if let Some(toml::Value::String(s)) = table.get_mut("default_provider")
+        && s == "claude-code"
+    {
+        *s = "anthropic".to_string();
+    }
+
     // V3: Wrap flat [providers.models.<type>] entries into [providers.models.<type>.default].
     // Same pattern as channel aliasing. Already-aliased (all-table) entries are skipped.
     if let Some(toml::Value::Table(providers)) = table.get_mut("providers")

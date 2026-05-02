@@ -282,6 +282,72 @@ allowed_users = ["@u:m"]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// claude-code provider rename
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn claude_code_provider_renamed_to_anthropic_in_models() {
+    let config = migrate(
+        r#"
+[providers.models.claude-code]
+api_key = "sk-ant-oat01-example"
+model = "claude-sonnet-4-6"
+"#,
+    );
+    assert!(
+        config.providers.models.contains_key("anthropic"),
+        "claude-code model entry should be moved under anthropic"
+    );
+    assert!(
+        !config.providers.models.contains_key("claude-code"),
+        "claude-code top-level key should not survive migration"
+    );
+    assert!(
+        config.providers.models["anthropic"].contains_key("claude-code"),
+        "entry should appear as anthropic.claude-code alias"
+    );
+    assert_eq!(
+        config.providers.models["anthropic"]["claude-code"]
+            .api_key
+            .as_deref(),
+        Some("sk-ant-oat01-example")
+    );
+}
+
+#[test]
+fn claude_code_fallback_renamed_to_anthropic() {
+    let config = migrate(
+        r#"
+[providers]
+fallback = "claude-code"
+
+[providers.models.claude-code]
+api_key = "sk-ant-oat01-example"
+model = "claude-sonnet-4-6"
+"#,
+    );
+    assert_eq!(
+        config.providers.fallback.first().map(String::as_str),
+        Some("anthropic.claude-code")
+    );
+}
+
+#[test]
+fn claude_code_v1_default_provider_renamed_to_anthropic() {
+    let config = migrate(
+        r#"
+default_provider = "claude-code"
+api_key = "sk-ant-oat01-example"
+"#,
+    );
+    assert_eq!(
+        config.providers.fallback.first().map(String::as_str),
+        Some("anthropic.default")
+    );
+    assert!(config.providers.models.contains_key("anthropic"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Exhaustive walk
 // ─────────────────────────────────────────────────────────────────────────────
 
