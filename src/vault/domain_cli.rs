@@ -144,6 +144,22 @@ pub async fn install(config: &Config, manifest_src: &str) -> Result<()> {
         style("✓").green(),
         placed.display()
     );
+
+    // Stamp the baseline-meta keys so PR 2's update decision tree can
+    // tell `current_version` from a stale manifest. For v1 manifests
+    // the baseline IS the bundle, so its version + sha go straight in.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    domain::write_baseline_meta(
+        &placed,
+        &manifest.version,
+        &manifest.bundle.sha256,
+        now,
+    )
+    .context("stamping baseline meta on installed domain.db")?;
+
     let info = domain::info(&config.workspace_dir)?;
     println!(
         "  {} {} docs, {} links, {} bytes",
@@ -155,14 +171,266 @@ pub async fn install(config: &Config, manifest_src: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the registry URL the client should poll. Order:
+///   1. `[domain].registry_url` in `config.toml` (the supported way).
+///   2. `MOA_DOMAIN_MANIFEST_URL` env var (legacy / ops override).
+/// Returns `Ok(None)` when neither is set — the caller is expected to
+/// treat that as a friendly no-op (general-public MoA build).
+fn resolve_registry_url(config: &Config) -> Option<String> {
+    if let Some(url) = config.domain.registry_url.as_ref() {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    std::env::var("MOA_DOMAIN_MANIFEST_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 pub async fn update(config: &Config) -> Result<()> {
-    let url = std::env::var("MOA_DOMAIN_MANIFEST_URL").map_err(|_| {
-        anyhow::anyhow!(
-            "no manifest URL configured; set `MOA_DOMAIN_MANIFEST_URL` or use \
-             `vault domain install --from <url>` directly"
-        )
-    })?;
-    install(config, &url).await
+    let Some(url) = resolve_registry_url(config) else {
+        // No corpus subscribed. This is the general-public MoA build's
+        // happy path — no network, no error, no surprise. Stays
+        // intentionally quiet so the weekly cron output looks clean.
+        println!(
+            "{} no domain registry configured (skipped)",
+            style("vault domain update:").dim()
+        );
+        return Ok(());
+    };
+
+    // Detect the manifest's schema_version once and dispatch. v1
+    // manifests still flow through the legacy `install` path (full
+    // re-download every time). v2 manifests route through the
+    // decision tree from docs/domain-db-incremental-design.md §3.
+    let raw = fetch_manifest_text(&url)
+        .await
+        .with_context(|| format!("fetching manifest {url}"))?;
+    let schema_version = serde_json::from_str::<ManifestVersionPeek>(&raw)
+        .map(|p| p.schema_version)
+        .unwrap_or(0);
+
+    match schema_version {
+        1 => {
+            // v1: same as `install`. The user opted in by setting a
+            // registry_url, so a full download is the contract.
+            install(config, &url).await
+        }
+        2 => update_v2(config, &url, &raw).await,
+        n => anyhow::bail!(
+            "unsupported manifest.schema_version {n}; this build understands 1 or 2"
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ManifestVersionPeek {
+    schema_version: u32,
+}
+
+async fn fetch_manifest_text(url_or_path: &str) -> Result<String> {
+    if url_or_path.starts_with("http://") || url_or_path.starts_with("https://") {
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("zeroclaw/", env!("CARGO_PKG_VERSION")))
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .context("building reqwest client for manifest peek")?;
+        let res = client
+            .get(url_or_path)
+            .send()
+            .await
+            .with_context(|| format!("GET {url_or_path}"))?;
+        if !res.status().is_success() {
+            anyhow::bail!(
+                "manifest fetch failed: HTTP {} from {url_or_path}",
+                res.status().as_u16()
+            );
+        }
+        Ok(res.text().await?)
+    } else {
+        Ok(std::fs::read_to_string(url_or_path)
+            .with_context(|| format!("reading manifest file {url_or_path}"))?)
+    }
+}
+
+async fn update_v2(config: &Config, manifest_url: &str, manifest_raw: &str) -> Result<()> {
+    use super::domain_delta::{self, UpdateOutcome};
+    use super::domain_manifest::DomainManifestV2;
+
+    let manifest: DomainManifestV2 = serde_json::from_str(manifest_raw)
+        .with_context(|| format!("parsing v2 manifest from {manifest_url}"))?;
+    domain_manifest::validate_v2(&manifest).context("validating v2 manifest")?;
+
+    println!(
+        "{} {} v{} (baseline {}, {} delta(s))",
+        style("vault domain update:").bold().cyan(),
+        manifest.name,
+        manifest.version,
+        manifest.baseline.version,
+        manifest.deltas.len()
+    );
+
+    let installed = domain::read_meta(&config.workspace_dir)
+        .context("reading installed domain.db meta")?;
+
+    match domain_delta::decide(&manifest, &installed) {
+        UpdateOutcome::AlreadyCurrent => {
+            println!(
+                "  {} already at v{} (no bytes to download)",
+                style("✓").green(),
+                manifest.version
+            );
+            Ok(())
+        }
+        UpdateOutcome::FullInstall => full_install_v2(config, &manifest).await,
+        UpdateOutcome::ApplyDelta { delta_index } => {
+            apply_delta_outcome(config, &manifest, delta_index).await
+        }
+    }
+}
+
+async fn full_install_v2(config: &Config, manifest: &super::domain_manifest::DomainManifestV2) -> Result<()> {
+    use super::domain_manifest::{BundleSpec, DomainManifest, ManifestStats};
+
+    println!(
+        "  {} full install of baseline v{} ({} bytes)",
+        style("→").cyan(),
+        manifest.baseline.version,
+        manifest.baseline.size_bytes
+    );
+
+    // Reuse the v1 download_bundle path by adapting the baseline
+    // into a v1-shaped manifest. That avoids duplicating the
+    // download/sha gate, and the staging file lands in the same
+    // place either way.
+    let v1_shaped = DomainManifest {
+        schema_version: 1,
+        name: manifest.name.clone(),
+        version: manifest.baseline.version.clone(),
+        generated_at: manifest.generated_at.clone(),
+        generator: manifest.generator.clone(),
+        bundle: BundleSpec {
+            url: manifest.baseline.url.clone(),
+            sha256: manifest.baseline.sha256.clone(),
+            size_bytes: manifest.baseline.size_bytes,
+            compression: "none".into(),
+        },
+        stats: manifest.baseline.stats.clone(),
+    };
+
+    let staging_dir = config.workspace_dir.join("memory");
+    let staging = domain_manifest::download_bundle(&v1_shaped, &staging_dir)
+        .await
+        .context("downloading + verifying baseline bundle")?;
+    println!("  {} sha256 verified", style("✓").green());
+
+    let placed = domain::install_from(&config.workspace_dir, &staging)?;
+    let _ = std::fs::remove_file(&staging);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    domain::write_baseline_meta(
+        &placed,
+        &manifest.baseline.version,
+        &manifest.baseline.sha256,
+        now,
+    )
+    .context("stamping baseline meta on installed domain.db")?;
+
+    // After the baseline, if the manifest also carries deltas the
+    // installed `current_version` ended up at `baseline.version`,
+    // not the chain head. Apply the latest delta in the same run so
+    // the user reaches `manifest.version` in one update.
+    if let Some(latest) = manifest.deltas.last() {
+        println!(
+            "  {} catching up via latest delta v{} ({} bytes)",
+            style("→").cyan(),
+            latest.version,
+            latest.size_bytes
+        );
+        let staging = super::domain_delta::download_delta(latest, &staging_dir)
+            .await
+            .context("downloading + verifying latest delta")?;
+        let now2 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let report = super::domain_delta::apply_delta(
+            &config.workspace_dir,
+            &staging,
+            &manifest.baseline.version,
+            &latest.version,
+            now2,
+        )?;
+        let _ = std::fs::remove_file(&staging);
+        println!(
+            "  {} applied v{} → v{} (+{} upserts, -{} deletes)",
+            style("✓").green(),
+            report.previous_version,
+            report.new_version,
+            report.upserted_documents,
+            report.deleted_documents
+        );
+    }
+
+    let info = domain::info(&config.workspace_dir)?;
+    println!(
+        "  {} {} docs, {} links, {} bytes",
+        style("ready:").bold().green(),
+        info.vault_documents_count,
+        info.vault_links_count,
+        info.size_bytes
+    );
+    Ok(())
+}
+
+async fn apply_delta_outcome(
+    config: &Config,
+    manifest: &super::domain_manifest::DomainManifestV2,
+    delta_index: usize,
+) -> Result<()> {
+    let delta = manifest
+        .deltas
+        .get(delta_index)
+        .ok_or_else(|| anyhow::anyhow!("delta_index {delta_index} out of range"))?;
+    println!(
+        "  {} applying latest delta v{} ({} bytes)",
+        style("→").cyan(),
+        delta.version,
+        delta.size_bytes
+    );
+
+    let staging_dir = config.workspace_dir.join("memory");
+    let staging = super::domain_delta::download_delta(delta, &staging_dir)
+        .await
+        .context("downloading + verifying delta")?;
+    println!("  {} sha256 verified", style("✓").green());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let report = super::domain_delta::apply_delta(
+        &config.workspace_dir,
+        &staging,
+        &manifest.baseline.version,
+        &delta.version,
+        now,
+    )?;
+    let _ = std::fs::remove_file(&staging);
+
+    println!(
+        "  {} v{} → v{} (+{} upserts, -{} deletes)",
+        style("ready:").bold().green(),
+        report.previous_version,
+        report.new_version,
+        report.upserted_documents,
+        report.deleted_documents
+    );
+    Ok(())
 }
 
 pub async fn swap(config: &Config, manifest_src: &str) -> Result<()> {
@@ -628,5 +896,97 @@ mod tests {
         assert_eq!(human_size(2048), "2.00 KB");
         assert_eq!(human_size(2 * 1024 * 1024), "2.00 MB");
         assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.00 GB");
+    }
+
+    // ── registry_url resolution ─────────────────────────────────────
+
+    /// Guards `MOA_DOMAIN_MANIFEST_URL` so concurrent tests in this
+    /// module don't observe each other's env mutations. The whole
+    /// resolution function reads/writes process-global state, so we
+    /// serialise the relevant tests through a Mutex.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_clean_env<F: FnOnce() -> R, R>(f: F) -> R {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("MOA_DOMAIN_MANIFEST_URL").ok();
+        std::env::remove_var("MOA_DOMAIN_MANIFEST_URL");
+        let out = f();
+        match prev {
+            Some(v) => std::env::set_var("MOA_DOMAIN_MANIFEST_URL", v),
+            None => std::env::remove_var("MOA_DOMAIN_MANIFEST_URL"),
+        }
+        out
+    }
+
+    #[test]
+    fn resolve_registry_url_returns_none_when_unset() {
+        with_clean_env(|| {
+            let cfg = Config::default();
+            assert!(resolve_registry_url(&cfg).is_none());
+        });
+    }
+
+    #[test]
+    fn resolve_registry_url_prefers_config_over_env() {
+        with_clean_env(|| {
+            let mut cfg = Config::default();
+            cfg.domain.registry_url = Some("https://from-config.example.com/m.json".into());
+            std::env::set_var(
+                "MOA_DOMAIN_MANIFEST_URL",
+                "https://from-env.example.com/m.json",
+            );
+            assert_eq!(
+                resolve_registry_url(&cfg).as_deref(),
+                Some("https://from-config.example.com/m.json")
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_registry_url_falls_back_to_env() {
+        with_clean_env(|| {
+            std::env::set_var(
+                "MOA_DOMAIN_MANIFEST_URL",
+                "https://from-env.example.com/m.json",
+            );
+            let cfg = Config::default();
+            assert_eq!(
+                resolve_registry_url(&cfg).as_deref(),
+                Some("https://from-env.example.com/m.json")
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_registry_url_treats_empty_string_as_unset() {
+        with_clean_env(|| {
+            let mut cfg = Config::default();
+            cfg.domain.registry_url = Some("   ".into());
+            std::env::set_var("MOA_DOMAIN_MANIFEST_URL", "");
+            assert!(resolve_registry_url(&cfg).is_none());
+        });
+    }
+
+    #[tokio::test]
+    async fn update_with_no_registry_is_a_silent_no_op() {
+        with_clean_env(|| {
+            // The async block has to capture the lock-free copy; we
+            // simulate by checking resolve directly here, then call the
+            // actual update in a separate guarded scope.
+        });
+        // Now run the real update — env is already clean.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("MOA_DOMAIN_MANIFEST_URL").ok();
+        std::env::remove_var("MOA_DOMAIN_MANIFEST_URL");
+
+        let cfg = Config::default();
+        // Should return Ok(()) and touch nothing. Any network call
+        // would fail because no URL is configured.
+        let res = update(&cfg).await;
+        assert!(res.is_ok(), "update should succeed silently: {:?}", res);
+
+        if let Some(v) = prev {
+            std::env::set_var("MOA_DOMAIN_MANIFEST_URL", v);
+        }
     }
 }
