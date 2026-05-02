@@ -5814,6 +5814,29 @@ pub struct RiskProfileConfig {
     pub excluded_tools: Vec<String>,
     /// Shell subprocess timeout in seconds. `0` inherits the global timeout.
     pub shell_timeout_secs: u64,
+    // ── Sandbox (from security.sandbox) ─────────────────────────────
+    /// Whether the sandbox is enabled for this profile. `None` inherits global.
+    pub sandbox_enabled: Option<bool>,
+    /// Sandbox backend identifier (e.g. `"firejail"`, `"landlock"`). `None` inherits.
+    pub sandbox_backend: Option<String>,
+    /// Extra arguments forwarded to firejail when sandbox_backend = "firejail".
+    pub firejail_args: Vec<String>,
+    // ── Resource limits (from security.resources) ───────────────────
+    /// Maximum memory in MiB for sandboxed processes. `0` inherits.
+    pub max_memory_mb: u32,
+    /// Maximum CPU time in seconds. `0` inherits.
+    pub max_cpu_time_seconds: u64,
+    /// Maximum number of subprocesses. `0` inherits.
+    pub max_subprocesses: u32,
+    /// Enable memory usage monitoring for this profile.
+    pub memory_monitoring: bool,
+    // ── Delegation guardrails (per-agent carve-out) ─────────────────
+    /// Maximum delegation recursion depth for agents using this profile.
+    pub max_delegation_depth: u32,
+    /// Delegate call timeout in seconds. `None` inherits global delegate timeout.
+    pub delegation_timeout_secs: Option<u64>,
+    /// Agentic delegate run timeout in seconds. `None` inherits global.
+    pub agentic_timeout_secs: Option<u64>,
 }
 
 /// Named runtime/LLM execution profile (`[runtime_profiles.<alias>]`).
@@ -5847,6 +5870,27 @@ pub struct RuntimeProfileConfig {
     pub allowed_tools: Vec<String>,
     /// Agentic run timeout in seconds.
     pub agentic_timeout_secs: Option<u64>,
+    // ── AgentConfig fields lifted from [agent] ───────────────────────
+    /// Maximum conversation history messages retained per session. `None` inherits.
+    pub max_history_messages: Option<usize>,
+    /// Maximum estimated tokens for context before compaction. `None` inherits.
+    pub max_context_tokens: Option<usize>,
+    /// Use compact bootstrap (6000 chars / 2 RAG chunks). `None` inherits.
+    pub compact_context: Option<bool>,
+    /// Enable parallel tool execution per iteration. `None` inherits.
+    pub parallel_tools: Option<bool>,
+    /// Tool dispatch strategy (e.g. `"auto"`). `None` inherits.
+    pub tool_dispatcher: Option<String>,
+    /// Tools exempt from within-turn dedup check.
+    pub tool_call_dedup_exempt: Vec<String>,
+    /// Maximum characters for the assembled system prompt. `None` inherits.
+    pub max_system_prompt_chars: Option<usize>,
+    /// Enable context-aware tool filtering per iteration. `None` inherits.
+    pub context_aware_tools: Option<bool>,
+    /// Maximum characters for a single tool result. `None` inherits.
+    pub max_tool_result_chars: Option<usize>,
+    /// Number of recent turns whose full tool context is preserved. `None` inherits.
+    pub keep_tool_context_turns: Option<usize>,
 }
 
 /// Named skill bundle (`[skill_bundles.<alias>]`).

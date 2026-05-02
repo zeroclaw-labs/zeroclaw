@@ -454,29 +454,104 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Synthesize [risk_profiles.default] from [autonomy] if not already present.
+    // V3: Synthesize [risk_profiles.default] from [autonomy] + [security.sandbox] +
+    // [security.resources] if not already present.
     // non_cli_excluded_tools is propagated to per-channel excluded_tools above;
     // it does not survive in the risk profile.
-    if let Some(toml::Value::Table(autonomy)) = table.get("autonomy").cloned() {
+    let autonomy_snapshot = table.get("autonomy").and_then(|v| v.as_table()).cloned();
+    let sandbox_snapshot = table
+        .get("security")
+        .and_then(|v| v.as_table())
+        .and_then(|s| s.get("sandbox"))
+        .and_then(|v| v.as_table())
+        .cloned();
+    let resources_snapshot = table
+        .get("security")
+        .and_then(|v| v.as_table())
+        .and_then(|s| s.get("resources"))
+        .and_then(|v| v.as_table())
+        .cloned();
+    if autonomy_snapshot.is_some() || sandbox_snapshot.is_some() || resources_snapshot.is_some() {
         let risk_profiles = table
             .entry("risk_profiles")
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
         if let toml::Value::Table(profiles) = risk_profiles
             && !profiles.contains_key("default")
         {
-            let mut profile = autonomy.clone();
+            let mut profile = autonomy_snapshot.clone().unwrap_or_default();
             profile.remove("non_cli_excluded_tools");
+            // Merge sandbox fields (prefixed to avoid collisions with autonomy fields).
+            if let Some(sandbox) = &sandbox_snapshot {
+                for (k, v) in sandbox {
+                    let dest_key = if k == "enabled" {
+                        "sandbox_enabled".to_string()
+                    } else if k == "backend" {
+                        "sandbox_backend".to_string()
+                    } else {
+                        k.clone()
+                    };
+                    profile.entry(dest_key).or_insert_with(|| v.clone());
+                }
+            }
+            // Merge resource-limits fields.
+            if let Some(resources) = &resources_snapshot {
+                for (k, v) in resources {
+                    profile.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
             profiles.insert("default".to_string(), toml::Value::Table(profile));
+        }
+    }
+    // Remove V2 flat [autonomy] block and the per-agent security subsections.
+    table.remove("autonomy");
+    if let Some(toml::Value::Table(security)) = table.get_mut("security") {
+        security.remove("sandbox");
+        security.remove("resources");
+    }
+
+    // V3: Per-agent risk-profile carve-out.
+    // Agents with inline max_depth or timeout overrides get their own risk profile
+    // named after the agent alias. allowed_tools stays on the agent delegate config.
+    let agents_for_risk: Vec<(String, toml::Table)> =
+        if let Some(toml::Value::Table(agents)) = table.get("agents") {
+            agents
+                .iter()
+                .filter_map(|(alias, val)| val.as_table().map(|t| (alias.clone(), t.clone())))
+                .collect()
+        } else {
+            Vec::new()
+        };
+    for (alias, agent_table) in &agents_for_risk {
+        let has_overrides = agent_table.contains_key("max_depth")
+            || agent_table.contains_key("timeout_secs")
+            || agent_table.contains_key("agentic_timeout_secs");
+        if !has_overrides {
+            continue;
+        }
+        let risk_profiles = table
+            .entry("risk_profiles")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(profiles) = risk_profiles
+            && !profiles.contains_key(alias.as_str())
+        {
+            let mut profile = toml::Table::new();
+            for key in &["max_depth", "timeout_secs", "agentic_timeout_secs"] {
+                if let Some(v) = agent_table.get(*key) {
+                    let dest_key = match *key {
+                        "max_depth" => "max_delegation_depth",
+                        "timeout_secs" => "delegation_timeout_secs",
+                        _ => key,
+                    };
+                    profile.insert(dest_key.to_string(), v.clone());
+                }
+            }
+            profiles.insert(alias.clone(), toml::Value::Table(profile));
         }
     }
 
     // V3: Synthesize [runtime_profiles.default] from [agent] if not already present.
-    // Copies execution-relevant fields; provider/model must be set manually.
-    let agent_snapshot = if let Some(toml::Value::Table(agent)) = table.get("agent") {
-        Some(agent.clone())
-    } else {
-        None
-    };
+    // The entire [agent] table is the seed; all fields carry over as-is.
+    let agent_snapshot = table.get("agent").and_then(|v| v.as_table()).cloned();
     if let Some(agent) = agent_snapshot {
         let runtime_profiles = table
             .entry("runtime_profiles")
@@ -484,15 +559,188 @@ pub fn prepare_table(table: &mut toml::Table) {
         if let toml::Value::Table(profiles) = runtime_profiles
             && !profiles.contains_key("default")
         {
+            profiles.insert("default".to_string(), toml::Value::Table(agent));
+        }
+    }
+    // Remove V2 flat [agent] block after synthesis.
+    table.remove("agent");
+
+    // V3: Per-agent runtime-profile carve-out.
+    // Agents whose max_iterations or agentic flag differs from the global [agent]
+    // block get their own runtime profile.
+    let agents_for_runtime: Vec<(String, toml::Table)> =
+        if let Some(toml::Value::Table(agents)) = table.get("agents") {
+            agents
+                .iter()
+                .filter_map(|(alias, val)| val.as_table().map(|t| (alias.clone(), t.clone())))
+                .collect()
+        } else {
+            Vec::new()
+        };
+    for (alias, agent_table) in &agents_for_runtime {
+        let has_runtime_overrides =
+            agent_table.contains_key("max_iterations") || agent_table.contains_key("agentic");
+        if !has_runtime_overrides {
+            continue;
+        }
+        let runtime_profiles = table
+            .entry("runtime_profiles")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(profiles) = runtime_profiles
+            && !profiles.contains_key(alias.as_str())
+        {
             let mut profile = toml::Table::new();
-            for key in &["max_tool_iterations", "parallel_tools", "tool_dispatcher"] {
-                if let Some(v) = agent.get(*key).cloned() {
-                    profile.insert(key.to_string(), v);
-                }
+            if let Some(v) = agent_table.get("max_iterations") {
+                profile.insert("max_tool_iterations".to_string(), v.clone());
             }
-            if !profile.is_empty() {
-                profiles.insert("default".to_string(), toml::Value::Table(profile));
+            if let Some(v) = agent_table.get("agentic") {
+                profile.insert("agentic".to_string(), v.clone());
             }
+            profiles.insert(alias.clone(), toml::Value::Table(profile));
+        }
+    }
+
+    // V3: Bundle namespace synthesis.
+    // [memory_namespaces.default] — minimal entry seeded from V2 [memory].
+    // Carries the backend type if set; the namespace key is the alias itself.
+    {
+        let backend = table
+            .get("memory")
+            .and_then(|v| v.as_table())
+            .and_then(|m| m.get("backend"))
+            .cloned();
+        let ns_map = table
+            .entry("memory_namespaces")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(nst) = ns_map
+            && !nst.contains_key("default")
+        {
+            let mut entry = toml::Table::new();
+            entry.insert(
+                "namespace".to_string(),
+                toml::Value::String("default".to_string()),
+            );
+            if let Some(b) = backend {
+                entry.insert("backend".to_string(), b);
+            }
+            nst.insert("default".to_string(), toml::Value::Table(entry));
+        }
+    }
+
+    // [skill_bundles.default] ← directory = "skills" (default skills dir)
+    {
+        let bundles = table
+            .entry("skill_bundles")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(bt) = bundles
+            && !bt.contains_key("default")
+        {
+            let mut b = toml::Table::new();
+            b.insert(
+                "directory".to_string(),
+                toml::Value::String("skills".to_string()),
+            );
+            bt.insert("default".to_string(), toml::Value::Table(b));
+        }
+    }
+
+    // Per-agent skill_bundle carve-out: agents with skills_directory get their own bundle.
+    let agents_for_skills: Vec<(String, String)> =
+        if let Some(toml::Value::Table(agents)) = table.get("agents") {
+            agents
+                .iter()
+                .filter_map(|(alias, val)| {
+                    val.as_table()
+                        .and_then(|t| t.get("skills_directory"))
+                        .and_then(|v| v.as_str())
+                        .map(|dir| (alias.clone(), dir.to_string()))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    for (alias, dir) in &agents_for_skills {
+        let bundles = table
+            .entry("skill_bundles")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(bt) = bundles
+            && !bt.contains_key(alias.as_str())
+        {
+            let mut b = toml::Table::new();
+            b.insert("directory".to_string(), toml::Value::String(dir.clone()));
+            bt.insert(alias.clone(), toml::Value::Table(b));
+        }
+    }
+
+    // [knowledge_bundles.default] ← knowledge directory if present in [knowledge].
+    if let Some(toml::Value::Table(knowledge)) = table.get("knowledge").cloned() {
+        let bundles = table
+            .entry("knowledge_bundles")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(bt) = bundles
+            && !bt.contains_key("default")
+        {
+            bt.insert("default".to_string(), toml::Value::Table(knowledge));
+        }
+    }
+
+    // V3: Migrate V2 [mcp.servers.<alias>] map format to V3 [[mcp.servers]] Vec format.
+    // V2: servers are a TOML table keyed by name. V3: servers are an array with an explicit
+    // `name` field. Collect the V2 entries first (for bundle synthesis below), then replace.
+    let v2_mcp_servers: Option<Vec<(String, toml::Table)>> = table
+        .get("mcp")
+        .and_then(|v| v.as_table())
+        .and_then(|mcp| mcp.get("servers"))
+        .and_then(|v| v.as_table())
+        .map(|servers| {
+            servers
+                .iter()
+                .filter_map(|(alias, val)| val.as_table().map(|t| (alias.clone(), t.clone())))
+                .collect()
+        });
+    if let Some(ref entries) = v2_mcp_servers
+        && !entries.is_empty()
+    {
+        let mcp_table = table
+            .entry("mcp")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(mcp) = mcp_table {
+            let vec_entries: Vec<toml::Value> = entries
+                .iter()
+                .map(|(alias, server_t)| {
+                    let mut t = server_t.clone();
+                    t.entry("name".to_string())
+                        .or_insert_with(|| toml::Value::String(alias.clone()));
+                    toml::Value::Table(t)
+                })
+                .collect();
+            mcp.insert("servers".to_string(), toml::Value::Array(vec_entries));
+        }
+    }
+
+    // [mcp_bundles.default] ← lists all V2 mcp.servers.* alias keys.
+    // The bundle is a thin wrapper referencing all known server aliases by name.
+    let mcp_server_aliases: Vec<String> = v2_mcp_servers
+        .map(|entries| entries.into_iter().map(|(alias, _)| alias).collect())
+        .unwrap_or_default();
+    if !mcp_server_aliases.is_empty() {
+        let bundles = table
+            .entry("mcp_bundles")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(bt) = bundles
+            && !bt.contains_key("default")
+        {
+            let mut b = toml::Table::new();
+            b.insert(
+                "servers".to_string(),
+                toml::Value::Array(
+                    mcp_server_aliases
+                        .into_iter()
+                        .map(toml::Value::String)
+                        .collect(),
+                ),
+            );
+            bt.insert("default".to_string(), toml::Value::Table(b));
         }
     }
 

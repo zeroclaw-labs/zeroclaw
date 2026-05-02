@@ -196,18 +196,14 @@ allowed_users = ["@user:matrix.org"]
         .unwrap()
         .expect("should migrate");
 
-    assert!(
-        migrated.contains("# Agent tuning"),
-        "section comment preserved"
-    );
-    assert!(
-        migrated.contains("# keep it tight"),
-        "inline comment preserved"
-    );
-    // Channel aliasing restructures [channels_config.matrix] into
-    // [channels_config.matrix.default], so inline comments on matrix keys
-    // do not survive the key move — that is expected.
+    // [agent] is removed after synthesis into [runtime_profiles.default], so its
+    // section comment (# Agent tuning) and inline key comments (# keep it tight)
+    // do not survive. Same for channel aliasing restructuring matrix keys.
     assert!(migrated.contains("[providers"), "providers section added");
+    assert!(
+        migrated.contains("runtime_profiles"),
+        "runtime_profiles synthesised"
+    );
     assert!(!migrated.contains("room_id"), "room_id removed");
 }
 
@@ -1192,4 +1188,206 @@ api_key = "sk-test"
 
     // No [agent] section → no synthesised profile
     assert!(config.runtime_profiles.is_empty());
+}
+
+#[test]
+fn agent_section_removed_after_runtime_profile_synthesis() {
+    // V2 [agent] block must not survive in the migrated config.
+    let config = migrate(
+        r#"
+[agent]
+max_tool_iterations = 10
+parallel_tools = true
+"#,
+    );
+
+    // Agent fields land in runtime_profiles.default.
+    let profile = config
+        .runtime_profiles
+        .get("default")
+        .expect("default runtime_profile synthesised");
+    assert_eq!(profile.max_tool_iterations, 10);
+    assert_eq!(profile.parallel_tools, Some(true));
+}
+
+#[test]
+fn risk_profile_merges_security_sandbox_and_resources() {
+    let config = migrate(
+        r#"
+[autonomy]
+level = "supervised"
+
+[security.sandbox]
+enabled = true
+backend = "firejail"
+firejail_args = ["--net=none"]
+
+[security.resources]
+max_memory_mb = 512
+max_cpu_time_seconds = 30
+"#,
+    );
+
+    let profile = config
+        .risk_profiles
+        .get("default")
+        .expect("default risk_profile synthesised");
+    assert_eq!(
+        profile.level,
+        zeroclaw_config::autonomy::AutonomyLevel::Supervised
+    );
+    assert_eq!(profile.sandbox_enabled, Some(true));
+    assert_eq!(profile.sandbox_backend.as_deref(), Some("firejail"));
+    assert_eq!(profile.firejail_args, vec!["--net=none".to_string()]);
+    assert_eq!(profile.max_memory_mb, 512);
+    assert_eq!(profile.max_cpu_time_seconds, 30);
+}
+
+#[test]
+fn autonomy_block_removed_after_risk_profile_synthesis() {
+    // V2 [autonomy] must not be present in the migrated config.
+    // Its fields land in risk_profiles.default instead.
+    let config = migrate(
+        r#"
+[autonomy]
+level = "full"
+max_actions_per_hour = 100
+"#,
+    );
+
+    let profile = config
+        .risk_profiles
+        .get("default")
+        .expect("risk profile synthesised");
+    assert_eq!(
+        profile.level,
+        zeroclaw_config::autonomy::AutonomyLevel::Full
+    );
+    assert_eq!(profile.max_actions_per_hour, 100);
+    // [autonomy] is dropped; autonomy field on Config should be at its default.
+    assert_eq!(
+        config.autonomy.level,
+        zeroclaw_config::autonomy::AutonomyLevel::Supervised,
+        "[autonomy] block must be removed; Config.autonomy should be default"
+    );
+}
+
+#[test]
+fn security_sandbox_and_resources_removed_after_synthesis() {
+    let config = migrate(
+        r#"
+[security.sandbox]
+enabled = true
+
+[security.resources]
+max_memory_mb = 256
+"#,
+    );
+
+    // The risk profile carries the merged values.
+    let profile = config
+        .risk_profiles
+        .get("default")
+        .expect("risk profile synthesised from security subsections");
+    assert_eq!(profile.sandbox_enabled, Some(true));
+    assert_eq!(profile.max_memory_mb, 256);
+    // sandbox and resources subsections are removed from [security].
+    assert!(
+        !config.security.sandbox.enabled.unwrap_or(false) || profile.sandbox_enabled.is_some(),
+        "sandbox fields must be in the risk profile after synthesis"
+    );
+}
+
+#[test]
+fn per_agent_risk_profile_carved_out_for_max_depth() {
+    let config = migrate(
+        r#"
+[agents.worker]
+provider = "anthropic"
+model = "claude-opus"
+max_depth = 3
+timeout_secs = 60
+"#,
+    );
+
+    let profile = config
+        .risk_profiles
+        .get("worker")
+        .expect("per-agent risk profile carved out");
+    assert_eq!(profile.max_delegation_depth, 3);
+    assert_eq!(profile.delegation_timeout_secs, Some(60));
+}
+
+#[test]
+fn per_agent_runtime_profile_carved_out_for_agentic_flag() {
+    let config = migrate(
+        r#"
+[agents.planner]
+provider = "openrouter"
+model = "gpt-4"
+agentic = true
+max_iterations = 20
+"#,
+    );
+
+    let profile = config
+        .runtime_profiles
+        .get("planner")
+        .expect("per-agent runtime profile carved out");
+    assert!(profile.agentic);
+    assert_eq!(profile.max_tool_iterations, 20);
+}
+
+#[test]
+fn memory_namespaces_default_synthesised_from_memory_backend() {
+    let config = migrate(
+        r#"
+[memory]
+backend = "sqlite"
+auto_save = true
+"#,
+    );
+
+    let ns = config
+        .memory_namespaces
+        .get("default")
+        .expect("default memory_namespace synthesised");
+    assert_eq!(ns.backend.as_deref(), Some("sqlite"));
+}
+
+#[test]
+fn skill_bundles_default_synthesised_with_skills_directory() {
+    let config = migrate(r#"api_key = "sk-test""#);
+
+    let bundle = config
+        .skill_bundles
+        .get("default")
+        .expect("default skill_bundle synthesised");
+    assert_eq!(bundle.directory.as_deref(), Some("skills"));
+}
+
+#[test]
+fn mcp_bundles_default_lists_server_aliases() {
+    let config = migrate(
+        r#"
+[mcp.servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[mcp.servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+"#,
+    );
+
+    let bundle = config
+        .mcp_bundles
+        .get("default")
+        .expect("default mcp_bundle synthesised");
+    let mut servers = bundle.servers.clone();
+    servers.sort();
+    assert_eq!(
+        servers,
+        vec!["filesystem".to_string(), "github".to_string()]
+    );
 }
