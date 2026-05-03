@@ -466,21 +466,34 @@ impl Channel for SignalChannel {
         // for "pick one of N" prompts; consumers needing multi-select
         // should call SignalChannel::send_poll directly.
         //
-        // Polls require ≥2 options per Signal protocol; for 0 or 1
-        // options, fall back to the trait default (numbered text). The
-        // callback ids passed in here are dropped on the wire because
-        // Signal polls correlate by index — the consumer sees a
-        // pollAnswer with selected_titles back via process_envelope,
-        // which re-emits as `[choice]<title>`. The label text is what
-        // matters at render time.
+        // Empty options → no-op (send only the prompt if any) so we
+        // don't ship a useless "(reply with name or number)" header
+        // with nothing under it. See Channel::send_choice docs.
+        let trimmed_prompt = prompt.trim();
+        if options.is_empty() {
+            if trimmed_prompt.is_empty() {
+                return Ok(());
+            }
+            return self
+                .send(&SendMessage::new(trimmed_prompt, recipient))
+                .await;
+        }
+
+        // Polls require ≥2 options per Signal protocol; for exactly
+        // 1 option, fall back to text — a 1-option poll is a UX
+        // anti-pattern. The callback ids passed in here are dropped
+        // on the wire because Signal polls correlate by label —
+        // pollAnswer.selectedTitles round-trips. Per the trait's
+        // docs, callers needing a stable id round-trip should encode
+        // it INTO the label or maintain a side-map.
         if options.len() >= 2 {
             let labels: Vec<String> = options.iter().map(|(_, l)| l.clone()).collect();
             return self.send_poll(recipient, prompt, &labels, false).await;
         }
-        // Defer to default text rendering (numbered + hint).
+        // Single-option text fallback.
         let mut text = String::new();
-        if !prompt.trim().is_empty() {
-            text.push_str(prompt.trim());
+        if !trimmed_prompt.is_empty() {
+            text.push_str(trimmed_prompt);
             text.push_str("\n\n");
         }
         text.push_str("(reply with name or number)\n");
