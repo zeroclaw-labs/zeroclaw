@@ -11,7 +11,7 @@ Three ways to add a provider ZeroClaw doesn't ship with:
 If the service speaks OpenAI chat-completions, this is a config-only change:
 
 ```toml
-[providers.models.my-endpoint]
+[providers.models."custom:https://my-gateway.example.com"]
 kind = "openai-compatible"
 base_url = "https://my-gateway.example.com"
 model = "my-model-id"
