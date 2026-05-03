@@ -951,9 +951,16 @@ pub fn prepare_table(table: &mut toml::Table) {
     }
 
     // V3: Rename claude-code provider to anthropic, wrap flat provider entries into
-    // `<type>.default` alias, and strip any lingering providers.fallback key.
+    // `<type>.default` alias, and normalize providers.fallback to Vec<String> with
+    // dotted type.alias keys (V2 had a bare string; V3 has an array of dotted paths).
     if let Some(toml::Value::Table(providers)) = table.get_mut("providers") {
-        providers.remove("fallback");
+        // Normalize providers.fallback to an array if it's a bare string (V2 shape).
+        if let Some(toml::Value::String(s)) = providers.get("fallback").cloned() {
+            providers.insert(
+                "fallback".into(),
+                toml::Value::Array(vec![toml::Value::String(s)]),
+            );
+        }
         if let Some(toml::Value::Table(models)) = providers.get_mut("models") {
             // Rename claude-code → anthropic.claude-code alias.
             if let Some(entry) = models.remove("claude-code") {

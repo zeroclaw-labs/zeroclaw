@@ -11912,8 +11912,7 @@ auto_save = true
                         );
                     m
                 },
-                model_routes: Vec::new(),
-                embedding_routes: Vec::new(),
+                ..Default::default()
             },
             workspace_dir: PathBuf::from("/tmp/test/workspace"),
             config_path: PathBuf::from("/tmp/test/config.toml"),

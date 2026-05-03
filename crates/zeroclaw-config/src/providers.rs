@@ -15,6 +15,14 @@ pub struct ProvidersConfig {
     #[nested]
     pub models: HashMap<String, HashMap<String, ModelProviderConfig>>,
 
+    /// Ordered list of preferred `<type>.<alias>` keys to use for default routing.
+    /// Each entry references a configured entry in `providers.models`, e.g.
+    /// `["openai.gpt5-4", "anthropic.default"]`. The first reachable entry wins.
+    /// Routing logic is not yet implemented — this field is reserved for a
+    /// follow-up that wires it into provider resolution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<String>,
+
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_routes: Vec<ModelRouteConfig>,
