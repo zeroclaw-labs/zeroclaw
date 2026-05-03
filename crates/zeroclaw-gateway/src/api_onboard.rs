@@ -253,6 +253,12 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
             .filter_map(|s| s.path.split('.').next())
             .collect();
 
+    // Ensure map-keyed sections surface even when their HashMap is empty
+    // (prop_fields() only yields paths for populated entries).
+    for &prefix in &map_keyed_roots {
+        roots.insert(prefix.to_string());
+    }
+
     let sections: Vec<SectionInfo> = roots
         .into_iter()
         .map(|key| {
