@@ -1,6 +1,7 @@
 [alias]
 mdbook = "run -p xtask --bin mdbook --"
 fluent = "run -p xtask --bin fluent --"
+web = "run -p xtask --bin web --"
 
 [build]
 rustdocflags = ["--default-theme=ayu"]

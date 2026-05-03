@@ -1,10 +1,11 @@
 import { Component, createContext, useContext, useEffect, useState, type ErrorInfo, type ReactNode } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { ThemeProvider } from './contexts/ThemeContext';
 
 import { loadLocale, saveLocale } from './contexts/ThemeContext';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
-import { getAdminPairCode } from './lib/api';
+import { getAdminPairCode, getOnboardStatus } from './lib/api';
 import { basePath } from './lib/basePath';
 import { setLocale, type Locale } from './lib/i18n';
 import { Router } from './router/router';
@@ -211,10 +212,47 @@ function AppContent() {
   return (
     <DraftContext.Provider value={draftStore}>
       <LocaleContext.Provider value={{ locale, setAppLocale }}>
+        <FreshInstallRedirect />
         <Router />
       </LocaleContext.Provider>
     </DraftContext.Provider>
   );
+}
+
+// Redirects fresh installs (no completed onboarding sections, no provider
+// configured) from the default `/` landing to `/onboard`. The daemon
+// always writes a default config.toml on init, so file existence isn't
+// the right signal — we ask the gateway via /api/onboard/status which
+// inspects the in-memory config for explicit user-driven markers
+// (`onboard_state.completed_sections`, `providers.fallback`,
+// `providers.models`).
+//
+// Fires once per session. Only redirects when the user lands at `/` —
+// manual navigation to other routes is left alone, so the user can
+// always escape into the existing config editor or chat surfaces if
+// they want.
+function FreshInstallRedirect() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [checked, setChecked] = useState(false);
+
+  useEffect(() => {
+    if (checked) return;
+    setChecked(true);
+    if (location.pathname !== '/') return;
+    void getOnboardStatus()
+      .then((status) => {
+        if (status.needs_onboarding) {
+          navigate('/onboard', { replace: true });
+        }
+      })
+      .catch(() => {
+        // Status check failed (network blip, gateway hiccup); the
+        // dashboard renders normally as the safe default.
+      });
+  }, [checked, location.pathname, navigate]);
+
+  return null;
 }
 
 export default function App() {

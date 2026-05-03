@@ -1,4 +1,10 @@
 @import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+/* GitHub Dark theme for highlight.js — matches the dashboard's dark
+   palette and is what `rehype-highlight` outputs `hljs-*` classes for
+   in the personality editor's Markdown preview. */
+@import "highlight.js/styles/github-dark.css";
 
 @theme {
   /* Theme-aware colors mapped to CSS custom properties */

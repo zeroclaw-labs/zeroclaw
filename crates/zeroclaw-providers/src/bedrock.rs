@@ -956,6 +956,7 @@ impl BedrockProvider {
                                 id: wrapper.tool_use.tool_use_id,
                                 name: wrapper.tool_use.name,
                                 arguments: wrapper.tool_use.input.to_string(),
+                                extra_content: None,
                             });
                         }
                     }
