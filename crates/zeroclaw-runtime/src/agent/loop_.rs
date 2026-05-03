@@ -5755,6 +5755,7 @@ mod tests {
                         id: "call_wait".into(),
                         name: "count_tool".into(),
                         arguments: r#"{"value":"A"}"#.into(),
+                        extra_content: None,
                     }],
                     usage: None,
                     reasoning_content: None,
@@ -5987,6 +5988,7 @@ mod tests {
                 id: "call_native_1".to_string(),
                 name: "count_tool".to_string(),
                 arguments: r#"{"value":"A"}"#.to_string(),
+                extra_content: None,
             }),
             NativeStreamTurn::Text("done".to_string()),
         ]);
@@ -6963,6 +6965,7 @@ Let me check the result."#;
             id: "call_1".into(),
             name: "shell".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }];
         let result = build_native_assistant_history("answer", &calls, Some("thinking step"));
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -6977,6 +6980,7 @@ Let me check the result."#;
             id: "call_1".into(),
             name: "shell".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }];
         let result = build_native_assistant_history("answer", &calls, None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();

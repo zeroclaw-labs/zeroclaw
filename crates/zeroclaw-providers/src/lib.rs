@@ -1084,6 +1084,35 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
     create_provider_with_options(name, api_key, &ProviderRuntimeOptions::default())
 }
 
+/// Build a `ModelProviderConfig` populated with the named provider's
+/// effective default values from its `Provider` trait methods (the same
+/// `default_temperature` / `default_max_tokens` / `default_timeout_secs` /
+/// `default_wire_api` / `default_base_url` the runtime already calls at
+/// every chat request).
+///
+/// One shared function — gateway onboarding pre-fill, CLI wizard prompt
+/// pre-fill, and any future caller all consume this so the surfaces can't
+/// drift. The schema-level cleanup (per-provider typed configs that would
+/// eliminate the hardcoded field list here) ships with v3 / #5947.
+///
+/// Returns `ModelProviderConfig::default()` (all `None`) for unknown
+/// providers — the form just opens blank, callers don't have to special
+/// case.
+pub fn default_provider_config(name: &str) -> zeroclaw_config::schema::ModelProviderConfig {
+    use zeroclaw_config::schema::ModelProviderConfig;
+    let Ok(handle) = create_provider(name, None) else {
+        return ModelProviderConfig::default();
+    };
+    ModelProviderConfig {
+        base_url: handle.default_base_url().map(str::to_string),
+        temperature: Some(handle.default_temperature()),
+        max_tokens: Some(handle.default_max_tokens()),
+        timeout_secs: Some(handle.default_timeout_secs()),
+        wire_api: Some(handle.default_wire_api().to_string()),
+        ..Default::default()
+    }
+}
+
 /// Factory: create provider with runtime options (auth profile override, state dir).
 pub fn create_provider_with_options(
     name: &str,

@@ -305,11 +305,11 @@ impl V1Compat {
             return;
         }
 
-        let fallback = self.default_provider.take();
-        let Some(fallback) = fallback.or_else(|| self.config.providers.fallback.first().cloned())
-        else {
-            return;
-        };
+        let fallback = self
+            .default_provider
+            .take()
+            .or_else(|| self.config.providers.fallback.first().cloned())
+            .unwrap_or_else(|| "default".to_string());
 
         // Fill gaps in the fallback entry from top-level V1 fields.
         // fallback is a bare type name (e.g. "anthropic"); map to "default" alias in nested map.

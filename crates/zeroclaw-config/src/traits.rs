@@ -20,6 +20,13 @@ pub enum PropKind {
     Enum,
     /// A `Vec<String>` field; set via comma-separated input.
     StringArray,
+    /// A `Vec<T>` field where `T` is a serializable struct (e.g. `Vec<McpServerConfig>`,
+    /// `Vec<PeripheralBoardConfig>`). Round-tripped on the wire as a JSON array of
+    /// objects; the dashboard renders a per-row sub-form using the JSON Schema
+    /// from `OPTIONS /api/config` to discover the element type's field shape.
+    /// Schema v3 / #5947 will migrate the load-bearing ones (mcp.servers etc.)
+    /// to `HashMap<String, T>` keyed tables; until then this kind covers them.
+    ObjectArray,
 }
 
 /// Maps Rust types to PropKind at compile time.
@@ -79,6 +86,10 @@ pub struct PropFieldInfo {
     /// when the field has no doc comment. Onboard uses this as human-readable
     /// prompt text instead of the raw kebab-case field name.
     pub description: &'static str,
+    /// Whether this field's value is derived from a secret (`#[derived_from_secret]`).
+    /// Subject to the same write-only / no-readback rules as `#[secret]`.
+    /// Reserved for future schema additions; currently no fields are derived.
+    pub derived_from_secret: bool,
 }
 
 impl PropFieldInfo {
@@ -152,6 +163,41 @@ pub fn restore_required_secret(value: &mut String, current: &str) {
     if is_masked_secret(value) {
         *value = current.to_string();
     }
+}
+
+/// Stable wire-form for an addable section — a `HashMap<String, T>` (Map) or
+/// `Vec<T>` (List) field whose value type implements `Configurable`. The
+/// dashboard / CLI use this to surface `+ Add` affordances without
+/// hardcoding the section list. Auto-discovered by the `Configurable` derive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "schema-export",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "schema-export", serde(rename_all = "snake_case"))]
+pub enum MapKeyKind {
+    /// `HashMap<String, T>` — key is user-supplied; new value is default.
+    Map,
+    /// `Vec<T>` — entries are appended; the user-supplied "key" is stored
+    /// in the value type's natural identifier field (e.g. `name`, `hint`).
+    List,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    feature = "schema-export",
+    derive(serde::Serialize, schemars::JsonSchema)
+)]
+pub struct MapKeySection {
+    /// Dotted section path, e.g. `providers.models`, `mcp.servers`.
+    pub path: &'static str,
+    /// Whether the section is a map or a list.
+    pub kind: MapKeyKind,
+    /// Rust type name of the value, e.g. `ModelProviderConfig`. For display only.
+    pub value_type: &'static str,
+    /// Doc comment on the field (flattened to one line). What the user sees
+    /// when picking which kind of thing to add.
+    pub description: &'static str,
 }
 
 /// The trait for describing a channel

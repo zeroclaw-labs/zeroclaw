@@ -672,6 +672,10 @@ struct ToolCall {
         skip_serializing_if = "Option::is_none"
     )]
     parameters: Option<serde_json::Value>,
+
+    /// See [`zeroclaw_api::ToolCall::extra_content`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra_content: Option<serde_json::Value>,
 }
 
 impl ToolCall {
@@ -867,6 +871,8 @@ struct StreamToolCallDelta {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+    #[serde(default)]
+    extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -882,6 +888,7 @@ struct StreamToolCallAccumulator {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    extra_content: Option<serde_json::Value>,
 }
 
 impl StreamToolCallAccumulator {
@@ -909,6 +916,11 @@ impl StreamToolCallAccumulator {
         {
             self.arguments.push_str(arguments_delta);
         }
+
+        // Last-write-wins: signature is opaque and delivered once per call.
+        if let Some(extra) = delta.extra_content.as_ref() {
+            self.extra_content = Some(extra.clone());
+        }
     }
 
     fn into_provider_tool_call(self) -> Option<ProviderToolCall> {
@@ -934,6 +946,7 @@ impl StreamToolCallAccumulator {
             id: self.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             name,
             arguments: normalized_arguments,
+            extra_content: self.extra_content,
         })
     }
 }
@@ -1514,6 +1527,9 @@ impl OpenAiCompatibleProvider {
                             name: None,
                             arguments: None,
                             parameters: None,
+                            // Round-trip extra_content (e.g. Gemini
+                            // thoughtSignature) — dropping it here was the bug.
+                            extra_content: tc.extra_content,
                         })
                         .collect::<Vec<_>>();
 
@@ -1689,6 +1705,7 @@ impl OpenAiCompatibleProvider {
                     id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     name,
                     arguments: normalized_arguments,
+                    extra_content: tc.extra_content,
                 })
             })
             .collect::<Vec<_>>();
@@ -2055,6 +2072,7 @@ impl Provider for OpenAiCompatibleProvider {
                     id: uuid::Uuid::new_v4().to_string(),
                     name,
                     arguments,
+                    extra_content: tc.extra_content,
                 })
             })
             .collect::<Vec<_>>();
@@ -3109,6 +3127,7 @@ mod tests {
                 name: None,
                 arguments: None,
                 parameters: None,
+                extra_content: None,
             }]),
             reasoning_content: None,
         };
@@ -3979,6 +3998,7 @@ mod tests {
             }),
             name: None,
             arguments: None,
+            extra_content: None,
         });
         acc.apply_delta(&StreamToolCallDelta {
             index: Some(0),
@@ -3989,6 +4009,7 @@ mod tests {
             }),
             name: None,
             arguments: None,
+            extra_content: None,
         });
 
         let tool_call = acc
@@ -4037,6 +4058,7 @@ mod tests {
                 name: None,
                 arguments: None,
                 parameters: None,
+                extra_content: None,
             }]),
         };
 
@@ -4216,6 +4238,7 @@ mod tests {
             name: None,
             arguments: None,
             parameters: None,
+            extra_content: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert!(!json.as_object().unwrap().contains_key("name"));
@@ -4237,6 +4260,7 @@ mod tests {
             name: Some("shell".to_string()),
             arguments: Some("{\"command\":\"ls\"}".to_string()),
             parameters: None,
+            extra_content: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert_eq!(json["name"], "shell");

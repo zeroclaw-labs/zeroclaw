@@ -341,7 +341,11 @@ pub fn all_tools_with_runtime(
 ) {
     let has_shell_access = runtime.has_shell_access();
     let runtime_kind = root_config.runtime.kind.as_str();
-    let sandbox = create_sandbox(&root_config.security, runtime_kind, Some(workspace_dir));
+    let sandbox = create_sandbox(
+        &root_config.security,
+        runtime_kind,
+        Some(&security.workspace_dir),
+    );
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
@@ -773,7 +777,10 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ask_user_tool));
 
     // Human escalation tool — always registered; channel map populated later by start_channels.
-    let escalate_tool = EscalateToHumanTool::new(security.clone(), workspace_dir.to_path_buf());
+    let escalate_tool = EscalateToHumanTool::new(
+        security.clone(),
+        root_config.escalation.alert_channels.clone(),
+    );
     let escalate_handle = escalate_tool.channel_map_handle();
     tool_arcs.push(Arc::new(escalate_tool));
 
