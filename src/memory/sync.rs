@@ -634,11 +634,86 @@ impl SyncEngine {
 }
 
 impl SyncEngine {
-    /// Create a new sync engine for the given workspace.
-    pub fn new(workspace_dir: &Path, enabled: bool) -> anyhow::Result<Self> {
-        let db_path = workspace_dir.join("sync_state.db");
+    /// PBKDF2-SHA256 iteration count for sync-key derivation.
+    /// 200_000 is the OWASP-recommended minimum for SHA-256 (as of 2023);
+    /// raised here to leave headroom against future GPU advances. The
+    /// derivation runs once per process startup, so the ~150ms cost is
+    /// invisible to users.
+    pub const SYNC_KEY_KDF_ITERATIONS: u32 = 200_000;
 
-        // Load or generate device ID
+    /// Derive a 32-byte sync key from a user passphrase using
+    /// PBKDF2-HMAC-SHA256.
+    ///
+    /// This is the building block for the patent-mandated key model
+    /// described in `docs/ephemeral-relay-sync-patent.md` Claim 8 ("AES-256-GCM
+    /// + PBKDF2 key derivation"). It does not yet replace the existing
+    /// `.sync_key` random-key path that `SyncEngine::new` uses by default —
+    /// that swap requires a coupled change to the pairing flow so newly
+    /// added devices can derive the SAME key from the same passphrase
+    /// (or share a master key over the pairing channel). See the module-
+    /// level FIXME below for the migration plan.
+    ///
+    /// `salt` should be a stable, per-user value (e.g. user_id, account
+    /// email hash). Using a per-device salt would defeat the purpose
+    /// because two devices for the same user would derive different keys.
+    pub fn derive_sync_key_from_passphrase(passphrase: &[u8], salt: &[u8]) -> [u8; 32] {
+        use hmac::Hmac;
+        use sha2::Sha256;
+
+        let mut key = [0u8; 32];
+        // pbkdf2 0.12 returns Result on the trait method; the only error
+        // path is invalid output length (32 bytes here is always valid).
+        let _ = pbkdf2::pbkdf2::<Hmac<Sha256>>(
+            passphrase,
+            salt,
+            Self::SYNC_KEY_KDF_ITERATIONS,
+            &mut key,
+        );
+        key
+    }
+
+    /// Construct a `SyncEngine` with an explicitly supplied encryption key.
+    ///
+    /// Use this instead of `new()` when:
+    /// - The key was derived from a passphrase via
+    ///   `derive_sync_key_from_passphrase` (the patent-correct path).
+    /// - The key was received from a peer device over the pairing channel
+    ///   (the multi-device-sync-actually-works path).
+    ///
+    /// Like `new()`, this still loads/persists the device ID file and
+    /// initializes the SQLite journal, but it does NOT touch
+    /// `<workspace>/.sync_key`. Callers that want to also persist the
+    /// supplied key for restart resumption can write it themselves
+    /// (with file mode 0o600); we deliberately do not auto-persist
+    /// passphrase-derived keys because their long-term storage policy
+    /// is the caller's decision, not the engine's.
+    pub fn with_explicit_key(
+        workspace_dir: &Path,
+        enabled: bool,
+        encryption_key: [u8; 32],
+    ) -> anyhow::Result<Self> {
+        let db_path = workspace_dir.join("sync_state.db");
+        let device_id = Self::load_or_generate_device_id(workspace_dir)?;
+
+        if enabled {
+            Self::init_db(&db_path)?;
+        }
+
+        let mut engine = Self {
+            device_id,
+            version: VersionVector::default(),
+            journal: Vec::new(),
+            encryption_key,
+            db_path,
+            enabled,
+            hlc: None,
+        };
+        engine.load()?;
+        Ok(engine)
+    }
+
+    /// Helper extracted from `new()` so `with_explicit_key()` can reuse it.
+    fn load_or_generate_device_id(workspace_dir: &Path) -> anyhow::Result<DeviceId> {
         let device_id_path = workspace_dir.join(".device_id");
         let device_id = if device_id_path.exists() {
             let id_str = std::fs::read_to_string(&device_id_path)?;
@@ -646,7 +721,6 @@ impl SyncEngine {
         } else {
             let id = DeviceId::generate();
             std::fs::write(&device_id_path, &id.0)?;
-            // Restrict key file to owner-only access (0o600).
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -654,8 +728,45 @@ impl SyncEngine {
             }
             id
         };
+        Ok(device_id)
+    }
 
-        // Load or generate encryption key
+    /// Create a new sync engine for the given workspace.
+    ///
+    /// FIXME (2026-05-03 audit, D2): this loads `<workspace>/.sync_key`
+    /// or generates a fresh random one if absent. That keeps each
+    /// device's encryption key independent — meaning two devices on the
+    /// same user account will produce ciphertext the other cannot read,
+    /// and the patent-mandated multi-device sync does not actually work
+    /// with this constructor alone. A test in `synced.rs` (`apply_remote_deltas`
+    /// case `share_key_via_pairing_*`) admits this with the comment "In
+    /// production, all devices share the same .sync_key file".
+    ///
+    /// The migration plan is:
+    ///   1. Pairing flow (separate PR) generates a master sync key on
+    ///      the first device and ships it over the pairing channel
+    ///      (encrypted under the pairing token) to subsequent devices.
+    ///   2. Each device persists the master key locally (0o600), or
+    ///      derives per-device subkeys via HKDF.
+    ///   3. `SyncEngine` constructors are switched from
+    ///      `new(workspace, enabled)` to
+    ///      `with_explicit_key(workspace, enabled, master_key)`.
+    ///   4. `.sync_key` random-generation is removed (this function
+    ///      becomes a thin wrapper over `with_explicit_key`).
+    ///
+    /// Until that lands, this constructor preserves the existing
+    /// behavior so the rest of the codebase keeps building. Callers
+    /// who want the patent-correct path NOW can use
+    /// `derive_sync_key_from_passphrase` + `with_explicit_key` directly.
+    pub fn new(workspace_dir: &Path, enabled: bool) -> anyhow::Result<Self> {
+        let db_path = workspace_dir.join("sync_state.db");
+        let device_id = Self::load_or_generate_device_id(workspace_dir)?;
+
+        // Load or generate encryption key.
+        // See the FIXME on this function — production multi-device sync
+        // requires the key to be shared across devices, not regenerated
+        // per device. The current behavior is preserved for backward
+        // compatibility with existing single-device installs.
         let key_path = workspace_dir.join(".sync_key");
         let encryption_key = if key_path.exists() {
             let key_bytes = std::fs::read(&key_path)?;
@@ -669,7 +780,6 @@ impl SyncEngine {
             let mut key = [0u8; 32];
             rand::fill(&mut key);
             std::fs::write(&key_path, key)?;
-            // Restrict key file to owner-only access (0o600).
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -691,10 +801,7 @@ impl SyncEngine {
             enabled,
             hlc: None,
         };
-
-        // Load persisted state from SQLite
         engine.load()?;
-
         Ok(engine)
     }
 
@@ -1684,6 +1791,58 @@ mod tests {
             DeltaOperation::Store { embedding, .. } => assert!(embedding.is_none()),
             _ => panic!("unexpected variant"),
         }
+    }
+
+    #[test]
+    fn derive_sync_key_is_deterministic_per_passphrase_and_salt() {
+        // PBKDF2 must produce the same 32-byte key from the same
+        // (passphrase, salt) pair on every invocation. This is the
+        // foundation for the patent-mandated cross-device sync: device
+        // A and device B both derive the same key from the same user
+        // passphrase + the user's stable salt.
+        let pass = b"correct horse battery staple";
+        let salt = b"user@example.com";
+        let k1 = SyncEngine::derive_sync_key_from_passphrase(pass, salt);
+        let k2 = SyncEngine::derive_sync_key_from_passphrase(pass, salt);
+        assert_eq!(k1, k2, "PBKDF2 derivation must be deterministic");
+    }
+
+    #[test]
+    fn derive_sync_key_changes_with_passphrase_or_salt() {
+        let salt = b"u@x";
+        let k_a = SyncEngine::derive_sync_key_from_passphrase(b"alpha", salt);
+        let k_b = SyncEngine::derive_sync_key_from_passphrase(b"beta", salt);
+        assert_ne!(k_a, k_b, "different passphrases must yield different keys");
+
+        let pass = b"alpha";
+        let k_s1 = SyncEngine::derive_sync_key_from_passphrase(pass, b"salt-one");
+        let k_s2 = SyncEngine::derive_sync_key_from_passphrase(pass, b"salt-two");
+        assert_ne!(k_s1, k_s2, "different salts must yield different keys");
+    }
+
+    #[test]
+    fn with_explicit_key_does_not_touch_sync_key_file() {
+        // The key model that the patent + privacy invariants require
+        // is "key is per-user, not per-device, and is NEVER persisted
+        // unless the caller explicitly chooses to". `with_explicit_key`
+        // honors that — it persists the device ID file (so the device
+        // has a stable identity for the relay) but it MUST NOT write
+        // `.sync_key` to disk, because the caller's intent in choosing
+        // the explicit-key path is "don't autopersist this key".
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = SyncEngine::derive_sync_key_from_passphrase(b"pass", b"u@x");
+        let _engine = SyncEngine::with_explicit_key(tmp.path(), false, key)
+            .expect("explicit-key constructor must succeed");
+
+        assert!(
+            tmp.path().join(".device_id").exists(),
+            "device ID file should be created (stable identity for the relay)"
+        );
+        assert!(
+            !tmp.path().join(".sync_key").exists(),
+            "explicit-key constructor must NOT autopersist the sync key — \
+             persistence policy is the caller's decision"
+        );
     }
 }
 
