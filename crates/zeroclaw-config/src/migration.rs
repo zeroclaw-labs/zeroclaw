@@ -80,92 +80,6 @@ pub fn migrate_to_current(raw: &str) -> Result<super::schema::Config> {
     Ok(config)
 }
 
-/// Render `config` as a V2-shaped TOML table (downgrade): take the
-/// `default` alias of every aliased channel/provider entry, strip
-/// V3-only top-level sections, drop per-agent V3 fields. Used by the
-/// fixture generator to emit reference V2 snapshots.
-pub fn snapshot_v2(config: &super::schema::Config) -> toml::Table {
-    let raw = toml::to_string(config).unwrap_or_default();
-    let mut config_table: toml::Table = toml::from_str(&raw).unwrap_or_default();
-    config_table.insert("schema_version".into(), toml::Value::Integer(2));
-
-    if let Some(toml::Value::Table(providers)) = config_table.get_mut("providers")
-        && let Some(toml::Value::Table(models)) = providers.get_mut("models")
-    {
-        let type_keys: Vec<String> = models.keys().cloned().collect();
-        for type_key in type_keys {
-            if let Some(toml::Value::Table(alias_map)) = models.get(&type_key).cloned() {
-                if alias_map
-                    .values()
-                    .any(|v| !matches!(v, toml::Value::Table(_)))
-                {
-                    continue;
-                }
-                if let Some(toml::Value::Table(default_entry)) = alias_map.get("default").cloned() {
-                    models.insert(type_key, toml::Value::Table(default_entry));
-                }
-            }
-        }
-    }
-
-    if let Some(toml::Value::Table(channels)) = config_table.get_mut("channels") {
-        let ch_keys: Vec<String> = channels.keys().cloned().collect();
-        for ch_type in ch_keys {
-            if let Some(toml::Value::Table(alias_map)) = channels.get(&ch_type).cloned() {
-                if alias_map
-                    .values()
-                    .any(|v| !matches!(v, toml::Value::Table(_)))
-                {
-                    continue;
-                }
-                if let Some(toml::Value::Table(default_entry)) = alias_map.get("default").cloned() {
-                    channels.insert(ch_type, toml::Value::Table(default_entry));
-                }
-            }
-        }
-    }
-
-    for key in &[
-        "risk_profiles",
-        "runtime_profiles",
-        "memory_namespaces",
-        "skill_bundles",
-        "mcp_bundles",
-        "knowledge_bundles",
-    ] {
-        config_table.remove(*key);
-    }
-
-    if let Some(toml::Value::Table(agents)) = config_table.get_mut("agents") {
-        let agent_keys: Vec<String> = agents.keys().cloned().collect();
-        for key in agent_keys {
-            if let Some(toml::Value::Table(at)) = agents.get_mut(&key) {
-                at.remove("model_provider");
-            }
-        }
-    }
-
-    config_table
-}
-
-/// Render `config` as a current-schema (V3) TOML table. The `Config`
-/// struct still carries V2-era fields (`autonomy`, `agent`, `swarms`,
-/// some `security` subsections) that `prepare_table` strips on load;
-/// strip them here so the canonical V3 fixture matches a round-tripped
-/// load exactly.
-pub fn snapshot_current(config: &super::schema::Config) -> toml::Table {
-    let mut t: toml::Table =
-        toml::from_str(&toml::to_string(config).unwrap_or_default()).unwrap_or_default();
-    t.remove("autonomy");
-    t.remove("agent");
-    t.remove("swarms");
-    if let Some(toml::Value::Table(security)) = t.get_mut("security") {
-        security.remove("sandbox");
-        security.remove("resources");
-    }
-    t
-}
-
 /// Move a scalar string field into a `Vec<String>` field on the same TOML table.
 ///
 /// Removes `old_key` from `section`. If the value is non-empty and not `"*"`,
@@ -342,6 +256,10 @@ fn migrate_v1_provider_fields_into_providers_table(table: &mut toml::Table) {
 /// `Config::map_key_sections()` so adding a new channel to the schema
 /// automatically extends migration coverage — no hand-maintained list to
 /// drift out of sync.
+///
+/// `map_key_sections()` emits kebab-case (e.g. `channels.gmail-push`); the
+/// TOML keys are snake_case (`gmail_push`). Convert back so comparison against
+/// raw TOML table keys works.
 fn channel_types() -> Vec<String> {
     use crate::schema::Config;
     Config::map_key_sections()
@@ -354,7 +272,8 @@ fn channel_types() -> Vec<String> {
             if rest.contains('.') {
                 None
             } else {
-                Some(rest.to_string())
+                // Kebab → snake to match TOML key shape.
+                Some(rest.replace('-', "_"))
             }
         })
         .collect()
@@ -1586,75 +1505,6 @@ fn values_equal(edit: &toml_edit::Value, toml: &toml::Value) -> bool {
         }
         _ => false,
     }
-}
-
-/// Deep-merge `overlay` into `base`, with overlay values winning.
-/// Sub-tables are merged recursively; scalars and arrays are replaced.
-fn merge_tables(base: &mut toml::Table, overlay: &toml::Table) {
-    for (k, v) in overlay {
-        match (base.get_mut(k), v) {
-            (Some(toml::Value::Table(base_t)), toml::Value::Table(overlay_t)) => {
-                merge_tables(base_t, overlay_t);
-            }
-            _ => {
-                base.insert(k.clone(), v.clone());
-            }
-        }
-    }
-}
-
-/// Generate a canonical mock config for the given schema version.
-///
-/// `fixture_raw` is the content of `v1.toml` (the base fixture).
-/// `partial_raw` is the optional content of `v{version}.partial.toml`,
-/// deep-merged on top of the result after the migration runs.
-///
-/// Architecture note: V1→V2→V3 transforms all live in `prepare_table`
-/// (TOML-level), so `migrate_to_current` is the single entry point.
-/// Per-version snapshots downgrade the resulting V3 `Config` back to the
-/// requested target shape via `snapshot_v2` / `snapshot_current`.
-pub fn generate_fixture(
-    version: u32,
-    fixture_raw: &str,
-    partial_raw: Option<&str>,
-) -> Result<String> {
-    if !(1..=CURRENT_SCHEMA_VERSION).contains(&version) {
-        return Err(anyhow::anyhow!(
-            "unsupported schema version {version}; supported versions are 1–{CURRENT_SCHEMA_VERSION}"
-        ));
-    }
-
-    // V1 output is the raw fixture verbatim — no migration, no prepare_table.
-    // Parsing the fixture through migration would rewrite field names
-    // (room_id → allowed_rooms, etc.), producing a V3-shaped document
-    // instead of the true V1 shape.
-    if version == 1 {
-        let mut table: toml::Table =
-            toml::from_str(fixture_raw).context("failed to parse v1 fixture")?;
-        table.insert("schema_version".into(), toml::Value::Integer(1));
-        if let Some(partial_toml) = partial_raw {
-            let overlay: toml::Table =
-                toml::from_str(partial_toml).context("failed to parse partial fixture")?;
-            merge_tables(&mut table, &overlay);
-        }
-        return toml::to_string_pretty(&table).context("failed to serialize fixture");
-    }
-
-    let mut config = migrate_to_current(fixture_raw)?;
-    config.schema_version = version;
-
-    let mut table = match version {
-        2 => snapshot_v2(&config),
-        _ => snapshot_current(&config),
-    };
-
-    if let Some(partial_toml) = partial_raw {
-        let overlay: toml::Table =
-            toml::from_str(partial_toml).context("failed to parse partial fixture")?;
-        merge_tables(&mut table, &overlay);
-    }
-
-    toml::to_string_pretty(&table).context("failed to serialize fixture")
 }
 
 /// Convert a `toml::Value` to a `toml_edit::Value`.

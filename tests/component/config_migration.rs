@@ -8,6 +8,90 @@ fn migrate(toml_str: &str) -> zeroclaw::config::Config {
     migration::migrate_to_current(toml_str).expect("migration succeeds")
 }
 
+/// `prepare_table` applied twice produces identical TOML. Catches non-idempotent
+/// rules that would corrupt round-tripped configs on every save.
+#[test]
+fn prepare_table_is_idempotent_on_v1_input() {
+    let v1 = r#"
+schema_version = 1
+api_key = "sk-example"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4-6"
+
+[autonomy]
+level = "supervised"
+max_actions_per_hour = 100
+
+[agent]
+max_tool_iterations = 8
+
+[cron]
+enabled = true
+
+[[cron.jobs]]
+id = "daily"
+job_type = "shell"
+command = "echo daily"
+schedule = { kind = "cron", expr = "0 9 * * *" }
+
+[channels_config.matrix]
+homeserver = "https://matrix.example.org"
+access_token = "syt_example_access_token"
+room_id = "!example:example.org"
+allowed_users = ["@admin:example.org"]
+
+[channels_config.discord]
+bot_token = "discord-bot-token"
+guild_id = "111111111111111111"
+allowed_users = []
+"#;
+    let mut once: toml::Table = toml::from_str(v1).expect("v1 input parses");
+    migration::prepare_table(&mut once);
+    let mut twice = once.clone();
+    migration::prepare_table(&mut twice);
+    assert_eq!(
+        toml::to_string(&once).unwrap(),
+        toml::to_string(&twice).unwrap(),
+        "prepare_table must be idempotent on V1 input"
+    );
+}
+
+/// `prepare_table` on already-V3 input is a no-op.
+#[test]
+fn prepare_table_is_idempotent_on_v3_input() {
+    let v3 = r#"
+schema_version = 3
+api_key = "sk-example"
+
+[providers.models.openrouter.default]
+api_key = "sk-or"
+
+[risk_profiles.default]
+level = "supervised"
+max_actions_per_hour = 100
+
+[agents.default]
+model_provider = "openrouter.default"
+
+[scheduler]
+enabled = true
+
+[channels.matrix.default]
+homeserver = "https://matrix.example.org"
+access_token = "syt_example"
+allowed_rooms = ["!example:example.org"]
+allowed_users = ["@admin:example.org"]
+"#;
+    let mut t: toml::Table = toml::from_str(v3).expect("v3 input parses");
+    let before = toml::to_string(&t).unwrap();
+    migration::prepare_table(&mut t);
+    let after = toml::to_string(&t).unwrap();
+    assert_eq!(
+        before, after,
+        "prepare_table on V3-shaped input must be a no-op"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Merge precedence
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2305,325 +2389,6 @@ token = "pinggy-token"
     assert_eq!(config.tunnel.provider, "pinggy");
     let pg = config.tunnel.pinggy.as_ref().unwrap();
     assert_eq!(pg.token.as_deref(), Some("pinggy-token"));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Fixture generation (zeroclaw config generate)
-// ─────────────────────────────────────────────────────────────────────────────
-
-const FIXTURES_DIR: &str = "crates/zeroclaw-config/src/fixtures";
-
-fn fixture_raw(name: &str) -> String {
-    std::fs::read_to_string(format!("{FIXTURES_DIR}/{name}"))
-        .unwrap_or_else(|e| panic!("failed to read {FIXTURES_DIR}/{name}: {e}"))
-}
-
-fn generate(version: u32) -> String {
-    let v1 = fixture_raw("v1.toml");
-    let partial_path = format!("{FIXTURES_DIR}/v{version}.partial.toml");
-    let partial = std::fs::read_to_string(&partial_path).ok();
-    migration::generate_fixture(version, &v1, partial.as_deref())
-        .unwrap_or_else(|e| panic!("generate_fixture({version}) failed: {e}"))
-}
-
-#[test]
-fn fixture_v1_preserves_raw_field_names() {
-    let out = generate(1);
-    // V1 uses the pre-migration field names — not the V3 aliases.
-    assert!(
-        out.contains("room_id"),
-        "V1 should have room_id, not allowed_rooms"
-    );
-    assert!(
-        out.contains("guild_id"),
-        "V1 should have guild_id, not guild_ids"
-    );
-    assert!(
-        out.contains("subreddit"),
-        "V1 should have subreddit, not subreddits"
-    );
-    assert!(
-        out.contains("channels_config"),
-        "V1 should use channels_config key"
-    );
-    assert!(
-        !out.contains(".default]"),
-        "V1 should not have aliased channel sections"
-    );
-}
-
-#[test]
-fn fixture_v1_has_correct_schema_version() {
-    let out = generate(1);
-    assert!(out.contains("schema_version = 1"));
-}
-
-#[test]
-fn fixture_v2_has_correct_schema_version() {
-    let out = generate(2);
-    assert!(out.contains("schema_version = 2"));
-}
-
-#[test]
-fn fixture_v2_has_flat_provider_models() {
-    let out = generate(2);
-    // V2 providers.models is flat: [providers.models.myprovider] not [providers.models.myprovider.default]
-    assert!(
-        out.contains("[providers.models.myprovider]"),
-        "V2 should have flat provider model section"
-    );
-}
-
-// `fixture_v2_provider_fallback_is_string` deleted: `providers.fallback`
-// no longer exists in V3 and the V2 downgrade path no longer emits it.
-
-#[test]
-fn fixture_v3_has_correct_schema_version() {
-    let out = generate(3);
-    assert!(out.contains(&format!("schema_version = {CURRENT_SCHEMA_VERSION}")));
-}
-
-#[test]
-fn fixture_v3_has_aliased_provider_models() {
-    let out = generate(3);
-    // V3 providers.models is nested: [providers.models.myprovider.default]
-    assert!(
-        out.contains("[providers.models.myprovider.default]"),
-        "V3 should have aliased provider model section"
-    );
-}
-
-// `fixture_v3_provider_fallback_is_array` deleted: `providers.fallback`
-// no longer exists in V3.
-
-#[test]
-fn fixture_v3_has_aliased_channels() {
-    let out = generate(3);
-    assert!(
-        out.contains("[channels.discord.default]"),
-        "V3 should have aliased channel sections"
-    );
-    assert!(
-        out.contains("[channels.matrix.default]"),
-        "V3 should have aliased matrix channel"
-    );
-}
-
-#[test]
-fn fixture_v3_has_agent_per_enabled_channel() {
-    let out = generate(3);
-    // All 7 channels in v1.toml have enabled = true; migration synthesizes one agent per channel
-    for ch_type in &[
-        "discord",
-        "matrix",
-        "mattermost",
-        "reddit",
-        "signal",
-        "slack",
-        "telegram",
-    ] {
-        assert!(
-            out.contains(&format!("[agents.{ch_type}-default]")),
-            "V3 should have synthesized agent agents.{ch_type}-default"
-        );
-        assert!(
-            out.contains(&format!("channels = [\"{ch_type}.default\"]")),
-            "Synthesized agent for {ch_type} should reference {ch_type}.default"
-        );
-    }
-}
-
-#[test]
-fn fixture_v3_channel_configs_have_no_enabled_field() {
-    let out = generate(3);
-    let lines: Vec<&str> = out.lines().collect();
-    let mut in_channel_section = false;
-    for line in &lines {
-        if line.starts_with("[channels.") {
-            in_channel_section = true;
-        } else if line.starts_with('[') {
-            in_channel_section = false;
-        }
-        if in_channel_section {
-            assert!(
-                !line.trim_start().starts_with("enabled ="),
-                "Channel config should not contain enabled field: {line}"
-            );
-        }
-    }
-}
-
-#[test]
-fn fixture_v3_has_risk_profiles() {
-    let out = generate(3);
-    assert!(
-        out.contains("[risk_profiles.default]"),
-        "V3 should have risk_profiles.default from autonomy migration"
-    );
-}
-
-#[test]
-fn fixture_v3_has_runtime_profiles() {
-    let out = generate(3);
-    assert!(
-        out.contains("[runtime_profiles.default]"),
-        "V3 should have runtime_profiles.default from agent migration"
-    );
-}
-
-#[test]
-fn fixture_v3_does_not_have_legacy_autonomy_section() {
-    let out = generate(3);
-    assert!(
-        !out.contains("\n[autonomy]"),
-        "V3 should not re-emit the legacy [autonomy] section"
-    );
-}
-
-#[test]
-fn fixture_v3_does_not_have_legacy_agent_section() {
-    let out = generate(3);
-    assert!(
-        !out.contains("\n[agent]"),
-        "V3 should not re-emit the legacy [agent] section"
-    );
-}
-
-#[test]
-fn fixture_v2_and_v3_are_comparable_in_size() {
-    let v2 = generate(2);
-    let v3 = generate(3);
-    let v2_lines = v2.lines().count();
-    let v3_lines = v3.lines().count();
-    // V2 and V3 should be within 20% of each other in line count.
-    let ratio = v2_lines as f64 / v3_lines as f64;
-    assert!(
-        ratio > 0.8 && ratio < 1.2,
-        "V2 ({v2_lines} lines) and V3 ({v3_lines} lines) should be comparable in size"
-    );
-}
-
-#[test]
-fn fixture_v3_migrates_to_current_version() {
-    let out = generate(3);
-    // A V3 fixture loaded through the migration pipeline should already be at
-    // current version and require no further migration.
-    let config = migrate(&out);
-    assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
-}
-
-#[test]
-fn fixture_v3_has_gateway_tls() {
-    let out = generate(3);
-    assert!(
-        out.contains("[gateway.tls]"),
-        "V3 should have gateway.tls section"
-    );
-    assert!(
-        out.contains("cert_path"),
-        "V3 gateway.tls should have cert_path"
-    );
-}
-
-#[test]
-fn fixture_v3_has_tunnel() {
-    let out = generate(3);
-    assert!(out.contains("[tunnel]"), "V3 should have tunnel section");
-    assert!(
-        out.contains("[tunnel.tailscale]"),
-        "V3 should have tunnel.tailscale section"
-    );
-}
-
-#[test]
-fn fixture_v3_has_model_routes() {
-    let out = generate(3);
-    assert!(
-        out.contains("[[providers.model_routes]]"),
-        "V3 should have model_routes entries"
-    );
-    assert!(
-        out.contains("[[providers.embedding_routes]]"),
-        "V3 should have embedding_routes entries"
-    );
-}
-
-#[test]
-fn fixture_v3_has_memory_backends() {
-    let out = generate(3);
-    assert!(
-        out.contains("[memory.qdrant]"),
-        "V3 should have memory.qdrant section"
-    );
-    assert!(
-        out.contains("[memory.postgres]"),
-        "V3 should have memory.postgres section"
-    );
-}
-
-#[test]
-fn fixture_v3_has_matrix_e2ee_fields() {
-    let out = generate(3);
-    assert!(
-        out.contains("access_token"),
-        "V3 matrix channel should have access_token"
-    );
-    assert!(
-        out.contains("recovery_key"),
-        "V3 matrix channel should have recovery_key"
-    );
-    assert!(
-        out.contains("device_id"),
-        "V3 matrix channel should have device_id"
-    );
-}
-
-#[test]
-fn fixture_v3_has_mattermost_login_id() {
-    let out = generate(3);
-    assert!(
-        out.contains("login_id"),
-        "V3 mattermost channel should have login_id"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// V3 — agent migration & validation contract
-// (Catches the bugs the earlier round of tests missed: kebab/snake drift,
-// non-idempotent transforms, and missing per-agent fold of [agent].)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `prepare_table` applied twice produces identical TOML — one pass is
-/// enough; a second pass should be a no-op. Catches non-idempotent rules
-/// that would otherwise corrupt round-tripped configs on every save.
-#[test]
-fn prepare_table_is_idempotent_on_v1_input() {
-    let v1 = fixture_raw("v1.toml");
-    let mut once: toml::Table = toml::from_str(&v1).expect("v1 fixture parses");
-    migration::prepare_table(&mut once);
-    let mut twice = once.clone();
-    migration::prepare_table(&mut twice);
-    let once_serialised = toml::to_string(&once).expect("re-serialize once");
-    let twice_serialised = toml::to_string(&twice).expect("re-serialize twice");
-    assert_eq!(
-        once_serialised, twice_serialised,
-        "prepare_table must be idempotent — second pass changed the table"
-    );
-}
-
-#[test]
-fn prepare_table_is_idempotent_on_v3_output() {
-    // Run the V3 fixture (already migrated) through prepare_table —
-    // every step should be a no-op since the input is already V3-shaped.
-    let v3 = generate(3);
-    let mut t: toml::Table = toml::from_str(&v3).expect("v3 fixture parses");
-    let before = toml::to_string(&t).expect("serialize before");
-    migration::prepare_table(&mut t);
-    let after = toml::to_string(&t).expect("serialize after");
-    assert_eq!(
-        before, after,
-        "prepare_table on a V3-shaped input must be a no-op"
-    );
 }
 
 /// V2 `[agent]` section folds onto `[agents.default]` when no

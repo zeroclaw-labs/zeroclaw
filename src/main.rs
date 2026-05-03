@@ -944,39 +944,6 @@ enum ConfigCommands {
     },
     /// Print the API explorer URL (plus a hint if the daemon isn't running).
     Docs,
-    /// Generate a canonical mock config for a given schema version.
-    ///
-    /// Reads `v1.toml` from the fixtures directory as the base, runs the migration
-    /// chain up to VERSION, then deep-merges any `v{VERSION}.partial.toml` found in
-    /// the same directory on top of the result.
-    ///
-    /// Expected directory layout:
-    ///
-    ///   fixtures/
-    ///     v1.toml              ← required; full V1 config with all sections
-    ///     v2.partial.toml      ← optional; V2-only fields not derivable from V1
-    ///     v3.partial.toml      ← optional; V3-only fields not derivable from V1/V2
-    ///
-    /// The canonical fixtures directory in this repo is:
-    ///
-    ///   crates/zeroclaw-config/src/fixtures/
-    ///
-    /// Examples:
-    ///
-    ///   zeroclaw config generate --fixtures-dir crates/zeroclaw-config/src/fixtures 1 > ~/.zeroclaw/config.toml
-    ///   zeroclaw config generate --fixtures-dir crates/zeroclaw-config/src/fixtures 3
-    ///   zeroclaw config generate --fixtures-dir crates/zeroclaw-config/src/fixtures 2 > config-v2.toml
-    #[clap(verbatim_doc_comment)]
-    Generate {
-        /// Schema version to generate
-        version: u32,
-        /// Directory containing v1.toml and optional v{N}.partial.toml overlay files
-        #[arg(long)]
-        fixtures_dir: std::path::PathBuf,
-        /// Write to this path instead of printing to stdout
-        #[arg(long, short)]
-        output: Option<std::path::PathBuf>,
-    },
     /// Print matching property paths for shell completion (hidden)
     #[command(hide = true)]
     Complete {
@@ -1430,44 +1397,6 @@ async fn main() -> Result<()> {
         }
 
         cfg.save().await?;
-        return Ok(());
-    }
-
-    // config generate needs no config — handle it before load_or_init.
-    if let Commands::Config {
-        config_command:
-            ConfigCommands::Generate {
-                version,
-                fixtures_dir,
-                output,
-            },
-    } = &cli.command
-    {
-        let v1_path = fixtures_dir.join("v1.toml");
-        let fixture_toml = std::fs::read_to_string(&v1_path)
-            .with_context(|| format!("failed to read {}", v1_path.display()))?;
-        let partial_path = fixtures_dir.join(format!("v{version}.partial.toml"));
-        let partial_toml = if partial_path.exists() {
-            Some(
-                std::fs::read_to_string(&partial_path)
-                    .with_context(|| format!("failed to read {}", partial_path.display()))?,
-            )
-        } else {
-            None
-        };
-        let result = zeroclaw_config::migration::generate_fixture(
-            *version,
-            &fixture_toml,
-            partial_toml.as_deref(),
-        )?;
-        match output {
-            Some(path) => {
-                std::fs::write(path, &result)
-                    .with_context(|| format!("failed to write to {}", path.display()))?;
-                println!("wrote v{version} fixture to {}", path.display());
-            }
-            None => print!("{result}"),
-        }
         return Ok(());
     }
 
@@ -2642,9 +2571,6 @@ async fn main() -> Result<()> {
                     }
                 }
                 Ok(())
-            }
-            ConfigCommands::Generate { .. } => {
-                unreachable!("config generate is handled before config load")
             }
             ConfigCommands::Patch { input, json } => {
                 let body = match input.as_deref() {
