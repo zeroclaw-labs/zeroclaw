@@ -703,6 +703,61 @@ pub async fn handle_templates(State(state): State<AppState>, headers: HeaderMap)
     axum::Json(TemplatesResponse { templates }).into_response()
 }
 
+/// `GET /api/config/map-keys?path=<section>` — list the current alias keys at
+/// a map-keyed section path, e.g. `channels.discord` → `["default","work"]`.
+pub async fn handle_get_map_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<MapKeyQuery>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let cfg = state.config.lock().clone();
+    match cfg.get_map_keys(&q.path) {
+        Some(keys) => {
+            axum::Json(serde_json::json!({ "path": q.path, "keys": keys })).into_response()
+        }
+        None => error_response(
+            ConfigApiError::new(
+                ConfigApiCode::PathNotFound,
+                format!("no map-keyed section at `{}`", q.path),
+            )
+            .with_path(&q.path),
+        ),
+    }
+}
+
+/// `DELETE /api/config/map-key?path=<section>&key=<alias>` — remove an alias
+/// from a map-keyed section. Persists on success.
+pub async fn handle_delete_map_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<MapKeyQuery>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let mut working = state.config.lock().clone();
+    let removed = match working.delete_map_key(&q.path, &q.key) {
+        Ok(b) => b,
+        Err(msg) => {
+            return error_response(
+                ConfigApiError::new(ConfigApiCode::PathNotFound, msg).with_path(&q.path),
+            );
+        }
+    };
+    if removed && let Err(e) = persist_and_swap(&state, working).await {
+        return error_response(e);
+    }
+    axum::Json(MapKeyResponse {
+        path: q.path,
+        key: q.key,
+        created: false,
+    })
+    .into_response()
+}
+
 /// `POST /api/config/map-key?path=<section>&key=<name>` — instantiate a new
 /// entry under a map-keyed section with default values, or append to a
 /// list-shaped one with `key` as the new entry's natural identifier.
@@ -740,6 +795,61 @@ pub async fn handle_map_key(
     }
 
     axum::Json(MapKeyResponse { path, key, created }).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct RenameMapKeyBody {
+    /// Section path, e.g. `channels.discord` or `providers.models.anthropic`.
+    pub path: String,
+    /// Current alias name.
+    pub from: String,
+    /// New alias name.
+    pub to: String,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct RenameMapKeyResponse {
+    pub path: String,
+    pub from: String,
+    pub to: String,
+    pub renamed: bool,
+}
+
+/// `POST /api/config/rename-map-key` — rename an alias within a map-keyed
+/// section, preserving the entry's value. Atomic: persists only on success.
+pub async fn handle_rename_map_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<RenameMapKeyBody>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut working = state.config.lock().clone();
+
+    let renamed = match working.rename_map_key(&body.path, &body.from, &body.to) {
+        Ok(b) => b,
+        Err(msg) => {
+            return error_response(
+                ConfigApiError::new(ConfigApiCode::ValidationFailed, msg).with_path(&body.path),
+            );
+        }
+    };
+
+    if renamed && let Err(e) = persist_and_swap(&state, working).await {
+        return error_response(e);
+    }
+
+    axum::Json(RenameMapKeyResponse {
+        path: body.path,
+        from: body.from,
+        to: body.to,
+        renamed,
+    })
+    .into_response()
 }
 
 /// PATCH /api/config — apply a JSON Patch document atomically.

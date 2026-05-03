@@ -164,9 +164,15 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     //    `handle_map_key` walks `Config::map_key_sections()` and matches
     //    on the path string — no hand-maintained list anywhere.
     let mut map_key_section_entries: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut get_map_keys_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut create_map_key_arms: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut delete_map_key_arms: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut rename_map_key_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut get_map_keys_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut create_map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut delete_map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut rename_map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
 
     for field in fields {
         let field_ident = field.ident.as_ref().expect("Named field must have ident");
@@ -479,6 +485,84 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             }
                         }
                     });
+
+                    // get_map_keys for double-nested HashMap.
+                    get_map_keys_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let outer_expected = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            if section_path == outer_expected {
+                                return Some(self.#field_ident.keys().cloned().collect());
+                            }
+                            let inner_expected_prefix = format!("{outer_expected}.");
+                            if let Some(outer_key) = section_path.strip_prefix(&inner_expected_prefix) {
+                                if let Some(inner_map) = self.#field_ident.get(outer_key) {
+                                    return Some(inner_map.keys().cloned().collect());
+                                }
+                                return Some(vec![]);
+                            }
+                        }
+                    });
+
+                    // delete_map_key for double-nested HashMap.
+                    // section_path == outer_expected → delete entire type bucket.
+                    // section_path == outer_expected.<outer_key> → delete one alias.
+                    delete_map_key_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let outer_expected = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            if section_path == outer_expected {
+                                let removed = self.#field_ident.remove(map_key).is_some();
+                                return Ok(removed);
+                            }
+                            let inner_expected_prefix = format!("{outer_expected}.");
+                            if let Some(outer_key) = section_path.strip_prefix(&inner_expected_prefix) {
+                                if let Some(inner_map) = self.#field_ident.get_mut(outer_key) {
+                                    let removed = inner_map.remove(map_key).is_some();
+                                    return Ok(removed);
+                                }
+                                return Err(format!(
+                                    "outer key `{outer_key}` not found in `{outer_expected}`",
+                                ));
+                            }
+                        }
+                    });
+
+                    // rename_map_key for double-nested HashMap.
+                    rename_map_key_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let outer_expected = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            let inner_expected_prefix = format!("{outer_expected}.");
+                            if let Some(outer_key) = section_path.strip_prefix(&inner_expected_prefix) {
+                                if let Some(inner_map) = self.#field_ident.get_mut(outer_key) {
+                                    if inner_map.contains_key(new_key) {
+                                        return Err(format!("alias `{new_key}` already exists"));
+                                    }
+                                    if let Some(val) = inner_map.remove(map_key) {
+                                        inner_map.insert(new_key.to_string(), val);
+                                        return Ok(true);
+                                    }
+                                    return Ok(false);
+                                }
+                                return Err(format!(
+                                    "outer key `{outer_key}` not found in `{outer_expected}`",
+                                ));
+                            }
+                        }
+                    });
                 } else {
                     // ── HashMap<String, T: Configurable> (single-level) ──
 
@@ -619,6 +703,59 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 }
                                 self.#field_ident.insert(map_key.to_string(), <#value_ty>::default());
                                 return Ok(true);
+                            }
+                        }
+                    });
+
+                    // get_map_keys for single-level HashMap.
+                    get_map_keys_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let expected = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            if section_path == expected {
+                                return Some(self.#field_ident.keys().cloned().collect());
+                            }
+                        }
+                    });
+
+                    // delete_map_key for single-level HashMap.
+                    delete_map_key_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let expected = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            if section_path == expected {
+                                let removed = self.#field_ident.remove(map_key).is_some();
+                                return Ok(removed);
+                            }
+                        }
+                    });
+
+                    // rename_map_key for single-level HashMap.
+                    rename_map_key_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let expected = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            if section_path == expected {
+                                if self.#field_ident.contains_key(new_key) {
+                                    return Err(format!("alias `{new_key}` already exists"));
+                                }
+                                if let Some(val) = self.#field_ident.remove(map_key) {
+                                    self.#field_ident.insert(new_key.to_string(), val);
+                                    return Ok(true);
+                                }
+                                return Ok(false);
                             }
                         }
                     });
@@ -846,9 +983,24 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 map_key_recurse.push(quote! {
                     out.extend(<#field_ty>::map_key_sections());
                 });
+                get_map_keys_recurse.push(quote! {
+                    if let Some(keys) = self.#field_ident.get_map_keys(section_path) {
+                        return Some(keys);
+                    }
+                });
                 create_map_key_recurse.push(quote! {
                     if let Ok(created) = self.#field_ident.create_map_key(section_path, map_key) {
                         return Ok(created);
+                    }
+                });
+                delete_map_key_recurse.push(quote! {
+                    if let Ok(removed) = self.#field_ident.delete_map_key(section_path, map_key) {
+                        return Ok(removed);
+                    }
+                });
+                rename_map_key_recurse.push(quote! {
+                    if let Ok(renamed) = self.#field_ident.rename_map_key(section_path, map_key, new_key) {
+                        return Ok(renamed);
                     }
                 });
 
@@ -1113,6 +1265,14 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 out
             }
 
+            /// Return the current alias keys at `section_path`, or `None` if
+            /// the path doesn't resolve to a map-keyed section in this tree.
+            pub fn get_map_keys(&self, section_path: &str) -> Option<Vec<String>> {
+                #(#get_map_keys_arms)*
+                #(#get_map_keys_recurse)*
+                None
+            }
+
             /// Insert a default-valued entry under a map-keyed section, or
             /// append to a list-shaped one, with `map_key` as the new entry's
             /// natural identifier (HashMap key for Map sections; identifier
@@ -1128,6 +1288,47 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             ) -> Result<bool, String> {
                 #(#create_map_key_arms)*
                 #(#create_map_key_recurse)*
+                Err(format!(
+                    "no map-keyed/list section at `{}` in `{}`",
+                    section_path,
+                    Self::configurable_prefix(),
+                ))
+            }
+
+            /// Remove the entry identified by `map_key` from the map-keyed
+            /// section at `section_path`.
+            ///
+            /// Returns `Ok(true)` if the entry existed and was removed,
+            /// `Ok(false)` if it didn't exist, or `Err(reason)` if the
+            /// section path doesn't resolve.
+            pub fn delete_map_key(
+                &mut self,
+                section_path: &str,
+                map_key: &str,
+            ) -> Result<bool, String> {
+                #(#delete_map_key_arms)*
+                #(#delete_map_key_recurse)*
+                Err(format!(
+                    "no map-keyed/list section at `{}` in `{}`",
+                    section_path,
+                    Self::configurable_prefix(),
+                ))
+            }
+
+            /// Rename `map_key` to `new_key` within the map-keyed section at
+            /// `section_path`, preserving the entry's value.
+            ///
+            /// Returns `Ok(true)` if renamed, `Ok(false)` if `map_key` didn't
+            /// exist, or `Err(reason)` if `new_key` already exists or the
+            /// section path doesn't resolve.
+            pub fn rename_map_key(
+                &mut self,
+                section_path: &str,
+                map_key: &str,
+                new_key: &str,
+            ) -> Result<bool, String> {
+                #(#rename_map_key_arms)*
+                #(#rename_map_key_recurse)*
                 Err(format!(
                     "no map-keyed/list section at `{}` in `{}`",
                     section_path,

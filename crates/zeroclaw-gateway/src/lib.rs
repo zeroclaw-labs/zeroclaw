@@ -1036,7 +1036,12 @@ pub async fn run_gateway(
         .route("/api/config/list", get(api_config::handle_list))
         .route("/api/config/drift", get(api_config::handle_drift))
         .route("/api/config/templates", get(api_config::handle_templates))
-        .route("/api/config/map-key", post(api_config::handle_map_key))
+        .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
+        .route(
+            "/api/config/map-key",
+            post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
+        )
+        .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
         .route("/api/onboard/catalog", get(api_onboard::handle_catalog))
         .route(
             "/api/onboard/catalog/models",
