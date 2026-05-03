@@ -149,11 +149,6 @@ pub struct Config {
     #[nested]
     pub scheduler: SchedulerConfig,
 
-    /// Agent orchestration settings (`[agent]`).
-    #[serde(default)]
-    #[nested]
-    pub agent: AgentConfig,
-
     /// Pacing controls for slow/local LLM workloads (`[pacing]`).
     #[serde(default)]
     #[nested]
@@ -685,37 +680,121 @@ pub struct DelegateAgentConfig {
     /// Whether this agent is active. Set false to disable without removing the definition.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Optional system prompt. Deprecated in V3 — move content to `agents/<alias>/AGENTS.md`.
+    /// Optional system prompt. Prefer placing prose in `agents/<alias>/AGENTS.md`.
     #[serde(default)]
     pub system_prompt: Option<String>,
     /// Channel aliases this agent handles (e.g. `["telegram.default", "discord.work"]`).
     #[serde(default)]
     pub channels: Vec<String>,
-    /// V3: dotted model-provider alias (e.g. `"anthropic.default"`).
+    /// Dotted model-provider alias (e.g. `"anthropic.default"`).
     /// Resolves through `providers.models.<type>.<alias>` at runtime.
     #[serde(default)]
     pub model_provider: String,
-    /// V3: ordered fallback chain of dotted provider aliases.
-    #[serde(default)]
-    pub model_provider_fallback: Vec<String>,
-    /// V3: risk profile alias (e.g. `"default"`). Resolves delegation guardrails at runtime.
+    /// Risk profile alias (e.g. `"default"`). Resolves delegation guardrails at runtime.
     #[serde(default)]
     pub risk_profile: String,
-    /// V3: runtime profile alias (e.g. `"default"`). Resolves agentic/iteration settings.
+    /// Runtime profile alias (e.g. `"default"`). Resolves agentic/iteration settings.
     #[serde(default)]
     pub runtime_profile: String,
-    /// V3: skill bundle alias. Resolves to `skill_bundles[key].directory` at runtime.
+    /// Skill bundle aliases. Each entry resolves to
+    /// `skill_bundles[key].directory` at runtime; the agent loads every
+    /// listed bundle.
     #[serde(default)]
-    pub skill_bundle: String,
-    /// V3: knowledge bundle alias.
+    pub skill_bundles: Vec<String>,
+    /// Knowledge bundle aliases. Additive — the agent loads every listed
+    /// bundle.
     #[serde(default)]
-    pub knowledge_bundle: String,
-    /// V3: MCP bundle alias.
+    pub knowledge_bundles: Vec<String>,
+    /// MCP bundle aliases. Each entry references `mcp_bundles[key]`,
+    /// itself a named group of MCP servers; agents pick which bundles to
+    /// load.
     #[serde(default)]
-    pub mcp_bundle: String,
-    /// V3: memory namespace alias. Empty string = no namespace isolation.
+    pub mcp_bundles: Vec<String>,
+    /// Memory namespace alias. Single-select reference into
+    /// `memory_namespaces[key]`. Empty string = no namespace isolation.
+    /// Multiple agents sharing a namespace see the same memory.
     #[serde(default)]
     pub memory_namespace: String,
+
+    // ── Agent loop / runtime tunables (folded from V2 `[agent]` ──────
+    // V3 makes these per-agent. Defaults preserve V2 behavior so an
+    // unconfigured agent runs identically to the old global `[agent]`.
+    /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
+    #[serde(default = "default_agent_compact_context")]
+    pub compact_context: bool,
+    /// Maximum tool-call loop turns per user message. Default: `10`.
+    /// Setting to `0` falls back to the safe default of `10`.
+    #[serde(default = "default_agent_max_tool_iterations")]
+    pub max_tool_iterations: usize,
+    /// Maximum conversation history messages retained per session. Default: `50`.
+    #[serde(default = "default_agent_max_history_messages")]
+    pub max_history_messages: usize,
+    /// Maximum estimated tokens for conversation history before compaction triggers.
+    /// Uses ~4 chars/token heuristic. When this threshold is exceeded, older messages
+    /// are summarized to preserve context while staying within budget. Default: `32000`.
+    #[serde(default = "default_agent_max_context_tokens")]
+    pub max_context_tokens: usize,
+    /// Enable parallel tool execution within a single iteration. Default: `false`.
+    #[serde(default)]
+    pub parallel_tools: bool,
+    /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
+    #[serde(default = "default_agent_tool_dispatcher")]
+    pub tool_dispatcher: String,
+    /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
+    #[serde(default)]
+    pub tool_call_dedup_exempt: Vec<String>,
+    /// Per-turn MCP tool schema filtering groups.
+    ///
+    /// When non-empty, only MCP tools matched by an active group are included in the
+    /// tool schema sent to the LLM for that turn. Built-in tools always pass through.
+    /// Default: `[]` (no filtering — all tools included).
+    #[serde(default)]
+    pub tool_filter_groups: Vec<ToolFilterGroup>,
+    /// Maximum characters for the assembled system prompt. When `> 0`, the prompt
+    /// is truncated to this limit after assembly (keeping the top portion which
+    /// contains identity and safety instructions). `0` means unlimited.
+    /// Useful for small-context models (e.g. glm-4.5-air ~8K tokens → set to 8000).
+    #[serde(default = "default_max_system_prompt_chars")]
+    pub max_system_prompt_chars: usize,
+    /// Thinking/reasoning level control. Configures how deeply the model reasons
+    /// per message. Users can override per-message with `/think:<level>` directives.
+    #[nested]
+    #[serde(default)]
+    pub thinking: crate::scattered_types::ThinkingConfig,
+    /// History pruning configuration for token efficiency.
+    #[nested]
+    #[serde(default)]
+    pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
+    /// Enable context-aware tool filtering (only surface relevant tools per iteration).
+    #[serde(default)]
+    pub context_aware_tools: bool,
+    /// Post-response quality evaluator configuration.
+    #[nested]
+    #[serde(default)]
+    pub eval: crate::scattered_types::EvalConfig,
+    /// Automatic complexity-based classification fallback.
+    #[nested]
+    #[serde(default)]
+    pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
+    /// Context compression configuration for automatic conversation compaction.
+    #[nested]
+    #[serde(default)]
+    pub context_compression: crate::scattered_types::ContextCompressionConfig,
+    /// Maximum characters for a single tool result before truncation.
+    /// Head (2/3) and tail (1/3) are preserved with a truncation marker in the
+    /// middle. Set to `0` to disable truncation. Default: `50000`.
+    #[serde(default = "default_max_tool_result_chars")]
+    pub max_tool_result_chars: usize,
+    /// Number of most recent conversation turns whose full tool-call/result
+    /// messages are preserved in channel conversation history. Older turns
+    /// keep only the final assistant text. Set to `0` to disable (previous
+    /// behavior). Default: `2`.
+    #[serde(default = "default_keep_tool_context_turns")]
+    pub keep_tool_context_turns: usize,
+}
+
+fn default_agent_compact_context() -> bool {
+    true
 }
 
 impl Default for DelegateAgentConfig {
@@ -725,14 +804,46 @@ impl Default for DelegateAgentConfig {
             system_prompt: None,
             channels: Vec::new(),
             model_provider: String::new(),
-            model_provider_fallback: Vec::new(),
             risk_profile: String::new(),
             runtime_profile: String::new(),
-            skill_bundle: String::new(),
-            knowledge_bundle: String::new(),
-            mcp_bundle: String::new(),
+            skill_bundles: Vec::new(),
+            knowledge_bundles: Vec::new(),
+            mcp_bundles: Vec::new(),
             memory_namespace: String::new(),
+            compact_context: default_agent_compact_context(),
+            max_tool_iterations: default_agent_max_tool_iterations(),
+            max_history_messages: default_agent_max_history_messages(),
+            max_context_tokens: default_agent_max_context_tokens(),
+            parallel_tools: false,
+            tool_dispatcher: default_agent_tool_dispatcher(),
+            tool_call_dedup_exempt: Vec::new(),
+            tool_filter_groups: Vec::new(),
+            max_system_prompt_chars: default_max_system_prompt_chars(),
+            thinking: crate::scattered_types::ThinkingConfig::default(),
+            history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
+            context_aware_tools: false,
+            eval: crate::scattered_types::EvalConfig::default(),
+            auto_classify: None,
+            context_compression: crate::scattered_types::ContextCompressionConfig::default(),
+            max_tool_result_chars: default_max_tool_result_chars(),
+            keep_tool_context_turns: default_keep_tool_context_turns(),
         }
+    }
+}
+
+impl Config {
+    /// Reference to the conventional "default" agent config, with a static
+    /// fallback when the user hasn't defined one yet. This is the bridge
+    /// from V2's global `[agent]` section to V3's per-agent dispatch:
+    /// callsites that don't yet thread the routed agent alias resolve here
+    /// instead, preserving prior behavior while the rest of the runtime
+    /// migrates to per-agent lookups.
+    pub fn default_agent(&self) -> &DelegateAgentConfig {
+        use std::sync::OnceLock;
+        static FALLBACK: OnceLock<DelegateAgentConfig> = OnceLock::new();
+        self.agents
+            .get("default")
+            .unwrap_or_else(|| FALLBACK.get_or_init(DelegateAgentConfig::default))
     }
 }
 
@@ -1515,97 +1626,6 @@ fn default_local_whisper_timeout_secs() -> u64 {
     300
 }
 
-/// Agent orchestration configuration (`[agent]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "agent"]
-pub struct AgentConfig {
-    /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
-    #[serde(default)]
-    pub compact_context: bool,
-    /// Maximum tool-call loop turns per user message. Default: `10`.
-    /// Setting to `0` falls back to the safe default of `10`.
-    #[serde(default = "default_agent_max_tool_iterations")]
-    pub max_tool_iterations: usize,
-    /// Maximum conversation history messages retained per session. Default: `50`.
-    #[serde(default = "default_agent_max_history_messages")]
-    pub max_history_messages: usize,
-    /// Maximum estimated tokens for conversation history before compaction triggers.
-    /// Uses ~4 chars/token heuristic. When this threshold is exceeded, older messages
-    /// are summarized to preserve context while staying within budget. Default: `32000`.
-    #[serde(default = "default_agent_max_context_tokens")]
-    pub max_context_tokens: usize,
-    /// Enable parallel tool execution within a single iteration. Default: `false`.
-    #[serde(default)]
-    pub parallel_tools: bool,
-    /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
-    #[serde(default = "default_agent_tool_dispatcher")]
-    pub tool_dispatcher: String,
-    /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
-    #[serde(default)]
-    pub tool_call_dedup_exempt: Vec<String>,
-    /// Per-turn MCP tool schema filtering groups.
-    ///
-    /// When non-empty, only MCP tools matched by an active group are included in the
-    /// tool schema sent to the LLM for that turn. Built-in tools always pass through.
-    /// Default: `[]` (no filtering — all tools included).
-    #[serde(default)]
-    pub tool_filter_groups: Vec<ToolFilterGroup>,
-    /// Maximum characters for the assembled system prompt. When `> 0`, the prompt
-    /// is truncated to this limit after assembly (keeping the top portion which
-    /// contains identity and safety instructions). `0` means unlimited.
-    /// Useful for small-context models (e.g. glm-4.5-air ~8K tokens → set to 8000).
-    #[serde(default = "default_max_system_prompt_chars")]
-    pub max_system_prompt_chars: usize,
-    /// Thinking/reasoning level control. Configures how deeply the model reasons
-    /// per message. Users can override per-message with `/think:<level>` directives.
-    #[nested]
-    #[serde(default)]
-    pub thinking: crate::scattered_types::ThinkingConfig,
-
-    /// History pruning configuration for token efficiency.
-    #[nested]
-    #[serde(default)]
-    pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
-
-    /// Enable context-aware tool filtering (only surface relevant tools per iteration).
-    #[serde(default)]
-    pub context_aware_tools: bool,
-
-    /// Post-response quality evaluator configuration.
-    #[nested]
-    #[serde(default)]
-    pub eval: crate::scattered_types::EvalConfig,
-
-    /// Automatic complexity-based classification fallback.
-    #[nested]
-    #[serde(default)]
-    pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
-
-    /// Context compression configuration for automatic conversation compaction.
-    #[nested]
-    #[serde(default)]
-    pub context_compression: crate::scattered_types::ContextCompressionConfig,
-
-    /// Maximum characters for a single tool result before truncation.
-    /// Head (2/3) and tail (1/3) are preserved with a truncation marker in the
-    /// middle. Set to `0` to disable truncation. Default: `50000`.
-    #[serde(default = "default_max_tool_result_chars")]
-    pub max_tool_result_chars: usize,
-
-    /// Number of most recent conversation turns whose full tool-call/result
-    /// messages are preserved in channel conversation history. Older turns
-    /// keep only the final assistant text. Set to `0` to disable (previous
-    /// behavior). Default: `2`.
-    #[serde(default = "default_keep_tool_context_turns")]
-    pub keep_tool_context_turns: usize,
-
-    /// Channel aliases this agent handles (e.g. `["telegram.default", "discord.work"]`).
-    /// Populated by migration from V2 `channels.<type>.agent = "<alias>"` bindings.
-    #[serde(default)]
-    pub channels: Vec<String>,
-}
-
 fn default_max_tool_result_chars() -> usize {
     50_000
 }
@@ -1632,31 +1652,6 @@ fn default_agent_tool_dispatcher() -> String {
 
 fn default_max_system_prompt_chars() -> usize {
     0
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            compact_context: true,
-            max_tool_iterations: default_agent_max_tool_iterations(),
-            max_history_messages: default_agent_max_history_messages(),
-            max_context_tokens: default_agent_max_context_tokens(),
-            parallel_tools: false,
-            tool_dispatcher: default_agent_tool_dispatcher(),
-            tool_call_dedup_exempt: Vec::new(),
-            tool_filter_groups: Vec::new(),
-            max_system_prompt_chars: default_max_system_prompt_chars(),
-            thinking: crate::scattered_types::ThinkingConfig::default(),
-            history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
-            context_aware_tools: false,
-            eval: crate::scattered_types::EvalConfig::default(),
-            auto_classify: None,
-            context_compression: crate::scattered_types::ContextCompressionConfig::default(),
-            max_tool_result_chars: default_max_tool_result_chars(),
-            keep_tool_context_turns: default_keep_tool_context_turns(),
-            channels: Vec::new(),
-        }
-    }
 }
 
 // ── Pacing ────────────────────────────────────────────────────────
@@ -5889,7 +5884,7 @@ pub struct RuntimeProfileConfig {
     pub allowed_tools: Vec<String>,
     /// Agentic run timeout in seconds.
     pub agentic_timeout_secs: Option<u64>,
-    // ── AgentConfig fields lifted from [agent] ───────────────────────
+    // ── Per-agent runtime tunables (also live on DelegateAgentConfig) ─
     /// Maximum conversation history messages retained per session. `None` inherits.
     pub max_history_messages: Option<usize>,
     /// Maximum estimated tokens for context before compaction. `None` inherits.
@@ -9607,7 +9602,6 @@ impl Default for Config {
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
-            agent: AgentConfig::default(),
             pacing: PacingConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
@@ -10201,17 +10195,12 @@ impl Config {
             // We now deserialize with `toml::from_str` (which is correct)
             // and run `serde_ignored` separately just for diagnostics.
             //
-            // Before deserialization, run `prepare_table` to handle nested
-            // field migrations (e.g. room_id → allowed_rooms in matrix)
-            // that `#[serde(flatten)]` cannot capture.
-            let mut table: toml::Table =
-                toml::from_str(&contents).context("Failed to parse config as TOML table")?;
-            crate::migration::prepare_table(&mut table);
-            let table_str =
-                toml::to_string(&table).context("Failed to re-serialize prepared table")?;
-            let compat: crate::migration::V1Compat =
-                toml::from_str(&table_str).context("Failed to deserialize config file")?;
-            let mut config: Config = compat.into_config();
+            // `migrate_to_current` runs `prepare_table` (V1→V2→V3 TOML
+            // transforms) and deserializes directly into Config — no
+            // V1Compat intermediate is needed since every legacy field
+            // shape is normalized at the TOML level first.
+            let mut config: Config = crate::migration::migrate_to_current(&contents)
+                .context("Failed to migrate config")?;
 
             // Ensure the built-in default auto_approve entries are always
             // present.  When a user specifies `auto_approve` in their TOML
@@ -11036,6 +11025,137 @@ impl Config {
             );
         }
 
+        // Per-agent validation. Mandatory + alias-existence checks live
+        // here so the gateway PATCH path returns structured per-field
+        // errors and the frontend never owns this rule. Sorted iteration
+        // keeps error ordering stable across runs.
+        let mut agent_aliases: Vec<&String> = self.agents.keys().collect();
+        agent_aliases.sort();
+        for alias in agent_aliases {
+            let agent = &self.agents[alias];
+
+            // model_provider: mandatory, dotted `<type>.<inner>` ref into
+            // providers.models.<type>.<inner>.
+            let mp = agent.model_provider.trim();
+            if mp.is_empty() {
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("agents.{alias}.model-provider"),
+                    "agents.{alias}.model_provider must reference a configured model provider (e.g. \"anthropic.default\")",
+                );
+            }
+            match mp.split_once('.') {
+                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    let exists = self
+                        .get_map_keys(&format!("providers.models.{ty}"))
+                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("agents.{alias}.model-provider"),
+                            "agents.{alias}.model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.model-provider"),
+                    "agents.{alias}.model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
+                ),
+            }
+
+            // channels: each entry is a dotted `<type>.<inner>` ref into
+            // channels.<type>.<inner>. Empty list is valid (delegate-only agent).
+            // Uses the schema-derived `get_map_keys` so new channel types
+            // surface here automatically — no per-type match arm.
+            for (i, ch) in agent.channels.iter().enumerate() {
+                let trimmed = ch.trim();
+                match trimmed.split_once('.') {
+                    Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                        let exists = self
+                            .get_map_keys(&format!("channels.{ty}"))
+                            .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                        if !exists {
+                            validation_bail!(
+                                DanglingReference,
+                                format!("agents.{alias}.channels[{i}]"),
+                                "agents.{alias}.channels[{i}] = {trimmed:?} but channels.{ty}.{inner} is not configured",
+                            );
+                        }
+                    }
+                    _ => validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.channels[{i}]"),
+                        "agents.{alias}.channels[{i}] must be dotted form `<type>.<alias>` (got {trimmed:?})",
+                    ),
+                }
+            }
+
+            // Bare-alias bundle refs. Tuple is (kebab section path, kebab
+            // agent field name, value list). Both names use the schema's
+            // kebab form: section name matches what `get_map_keys` expects
+            // (macro converts snake→kebab via `snake_to_kebab` per
+            // crates/zeroclaw-macros/src/lib.rs:1056); field name matches
+            // what `prop_fields()` emits, so DanglingReference paths bind
+            // directly to the right inline error in the dashboard form.
+            let bare_multi: &[(&str, &str, &[String])] = &[
+                ("skill-bundles", "skill_bundles", &agent.skill_bundles),
+                (
+                    "knowledge-bundles",
+                    "knowledge_bundles",
+                    &agent.knowledge_bundles,
+                ),
+                ("mcp-bundles", "mcp_bundles", &agent.mcp_bundles),
+            ];
+            for (section, field, values) in bare_multi {
+                for (i, key) in values.iter().enumerate() {
+                    let trimmed = key.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let exists = self
+                        .get_map_keys(section)
+                        .is_some_and(|keys| keys.iter().any(|k| k == trimmed));
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("agents.{alias}.{field}[{i}]"),
+                            "agents.{alias}.{field}[{i}] = {trimmed:?} but {section}.{trimmed} is not configured",
+                        );
+                    }
+                }
+            }
+            let bare_single: &[(&str, &str, &str)] = &[
+                ("risk-profiles", "risk-profile", agent.risk_profile.as_str()),
+                (
+                    "runtime-profiles",
+                    "runtime-profile",
+                    agent.runtime_profile.as_str(),
+                ),
+                (
+                    "memory-namespaces",
+                    "memory-namespace",
+                    agent.memory_namespace.as_str(),
+                ),
+            ];
+            for (section, field, raw) in bare_single {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let exists = self
+                    .get_map_keys(section)
+                    .is_some_and(|keys| keys.iter().any(|k| k == trimmed));
+                if !exists {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.{field}"),
+                        "agents.{alias}.{field} = {trimmed:?} but {section}.{trimmed} is not configured",
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -11412,9 +11532,13 @@ mod tests {
             merged.push(']');
         }
         merged.push('\n');
-        // Deserialize through V1Compat to handle legacy top-level fields.
-        let compat: crate::migration::V1Compat = toml::from_str(&merged).unwrap();
-        let mut config = compat.into_config();
+        // Schema-deserialization helper: parses TOML directly into Config
+        // WITHOUT running migration transforms. Tests that need migration
+        // behavior should use `migrate_to_current` directly. This helper
+        // exists so V2-shaped inputs (e.g. flat `[autonomy]` blocks) can
+        // be exercised against the typed deserializer without losing
+        // sections that V2→V3 strips.
+        let mut config: Config = toml::from_str(&merged).unwrap();
         config.autonomy.ensure_default_auto_approve();
         config
     }
@@ -11939,7 +12063,6 @@ auto_save = true
             project_intel: ProjectIntelConfig::default(),
             google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
-            agent: AgentConfig::default(),
             pacing: PacingConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -12190,11 +12313,13 @@ auto_approve = ["weather", "file_read"]
 
     #[test]
     async fn provider_timeout_secs_parses_from_toml() {
+        // V1 top-level `provider_timeout_secs` is folded into the
+        // synthesized provider entry's `timeout_secs` by V1→V2 migration.
         let raw = r#"
 default_temperature = 0.7
 provider_timeout_secs = 300
 "#;
-        let parsed = parse_test_config(raw);
+        let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
         assert_eq!(
             parsed
                 .providers
@@ -12274,6 +12399,8 @@ provider_timeout_secs = 300
 
     #[test]
     async fn extra_headers_parses_from_toml() {
+        // V1 top-level `[extra_headers]` is folded into the synthesized
+        // default provider entry's `extra_headers` map by V1→V2 migration.
         let raw = r#"
 default_temperature = 0.7
 
@@ -12281,11 +12408,11 @@ default_temperature = 0.7
 User-Agent = "MyApp/1.0"
 X-Title = "zeroclaw"
 "#;
-        let parsed = parse_test_config(raw);
+        let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
         let headers = &parsed
             .providers
             .first_provider()
-            .expect("fallback provider")
+            .expect("synthesized default provider")
             .extra_headers;
         assert_eq!(headers.len(), 2);
         assert_eq!(headers.get("User-Agent").unwrap(), "MyApp/1.0");
@@ -12375,7 +12502,7 @@ reasoning_effort = "turbo"
 
     #[test]
     async fn agent_config_defaults() {
-        let cfg = AgentConfig::default();
+        let cfg = DelegateAgentConfig::default();
         assert!(cfg.compact_context);
         assert_eq!(cfg.max_tool_iterations, 10);
         assert_eq!(cfg.max_history_messages, 50);
@@ -12387,7 +12514,7 @@ reasoning_effort = "turbo"
     async fn agent_config_deserializes() {
         let raw = r#"
 default_temperature = 0.7
-[agent]
+[agents.default]
 compact_context = true
 max_tool_iterations = 20
 max_history_messages = 80
@@ -12395,11 +12522,15 @@ parallel_tools = true
 tool_dispatcher = "xml"
 "#;
         let parsed = parse_test_config(raw);
-        assert!(parsed.agent.compact_context);
-        assert_eq!(parsed.agent.max_tool_iterations, 20);
-        assert_eq!(parsed.agent.max_history_messages, 80);
-        assert!(parsed.agent.parallel_tools);
-        assert_eq!(parsed.agent.tool_dispatcher, "xml");
+        let agent = parsed
+            .agents
+            .get("default")
+            .expect("[agents.default] parses into agents map");
+        assert!(agent.compact_context);
+        assert_eq!(agent.max_tool_iterations, 20);
+        assert_eq!(agent.max_history_messages, 80);
+        assert!(agent.parallel_tools);
+        assert_eq!(agent.tool_dispatcher, "xml");
     }
 
     #[test]
@@ -12520,7 +12651,6 @@ default_temperature = 0.7
             project_intel: ProjectIntelConfig::default(),
             google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
-            agent: AgentConfig::default(),
             pacing: PacingConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -12566,8 +12696,7 @@ default_temperature = 0.7
         assert!(config_path.exists());
 
         let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
-        let compat: crate::migration::V1Compat = toml::from_str(&contents).unwrap();
-        let loaded = compat.into_config();
+        let loaded = crate::migration::migrate_to_current(&contents).unwrap();
         let entry = &loaded.providers.models["openrouter"]["default"];
         assert!(
             entry
@@ -12660,9 +12789,7 @@ default_temperature = 0.7
         let contents = tokio::fs::read_to_string(config.config_path.clone())
             .await
             .unwrap();
-        let stored: Config = toml::from_str::<crate::migration::V1Compat>(&contents)
-            .unwrap()
-            .into_config();
+        let stored: Config = crate::migration::migrate_to_current(&contents).unwrap();
         let store = crate::secrets::SecretStore::new(&dir, true);
 
         let root_encrypted = stored
@@ -13859,6 +13986,9 @@ default_temperature = 0.7
 
     #[test]
     async fn toml_supports_model_provider_and_model_alias_fields() {
+        // V1 aliases: `model_provider` → `default_provider`,
+        // `model` → `default_model`. Both folded into the synthesized
+        // `[providers.models.<type>.default]` entry by V1→V2 migration.
         let raw = r#"
 default_temperature = 0.7
 model_provider = "sub2api"
@@ -13871,7 +14001,7 @@ wire_api = "responses"
 requires_openai_auth = true
 "#;
 
-        let parsed = parse_test_config(raw);
+        let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
         assert!(
             parsed.providers.models.contains_key("sub2api"),
             "expected sub2api in providers.models"

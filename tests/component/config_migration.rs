@@ -2,14 +2,10 @@
 //!
 //! Validates V1→V2 migration via V1Compat, including the full validation pipeline.
 
-use zeroclaw::config::migration::{self, CURRENT_SCHEMA_VERSION, V1Compat};
+use zeroclaw::config::migration::{self, CURRENT_SCHEMA_VERSION};
 
 fn migrate(toml_str: &str) -> zeroclaw::config::Config {
-    let mut table: toml::Table = toml::from_str(toml_str).expect("failed to parse table");
-    migration::prepare_table(&mut table);
-    let prepared = toml::to_string(&table).expect("failed to re-serialize");
-    let compat: V1Compat = toml::from_str(&prepared).expect("failed to deserialize");
-    compat.into_config()
+    migration::migrate_to_current(toml_str).expect("migration succeeds")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,7 +73,7 @@ temperature = 0.3
         Some("sk-ant")
     );
     assert_eq!(
-        config.providers.first_provider_type(),
+        config.providers.first_provider_alias().as_deref(),
         Some("anthropic.default")
     );
     assert_eq!(
@@ -133,7 +129,7 @@ model = "claude"
 
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(
-        config.providers.first_provider_type(),
+        config.providers.first_provider_alias().as_deref(),
         Some("openrouter.default")
     );
     assert_eq!(
@@ -153,7 +149,7 @@ api_key = "sk-orphan"
     );
 
     assert_eq!(
-        config.providers.first_provider_type(),
+        config.providers.first_provider_alias().as_deref(),
         Some("default.default")
     );
     assert_eq!(
@@ -179,7 +175,7 @@ model_provider = "ollama"
     );
 
     assert_eq!(
-        config.providers.first_provider_type(),
+        config.providers.first_provider_alias().as_deref(),
         Some("ollama.default")
     );
 }
@@ -261,10 +257,10 @@ allowed_users = ["@u:m"]
 
     let config = migrate(&migrated_toml);
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
-    assert_eq!(
-        config.providers.first_provider_type(),
-        Some("openrouter.default")
-    );
+    // openrouter (the V1 default_provider) gets the synthesized default
+    // alias entry with V1 top-level fields; ollama survives from
+    // [model_providers.ollama]. Both must exist; no first-provider
+    // assertion (HashMap order is unspecified).
     assert_eq!(
         config.providers.models["openrouter"]["default"]
             .api_key
@@ -327,7 +323,7 @@ model = "claude-sonnet-4-6"
 "#,
     );
     assert_eq!(
-        config.providers.first_provider_type(),
+        config.providers.first_provider_alias().as_deref(),
         Some("anthropic.claude-code")
     );
 }
@@ -341,7 +337,7 @@ api_key = "sk-ant-oat01-example"
 "#,
     );
     assert_eq!(
-        config.providers.first_provider_type(),
+        config.providers.first_provider_alias().as_deref(),
         Some("anthropic.default")
     );
     assert!(config.providers.models.contains_key("anthropic"));
@@ -526,7 +522,7 @@ require_pairing = true
 
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(
-        config.providers.first_provider_type(),
+        config.providers.first_provider_alias().as_deref(),
         Some("openrouter.default")
     );
     assert_eq!(
@@ -1262,26 +1258,8 @@ model = "claude-opus-4-5"
     );
 }
 
-#[test]
-fn providers_fallback_updated_to_dotted_alias() {
-    let config = migrate(
-        r#"
-schema_version = 3
-
-[providers]
-fallback = "openrouter"
-
-[providers.models.openrouter]
-api_key = "sk-or"
-"#,
-    );
-
-    assert_eq!(
-        config.providers.first_provider_type(),
-        Some("openrouter.default"),
-        "bare fallback key must be upgraded to dotted form"
-    );
-}
+// `providers_fallback_updated_to_dotted_alias` deleted: `providers.fallback`
+// no longer exists in V3.
 
 #[test]
 fn agent_provider_synthesised_into_model_provider_alias() {
@@ -1352,7 +1330,7 @@ fn already_aliased_providers_not_double_wrapped() {
 schema_version = 3
 
 [providers]
-fallback = "anthropic.default"
+fallback = ["anthropic.default"]
 
 [providers.models.anthropic.default]
 api_key = "sk-ant"
@@ -1375,7 +1353,7 @@ model = "claude-opus-4-5"
         Some("sk-ant")
     );
     assert_eq!(
-        config.providers.first_provider_type(),
+        config.providers.first_provider_alias().as_deref(),
         Some("anthropic.default"),
         "already-dotted fallback must not be modified"
     );
@@ -2131,15 +2109,8 @@ fn fixture_v2_has_flat_provider_models() {
     );
 }
 
-#[test]
-fn fixture_v2_provider_fallback_is_string() {
-    let out = generate(2);
-    // V2 fallback is a bare string, not an array.
-    assert!(
-        out.contains("fallback = \"myprovider\""),
-        "V2 fallback should be a string"
-    );
-}
+// `fixture_v2_provider_fallback_is_string` deleted: `providers.fallback`
+// no longer exists in V3 and the V2 downgrade path no longer emits it.
 
 #[test]
 fn fixture_v3_has_correct_schema_version() {
@@ -2157,14 +2128,8 @@ fn fixture_v3_has_aliased_provider_models() {
     );
 }
 
-#[test]
-fn fixture_v3_provider_fallback_is_array() {
-    let out = generate(3);
-    assert!(
-        out.contains("fallback = [\"myprovider.default\"]"),
-        "V3 fallback should be an array with dotted alias"
-    );
-}
+// `fixture_v3_provider_fallback_is_array` deleted: `providers.fallback`
+// no longer exists in V3.
 
 #[test]
 fn fixture_v3_has_aliased_channels() {
@@ -2354,5 +2319,243 @@ fn fixture_v3_has_mattermost_login_id() {
     assert!(
         out.contains("login_id"),
         "V3 mattermost channel should have login_id"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V3 — agent migration & validation contract
+// (Catches the bugs the earlier round of tests missed: kebab/snake drift,
+// non-idempotent transforms, and missing per-agent fold of [agent].)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `prepare_table` applied twice produces identical TOML — one pass is
+/// enough; a second pass should be a no-op. Catches non-idempotent rules
+/// that would otherwise corrupt round-tripped configs on every save.
+#[test]
+fn prepare_table_is_idempotent_on_v1_input() {
+    let v1 = fixture_raw("v1.toml");
+    let mut once: toml::Table = toml::from_str(&v1).expect("v1 fixture parses");
+    migration::prepare_table(&mut once);
+    let mut twice = once.clone();
+    migration::prepare_table(&mut twice);
+    let once_serialised = toml::to_string(&once).expect("re-serialize once");
+    let twice_serialised = toml::to_string(&twice).expect("re-serialize twice");
+    assert_eq!(
+        once_serialised, twice_serialised,
+        "prepare_table must be idempotent — second pass changed the table"
+    );
+}
+
+#[test]
+fn prepare_table_is_idempotent_on_v3_output() {
+    // Run the V3 fixture (already migrated) through prepare_table —
+    // every step should be a no-op since the input is already V3-shaped.
+    let v3 = generate(3);
+    let mut t: toml::Table = toml::from_str(&v3).expect("v3 fixture parses");
+    let before = toml::to_string(&t).expect("serialize before");
+    migration::prepare_table(&mut t);
+    let after = toml::to_string(&t).expect("serialize after");
+    assert_eq!(
+        before, after,
+        "prepare_table on a V3-shaped input must be a no-op"
+    );
+}
+
+/// V2 `[agent]` section folds onto `[agents.default]` when no
+/// user-supplied `[agents.default]` exists.
+#[test]
+fn v2_global_agent_section_folds_onto_default_agent() {
+    let cfg = migrate(
+        r#"
+schema_version = 2
+api_key = "sk-test"
+
+[agent]
+max_tool_iterations = 7
+max_history_messages = 33
+compact_context = false
+tool_dispatcher = "xml"
+"#,
+    );
+    let agent = cfg
+        .agents
+        .get("default")
+        .expect("[agent] folded into agents.default");
+    assert_eq!(agent.max_tool_iterations, 7);
+    assert_eq!(agent.max_history_messages, 33);
+    assert!(!agent.compact_context);
+    assert_eq!(agent.tool_dispatcher, "xml");
+}
+
+/// User-supplied `[agents.default]` wins; legacy `[agent]` fields fold
+/// in only where absent on the user-defined entry.
+#[test]
+fn v2_agent_fold_does_not_overwrite_user_supplied_default() {
+    let cfg = migrate(
+        r#"
+schema_version = 2
+api_key = "sk-test"
+
+[agent]
+max_tool_iterations = 7
+
+[agents.default]
+max_tool_iterations = 99
+model_provider = "openrouter.default"
+"#,
+    );
+    let agent = cfg.agents.get("default").expect("default present");
+    // User-supplied wins for the field they specified.
+    assert_eq!(agent.max_tool_iterations, 99);
+    // model_provider survives unmodified.
+    assert_eq!(agent.model_provider, "openrouter.default");
+}
+
+/// Idempotency of the fold: a V3 input with no `[agent]` table is a no-op
+/// at this step.
+#[test]
+fn v2_agent_fold_is_noop_when_no_legacy_agent_section() {
+    let cfg = migrate(
+        r#"
+schema_version = 3
+api_key = "sk-test"
+
+[agents.researcher]
+model_provider = "openrouter.default"
+"#,
+    );
+    assert!(cfg.agents.contains_key("researcher"));
+    assert!(!cfg.agents.contains_key("default"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V3 — Config::validate() per-agent rules
+// ─────────────────────────────────────────────────────────────────────────────
+
+use zeroclaw::config::schema::{
+    Config, DelegateAgentConfig, ModelProviderConfig, RiskProfileConfig, SkillBundleConfig,
+};
+
+fn cfg_with_provider() -> Config {
+    let mut c = Config::default();
+    c.providers
+        .models
+        .entry("openrouter".into())
+        .or_default()
+        .insert("default".into(), ModelProviderConfig::default());
+    c
+}
+
+#[test]
+fn validate_rejects_agent_with_empty_model_provider() {
+    let mut c = cfg_with_provider();
+    c.agents.insert("ok".into(), DelegateAgentConfig::default()); // model_provider = ""
+    let err = c.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("agents.ok.model-provider"),
+        "expected error path agents.ok.model-provider, got: {err}"
+    );
+}
+
+#[test]
+fn validate_rejects_dangling_model_provider_reference() {
+    let mut c = cfg_with_provider();
+    c.agents.insert(
+        "dangly".into(),
+        DelegateAgentConfig {
+            model_provider: "anthropic.work".into(),
+            ..Default::default()
+        },
+    );
+    let err = c.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("anthropic.work")
+            && err.contains("not configured")
+            && err.contains("agents.dangly.model-provider"),
+        "expected dangling-ref message keyed on agents.dangly.model-provider, got: {err}"
+    );
+}
+
+#[test]
+fn validate_accepts_agent_with_valid_alias_refs() {
+    let mut c = cfg_with_provider();
+    c.risk_profiles
+        .insert("strict".into(), RiskProfileConfig::default());
+    c.skill_bundles
+        .insert("rust".into(), SkillBundleConfig::default());
+    c.agents.insert(
+        "good".into(),
+        DelegateAgentConfig {
+            model_provider: "openrouter.default".into(),
+            risk_profile: "strict".into(),
+            skill_bundles: vec!["rust".into()],
+            ..Default::default()
+        },
+    );
+    c.validate().expect("valid agent should pass validation");
+}
+
+#[test]
+fn validate_rejects_dangling_skill_bundle_reference() {
+    let mut c = cfg_with_provider();
+    c.agents.insert(
+        "missing-bundle".into(),
+        DelegateAgentConfig {
+            model_provider: "openrouter.default".into(),
+            skill_bundles: vec!["nonexistent".into()],
+            ..Default::default()
+        },
+    );
+    let err = c.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("agents.missing-bundle.skill_bundles[0]") && err.contains("nonexistent"),
+        "expected dangling skill_bundles ref, got: {err}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V3 — kebab-case path round-trip on agents
+// (Covers the bug where snake-case format!("agents.{alias}.model_provider")
+// returned "Unknown property" because get_prop only knows kebab.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn agent_field_paths_round_trip_through_kebab() {
+    use zeroclaw::config::Config;
+    let mut c = Config::default();
+    // Bring a default agent into existence so the nested-set routing
+    // through HashMap<String, DelegateAgentConfig> has a target.
+    c.create_map_key("agents", "researcher")
+        .expect("create agent alias");
+
+    // Every alias-ref agent field on its kebab path should accept a
+    // value through set_prop and round-trip through get_prop.
+    let path_value_pairs: &[(&str, &str)] = &[
+        ("agents.researcher.model-provider", "anthropic.default"),
+        ("agents.researcher.risk-profile", "strict"),
+        ("agents.researcher.runtime-profile", "fast"),
+        ("agents.researcher.memory-namespace", "team-a"),
+        ("agents.researcher.skill-bundles", "[\"rust\", \"python\"]"),
+        ("agents.researcher.knowledge-bundles", "[\"design-docs\"]"),
+        ("agents.researcher.mcp-bundles", "[\"filesystem\"]"),
+        ("agents.researcher.channels", "[\"telegram.default\"]"),
+    ];
+    for (path, value) in path_value_pairs {
+        c.set_prop(path, value)
+            .unwrap_or_else(|e| panic!("set_prop({path}, {value}) failed: {e}"));
+        let read = c
+            .get_prop(path)
+            .unwrap_or_else(|e| panic!("get_prop({path}) failed: {e}"));
+        assert!(
+            !read.is_empty() && read != "<unset>",
+            "round-trip readback empty for {path} (got {read:?})"
+        );
+    }
+
+    // Negative: snake-case form is rejected so nobody can accidentally
+    // bypass the kebab contract.
+    assert!(
+        c.set_prop("agents.researcher.model_provider", "x").is_err(),
+        "snake_case property name must be rejected; only kebab-case is valid"
     );
 }

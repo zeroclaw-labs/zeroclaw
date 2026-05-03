@@ -1226,7 +1226,7 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     // Use the user-configured max_history_messages (fall back to
     // MAX_CHANNEL_HISTORY when the config value is 0 or absent).
     let max_history = {
-        let configured = ctx.prompt_config.agent.max_history_messages;
+        let configured = ctx.prompt_config.default_agent().max_history_messages;
         if configured > 0 {
             configured
         } else {
@@ -2874,7 +2874,11 @@ async fn process_channel_message(
     // before the LLM call, preventing context-window-exceeded errors
     // and preserving key decisions through LLM-driven summarization.
     {
-        let cc_config = ctx.prompt_config.agent.context_compression.clone();
+        let cc_config = ctx
+            .prompt_config
+            .default_agent()
+            .context_compression
+            .clone();
         let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
             cc_config,
             ctx.context_token_budget,
@@ -3413,7 +3417,7 @@ async fn process_channel_message(
             // Persist intermediate tool-call/result messages from this turn
             // so the model retains concrete "I used tools" examples in
             // context, preventing drift toward tool-less responses (#4827).
-            let keep_tool_turns = ctx.prompt_config.agent.keep_tool_context_turns;
+            let keep_tool_turns = ctx.prompt_config.default_agent().keep_tool_context_turns;
             if keep_tool_turns > 0 {
                 // Find tool messages for the current turn: everything after
                 // the last user message up to (but not including) the final
@@ -5479,7 +5483,7 @@ pub async fn start_channels(
         tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
     }
 
-    let bootstrap_max_chars = if config.agent.compact_context {
+    let bootstrap_max_chars = if config.default_agent().compact_context {
         Some(6000)
     } else {
         None
@@ -5495,8 +5499,8 @@ pub async fn start_channels(
         Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
-        config.agent.compact_context,
-        config.agent.max_system_prompt_chars,
+        config.default_agent().compact_context,
+        config.default_agent().max_system_prompt_chars,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
@@ -5665,7 +5669,7 @@ pub async fn start_channels(
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
-        max_tool_iterations: config.agent.max_tool_iterations,
+        max_tool_iterations: config.default_agent().max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
         conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -5715,7 +5719,7 @@ pub async fn start_channels(
         },
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
         autonomy_level: config.autonomy.level,
-        tool_call_dedup_exempt: Arc::new(config.agent.tool_call_dedup_exempt.clone()),
+        tool_call_dedup_exempt: Arc::new(config.default_agent().tool_call_dedup_exempt.clone()),
         model_routes: Arc::new(config.providers.model_routes.clone()),
         query_classification: config.query_classification.clone(),
         ack_reactions: config.channels.ack_reactions,
@@ -5758,8 +5762,8 @@ pub async fn start_channels(
             }
         }),
         pacing: config.pacing.clone(),
-        max_tool_result_chars: config.agent.max_tool_result_chars,
-        context_token_budget: config.agent.max_context_tokens,
+        max_tool_result_chars: config.default_agent().max_tool_result_chars,
+        context_token_budget: config.default_agent().max_context_tokens,
         debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
             Duration::from_millis(config.channels.debounce_ms),
         )),
@@ -12237,7 +12241,7 @@ This is an example JSON object for profile settings."#;
 
     #[test]
     fn default_keep_tool_context_turns_is_two() {
-        let config = zeroclaw_config::schema::AgentConfig::default();
+        let config = zeroclaw_config::schema::DelegateAgentConfig::default();
         assert_eq!(config.keep_tool_context_turns, 2);
     }
 

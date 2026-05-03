@@ -184,9 +184,9 @@ pub struct OnboardStatusResponse {
 /// first init, so file existence isn't a useful "is the user new?" check.
 /// Instead we look at two explicit user-driven markers: any
 /// `onboard_state.completed_sections` entry (set when the wizard finishes
-/// a section) OR any usable provider (`providers.fallback` set, or any
-/// entry under `providers.models`). When neither is present, the user is
-/// fresh and should land at `/onboard` instead of the empty Dashboard.
+/// a section) OR any entry under `providers.models`. When neither is
+/// present, the user is fresh and should land at `/onboard` instead of
+/// the empty Dashboard.
 pub async fn handle_onboard_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -209,6 +209,64 @@ pub async fn handle_onboard_status(State(state): State<AppState>, headers: Heade
         reason,
     })
     .into_response()
+}
+
+/// All alias-reference choices an agent form needs, in one round-trip.
+/// Channels and model providers are returned in dotted form
+/// (`telegram.default`, `anthropic.work`); the bundle/profile/namespace
+/// lists are bare HashMap keys.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct AgentOptionsResponse {
+    pub channels: Vec<String>,
+    pub model_providers: Vec<String>,
+    pub risk_profiles: Vec<String>,
+    pub runtime_profiles: Vec<String>,
+    pub skill_bundles: Vec<String>,
+    pub knowledge_bundles: Vec<String>,
+    pub mcp_bundles: Vec<String>,
+    pub memory_namespaces: Vec<String>,
+}
+
+/// `GET /api/onboard/agent-options` — every alias-reference list the
+/// agent form needs, derived from the live config. Mirrors the lists the
+/// TUI computes locally for its alias pickers.
+pub async fn handle_agent_options(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let cfg = state.config.lock().clone();
+
+    fn dotted_aliases(cfg: &zeroclaw_config::schema::Config, prefix: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for f in cfg.prop_fields() {
+            if let Some(rest) = f.name.strip_prefix(&format!("{prefix}.")) {
+                let mut parts = rest.splitn(3, '.');
+                if let (Some(ty), Some(alias), Some(_)) = (parts.next(), parts.next(), parts.next())
+                {
+                    let dotted = format!("{ty}.{alias}");
+                    if !out.contains(&dotted) {
+                        out.push(dotted);
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    let response = AgentOptionsResponse {
+        channels: dotted_aliases(&cfg, "channels"),
+        model_providers: dotted_aliases(&cfg, "providers.models"),
+        risk_profiles: cfg.get_map_keys("risk_profiles").unwrap_or_default(),
+        runtime_profiles: cfg.get_map_keys("runtime_profiles").unwrap_or_default(),
+        skill_bundles: cfg.get_map_keys("skill_bundles").unwrap_or_default(),
+        knowledge_bundles: cfg.get_map_keys("knowledge_bundles").unwrap_or_default(),
+        mcp_bundles: cfg.get_map_keys("mcp_bundles").unwrap_or_default(),
+        memory_namespaces: cfg.get_map_keys("memory_namespaces").unwrap_or_default(),
+    };
+
+    axum::Json(response).into_response()
 }
 
 /// `GET /api/onboard/sections` — list every top-level config section.
@@ -371,6 +429,11 @@ fn section_help(key: &str) -> &'static str {
         "tunnel" => {
             "Optional: expose your gateway over the public internet via Cloudflare or ngrok. \
                      Pick `none` to keep it localhost-only."
+        }
+        "agents" => {
+            "An agent binds a model provider, profiles, bundles, and channels into one \
+                     dispatchable unit. Add one per persona; reuse the same alias across channels \
+                     to share state."
         }
         _ => "",
     }
@@ -729,6 +792,25 @@ pub async fn handle_section_select(
             };
             let prefix = format!("channels.{key}.{alias}");
             (prefix, created)
+        }
+        "agents" => {
+            // Agents are flat (one level): the URL path key IS the alias.
+            // create_map_key is idempotent, so selecting an existing alias
+            // just returns the form prefix without modifying anything.
+            let created = working.create_map_key("agents", &key).map_err(|msg| {
+                error_response(
+                    ConfigApiError::new(
+                        ConfigApiCode::PathNotFound,
+                        format!("could not select agent alias `{key}`: {msg}"),
+                    )
+                    .with_path("agents"),
+                )
+            });
+            let created = match created {
+                Ok(c) => c,
+                Err(resp) => return resp,
+            };
+            (format!("agents.{key}"), created)
         }
         "memory" => {
             // Set memory.backend to the picked key. Fields_prefix points at

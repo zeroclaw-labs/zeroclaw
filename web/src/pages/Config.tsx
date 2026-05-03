@@ -201,9 +201,13 @@ export default function Config() {
   }
 
   // Determine what to render in the main pane based on URL params.
+  // Two-tier alias sections route /config/<section>/<type>/<alias>.
   const needsAliasTier =
     activeSection?.has_picker &&
     (activeSection.key === 'providers' || activeSection.key === 'channels');
+  // One-tier alias sections route /config/<section>/<alias> directly.
+  // The list lives at the top of the section (no type selection step).
+  const isOneTierAliasSection = activeSection?.key === 'agents';
 
   const mainContent = (() => {
     if (!activeSection) return null;
@@ -268,6 +272,31 @@ export default function Config() {
       );
     }
 
+    // /config/:section/:alias — one-tier alias section field form
+    // (agents). The URL's :type slot carries the alias directly.
+    if (typeParam && isOneTierAliasSection) {
+      const fieldsPrefix = `${activeSection.key}.${typeParam}`;
+      return (
+        <div className="flex flex-col gap-3">
+          <button
+            type="button"
+            onClick={() => navigate(`/config/${encodeURIComponent(activeSection.key)}`)}
+            className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            Back to {activeSection.label}
+          </button>
+          <FieldForm
+            key={`${reloadKey}-${fieldsPrefix}`}
+            prefix={fieldsPrefix}
+            title={typeParam}
+            onSaved={fetchDrift}
+            drift={drifted}
+          />
+        </div>
+      );
+    }
+
     // /config/:section/:type — alias list (providers/channels) or direct form
     if (typeParam && needsAliasTier) {
       return (
@@ -306,6 +335,24 @@ export default function Config() {
             drift={drifted}
           />
         </div>
+      );
+    }
+
+    // /config/agents (or any one-tier alias section) — direct alias list with
+    // inline + Add affordance. Mirrors the two-tier AliasListView pattern but
+    // skips the type-selection step since the section IS the type.
+    if (isOneTierAliasSection) {
+      return (
+        <AliasListView
+          sectionKey={activeSection.key}
+          onSelectAlias={async (alias) => {
+            await selectSectionItem(activeSection.key, alias);
+            navigate(
+              `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(alias)}`,
+            );
+          }}
+          onBack={() => navigate('/config')}
+        />
       );
     }
 
@@ -478,7 +525,9 @@ function AliasListView({
   onBack,
 }: {
   sectionKey: string;
-  typeKey: string;
+  /** Channel/provider type for two-tier sections; omitted for one-tier
+   *  alias sections like agents that have no `<type>` segment. */
+  typeKey?: string;
   onSelectAlias: (alias: string) => Promise<void>;
   onBack: () => void;
 }) {
@@ -488,9 +537,14 @@ function AliasListView({
   const [error, setError] = useState<string | null>(null);
   const [aliasError, setAliasError] = useState<string | null>(null);
 
-  const mapPath = sectionKey === 'providers'
-    ? `providers.models.${typeKey}`
-    : `channels.${typeKey}`;
+  // Two-tier sections (providers, channels) put the type in the path;
+  // one-tier sections (agents, risk_profiles, etc.) just use the section
+  // key as-is. The map-keys endpoint then returns the alias names directly.
+  const mapPath = typeKey
+    ? sectionKey === 'providers'
+      ? `providers.models.${typeKey}`
+      : `${sectionKey}.${typeKey}`
+    : sectionKey;
 
   useEffect(() => {
     let cancelled = false;

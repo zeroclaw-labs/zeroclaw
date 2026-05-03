@@ -285,7 +285,8 @@ enum Commands {
         #[arg(long)]
         api_key: Option<String>,
 
-        /// Provider name (sets providers.fallback).
+        /// Provider name. Used as the type key for the synthesized
+        /// `[providers.models.<type>.default]` entry.
         #[arg(long)]
         provider: Option<String>,
 
@@ -877,8 +878,9 @@ enum ConfigCommands {
     /// the schema fragment for that property only — same payload `OPTIONS
     /// /api/config/prop?path=...` returns over HTTP.
     Schema {
-        /// Property path to scope the schema dump (e.g. `providers.fallback`).
-        /// Without it, dumps the whole-config schema.
+        /// Property path to scope the schema dump (e.g.
+        /// `agents.researcher.model_provider`). Without it, dumps the
+        /// whole-config schema.
         #[arg(long)]
         path: Option<String>,
     },

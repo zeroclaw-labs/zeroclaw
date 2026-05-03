@@ -33,7 +33,7 @@ pub struct ValidationWarning {
     /// Human-readable description suitable for direct display.
     pub message: String,
     /// Dotted property path the warning concerns
-    /// (e.g. `"providers.fallback"`).
+    /// (e.g. `"agents.researcher.model_provider"`).
     pub path: String,
 }
 

@@ -1078,15 +1078,12 @@ mod tests {
 
     #[test]
     fn config_validation_catches_bad_temperature() {
+        // Single provider entry with an out-of-range temperature so the
+        // doctor's `first_provider()` lookup deterministically picks it
+        // (HashMap iteration order is unspecified — multiple entries
+        // produce a coin-flip first pick).
         let mut config = Config::default();
         config.providers.models = Default::default();
-        config
-            .providers
-            .models
-            .entry("default.default".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
         config
             .providers
             .models

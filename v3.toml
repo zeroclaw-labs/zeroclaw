@@ -510,9 +510,6 @@ include_jira_data = false
 report_output_dir = "~/.zeroclaw/project-reports"
 risk_sensitivity = "medium"
 
-[providers]
-fallback = ["myprovider.default"]
-
 [providers.models.myprovider.default]
 api_key = "sk-example"
 model = "my-model"

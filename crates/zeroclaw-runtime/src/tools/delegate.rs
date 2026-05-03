@@ -354,14 +354,14 @@ impl DelegateTool {
             .unwrap_or_default()
     }
 
-    /// Resolve skills directory from the named skill bundle.
-    fn resolve_skills_dir(&self, skill_bundle: &str) -> Option<String> {
-        if skill_bundle.is_empty() {
-            return None;
-        }
-        self.skill_bundles
-            .get(skill_bundle)
-            .and_then(|b| b.directory.clone())
+    /// Resolve every configured skill bundle alias to its directory.
+    /// Empty list / no matches → caller falls back to the workspace default.
+    fn resolve_skill_bundle_dirs(&self, bundle_aliases: &[String]) -> Vec<String> {
+        bundle_aliases
+            .iter()
+            .filter(|a| !a.is_empty())
+            .filter_map(|a| self.skill_bundles.get(a).and_then(|b| b.directory.clone()))
+            .collect()
     }
 
     /// Resolve memory namespace string from the named memory namespace config.
@@ -1208,12 +1208,21 @@ impl DelegateTool {
         sub_tools: &[Box<dyn Tool>],
         workspace_dir: &Path,
     ) -> Option<String> {
-        // Resolve skills directory: scoped if configured, otherwise workspace default.
-        let skills_dir = self
-            .resolve_skills_dir(&agent_config.skill_bundle)
-            .map(|dir| workspace_dir.join(dir))
-            .unwrap_or_else(|| crate::skills::skills_dir(workspace_dir));
-        let skills = crate::skills::load_skills_from_directory(&skills_dir, false);
+        // Resolve skill bundle directories. With one or more configured
+        // bundles, load + concat skills from each. With none, fall back to
+        // the workspace default.
+        let bundle_dirs = self.resolve_skill_bundle_dirs(&agent_config.skill_bundles);
+        let skills = if bundle_dirs.is_empty() {
+            let default_dir = crate::skills::skills_dir(workspace_dir);
+            crate::skills::load_skills_from_directory(&default_dir, false)
+        } else {
+            bundle_dirs
+                .into_iter()
+                .flat_map(|dir| {
+                    crate::skills::load_skills_from_directory(&workspace_dir.join(dir), false)
+                })
+                .collect()
+        };
 
         // Determine shell policy instructions when the `shell` tool is in the
         // effective tool list.
@@ -2358,6 +2367,17 @@ mod tests {
     #[test]
     fn config_validation_accepts_minimal_agent() {
         let mut config = zeroclaw_config::schema::Config::default();
+        // model_provider must reference a real entry under
+        // providers.models — the validator (correctly) rejects dangling refs.
+        config
+            .providers
+            .models
+            .entry("ollama".into())
+            .or_default()
+            .insert(
+                "default".into(),
+                zeroclaw_config::schema::ModelProviderConfig::default(),
+            );
         config.agents.insert(
             "ok".into(),
             DelegateAgentConfig {
@@ -2365,7 +2385,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(config.validate().is_ok());
+        assert!(
+            config.validate().is_ok(),
+            "validate: {:?}",
+            config.validate()
+        );
     }
 
     #[test]
@@ -2383,7 +2407,7 @@ mod tests {
         .unwrap();
 
         let config = DelegateAgentConfig {
-            skill_bundle: "code_review".to_string(),
+            skill_bundles: vec!["code_review".to_string()],
             ..Default::default()
         };
 

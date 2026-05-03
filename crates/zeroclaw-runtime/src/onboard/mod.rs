@@ -67,9 +67,9 @@ pub enum Section {
 }
 
 impl Section {
-    /// Stable string name used in TOML paths (`providers.fallback`, etc.) and
-    /// surfaced over the HTTP CRUD API for grouping prop lists by section.
-    /// `All` has no path representation; returns `None`.
+    /// Stable string name used in TOML paths (`providers.models`, `agents`,
+    /// etc.) and surfaced over the HTTP CRUD API for grouping prop lists by
+    /// section. `All` has no path representation; returns `None`.
     pub fn as_path_prefix(self) -> Option<&'static str> {
         match self {
             Self::All => None,
@@ -1495,13 +1495,322 @@ async fn agents(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> Res
         };
 
         cfg.create_map_key("agents", &alias).ok();
-        let prefix = format!("agents.{alias}");
         cfg.save().await?;
         ui.heading(2, &alias);
-        let _ = prompt_fields_under(cfg, ui, &prefix, &[], &[]).await?;
+        let _ = prompt_agent_fields(cfg, ui, &alias).await?;
     }
     mark_completed(cfg, "agents").await?;
     Ok(Nav::Done)
+}
+
+/// Build the canonical schema path for a field on an agent alias entry.
+/// `set_prop` / `get_prop` and the schema's `KNOWN` table always use
+/// kebab-case field names (the `Configurable` derive does
+/// `snake_to_kebab` at compile time), so callers passing snake-cased
+/// field names (matching the Rust struct fields) need this conversion.
+/// Centralized so future additions can't reintroduce the snake/kebab
+/// drift bug.
+fn agent_field_path(alias: &str, snake_field: &str) -> String {
+    let kebab = snake_field.replace('_', "-");
+    format!("agents.{alias}.{kebab}")
+}
+
+/// Walk the fields under `agents.<alias>` with prompts tailored to each
+/// field's role: bool/text via the generic `prompt_field`, the system
+/// prompt via `$EDITOR`, and every alias-reference field (channels,
+/// model_provider, risk_profile, …) via a picker over the relevant
+/// configured aliases. Rewinds with `Nav::Back`.
+async fn prompt_agent_fields(cfg: &mut Config, ui: &mut dyn OnboardUi, alias: &str) -> Result<Nav> {
+    let channel_aliases = available_channel_aliases(cfg);
+    let provider_aliases = available_model_provider_aliases(cfg);
+    let risk_aliases = cfg.get_map_keys("risk_profiles").unwrap_or_default();
+    let runtime_aliases = cfg.get_map_keys("runtime_profiles").unwrap_or_default();
+    let skill_aliases = cfg.get_map_keys("skill_bundles").unwrap_or_default();
+    let knowledge_aliases = cfg.get_map_keys("knowledge_bundles").unwrap_or_default();
+    let mcp_aliases = cfg.get_map_keys("mcp_bundles").unwrap_or_default();
+    let memory_aliases = cfg.get_map_keys("memory_namespaces").unwrap_or_default();
+
+    let mut step: usize = 0;
+    loop {
+        let nav = match step {
+            0 => prompt_field(cfg, ui, &agent_field_path(alias, "enabled"), None).await?,
+            1 => prompt_agent_system_prompt(cfg, ui, alias).await?,
+            2 => prompt_agent_alias_multi(cfg, ui, alias, "channels", &channel_aliases).await?,
+            3 => {
+                prompt_agent_alias_single(cfg, ui, alias, "model_provider", &provider_aliases)
+                    .await?
+            }
+            4 => prompt_agent_alias_single(cfg, ui, alias, "risk_profile", &risk_aliases).await?,
+            5 => {
+                prompt_agent_alias_single(cfg, ui, alias, "runtime_profile", &runtime_aliases)
+                    .await?
+            }
+            6 => prompt_agent_alias_multi(cfg, ui, alias, "skill_bundles", &skill_aliases).await?,
+            7 => {
+                prompt_agent_alias_multi(cfg, ui, alias, "knowledge_bundles", &knowledge_aliases)
+                    .await?
+            }
+            8 => prompt_agent_alias_multi(cfg, ui, alias, "mcp_bundles", &mcp_aliases).await?,
+            9 => {
+                prompt_agent_alias_single(cfg, ui, alias, "memory_namespace", &memory_aliases)
+                    .await?
+            }
+            _ => return Ok(Nav::Done),
+        };
+        match nav {
+            Nav::Done => step += 1,
+            Nav::Back => {
+                if step == 0 {
+                    return Ok(Nav::Back);
+                }
+                step -= 1;
+            }
+        }
+    }
+}
+
+/// Multi-line system-prompt editor backed by `$EDITOR`. Falls through to
+/// the trait's `editor()` so backends pick the right surface (suspend +
+/// $EDITOR for the TUI, headless echo for `QuickUi`, textarea for the
+/// gateway when wired).
+async fn prompt_agent_system_prompt(
+    cfg: &mut Config,
+    ui: &mut dyn OnboardUi,
+    alias: &str,
+) -> Result<Nav> {
+    let path = agent_field_path(alias, "system_prompt");
+    let current = cfg.get_prop(&path).ok().unwrap_or_default();
+    let initial = if current == "<unset>" {
+        String::new()
+    } else {
+        current.clone()
+    };
+    ui.note("Optional system prompt. Prefer placing prose in `agents/<alias>/AGENTS.md`.");
+    match ui.editor("system-prompt", &initial).await? {
+        Answer::Back => Ok(Nav::Back),
+        Answer::Value(new) => {
+            if new != initial {
+                persist(cfg, &path, &new).await?;
+            }
+            Ok(Nav::Done)
+        }
+    }
+}
+
+/// Single-select alias picker. Always offers a `(none)` choice so the
+/// field can be cleared. When the candidate list is empty, falls back to
+/// a free-text prompt with a hint that no aliases are configured yet.
+async fn prompt_agent_alias_single(
+    cfg: &mut Config,
+    ui: &mut dyn OnboardUi,
+    alias: &str,
+    field: &str,
+    available: &[String],
+) -> Result<Nav> {
+    let path = agent_field_path(alias, field);
+    let current_raw = cfg.get_prop(&path).ok().unwrap_or_default();
+    let current = if current_raw == "<unset>" {
+        String::new()
+    } else {
+        current_raw
+    };
+    let help = field_doc(cfg, &path).unwrap_or_default();
+    ui.note(&help);
+
+    if available.is_empty() {
+        ui.note(&format!(
+            "{help}\nNo {field} aliases configured yet. Press Enter to leave empty."
+        ));
+        match ui.string(field, Some(&current)).await? {
+            Answer::Back => return Ok(Nav::Back),
+            Answer::Value(new) => {
+                if new != current {
+                    persist(cfg, &path, &new).await?;
+                }
+                return Ok(Nav::Done);
+            }
+        }
+    }
+
+    let mut items: Vec<SelectItem> = vec![SelectItem::new("(none)")];
+    for a in available {
+        items.push(SelectItem::new(a.as_str()));
+    }
+    let current_idx = if current.is_empty() {
+        Some(0)
+    } else {
+        available
+            .iter()
+            .position(|a| a == &current)
+            .map(|i| i + 1)
+            .or(Some(0))
+    };
+    match ui.select(field, &items, current_idx).await? {
+        Answer::Back => Ok(Nav::Back),
+        Answer::Value(0) => {
+            if !current.is_empty() {
+                persist(cfg, &path, "").await?;
+            }
+            Ok(Nav::Done)
+        }
+        Answer::Value(i) => {
+            let chosen = &available[i - 1];
+            if chosen != &current {
+                persist(cfg, &path, chosen).await?;
+            }
+            Ok(Nav::Done)
+        }
+    }
+}
+
+/// Multi-select alias picker rendered as a vertical toggle list. Each
+/// available alias is one row prefixed with `[x]` / `[ ]` and a
+/// `selected` badge when chosen; selecting a row toggles its membership.
+/// A trailing `Done` row commits the set. Mirrors the providers picker
+/// (see `providers()` in this file) so CLI and TUI feel identical.
+///
+/// Empty candidate list → no-op skip. Persists nothing if the user
+/// hasn't changed the selection from what's on disk.
+async fn prompt_agent_alias_multi(
+    cfg: &mut Config,
+    ui: &mut dyn OnboardUi,
+    alias: &str,
+    field: &str,
+    available: &[String],
+) -> Result<Nav> {
+    let path = agent_field_path(alias, field);
+    let current_raw = cfg.get_prop(&path).ok().unwrap_or_default();
+    let initial = parse_string_array_display(&current_raw);
+    // Drop currently-selected entries that no longer exist as candidates;
+    // the validator catches them otherwise but the picker shouldn't
+    // pretend they're present.
+    let mut selected: Vec<String> = initial
+        .iter()
+        .filter(|s| available.iter().any(|a| a == *s))
+        .cloned()
+        .collect();
+    let help = field_doc(cfg, &path).unwrap_or_default();
+
+    if available.is_empty() {
+        ui.note(&format!(
+            "{help}\nNo {field} aliases configured yet — skipping."
+        ));
+        return Ok(Nav::Done);
+    }
+
+    loop {
+        ui.note(&format!(
+            "{help}\nEnter toggles a row. Pick `Done` to commit. ({} of {} selected)",
+            selected.len(),
+            available.len(),
+        ));
+
+        let mut items: Vec<SelectItem> = available
+            .iter()
+            .map(|a| {
+                let is_selected = selected.contains(a);
+                let label = format!("[{}] {a}", if is_selected { "x" } else { " " });
+                if is_selected {
+                    SelectItem::with_badge(label, "selected")
+                } else {
+                    SelectItem::new(label)
+                }
+            })
+            .collect();
+        items.push(SelectItem::new("Done"));
+        let done_idx = items.len() - 1;
+
+        match ui.select(field, &items, Some(done_idx)).await? {
+            Answer::Back => return Ok(Nav::Back),
+            Answer::Value(i) if i == done_idx => {
+                let serialized = serialize_string_array_json(&selected);
+                if serialized != current_raw {
+                    persist(cfg, &path, &serialized).await?;
+                }
+                return Ok(Nav::Done);
+            }
+            Answer::Value(i) => {
+                let alias_at = &available[i];
+                if let Some(pos) = selected.iter().position(|a| a == alias_at) {
+                    selected.remove(pos);
+                } else {
+                    selected.push(alias_at.clone());
+                }
+            }
+        }
+    }
+}
+
+fn field_doc(cfg: &Config, path: &str) -> Option<String> {
+    cfg.prop_fields()
+        .into_iter()
+        .find(|f| f.name == path)
+        .map(|f| f.description.to_string())
+}
+
+/// Parse `get_prop`'s display form for a string array back into a Vec.
+/// `get_prop` returns toml's display syntax (e.g. `["a", "b"]`), so the
+/// JSON parser handles both shapes; falls back to comma-split.
+fn parse_string_array_display(s: &str) -> Vec<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed == "<unset>" || trimmed == "[]" {
+        return Vec::new();
+    }
+    if trimmed.starts_with('[')
+        && let Ok(arr) = serde_json::from_str::<Vec<String>>(trimmed)
+    {
+        return arr;
+    }
+    trimmed
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn serialize_string_array_json(items: &[String]) -> String {
+    serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// All currently-configured channel aliases in dotted form
+/// (`telegram.default`, `discord.work`). Pulled from `prop_fields` so it
+/// reflects whatever the user has just configured.
+fn available_channel_aliases(cfg: &Config) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for f in cfg.prop_fields() {
+        if let Some(rest) = f.name.strip_prefix("channels.") {
+            let mut parts = rest.splitn(3, '.');
+            if let (Some(ty), Some(alias), Some(_leaf)) = (parts.next(), parts.next(), parts.next())
+            {
+                let dotted = format!("{ty}.{alias}");
+                if !out.contains(&dotted) {
+                    out.push(dotted);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// All currently-configured model-provider aliases in dotted form
+/// (`anthropic.default`, `openrouter.work`). Pulled from `prop_fields`.
+fn available_model_provider_aliases(cfg: &Config) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for f in cfg.prop_fields() {
+        if let Some(rest) = f.name.strip_prefix("providers.models.") {
+            let mut parts = rest.splitn(3, '.');
+            if let (Some(ty), Some(alias), Some(_leaf)) = (parts.next(), parts.next(), parts.next())
+            {
+                let dotted = format!("{ty}.{alias}");
+                if !out.contains(&dotted) {
+                    out.push(dotted);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 #[cfg(test)]

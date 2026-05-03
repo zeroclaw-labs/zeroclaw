@@ -630,6 +630,9 @@ impl OnboardUi for RatatuiUi {
         } else {
             self.help = Some(msg.to_string());
         }
+        // A new field is being prompted — drop stale warns from the
+        // previous field. Status entries (informational) are preserved.
+        self.log.retain(|l| matches!(l.level, LogLevel::Status));
     }
 
     fn status(&mut self, msg: &str) {

@@ -2430,7 +2430,7 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
-    let bootstrap_max_chars = if config.agent.compact_context {
+    let bootstrap_max_chars = if config.default_agent().compact_context {
         Some(6000)
     } else {
         None
@@ -2446,8 +2446,8 @@ pub async fn run(
         Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
-        config.agent.compact_context,
-        config.agent.max_system_prompt_chars,
+        config.default_agent().compact_context,
+        config.default_agent().max_system_prompt_chars,
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -2517,7 +2517,7 @@ pub async fn run(
         let thinking_level = crate::agent::thinking::resolve_thinking_level(
             thinking_directive,
             None,
-            &config.agent.thinking,
+            &config.default_agent().thinking,
         );
         let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
         let effective_temperature = crate::agent::thinking::clamp_temperature(
@@ -2553,7 +2553,11 @@ pub async fn run(
             memory_session_id.as_deref(),
         )
         .await;
-        let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+        let rag_limit = if config.default_agent().compact_context {
+            2
+        } else {
+            5
+        };
         let hw_context = hardware_rag
             .as_ref()
             .map(|r| build_hardware_context(r, &effective_msg, &board_names, rag_limit))
@@ -2572,17 +2576,17 @@ pub async fn run(
         ];
 
         // Prune history for token efficiency (when enabled).
-        if config.agent.history_pruning.enabled {
+        if config.default_agent().history_pruning.enabled {
             let _stats = crate::agent::history_pruner::prune_history(
                 &mut history,
-                &config.agent.history_pruning,
+                &config.default_agent().history_pruning,
             );
         }
 
         // Compute per-turn excluded MCP tools from tool_filter_groups.
         let excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
-            &config.agent.tool_filter_groups,
+            &config.default_agent().tool_filter_groups,
             &effective_msg,
         );
 
@@ -2605,17 +2609,17 @@ pub async fn run(
                         channel_name,
                         None,
                         &config.multimodal,
-                        config.agent.max_tool_iterations,
+                        config.default_agent().max_tool_iterations,
                         None,
                         None,
                         None,
                         &excluded_tools,
-                        &config.agent.tool_call_dedup_exempt,
+                        &config.default_agent().tool_call_dedup_exempt,
                         activated_handle.as_ref(),
                         Some(model_switch_callback.clone()),
                         &config.pacing,
-                        config.agent.max_tool_result_chars,
-                        config.agent.max_context_tokens,
+                        config.default_agent().max_tool_result_chars,
+                        config.default_agent().max_context_tokens,
                         None, // shared_budget
                         None, // channel: CLI mode — uses prompt_cli
                         None, // receipt_generator
@@ -2797,7 +2801,7 @@ pub async fn run(
             let thinking_level = crate::agent::thinking::resolve_thinking_level(
                 thinking_directive,
                 None,
-                &config.agent.thinking,
+                &config.default_agent().thinking,
             );
             let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
             let turn_temperature = crate::agent::thinking::clamp_temperature(
@@ -2840,7 +2844,11 @@ pub async fn run(
                 memory_session_id.as_deref(),
             )
             .await;
-            let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+            let rag_limit = if config.default_agent().compact_context {
+                2
+            } else {
+                5
+            };
             let hw_context = hardware_rag
                 .as_ref()
                 .map(|r| build_hardware_context(r, &effective_input, &board_names, rag_limit))
@@ -2858,7 +2866,7 @@ pub async fn run(
             // Compute per-turn excluded MCP tools from tool_filter_groups.
             let excluded_tools = compute_excluded_mcp_tools(
                 &tools_registry,
-                &config.agent.tool_filter_groups,
+                &config.default_agent().tool_filter_groups,
                 &effective_input,
             );
 
@@ -2917,17 +2925,17 @@ pub async fn run(
                             channel_name,
                             None,
                             &config.multimodal,
-                            config.agent.max_tool_iterations,
+                            config.default_agent().max_tool_iterations,
                             Some(cancel_token.clone()),
                             Some(delta_tx.clone()),
                             None,
                             &excluded_tools,
-                            &config.agent.tool_call_dedup_exempt,
+                            &config.default_agent().tool_call_dedup_exempt,
                             activated_handle.as_ref(),
                             Some(model_switch_callback.clone()),
                             &config.pacing,
-                            config.agent.max_tool_result_chars,
-                            config.agent.max_context_tokens,
+                            config.default_agent().max_tool_result_chars,
+                            config.default_agent().max_context_tokens,
                             None, // shared_budget
                             None, // channel: interactive CLI — uses prompt_cli
                             None, // receipt_generator
@@ -2980,8 +2988,8 @@ pub async fn run(
                             );
                             let mut compressor =
                                 crate::agent::context_compressor::ContextCompressor::new(
-                                    config.agent.context_compression.clone(),
-                                    config.agent.max_context_tokens,
+                                    config.default_agent().context_compression.clone(),
+                                    config.default_agent().max_context_tokens,
                                 )
                                 .with_memory(mem.clone());
                             let error_msg = format!("{e}");
@@ -3039,8 +3047,8 @@ pub async fn run(
             // Context compression before hard trimming to preserve long-context signal.
             {
                 let compressor = crate::agent::context_compressor::ContextCompressor::new(
-                    config.agent.context_compression.clone(),
-                    config.agent.max_context_tokens,
+                    config.default_agent().context_compression.clone(),
+                    config.default_agent().max_context_tokens,
                 )
                 .with_memory(mem.clone());
                 match compressor
@@ -3061,13 +3069,16 @@ pub async fn run(
                             error = %e,
                             "Context compression failed, falling back to history trim"
                         );
-                        trim_history(&mut history, config.agent.max_history_messages / 2);
+                        trim_history(
+                            &mut history,
+                            config.default_agent().max_history_messages / 2,
+                        );
                     }
                 }
             }
 
             // Hard cap as a safety net.
-            trim_history(&mut history, config.agent.max_history_messages);
+            trim_history(&mut history, config.default_agent().max_history_messages);
 
             // Restore base system prompt (remove per-turn thinking prefix).
             if thinking_params.system_prompt_prefix.is_some()
@@ -3361,7 +3372,7 @@ pub async fn process_message(
         }
     }
 
-    let bootstrap_max_chars = if config.agent.compact_context {
+    let bootstrap_max_chars = if config.default_agent().compact_context {
         Some(6000)
     } else {
         None
@@ -3377,8 +3388,8 @@ pub async fn process_message(
         Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
-        config.agent.compact_context,
-        config.agent.max_system_prompt_chars,
+        config.default_agent().compact_context,
+        config.default_agent().max_system_prompt_chars,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
@@ -3400,7 +3411,7 @@ pub async fn process_message(
     let thinking_level = crate::agent::thinking::resolve_thinking_level(
         thinking_directive,
         None,
-        &config.agent.thinking,
+        &config.default_agent().thinking,
     );
     let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
     let effective_temperature = crate::agent::thinking::clamp_temperature(
@@ -3425,7 +3436,11 @@ pub async fn process_message(
         session_id,
     )
     .await;
-    let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+    let rag_limit = if config.default_agent().compact_context {
+        2
+    } else {
+        5
+    };
     let hw_context = hardware_rag
         .as_ref()
         .map(|r| build_hardware_context(r, effective_msg_ref, &board_names, rag_limit))
@@ -3444,7 +3459,7 @@ pub async fn process_message(
     ];
     let mut excluded_tools = compute_excluded_mcp_tools(
         &tools_registry,
-        &config.agent.tool_filter_groups,
+        &config.default_agent().tool_filter_groups,
         effective_msg_ref,
     );
     if config.autonomy.level != AutonomyLevel::Full {
@@ -3463,10 +3478,10 @@ pub async fn process_message(
         "daemon",
         None,
         &config.multimodal,
-        config.agent.max_tool_iterations,
+        config.default_agent().max_tool_iterations,
         Some(&approval_manager),
         &excluded_tools,
-        &config.agent.tool_call_dedup_exempt,
+        &config.default_agent().tool_call_dedup_exempt,
         activated_handle_pm.as_ref(),
         None,
         None, // channel: process_message path has no channel ref

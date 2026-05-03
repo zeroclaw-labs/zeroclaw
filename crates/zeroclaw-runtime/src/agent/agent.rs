@@ -32,7 +32,7 @@ pub struct Agent {
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
     memory_loader: Box<dyn MemoryLoader>,
-    config: zeroclaw_config::schema::AgentConfig,
+    config: zeroclaw_config::schema::DelegateAgentConfig,
     model_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
@@ -130,7 +130,7 @@ pub struct AgentBuilder {
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_loader: Option<Box<dyn MemoryLoader>>,
-    config: Option<zeroclaw_config::schema::AgentConfig>,
+    config: Option<zeroclaw_config::schema::DelegateAgentConfig>,
     model_name: Option<String>,
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
@@ -224,7 +224,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn config(mut self, config: zeroclaw_config::schema::AgentConfig) -> Self {
+    pub fn config(mut self, config: zeroclaw_config::schema::DelegateAgentConfig) -> Self {
         self.config = Some(config);
         self
     }
@@ -635,7 +635,7 @@ impl Agent {
             &provider_runtime_options,
         )?;
 
-        let dispatcher_choice = config.agent.tool_dispatcher.as_str();
+        let dispatcher_choice = config.default_agent().tool_dispatcher.as_str();
         let tool_dispatcher: Box<dyn ToolDispatcher> = match dispatcher_choice {
             "native" => Box::new(NativeToolDispatcher),
             "xml" => Box::new(XmlToolDispatcher),
@@ -689,7 +689,7 @@ impl Agent {
                 config.memory.min_relevance_score,
             )))
             .prompt_builder(SystemPromptBuilder::with_defaults())
-            .config(config.agent.clone())
+            .config(config.default_agent().clone())
             .model_name(model_name)
             .temperature(
                 fallback_provider_ag
@@ -2167,6 +2167,7 @@ mod tests {
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
         let server_handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -2181,10 +2182,17 @@ mod tests {
             ..Default::default()
         };
         {
+            // Use the `custom:<url>` provider — it builds an
+            // OpenAiCompatibleProvider routed through the `compat`
+            // closure, which is the only path that actually wires
+            // `extra_headers` onto outgoing requests. (The native
+            // `openai` factory ignores extra_headers; OpenRouter
+            // hardcodes the upstream URL.)
+            let provider_type = format!("custom:http://{mock_addr}");
             let entry = config
                 .providers
                 .models
-                .entry("openrouter".to_string())
+                .entry(provider_type)
                 .or_default()
                 .entry("default".to_string())
                 .or_default();
@@ -2698,9 +2706,9 @@ mod tests {
         // Force trimming with the boundary landing inside a pair:
         // 5 entries (AC, TR, AC, TR, AC) > 4 → drop_count = 1 → AC1 dropped,
         // TR1 left as an orphan unless the trim guards against it.
-        let agent_config = zeroclaw_config::schema::AgentConfig {
+        let agent_config = zeroclaw_config::schema::DelegateAgentConfig {
             max_history_messages: 4,
-            ..zeroclaw_config::schema::AgentConfig::default()
+            ..zeroclaw_config::schema::DelegateAgentConfig::default()
         };
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});

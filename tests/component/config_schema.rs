@@ -3,15 +3,11 @@
 //! Validates: config defaults, backward compatibility, invalid input rejection,
 //! and gateway/security/agent config boundary conditions.
 
-use zeroclaw::config::migration::{self, V1Compat};
+use zeroclaw::config::migration;
 use zeroclaw::config::{AutonomyConfig, ChannelsConfig, Config, GatewayConfig, SecurityConfig};
 
 fn migrate(toml_str: &str) -> Config {
-    let mut table: toml::Table = toml::from_str(toml_str).expect("failed to parse table");
-    migration::prepare_table(&mut table);
-    let prepared = toml::to_string(&table).expect("failed to re-serialize");
-    let compat: V1Compat = toml::from_str(&prepared).expect("failed to deserialize");
-    compat.into_config()
+    migration::migrate_to_current(toml_str).expect("migration succeeds")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,10 +65,14 @@ fn config_wrong_type_for_temperature_fails() {
     let toml_str = r#"
 default_temperature = "hot"
 "#;
-    let result: Result<V1Compat, _> = toml::from_str(toml_str);
+    // V1's `default_temperature` is folded into providers.models.<x>.default
+    // by `migrate_to_current`. A non-f64 value should fail at the migration
+    // boundary because the synthesized provider entry can't deserialize
+    // a string into Option<f64>.
+    let result = migration::migrate_to_current(toml_str);
     assert!(
         result.is_err(),
-        "string for f64 temperature should fail to parse"
+        "string for f64 temperature should fail migration"
     );
 }
 
@@ -386,7 +386,7 @@ fn config_empty_toml_uses_default_temperature() {
 #[test]
 fn config_minimal_toml_with_temperature_uses_defaults() {
     let config = migrate("default_temperature = 0.7\ndefault_provider = \"test\"\n");
-    assert_eq!(config.agent.max_tool_iterations, 10);
+    assert_eq!(config.default_agent().max_tool_iterations, 10);
     assert_eq!(config.gateway.port, 42617);
 }
 
@@ -403,7 +403,7 @@ fn config_only_temperature_parses() {
             .abs()
             < f64::EPSILON
     );
-    assert_eq!(config.agent.max_tool_iterations, 10);
+    assert_eq!(config.default_agent().max_tool_iterations, 10);
 }
 
 #[test]

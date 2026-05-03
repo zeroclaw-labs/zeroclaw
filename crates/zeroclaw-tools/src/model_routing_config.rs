@@ -29,14 +29,13 @@ impl ModelRoutingConfigTool {
             )
         })?;
 
-        let compat: zeroclaw_config::migration::V1Compat =
-            toml::from_str(&contents).map_err(|error| {
+        let mut parsed =
+            zeroclaw_config::migration::migrate_to_current(&contents).map_err(|error| {
                 anyhow::anyhow!(
                     "Failed to parse config file {}: {error}",
                     self.config.config_path.display()
                 )
             })?;
-        let mut parsed = compat.into_config();
         parsed.config_path = self.config.config_path.clone();
         parsed.workspace_dir = self.config.workspace_dir.clone();
         Ok(parsed)
@@ -1155,8 +1154,13 @@ mod tests {
 
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         let output: Value = serde_json::from_str(&get_result.output).unwrap();
-        assert_eq!(output["agents"]["coder"]["provider"], json!("openai"));
-        assert_eq!(output["agents"]["coder"]["model"], json!("gpt-5.3-codex"));
+        // V3 surfaces the dotted alias ref on the agent. The actual model
+        // string lives under providers.models.openai.coder (synthesized
+        // from the `model` upsert arg).
+        assert_eq!(
+            output["agents"]["coder"]["model_provider"],
+            json!("openai.coder")
+        );
         assert_eq!(output["agents"]["coder"]["agentic"], json!(true));
 
         let remove = tool

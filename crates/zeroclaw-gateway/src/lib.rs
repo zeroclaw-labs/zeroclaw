@@ -1056,6 +1056,10 @@ pub async fn run_gateway(
             get(api_onboard::handle_catalog_models),
         )
         .route("/api/onboard/status", get(api_onboard::handle_onboard_status))
+        .route(
+            "/api/onboard/agent-options",
+            get(api_onboard::handle_agent_options),
+        )
         .route("/api/onboard/sections", get(api_onboard::handle_sections))
         .route(
             "/api/onboard/sections/{section}",

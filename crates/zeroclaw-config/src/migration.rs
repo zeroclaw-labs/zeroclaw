@@ -14,17 +14,15 @@
 //!
 //! 1. Bump [`CURRENT_SCHEMA_VERSION`].
 //! 2. Add structural TOML-level rewrites to the appropriate `v{N}_to_v{M}_table()`
-//!    function (shape changes that must happen before serde deserialization).
-//!    `prepare_table()` dispatches to these based on `schema_version`.
-//! 3. Add a `fn vN_to_vM(config: &mut Config)` for any in-memory work that can
-//!    only run after deserialization, and gate it in `into_config()` on `from < M`.
-//!    V1 fields are the exception — they live on `V1Compat` and are handled by
-//!    `migrate_providers()`, gated on `from < 2 || has_legacy_fields()`.
-//! 4. Add a test in `tests/component/config_migration.rs`:
-//!    - Deserialize a TOML string with the old layout.
+//!    function. All shape-changing logic lives at the TOML level so a single
+//!    `prepare_table` pass produces a current-schema table that deserializes
+//!    directly into `Config`. `prepare_table()` dispatches to these based on
+//!    the input's `schema_version` value.
+//! 3. Add a test in `tests/component/config_migration.rs`:
+//!    - Run the test through `migration::migrate_to_current(toml_str)`.
 //!    - Assert the migrated `Config` has values in the new locations.
 //!    - Assert the old locations are empty/cleared.
-//! 5. Verify with `cargo test --test component -- config_migration`.
+//! 4. Verify with `cargo test --test component -- config_migration`.
 //!
 //! ## User-facing migration command
 //!
@@ -32,16 +30,14 @@
 //! schema version using `toml_edit` to preserve comments and formatting.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
-use std::collections::HashMap;
 use toml_edit::DocumentMut;
-
-use super::schema::ModelProviderConfig;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
-/// Top-level keys from V1 that are consumed by V1Compat during migration.
-/// Used by the unknown-key detector to suppress false "unknown key" warnings.
+/// Top-level keys from V1 that `migrate_v1_provider_fields_into_providers_table`
+/// folds into the V2/V3 `[providers.*]` shape. Used by the unknown-key
+/// detector to suppress false "unknown key" warnings on partially-migrated
+/// inputs (and by `migrate_file` to short-circuit no-op writes).
 pub const V1_LEGACY_KEYS: &[&str] = &[
     "api_key",
     "api_url",
@@ -60,304 +56,108 @@ pub const V1_LEGACY_KEYS: &[&str] = &[
     "channels_config",
 ];
 
-/// Wraps the current Config with extra fields from V1 that no longer exist on Config.
-/// `#[serde(flatten)]` lets Config consume its known fields; the old fields are
-/// captured here.
-#[derive(Deserialize)]
-pub struct V1Compat {
-    #[serde(flatten)]
-    pub config: super::schema::Config,
-
-    // ── Old top-level provider fields (removed in V2) ──
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    api_url: Option<String>,
-    #[serde(default)]
-    api_path: Option<String>,
-    #[serde(default, alias = "model_provider")]
-    default_provider: Option<String>,
-    #[serde(default, alias = "model")]
-    default_model: Option<String>,
-    #[serde(default)]
-    model_providers: HashMap<String, ModelProviderConfig>,
-    #[serde(default)]
-    default_temperature: Option<f64>,
-    #[serde(default)]
-    provider_timeout_secs: Option<u64>,
-    #[serde(default)]
-    provider_max_tokens: Option<u32>,
-    #[serde(default)]
-    extra_headers: Option<HashMap<String, String>>,
-    #[serde(default)]
-    model_routes: Vec<super::schema::ModelRouteConfig>,
-    #[serde(default)]
-    embedding_routes: Vec<super::schema::EmbeddingRouteConfig>,
+/// Run `prepare_table` on a raw config TOML string and deserialize the
+/// result directly into `Config`. This is the canonical migration entry
+/// point — V1 / V2 / V3 inputs all flow through the same path; the
+/// per-version TOML transforms in `prepare_table` ensure deserialization
+/// always sees a current-schema-shaped table.
+///
+/// Returns a fully-migrated `Config` with `schema_version` bumped to
+/// `CURRENT_SCHEMA_VERSION`.
+pub fn migrate_to_current(raw: &str) -> Result<super::schema::Config> {
+    let mut table: toml::Table = toml::from_str(raw).context("failed to parse config TOML")?;
+    prepare_table(&mut table);
+    let prepared = toml::to_string(&table).context("failed to re-serialize prepared table")?;
+    let mut config: super::schema::Config =
+        toml::from_str(&prepared).context("failed to deserialize migrated config")?;
+    config.schema_version = CURRENT_SCHEMA_VERSION;
+    Ok(config)
 }
 
-impl V1Compat {
-    /// Consume self, running each versioned migration step in order.
-    pub fn into_config(mut self) -> super::schema::Config {
-        let from = self.config.schema_version;
-        let needs_migration = from < CURRENT_SCHEMA_VERSION || self.has_legacy_fields();
+/// Render `config` as a V2-shaped TOML table (downgrade): take the
+/// `default` alias of every aliased channel/provider entry, strip
+/// V3-only top-level sections, drop per-agent V3 fields. Used by the
+/// fixture generator to emit reference V2 snapshots.
+pub fn snapshot_v2(config: &super::schema::Config) -> toml::Table {
+    let raw = toml::to_string(config).unwrap_or_default();
+    let mut config_table: toml::Table = toml::from_str(&raw).unwrap_or_default();
+    config_table.insert("schema_version".into(), toml::Value::Integer(2));
 
-        if !needs_migration {
-            return self.config;
-        }
-
-        if from < 2 || self.has_legacy_fields() {
-            self.v1_to_v2();
-        }
-        if from < 3 {
-            v2_to_v3(&mut self.config);
-        }
-
-        self.config.schema_version = CURRENT_SCHEMA_VERSION;
-
-        tracing::info!(
-            from = from,
-            to = CURRENT_SCHEMA_VERSION,
-            "Config schema migrated in-memory from version {from} to {CURRENT_SCHEMA_VERSION}. \
-             Run `zeroclaw config migrate` to update the file on disk.",
-        );
-
-        self.config
-    }
-
-    /// Parse a V1 fixture TOML string into V1Compat, running `prepare_table`
-    /// first so field shapes are normalised before serde deserialization —
-    /// same path as a real config load.
-    fn from_v1_fixture(raw: &str) -> Result<Self, String> {
-        let mut table: toml::Table =
-            toml::from_str(raw).map_err(|e| format!("failed to parse v1 fixture table: {e}"))?;
-        prepare_table(&mut table);
-        let prepared = toml::to_string(&table)
-            .map_err(|e| format!("failed to re-serialize v1 fixture: {e}"))?;
-        toml::from_str(&prepared).map_err(|e| format!("failed to deserialize v1 fixture: {e}"))
-    }
-
-    /// Serialize into V2 TOML shape.
-    ///
-    /// Starts from the full serialized config (so all sections are present), then
-    /// downgrades only the V3-specific shapes back to V2:
-    /// - `providers.fallback`: array → bare string (first entry, type portion only)
-    /// - `providers.models.<type>`: nested alias map → flat table (take "default" alias)
-    /// - `channels.<type>`: aliased sub-tables → flat table (take "default" alias)
-    /// - V3-only top-level sections (risk_profiles, runtime_profiles, agents, etc.)
-    ///   are stripped — they have no V2 equivalent.
-    fn snapshot_v2(&self) -> toml::Table {
-        let raw = toml::to_string(&self.config).unwrap_or_default();
-        let mut config_table: toml::Table = toml::from_str(&raw).unwrap_or_default();
-        config_table.insert("schema_version".into(), toml::Value::Integer(2));
-
-        if let Some(toml::Value::Table(providers)) = config_table.get_mut("providers") {
-            // Strip any lingering fallback key from V2 configs during downgrade.
-            providers.remove("fallback");
-
-            // Downgrade providers.models: nested alias map → flat (take "default" alias).
-            if let Some(toml::Value::Table(models)) = providers.get_mut("models") {
-                let type_keys: Vec<String> = models.keys().cloned().collect();
-                for type_key in type_keys {
-                    if let Some(toml::Value::Table(alias_map)) = models.get(&type_key).cloned() {
-                        // If already flat (no sub-tables), leave as-is.
-                        if alias_map
-                            .values()
-                            .any(|v| !matches!(v, toml::Value::Table(_)))
-                        {
-                            continue;
-                        }
-                        if let Some(toml::Value::Table(default_entry)) =
-                            alias_map.get("default").cloned()
-                        {
-                            models.insert(type_key, toml::Value::Table(default_entry));
-                        }
-                    }
+    if let Some(toml::Value::Table(providers)) = config_table.get_mut("providers")
+        && let Some(toml::Value::Table(models)) = providers.get_mut("models")
+    {
+        let type_keys: Vec<String> = models.keys().cloned().collect();
+        for type_key in type_keys {
+            if let Some(toml::Value::Table(alias_map)) = models.get(&type_key).cloned() {
+                if alias_map
+                    .values()
+                    .any(|v| !matches!(v, toml::Value::Table(_)))
+                {
+                    continue;
+                }
+                if let Some(toml::Value::Table(default_entry)) = alias_map.get("default").cloned() {
+                    models.insert(type_key, toml::Value::Table(default_entry));
                 }
             }
         }
+    }
 
-        // Downgrade channels: aliased sub-tables → flat (take "default" alias).
-        if let Some(toml::Value::Table(channels)) = config_table.get_mut("channels") {
-            let ch_keys: Vec<String> = channels.keys().cloned().collect();
-            for ch_type in ch_keys {
-                if let Some(toml::Value::Table(alias_map)) = channels.get(&ch_type).cloned() {
-                    if alias_map
-                        .values()
-                        .any(|v| !matches!(v, toml::Value::Table(_)))
-                    {
-                        // Already flat.
-                        continue;
-                    }
-                    if let Some(toml::Value::Table(default_entry)) =
-                        alias_map.get("default").cloned()
-                    {
-                        channels.insert(ch_type, toml::Value::Table(default_entry));
-                    }
+    if let Some(toml::Value::Table(channels)) = config_table.get_mut("channels") {
+        let ch_keys: Vec<String> = channels.keys().cloned().collect();
+        for ch_type in ch_keys {
+            if let Some(toml::Value::Table(alias_map)) = channels.get(&ch_type).cloned() {
+                if alias_map
+                    .values()
+                    .any(|v| !matches!(v, toml::Value::Table(_)))
+                {
+                    continue;
                 }
-            }
-            // Keep non-channel scalar fields (e.g. ack_reactions, cli) by leaving them.
-        }
-
-        // Strip V3-only top-level sections that do not exist in V2.
-        for key in &[
-            "risk_profiles",
-            "runtime_profiles",
-            "memory_namespaces",
-            "skill_bundles",
-            "mcp_bundles",
-            "knowledge_bundles",
-        ] {
-            config_table.remove(*key);
-        }
-
-        // Agents in V2 used inline provider/model/temperature — strip model_provider.
-        if let Some(toml::Value::Table(agents)) = config_table.get_mut("agents") {
-            let agent_keys: Vec<String> = agents.keys().cloned().collect();
-            for key in agent_keys {
-                if let Some(toml::Value::Table(at)) = agents.get_mut(&key) {
-                    at.remove("model_provider");
-                    at.remove("model_provider_fallback");
+                if let Some(toml::Value::Table(default_entry)) = alias_map.get("default").cloned() {
+                    channels.insert(ch_type, toml::Value::Table(default_entry));
                 }
             }
         }
-
-        config_table
     }
 
-    fn snapshot_current(&self) -> toml::Table {
-        let mut t: toml::Table =
-            toml::from_str(&toml::to_string(&self.config).unwrap_or_default()).unwrap_or_default();
-        // The Config struct still carries V2 fields that prepare_table strips when
-        // loading a V3 file. Strip them here so the canonical V3 fixture does not
-        // re-emit sections that migration removes (autonomy, agent, security
-        // subsections, swarms). Snapshot must match what a round-tripped load produces.
-        t.remove("autonomy");
-        t.remove("agent");
-        t.remove("swarms");
-        if let Some(toml::Value::Table(security)) = t.get_mut("security") {
-            security.remove("sandbox");
-            security.remove("resources");
-        }
-        t
+    for key in &[
+        "risk_profiles",
+        "runtime_profiles",
+        "memory_namespaces",
+        "skill_bundles",
+        "mcp_bundles",
+        "knowledge_bundles",
+    ] {
+        config_table.remove(*key);
     }
 
-    fn has_legacy_fields(&self) -> bool {
-        self.api_key.is_some()
-            || self.api_url.is_some()
-            || self.api_path.is_some()
-            || self.default_provider.is_some()
-            || self.default_model.is_some()
-            || !self.model_providers.is_empty()
-            || self.default_temperature.is_some()
-            || self.provider_timeout_secs.is_some()
-            || self.provider_max_tokens.is_some()
-            || self.extra_headers.as_ref().is_some_and(|h| !h.is_empty())
-            || !self.model_routes.is_empty()
-            || !self.embedding_routes.is_empty()
-    }
-
-    fn v1_to_v2(&mut self) {
-        // First, move old model_providers entries into providers.models.
-        // V1 top-level entries use bare type keys ("anthropic"); insert under "default" alias.
-        for (key, profile) in std::mem::take(&mut self.model_providers) {
-            self.config
-                .providers
-                .models
-                .entry(key)
-                .or_default()
-                .entry("default".to_string())
-                .or_insert(profile);
-        }
-
-        // Only create a fallback scaffolding entry if there are V1 top-level fields
-        // to migrate into it. If none exist, there is nothing to write and creating
-        // an empty entry would produce an invalid config.
-        let has_v1_fields = self.api_key.is_some()
-            || self.api_url.is_some()
-            || self.api_path.is_some()
-            || self.default_model.is_some()
-            || self.default_temperature.is_some()
-            || self.provider_timeout_secs.is_some()
-            || self.provider_max_tokens.is_some()
-            || self.extra_headers.as_ref().is_some_and(|h| !h.is_empty());
-
-        if !has_v1_fields {
-            if let Some(provider) = self.default_provider.take()
-                && self.config.providers.models.is_empty()
-            {
-                self.config
-                    .providers
-                    .models
-                    .entry(provider.clone())
-                    .or_default()
-                    .entry("default".to_string())
-                    .or_default();
+    if let Some(toml::Value::Table(agents)) = config_table.get_mut("agents") {
+        let agent_keys: Vec<String> = agents.keys().cloned().collect();
+        for key in agent_keys {
+            if let Some(toml::Value::Table(at)) = agents.get_mut(&key) {
+                at.remove("model_provider");
             }
-            return;
-        }
-
-        let fallback = self
-            .default_provider
-            .take()
-            .or_else(|| {
-                self.config
-                    .providers
-                    .first_provider_type()
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "default".to_string());
-
-        // Fill gaps in the fallback entry from top-level V1 fields.
-        // fallback is a bare type name (e.g. "anthropic"); map to "default" alias in nested map.
-        let entry = self
-            .config
-            .providers
-            .models
-            .entry(fallback.clone())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
-
-        if entry.api_key.is_none() {
-            entry.api_key = self.api_key.take();
-        }
-        if entry.base_url.is_none() {
-            entry.base_url = self.api_url.take();
-        }
-        if entry.api_path.is_none() {
-            entry.api_path = self.api_path.take();
-        }
-        if entry.model.is_none() {
-            entry.model = self.default_model.take();
-        }
-        if entry.temperature.is_none() {
-            entry.temperature = self.default_temperature.take();
-        }
-        if entry.timeout_secs.is_none() {
-            entry.timeout_secs = self.provider_timeout_secs.take();
-        }
-        if entry.max_tokens.is_none() {
-            entry.max_tokens = self.provider_max_tokens.take();
-        }
-        if entry.extra_headers.is_empty()
-            && let Some(headers) = self.extra_headers.take()
-        {
-            entry.extra_headers = headers;
-        }
-
-        // Move routing rules into providers.
-        if self.config.providers.model_routes.is_empty() && !self.model_routes.is_empty() {
-            self.config.providers.model_routes = std::mem::take(&mut self.model_routes);
-        }
-        if self.config.providers.embedding_routes.is_empty() && !self.embedding_routes.is_empty() {
-            self.config.providers.embedding_routes = std::mem::take(&mut self.embedding_routes);
-        }
-
-        // Populate providers.fallback so v2_to_v3() can normalize it to a dotted alias ref.
-        if !self.config.providers.fallback.contains(&fallback) {
-            self.config.providers.fallback.push(fallback);
         }
     }
+
+    config_table
+}
+
+/// Render `config` as a current-schema (V3) TOML table. The `Config`
+/// struct still carries V2-era fields (`autonomy`, `agent`, `swarms`,
+/// some `security` subsections) that `prepare_table` strips on load;
+/// strip them here so the canonical V3 fixture matches a round-tripped
+/// load exactly.
+pub fn snapshot_current(config: &super::schema::Config) -> toml::Table {
+    let mut t: toml::Table =
+        toml::from_str(&toml::to_string(config).unwrap_or_default()).unwrap_or_default();
+    t.remove("autonomy");
+    t.remove("agent");
+    t.remove("swarms");
+    if let Some(toml::Value::Table(security)) = t.get_mut("security") {
+        security.remove("sandbox");
+        security.remove("resources");
+    }
+    t
 }
 
 /// Move a scalar string field into a `Vec<String>` field on the same TOML table.
@@ -386,42 +186,197 @@ pub(crate) fn scalar_to_vec(section: &mut toml::Table, old_key: &str, new_key: &
     }
 }
 
-/// All channel type keys recognised in V2 `[channels]` that the aliasing
-/// migration wraps into `[channels.<type>.default]`.
-const CHANNEL_TYPES: &[&str] = &[
-    "telegram",
-    "discord",
-    "slack",
-    "mattermost",
-    "webhook",
-    "imessage",
-    "matrix",
-    "signal",
-    "whatsapp",
-    "linq",
-    "wati",
-    "nextcloud_talk",
-    "email",
-    "gmail_push",
-    "irc",
-    "lark",
-    "line",
-    "feishu",
-    "dingtalk",
-    "wecom",
-    "wechat",
-    "qq",
-    "twitter",
-    "mochat",
-    "nostr",
-    "clawdtalk",
-    "reddit",
-    "bluesky",
-    "voice_call",
-    "voice_wake",
-    "voice_duplex",
-    "mqtt",
-];
+/// V1 → V2 provider-section migration. Lifts V1's flat top-level
+/// provider scheme onto V2's nested `[providers.models.<type>.<alias>]`
+/// shape entirely at the TOML level, replacing the legacy `V1Compat`
+/// in-memory pass with a single pre-deserialization transform.
+///
+/// Handles:
+/// 1. `[model_providers.<type>]` → `[providers.models.<type>.default]`
+///    (V1 had a single alias per type; default-named).
+/// 2. Top-level V1 scalars (`api_key`, `api_url`, `api_path`,
+///    `default_model`, `default_temperature`, `provider_timeout_secs`,
+///    `provider_max_tokens`, `extra_headers`) folded into
+///    `[providers.models.<type>.default]` for the type resolved from
+///    `default_provider` (or `model_provider` alias) → first existing
+///    provider type → literal `"default"`.
+/// 3. Top-level `[[model_routes]]` / `[[embedding_routes]]` lifted under
+///    `[providers]` if not already present there.
+/// 4. All consumed V1 keys removed from the top-level table so the
+///    serde deserializer doesn't see leftover legacy fields.
+///
+/// No-op when no V1 keys are present (V2/V3 inputs pass through unchanged).
+fn migrate_v1_provider_fields_into_providers_table(table: &mut toml::Table) {
+    // Snapshot top-level V1 keys before mutating anything.
+    let api_key = table.remove("api_key");
+    let api_url = table.remove("api_url");
+    let api_path = table.remove("api_path");
+    let default_model = table
+        .remove("default_model")
+        .or_else(|| table.remove("model"));
+    let default_temperature = table.remove("default_temperature");
+    let provider_timeout_secs = table.remove("provider_timeout_secs");
+    let provider_max_tokens = table.remove("provider_max_tokens");
+    let extra_headers = table.remove("extra_headers");
+    // Resolve the V1 default-provider name. Pre-apply the V1's
+    // `claude-code` → `anthropic` rename here so the synthesized
+    // entry lands at `providers.models.anthropic.default` rather than
+    // tripping the v2_to_v3 alias-rename block (which would otherwise
+    // see `providers.models.claude-code` and shove it under
+    // `anthropic.claude-code`, double-nesting the value).
+    let default_provider = table
+        .remove("default_provider")
+        .or_else(|| table.remove("model_provider"))
+        .and_then(|v| v.as_str().map(str::to_string))
+        .map(|s| {
+            if s == "claude-code" {
+                "anthropic".to_string()
+            } else {
+                s
+            }
+        });
+    let v1_model_routes = table.remove("model_routes");
+    let v1_embedding_routes = table.remove("embedding_routes");
+    let v1_model_providers = table.remove("model_providers");
+
+    // Ensure [providers] exists; we'll write everything under it.
+    let providers = table
+        .entry("providers")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let toml::Value::Table(providers) = providers else {
+        return;
+    };
+    let models = providers
+        .entry("models")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let toml::Value::Table(models) = models else {
+        return;
+    };
+
+    // 1. [model_providers.<type>] → [providers.models.<type>.default].
+    if let Some(toml::Value::Table(legacy_providers)) = v1_model_providers {
+        for (ty, profile) in legacy_providers {
+            if let toml::Value::Table(profile) = profile {
+                let alias_map = models
+                    .entry(ty)
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                if let toml::Value::Table(alias_map) = alias_map {
+                    alias_map
+                        .entry("default".to_string())
+                        .or_insert(toml::Value::Table(profile));
+                }
+            }
+        }
+    }
+
+    // 2. Synthesize [providers.models.<type>.default] from top-level V1 scalars.
+    let has_v1_scalars = api_key.is_some()
+        || api_url.is_some()
+        || api_path.is_some()
+        || default_model.is_some()
+        || default_temperature.is_some()
+        || provider_timeout_secs.is_some()
+        || provider_max_tokens.is_some()
+        || extra_headers
+            .as_ref()
+            .is_some_and(|v| v.as_table().is_some_and(|t| !t.is_empty()));
+
+    if has_v1_scalars || default_provider.is_some() {
+        let provider_type = default_provider
+            .clone()
+            .or_else(|| models.keys().next().cloned())
+            .unwrap_or_else(|| "default".to_string());
+        let alias_map = models
+            .entry(provider_type)
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(alias_map) = alias_map {
+            let entry = alias_map
+                .entry("default".to_string())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if let toml::Value::Table(entry) = entry {
+                // (V1 scalar key, V2 entry key) — fill only when absent so
+                // user-supplied [providers.models.<type>.default] wins.
+                let pairs: &[(Option<toml::Value>, &str)] = &[
+                    (api_key, "api_key"),
+                    // V1's `api_url` is V2's `base_url`.
+                    (api_url, "base_url"),
+                    (api_path, "api_path"),
+                    (default_model, "model"),
+                    (default_temperature, "temperature"),
+                    (provider_timeout_secs, "timeout_secs"),
+                    (provider_max_tokens, "max_tokens"),
+                    (extra_headers, "extra_headers"),
+                ];
+                for (value, dest_key) in pairs {
+                    if let Some(v) = value
+                        && !entry.contains_key(*dest_key)
+                    {
+                        entry.insert((*dest_key).to_string(), v.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Lift V1 top-level [[model_routes]] / [[embedding_routes]] under [providers].
+    if let Some(routes) = v1_model_routes
+        && !providers.contains_key("model_routes")
+    {
+        providers.insert("model_routes".to_string(), routes);
+    }
+    if let Some(routes) = v1_embedding_routes
+        && !providers.contains_key("embedding_routes")
+    {
+        providers.insert("embedding_routes".to_string(), routes);
+    }
+}
+
+/// Schema-derived list of channel types recognised in V2 `[channels]` that the
+/// aliasing migration wraps into `[channels.<type>.default]`. Pulled from
+/// `Config::map_key_sections()` so adding a new channel to the schema
+/// automatically extends migration coverage — no hand-maintained list to
+/// drift out of sync.
+fn channel_types() -> Vec<String> {
+    use crate::schema::Config;
+    Config::map_key_sections()
+        .into_iter()
+        .filter_map(|s| {
+            // Sections under `channels.<type>` (alias maps) — extract `<type>`.
+            let rest = s.path.strip_prefix("channels.")?;
+            // Skip nested deeper paths like `channels.<type>.<sub>` if any
+            // ever appear; only direct children of `channels.` are types.
+            if rest.contains('.') {
+                None
+            } else {
+                Some(rest.to_string())
+            }
+        })
+        .collect()
+}
+
+/// Move every key from V2's global `[agent]` table onto `[agents.default]`,
+/// then delete `[agent]`. User-supplied keys on `[agents.default]` win
+/// (we only insert when absent). No-op when `[agent]` doesn't exist.
+fn fold_v2_agent_into_default_agent(table: &mut toml::Table) {
+    let Some(toml::Value::Table(legacy_agent)) = table.remove("agent") else {
+        return;
+    };
+    let agents = table
+        .entry("agents")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let toml::Value::Table(agents_map) = agents else {
+        return;
+    };
+    let default_agent = agents_map
+        .entry("default")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let toml::Value::Table(default_agent_table) = default_agent else {
+        return;
+    };
+    for (k, v) in legacy_agent {
+        default_agent_table.entry(k).or_insert(v);
+    }
+}
 
 /// Return true if this TOML table is a V2 flat channel config (has at least one
 /// non-table leaf value at the top level). V3 alias maps contain only sub-tables.
@@ -435,24 +390,13 @@ fn is_flat_provider_config(t: &toml::Table) -> bool {
     t.values().any(|v| !matches!(v, toml::Value::Table(_)))
 }
 
-/// V2 → V3 in-memory migration. TOML-level transforms run in `prepare_table`
-/// before deserialization; add post-deserialization work here as needed.
-fn v2_to_v3(config: &mut super::schema::Config) {
-    // Normalize providers.fallback entries from bare type names ("myprovider")
-    // to dotted type.alias refs ("myprovider.default") as required by V3.
-    for entry in &mut config.providers.fallback {
-        if !entry.contains('.') {
-            *entry = format!("{entry}.default");
-        }
-    }
-}
-
 /// Pre-deserialization table migration dispatcher.
 ///
 /// Reads `schema_version` from the raw table and calls only the transforms
 /// needed to bring it up to the current schema. Each version function is
 /// responsible for all TOML-level shape changes between those two versions.
-/// Called before deserialization into `V1Compat`.
+/// Called before deserialization into `Config`. Wrapped by
+/// `migrate_to_current` for the common case.
 pub fn prepare_table(table: &mut toml::Table) {
     let version = table
         .get("schema_version")
@@ -467,9 +411,18 @@ pub fn prepare_table(table: &mut toml::Table) {
     }
 }
 
-/// V1 → V2 TOML-level transforms: scalar field renames that must happen before
-/// serde deserialization can see the V2 field names.
+/// V1 → V2 TOML-level transforms: scalar field renames + V1 top-level
+/// scalar/section migrations into the V2 `[providers.*]` shape. All work
+/// happens at the TOML level so deserialization into `Config` succeeds
+/// directly — no V1Compat intermediate struct is needed.
 fn v1_to_v2_table(table: &mut toml::Table) {
+    // ── V1 top-level provider migration ─────────────────────────────
+    // Move [model_providers.<type>] → [providers.models.<type>.default],
+    // synthesize a default-provider entry from V1 top-level scalars
+    // (api_key, default_model, etc.), and lift V1 top-level
+    // [[model_routes]] / [[embedding_routes]] under [providers].
+    migrate_v1_provider_fields_into_providers_table(table);
+
     // channels_config.matrix.room_id → channels_config.matrix.allowed_rooms
     for key in &["channels_config", "channels"] {
         if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
@@ -588,7 +541,7 @@ fn v1_to_v2_table(table: &mut toml::Table) {
 }
 
 /// V2 → V3 TOML-level transforms: aliasing wraps, section synthesis, field
-/// removals, and renames that must happen before deserialization into V1Compat.
+/// removals, and renames that must happen before deserialization into `Config`.
 fn v2_to_v3_table(table: &mut toml::Table) {
     // Read non_cli_excluded_tools before the wrap so we can propagate it to
     // each channel alias's excluded_tools field. The flat autonomy field does
@@ -609,16 +562,17 @@ fn v2_to_v3_table(table: &mut toml::Table) {
     // V3: [channels.discord.default] nests those fields one level deeper.
     // Detection: a V2 config has at least one non-table leaf at the top of the
     // channel-type table. A V3 config has only sub-tables (alias entries).
+    let known_channel_types = channel_types();
     for channels_key in &["channels_config", "channels"] {
         if let Some(toml::Value::Table(channels)) = table.get_mut(*channels_key) {
-            for ch_type in CHANNEL_TYPES {
-                if let Some(toml::Value::Table(ch_table)) = channels.get(*ch_type)
+            for ch_type in &known_channel_types {
+                if let Some(toml::Value::Table(ch_table)) = channels.get(ch_type.as_str())
                     && is_flat_channel_config(ch_table)
                 {
                     let mut ch_clone = ch_table.clone();
                     // Strip V2 agent binding before wrapping; collect for inversion below.
                     if let Some(toml::Value::String(agent_alias)) = ch_clone.remove("agent") {
-                        agent_bindings.push((ch_type.to_string(), agent_alias));
+                        agent_bindings.push((ch_type.clone(), agent_alias));
                     }
                     // Propagate non_cli_excluded_tools to channel-side excluded_tools.
                     if let Some(ref tools) = excluded_tools_for_channels {
@@ -628,7 +582,7 @@ fn v2_to_v3_table(table: &mut toml::Table) {
                     }
                     let mut alias_map = toml::Table::new();
                     alias_map.insert("default".to_string(), toml::Value::Table(ch_clone));
-                    channels.insert(ch_type.to_string(), toml::Value::Table(alias_map));
+                    channels.insert(ch_type.clone(), toml::Value::Table(alias_map));
                 }
             }
         }
@@ -761,8 +715,14 @@ fn v2_to_v3_table(table: &mut toml::Table) {
             profiles.insert("default".to_string(), toml::Value::Table(agent));
         }
     }
-    // Remove V2 flat [agent] block after synthesis.
-    table.remove("agent");
+    // Fold what's left of V2's global `[agent]` table onto
+    // `[agents.default]` (after risk/runtime profile synthesis has copied
+    // out what it needed). `AgentConfig` (singular) was deleted in V3 —
+    // every former global runtime tunable is per-agent now. User-supplied
+    // [agents.default] always wins. The fold internally `remove`s
+    // `[agent]`, so no separate cleanup is needed below. Idempotent on
+    // V3 inputs.
+    fold_v2_agent_into_default_agent(table);
 
     // Per-agent runtime-profile carve-out.
     let agents_for_runtime: Vec<(String, toml::Table)> =
@@ -1028,22 +988,11 @@ fn v2_to_v3_table(table: &mut toml::Table) {
         *s = "anthropic".to_string();
     }
 
-    // Rename claude-code provider to anthropic, wrap flat provider entries into
-    // `<type>.default` alias, and normalize providers.fallback to Vec<String> with
-    // dotted type.alias keys (V2 had a bare string; V3 has an array of dotted paths).
+    // Rename claude-code provider to anthropic and wrap flat provider entries
+    // into `<type>.default` alias. The legacy `providers.fallback` field is
+    // gone in V3 — strip it from any V2 input that still carries one.
     if let Some(toml::Value::Table(providers)) = table.get_mut("providers") {
-        // Normalize providers.fallback to an array if it's a bare string (V2 shape).
-        if let Some(toml::Value::String(s)) = providers.get("fallback").cloned() {
-            let dotted = if s.contains('.') {
-                s
-            } else {
-                format!("{s}.default")
-            };
-            providers.insert(
-                "fallback".into(),
-                toml::Value::Array(vec![toml::Value::String(dotted)]),
-            );
-        }
+        providers.remove("fallback");
         if let Some(toml::Value::Table(models)) = providers.get_mut("models") {
             // Rename claude-code → anthropic.claude-code alias.
             if let Some(entry) = models.remove("claude-code") {
@@ -1269,21 +1218,27 @@ fn v2_to_v3_table(table: &mut toml::Table) {
 
 // ── File-level migration (comment-preserving) ───────────────────────────────
 //
-// Uses V1Compat (the single source of migration logic) to compute the migrated
-// Config, then syncs the original toml_edit document to match. The sync function
-// is generic — it doesn't know field names, it just diffs two table structures.
+// Uses `migrate_to_current` to compute the migrated Config, then syncs the
+// original toml_edit document to match. The sync function is generic — it
+// doesn't know field names, it just diffs two table structures.
 
 /// Migrate a raw TOML config file, preserving comments and formatting.
-/// Returns `None` if already at current version.
+/// Returns `None` if already at current version with no legacy keys to fold.
 pub fn migrate_file(raw: &str) -> Result<Option<String>> {
-    let mut table: toml::Table = toml::from_str(raw).context("Failed to parse config table")?;
-    prepare_table(&mut table);
-    let prepared = toml::to_string(&table).context("Failed to re-serialize prepared table")?;
-    let compat: V1Compat = toml::from_str(&prepared).context("Failed to deserialize config")?;
-    if compat.config.schema_version >= CURRENT_SCHEMA_VERSION && !compat.has_legacy_fields() {
+    // Short-circuit when the input is already at the current schema version
+    // and carries no V1 top-level keys we'd need to fold. Comparing against
+    // the parsed table (not a full Config deserialize) keeps this cheap.
+    let probe: toml::Table = toml::from_str(raw).context("Failed to parse config table")?;
+    let already_current = probe
+        .get("schema_version")
+        .and_then(|v| v.as_integer())
+        .is_some_and(|v| v as u32 >= CURRENT_SCHEMA_VERSION)
+        && !V1_LEGACY_KEYS.iter().any(|k| probe.contains_key(*k));
+    if already_current {
         return Ok(None);
     }
-    let config = compat.into_config();
+
+    let config = migrate_to_current(raw).context("Failed to migrate config")?;
 
     // Serialize the migrated config to get the target table structure.
     let target: toml::Table = toml::from_str(&toml::to_string(&config)?)
@@ -1360,9 +1315,6 @@ fn values_equal(edit: &toml_edit::Value, toml: &toml::Value) -> bool {
     }
 }
 
-/// Generate a canonical mock config for the given schema version by constructing
-/// a V1Compat mock in code and running the migration chain up to `version`.
-/// Returns an error if `version` is not a supported schema version.
 /// Deep-merge `overlay` into `base`, with overlay values winning.
 /// Sub-tables are merged recursively; scalars and arrays are replaced.
 fn merge_tables(base: &mut toml::Table, overlay: &toml::Table) {
@@ -1381,39 +1333,28 @@ fn merge_tables(base: &mut toml::Table, overlay: &toml::Table) {
 /// Generate a canonical mock config for the given schema version.
 ///
 /// `fixture_raw` is the content of `v1.toml` (the base fixture).
-/// `partial_raw` is the optional content of `v{version}.partial.toml`, deep-merged
-/// on top of the result after the migration chain runs.
+/// `partial_raw` is the optional content of `v{version}.partial.toml`,
+/// deep-merged on top of the result after the migration runs.
+///
+/// Architecture note: V1→V2→V3 transforms all live in `prepare_table`
+/// (TOML-level), so `migrate_to_current` is the single entry point.
+/// Per-version snapshots downgrade the resulting V3 `Config` back to the
+/// requested target shape via `snapshot_v2` / `snapshot_current`.
 pub fn generate_fixture(
     version: u32,
     fixture_raw: &str,
     partial_raw: Option<&str>,
 ) -> Result<String> {
-    type MigrateFn = fn(&mut V1Compat);
-    type SnapshotFn = fn(&V1Compat) -> toml::Table;
-
-    // Each entry: (version, migration step, snapshot serializer).
-    // Migrations are cumulative. To add a new version: append one line.
-    // Version 1 is handled before this loop — raw fixture pass-through, no migration.
-    let steps: &[(u32, MigrateFn, SnapshotFn)] = &[
-        (2, |c| c.v1_to_v2(), V1Compat::snapshot_v2),
-        (
-            CURRENT_SCHEMA_VERSION,
-            |c| v2_to_v3(&mut c.config),
-            V1Compat::snapshot_current,
-        ),
-    ];
-
-    let max = steps.iter().map(|&(v, _, _)| v).max().unwrap_or(0);
-    if version < 1 || version > max {
+    if !(1..=CURRENT_SCHEMA_VERSION).contains(&version) {
         return Err(anyhow::anyhow!(
-            "unsupported schema version {version}; supported versions are 1–{max}"
+            "unsupported schema version {version}; supported versions are 1–{CURRENT_SCHEMA_VERSION}"
         ));
     }
 
     // V1 output is the raw fixture verbatim — no migration, no prepare_table.
-    // Parsing the fixture through from_v1_fixture (which runs prepare_table) would
-    // irreversibly rewrite field names (room_id → allowed_rooms, etc.), producing
-    // a V3-shaped document instead of the true V1 shape.
+    // Parsing the fixture through migration would rewrite field names
+    // (room_id → allowed_rooms, etc.), producing a V3-shaped document
+    // instead of the true V1 shape.
     if version == 1 {
         let mut table: toml::Table =
             toml::from_str(fixture_raw).context("failed to parse v1 fixture")?;
@@ -1426,19 +1367,13 @@ pub fn generate_fixture(
         return toml::to_string_pretty(&table).context("failed to serialize fixture");
     }
 
-    let mut compat: V1Compat =
-        V1Compat::from_v1_fixture(fixture_raw).map_err(|e| anyhow::anyhow!(e))?;
+    let mut config = migrate_to_current(fixture_raw)?;
+    config.schema_version = version;
 
-    let mut snapshot: SnapshotFn = V1Compat::snapshot_current;
-    for &(target, migrate, serialize) in steps {
-        if version >= target {
-            migrate(&mut compat);
-            snapshot = serialize;
-        }
-    }
-    compat.config.schema_version = version;
-
-    let mut table = snapshot(&compat);
+    let mut table = match version {
+        2 => snapshot_v2(&config),
+        _ => snapshot_current(&config),
+    };
 
     if let Some(partial_toml) = partial_raw {
         let overlay: toml::Table =

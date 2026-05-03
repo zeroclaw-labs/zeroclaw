@@ -99,10 +99,10 @@ pub struct PatchResponse {
     pub results: Vec<PatchOpResult>,
     /// Non-fatal validation warnings against the post-save config state.
     /// Empty when nothing is flagged. Surfaces what the CLI prints on
-    /// stderr so dashboard callers see the same signal — e.g.
-    /// `providers.fallback` referencing a non-existent provider returns
-    /// HTTP 200 with the save committed, plus a `dangling_provider_fallback`
-    /// warning here.
+    /// stderr so dashboard callers see the same signal — e.g. an
+    /// `agents.<x>.model_provider` referencing an unconfigured provider
+    /// returns HTTP 200 with the save committed, plus a structured
+    /// validation warning here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<zeroclaw_config::validation_warnings::ValidationWarning>,
 }
@@ -399,7 +399,7 @@ pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<D
 
 // ── Handlers ────────────────────────────────────────────────────────
 
-/// GET /api/config/prop?path=providers.fallback
+/// GET /api/config/prop?path=agents.researcher.model_provider
 ///
 /// Returns the user's current value for non-secret fields. For secret fields,
 /// returns `{path, populated}` only — the value, length, and any encoded form
@@ -1102,10 +1102,11 @@ pub async fn handle_patch(
     .into_response()
 }
 
-/// Convert a JSON Pointer (`/providers/fallback`) to the dotted path the
-/// `Config::set_prop` machinery expects (`providers.fallback`). Accepts both
-/// forms — passing already-dotted paths through unchanged so dashboard clients
-/// can use whichever is more natural.
+/// Convert a JSON Pointer (`/agents/researcher/model_provider`) to the
+/// dotted path the `Config::set_prop` machinery expects
+/// (`agents.researcher.model_provider`). Accepts both forms — passing
+/// already-dotted paths through unchanged so dashboard clients can use
+/// whichever is more natural.
 fn json_pointer_to_dotted(path: &str) -> String {
     if path.starts_with('/') {
         path.trim_start_matches('/').replace('/', ".")
@@ -1275,7 +1276,7 @@ pub async fn handle_options_config(headers: HeaderMap) -> Response {
     schema_response("zeroclaw_config_schema_full")
 }
 
-/// OPTIONS /api/config/prop?path=providers.fallback — per-field schema fragment.
+/// OPTIONS /api/config/prop?path=agents.researcher.model_provider — per-field schema fragment.
 ///
 /// Returns 404 with `path_not_found` if the path doesn't resolve against the
 /// in-memory config — same contract as `GET /api/config/prop`. Previously

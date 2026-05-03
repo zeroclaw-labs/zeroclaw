@@ -33,7 +33,7 @@ use crate::tools::{Tool, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use zeroclaw_config::schema::{AgentConfig, MemoryConfig};
+use zeroclaw_config::schema::{DelegateAgentConfig, MemoryConfig};
 use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
@@ -312,7 +312,7 @@ fn build_agent_with_memory(
 fn build_agent_with_config(
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
-    config: AgentConfig,
+    config: DelegateAgentConfig,
 ) -> Agent {
     Agent::builder()
         .provider(provider)
@@ -471,9 +471,9 @@ async fn turn_bails_out_at_max_iterations() {
 
     let provider = Box::new(ScriptedProvider::new(responses));
 
-    let config = AgentConfig {
+    let config = DelegateAgentConfig {
         max_tool_iterations: max_iters,
-        ..AgentConfig::default()
+        ..DelegateAgentConfig::default()
     };
 
     let mut agent = build_agent_with_config(provider, vec![Box::new(EchoTool)], config);
@@ -611,9 +611,9 @@ async fn history_trims_after_max_messages() {
     }
 
     let provider = Box::new(ScriptedProvider::new(responses));
-    let config = AgentConfig {
+    let config = DelegateAgentConfig {
         max_history_messages: max_history,
-        ..AgentConfig::default()
+        ..DelegateAgentConfig::default()
     };
 
     let mut agent = build_agent_with_config(provider, vec![], config);

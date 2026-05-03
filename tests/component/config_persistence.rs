@@ -7,7 +7,7 @@
 //! and config file round-trips to verify workspace discovery and persistence.
 
 use std::fs;
-use zeroclaw::config::{AgentConfig, Config, MemoryConfig};
+use zeroclaw::config::{Config, DelegateAgentConfig, MemoryConfig};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config default construction
@@ -54,12 +54,12 @@ fn config_default_temperature_positive() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AgentConfig defaults
+// DelegateAgentConfig defaults
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn agent_config_default_max_tool_iterations() {
-    let agent = AgentConfig::default();
+    let agent = DelegateAgentConfig::default();
     assert_eq!(
         agent.max_tool_iterations, 10,
         "default max_tool_iterations should be 10"
@@ -68,7 +68,7 @@ fn agent_config_default_max_tool_iterations() {
 
 #[test]
 fn agent_config_default_max_history_messages() {
-    let agent = AgentConfig::default();
+    let agent = DelegateAgentConfig::default();
     assert_eq!(
         agent.max_history_messages, 50,
         "default max_history_messages should be 50"
@@ -77,7 +77,7 @@ fn agent_config_default_max_history_messages() {
 
 #[test]
 fn agent_config_default_tool_dispatcher() {
-    let agent = AgentConfig::default();
+    let agent = DelegateAgentConfig::default();
     assert_eq!(
         agent.tool_dispatcher, "auto",
         "default tool_dispatcher should be 'auto'"
@@ -86,7 +86,7 @@ fn agent_config_default_tool_dispatcher() {
 
 #[test]
 fn agent_config_default_compact_context_on() {
-    let agent = AgentConfig::default();
+    let agent = DelegateAgentConfig::default();
     assert!(
         agent.compact_context,
         "compact_context should default to true"
@@ -149,9 +149,8 @@ fn config_toml_roundtrip_preserves_provider() {
         );
 
     let toml_str = toml::to_string(&config).expect("config should serialize to TOML");
-    let compat: zeroclaw::config::migration::V1Compat =
-        toml::from_str(&toml_str).expect("TOML should deserialize back");
-    let parsed = compat.into_config();
+    let parsed = zeroclaw::config::migration::migrate_to_current(&toml_str)
+        .expect("TOML should round-trip through migration");
 
     assert_eq!(parsed.providers.first_provider_type(), Some("deepseek"));
     assert_eq!(
@@ -176,16 +175,21 @@ fn config_toml_roundtrip_preserves_provider() {
 #[test]
 fn config_toml_roundtrip_preserves_agent_config() {
     let mut config = Config::default();
-    config.agent.max_tool_iterations = 5;
-    config.agent.max_history_messages = 25;
-    config.agent.compact_context = true;
+    let agent = config.agents.entry("default".into()).or_default();
+    agent.max_tool_iterations = 5;
+    agent.max_history_messages = 25;
+    agent.compact_context = true;
 
     let toml_str = toml::to_string(&config).expect("config should serialize to TOML");
     let parsed: Config = toml::from_str(&toml_str).expect("TOML should deserialize back");
 
-    assert_eq!(parsed.agent.max_tool_iterations, 5);
-    assert_eq!(parsed.agent.max_history_messages, 25);
-    assert!(parsed.agent.compact_context);
+    let agent = parsed
+        .agents
+        .get("default")
+        .expect("default agent survived round-trip");
+    assert_eq!(agent.max_tool_iterations, 5);
+    assert_eq!(agent.max_history_messages, 25);
+    assert!(agent.compact_context);
 }
 
 #[test]
@@ -228,15 +232,18 @@ fn config_file_write_read_roundtrip() {
                 ..Default::default()
             },
         );
-    config.agent.max_tool_iterations = 15;
+    config
+        .agents
+        .entry("default".into())
+        .or_default()
+        .max_tool_iterations = 15;
 
     let toml_str = toml::to_string(&config).expect("config should serialize");
     fs::write(&config_path, &toml_str).expect("config file write should succeed");
 
     let read_back = fs::read_to_string(&config_path).expect("config file read should succeed");
-    let compat: zeroclaw::config::migration::V1Compat =
-        toml::from_str(&read_back).expect("TOML should parse back");
-    let parsed = compat.into_config();
+    let parsed = zeroclaw::config::migration::migrate_to_current(&read_back)
+        .expect("TOML should round-trip through migration");
 
     assert_eq!(parsed.providers.first_provider_type(), Some("mistral"));
     assert_eq!(
@@ -246,7 +253,14 @@ fn config_file_write_read_roundtrip() {
             .and_then(|e| e.model.as_deref()),
         Some("mistral-large")
     );
-    assert_eq!(parsed.agent.max_tool_iterations, 15);
+    assert_eq!(
+        parsed
+            .agents
+            .get("default")
+            .map(|a| a.max_tool_iterations)
+            .unwrap_or(0),
+        15
+    );
 }
 
 #[test]
@@ -257,28 +271,32 @@ default_temperature = 0.7
 "#;
     let parsed: Config = toml::from_str(minimal_toml).expect("minimal TOML should parse");
 
-    // Agent config should use defaults
-    assert_eq!(parsed.agent.max_tool_iterations, 10);
-    assert_eq!(parsed.agent.max_history_messages, 50);
-    assert!(parsed.agent.compact_context);
+    // No `[agents.default]` defined — `default_agent()` returns the
+    // static fallback, which is `DelegateAgentConfig::default()`.
+    let agent = parsed.default_agent();
+    assert_eq!(agent.max_tool_iterations, 10);
+    assert_eq!(agent.max_history_messages, 50);
+    assert!(agent.compact_context);
 }
 
 #[test]
 fn config_file_with_custom_agent_section() {
+    // V3 lifts the old global `[agent]` settings into `[agents.<alias>]`.
     let toml_with_agent = r#"
 default_temperature = 0.7
 
-[agent]
+[agents.default]
 max_tool_iterations = 3
 compact_context = true
 "#;
     let parsed: Config =
-        toml::from_str(toml_with_agent).expect("TOML with agent section should parse");
+        toml::from_str(toml_with_agent).expect("TOML with [agents.default] should parse");
 
-    assert_eq!(parsed.agent.max_tool_iterations, 3);
-    assert!(parsed.agent.compact_context);
+    let agent = parsed.agents.get("default").expect("default agent parsed");
+    assert_eq!(agent.max_tool_iterations, 3);
+    assert!(agent.compact_context);
     // max_history_messages should still use default
-    assert_eq!(parsed.agent.max_history_messages, 50);
+    assert_eq!(agent.max_history_messages, 50);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

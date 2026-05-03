@@ -748,6 +748,21 @@ export function getOnboardStatus(): Promise<OnboardStatusResponse> {
   return apiFetch<OnboardStatusResponse>('/api/onboard/status');
 }
 
+export interface AgentOptionsResponse {
+  channels: string[];
+  model_providers: string[];
+  risk_profiles: string[];
+  runtime_profiles: string[];
+  skill_bundles: string[];
+  knowledge_bundles: string[];
+  mcp_bundles: string[];
+  memory_namespaces: string[];
+}
+
+export function getAgentOptions(): Promise<AgentOptionsResponse> {
+  return apiFetch<AgentOptionsResponse>('/api/onboard/agent-options');
+}
+
 export interface PickerItem {
   key: string;
   label: string;
