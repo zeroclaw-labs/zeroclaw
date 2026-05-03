@@ -54,6 +54,12 @@ pub const V1_LEGACY_KEYS: &[&str] = &[
     "model_routes",
     "embedding_routes",
     "channels_config",
+    // V2 keys removed in V3 — migration absorbs them into risk_profiles +
+    // providers.tts + storage + scheduler. Suppressing them in the
+    // unknown-key detector avoids false-positive warnings during V2→V3
+    // migration of partially-shaped inputs.
+    "autonomy",
+    "agent",
 ];
 
 /// Run `prepare_table` on a raw config TOML string and deserialize the
