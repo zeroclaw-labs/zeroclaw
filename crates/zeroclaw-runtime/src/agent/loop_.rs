@@ -335,11 +335,17 @@ fn autosave_memory_key(prefix: &str) -> String {
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
 /// Core memories are exempt from time decay (evergreen).
+///
+/// `exclude_conversation` skips `MemoryCategory::Conversation` entries
+/// regardless of their key shape. Set to `true` for autonomous/scheduled
+/// runs (cron, daemon heartbeat) so chat memory cannot leak into prompts
+/// the user did not initiate. See #5415 / #5456.
 async fn build_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
     session_id: Option<&str>,
+    exclude_conversation: bool,
 ) -> String {
     let mut context = String::new();
 
@@ -359,6 +365,16 @@ async fn build_context(
         if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &relevant {
+                // Scheduled (cron / heartbeat) runs must not see chat-origin
+                // memories. The autosave-key checks below catch the agent's
+                // own autosaves but miss Conversation entries written by
+                // channel handlers (Discord, gateway, WhatsApp, …) under
+                // their own keys. See #5415 / #5456.
+                if exclude_conversation
+                    && matches!(entry.category, MemoryCategory::Conversation)
+                {
+                    continue;
+                }
                 if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
@@ -2534,12 +2550,16 @@ pub async fn run(
                 .await;
         }
 
-        // Inject memory + hardware RAG context into user message
+        // Inject memory + hardware RAG context into user message.
+        // For non-interactive runs (cron, daemon heartbeat), exclude
+        // Conversation-category memories so chat history does not leak
+        // into autonomous executions. See #5415 / #5456.
         let mem_context = build_context(
             mem.as_ref(),
             &effective_msg,
             config.memory.min_relevance_score,
             memory_session_id.as_deref(),
+            !interactive,
         )
         .await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -2821,12 +2841,15 @@ pub async fn run(
                     .await;
             }
 
-            // Inject memory + hardware RAG context into user message
+            // Inject memory + hardware RAG context into user message.
+            // Interactive REPL: keep Conversation memories (user is actively
+            // chatting in this session and may want their own history recalled).
             let mem_context = build_context(
                 mem.as_ref(),
                 &effective_input,
                 config.memory.min_relevance_score,
                 memory_session_id.as_deref(),
+                false,
             )
             .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -3406,11 +3429,15 @@ pub async fn process_message(
     }
 
     let effective_msg_ref = effective_message.as_str();
+    // process_message is the channel entrypoint (Discord, Telegram, gateway,
+    // etc.) — recall is scoped to the channel's session_id, so retrieving the
+    // user's own Conversation history within their session is intended.
     let mem_context = build_context(
         mem.as_ref(),
         effective_msg_ref,
         config.memory.min_relevance_score,
         session_id,
+        false,
     )
     .await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -6366,7 +6393,7 @@ mod tests {
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0, None).await;
+        let context = build_context(&mem, "status updates", 0.0, None, false).await;
         assert!(context.contains("user_preference"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
@@ -6401,10 +6428,54 @@ mod tests {
         .await
         .unwrap();
 
-        let context = build_context(&mem, "answers", 0.0, None).await;
+        let context = build_context(&mem, "answers", 0.0, None, false).await;
         assert!(context.contains("user_preference"));
         assert!(!context.contains("user_msg"));
         assert!(!context.contains("embedding prior context"));
+    }
+
+    /// Regression: cron / heartbeat runs must not surface chat-origin
+    /// `Conversation` memories — the leak path the #5456 prefix filter
+    /// missed because `agent::run` performs a second, unfiltered recall
+    /// inside `build_context`. See #5415.
+    #[tokio::test]
+    async fn build_context_excludes_conversation_when_flag_set() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        // A Conversation entry written by a chat channel with a non-autosave
+        // key (autosave keys are already skipped by the existing filters).
+        mem.store(
+            "discord:guild:chan:msg-42",
+            "Reminder for Alice: the API key is in 1Password vault Foo.",
+            MemoryCategory::Conversation,
+            Some("discord:guild:chan"),
+        )
+        .await
+        .unwrap();
+        // A non-Conversation memory that should still surface so we know the
+        // function still does its job — only Conversation should be dropped.
+        mem.store(
+            "team_oncall",
+            "Primary on-call rotates every Monday at 09:00 UTC.",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let context = build_context(&mem, "Alice on-call", 0.0, None, true).await;
+        assert!(
+            !context.contains("Alice"),
+            "Conversation memory leaked into scheduled context: {context}"
+        );
+        assert!(
+            !context.contains("API key"),
+            "Conversation memory leaked into scheduled context: {context}"
+        );
+        assert!(
+            context.contains("team_oncall"),
+            "Non-Conversation memory should still surface: {context}"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
