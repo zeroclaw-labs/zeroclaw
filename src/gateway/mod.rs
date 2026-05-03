@@ -1825,6 +1825,22 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 ])
                 .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
                 .max_age(Duration::from_secs(3600));
+            // SECURITY (CSRF defense): when CORS_ALLOWED_ORIGINS is set,
+            // honor the explicit allowlist. When it is not set, the
+            // safe default depends on the bind scope:
+            //
+            //   - 127.0.0.1 (default per-device gateway): the Same-Origin
+            //     Policy plus loopback isolation is sufficient; permissive
+            //     CORS is fine because no remote browser can reach the
+            //     loopback in the first place.
+            //
+            //   - 0.0.0.0 / public bind (`allow_public_bind = true`):
+            //     `CorsLayer::permissive` would let any origin's
+            //     browser-resident JavaScript hit our state-changing
+            //     endpoints. Refuse to start with an open CORS policy
+            //     in that case — operator must set CORS_ALLOWED_ORIGINS
+            //     to enumerate trusted sites. This is "fail secure" per
+            //     CLAUDE.md §3.6.
             match std::env::var("CORS_ALLOWED_ORIGINS") {
                 Ok(origins) if !origins.is_empty() && origins != "*" => {
                     let parsed: Vec<HeaderValue> = origins
@@ -1832,6 +1848,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                         .filter_map(|o| o.trim().parse().ok())
                         .collect();
                     cors.allow_origin(AllowOrigin::list(parsed))
+                }
+                _ if config.gateway.allow_public_bind => {
+                    tracing::error!(
+                        "Refusing permissive CORS on a public bind. \
+                         Set CORS_ALLOWED_ORIGINS to a comma-separated list \
+                         of trusted origins (e.g. https://your.app), or unset \
+                         [gateway].allow_public_bind. Defaulting to a closed \
+                         CORS allow-list (no cross-origin browser access)."
+                    );
+                    cors.allow_origin(AllowOrigin::list(Vec::<HeaderValue>::new()))
                 }
                 _ => cors.allow_origin(Any),
             }

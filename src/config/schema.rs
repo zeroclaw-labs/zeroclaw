@@ -2853,17 +2853,6 @@ pub struct GatewayConfig {
     #[serde(default = "default_idempotency_ttl_secs")]
     pub idempotency_ttl_secs: u64,
 
-    /// Owner username for pairing authentication (optional).
-    /// When set together with `owner_password`, clients must provide
-    /// matching credentials during the pairing handshake.
-    #[serde(default)]
-    pub owner_username: Option<String>,
-
-    /// Owner password for pairing authentication (optional).
-    /// Stored as plaintext in config/env; hashed on load.
-    #[serde(default)]
-    pub owner_password: Option<String>,
-
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
@@ -2936,8 +2925,6 @@ impl Default for GatewayConfig {
             trust_forwarded_headers: false,
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
-            owner_username: None,
-            owner_password: None,
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             node_control: NodeControlConfig::default(),
         }
@@ -13586,8 +13573,6 @@ channel_id = "C123"
             trust_forwarded_headers: true,
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
-            owner_username: None,
-            owner_password: None,
             idempotency_max_keys: 4096,
             node_control: NodeControlConfig {
                 enabled: true,
