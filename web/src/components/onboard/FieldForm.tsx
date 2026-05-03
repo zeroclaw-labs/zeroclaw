@@ -202,21 +202,26 @@ function loadAgentOptions(): Promise<AgentOptionsResponse> {
 // matched options. Mandatory-vs-optional is enforced by `Config::validate()`
 // at the backend on save — the frontend just submits whatever the user
 // picks (including empty) and surfaces structured errors inline.
+//
+// Keys are kebab-case to match `prop_fields()` emission (the macro at
+// crates/zeroclaw-macros/src/lib.rs:1056 converts every snake_case Rust
+// field name to kebab-case for the schema path).
 const AGENT_SINGLE_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
-  model_provider: 'model_providers',
-  risk_profile: 'risk_profiles',
-  runtime_profile: 'runtime_profiles',
-  memory_namespace: 'memory_namespaces',
+  'model-provider': 'model_providers',
+  'risk-profile': 'risk_profiles',
+  'runtime-profile': 'runtime_profiles',
+  'memory-namespace': 'memory_namespaces',
 };
 
 // Multi-select alias-ref fields on an agent: render as the chip editor with
 // a `<datalist>` of the available aliases (no free text expected — the
-// suggestions list is the canonical input source).
+// suggestions list is the canonical input source). Same kebab-case
+// convention as AGENT_SINGLE_ALIAS_FIELDS above.
 const AGENT_MULTI_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
   channels: 'channels',
-  skill_bundles: 'skill_bundles',
-  knowledge_bundles: 'knowledge_bundles',
-  mcp_bundles: 'mcp_bundles',
+  'skill-bundles': 'skill_bundles',
+  'knowledge-bundles': 'knowledge_bundles',
+  'mcp-bundles': 'mcp_bundles',
 };
 
 function agentFieldKey(path: string): string | null {
@@ -657,7 +662,8 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
   // renders as a picker over the live config rather than a free-text
   // input. The `system_prompt` field gets a textarea.
   const agentField = agentFieldKey(entry.path);
-  const isAgentSystemPrompt = agentField === 'system_prompt';
+  // Schema path is kebab-case (matches prop_fields() emission).
+  const isAgentSystemPrompt = agentField === 'system-prompt';
   const agentSingleAliasKind: keyof AgentOptionsResponse | null =
     agentField && AGENT_SINGLE_ALIAS_FIELDS[agentField]
       ? AGENT_SINGLE_ALIAS_FIELDS[agentField]
