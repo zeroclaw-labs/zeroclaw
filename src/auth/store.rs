@@ -274,8 +274,13 @@ impl AuthStore {
     /// - Kakao OAuth users setting their first password (enables app login)
     /// - Regular users changing their password
     pub fn set_password(&self, user_id: &str, new_password: &str) -> Result<()> {
-        if new_password.len() < 4 {
-            bail!("Password must be at least 4 characters");
+        // SECURITY: keep this in sync with `register()` (see line ~214)
+        // which enforces 8+ chars. Allowing a shorter password here was
+        // a downgrade path: a user could register with a strong 8+
+        // password and then `set_password` it down to 4 chars,
+        // weakening their account post-registration.
+        if new_password.len() < 8 {
+            bail!("Password must be at least 8 characters");
         }
         let salt = generate_salt();
         let hash = hash_password(new_password, &salt);
@@ -1140,15 +1145,37 @@ fn hash_token(token: &str) -> String {
 }
 
 /// Constant-time byte comparison to prevent timing attacks.
+///
+/// The previous implementation returned early on a length mismatch,
+/// leaking the stored hash length via response time (a timing oracle
+/// on password-hash length, which constrains the attacker's search
+/// space). This version always iterates `max(a.len, b.len)` bytes,
+/// XORing each pair (treating out-of-bounds positions as 0) plus
+/// folding in the length difference, then collapses the accumulator
+/// to a single bool. Equality is byte-for-byte identical to the
+/// previous implementation when the inputs are the same length;
+/// the only behavior change is that mismatched-length inputs now
+/// take the same time as matched-length ones.
+///
+/// Mirrors the correct implementation already shipped in
+/// `src/security/pairing.rs::constant_time_eq` (lines 439-456).
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+    let max_len = a.len().max(b.len());
+    // Iterate the longer of the two, treating out-of-bounds positions
+    // as 0. This keeps total work constant per max_len regardless of
+    // which input is longer.
+    let mut byte_diff: u8 = 0;
+    for i in 0..max_len {
+        let ax = *a.get(i).unwrap_or(&0);
+        let by = *b.get(i).unwrap_or(&0);
+        byte_diff |= ax ^ by;
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    // Fold the length difference into the verdict via a single
+    // boolean OR. `len_diff != 0` is true iff the lengths differ;
+    // we OR that into the byte-level diff so unequal-length inputs
+    // can never compare equal even when the longer suffix is all zero.
+    let len_diff_nonzero = a.len() ^ b.len() != 0;
+    (byte_diff != 0) | len_diff_nonzero == false
 }
 
 /// Current Unix epoch in seconds.
@@ -1438,5 +1465,36 @@ mod tests {
         assert!(constant_time_eq(b"hello", b"hello"));
         assert!(!constant_time_eq(b"hello", b"world"));
         assert!(!constant_time_eq(b"short", b"longer"));
+    }
+
+    #[test]
+    fn constant_time_eq_handles_length_mismatch_safely() {
+        // Regression: previous implementation returned early on length
+        // mismatch, leaking length via response time. New implementation
+        // must still return false for unequal lengths.
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(!constant_time_eq(b"a", b""));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"abcd", b"abc"));
+        // And — crucially — an all-zero-suffix longer side must NOT
+        // compare equal to its prefix.
+        assert!(!constant_time_eq(b"abc\0\0", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abc\0\0"));
+        // Same-length zero bytes should still match.
+        assert!(constant_time_eq(b"\0\0\0", b"\0\0\0"));
+    }
+
+    #[test]
+    fn set_password_rejects_short_password() {
+        // Regression for D4: set_password used to allow 4+ chars while
+        // register required 8+. That was a downgrade path. Both paths
+        // now require >= 8.
+        let (_tmp, store) = test_store();
+        let user_id = store.register("test_user", "initialpw1").unwrap();
+        let too_short = store.set_password(&user_id, "1234567");
+        assert!(too_short.is_err(), "set_password must reject < 8 chars");
+        assert!(too_short.unwrap_err().to_string().contains("at least 8"));
+        let exactly_eight = store.set_password(&user_id, "12345678");
+        assert!(exactly_eight.is_ok(), "set_password must accept exactly 8 chars");
     }
 }
