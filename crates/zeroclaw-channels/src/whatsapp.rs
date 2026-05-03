@@ -261,13 +261,45 @@ impl WhatsAppChannel {
                         continue;
                     }
 
-                    // Extract text content (support text messages only for now)
+                    // Extract content. Three shapes that produce a usable
+                    // text body:
+                    //   1. text       — plain message; .text.body
+                    //   2. interactive.button_reply  — user tapped a button
+                    //                                  in an interactive message
+                    //   3. interactive.list_reply    — user picked a row in
+                    //                                  an interactive list
+                    //
+                    // For (2) and (3), Calciforge-style consumers want the
+                    // option's `id` (which round-trips to the original
+                    // ChoiceOption.callback_data). We surface that as
+                    // `[choice]<id>` so consumers can recognize the sentinel
+                    // and resolve it back; consumers that don't care can
+                    // ignore the prefix.
                     let content = if let Some(text_obj) = msg.get("text") {
                         text_obj
                             .get("body")
                             .and_then(|b| b.as_str())
                             .unwrap_or("")
                             .to_string()
+                    } else if let Some(interactive) = msg.get("interactive") {
+                        let kind = interactive
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
+                        let reply = match kind {
+                            "button_reply" => interactive.get("button_reply"),
+                            "list_reply" => interactive.get("list_reply"),
+                            _ => None,
+                        };
+                        match reply.and_then(|r| r.get("id")).and_then(|i| i.as_str()) {
+                            Some(id) if !id.is_empty() => format!("[choice]{id}"),
+                            _ => {
+                                tracing::debug!(
+                                    "WhatsApp: interactive reply from {from} missing id, dropping"
+                                );
+                                continue;
+                            }
+                        }
                     } else {
                         // Could be image, audio, etc. — skip for now
                         tracing::debug!("WhatsApp: skipping non-text message from {from}");
@@ -327,6 +359,178 @@ impl WhatsAppChannel {
 
         messages
     }
+
+    /// Send an interactive button message (≤ 3 buttons per Meta's Cloud
+    /// API limit). Each tuple is `(id, label)`; `id` round-trips back
+    /// through the inbound `interactive.button_reply.id` field as a
+    /// `[choice]<id>` synthetic `ChannelMessage` content (see
+    /// `parse_webhook_payload`).
+    ///
+    /// Meta's `interactive` body schema:
+    /// https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages
+    pub async fn send_interactive_buttons(
+        &self,
+        recipient: &str,
+        body_text: &str,
+        buttons: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        if buttons.is_empty() || buttons.len() > 3 {
+            anyhow::bail!(
+                "WhatsApp interactive buttons require 1..=3 options (got {}); \
+                 use send_interactive_list for more",
+                buttons.len()
+            );
+        }
+        let url = format!(
+            "https://graph.facebook.com/v18.0/{}/messages",
+            self.endpoint_id
+        );
+        ensure_https(&url)?;
+        let to = recipient.strip_prefix('+').unwrap_or(recipient);
+        let action_buttons: Vec<serde_json::Value> = buttons
+            .iter()
+            .map(|(id, label)| {
+                // Meta caps button title at 20 chars and id at 256.
+                let title = label.chars().take(20).collect::<String>();
+                let id_trim = id.chars().take(256).collect::<String>();
+                serde_json::json!({
+                    "type": "reply",
+                    "reply": { "id": id_trim, "title": title },
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": { "text": body_text },
+                "action": { "buttons": action_buttons },
+            }
+        });
+        self.post_to_meta(&url, &body).await
+    }
+
+    /// Send an interactive list message (more than 3 options, up to 10
+    /// rows per section, up to 10 sections per Meta's limits). `sections`
+    /// each carry a section title + rows. Each row's `id` round-trips
+    /// through the inbound `interactive.list_reply.id` as `[choice]<id>`.
+    ///
+    /// `button_text` is the button label that opens the list (Meta limits
+    /// to 20 chars).
+    pub async fn send_interactive_list(
+        &self,
+        recipient: &str,
+        body_text: &str,
+        button_text: &str,
+        sections: &[InteractiveListSection],
+    ) -> anyhow::Result<()> {
+        if sections.is_empty() {
+            anyhow::bail!("WhatsApp interactive list requires at least one section");
+        }
+        if sections.len() > 10 {
+            anyhow::bail!(
+                "WhatsApp interactive list capped at 10 sections (got {})",
+                sections.len()
+            );
+        }
+        for s in sections {
+            if s.rows.len() > 10 {
+                anyhow::bail!(
+                    "WhatsApp interactive list section '{}' capped at 10 rows (got {})",
+                    s.title,
+                    s.rows.len()
+                );
+            }
+        }
+        let url = format!(
+            "https://graph.facebook.com/v18.0/{}/messages",
+            self.endpoint_id
+        );
+        ensure_https(&url)?;
+        let to = recipient.strip_prefix('+').unwrap_or(recipient);
+        let action_sections: Vec<serde_json::Value> = sections
+            .iter()
+            .map(|s| {
+                let rows: Vec<serde_json::Value> = s
+                    .rows
+                    .iter()
+                    .map(|r| {
+                        let mut row = serde_json::json!({
+                            "id": r.id.chars().take(200).collect::<String>(),
+                            "title": r.title.chars().take(24).collect::<String>(),
+                        });
+                        if let Some(d) = &r.description {
+                            row["description"] =
+                                serde_json::Value::String(d.chars().take(72).collect());
+                        }
+                        row
+                    })
+                    .collect();
+                serde_json::json!({
+                    "title": s.title.chars().take(24).collect::<String>(),
+                    "rows": rows,
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "interactive",
+            "interactive": {
+                "type": "list",
+                "body": { "text": body_text },
+                "action": {
+                    "button": button_text.chars().take(20).collect::<String>(),
+                    "sections": action_sections,
+                },
+            }
+        });
+        self.post_to_meta(&url, &body).await
+    }
+
+    async fn post_to_meta(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<()> {
+        let resp = self
+            .http_client()
+            .post(url)
+            .bearer_auth(&self.access_token)
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_body = resp.text().await.unwrap_or_default();
+            tracing::error!("WhatsApp interactive send failed: {status} — {error_body}");
+            anyhow::bail!("WhatsApp API error: {status}");
+        }
+        Ok(())
+    }
+}
+
+/// One section in an interactive list message. Sections group related
+/// rows under a header.
+#[derive(Debug, Clone)]
+pub struct InteractiveListSection {
+    /// Section header (Meta caps at 24 chars; we truncate).
+    pub title: String,
+    /// Rows in this section. Up to 10 per Meta's limit.
+    pub rows: Vec<InteractiveListRow>,
+}
+
+/// One row in an interactive list message.
+#[derive(Debug, Clone)]
+pub struct InteractiveListRow {
+    /// Stable identifier round-tripped via inbound `interactive.list_reply.id`
+    /// as `[choice]<id>`.
+    pub id: String,
+    /// User-visible label (Meta caps at 24 chars).
+    pub title: String,
+    /// Optional secondary line (Meta caps at 72 chars).
+    pub description: Option<String>,
 }
 
 #[async_trait]
