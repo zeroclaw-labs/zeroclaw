@@ -114,8 +114,10 @@ impl ZeroClawController {
     /// Create with default config
     #[uniffi::constructor]
     pub fn with_defaults(data_dir: String) -> Arc<Self> {
-        let mut config = ZeroClawConfig::default();
-        config.data_dir = data_dir;
+        let config = ZeroClawConfig {
+            data_dir,
+            ..ZeroClawConfig::default()
+        };
         Self::new(config)
     }
 
@@ -511,7 +513,7 @@ mod tests {
     #[test]
     fn test_send_message_without_gateway() {
         let controller = ZeroClawController::with_defaults("/tmp/zeroclaw".to_string());
-        let result = controller.send_message("Hello".to_string());
+        let _result = controller.send_message("Hello".to_string());
         // Without a gateway running, this will fail
         // But the user message should still be in history
         let messages = controller.get_messages();
