@@ -718,11 +718,21 @@ impl Channel for WhatsAppWebChannel {
                                     eprintln!();
                                 }
                                 Err(err) => {
+                                    // SECURITY: the QR payload is the WhatsApp Web pairing
+                                    // credential — anyone who scans it captures the user's
+                                    // session. We must NOT log the raw value at any level
+                                    // that lands in default-visible log streams. Log only
+                                    // the rendering failure + a fixed-length prefix so the
+                                    // operator can tell different failures apart while
+                                    // keeping the actual credential off disk / off screen.
+                                    let prefix: String = code.chars().take(4).collect();
+                                    let len = code.chars().count();
                                     tracing::warn!(
-                                        "WhatsApp Web: failed to render pairing QR in terminal: {}",
-                                        err
+                                        "WhatsApp Web: failed to render pairing QR in terminal \
+                                         (prefix={prefix}…, len={len}): {err}. \
+                                         Rerun with TERM that supports QR rendering, or use \
+                                         the pair-code flow (set [whatsapp_web].pair_phone)."
                                     );
-                                    tracing::info!("WhatsApp Web QR payload: {}", code);
                                 }
                             }
                         }
