@@ -21,7 +21,7 @@ api_key = "..."                    # omit if the endpoint needs no auth
 Then reference it:
 
 ```toml
-default_model = "my-endpoint"
+default_model = "custom:https://my-gateway.example.com"
 ```
 
 This is the same implementation used for Groq, Mistral, xAI, and every other OpenAI-compat provider in the [catalog](./catalog.md).
