@@ -4,6 +4,20 @@
 //! iOS cannot launch sidecar processes, so ZeroClaw runs in-process
 //! as a static library linked into the MoA app.
 //!
+//! ## SECURITY / PLATFORM INVARIANT
+//!
+//! Apple's iOS sandbox forbids `posix_spawn` / `fork` for app-store
+//! distribution. Any child-process spawn from inside this crate would
+//! either fail at runtime (and look like a generic gateway-not-running
+//! bug to the user) or get the app rejected at App Store review.
+//!
+//! The `FORBID_UNSAFE_PROCESS_SPAWN` const below exists to make any
+//! future PR that imports `std::process::Command` into this crate
+//! easy to grep for. If you legitimately need to spawn a helper
+//! process from iOS, talk to the security maintainer first — the
+//! correct answer is almost always "extend the in-process API
+//! instead".
+//!
 //! ## Architecture
 //! ```text
 //! MoA iOS App (SwiftUI)
@@ -28,6 +42,16 @@ use std::os::raw::c_char;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
+
+/// Documentation marker that this crate must NEVER spawn a child process
+/// when targeting iOS. Searched by reviewers; the value is unused at
+/// runtime. Together with the module-header invariant doc, this gives
+/// future contributors an obvious anchor to grep for before adding a
+/// `std::process::Command::new(...)` call.
+#[cfg(target_os = "ios")]
+#[allow(dead_code)]
+const FORBID_UNSAFE_PROCESS_SPAWN: &str =
+    "iOS sandbox forbids fork/exec; ZeroClaw runs in-process here";
 
 /// Global runtime for async operations.
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
