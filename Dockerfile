@@ -32,13 +32,20 @@ COPY --parents crates/*/Cargo.toml ./
 COPY --parents crates/aardvark-sys/build.rs ./
 # apps/tauri: .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
+# tools/fill-translations and xtask are dev/build tools; copy manifests only so
+# Cargo can resolve the workspace, then stub their entry points so the
+# dependency pre-fetch step succeeds without building them into the image.
+COPY tools/fill-translations/Cargo.toml tools/fill-translations/Cargo.toml
+COPY xtask/Cargo.toml xtask/Cargo.toml
 # Create dummy targets for all workspace members so manifest parsing succeeds.
-RUN mkdir -p src benches apps/tauri/src \
+RUN mkdir -p src benches apps/tauri/src tools/fill-translations/src xtask/src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
     && echo "fn main() {}" > apps/tauri/src/main.rs \
     && echo "fn main() {}" > apps/tauri/build.rs \
+    && echo "fn main() {}" > tools/fill-translations/src/main.rs \
+    && echo "fn main() {}" > xtask/src/main.rs \
     && for d in crates/*/; do mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
