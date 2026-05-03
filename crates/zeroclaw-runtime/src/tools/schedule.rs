@@ -137,12 +137,12 @@ impl Tool for ScheduleTool {
 
 impl ScheduleTool {
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
-        if !self.config.cron.enabled {
+        if !self.config.scheduler.enabled {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "cron is disabled by config (cron.enabled=false); cannot perform '{action}'"
+                    "cron is disabled by config (scheduler.enabled=false); cannot perform '{action}'"
                 )),
             });
         }
@@ -702,7 +702,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.cron.enabled = false;
+        config.scheduler.enabled = false;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,

@@ -34,10 +34,9 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
     // ── Declarative job sync: reconcile config-defined jobs with the DB.
-    let mut jobs_with_builtin = config.cron.jobs.clone();
+    let mut jobs_with_builtin = config.cron.clone();
     if let Some(ref schedule_cron) = config.backup.schedule_cron {
         let backup_job = CronJobDecl {
-            id: "__builtin_backup".to_string(),
             name: Some("Scheduled backup".to_string()),
             job_type: "shell".to_string(),
             schedule: CronScheduleDecl::Cron {
@@ -57,7 +56,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             schedule = %schedule_cron,
             "Synthesizing builtin backup cron job from config.backup.schedule_cron"
         );
-        jobs_with_builtin.push(backup_job);
+        jobs_with_builtin.insert("__builtin_backup".to_string(), backup_job);
     }
 
     match sync_declarative_jobs(&config, &jobs_with_builtin) {
@@ -77,8 +76,8 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
     //    which could leave some overdue jobs waiting across many cycles
     //    if the machine was off for a while. The catch-up phase fetches
     //    without the `max_tasks` limit so every missed job fires once.
-    //    Controlled by `[cron] catch_up_on_startup` (default: true).
-    if config.cron.catch_up_on_startup {
+    //    Controlled by `[scheduler] catch_up_on_startup` (default: true).
+    if config.scheduler.catch_up_on_startup {
         catch_up_overdue_jobs(&config, &security, &event_tx).await;
     } else {
         tracing::info!("Scheduler startup: catch-up disabled by config");

@@ -2429,6 +2429,181 @@ model_provider = "openrouter.default"
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// V3 — Cron promotion: [cron] subsystem + [[cron.jobs]] → [scheduler] +
+// alias-keyed [cron.<id>] map.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn v2_cron_subsystem_fields_migrate_onto_scheduler() {
+    let cfg = migrate(
+        r#"
+schema_version = 2
+
+[cron]
+enabled = false
+catch_up_on_startup = false
+max_run_history = 200
+"#,
+    );
+    assert!(!cfg.scheduler.enabled);
+    assert!(!cfg.scheduler.catch_up_on_startup);
+    assert_eq!(cfg.scheduler.max_run_history, 200);
+    assert!(cfg.cron.is_empty(), "no jobs declared, cron map is empty");
+}
+
+#[test]
+fn v2_cron_jobs_array_migrates_to_alias_map() {
+    let cfg = migrate(
+        r#"
+schema_version = 2
+
+[[cron.jobs]]
+id = "daily-report"
+job_type = "shell"
+command = "echo report"
+schedule = { kind = "cron", expr = "0 9 * * *" }
+
+[[cron.jobs]]
+id = "health-check"
+job_type = "agent"
+prompt = "Check server health"
+schedule = { kind = "every", every_ms = 300000 }
+"#,
+    );
+    assert_eq!(cfg.cron.len(), 2);
+
+    let report = cfg.cron.get("daily-report").expect("daily-report present");
+    assert_eq!(report.command.as_deref(), Some("echo report"));
+    assert_eq!(report.job_type, "shell");
+
+    let health = cfg.cron.get("health-check").expect("health-check present");
+    assert_eq!(health.job_type, "agent");
+    assert_eq!(health.prompt.as_deref(), Some("Check server health"));
+}
+
+#[test]
+fn v2_cron_jobs_without_id_get_synthesized_keys() {
+    let cfg = migrate(
+        r#"
+schema_version = 2
+
+[[cron.jobs]]
+job_type = "shell"
+command = "echo a"
+schedule = { kind = "cron", expr = "0 9 * * *" }
+
+[[cron.jobs]]
+job_type = "shell"
+command = "echo b"
+schedule = { kind = "cron", expr = "0 10 * * *" }
+"#,
+    );
+    assert_eq!(cfg.cron.len(), 2);
+    assert!(cfg.cron.contains_key("job-0"));
+    assert!(cfg.cron.contains_key("job-1"));
+}
+
+#[test]
+fn v2_cron_user_supplied_scheduler_values_win() {
+    let cfg = migrate(
+        r#"
+schema_version = 2
+
+[cron]
+enabled = false
+max_run_history = 100
+
+[scheduler]
+enabled = true
+"#,
+    );
+    // [scheduler].enabled was set explicitly → preserved.
+    assert!(cfg.scheduler.enabled);
+    // [scheduler].max_run_history was unset → folded from [cron].
+    assert_eq!(cfg.scheduler.max_run_history, 100);
+}
+
+#[test]
+fn v3_cron_alias_map_passes_through_unchanged() {
+    let cfg = migrate(
+        r#"
+schema_version = 3
+
+[cron.nightly]
+job_type = "shell"
+command = "echo go"
+schedule = { kind = "cron", expr = "0 2 * * *" }
+"#,
+    );
+    assert_eq!(cfg.cron.len(), 1);
+    let job = cfg.cron.get("nightly").expect("nightly present");
+    assert_eq!(job.command.as_deref(), Some("echo go"));
+}
+
+#[test]
+fn v2_cron_promotion_is_idempotent() {
+    let raw = r#"
+schema_version = 2
+
+[cron]
+enabled = false
+max_run_history = 33
+
+[[cron.jobs]]
+id = "j1"
+job_type = "shell"
+command = "echo j1"
+schedule = { kind = "cron", expr = "0 9 * * *" }
+"#;
+    // Migrate once: capture the V3 output.
+    let once = migrate(raw);
+    let serialized = toml::to_string(&once).expect("serialize once");
+
+    // Re-migrate the V3 output as raw input: should be identical.
+    let twice = migrate(&serialized);
+    let serialized_twice = toml::to_string(&twice).expect("serialize twice");
+
+    assert_eq!(
+        serialized, serialized_twice,
+        "cron promotion must be idempotent — re-migrating V3 output changed the table"
+    );
+    assert_eq!(twice.cron.len(), 1);
+    assert!(twice.cron.contains_key("j1"));
+    assert!(!twice.scheduler.enabled);
+    assert_eq!(twice.scheduler.max_run_history, 33);
+}
+
+#[test]
+fn agent_cron_jobs_field_round_trips() {
+    let cfg = migrate(
+        r#"
+schema_version = 3
+
+[agents.assistant]
+model_provider = "openrouter.default"
+cron_jobs = ["daily-digest", "health-watch"]
+
+[cron.daily-digest]
+job_type = "agent"
+prompt = "Summarize yesterday"
+schedule = { kind = "cron", expr = "0 9 * * *" }
+
+[cron.health-watch]
+job_type = "shell"
+command = "echo ok"
+schedule = { kind = "every", every_ms = 60000 }
+"#,
+    );
+
+    let agent = cfg.agents.get("assistant").expect("assistant present");
+    assert_eq!(
+        agent.cron_jobs,
+        vec!["daily-digest".to_string(), "health-watch".to_string()]
+    );
+    assert_eq!(cfg.cron.len(), 2);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // V3 — Config::validate() per-agent rules
 // ─────────────────────────────────────────────────────────────────────────────
 

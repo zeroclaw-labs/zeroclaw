@@ -686,7 +686,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Scheduled tasks",
             category: IntegrationCategory::ToolsAutomation,
             status_fn: |c| {
-                if c.cron.enabled {
+                if c.scheduler.enabled {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -1012,7 +1012,7 @@ mod tests {
     #[test]
     fn cron_active_when_enabled() {
         let mut config = Config::default();
-        config.cron.enabled = true;
+        config.scheduler.enabled = true;
         let entries = all_integrations();
         let cron = entries.iter().find(|e| e.name == "Cron").unwrap();
         assert!(matches!(
@@ -1024,7 +1024,7 @@ mod tests {
     #[test]
     fn cron_available_when_disabled() {
         let mut config = Config::default();
-        config.cron.enabled = false;
+        config.scheduler.enabled = false;
         let entries = all_integrations();
         let cron = entries.iter().find(|e| e.name == "Cron").unwrap();
         assert!(matches!(

@@ -516,9 +516,9 @@ pub async fn handle_api_cron_settings_get(
 
     let config = state.config.lock().clone();
     Json(serde_json::json!({
-        "enabled": config.cron.enabled,
-        "catch_up_on_startup": config.cron.catch_up_on_startup,
-        "max_run_history": config.cron.max_run_history,
+        "enabled": config.scheduler.enabled,
+        "catch_up_on_startup": config.scheduler.catch_up_on_startup,
+        "max_run_history": config.scheduler.max_run_history,
     }))
     .into_response()
 }
@@ -536,13 +536,13 @@ pub async fn handle_api_cron_settings_patch(
     let mut config = state.config.lock().clone();
 
     if let Some(v) = body.get("enabled").and_then(|v| v.as_bool()) {
-        config.cron.enabled = v;
+        config.scheduler.enabled = v;
     }
     if let Some(v) = body.get("catch_up_on_startup").and_then(|v| v.as_bool()) {
-        config.cron.catch_up_on_startup = v;
+        config.scheduler.catch_up_on_startup = v;
     }
     if let Some(v) = body.get("max_run_history").and_then(|v| v.as_u64()) {
-        config.cron.max_run_history = u32::try_from(v).unwrap_or(u32::MAX);
+        config.scheduler.max_run_history = u32::try_from(v).unwrap_or(u32::MAX);
     }
 
     if let Err(e) = config.save().await {
@@ -557,9 +557,9 @@ pub async fn handle_api_cron_settings_patch(
 
     Json(serde_json::json!({
         "status": "ok",
-        "enabled": config.cron.enabled,
-        "catch_up_on_startup": config.cron.catch_up_on_startup,
-        "max_run_history": config.cron.max_run_history,
+        "enabled": config.scheduler.enabled,
+        "catch_up_on_startup": config.scheduler.catch_up_on_startup,
+        "max_run_history": config.scheduler.max_run_history,
     }))
     .into_response()
 }

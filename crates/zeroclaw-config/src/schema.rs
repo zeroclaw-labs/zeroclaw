@@ -174,10 +174,14 @@ pub struct Config {
     #[nested]
     pub heartbeat: HeartbeatConfig,
 
-    /// Cron job configuration (`[cron]`).
-    #[serde(default)]
+    /// Declarative cron jobs (`[cron.<alias>]`), alias-keyed.
+    ///
+    /// Each entry is a named scheduled job synced into the database at
+    /// scheduler startup. Subsystem runtime knobs (enable/disable, catch-up,
+    /// run-history retention) live on `[scheduler]`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
-    pub cron: CronConfig,
+    pub cron: HashMap<String, CronJobDecl>,
 
     /// Channel configurations: Telegram, Discord, Slack, etc. (`[channels]`).
     #[serde(default, alias = "channels_config")]
@@ -715,6 +719,11 @@ pub struct DelegateAgentConfig {
     /// Multiple agents sharing a namespace see the same memory.
     #[serde(default)]
     pub memory_namespace: String,
+    /// Cron job aliases. Each entry references `cron[key]` — a declarative
+    /// scheduled job invoked by the scheduler on its configured trigger.
+    /// When the cron fires, this agent is the actor that executes the job.
+    #[serde(default)]
+    pub cron_jobs: Vec<String>,
 
     // ── Agent loop / runtime tunables (folded from V2 `[agent]` ──────
     // V3 makes these per-agent. Defaults preserve V2 behavior so an
@@ -810,6 +819,7 @@ impl Default for DelegateAgentConfig {
             knowledge_bundles: Vec::new(),
             mcp_bundles: Vec::new(),
             memory_namespace: String::new(),
+            cron_jobs: Vec::new(),
             compact_context: default_agent_compact_context(),
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
@@ -6174,19 +6184,33 @@ impl Default for ReliabilityConfig {
 // ── Scheduler ────────────────────────────────────────────────────
 
 /// Scheduler configuration for periodic task execution (`[scheduler]` section).
+///
+/// V3 owns the cron-runtime knobs (previously on `[cron]`): per-job declarations
+/// moved to `Config.cron: HashMap<String, CronJobDecl>` (alias-keyed), while the
+/// scheduler loop's runtime behavior (`enabled`, polling cap, catch-up) lives here.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "scheduler"]
 pub struct SchedulerConfig {
-    /// Enable the built-in scheduler loop.
+    /// Enable the built-in scheduler loop. When false, no cron jobs run.
     #[serde(default = "default_scheduler_enabled")]
     pub enabled: bool,
-    /// Maximum number of persisted scheduled tasks.
+    /// Maximum number of persisted scheduled tasks per polling cycle.
     #[serde(default = "default_scheduler_max_tasks")]
     pub max_tasks: usize,
-    /// Maximum tasks executed per scheduler polling cycle.
+    /// Maximum tasks executed in parallel within a single polling cycle.
     #[serde(default = "default_scheduler_max_concurrent")]
     pub max_concurrent: usize,
+    /// Run all overdue jobs at scheduler startup. Default: `true`.
+    ///
+    /// When the daemon restarts late, jobs whose `next_run` is in the past
+    /// fire once before normal polling resumes. Disable to wait for the
+    /// next scheduled occurrence instead.
+    #[serde(default = "default_true")]
+    pub catch_up_on_startup: bool,
+    /// Maximum number of historical cron run records to retain. Default: `50`.
+    #[serde(default = "default_max_run_history")]
+    pub max_run_history: u32,
 }
 
 fn default_scheduler_enabled() -> bool {
@@ -6207,6 +6231,8 @@ impl Default for SchedulerConfig {
             enabled: default_scheduler_enabled(),
             max_tasks: default_scheduler_max_tasks(),
             max_concurrent: default_scheduler_max_concurrent(),
+            catch_up_on_startup: true,
+            max_run_history: default_max_run_history(),
         }
     }
 }
@@ -6428,43 +6454,17 @@ impl Default for HeartbeatConfig {
 
 // ── Cron ────────────────────────────────────────────────────────
 
-/// Cron job configuration (`[cron]` section).
+/// A declarative cron job definition (`[cron.<alias>]`).
+///
+/// Stored alias-keyed on `Config.cron`. The map key serves as the stable job id.
+/// Synced into the database at scheduler startup with `source = "declarative"`,
+/// distinguishing them from jobs created imperatively via CLI or API.
+/// Declarative config takes precedence on each sync: if the config changes,
+/// the DB is updated to match. Imperative jobs are never deleted by sync.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "cron"]
-pub struct CronConfig {
-    /// Enable the cron subsystem. Default: `true`.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Run all overdue jobs at scheduler startup. Default: `true`.
-    ///
-    /// When the machine boots late or the daemon restarts, jobs whose
-    /// `next_run` is in the past are considered "missed". With this
-    /// option enabled the scheduler fires them once before entering
-    /// the normal polling loop. Disable if you prefer missed jobs to
-    /// simply wait for their next scheduled occurrence.
-    #[serde(default = "default_true")]
-    pub catch_up_on_startup: bool,
-    /// Maximum number of historical cron run records to retain. Default: `50`.
-    #[serde(default = "default_max_run_history")]
-    pub max_run_history: u32,
-    /// Declarative cron job definitions (`[[cron.jobs]]`).
-    ///
-    /// Jobs declared here are synced into the database at scheduler startup.
-    /// They use `source = "declarative"` to distinguish them from jobs
-    /// created imperatively via CLI or API. Declarative config takes
-    /// precedence on each sync: if the config changes, the DB is updated
-    /// to match. Imperative jobs are never deleted by the sync process.
-    #[serde(default)]
-    pub jobs: Vec<CronJobDecl>,
-}
-
-/// A declarative cron job definition for the `[[cron.jobs]]` config array.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CronJobDecl {
-    /// Stable identifier used for merge semantics across syncs.
-    pub id: String,
     /// Human-readable name.
     #[serde(default)]
     pub name: Option<String>,
@@ -6472,6 +6472,7 @@ pub struct CronJobDecl {
     #[serde(default = "default_job_type_decl")]
     pub job_type: String,
     /// Schedule for the job.
+    #[serde(default)]
     pub schedule: CronScheduleDecl,
     /// Shell command to run (required when `job_type = "shell"`).
     #[serde(default)]
@@ -6497,7 +6498,26 @@ pub struct CronJobDecl {
     pub session_target: Option<String>,
     /// Delivery configuration.
     #[serde(default)]
+    #[nested]
     pub delivery: Option<DeliveryConfigDecl>,
+}
+
+impl Default for CronJobDecl {
+    fn default() -> Self {
+        Self {
+            name: None,
+            job_type: default_job_type_decl(),
+            schedule: CronScheduleDecl::default(),
+            command: None,
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+        }
+    }
 }
 
 /// Schedule variant for declarative cron jobs.
@@ -6517,9 +6537,22 @@ pub enum CronScheduleDecl {
     At { at: String },
 }
 
+impl Default for CronScheduleDecl {
+    fn default() -> Self {
+        // Empty cron expression — `validate_decl` rejects it. Used only as
+        // a placeholder when a fresh map entry is auto-created via the
+        // schema's `create_map_key` path; the user fills it in immediately.
+        Self::Cron {
+            expr: String::new(),
+            tz: None,
+        }
+    }
+}
+
 /// Delivery configuration for declarative cron jobs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "cron-delivery"]
 pub struct DeliveryConfigDecl {
     /// Delivery mode: `"none"` or `"announce"`.
     #[serde(default = "default_delivery_mode")]
@@ -6535,6 +6568,17 @@ pub struct DeliveryConfigDecl {
     pub best_effort: bool,
 }
 
+impl Default for DeliveryConfigDecl {
+    fn default() -> Self {
+        Self {
+            mode: default_delivery_mode(),
+            channel: None,
+            to: None,
+            best_effort: true,
+        }
+    }
+}
+
 fn default_job_type_decl() -> String {
     "shell".to_string()
 }
@@ -6545,17 +6589,6 @@ fn default_delivery_mode() -> String {
 
 fn default_max_run_history() -> u32 {
     50
-}
-
-impl Default for CronConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            catch_up_on_startup: true,
-            max_run_history: default_max_run_history(),
-            jobs: Vec::new(),
-        }
-    }
 }
 
 // ── Tunnel ──────────────────────────────────────────────────────
@@ -9623,7 +9656,7 @@ impl Default for Config {
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
             heartbeat: HeartbeatConfig::default(),
-            cron: CronConfig::default(),
+            cron: HashMap::new(),
             channels: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -11748,29 +11781,31 @@ recipient = "42"
     }
 
     #[test]
-    async fn cron_config_default() {
-        let c = CronConfig::default();
-        assert!(c.enabled);
-        assert_eq!(c.max_run_history, 50);
+    async fn scheduler_config_default() {
+        let s = SchedulerConfig::default();
+        assert!(s.enabled);
+        assert!(s.catch_up_on_startup);
+        assert_eq!(s.max_run_history, 50);
     }
 
     #[test]
-    async fn cron_config_serde_roundtrip() {
-        let c = CronConfig {
+    async fn scheduler_config_serde_roundtrip() {
+        let s = SchedulerConfig {
             enabled: false,
+            max_tasks: 16,
+            max_concurrent: 2,
             catch_up_on_startup: false,
             max_run_history: 100,
-            jobs: Vec::new(),
         };
-        let json = serde_json::to_string(&c).unwrap();
-        let parsed: CronConfig = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: SchedulerConfig = serde_json::from_str(&json).unwrap();
         assert!(!parsed.enabled);
         assert!(!parsed.catch_up_on_startup);
         assert_eq!(parsed.max_run_history, 100);
     }
 
     #[test]
-    async fn config_defaults_cron_when_section_missing() {
+    async fn config_defaults_scheduler_when_section_missing() {
         let toml_str = r#"
 workspace_dir = "/tmp/workspace"
 config_path = "/tmp/config.toml"
@@ -11778,9 +11813,10 @@ default_temperature = 0.7
 "#;
 
         let parsed = parse_test_config(toml_str);
-        assert!(parsed.cron.enabled);
-        assert!(parsed.cron.catch_up_on_startup);
-        assert_eq!(parsed.cron.max_run_history, 50);
+        assert!(parsed.scheduler.enabled);
+        assert!(parsed.scheduler.catch_up_on_startup);
+        assert_eq!(parsed.scheduler.max_run_history, 50);
+        assert!(parsed.cron.is_empty());
     }
 
     #[test]
@@ -12002,7 +12038,7 @@ auto_save = true
                 to: Some("123456".into()),
                 ..HeartbeatConfig::default()
             },
-            cron: CronConfig::default(),
+            cron: HashMap::new(),
             channels: ChannelsConfig {
                 cli: true,
                 telegram: HashMap::from([(
@@ -12647,7 +12683,7 @@ default_temperature = 0.7
             pipeline: PipelineConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
-            cron: CronConfig::default(),
+            cron: HashMap::new(),
             channels: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),

@@ -1214,6 +1214,99 @@ fn v2_to_v3_table(table: &mut toml::Table) {
             }
         }
     }
+
+    // V3 cron promotion:
+    // - V2 had `[cron]` with subsystem knobs (enabled, catch_up_on_startup,
+    //   max_run_history) plus `[[cron.jobs]]` array. V3 makes `[cron.<alias>]`
+    //   the alias-keyed job map directly; subsystem knobs live on `[scheduler]`.
+    // - Move scalar cron fields onto `[scheduler]`; user-supplied scheduler
+    //   values always win.
+    // - Move `[[cron.jobs]]` array into `[cron.<id>]` map (id field removed,
+    //   the alias key preserves stable identity).
+    promote_v2_cron_subsystem(table);
+}
+
+fn promote_v2_cron_subsystem(table: &mut toml::Table) {
+    // Detect V3-shape early: if `[cron]` is already a map of subtables and
+    // contains no subsystem scalars / jobs array, no work to do (idempotent).
+    let cron_is_v3_shape = match table.get("cron") {
+        Some(toml::Value::Table(t)) => {
+            !t.contains_key("enabled")
+                && !t.contains_key("catch_up_on_startup")
+                && !t.contains_key("max_run_history")
+                && !t.contains_key("jobs")
+        }
+        _ => true, // missing or non-table → nothing to migrate
+    };
+    if cron_is_v3_shape {
+        return;
+    }
+
+    // Take ownership of the V2 cron table so we can re-shape it from scratch.
+    let v2_cron = match table.remove("cron") {
+        Some(toml::Value::Table(t)) => t,
+        Some(other) => {
+            tracing::warn!(
+                "v2→v3 migration: [cron] is not a table, dropping ({:?})",
+                other.type_str()
+            );
+            return;
+        }
+        None => return,
+    };
+
+    let mut cron_subsystem: toml::Table = toml::Table::new();
+    let mut jobs_array: Option<toml::Value> = None;
+    let mut new_cron_map: toml::Table = toml::Table::new();
+
+    for (k, v) in v2_cron {
+        match k.as_str() {
+            "enabled" | "catch_up_on_startup" | "max_run_history" => {
+                cron_subsystem.insert(k, v);
+            }
+            "jobs" => {
+                jobs_array = Some(v);
+            }
+            // V3 already-aliased entries: preserve.
+            _ => {
+                new_cron_map.insert(k, v);
+            }
+        }
+    }
+
+    // Promote subsystem scalars onto `[scheduler]`. User-supplied values win.
+    if !cron_subsystem.is_empty() {
+        let scheduler = table
+            .entry("scheduler")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(s) = scheduler {
+            for (k, v) in cron_subsystem {
+                s.entry(k).or_insert(v);
+            }
+        }
+    }
+
+    // Convert `[[cron.jobs]]` array into the alias-keyed map. Each entry's
+    // `id` field becomes the map key; if missing, synthesize one from the
+    // index. Conflicts with already-present V3 aliases keep the V3 entry
+    // (idempotent on V3-shaped configs that also had V2 jobs).
+    if let Some(toml::Value::Array(items)) = jobs_array {
+        for (idx, item) in items.into_iter().enumerate() {
+            if let toml::Value::Table(mut job_table) = item {
+                let job_id = match job_table.remove("id") {
+                    Some(toml::Value::String(s)) if !s.trim().is_empty() => s,
+                    _ => format!("job-{idx}"),
+                };
+                if !new_cron_map.contains_key(&job_id) {
+                    new_cron_map.insert(job_id, toml::Value::Table(job_table));
+                }
+            }
+        }
+    }
+
+    if !new_cron_map.is_empty() {
+        table.insert("cron".to_string(), toml::Value::Table(new_cron_map));
+    }
 }
 
 // ── File-level migration (comment-preserving) ───────────────────────────────

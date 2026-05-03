@@ -255,7 +255,7 @@ pub async fn run(
         ));
     }
 
-    if config.cron.enabled {
+    if config.scheduler.enabled {
         let scheduler_cfg = config.clone();
         let scheduler_event_tx = event_tx.clone();
         handles.push(spawn_component_supervisor(
