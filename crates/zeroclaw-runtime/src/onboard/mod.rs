@@ -897,9 +897,7 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                     if flags.provider.is_some() {
                         return Ok(Nav::Back);
                     }
-                    if is_new_entry
-                        && let Some(aliases) = cfg.providers.models.get_mut(&picked)
-                    {
+                    if is_new_entry && let Some(aliases) = cfg.providers.models.get_mut(&picked) {
                         aliases.remove(&alias);
                         if aliases.is_empty() {
                             cfg.providers.models.remove(&picked);
@@ -914,14 +912,12 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
 
         if flags.model.is_none() {
             ui.heading(2, &format!("{display_name} › Model"));
-            match prompt_model(cfg, ui, &picked).await? {
+            match prompt_model(cfg, ui, &prefix).await? {
                 Nav::Back => {
                     if flags.provider.is_some() {
                         return Ok(Nav::Back);
                     }
-                    if is_new_entry
-                        && let Some(aliases) = cfg.providers.models.get_mut(&picked)
-                    {
+                    if is_new_entry && let Some(aliases) = cfg.providers.models.get_mut(&picked) {
                         aliases.remove(&alias);
                         if aliases.is_empty() {
                             cfg.providers.models.remove(&picked);
@@ -1018,29 +1014,34 @@ fn provider_trait_defaults_for_prompts(provider: &str, prefix: &str) -> Vec<Fiel
 /// Calls `Provider::list_models()` (no auth — see `zeroclaw-providers`
 /// models_dev + native public endpoints). Falls back to a manual string
 /// input when the provider doesn't expose a no-auth list or the fetch fails.
-async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, provider: &str) -> Result<Nav> {
-    let model_path = format!("providers.models.{provider}.default.model");
+/// `prefix` is the full alias-level path: `providers.models.<type>.<alias>`.
+async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, prefix: &str) -> Result<Nav> {
+    let model_path = format!("{prefix}.model");
     let current = cfg.get_prop(&model_path).unwrap_or_default();
     let is_set = !current.is_empty() && current != "<unset>";
-    // Resolve profile: support both dotted "type.alias" and bare type key → "default" alias.
-    let profile = if let Some((type_k, alias_k)) = provider.split_once('.') {
-        cfg.providers
-            .models
-            .get(type_k)
-            .and_then(|m| m.get(alias_k))
-    } else {
-        cfg.providers
-            .models
-            .get(provider)
-            .and_then(|m| m.get("default"))
+    // Extract type and alias from "providers.models.<type>.<alias>".
+    let (provider, profile) = match prefix.strip_prefix("providers.models.") {
+        Some(rest) => {
+            if let Some((type_k, alias_k)) = rest.split_once('.') {
+                let profile = cfg
+                    .providers
+                    .models
+                    .get(type_k)
+                    .and_then(|m| m.get(alias_k));
+                (type_k.to_string(), profile)
+            } else {
+                (rest.to_string(), None)
+            }
+        }
+        None => (prefix.to_string(), None),
     };
     let api_key = profile.and_then(|entry| entry.api_key.as_deref());
     let configured_base_url = profile.and_then(|entry| entry.base_url.as_deref());
-    let discovery_base_url = openai_compat_discovery_base_url(provider, configured_base_url);
+    let discovery_base_url = openai_compat_discovery_base_url(&provider, configured_base_url);
     let should_try_openai_compat =
-        provider.trim().starts_with("custom:") || !is_known_provider_name(provider);
+        provider.trim().starts_with("custom:") || !is_known_provider_name(&provider);
 
-    let catalog_models = match zeroclaw_providers::create_provider(provider, None) {
+    let catalog_models = match zeroclaw_providers::create_provider(&provider, None) {
         Ok(handle) => {
             ui.status("Fetching models...");
             match handle.list_models().await {
@@ -1812,7 +1813,9 @@ mod tests {
             );
         let mut ui = QuickUi::new().with("Model", "gateway-large");
 
-        prompt_model(&mut cfg, &mut ui, "my-gateway").await.unwrap();
+        prompt_model(&mut cfg, &mut ui, "providers.models.my-gateway.default")
+            .await
+            .unwrap();
 
         let model_cfg = cfg
             .providers
@@ -2032,5 +2035,258 @@ mod tests {
             after_first, after_second,
             "second run hit the skip-gate and must not rewrite config.toml"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // BackAt: a test-only OnboardUi that returns Answer::Back for one named
+    // prompt, and delegates everything else to an inner QuickUi. Used to drive
+    // ESC / Back navigation through provider and channel flows without spinning
+    // up the full TUI.
+    // ---------------------------------------------------------------------------
+    struct BackAt {
+        back_prompt: &'static str,
+        inner: QuickUi,
+    }
+
+    impl BackAt {
+        fn new(back_prompt: &'static str, inner: QuickUi) -> Self {
+            Self { back_prompt, inner }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OnboardUi for BackAt {
+        async fn confirm(&mut self, prompt: &str, default: bool) -> anyhow::Result<Answer<bool>> {
+            if prompt == self.back_prompt {
+                return Ok(Answer::Back);
+            }
+            self.inner.confirm(prompt, default).await
+        }
+
+        async fn string(
+            &mut self,
+            prompt: &str,
+            current: Option<&str>,
+        ) -> anyhow::Result<Answer<String>> {
+            if prompt == self.back_prompt {
+                return Ok(Answer::Back);
+            }
+            self.inner.string(prompt, current).await
+        }
+
+        async fn secret(
+            &mut self,
+            prompt: &str,
+            has_current: bool,
+        ) -> anyhow::Result<Answer<Option<String>>> {
+            if prompt == self.back_prompt {
+                return Ok(Answer::Back);
+            }
+            self.inner.secret(prompt, has_current).await
+        }
+
+        async fn select(
+            &mut self,
+            prompt: &str,
+            items: &[SelectItem],
+            current: Option<usize>,
+        ) -> anyhow::Result<Answer<usize>> {
+            if prompt == self.back_prompt {
+                return Ok(Answer::Back);
+            }
+            self.inner.select(prompt, items, current).await
+        }
+
+        async fn editor(&mut self, hint: &str, initial: &str) -> anyhow::Result<Answer<String>> {
+            if hint == self.back_prompt {
+                return Ok(Answer::Back);
+            }
+            self.inner.editor(hint, initial).await
+        }
+
+        fn heading(&mut self, level: u8, text: &str) {
+            self.inner.heading(level, text);
+        }
+
+        fn note(&mut self, msg: &str) {
+            self.inner.note(msg);
+        }
+
+        fn status(&mut self, msg: &str) {
+            self.inner.status(msg);
+        }
+
+        fn warn(&mut self, msg: &str) {
+            self.inner.warn(msg);
+        }
+    }
+
+    // US-7 / prompt_model regression: model is written to the alias the user
+    // actually selected, not to a hardcoded ".default." path. A non-default
+    // alias ("work") must produce providers.models.anthropic.work.model, never
+    // providers.models.anthropic.default.model.
+    #[tokio::test]
+    async fn prompt_model_writes_to_actual_alias_not_hardcoded_default() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        cfg.providers
+            .models
+            .entry("anthropic".into())
+            .or_default()
+            .insert("work".to_string(), ModelProviderConfig::default());
+
+        let mut ui = QuickUi::new().with("Model", "claude-opus-4-7");
+        prompt_model(&mut cfg, &mut ui, "providers.models.anthropic.work")
+            .await
+            .unwrap();
+
+        let work_model = cfg
+            .providers
+            .models
+            .get("anthropic")
+            .and_then(|m| m.get("work"))
+            .and_then(|c| c.model.as_deref());
+        assert_eq!(
+            work_model,
+            Some("claude-opus-4-7"),
+            "model must be written to the 'work' alias, not 'default'"
+        );
+
+        let default_model = cfg
+            .providers
+            .models
+            .get("anthropic")
+            .and_then(|m| m.get("default"))
+            .and_then(|c| c.model.as_deref());
+        assert!(
+            default_model.is_none(),
+            "no 'default' alias should exist — path was hardcoded to 'default' (regression)"
+        );
+    }
+
+    // US-3 / ESC regression: backing out of api-key prompt on an existing alias
+    // must leave that alias intact with its original values.
+    #[tokio::test]
+    async fn providers_esc_on_existing_alias_leaves_config_untouched() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+
+        // Pre-seed an existing alias with a known api_key.
+        cfg.providers
+            .models
+            .entry("anthropic".into())
+            .or_default()
+            .insert(
+                "my-alias".to_string(),
+                ModelProviderConfig {
+                    api_key: Some("sk-original".into()),
+                    model: Some("claude-opus-4-7".into()),
+                    ..Default::default()
+                },
+            );
+
+        // Drive providers(): pick anthropic, pick "my-alias" (existing), ESC at api-key.
+        // The loop should continue (not remove the entry) because is_new_entry = false.
+        // After ESC the loop re-presents the provider select — we then pick "Done".
+        let mut ui = BackAt::new(
+            "api-key",
+            QuickUi::new()
+                .with_sequence("Provider", ["Anthropic", "Done"])
+                .with("Alias", "my-alias"),
+        );
+        run(&mut cfg, &mut ui, Section::Providers, &Flags::default())
+            .await
+            .unwrap();
+
+        let alias_cfg = cfg
+            .providers
+            .models
+            .get("anthropic")
+            .and_then(|m| m.get("my-alias"))
+            .expect("my-alias must survive ESC on an existing entry");
+        assert_eq!(
+            alias_cfg.api_key.as_deref(),
+            Some("sk-original"),
+            "original api_key must not be clobbered after ESC"
+        );
+        assert_eq!(alias_cfg.model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    // US-1 / ESC regression: backing out of api-key prompt on a brand-new alias
+    // must remove the in-progress entry so it never reaches disk.
+    #[tokio::test]
+    async fn providers_esc_on_new_alias_removes_entry() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+
+        // No pre-existing aliases for anthropic. The alias prompt fires first,
+        // user types "fresh". ESC at api-key removes "fresh" and loops. Then
+        // the provider select fires again and the user picks "Done".
+        let mut ui = BackAt::new(
+            "api-key",
+            QuickUi::new()
+                .with_sequence("Provider", ["Anthropic", "Done"])
+                .with("Alias (name for this configuration)", "fresh"),
+        );
+        run(&mut cfg, &mut ui, Section::Providers, &Flags::default())
+            .await
+            .unwrap();
+
+        let entry = cfg
+            .providers
+            .models
+            .get("anthropic")
+            .and_then(|m| m.get("fresh"));
+        assert!(
+            entry.is_none(),
+            "in-progress 'fresh' alias must be removed after ESC (never persisted)"
+        );
+    }
+
+    // US-2: get_map_keys returns all configured aliases, not just "default".
+    // Covers the gateway endpoint regression where MapKeyQuery required `key`
+    // and returned 400 on every alias-list fetch.
+    #[tokio::test]
+    async fn get_map_keys_returns_all_channel_aliases() {
+        use zeroclaw_config::schema::DiscordConfig;
+
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        cfg.channels
+            .discord
+            .insert("default".into(), DiscordConfig::default());
+        cfg.channels
+            .discord
+            .insert("alerts".into(), DiscordConfig::default());
+
+        let mut keys = cfg
+            .get_map_keys("channels.discord")
+            .expect("discord has two entries — get_map_keys must return Some");
+        keys.sort();
+        assert_eq!(keys, vec!["alerts", "default"]);
+    }
+
+    // US-2 / model providers: get_map_keys returns all provider aliases across
+    // both the type and alias layers.
+    #[tokio::test]
+    async fn get_map_keys_returns_all_provider_aliases() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        cfg.providers
+            .models
+            .entry("anthropic".into())
+            .or_default()
+            .insert("default".into(), ModelProviderConfig::default());
+        cfg.providers
+            .models
+            .entry("anthropic".into())
+            .or_default()
+            .insert("work".into(), ModelProviderConfig::default());
+
+        let mut keys = cfg
+            .get_map_keys("providers.models.anthropic")
+            .expect("anthropic has two aliases — get_map_keys must return Some");
+        keys.sort();
+        assert_eq!(keys, vec!["default", "work"]);
     }
 }
