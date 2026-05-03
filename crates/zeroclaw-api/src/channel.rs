@@ -129,6 +129,47 @@ pub trait Channel: Send + Sync {
         true
     }
 
+    /// Send a discrete-choice prompt with options.
+    ///
+    /// Each `(callback_id, label)` pair represents one choice. The
+    /// `callback_id` is the stable identifier the channel uses when the
+    /// user makes a selection — for native-interactive channels, this
+    /// id round-trips back through the inbound message (e.g. as the
+    /// `id` field of a WhatsApp `interactive.button_reply`, or via a
+    /// `[choice]<callback_id>` content sentinel for Signal poll votes).
+    ///
+    /// The default impl renders a numbered text fallback with an
+    /// explicit "reply with name or number" hint, suitable for any
+    /// channel that has no native UI for discrete choices (Matrix, SMS,
+    /// IRC, etc.). Channels with native interactive support (Telegram
+    /// inline keyboards, Signal polls, WhatsApp interactive buttons /
+    /// lists) override this to render natively. The contract: the
+    /// caller will see the user's selection arrive on the inbound side
+    /// — either as the rendered numbered text (which the caller is
+    /// expected to match against its options) or as a structured
+    /// channel-specific sentinel.
+    ///
+    /// `prompt` is the question / title; rendered ABOVE the options.
+    async fn send_choice(
+        &self,
+        recipient: &str,
+        prompt: &str,
+        options: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        let mut text = String::new();
+        if !prompt.trim().is_empty() {
+            text.push_str(prompt.trim());
+            text.push_str("\n\n");
+        }
+        text.push_str("(reply with name or number)\n");
+        for (idx, (_id, label)) in options.iter().enumerate() {
+            text.push_str(&format!("{}. {}\n", idx + 1, label.trim()));
+        }
+        // Trim trailing newline so the message looks tidy across clients.
+        let trimmed = text.trim_end().to_string();
+        self.send(&SendMessage::new(trimmed, recipient)).await
+    }
+
     /// Signal that the bot is processing a response (e.g. "typing" indicator).
     async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
         Ok(())

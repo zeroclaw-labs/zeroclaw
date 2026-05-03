@@ -584,6 +584,58 @@ impl Channel for WhatsAppChannel {
         Ok(())
     }
 
+    async fn send_choice(
+        &self,
+        recipient: &str,
+        prompt: &str,
+        options: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        // WhatsApp Cloud interactive: ≤ 3 buttons OR up to 10×10 list rows.
+        // 1 option falls through to plain text — there's no UX win to a
+        // single-button interactive message.
+        if options.len() >= 2 && options.len() <= 3 {
+            let buttons: Vec<(String, String)> = options
+                .iter()
+                .map(|(id, label)| (id.clone(), label.clone()))
+                .collect();
+            return self
+                .send_interactive_buttons(recipient, prompt, &buttons)
+                .await;
+        }
+        if options.len() > 3 {
+            // Pack into a single section for the list message. Operators
+            // who want grouped sections should call send_interactive_list
+            // directly; this default flattens.
+            let rows: Vec<InteractiveListRow> = options
+                .iter()
+                .map(|(id, label)| InteractiveListRow {
+                    id: id.clone(),
+                    title: label.clone(),
+                    description: None,
+                })
+                .collect();
+            let section = InteractiveListSection {
+                title: "Options".to_string(),
+                rows,
+            };
+            return self
+                .send_interactive_list(recipient, prompt, "Choose", &[section])
+                .await;
+        }
+        // 0 or 1 options → defer to plain text.
+        let mut text = String::new();
+        if !prompt.trim().is_empty() {
+            text.push_str(prompt.trim());
+            text.push_str("\n\n");
+        }
+        text.push_str("(reply with name or number)\n");
+        for (idx, (_id, label)) in options.iter().enumerate() {
+            text.push_str(&format!("{}. {}\n", idx + 1, label.trim()));
+        }
+        let trimmed = text.trim_end().to_string();
+        self.send(&SendMessage::new(trimmed, recipient)).await
+    }
+
     async fn request_approval(
         &self,
         recipient: &str,

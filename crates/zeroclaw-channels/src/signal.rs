@@ -455,6 +455,42 @@ impl Channel for SignalChannel {
         Ok(())
     }
 
+    async fn send_choice(
+        &self,
+        recipient: &str,
+        prompt: &str,
+        options: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        // Signal supports native polls via signal-cli-rest-api `/v2/send`
+        // pollDetails. Single-select (multi=false) is the right default
+        // for "pick one of N" prompts; consumers needing multi-select
+        // should call SignalChannel::send_poll directly.
+        //
+        // Polls require ≥2 options per Signal protocol; for 0 or 1
+        // options, fall back to the trait default (numbered text). The
+        // callback ids passed in here are dropped on the wire because
+        // Signal polls correlate by index — the consumer sees a
+        // pollAnswer with selected_titles back via process_envelope,
+        // which re-emits as `[choice]<title>`. The label text is what
+        // matters at render time.
+        if options.len() >= 2 {
+            let labels: Vec<String> = options.iter().map(|(_, l)| l.clone()).collect();
+            return self.send_poll(recipient, prompt, &labels, false).await;
+        }
+        // Defer to default text rendering (numbered + hint).
+        let mut text = String::new();
+        if !prompt.trim().is_empty() {
+            text.push_str(prompt.trim());
+            text.push_str("\n\n");
+        }
+        text.push_str("(reply with name or number)\n");
+        for (idx, (_id, label)) in options.iter().enumerate() {
+            text.push_str(&format!("{}. {}\n", idx + 1, label.trim()));
+        }
+        let trimmed = text.trim_end().to_string();
+        self.send(&SendMessage::new(trimmed, recipient)).await
+    }
+
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let mut url = reqwest::Url::parse(&format!("{}/api/v1/events", self.http_url))?;
         url.query_pairs_mut().append_pair("account", &self.account);
@@ -696,6 +732,7 @@ mod tests {
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
                 attachments: None,
+                poll_answer: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
@@ -771,6 +808,7 @@ mod tests {
             timestamp: Some(1000),
             group_info: None,
             attachments: None,
+            poll_answer: None,
         };
         assert!(ch.matches_group(&dm));
 
@@ -781,6 +819,7 @@ mod tests {
                 group_id: Some("group123".to_string()),
             }),
             attachments: None,
+            poll_answer: None,
         };
         assert!(ch.matches_group(&group));
     }
@@ -795,6 +834,7 @@ mod tests {
                 group_id: Some("group123".to_string()),
             }),
             attachments: None,
+            poll_answer: None,
         };
         assert!(ch.matches_group(&matching));
 
@@ -805,6 +845,7 @@ mod tests {
                 group_id: Some("other_group".to_string()),
             }),
             attachments: None,
+            poll_answer: None,
         };
         assert!(!ch.matches_group(&non_matching));
     }
@@ -817,6 +858,7 @@ mod tests {
             timestamp: Some(1000),
             group_info: None,
             attachments: None,
+            poll_answer: None,
         };
         assert!(ch.matches_group(&dm));
 
@@ -827,6 +869,7 @@ mod tests {
                 group_id: Some("group123".to_string()),
             }),
             attachments: None,
+            poll_answer: None,
         };
         assert!(!ch.matches_group(&group));
     }
@@ -839,6 +882,7 @@ mod tests {
             timestamp: Some(1000),
             group_info: None,
             attachments: None,
+            poll_answer: None,
         };
         assert_eq!(ch.reply_target(&dm, "+1111111111"), "+1111111111");
     }
@@ -853,6 +897,7 @@ mod tests {
                 group_id: Some("group123".to_string()),
             }),
             attachments: None,
+            poll_answer: None,
         };
         assert_eq!(ch.reply_target(&group, "+1111111111"), "group:group123");
     }
@@ -951,6 +996,7 @@ mod tests {
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
                 attachments: None,
+                poll_answer: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
@@ -986,6 +1032,7 @@ mod tests {
                     group_id: Some("testgroup".to_string()),
                 }),
                 attachments: None,
+                poll_answer: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
@@ -1061,6 +1108,7 @@ mod tests {
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
                 attachments: Some(vec![serde_json::json!({"contentType": "image/png"})]),
+                poll_answer: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
