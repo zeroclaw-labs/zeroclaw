@@ -668,10 +668,13 @@ impl TaskClassifier {
             }
         }
 
-        // Find best match
+        // Find best match. `partial_cmp().unwrap()` would panic on NaN —
+        // the `+= 1.0` accumulator is finite today, but adding any future
+        // weight that could go through `0.0/0.0` or an `f64::NAN` constant
+        // would crash the classifier. Sibling of BUG #14 fixed in PR #225.
         let (best_idx, best_score) = scores
             .iter()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(&idx, &score)| (idx, score))
             .unwrap_or((usize::MAX, 0.0));
 
