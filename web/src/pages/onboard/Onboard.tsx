@@ -380,7 +380,7 @@ export default function Onboard() {
                     </span>
                     <ChevronRight className="h-3 w-3" />
                     <span style={{ color: 'var(--pc-accent)', fontWeight: 600 }}>
-                      {picked.fieldsPrefix.split('.').at(-1)}
+                      {picked.fieldsPrefix.split('.').slice(-1)[0]}
                     </span>
                   </>
                 )}
@@ -439,7 +439,6 @@ export default function Onboard() {
                 typeKey={pickedType.item.key}
                 typeLabel={pickedType.item.label}
                 onSelectAlias={(alias) => void openWithAlias(pickedType.item, pickedType.sectionKey, alias)}
-                onBack={() => setPickedType(null)}
               />
             ) : (
               <SectionPicker
@@ -462,13 +461,11 @@ function OnboardAliasListView({
   typeKey,
   typeLabel,
   onSelectAlias,
-  onBack,
 }: {
   sectionKey: string;
   typeKey: string;
   typeLabel: string;
   onSelectAlias: (alias: string) => void;
-  onBack: () => void;
 }) {
   const [aliases, setAliases] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
