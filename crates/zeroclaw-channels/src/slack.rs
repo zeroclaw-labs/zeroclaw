@@ -2553,6 +2553,7 @@ impl SlackChannel {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         })
     }
@@ -2796,6 +2797,7 @@ impl SlackChannel {
                                             .as_secs(),
                                         thread_ts,
                                         interruption_scope_id: scope_id,
+                                        metadata: serde_json::Value::Null,
                                         attachments: vec![],
                                     };
                                     tracing::info!(
@@ -2902,6 +2904,7 @@ impl SlackChannel {
                         Self::inbound_thread_ts_genuine_only(event)
                     },
                     interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
+                    metadata: serde_json::Value::Null,
                     attachments: vec![],
                 };
 
@@ -3915,6 +3918,7 @@ impl Channel for SlackChannel {
                                 Self::inbound_thread_ts_genuine_only(msg)
                             },
                             interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
+                            metadata: serde_json::Value::Null,
                             attachments: vec![],
                         };
 
@@ -4009,6 +4013,7 @@ impl Channel for SlackChannel {
                             .as_secs(),
                         thread_ts: Some(thread_ts.clone()),
                         interruption_scope_id: Some(thread_ts.clone()),
+                        metadata: serde_json::Value::Null,
                         attachments: vec![],
                     };
 
@@ -5081,6 +5086,7 @@ mod tests {
             timestamp: 0,
             thread_ts: None, // thread_replies=false → no fallback to ts
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
 
@@ -5107,6 +5113,7 @@ mod tests {
             timestamp: 0,
             thread_ts: Some(ts.to_string()), // thread_replies=true → ts as thread_ts
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
 

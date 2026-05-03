@@ -225,6 +225,7 @@ impl RedditChannel {
             timestamp,
             thread_ts: item.parent_id.clone(),
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         })
     }

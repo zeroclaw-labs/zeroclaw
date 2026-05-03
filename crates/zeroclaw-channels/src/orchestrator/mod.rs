@@ -7277,6 +7277,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7369,6 +7370,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7475,6 +7477,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 3,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7566,6 +7569,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7667,6 +7671,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7789,6 +7794,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -7892,6 +7898,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 3,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -8010,6 +8017,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 4,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -8116,6 +8124,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -8212,6 +8221,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -8430,6 +8440,7 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         })
         .await
@@ -8443,6 +8454,7 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 2,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         })
         .await
@@ -8545,6 +8557,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             })
             .await
@@ -8559,6 +8572,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             })
             .await
@@ -8678,6 +8692,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             })
             .await
@@ -8692,6 +8707,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             })
             .await
@@ -8808,6 +8824,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             })
             .await
@@ -8822,6 +8839,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             })
             .await
@@ -8916,6 +8934,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -9005,6 +9024,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -9094,6 +9114,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -9631,6 +9652,7 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
 
@@ -9648,6 +9670,7 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: Some("1741234567.123456".into()),
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
 
@@ -9668,6 +9691,7 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
 
@@ -9685,6 +9709,7 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
         let msg2 = zeroclaw_api::channel::ChannelMessage {
@@ -9696,6 +9721,7 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 2,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
 
@@ -9719,6 +9745,7 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
         let msg2 = zeroclaw_api::channel::ChannelMessage {
@@ -9730,6 +9757,7 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 2,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
 
@@ -9889,6 +9917,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -9906,6 +9935,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -10035,6 +10065,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -10069,6 +10100,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -10108,6 +10140,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 3,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -10222,6 +10255,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -10340,6 +10374,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -10965,6 +11000,7 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -11062,6 +11098,7 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -11079,6 +11116,7 @@ This is an example JSON object for profile settings."#;
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -11194,6 +11232,7 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -11211,6 +11250,7 @@ This is an example JSON object for profile settings."#;
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -11370,6 +11410,7 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -11492,6 +11533,7 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -11606,6 +11648,7 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -11740,6 +11783,7 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             },
             CancellationToken::new(),
@@ -11939,6 +11983,7 @@ This is an example JSON object for profile settings."#;
             timestamp: 0,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
@@ -11955,6 +12000,7 @@ This is an example JSON object for profile settings."#;
             timestamp: 0,
             thread_ts: Some("$thread1".into()),
             interruption_scope_id: Some("$thread1".into()),
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice_$thread1");
@@ -11972,6 +12018,7 @@ This is an example JSON object for profile settings."#;
             timestamp: 0,
             thread_ts: Some("1234567890.000100".into()), // Slack top-level fallback
             interruption_scope_id: None,                 // but NOT a thread reply
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
         assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
@@ -12058,6 +12105,7 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             })
             .await
@@ -12072,6 +12120,7 @@ This is an example JSON object for profile settings."#;
                 timestamp: 2,
                 thread_ts: Some("1741234567.200002".to_string()),
                 interruption_scope_id: Some("1741234567.200002".to_string()),
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             })
             .await

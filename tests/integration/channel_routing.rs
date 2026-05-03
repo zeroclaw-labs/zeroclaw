@@ -26,6 +26,7 @@ fn channel_message_sender_field_holds_platform_user_id() {
         timestamp: 1700000000,
         thread_ts: None,
         interruption_scope_id: None,
+        metadata: serde_json::Value::Null,
         attachments: vec![],
     };
 
@@ -50,6 +51,7 @@ fn channel_message_reply_target_distinct_from_sender() {
         timestamp: 1700000000,
         thread_ts: None,
         interruption_scope_id: None,
+        metadata: serde_json::Value::Null,
         attachments: vec![],
     };
 
@@ -72,6 +74,7 @@ fn channel_message_fields_not_swapped() {
         timestamp: 1700000000,
         thread_ts: None,
         interruption_scope_id: None,
+        metadata: serde_json::Value::Null,
         attachments: vec![],
     };
 
@@ -100,6 +103,10 @@ fn channel_message_preserves_all_fields_on_clone() {
         timestamp: 1700000001,
         thread_ts: None,
         interruption_scope_id: None,
+        metadata: serde_json::json!({
+            "source": "routing-test",
+            "message_id": "platform_msg_123"
+        }),
         attachments: vec![],
     };
 
@@ -111,6 +118,7 @@ fn channel_message_preserves_all_fields_on_clone() {
     assert_eq!(cloned.content, original.content);
     assert_eq!(cloned.channel, original.channel);
     assert_eq!(cloned.timestamp, original.timestamp);
+    assert_eq!(cloned.metadata, original.metadata);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -195,6 +203,7 @@ impl Channel for CapturingChannel {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         })
         .await

@@ -373,6 +373,7 @@ mod tests {
                 timestamp: 1000,
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             };
             let _ = tx.send(msg).await;

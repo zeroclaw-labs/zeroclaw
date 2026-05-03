@@ -176,7 +176,7 @@ struct LarkEvent {
 #[derive(Debug, serde::Deserialize)]
 struct LarkEventHeader {
     event_type: String,
-    #[allow(dead_code)]
+    #[serde(default)]
     event_id: String,
 }
 
@@ -224,6 +224,9 @@ const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
 /// Lark card payloads have a ~30 KB limit; leave margin for JSON envelope.
 const LARK_CARD_MARKDOWN_MAX_BYTES: usize = 28_000;
 
+/// CardKit element id targeted by streaming content updates.
+const LARK_STREAMING_ELEMENT_ID: &str = "streaming_content";
+
 /// Maximum image size we will download and inline (5 MiB).
 const LARK_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 
@@ -267,6 +270,73 @@ fn build_interactive_card_body(recipient: &str, markdown: &str) -> serde_json::V
         "receive_id": recipient,
         "msg_type": "interactive",
         "content": build_card_content(markdown),
+    })
+}
+
+fn lark_card_summary(markdown: &str) -> String {
+    let summary = markdown
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Processing...");
+
+    if summary.chars().count() <= 120 {
+        return summary.to_string();
+    }
+
+    let mut truncated = summary.chars().take(117).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+/// Build a CardKit JSON 2.0 card with a stable streaming markdown element.
+fn build_cardkit_card(markdown: &str, streaming_mode: bool) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": {
+            "streaming_mode": streaming_mode,
+            "summary": {
+                "content": lark_card_summary(markdown)
+            }
+        },
+        "body": {
+            "elements": [{
+                "tag": "markdown",
+                "content": markdown,
+                "text_align": "left",
+                "text_size": "normal_v2",
+                "element_id": LARK_STREAMING_ELEMENT_ID
+            }]
+        }
+    })
+}
+
+fn build_cardkit_streaming_card(markdown: &str) -> serde_json::Value {
+    build_cardkit_card(markdown, true)
+}
+
+fn build_cardkit_card_payload(card: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "card_json",
+        "data": card.to_string(),
+    })
+}
+
+fn build_cardkit_reference_content(card_id: &str) -> String {
+    serde_json::json!({
+        "type": "card",
+        "data": {
+            "card_id": card_id
+        }
+    })
+    .to_string()
+}
+
+fn build_cardkit_message_body(recipient: &str, card_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "receive_id": recipient,
+        "msg_type": "interactive",
+        "content": build_cardkit_reference_content(card_id),
     })
 }
 
@@ -327,6 +397,13 @@ fn extract_lark_response_code(body: &serde_json::Value) -> Option<i64> {
     body.get("code").and_then(|c| c.as_i64())
 }
 
+fn extract_lark_card_id(body: &serde_json::Value) -> Option<String> {
+    body.pointer("/data/card_id")
+        .or_else(|| body.get("card_id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 fn is_lark_invalid_access_token(body: &serde_json::Value) -> bool {
     extract_lark_response_code(body) == Some(LARK_INVALID_ACCESS_TOKEN_CODE)
 }
@@ -375,6 +452,259 @@ fn ensure_lark_send_success(
     Ok(())
 }
 
+fn build_lark_message_metadata(
+    platform: LarkPlatform,
+    transport: &str,
+    header_event_type: &str,
+    header_event_id: Option<&str>,
+    event: &serde_json::Value,
+    post_mentioned_open_ids: &[String],
+) -> serde_json::Value {
+    let message = event
+        .get("message")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let sender = event
+        .get("sender")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let sender_open_id = event
+        .pointer("/sender/sender_id/open_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let sender_type = event
+        .pointer("/sender/sender_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let message_id = event
+        .pointer("/message/message_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let chat_id = event
+        .pointer("/message/chat_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let chat_type = event
+        .pointer("/message/chat_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let message_type = event
+        .pointer("/message/message_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let mentions = event
+        .pointer("/message/mentions")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+
+    serde_json::json!({
+        "lark": {
+            "platform": platform.channel_name(),
+            "transport": transport,
+            "event_type": header_event_type,
+            "event_id": header_event_id.unwrap_or(""),
+            "sender_open_id": sender_open_id,
+            "sender_type": sender_type,
+            "sender": sender,
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "message_type": message_type,
+            "message": message,
+            "mentions": mentions,
+            "post_mentioned_open_ids": post_mentioned_open_ids,
+        }
+    })
+}
+
+fn build_lark_card_action_metadata(
+    platform: LarkPlatform,
+    transport: &str,
+    header_event_id: Option<&str>,
+    event: &serde_json::Value,
+) -> serde_json::Value {
+    let operator = event
+        .get("operator")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let action = event
+        .get("action")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let context = event
+        .get("context")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let sender_open_id = event
+        .pointer("/operator/open_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let message_id = event
+        .pointer("/context/open_message_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let chat_id = event
+        .pointer("/context/open_chat_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    serde_json::json!({
+        "lark": {
+            "platform": platform.channel_name(),
+            "transport": transport,
+            "event_type": "card.action.trigger",
+            "event_id": header_event_id.unwrap_or(""),
+            "sender_open_id": sender_open_id,
+            "sender_type": "user",
+            "sender": operator,
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "chat_type": "",
+            "message_type": "interactive",
+            "message": {
+                "message_id": message_id,
+                "chat_id": chat_id,
+                "message_type": "interactive"
+            },
+            "mentions": [],
+            "post_mentioned_open_ids": [],
+            "card_action": action,
+            "card_context": context,
+            "card_token": event.get("token").cloned().unwrap_or(serde_json::Value::Null),
+            "event": event,
+        }
+    })
+}
+
+fn parse_interactive_card_content(content: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    parse_interactive_card_value(&parsed)
+}
+
+fn parse_interactive_card_value(value: &serde_json::Value) -> Option<String> {
+    if let Some(card_id) = extract_lark_card_id(value) {
+        return Some(format!("[CARD:{card_id}]"));
+    }
+
+    if value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|ty| ty == "card_json")
+        && let Some(data) = value.get("data").and_then(|v| v.as_str())
+        && let Ok(nested) = serde_json::from_str::<serde_json::Value>(data)
+        && let Some(text) = parse_interactive_card_value(&nested)
+    {
+        return Some(text);
+    }
+
+    let mut parts = Vec::new();
+    collect_interactive_card_text(value, &mut parts);
+    let text = parts.join("\n").trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn collect_interactive_card_text(value: &serde_json::Value, parts: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if matches!(key.as_str(), "title" | "content" | "text")
+                    && let Some(text) = child.as_str()
+                {
+                    push_unique_trimmed(parts, text);
+                }
+
+                if child.is_object() || child.is_array() {
+                    collect_interactive_card_text(child, parts);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_interactive_card_text(item, parts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_unique_trimmed(parts: &mut Vec<String>, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || parts.iter().any(|part| part == trimmed) {
+        return;
+    }
+    parts.push(trimmed.to_string());
+}
+
+fn first_nonempty_string_field<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn compact_json(value: &serde_json::Value) -> Option<String> {
+    if value.is_null()
+        || value.as_object().is_some_and(|obj| obj.is_empty())
+        || value.as_array().is_some_and(|arr| arr.is_empty())
+    {
+        return None;
+    }
+    serde_json::to_string(value).ok()
+}
+
+fn extract_card_action_content(event: &serde_json::Value) -> Option<String> {
+    let action = event.get("action")?;
+    if let Some(input) = action
+        .get("input_value")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(input.to_string());
+    }
+
+    const DIRECT_TEXT_KEYS: &[&str] = &[
+        "text",
+        "content",
+        "message",
+        "command",
+        "prompt",
+        "query",
+        "instruction",
+        "action",
+    ];
+
+    if let Some(value) = action.get("value") {
+        if let Some(text) = first_nonempty_string_field(value, DIRECT_TEXT_KEYS) {
+            return Some(text.to_string());
+        }
+    }
+
+    if let Some(form_value) = action.get("form_value") {
+        if let Some(text) = first_nonempty_string_field(form_value, DIRECT_TEXT_KEYS) {
+            return Some(text.to_string());
+        }
+        if let Some(text) = compact_json(form_value) {
+            return Some(text);
+        }
+    }
+
+    if let Some(option) = action
+        .get("option")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(option.to_string());
+    }
+
+    action.get("value").and_then(compact_json)
+}
+
 /// Lark/Feishu channel.
 ///
 /// Supports two receive modes (configured via `receive_mode` in config):
@@ -398,6 +728,8 @@ pub struct LarkChannel {
     tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Per-CardKit card monotonically increasing streaming sequence.
+    card_stream_sequences: Arc<RwLock<HashMap<String, u64>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
@@ -447,6 +779,7 @@ impl LarkChannel {
             receive_mode: zeroclaw_config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
+            card_stream_sequences: Arc::new(RwLock::new(HashMap::new())),
             proxy_url: None,
             transcription: None,
             transcription_manager: None,
@@ -565,6 +898,25 @@ impl LarkChannel {
 
     fn send_message_url(&self) -> String {
         format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    }
+
+    fn cardkit_cards_url(&self) -> String {
+        format!("{}/cardkit/v1/cards", self.api_base())
+    }
+
+    fn cardkit_card_url(&self, card_id: &str) -> String {
+        format!("{}/cardkit/v1/cards/{card_id}", self.api_base())
+    }
+
+    fn cardkit_card_settings_url(&self, card_id: &str) -> String {
+        format!("{}/cardkit/v1/cards/{card_id}/settings", self.api_base())
+    }
+
+    fn cardkit_element_content_url(&self, card_id: &str, element_id: &str) -> String {
+        format!(
+            "{}/cardkit/v1/cards/{card_id}/elements/{element_id}/content",
+            self.api_base()
+        )
     }
 
     fn message_reaction_url(&self, message_id: &str) -> String {
@@ -878,11 +1230,31 @@ impl LarkChannel {
 
                     if msg_type != "event" { continue; }
 
-                    let event: LarkEvent = match serde_json::from_slice(&payload) {
-                        Ok(e) => e,
+                    let payload_value: serde_json::Value = match serde_json::from_slice(&payload) {
+                        Ok(v) => v,
                         Err(e) => { tracing::error!("Lark: event JSON: {e}"); continue; }
                     };
-                    if event.header.event_type != "im.message.receive_v1" { continue; }
+                    let event: LarkEvent = match serde_json::from_value(payload_value.clone()) {
+                        Ok(e) => e,
+                        Err(e) => { tracing::error!("Lark: event envelope: {e}"); continue; }
+                    };
+                    let header_event_type = event.header.event_type.clone();
+                    let header_event_id = event.header.event_id.clone();
+                    if header_event_type == "card.action.trigger" {
+                        for channel_msg in
+                            self.parse_card_action_trigger_payload(&payload_value, "websocket")
+                        {
+                            tracing::debug!(
+                                "Lark WS: card action in {}",
+                                channel_msg.reply_target
+                            );
+                            if tx.send(channel_msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    if header_event_type != "im.message.receive_v1" { continue; }
 
                     let event_payload = event.event;
 
@@ -985,6 +1357,10 @@ impl LarkChannel {
                             Some(t) => (t, Vec::new()),
                             None => { tracing::debug!("Lark WS: list message with no extractable text"); continue; }
                         },
+                        "interactive" => match parse_interactive_card_content(&lark_msg.content) {
+                            Some(t) => (t, Vec::new()),
+                            None => { tracing::debug!("Lark WS: interactive card with no extractable text"); continue; }
+                        },
                         _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
                     };
 
@@ -1017,7 +1393,7 @@ impl LarkChannel {
                     });
 
                     let channel_msg = ChannelMessage {
-                        id: Uuid::new_v4().to_string(),
+                        id: lark_msg.message_id.clone(),
                         sender: lark_msg.chat_id.clone(),
                         reply_target: lark_msg.chat_id.clone(),
                         content: text,
@@ -1028,7 +1404,15 @@ impl LarkChannel {
                             .as_secs(),
                         thread_ts: None,
                         interruption_scope_id: None,
-                    attachments: vec![],
+                        metadata: build_lark_message_metadata(
+                            self.platform,
+                            "websocket",
+                            &header_event_type,
+                            Some(&header_event_id),
+                            &event_payload,
+                            &post_mentioned_open_ids,
+                        ),
+                        attachments: vec![],
                     };
 
                     tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
@@ -1042,6 +1426,92 @@ impl LarkChannel {
     /// Check if a user open_id is allowed
     fn is_user_allowed(&self, open_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == open_id)
+    }
+
+    fn parse_card_action_trigger_payload(
+        &self,
+        payload: &serde_json::Value,
+        transport: &str,
+    ) -> Vec<ChannelMessage> {
+        let Some(event) = payload.get("event") else {
+            return vec![];
+        };
+        let operator_open_id = event
+            .pointer("/operator/open_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if operator_open_id.is_empty() {
+            return vec![];
+        }
+        if !self.is_user_allowed(operator_open_id) {
+            tracing::warn!("Lark: ignoring card action from unauthorized user: {operator_open_id}");
+            return vec![];
+        }
+
+        let open_chat_id = event
+            .pointer("/context/open_chat_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if open_chat_id.is_empty() {
+            tracing::debug!("Lark: card action missing context.open_chat_id");
+            return vec![];
+        }
+
+        let Some(content) = extract_card_action_content(event) else {
+            tracing::debug!("Lark: card action with no extractable content");
+            return vec![];
+        };
+
+        let open_message_id = event
+            .pointer("/context/open_message_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let header_event_id = payload.pointer("/header/event_id").and_then(|e| e.as_str());
+        let id = header_event_id
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                if open_message_id.is_empty() {
+                    None
+                } else {
+                    Some(open_message_id)
+                }
+            })
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let timestamp = payload
+            .pointer("/header/create_time")
+            .and_then(|t| t.as_str())
+            .and_then(|t| t.parse::<u64>().ok())
+            .map(|ms| ms / 1000)
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+        let thread_scope = if open_message_id.is_empty() {
+            None
+        } else {
+            Some(open_message_id.to_string())
+        };
+
+        vec![ChannelMessage {
+            id,
+            sender: open_chat_id.to_string(),
+            reply_target: open_chat_id.to_string(),
+            content,
+            channel: self.channel_name().to_string(),
+            timestamp,
+            thread_ts: thread_scope.clone(),
+            interruption_scope_id: thread_scope,
+            metadata: build_lark_card_action_metadata(
+                self.platform,
+                transport,
+                header_event_id,
+                event,
+            ),
+            attachments: vec![],
+        }]
     }
 
     /// Get or refresh tenant access token
@@ -1466,6 +1936,9 @@ impl LarkChannel {
             .pointer("/header/event_type")
             .and_then(|e| e.as_str())
             .unwrap_or("");
+        if event_type == "card.action.trigger" {
+            return self.parse_card_action_trigger_payload(payload, "webhook");
+        }
         if event_type != "im.message.receive_v1" {
             return vec![];
         }
@@ -1546,8 +2019,20 @@ impl LarkChannel {
                     .as_secs()
             });
 
+        let event = payload.get("event").unwrap_or(&serde_json::Value::Null);
+        let header_event_type = payload
+            .pointer("/header/event_type")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
+        let header_event_id = payload.pointer("/header/event_id").and_then(|e| e.as_str());
+        let id = if message_id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            message_id.to_string()
+        };
+
         vec![ChannelMessage {
-            id: Uuid::new_v4().to_string(),
+            id,
             sender: chat_id.to_string(),
             reply_target: chat_id.to_string(),
             content: text,
@@ -1555,6 +2040,14 @@ impl LarkChannel {
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: build_lark_message_metadata(
+                self.platform,
+                "webhook",
+                header_event_type,
+                header_event_id,
+                event,
+                &[],
+            ),
             attachments: vec![],
         }]
     }
@@ -1565,9 +2058,20 @@ impl LarkChannel {
         token: &str,
         body: &serde_json::Value,
     ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        self.send_json_once(reqwest::Method::POST, url, token, body)
+            .await
+    }
+
+    async fn send_json_once(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
         let resp = self
             .http_client()
-            .post(url)
+            .request(method, url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json; charset=utf-8")
             .json(body)
@@ -1578,6 +2082,147 @@ impl LarkChannel {
         let parsed = serde_json::from_str::<serde_json::Value>(&raw)
             .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
         Ok((status, parsed))
+    }
+
+    async fn send_json_with_token_refresh(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: &serde_json::Value,
+        context: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let token = self.get_tenant_access_token().await?;
+        let (status, response) = self
+            .send_json_once(method.clone(), url, &token, body)
+            .await?;
+
+        if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) =
+                self.send_json_once(method, url, &new_token, body).await?;
+
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                anyhow::bail!(
+                    "Lark API request failed after token refresh: context={context}, status={retry_status}, body={retry_response}"
+                );
+            }
+
+            ensure_lark_send_success(retry_status, &retry_response, context)?;
+            return Ok(retry_response);
+        }
+
+        ensure_lark_send_success(status, &response, context)?;
+        Ok(response)
+    }
+
+    async fn next_card_stream_sequence(&self, card_id: &str) -> u64 {
+        let mut sequences = self.card_stream_sequences.write().await;
+        let sequence = sequences.entry(card_id.to_string()).or_insert(0);
+        *sequence = sequence.saturating_add(1);
+        *sequence
+    }
+
+    async fn reset_card_stream_sequence(&self, card_id: &str) {
+        let mut sequences = self.card_stream_sequences.write().await;
+        sequences.insert(card_id.to_string(), 0);
+    }
+
+    async fn clear_card_stream_sequence(&self, card_id: &str) {
+        let mut sequences = self.card_stream_sequences.write().await;
+        sequences.remove(card_id);
+    }
+
+    async fn create_cardkit_card(&self, markdown: &str) -> anyhow::Result<String> {
+        let card = build_cardkit_streaming_card(markdown);
+        let body = build_cardkit_card_payload(&card);
+        let response = self
+            .send_json_with_token_refresh(
+                reqwest::Method::POST,
+                &self.cardkit_cards_url(),
+                &body,
+                "cardkit card.create",
+            )
+            .await?;
+
+        extract_lark_card_id(&response).ok_or_else(|| {
+            anyhow::anyhow!("Lark CardKit create response missing card_id: {response}")
+        })
+    }
+
+    async fn send_cardkit_card_message(
+        &self,
+        recipient: &str,
+        card_id: &str,
+    ) -> anyhow::Result<()> {
+        let body = build_cardkit_message_body(recipient, card_id);
+        self.send_json_with_token_refresh(
+            reqwest::Method::POST,
+            &self.send_message_url(),
+            &body,
+            "im message.create cardkit",
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn stream_cardkit_content(&self, card_id: &str, text: &str) -> anyhow::Result<()> {
+        let sequence = self.next_card_stream_sequence(card_id).await;
+        let body = serde_json::json!({
+            "content": text,
+            "sequence": sequence,
+        });
+
+        self.send_json_with_token_refresh(
+            reqwest::Method::PUT,
+            &self.cardkit_element_content_url(card_id, LARK_STREAMING_ELEMENT_ID),
+            &body,
+            "cardkit cardElement.content",
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn replace_cardkit_card(&self, card_id: &str, markdown: &str) -> anyhow::Result<()> {
+        let sequence = self.next_card_stream_sequence(card_id).await;
+        let card = build_cardkit_card(markdown, true);
+        let body = serde_json::json!({
+            "card": build_cardkit_card_payload(&card),
+            "sequence": sequence,
+        });
+
+        self.send_json_with_token_refresh(
+            reqwest::Method::PUT,
+            &self.cardkit_card_url(card_id),
+            &body,
+            "cardkit card.update",
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn set_cardkit_streaming_mode(
+        &self,
+        card_id: &str,
+        streaming_mode: bool,
+    ) -> anyhow::Result<()> {
+        let sequence = self.next_card_stream_sequence(card_id).await;
+        let body = serde_json::json!({
+            "settings": serde_json::json!({
+                "streaming_mode": streaming_mode
+            })
+            .to_string(),
+            "sequence": sequence,
+        });
+
+        self.send_json_with_token_refresh(
+            reqwest::Method::PATCH,
+            &self.cardkit_card_settings_url(card_id),
+            &body,
+            "cardkit card.settings",
+        )
+        .await?;
+        Ok(())
     }
 
     /// Parse an event callback payload and extract messages.
@@ -1593,6 +2238,9 @@ impl LarkChannel {
             .unwrap_or("");
 
         if event_type != "im.message.receive_v1" {
+            if event_type == "card.action.trigger" {
+                return self.parse_card_action_trigger_payload(payload, "webhook");
+            }
             return messages;
         }
 
@@ -1726,6 +2374,13 @@ impl LarkChannel {
                     return messages;
                 }
             },
+            "interactive" => match parse_interactive_card_content(content_str) {
+                Some(t) => (t, Vec::new()),
+                None => {
+                    tracing::debug!("Lark: interactive card with no extractable text");
+                    return messages;
+                }
+            },
             _ => {
                 tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
                 return messages;
@@ -1762,8 +2417,15 @@ impl LarkChannel {
             .and_then(|c| c.as_str())
             .unwrap_or(open_id);
 
+        let header_event_id = payload.pointer("/header/event_id").and_then(|e| e.as_str());
+        let id = if evt_message_id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            evt_message_id.to_string()
+        };
+
         messages.push(ChannelMessage {
-            id: Uuid::new_v4().to_string(),
+            id,
             sender: chat_id.to_string(),
             reply_target: chat_id.to_string(),
             content: text,
@@ -1771,6 +2433,14 @@ impl LarkChannel {
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: build_lark_message_metadata(
+                self.platform,
+                "webhook",
+                event_type,
+                header_event_id,
+                event,
+                &post_mentioned_open_ids,
+            ),
             attachments: vec![],
         });
 
@@ -1813,6 +2483,54 @@ impl Channel for LarkChannel {
             }
         }
 
+        Ok(())
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        true
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        let card_id = self.create_cardkit_card(&message.content).await?;
+        self.reset_card_stream_sequence(&card_id).await;
+        self.send_cardkit_card_message(&message.recipient, &card_id)
+            .await?;
+        Ok(Some(card_id))
+    }
+
+    async fn update_draft(
+        &self,
+        _recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.stream_cardkit_content(message_id, text).await
+    }
+
+    async fn update_draft_progress(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.update_draft(recipient, message_id, text).await
+    }
+
+    async fn finalize_draft(
+        &self,
+        _recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.replace_cardkit_card(message_id, text).await?;
+        self.set_cardkit_streaming_mode(message_id, false).await?;
+        self.clear_card_stream_sequence(message_id).await;
+        Ok(())
+    }
+
+    async fn cancel_draft(&self, _recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        self.set_cardkit_streaming_mode(message_id, false).await?;
+        self.clear_card_stream_sequence(message_id).await;
         Ok(())
     }
 
@@ -2657,18 +3375,23 @@ mod tests {
         let ch = make_channel();
         let payload = serde_json::json!({
             "header": {
-                "event_type": "im.message.receive_v1"
+                "event_type": "im.message.receive_v1",
+                "event_id": "evt_test_123"
             },
             "event": {
                 "sender": {
+                    "sender_type": "user",
                     "sender_id": {
                         "open_id": "ou_testuser123"
                     }
                 },
                 "message": {
+                    "message_id": "om_test_msg_123",
                     "message_type": "text",
                     "content": "{\"text\":\"Hello ZeroClaw!\"}",
+                    "chat_type": "p2p",
                     "chat_id": "oc_chat123",
+                    "mentions": [{ "id": { "open_id": "ou_bot" } }],
                     "create_time": "1699999999000"
                 }
             }
@@ -2680,6 +3403,24 @@ mod tests {
         assert_eq!(msgs[0].sender, "oc_chat123");
         assert_eq!(msgs[0].channel, "lark");
         assert_eq!(msgs[0].timestamp, 1_699_999_999);
+        assert_eq!(msgs[0].id, "om_test_msg_123");
+        assert_eq!(msgs[0].metadata["lark"]["platform"], "lark");
+        assert_eq!(msgs[0].metadata["lark"]["transport"], "webhook");
+        assert_eq!(
+            msgs[0].metadata["lark"]["event_type"],
+            "im.message.receive_v1"
+        );
+        assert_eq!(msgs[0].metadata["lark"]["event_id"], "evt_test_123");
+        assert_eq!(msgs[0].metadata["lark"]["sender_open_id"], "ou_testuser123");
+        assert_eq!(msgs[0].metadata["lark"]["sender_type"], "user");
+        assert_eq!(msgs[0].metadata["lark"]["message_id"], "om_test_msg_123");
+        assert_eq!(msgs[0].metadata["lark"]["chat_id"], "oc_chat123");
+        assert_eq!(msgs[0].metadata["lark"]["chat_type"], "p2p");
+        assert_eq!(msgs[0].metadata["lark"]["message_type"], "text");
+        assert_eq!(
+            msgs[0].metadata["lark"]["message"]["content"],
+            "{\"text\":\"Hello ZeroClaw!\"}"
+        );
     }
 
     #[tokio::test]
@@ -2726,6 +3467,103 @@ mod tests {
 
         let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lark_parse_interactive_card_message_extracts_markdown() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "header": {
+                "event_type": "im.message.receive_v1",
+                "event_id": "evt_card_msg_123"
+            },
+            "event": {
+                "sender": {
+                    "sender_type": "user",
+                    "sender_id": { "open_id": "ou_testuser123" }
+                },
+                "message": {
+                    "message_id": "om_card_msg_123",
+                    "message_type": "interactive",
+                    "content": serde_json::json!({
+                        "schema": "2.0",
+                        "body": {
+                            "elements": [{
+                                "tag": "markdown",
+                                "content": "继续任务"
+                            }]
+                        }
+                    }).to_string(),
+                    "chat_type": "p2p",
+                    "chat_id": "oc_chat123",
+                    "create_time": "1699999999000"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "继续任务");
+        assert_eq!(
+            msgs[0].metadata["lark"]["event_type"],
+            "im.message.receive_v1"
+        );
+        assert_eq!(msgs[0].metadata["lark"]["message_type"], "interactive");
+        assert_eq!(msgs[0].metadata["lark"]["message_id"], "om_card_msg_123");
+    }
+
+    #[tokio::test]
+    async fn lark_parse_card_action_trigger_as_channel_message() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "schema": "2.0",
+            "header": {
+                "event_type": "card.action.trigger",
+                "event_id": "evt_card_action_123",
+                "create_time": "1699999999000"
+            },
+            "event": {
+                "operator": {
+                    "open_id": "ou_testuser123",
+                    "tenant_key": "tenant"
+                },
+                "token": "card_update_token",
+                "action": {
+                    "tag": "button",
+                    "value": {
+                        "command": "继续任务",
+                        "task_id": "task_123"
+                    }
+                },
+                "context": {
+                    "open_message_id": "om_card_msg_123",
+                    "open_chat_id": "oc_chat123"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "evt_card_action_123");
+        assert_eq!(msgs[0].content, "继续任务");
+        assert_eq!(msgs[0].sender, "oc_chat123");
+        assert_eq!(msgs[0].reply_target, "oc_chat123");
+        assert_eq!(msgs[0].thread_ts.as_deref(), Some("om_card_msg_123"));
+        assert_eq!(
+            msgs[0].interruption_scope_id.as_deref(),
+            Some("om_card_msg_123")
+        );
+        assert_eq!(
+            msgs[0].metadata["lark"]["event_type"],
+            "card.action.trigger"
+        );
+        assert_eq!(msgs[0].metadata["lark"]["sender_open_id"], "ou_testuser123");
+        assert_eq!(msgs[0].metadata["lark"]["message_id"], "om_card_msg_123");
+        assert_eq!(msgs[0].metadata["lark"]["chat_id"], "oc_chat123");
+        assert_eq!(
+            msgs[0].metadata["lark"]["card_action"]["value"]["task_id"],
+            "task_123"
+        );
     }
 
     #[test]
@@ -3513,6 +4351,104 @@ mod tests {
         assert_eq!(elements.len(), 1);
         assert_eq!(elements[0]["tag"], "markdown");
         assert_eq!(elements[0]["content"], "**Hello** world");
+    }
+
+    #[test]
+    fn build_cardkit_streaming_card_exposes_streaming_element() {
+        let card = build_cardkit_streaming_card("Thinking...");
+        assert_eq!(card["schema"], "2.0");
+        assert_eq!(card["config"]["streaming_mode"], true);
+        assert_eq!(
+            card["body"]["elements"][0]["element_id"],
+            LARK_STREAMING_ELEMENT_ID
+        );
+        assert_eq!(card["body"]["elements"][0]["content"], "Thinking...");
+    }
+
+    #[test]
+    fn build_cardkit_reference_content_produces_card_id_payload() {
+        let content = build_cardkit_reference_content("card_test_123");
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["type"], "card");
+        assert_eq!(parsed["data"]["card_id"], "card_test_123");
+    }
+
+    #[tokio::test]
+    async fn lark_draft_streaming_uses_cardkit_card_id() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "test-tenant-token",
+                "expire": 7200
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/cardkit/v1/cards"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": { "card_id": "card_test_123" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/im/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": { "message_id": "om_sent_123" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path(
+                "/cardkit/v1/cards/card_test_123/elements/streaming_content/content",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/cardkit/v1/cards/card_test_123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path("/cardkit/v1/cards/card_test_123/settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(mock_server.uri());
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "oc_chat123"))
+            .await
+            .unwrap();
+        assert_eq!(draft_id.as_deref(), Some("card_test_123"));
+
+        ch.update_draft("oc_chat123", "card_test_123", "Hello")
+            .await
+            .unwrap();
+        ch.finalize_draft("oc_chat123", "card_test_123", "Hello world")
+            .await
+            .unwrap();
     }
 
     #[test]

@@ -300,6 +300,7 @@ impl VoiceCallChannel {
             timestamp: chrono::Utc::now().timestamp().unsigned_abs(),
             thread_ts: Some(call_id.to_string()),
             interruption_scope_id: Some(call_id.to_string()),
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
         tx.send(msg)

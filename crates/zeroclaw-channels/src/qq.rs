@@ -1295,6 +1295,7 @@ impl Channel for QQChannel {
                                     .as_secs(),
                                 thread_ts: None,
                                 interruption_scope_id: None,
+                    metadata: serde_json::Value::Null,
                     attachments: vec![],
                             };
 
@@ -1336,6 +1337,7 @@ impl Channel for QQChannel {
                                     .as_secs(),
                                 thread_ts: None,
                                 interruption_scope_id: None,
+                    metadata: serde_json::Value::Null,
                     attachments: vec![],
                             };
 

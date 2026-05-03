@@ -238,6 +238,7 @@ impl Channel for VoiceWakeChannel {
                                         timestamp: ts,
                                         thread_ts: None,
                                         interruption_scope_id: None,
+                                        metadata: serde_json::Value::Null,
                                         attachments: vec![],
                                     };
 

@@ -436,6 +436,7 @@ impl GmailPushChannel {
                         timestamp,
                         thread_ts: Some(gmail_msg.thread_id),
                         interruption_scope_id: None,
+                        metadata: serde_json::Value::Null,
                         attachments: Vec::new(),
                     };
 

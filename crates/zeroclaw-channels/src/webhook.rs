@@ -239,6 +239,7 @@ impl Channel for WebhookChannel {
                 timestamp,
                 thread_ts: payload.thread_id,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             };
 

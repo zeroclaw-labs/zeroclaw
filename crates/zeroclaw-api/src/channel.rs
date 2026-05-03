@@ -43,6 +43,12 @@ pub struct ChannelMessage {
     /// is genuinely inside a reply thread and should be isolated from other threads.
     /// `None` means top-level — scope is sender+channel only.
     pub interruption_scope_id: Option<String>,
+    /// Channel-specific structured metadata.
+    ///
+    /// Channels can expose platform-native fields here without expanding the
+    /// cross-channel API surface. Consumers should treat absent or `null`
+    /// metadata as "no platform-specific data".
+    pub metadata: serde_json::Value,
     /// Media attachments (audio, images, video) for the media pipeline.
     /// Channels populate this when they receive media alongside a text message.
     /// Defaults to empty — existing channels are unaffected.

@@ -289,6 +289,7 @@ impl Channel for TwitterChannel {
                                     .and_then(|c| c.as_str())
                                     .map(|s| s.to_string()),
                                 interruption_scope_id: None,
+                                metadata: serde_json::Value::Null,
                                 attachments: vec![],
                             };
 

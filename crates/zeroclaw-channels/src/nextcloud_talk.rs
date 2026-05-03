@@ -250,6 +250,7 @@ impl NextcloudTalkChannel {
             timestamp: Self::now_unix_secs(),
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         });
 
@@ -363,6 +364,7 @@ impl NextcloudTalkChannel {
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         });
 

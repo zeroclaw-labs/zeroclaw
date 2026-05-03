@@ -55,6 +55,7 @@ impl Channel for CliChannel {
                     .as_secs(),
                 thread_ts: None,
                 interruption_scope_id: None,
+                metadata: serde_json::Value::Null,
                 attachments: vec![],
             };
 
@@ -124,6 +125,7 @@ mod tests {
             timestamp: 1_234_567_890,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
         assert_eq!(msg.id, "test-id");
@@ -145,6 +147,7 @@ mod tests {
             timestamp: 0,
             thread_ts: None,
             interruption_scope_id: None,
+            metadata: serde_json::Value::Null,
             attachments: vec![],
         };
         let cloned = msg.clone();

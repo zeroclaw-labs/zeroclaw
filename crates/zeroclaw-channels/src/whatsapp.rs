@@ -319,6 +319,7 @@ impl WhatsAppChannel {
                         timestamp,
                         thread_ts: None,
                         interruption_scope_id: None,
+                        metadata: serde_json::Value::Null,
                         attachments: vec![],
                     });
                 }

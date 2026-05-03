@@ -254,6 +254,7 @@ impl Channel for NostrChannel {
                             timestamp,
                             thread_ts: None,
                             interruption_scope_id: None,
+                            metadata: serde_json::Value::Null,
                             attachments: vec![],
                         };
                         if tx.send(msg).await.is_err() {
