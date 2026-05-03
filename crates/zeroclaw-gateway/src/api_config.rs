@@ -703,12 +703,18 @@ pub async fn handle_templates(State(state): State<AppState>, headers: HeaderMap)
     axum::Json(TemplatesResponse { templates }).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct MapPathQuery {
+    pub path: String,
+}
+
 /// `GET /api/config/map-keys?path=<section>` — list the current alias keys at
 /// a map-keyed section path, e.g. `channels.discord` → `["default","work"]`.
 pub async fn handle_get_map_keys(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<MapKeyQuery>,
+    Query(q): Query<MapPathQuery>,
 ) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();

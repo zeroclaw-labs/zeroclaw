@@ -19,7 +19,7 @@
 
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Check, ChevronRight } from 'lucide-react';
+import { Check, ChevronRight, Plus } from 'lucide-react';
 import {
   ApiError,
   getMapKeys,
@@ -31,7 +31,6 @@ import {
   type PickerItem,
   type SectionInfo,
 } from '../../lib/api';
-import AliasPromptDialog from '../../components/AliasPromptDialog';
 import FieldForm, { type FieldFormHandle } from '../../components/onboard/FieldForm';
 import SectionPicker from '../../components/onboard/SectionPicker';
 
@@ -88,12 +87,8 @@ export default function Onboard() {
   const [sections, setSections] = useState<SectionInfo[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [picked, setPicked] = useState<{ item: PickerItem; fieldsPrefix: string } | null>(null);
-  const [aliasPending, setAliasPending] = useState<{
-    item: PickerItem;
-    sectionKey: string;
-    existingAliases: string[];
-    namingNew: boolean;
-  } | null>(null);
+  // When a provider/channel type is selected, show alias list inline before opening form.
+  const [pickedType, setPickedType] = useState<{ item: PickerItem; sectionKey: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [finishing, setFinishing] = useState(false);
@@ -145,12 +140,13 @@ export default function Onboard() {
   const goToSection = (key: string) => {
     setActiveKey(key);
     setPicked(null);
+    setPickedType(null);
   };
 
   const openWithAlias = async (item: PickerItem, sectionKey: string, alias: string) => {
-    setAliasPending(null);
     try {
       const resp = await selectSectionItem(sectionKey, item.key, alias);
+      setPickedType(null);
       setPicked({ item, fieldsPrefix: resp.fields_prefix });
     } catch (e) {
       if (e instanceof ApiError) {
@@ -164,20 +160,7 @@ export default function Onboard() {
   const handlePick = async (item: PickerItem) => {
     if (!activeSection) return;
     if (activeSection.key === 'providers' || activeSection.key === 'channels') {
-      const mapPath =
-        activeSection.key === 'providers'
-          ? `providers.models.${item.key}`
-          : `channels.${item.key}`;
-      let existingAliases: string[] = [];
-      try {
-        const resp = await getMapKeys(mapPath);
-        existingAliases = resp.keys;
-      } catch { /* no aliases yet */ }
-      if (existingAliases.length === 0) {
-        setAliasPending({ item, sectionKey: activeSection.key, existingAliases: [], namingNew: true });
-      } else {
-        setAliasPending({ item, sectionKey: activeSection.key, existingAliases, namingNew: false });
-      }
+      setPickedType({ item, sectionKey: activeSection.key });
       return;
     }
     try {
@@ -231,9 +214,10 @@ export default function Onboard() {
       if (next) {
         setActiveKey(next.key);
         setPicked(null);
+        setPickedType(null);
       } else {
-        // Wizard done — stay on current section but clear picked state.
         setPicked(null);
+        setPickedType(null);
       }
     } finally {
       setAdvancing(false);
@@ -371,23 +355,32 @@ export default function Onboard() {
                 <ChevronRight className="h-3 w-3" />
                 <span
                   style={{
-                    color: picked
-                      ? 'var(--pc-text-secondary)'
-                      : 'var(--pc-accent)',
-                    cursor: picked ? 'pointer' : 'default',
-                    fontWeight: picked ? 400 : 600,
+                    color: picked || pickedType ? 'var(--pc-text-secondary)' : 'var(--pc-accent)',
+                    cursor: picked || pickedType ? 'pointer' : 'default',
+                    fontWeight: picked || pickedType ? 400 : 600,
                   }}
-                  onClick={() => picked && setPicked(null)}
+                  onClick={() => { setPicked(null); setPickedType(null); }}
                 >
                   {activeSection.label}
                 </span>
+                {pickedType && (
+                  <>
+                    <ChevronRight className="h-3 w-3" />
+                    <span style={{ color: 'var(--pc-accent)', fontWeight: 600 }}>
+                      {pickedType.item.label}
+                    </span>
+                  </>
+                )}
                 {picked && (
                   <>
                     <ChevronRight className="h-3 w-3" />
-                    <span
-                      style={{ color: 'var(--pc-accent)', fontWeight: 600 }}
-                    >
+                    <span style={{ color: 'var(--pc-text-secondary)', cursor: 'pointer' }}
+                      onClick={(e) => { e.stopPropagation(); setPickedType({ item: picked.item, sectionKey: activeSection.key }); setPicked(null); }}>
                       {picked.item.label}
+                    </span>
+                    <ChevronRight className="h-3 w-3" />
+                    <span style={{ color: 'var(--pc-accent)', fontWeight: 600 }}>
+                      {picked.fieldsPrefix.split('.').at(-1)}
                     </span>
                   </>
                 )}
@@ -433,137 +426,119 @@ export default function Onboard() {
                 prefix={activeSection.key}
                 title={activeSection.label}
               />
-            ) : !picked ? (
+            ) : picked ? (
+              <FieldForm
+                ref={formRef}
+                prefix={picked.fieldsPrefix}
+                title={picked.item.label}
+                onSaved={() => setPicked(null)}
+              />
+            ) : pickedType ? (
+              <OnboardAliasListView
+                sectionKey={pickedType.sectionKey}
+                typeKey={pickedType.item.key}
+                typeLabel={pickedType.item.label}
+                onSelectAlias={(alias) => void openWithAlias(pickedType.item, pickedType.sectionKey, alias)}
+                onBack={() => setPickedType(null)}
+              />
+            ) : (
               <SectionPicker
                 sectionKey={activeSection.key}
                 help={activeSection.help}
                 onPick={(item) => void handlePick(item)}
                 onSkip={() => void advanceSection()}
               />
-            ) : (
-              <FieldForm
-                ref={formRef}
-                prefix={picked.fieldsPrefix}
-                title={picked.item.label}
-                onSaved={() => {
-                  // Return to the picker so the user can add another or
-                  // hit Next/Finish in the breadcrumb row.
-                  setPicked(null);
-                }}
-              />
             )}
           </div>
         )}
       </main>
 
-      {aliasPending && !aliasPending.namingNew && (
-        <OnboardAliasPicker
-          item={aliasPending.item}
-          sectionKey={aliasPending.sectionKey}
-          existingAliases={aliasPending.existingAliases}
-          onSelect={(alias) => void openWithAlias(aliasPending.item, aliasPending.sectionKey, alias)}
-          onAddNew={() => setAliasPending((p) => p && { ...p, namingNew: true })}
-          onCancel={() => setAliasPending(null)}
-        />
-      )}
-      {aliasPending?.namingNew && (
-        <AliasPromptDialog
-          label={aliasPending.item.label}
-          suggestion={
-            aliasPending.existingAliases.length > 0
-              ? `${aliasPending.existingAliases[0]}-2`
-              : 'default'
-          }
-          onConfirm={(alias) => void openWithAlias(aliasPending.item, aliasPending.sectionKey, alias)}
-          onCancel={() => {
-            if (aliasPending.existingAliases.length > 0) {
-              setAliasPending((p) => p && { ...p, namingNew: false });
-            } else {
-              setAliasPending(null);
-            }
-          }}
-        />
-      )}
     </div>
   );
 }
 
-function OnboardAliasPicker({
-  item,
+function OnboardAliasListView({
   sectionKey,
-  existingAliases,
-  onSelect,
-  onAddNew,
-  onCancel,
+  typeKey,
+  typeLabel,
+  onSelectAlias,
+  onBack,
 }: {
-  item: PickerItem;
   sectionKey: string;
-  existingAliases: string[];
-  onSelect: (alias: string) => void;
-  onAddNew: () => void;
-  onCancel: () => void;
+  typeKey: string;
+  typeLabel: string;
+  onSelectAlias: (alias: string) => void;
+  onBack: () => void;
 }) {
+  const [aliases, setAliases] = useState<string[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [newAlias, setNewAlias] = useState('');
+
+  const mapPath = sectionKey === 'providers'
+    ? `providers.models.${typeKey}`
+    : `channels.${typeKey}`;
+
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onCancel();
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [onCancel]);
+    let cancelled = false;
+    setLoading(true);
+    getMapKeys(mapPath)
+      .then((r) => { if (!cancelled) setAliases(r.keys); })
+      .catch(() => { if (!cancelled) setAliases([]); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [mapPath]);
+
+  const submit = () => {
+    const trimmed = newAlias.trim() || (aliases.length === 0 ? 'default' : `${aliases[0]}-2`);
+    onSelectAlias(trimmed);
+  };
 
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      className="fixed inset-0 z-50 flex items-center justify-center"
-      onClick={onCancel}
-    >
-      <div
-        className="absolute inset-0"
-        style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(8px)' }}
-      />
-      <div
-        className="relative w-full max-w-sm mx-4 rounded-3xl border shadow-2xl"
-        style={{ background: 'var(--pc-bg-base)', borderColor: 'var(--pc-border)' }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div
-          className="px-6 py-4 border-b text-sm font-semibold"
-          style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)' }}
-        >
-          {item.label} — select alias
+    <div className="flex flex-col gap-3">
+      <p className="text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
+        {typeLabel} — select or create an alias
+      </p>
+      {loading ? (
+        <div className="flex items-center justify-center py-12">
+          <div className="h-8 w-8 border-2 rounded-full animate-spin"
+            style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
         </div>
-        <div className="flex flex-col divide-y" style={{ borderColor: 'var(--pc-border)' }}>
-          {existingAliases.map((alias) => (
+      ) : (
+        <div className="surface-panel divide-y" style={{ borderColor: 'var(--pc-border)' }}>
+          {aliases.map((alias) => (
             <button
               key={alias}
               type="button"
-              onClick={() => onSelect(alias)}
-              className="flex items-center justify-between gap-3 px-6 py-3 text-left text-sm"
-              style={{ color: 'var(--pc-text-primary)', background: 'transparent', border: 'none', cursor: 'pointer' }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--pc-bg-elevated)')}
-              onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+              onClick={() => onSelectAlias(alias)}
+              className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left text-sm transition-colors hover:opacity-90"
             >
-              <span>{alias}</span>
-              <code className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
-                {sectionKey === 'providers'
-                  ? `providers.models.${item.key}.${alias}`
-                  : `channels.${item.key}.${alias}`}
-              </code>
+              <div>
+                <span style={{ color: 'var(--pc-text-primary)', fontWeight: 500 }}>{alias}</span>
+                <code className="block text-xs mt-0.5" style={{ color: 'var(--pc-text-faint)' }}>
+                  {mapPath}.{alias}
+                </code>
+              </div>
+              <ChevronRight className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-text-muted)' }} />
             </button>
           ))}
-          <button
-            type="button"
-            onClick={onAddNew}
-            className="px-6 py-3 text-sm text-left"
-            style={{ color: 'var(--pc-accent)', background: 'transparent', border: 'none', cursor: 'pointer' }}
-            onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--pc-bg-elevated)')}
-            onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-          >
-            + Add new alias
-          </button>
+          <div className="flex items-center gap-2 px-4 py-3">
+            <Plus className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-accent)' }} />
+            <input
+              type="text"
+              className="input-electric flex-1 px-3 py-1.5 text-sm"
+              placeholder={aliases.length === 0 ? 'default' : `${aliases[0]}-2`}
+              value={newAlias}
+              onChange={(e) => setNewAlias(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
+              // eslint-disable-next-line jsx-a11y/no-autofocus
+              autoFocus={aliases.length === 0}
+            />
+            <button type="button" onClick={submit} className="btn-electric text-sm px-3 py-1.5 flex-shrink-0">
+              Add
+            </button>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
