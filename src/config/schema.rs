@@ -11601,6 +11601,27 @@ mod tests {
     }
 
     #[test]
+    async fn sync_config_default_matches_serde_default() {
+        // Regression for the BUG #15 sibling fixed alongside this test.
+        // `SyncConfig::default()` MUST mirror what serde produces when the
+        // TOML has no `[sync]` section. Otherwise `Config::default()`
+        // ships with sync silently disabled while users who never wrote
+        // a `[sync]` section get sync enabled — divergent runtime behavior.
+        let from_default = SyncConfig::default();
+        let from_empty_toml: SyncConfig = toml::from_str("").unwrap();
+
+        assert_eq!(from_default.enabled, from_empty_toml.enabled,
+            "SyncConfig::default().enabled must match serde-deserialized empty TOML");
+        assert!(from_default.enabled,
+            "Sync is enabled-by-default per ARCHITECTURE-v8 §12 and the schema doc on `enabled`");
+        assert_eq!(from_default.relay_ttl_secs, from_empty_toml.relay_ttl_secs);
+        assert_eq!(from_default.journal_retention_days, from_empty_toml.journal_retention_days);
+        assert_eq!(from_default.batch_size, from_empty_toml.batch_size);
+        assert_eq!(from_default.home_timezone, from_empty_toml.home_timezone);
+        assert_eq!(from_default.relay_url, from_empty_toml.relay_url);
+    }
+
+    #[test]
     async fn wasm_config_default_has_correct_values() {
         let cfg = WasmConfig::default();
         assert!(cfg.enabled, "WASM tools should be enabled by default");
@@ -17495,8 +17516,15 @@ pub fn get_home_timezone() -> Option<String> {
 
 impl Default for SyncConfig {
     fn default() -> Self {
+        // Mirror the serde defaults so `SyncConfig::default()` and
+        // TOML deserialization without a `[sync]` section produce the
+        // same value. Previously `enabled` here was hard-coded `false`
+        // while serde used `default_true`, which silently disabled
+        // sync wherever `Config::default()` is constructed (see
+        // `Config::default()` and `OnboardWizard`). Same drift class
+        // as BUG #15 fixed in PR #225 for `DomainConfig`.
         Self {
-            enabled: false,
+            enabled: default_true(),
             relay_url: None,
             relay_ttl_secs: default_relay_ttl_secs(),
             journal_retention_days: default_journal_retention_days(),
