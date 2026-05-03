@@ -1167,53 +1167,11 @@ fn v2_to_v3_table(table: &mut toml::Table) {
         }
     }
 
-    // Migrate legacy top-level [memory] pgvector fields to [memory.postgres]
-    // and db_url to [storage.provider.config].
-    let (legacy_pg_enabled, legacy_pg_dims, legacy_db_url) =
-        if let Some(toml::Value::Table(memory)) = table.get_mut("memory") {
-            (
-                memory.remove("pgvector_enabled"),
-                memory.remove("pgvector_dimensions"),
-                memory.remove("db_url"),
-            )
-        } else {
-            (None, None, None)
-        };
-
-    if (legacy_pg_enabled.is_some() || legacy_pg_dims.is_some())
-        && let Some(toml::Value::Table(memory)) = table.get_mut("memory")
-    {
-        let postgres = memory
-            .entry("postgres")
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        if let toml::Value::Table(pg) = postgres {
-            if let Some(v) = legacy_pg_enabled {
-                pg.entry("vector_enabled").or_insert(v);
-            }
-            if let Some(v) = legacy_pg_dims {
-                pg.entry("vector_dimensions").or_insert(v);
-            }
-        }
-    }
-
-    if let Some(url) = legacy_db_url {
-        let storage = table
-            .entry("storage")
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        if let toml::Value::Table(s) = storage {
-            let provider = s
-                .entry("provider")
-                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-            if let toml::Value::Table(p) = provider {
-                let cfg = p
-                    .entry("config")
-                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-                if let toml::Value::Table(c) = cfg {
-                    c.entry("db_url").or_insert(url);
-                }
-            }
-        }
-    }
+    // V3 storage promotion:
+    // V2 had typed memory backends as `[memory.<backend>]` subsections plus
+    // a single-instance `[storage.provider.config]` table for connection params.
+    // V3 collapses those into alias-keyed `[storage.<backend>.<alias>]`.
+    promote_v2_storage_subsystem(table);
 
     // V3 cron promotion:
     // - V2 had `[cron]` with subsystem knobs (enabled, catch_up_on_startup,
@@ -1224,6 +1182,125 @@ fn v2_to_v3_table(table: &mut toml::Table) {
     // - Move `[[cron.jobs]]` array into `[cron.<id>]` map (id field removed,
     //   the alias key preserves stable identity).
     promote_v2_cron_subsystem(table);
+}
+
+fn promote_v2_storage_subsystem(table: &mut toml::Table) {
+    use std::collections::BTreeMap;
+
+    // Step 1: extract V2 inputs.
+    //
+    // V2 sources for migration:
+    // - [memory] sqlite_open_timeout_secs
+    // - [memory] pgvector_enabled, pgvector_dimensions, db_url (legacy)
+    // - [memory.postgres] vector_enabled, vector_dimensions
+    // - [memory.qdrant] url, collection, api_key
+    // - [storage.provider.config] db_url, schema, table, connect_timeout_secs, provider
+    //
+    // V3 destinations:
+    // - [storage.sqlite.default] open_timeout_secs, path
+    // - [storage.postgres.default] db_url, schema, table, connect_timeout_secs, vector_enabled, vector_dimensions
+    // - [storage.qdrant.default] url, collection, api_key
+    // - [storage.markdown.default] directory
+    // - [storage.lucid.default] binary_path
+
+    let mut sqlite_default: BTreeMap<String, toml::Value> = BTreeMap::new();
+    let mut postgres_default: BTreeMap<String, toml::Value> = BTreeMap::new();
+    let mut qdrant_default: BTreeMap<String, toml::Value> = BTreeMap::new();
+
+    if let Some(toml::Value::Table(memory)) = table.get_mut("memory") {
+        // SQLite open-timeout migrates onto storage.sqlite.default.open_timeout_secs.
+        if let Some(v) = memory.remove("sqlite_open_timeout_secs") {
+            sqlite_default.insert("open_timeout_secs".to_string(), v);
+        }
+
+        // V1-shaped pgvector fields onto storage.postgres.default.
+        if let Some(v) = memory.remove("pgvector_enabled") {
+            postgres_default.insert("vector_enabled".to_string(), v);
+        }
+        if let Some(v) = memory.remove("pgvector_dimensions") {
+            postgres_default.insert("vector_dimensions".to_string(), v);
+        }
+
+        // Legacy V1 [memory] db_url onto storage.postgres.default.
+        if let Some(v) = memory.remove("db_url") {
+            postgres_default.insert("db_url".to_string(), v);
+        }
+
+        // V2 [memory.postgres] vector fields.
+        if let Some(toml::Value::Table(pg)) = memory.remove("postgres") {
+            for (k, v) in pg {
+                postgres_default.entry(k).or_insert(v);
+            }
+        }
+
+        // V2 [memory.qdrant] full subsection.
+        if let Some(toml::Value::Table(qd)) = memory.remove("qdrant") {
+            for (k, v) in qd {
+                qdrant_default.entry(k).or_insert(v);
+            }
+        }
+    }
+
+    // V2 [storage.provider.config] connection block. The `provider = "..."`
+    // field was a V2 redundancy (memory.backend already names the backend);
+    // we drop it on the floor here. The remaining fields fold onto
+    // storage.postgres.default (the only V2 SQL backend that used them).
+    if let Some(toml::Value::Table(storage)) = table.get_mut("storage")
+        && let Some(toml::Value::Table(provider)) = storage.remove("provider")
+    {
+        let provider_config = provider
+            .into_iter()
+            .find_map(|(k, v)| {
+                if k == "config"
+                    && let toml::Value::Table(t) = v
+                {
+                    return Some(t);
+                }
+                None
+            })
+            .unwrap_or_default();
+        for (k, v) in provider_config {
+            if k == "provider" {
+                continue;
+            }
+            postgres_default.entry(k).or_insert(v);
+        }
+    }
+
+    // Step 2: write the synthesized defaults into [storage.<backend>.default]
+    // entries. Preserves any user-supplied V3 `[storage.<backend>.<alias>]`
+    // entries already present (we only fill `default` if missing or merge into
+    // it without overwrite).
+    let storage_root = table
+        .entry("storage")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let toml::Value::Table(storage) = storage_root else {
+        return;
+    };
+
+    let merge_into_default =
+        |storage: &mut toml::Table, backend: &str, fields: BTreeMap<String, toml::Value>| {
+            if fields.is_empty() {
+                return;
+            }
+            let backend_table = storage
+                .entry(backend.to_string())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if let toml::Value::Table(bt) = backend_table {
+                let default_entry = bt
+                    .entry("default".to_string())
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                if let toml::Value::Table(de) = default_entry {
+                    for (k, v) in fields {
+                        de.entry(k).or_insert(v);
+                    }
+                }
+            }
+        };
+
+    merge_into_default(storage, "sqlite", sqlite_default);
+    merge_into_default(storage, "postgres", postgres_default);
+    merge_into_default(storage, "qdrant", qdrant_default);
 }
 
 fn promote_v2_cron_subsystem(table: &mut toml::Table) {

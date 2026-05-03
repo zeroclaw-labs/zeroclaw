@@ -1976,10 +1976,7 @@ async fn main() -> Result<()> {
             } else {
                 println!("🔴 Service:       stopped");
             }
-            let effective_memory_backend = memory::effective_memory_backend_name(
-                &config.memory.backend,
-                Some(&config.storage.provider.config),
-            );
+            let effective_memory_backend = config.resolve_active_storage().kind();
             println!(
                 "💓 Heartbeat:      {}",
                 if config.heartbeat.enabled {

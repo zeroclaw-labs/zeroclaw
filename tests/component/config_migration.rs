@@ -932,10 +932,12 @@ sqlite_open_timeout_secs = 30
 
     assert_eq!(config.memory.backend, "sqlite");
     assert!(config.memory.auto_save);
-    assert_eq!(config.memory.sqlite_open_timeout_secs, Some(30));
-    // postgres defaults initialized even for sqlite users
-    assert!(!config.memory.postgres.vector_enabled);
-    assert_eq!(config.memory.postgres.vector_dimensions, 1536);
+    let sqlite = config
+        .storage
+        .sqlite
+        .get("default")
+        .expect("V2 sqlite_open_timeout_secs migrates onto [storage.sqlite.default]");
+    assert_eq!(sqlite.open_timeout_secs, Some(30));
 }
 
 #[test]
@@ -949,11 +951,12 @@ sqlite_open_timeout_secs = 120
 "#,
     );
 
-    assert_eq!(config.memory.sqlite_open_timeout_secs, Some(120));
+    let sqlite = config.storage.sqlite.get("default").unwrap();
+    assert_eq!(sqlite.open_timeout_secs, Some(120));
 }
 
 #[test]
-fn memory_legacy_pgvector_fields_moved_to_postgres_subsection() {
+fn memory_legacy_pgvector_fields_moved_to_storage_postgres_default() {
     let config = migrate(
         r#"
 [memory]
@@ -965,12 +968,13 @@ pgvector_dimensions = 768
     );
 
     assert_eq!(config.memory.backend, "postgres");
-    assert!(config.memory.postgres.vector_enabled);
-    assert_eq!(config.memory.postgres.vector_dimensions, 768);
+    let pg = config.storage.postgres.get("default").unwrap();
+    assert!(pg.vector_enabled);
+    assert_eq!(pg.vector_dimensions, 768);
 }
 
 #[test]
-fn memory_legacy_db_url_moved_to_storage_provider_config() {
+fn memory_legacy_db_url_moved_to_storage_postgres_default() {
     let config = migrate(
         r#"
 [memory]
@@ -981,10 +985,11 @@ db_url = "postgres://user:pass@localhost/db"
     );
 
     assert_eq!(config.memory.backend, "postgres");
+    let pg = config.storage.postgres.get("default").unwrap();
     assert_eq!(
-        config.storage.provider.config.db_url.as_deref(),
+        pg.db_url.as_deref(),
         Some("postgres://user:pass@localhost/db"),
-        "db_url must be migrated to [storage.provider.config], not silently dropped"
+        "db_url must be migrated to [storage.postgres.default], not silently dropped"
     );
 }
 
@@ -996,15 +1001,16 @@ fn memory_legacy_db_url_does_not_overwrite_existing_storage_db_url() {
 backend = "postgres"
 db_url = "postgres://old@host/old"
 
-[storage.provider.config]
+[storage.postgres.default]
 db_url = "postgres://new@host/new"
 "#,
     );
 
+    let pg = config.storage.postgres.get("default").unwrap();
     assert_eq!(
-        config.storage.provider.config.db_url.as_deref(),
+        pg.db_url.as_deref(),
         Some("postgres://new@host/new"),
-        "existing [storage.provider.config].db_url must not be overwritten"
+        "existing [storage.postgres.default].db_url must not be overwritten"
     );
 }
 
@@ -1020,12 +1026,10 @@ db_url = "postgres://user:pass@host/db"
 "#,
     );
 
-    assert!(config.memory.postgres.vector_enabled);
-    assert_eq!(config.memory.postgres.vector_dimensions, 1536);
-    assert_eq!(
-        config.storage.provider.config.db_url.as_deref(),
-        Some("postgres://user:pass@host/db")
-    );
+    let pg = config.storage.postgres.get("default").unwrap();
+    assert!(pg.vector_enabled);
+    assert_eq!(pg.vector_dimensions, 1536);
+    assert_eq!(pg.db_url.as_deref(), Some("postgres://user:pass@host/db"));
 }
 
 #[test]
@@ -1068,11 +1072,9 @@ collection = "memories"
     );
 
     assert_eq!(config.memory.backend, "qdrant");
-    assert_eq!(
-        config.memory.qdrant.url.as_deref(),
-        Some("http://localhost:6334")
-    );
-    assert_eq!(config.memory.qdrant.collection, "memories");
+    let qd = config.storage.qdrant.get("default").unwrap();
+    assert_eq!(qd.url.as_deref(), Some("http://localhost:6334"));
+    assert_eq!(qd.collection, "memories");
 }
 
 #[test]
@@ -1089,7 +1091,7 @@ auto_save = false
 }
 
 #[test]
-fn memory_postgres_subsection_preserved_when_already_present() {
+fn memory_postgres_subsection_migrates_to_storage_postgres_default() {
     let config = migrate(
         r#"
 [memory]
@@ -1102,8 +1104,9 @@ vector_dimensions = 1024
 "#,
     );
 
-    assert!(config.memory.postgres.vector_enabled);
-    assert_eq!(config.memory.postgres.vector_dimensions, 1024);
+    let pg = config.storage.postgres.get("default").unwrap();
+    assert!(pg.vector_enabled);
+    assert_eq!(pg.vector_dimensions, 1024);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1924,9 +1927,14 @@ members = ["agent_a", "agent_b"]
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn storage_provider_config_round_trips() {
+fn v2_storage_provider_config_migrates_to_postgres_default() {
     let config = migrate(
         r#"
+schema_version = 2
+
+[memory]
+backend = "postgres"
+
 [storage.provider.config]
 db_url = "postgres://user:pass@host/db"
 schema = "myschema"
@@ -1935,25 +1943,133 @@ connect_timeout_secs = 10
 "#,
     );
 
-    assert_eq!(
-        config.storage.provider.config.db_url.as_deref(),
-        Some("postgres://user:pass@host/db")
-    );
-    assert_eq!(config.storage.provider.config.schema, "myschema");
-    assert_eq!(config.storage.provider.config.table, "entries");
-    assert_eq!(
-        config.storage.provider.config.connect_timeout_secs,
-        Some(10)
-    );
+    let pg = config.storage.postgres.get("default").unwrap();
+    assert_eq!(pg.db_url.as_deref(), Some("postgres://user:pass@host/db"));
+    assert_eq!(pg.schema, "myschema");
+    assert_eq!(pg.table, "entries");
+    assert_eq!(pg.connect_timeout_secs, Some(10));
 }
 
 #[test]
 fn storage_defaults_when_absent() {
     let config = migrate(r#"schema_version = 2"#);
 
-    assert_eq!(config.storage.provider.config.schema, "public");
-    assert_eq!(config.storage.provider.config.table, "memories");
-    assert!(config.storage.provider.config.db_url.is_none());
+    // No V2 storage data → empty per-backend maps in V3.
+    assert!(config.storage.sqlite.is_empty());
+    assert!(config.storage.postgres.is_empty());
+    assert!(config.storage.qdrant.is_empty());
+    assert!(config.storage.markdown.is_empty());
+    assert!(config.storage.lucid.is_empty());
+}
+
+#[test]
+fn v3_storage_alias_maps_pass_through_unchanged() {
+    let config = migrate(
+        r#"
+schema_version = 3
+
+[memory]
+backend = "postgres.work"
+
+[storage.postgres.work]
+db_url = "postgres://user:pw@host/db"
+vector_enabled = true
+vector_dimensions = 768
+"#,
+    );
+    let pg = config.storage.postgres.get("work").unwrap();
+    assert_eq!(pg.db_url.as_deref(), Some("postgres://user:pw@host/db"));
+    assert!(pg.vector_enabled);
+    assert_eq!(pg.vector_dimensions, 768);
+    assert_eq!(config.memory.backend, "postgres.work");
+}
+
+#[test]
+fn v2_storage_promotion_is_idempotent() {
+    let raw = r#"
+schema_version = 2
+
+[memory]
+backend = "postgres"
+sqlite_open_timeout_secs = 60
+pgvector_enabled = true
+pgvector_dimensions = 768
+db_url = "postgres://user:pw@host/db"
+
+[memory.qdrant]
+url = "http://localhost:6333"
+collection = "memories"
+"#;
+    let once = migrate(raw);
+    let serialized = toml::to_string(&once).expect("serialize once");
+
+    let twice = migrate(&serialized);
+    let serialized_twice = toml::to_string(&twice).expect("serialize twice");
+
+    assert_eq!(
+        serialized, serialized_twice,
+        "storage promotion must be idempotent — re-migrating V3 output changed the table"
+    );
+}
+
+#[test]
+fn config_resolve_active_storage_finds_alias() {
+    use zeroclaw::config::schema::ActiveStorage;
+    let config = migrate(
+        r#"
+schema_version = 3
+
+[memory]
+backend = "qdrant.work"
+
+[storage.qdrant.work]
+url = "http://qdrant.example/"
+collection = "shared"
+"#,
+    );
+    match config.resolve_active_storage() {
+        ActiveStorage::Qdrant(q) => {
+            assert_eq!(q.url.as_deref(), Some("http://qdrant.example/"));
+            assert_eq!(q.collection, "shared");
+        }
+        other => panic!("expected ActiveStorage::Qdrant, got {other:?}"),
+    }
+}
+
+#[test]
+fn config_resolve_active_storage_bare_backend_falls_back_to_default() {
+    use zeroclaw::config::schema::ActiveStorage;
+    let config = migrate(
+        r#"
+schema_version = 3
+
+[memory]
+backend = "sqlite"
+
+[storage.sqlite.default]
+open_timeout_secs = 90
+"#,
+    );
+    match config.resolve_active_storage() {
+        ActiveStorage::Sqlite(s) => {
+            assert_eq!(s.open_timeout_secs, Some(90));
+        }
+        other => panic!("expected ActiveStorage::Sqlite, got {other:?}"),
+    }
+}
+
+#[test]
+fn config_resolve_active_storage_unknown_returns_none() {
+    use zeroclaw::config::schema::ActiveStorage;
+    let config = migrate(
+        r#"
+schema_version = 3
+
+[memory]
+backend = "qdrant.missing"
+"#,
+    );
+    matches!(config.resolve_active_storage(), ActiveStorage::None);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

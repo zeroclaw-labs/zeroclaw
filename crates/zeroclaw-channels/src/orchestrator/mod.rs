@@ -5268,7 +5268,7 @@ pub async fn start_channels(
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
         &config.providers.embedding_routes,
-        Some(&config.storage.provider.config),
+        config.resolve_active_storage(),
         &config.workspace_dir,
         config
             .providers
@@ -5544,10 +5544,7 @@ pub async fn start_channels(
 
     println!("🦀 ZeroClaw Channel Server");
     println!("  🤖 Model:    {model}");
-    let effective_backend = zeroclaw_memory::effective_memory_backend_name(
-        &config.memory.backend,
-        Some(&config.storage.provider.config),
-    );
+    let effective_backend = config.resolve_active_storage().kind();
     println!(
         "  🧠 Memory:   {} (auto-save: {})",
         effective_backend,

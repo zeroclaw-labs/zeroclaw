@@ -855,6 +855,91 @@ impl Config {
             .get("default")
             .unwrap_or_else(|| FALLBACK.get_or_init(DelegateAgentConfig::default))
     }
+
+    /// Resolve the active storage backend for the memory subsystem.
+    ///
+    /// `MemoryConfig.backend` is a dotted reference (`<backend>.<alias>`) into
+    /// `Config.storage.<backend>.<alias>`. Bare backend names are interpreted
+    /// as `<backend>.default` for back-compat.
+    ///
+    /// Returns `ActiveStorage::None` when no backend is configured, when the
+    /// backend is `"none"`, or when the dotted alias does not resolve to a
+    /// configured entry.
+    pub fn resolve_active_storage(&self) -> ActiveStorage<'_> {
+        let backend = self.memory.backend.trim();
+        if backend.is_empty() || backend.eq_ignore_ascii_case("none") {
+            return ActiveStorage::None;
+        }
+        let (kind, alias) = backend.split_once('.').unwrap_or((backend, "default"));
+        match kind {
+            "sqlite" => self
+                .storage
+                .sqlite
+                .get(alias)
+                .map(ActiveStorage::Sqlite)
+                .unwrap_or(ActiveStorage::None),
+            "postgres" => self
+                .storage
+                .postgres
+                .get(alias)
+                .map(ActiveStorage::Postgres)
+                .unwrap_or(ActiveStorage::None),
+            "qdrant" => self
+                .storage
+                .qdrant
+                .get(alias)
+                .map(ActiveStorage::Qdrant)
+                .unwrap_or(ActiveStorage::None),
+            "markdown" => self
+                .storage
+                .markdown
+                .get(alias)
+                .map(ActiveStorage::Markdown)
+                .unwrap_or(ActiveStorage::None),
+            "lucid" => self
+                .storage
+                .lucid
+                .get(alias)
+                .map(ActiveStorage::Lucid)
+                .unwrap_or(ActiveStorage::None),
+            _ => ActiveStorage::None,
+        }
+    }
+}
+
+/// Resolved storage backend variant.
+///
+/// Returned from [`Config::resolve_active_storage`]. Each variant carries a
+/// borrow of the typed config from the corresponding `Config.storage` map.
+#[derive(Debug, Clone, Copy)]
+pub enum ActiveStorage<'a> {
+    /// No storage configured (`memory.backend = "none"` or unresolved alias).
+    None,
+    /// SQLite storage instance.
+    Sqlite(&'a SqliteStorageConfig),
+    /// PostgreSQL storage instance.
+    Postgres(&'a PostgresStorageConfig),
+    /// Qdrant storage instance.
+    Qdrant(&'a QdrantStorageConfig),
+    /// Markdown directory storage instance.
+    Markdown(&'a MarkdownStorageConfig),
+    /// Lucid CLI sync instance.
+    Lucid(&'a LucidStorageConfig),
+}
+
+impl ActiveStorage<'_> {
+    /// Backend type name (`"sqlite"`, `"postgres"`, etc.); `"none"` for unconfigured.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ActiveStorage::None => "none",
+            ActiveStorage::Sqlite(_) => "sqlite",
+            ActiveStorage::Postgres(_) => "postgres",
+            ActiveStorage::Qdrant(_) => "qdrant",
+            ActiveStorage::Markdown(_) => "markdown",
+            ActiveStorage::Lucid(_) => "lucid",
+        }
+    }
 }
 
 fn default_delegate_timeout_secs() -> u64 {
@@ -5083,59 +5168,144 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 // ── Memory ───────────────────────────────────────────────────
 
 /// Persistent storage configuration (`[storage]` section).
+///
+/// V3 promotes storage to a two-tier alias-keyed map: `[storage.<backend>.<alias>]`,
+/// parallel to `[providers.models.<type>.<alias>]`. Each backend has its own typed
+/// config struct. `MemoryConfig.backend` carries a dotted reference (`"sqlite.default"`,
+/// `"postgres.work"`) that resolves to one of these entries via
+/// [`Config::resolve_active_storage`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "storage"]
 pub struct StorageConfig {
-    /// Storage provider settings (e.g. sqlite, postgres).
-    #[serde(default)]
+    /// SQLite storage instances (`[storage.sqlite.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
-    pub provider: StorageProviderSection,
+    pub sqlite: HashMap<String, SqliteStorageConfig>,
+    /// PostgreSQL storage instances (`[storage.postgres.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub postgres: HashMap<String, PostgresStorageConfig>,
+    /// Qdrant storage instances (`[storage.qdrant.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub qdrant: HashMap<String, QdrantStorageConfig>,
+    /// Markdown storage instances (`[storage.markdown.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub markdown: HashMap<String, MarkdownStorageConfig>,
+    /// Lucid CLI sync instances (`[storage.lucid.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub lucid: HashMap<String, LucidStorageConfig>,
 }
 
-/// Wrapper for the storage provider configuration section.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+/// SQLite storage backend (`[storage.sqlite.<alias>]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "storage.provider"]
-pub struct StorageProviderSection {
-    /// Storage provider backend settings.
-    #[serde(default)]
-    #[nested]
-    pub config: StorageProviderConfig,
+#[prefix = "storage-sqlite"]
+#[serde(default)]
+pub struct SqliteStorageConfig {
+    /// Optional override for the SQLite database path.
+    /// When unset, defaults to `<workspace_dir>/brain.db`.
+    pub path: Option<String>,
+    /// Maximum seconds to wait when opening the DB if it's locked.
+    /// `None` waits indefinitely. Recommended max: 300.
+    pub open_timeout_secs: Option<u64>,
 }
 
-/// Storage provider backend configuration for remote storage backends.
+/// PostgreSQL storage backend (`[storage.postgres.<alias>]`).
+///
+/// Holds connection parameters AND pgvector settings — V3 collapses the V2
+/// `[storage.provider.config]` (connection) and `[memory.postgres]`
+/// (vector params) into one alias-keyed entry.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "storage.provider"]
-pub struct StorageProviderConfig {
-    /// Storage engine key (e.g. "sqlite", "qdrant").
-    #[serde(default)]
-    pub provider: String,
-
-    /// Connection URL for remote providers.
+#[prefix = "storage-postgres"]
+#[serde(default)]
+pub struct PostgresStorageConfig {
+    /// Connection URL (e.g. `"postgres://user:pass@host/db"`).
     /// Accepts legacy aliases: dbURL, database_url, databaseUrl.
-    #[serde(
-        default,
-        alias = "dbURL",
-        alias = "database_url",
-        alias = "databaseUrl"
-    )]
+    #[serde(alias = "dbURL", alias = "database_url", alias = "databaseUrl")]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub db_url: Option<String>,
-
-    /// Database schema for SQL backends.
-    #[serde(default = "default_storage_schema")]
+    /// Database schema for the memory table.
     pub schema: String,
-
     /// Table name for memory entries.
-    #[serde(default = "default_storage_table")]
     pub table: String,
-
-    /// Optional connection timeout in seconds for remote providers.
-    #[serde(default)]
+    /// Optional connection timeout in seconds.
     pub connect_timeout_secs: Option<u64>,
+    /// Enable pgvector extension for hybrid vector+keyword recall.
+    pub vector_enabled: bool,
+    /// Vector dimensions for pgvector embeddings.
+    pub vector_dimensions: usize,
+}
+
+impl Default for PostgresStorageConfig {
+    fn default() -> Self {
+        Self {
+            db_url: None,
+            schema: default_storage_schema(),
+            table: default_storage_table(),
+            connect_timeout_secs: None,
+            vector_enabled: false,
+            vector_dimensions: default_pgvector_dimensions(),
+        }
+    }
+}
+
+/// Qdrant vector database backend (`[storage.qdrant.<alias>]`).
+///
+/// URL, collection, and API key all fall back to environment variables
+/// (`QDRANT_URL`, `QDRANT_COLLECTION`, `QDRANT_API_KEY`) when unset.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "storage-qdrant"]
+#[serde(default)]
+pub struct QdrantStorageConfig {
+    /// Qdrant server URL (e.g. `"http://localhost:6333"`).
+    /// Falls back to `QDRANT_URL` env var if unset.
+    pub url: Option<String>,
+    /// Collection name for storing memories.
+    /// Falls back to `QDRANT_COLLECTION` env var, or `"zeroclaw_memories"`.
+    pub collection: String,
+    /// API key for Qdrant Cloud or secured instances.
+    /// Falls back to `QDRANT_API_KEY` env var if unset.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: Option<String>,
+}
+
+impl Default for QdrantStorageConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            collection: default_qdrant_collection(),
+            api_key: None,
+        }
+    }
+}
+
+/// Markdown directory storage (`[storage.markdown.<alias>]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "storage-markdown"]
+#[serde(default)]
+pub struct MarkdownStorageConfig {
+    /// Optional override for the markdown root directory.
+    /// When unset, defaults to `<workspace_dir>/memory/`.
+    pub directory: Option<String>,
+}
+
+/// Lucid CLI sync backend (`[storage.lucid.<alias>]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "storage-lucid"]
+#[serde(default)]
+pub struct LucidStorageConfig {
+    /// Optional path to the lucid-memory binary.
+    pub binary_path: Option<String>,
 }
 
 fn default_storage_schema() -> String {
@@ -5146,80 +5316,8 @@ fn default_storage_table() -> String {
     "memories".into()
 }
 
-impl Default for StorageProviderConfig {
-    fn default() -> Self {
-        Self {
-            provider: String::new(),
-            db_url: None,
-            schema: default_storage_schema(),
-            table: default_storage_table(),
-            connect_timeout_secs: None,
-        }
-    }
-}
-
-/// PostgreSQL memory backend configuration (`[memory.postgres]` section).
-///
-/// Used when `[memory].backend = "postgres"`. Connection parameters
-/// (`db_url`, `schema`, `table`, `connect_timeout_secs`) live under
-/// `[storage.provider.config]`; this struct only holds vector-search settings.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "memory.postgres"]
-pub struct PostgresMemoryConfig {
-    /// Enable pgvector extension for hybrid vector+keyword recall.
-    #[serde(default)]
-    pub vector_enabled: bool,
-
-    /// Vector dimensions for pgvector embeddings (default: 1536).
-    #[serde(default = "default_pgvector_dimensions")]
-    pub vector_dimensions: usize,
-}
-
-impl Default for PostgresMemoryConfig {
-    fn default() -> Self {
-        Self {
-            vector_enabled: false,
-            vector_dimensions: default_pgvector_dimensions(),
-        }
-    }
-}
-
-/// Qdrant vector database backend configuration (`[memory.qdrant]` section).
-///
-/// Used when `[memory].backend = "qdrant"`. URL, collection, and API key all
-/// fall back to environment variables (`QDRANT_URL`, `QDRANT_COLLECTION`,
-/// `QDRANT_API_KEY`) when not set explicitly.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "memory.qdrant"]
-pub struct QdrantConfig {
-    /// Qdrant server URL (e.g. `"http://localhost:6333"`).
-    /// Falls back to `QDRANT_URL` env var if not set.
-    #[serde(default)]
-    pub url: Option<String>,
-    /// Qdrant collection name for storing memories.
-    /// Falls back to `QDRANT_COLLECTION` env var, or default "zeroclaw_memories".
-    #[serde(default = "default_qdrant_collection")]
-    pub collection: String,
-    /// Optional API key for Qdrant Cloud or secured instances.
-    /// Falls back to `QDRANT_API_KEY` env var if not set.
-    #[serde(default)]
-    pub api_key: Option<String>,
-}
-
 fn default_qdrant_collection() -> String {
     "zeroclaw_memories".into()
-}
-
-impl Default for QdrantConfig {
-    fn default() -> Self {
-        Self {
-            url: None,
-            collection: default_qdrant_collection(),
-            api_key: None,
-        }
-    }
 }
 
 /// Search strategy for memory recall.
@@ -5239,14 +5337,19 @@ pub enum SearchMode {
 /// Memory backend configuration (`[memory]` section).
 ///
 /// Controls conversation memory storage, embeddings, hybrid search, response
-/// caching, and memory snapshot/hydration. Backend-specific sub-tables
-/// (`[memory.qdrant]`, `[memory.postgres]`) live alongside.
+/// caching, and memory snapshot/hydration. Backend-specific connection settings
+/// live under `[storage.<backend>.<alias>]`; this section selects which storage
+/// instance to use via the `backend` dotted reference.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// Where conversations, notes, and memories live. `sqlite` = embedded DB with optional vector + keyword hybrid search (fast, self-contained, default pick); `markdown` = plain-text files you can read and edit by hand (portable but no vector search); `lucid` = sync with the external `lucid-memory` CLI; `qdrant` = dedicated vector DB via `[memory.qdrant]` or `QDRANT_URL` env var; `none` = disable memory entirely.
+    /// Dotted reference to the active storage instance: `<backend>.<alias>`
+    /// (e.g. `"sqlite.default"`, `"postgres.work"`). Resolves through
+    /// `Config.storage.<backend>.<alias>` at runtime. Bare backend names
+    /// (`"sqlite"`) are treated as `"<backend>.default"`. Set to `"none"` to
+    /// disable persistence entirely.
     pub backend: String,
     /// Auto-save what *you* tell ZeroClaw into memory as conversation history — the agent's own replies are not saved. Turn off if you want memory to only hold things you explicitly record via the memory tool.
     #[serde(default = "default_auto_save")]
@@ -5355,26 +5458,11 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub policy: MemoryPolicyConfig,
-
-    // ── SQLite backend options ─────────────────────────────────
-    /// For sqlite backend: max seconds to wait when opening the DB (e.g. file locked).
-    /// None = wait indefinitely (default). Recommended max: 300.
-    #[serde(default)]
-    pub sqlite_open_timeout_secs: Option<u64>,
-
-    // ── Qdrant backend options ─────────────────────────────────
-    /// Configuration for Qdrant vector database backend.
-    /// Only used when `backend = "qdrant"`.
-    #[serde(default)]
-    #[nested]
-    pub qdrant: QdrantConfig,
-
-    // ── PostgreSQL backend options ─────────────────────────────
-    /// Configuration for PostgreSQL memory backend (`[memory.postgres]`).
-    /// Only used when `backend = "postgres"`.
-    #[serde(default)]
-    #[nested]
-    pub postgres: PostgresMemoryConfig,
+    // Backend-specific config fields (sqlite_open_timeout_secs, qdrant.*,
+    // postgres.*) lived here in V2. V3 moves them onto
+    // `[storage.<backend>.<alias>]`. The `backend` field now carries a dotted
+    // alias reference and the runtime looks up the typed config via
+    // `Config::resolve_active_storage`.
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -5503,9 +5591,6 @@ impl Default for MemoryConfig {
             audit_enabled: false,
             audit_retention_days: default_audit_retention_days(),
             policy: MemoryPolicyConfig::default(),
-            sqlite_open_timeout_secs: None,
-            qdrant: QdrantConfig::default(),
-            postgres: PostgresMemoryConfig::default(),
         }
     }
 }
@@ -11828,7 +11913,6 @@ default_temperature = 0.7
         assert_eq!(m.archive_after_days, 7);
         assert_eq!(m.purge_after_days, 30);
         assert_eq!(m.conversation_retention_days, 30);
-        assert!(m.sqlite_open_timeout_secs.is_none());
         assert_eq!(m.search_mode, SearchMode::Hybrid);
     }
 
@@ -11908,53 +11992,41 @@ auto_save = true
     }
 
     #[test]
-    async fn storage_provider_config_defaults() {
+    async fn storage_two_tier_defaults_empty() {
         let storage = StorageConfig::default();
-        assert!(storage.provider.config.provider.is_empty());
-        assert!(storage.provider.config.db_url.is_none());
-        assert_eq!(storage.provider.config.schema, "public");
-        assert_eq!(storage.provider.config.table, "memories");
-        assert!(storage.provider.config.connect_timeout_secs.is_none());
+        assert!(storage.sqlite.is_empty());
+        assert!(storage.postgres.is_empty());
+        assert!(storage.qdrant.is_empty());
+        assert!(storage.markdown.is_empty());
+        assert!(storage.lucid.is_empty());
     }
 
     #[test]
-    async fn memory_config_pgvector_defaults() {
-        let memory = MemoryConfig::default();
-        assert!(!memory.postgres.vector_enabled);
-        assert_eq!(memory.postgres.vector_dimensions, 1536);
-    }
-
-    #[test]
-    async fn memory_config_pgvector_roundtrip() {
-        // `auto_save` is required on MemoryConfig and unrelated to the pgvector
-        // fields these tests exercise. Including it keeps the fixture parseable
-        // without coupling the test to schema-default behavior on auto_save.
+    async fn storage_postgres_alias_pgvector_roundtrip() {
         let toml = r#"
-            backend = "postgres"
-            auto_save = true
-            [postgres]
+            [postgres.default]
+            db_url = "postgres://user:pw@host/db"
             vector_enabled = true
             vector_dimensions = 768
         "#;
-        let parsed: MemoryConfig = toml::from_str(toml).unwrap();
-        assert!(parsed.postgres.vector_enabled);
-        assert_eq!(parsed.postgres.vector_dimensions, 768);
-
-        let serialized = toml::to_string(&parsed).unwrap();
-        let reparsed: MemoryConfig = toml::from_str(&serialized).unwrap();
-        assert!(reparsed.postgres.vector_enabled);
-        assert_eq!(reparsed.postgres.vector_dimensions, 768);
+        let parsed: StorageConfig = toml::from_str(toml).unwrap();
+        let pg = parsed.postgres.get("default").expect("alias present");
+        assert_eq!(pg.db_url.as_deref(), Some("postgres://user:pw@host/db"));
+        assert!(pg.vector_enabled);
+        assert_eq!(pg.vector_dimensions, 768);
     }
 
     #[test]
-    async fn memory_config_pgvector_defaults_when_omitted() {
+    async fn storage_postgres_pgvector_defaults_when_omitted() {
         let toml = r#"
-            backend = "postgres"
-            auto_save = true
+            [postgres.default]
         "#;
-        let parsed: MemoryConfig = toml::from_str(toml).unwrap();
-        assert!(!parsed.postgres.vector_enabled);
-        assert_eq!(parsed.postgres.vector_dimensions, 1536);
+        let parsed: StorageConfig = toml::from_str(toml).unwrap();
+        let pg = parsed.postgres.get("default").expect("alias present");
+        assert!(!pg.vector_enabled);
+        assert_eq!(pg.vector_dimensions, 1536);
+        assert_eq!(pg.schema, "public");
+        assert_eq!(pg.table, "memories");
     }
 
     #[test]
@@ -12488,30 +12560,27 @@ default_temperature = 0.7
     }
 
     #[test]
-    async fn storage_provider_dburl_alias_deserializes() {
+    async fn storage_postgres_dburl_alias_deserializes() {
         let raw = r#"
 default_temperature = 0.7
 
-[storage.provider.config]
-provider = "qdrant"
-dbURL = "http://localhost:6333"
+[storage.postgres.default]
+dbURL = "postgres://user:pw@host/db"
 schema = "public"
 table = "memories"
 connect_timeout_secs = 12
 "#;
 
         let parsed = parse_test_config(raw);
-        assert_eq!(parsed.storage.provider.config.provider, "qdrant");
-        assert_eq!(
-            parsed.storage.provider.config.db_url.as_deref(),
-            Some("http://localhost:6333")
-        );
-        assert_eq!(parsed.storage.provider.config.schema, "public");
-        assert_eq!(parsed.storage.provider.config.table, "memories");
-        assert_eq!(
-            parsed.storage.provider.config.connect_timeout_secs,
-            Some(12)
-        );
+        let pg = parsed
+            .storage
+            .postgres
+            .get("default")
+            .expect("postgres.default present");
+        assert_eq!(pg.db_url.as_deref(), Some("postgres://user:pw@host/db"));
+        assert_eq!(pg.schema, "public");
+        assert_eq!(pg.table, "memories");
+        assert_eq!(pg.connect_timeout_secs, Some(12));
     }
 
     #[test]
@@ -12799,7 +12868,13 @@ default_temperature = 0.7
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
-        config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
+        config.storage.postgres.insert(
+            "default".to_string(),
+            PostgresStorageConfig {
+                db_url: Some("postgres://user:pw@host/db".into()),
+                ..PostgresStorageConfig::default()
+            },
+        );
         config.channels.feishu.insert(
             "default".to_string(),
             FeishuConfig {
@@ -12890,7 +12965,12 @@ default_temperature = 0.7
         assert!(crate::secrets::SecretStore::is_encrypted(worker_encrypted));
         assert_eq!(store.decrypt(worker_encrypted).unwrap(), "agent-credential");
 
-        let storage_db_url = stored.storage.provider.config.db_url.as_deref().unwrap();
+        let storage_db_url = stored
+            .storage
+            .postgres
+            .get("default")
+            .and_then(|p| p.db_url.as_deref())
+            .unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(storage_db_url));
         assert_eq!(
             store.decrypt(storage_db_url).unwrap(),

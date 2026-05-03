@@ -1,7 +1,7 @@
 use super::traits::{Memory, MemoryCategory};
 use super::{
-    MemoryBackendKind, classify_memory_backend, create_memory_for_migration,
-    effective_memory_backend_name,
+    MemoryBackendKind, backend_kind_from_dotted, classify_memory_backend,
+    create_memory_for_migration,
 };
 use crate::config::Config;
 use anyhow::{Result, bail};
@@ -30,10 +30,7 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
 /// embedding provider initialisation for local backends by using the
 /// migration factory.
 fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
-    let backend = effective_memory_backend_name(
-        &config.memory.backend,
-        Some(&config.storage.provider.config),
-    );
+    let backend = backend_kind_from_dotted(&config.memory.backend);
 
     match classify_memory_backend(&backend) {
         MemoryBackendKind::None => {

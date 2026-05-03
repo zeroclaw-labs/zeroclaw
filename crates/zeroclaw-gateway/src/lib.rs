@@ -492,7 +492,7 @@ pub async fn run_gateway(
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
         &config.providers.embedding_routes,
-        Some(&config.storage.provider.config),
+        config.resolve_active_storage(),
         &config.workspace_dir,
         fallback.and_then(|e| e.api_key.as_deref()),
     )?);
