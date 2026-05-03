@@ -63,7 +63,7 @@ PRs with merge conflicts receive `needs-author-action` only — no review, no di
 
 ## Squash-merge strategy
 
-ZeroClaw uses squash-merge for all PRs. The `squash-merge` skill produces both the purple **Merged** badge *and* a conventional-commits formatted squash message with full commit history in the body.
+ZeroClaw uses squash-merge for all PRs; see [PR Workflow](./pr-workflow.md#maintainer-merge-process) for the human merge-readiness process and rare regular-merge exceptions. The `squash-merge` skill handles the final execution step by producing both the purple **Merged** badge *and* a conventional-commits formatted squash message with full commit history in the body.
 
 ### Why the skill exists
 
