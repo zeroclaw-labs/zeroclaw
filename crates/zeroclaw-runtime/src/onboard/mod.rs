@@ -897,7 +897,14 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                     if flags.provider.is_some() {
                         return Ok(Nav::Back);
                     }
-                    cfg.providers.models.remove(&picked);
+                    if is_new_entry
+                        && let Some(aliases) = cfg.providers.models.get_mut(&picked)
+                    {
+                        aliases.remove(&alias);
+                        if aliases.is_empty() {
+                            cfg.providers.models.remove(&picked);
+                        }
+                    }
                     continue;
                 }
                 Nav::Done => {}
@@ -912,7 +919,14 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                     if flags.provider.is_some() {
                         return Ok(Nav::Back);
                     }
-                    cfg.providers.models.remove(&picked);
+                    if is_new_entry
+                        && let Some(aliases) = cfg.providers.models.get_mut(&picked)
+                    {
+                        aliases.remove(&alias);
+                        if aliases.is_empty() {
+                            cfg.providers.models.remove(&picked);
+                        }
+                    }
                     continue;
                 }
                 Nav::Done => {}
