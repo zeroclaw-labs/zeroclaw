@@ -4,6 +4,8 @@ use std::path::Path;
 use zeroclaw_api::provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
+use crate::history_sanitizer::enforce_leading_user_turn;
+
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
     "image/png",
@@ -167,8 +169,16 @@ pub async fn prepare_messages_for_provider(
     let total_images = count_image_markers(messages);
 
     if total_images == 0 {
+        let mut sanitized = messages.to_vec();
+        let dropped = enforce_leading_user_turn(&mut sanitized);
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                "history sanitizer dropped {dropped} leading non-user turn(s) before provider call (issue #6302)"
+            );
+        }
         return Ok(PreparedMessages {
-            messages: messages.to_vec(),
+            messages: sanitized,
             contains_images: false,
         });
     }
@@ -210,6 +220,14 @@ pub async fn prepare_messages_for_provider(
             role: message.role.clone(),
             content,
         });
+    }
+
+    let dropped = enforce_leading_user_turn(&mut normalized_messages);
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            "history sanitizer dropped {dropped} leading non-user turn(s) before provider call (issue #6302)"
+        );
     }
 
     Ok(PreparedMessages {
