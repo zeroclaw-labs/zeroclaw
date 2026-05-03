@@ -256,4 +256,32 @@ pub trait Channel: Send + Sync {
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
         Ok(None)
     }
+
+    /// Ask the user a multiple-choice question and return the chosen option's text.
+    ///
+    /// Returns `Ok(Some(answer))` if the channel handled the question natively
+    /// (e.g. ACP `session/request_permission`, Telegram inline keyboard).
+    /// Returns `Ok(None)` to signal the caller should fall back to the
+    /// generic `send` + `listen` flow. Default impl returns `None`.
+    ///
+    /// Free-form questions (no choices) are not modeled here yet — they
+    /// require the ACP elicitation RFD to land for a clean cross-channel API.
+    async fn request_choice(
+        &self,
+        _question: &str,
+        _choices: &[String],
+        _timeout: std::time::Duration,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Whether this channel can answer free-form (no-choices) `ask_user`
+    /// questions via the standard `send` + `listen` flow.
+    ///
+    /// Channels that can only handle structured choices (e.g. ACP today, until
+    /// the elicitation RFD lands) should return `false` so callers can fail
+    /// fast with a useful error instead of timing out on `listen`.
+    fn supports_free_form_ask(&self) -> bool {
+        true
+    }
 }

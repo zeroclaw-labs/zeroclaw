@@ -3107,7 +3107,7 @@ dependencies = [
 
 [[package]]
 name = "fill-translations"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -13069,7 +13069,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -13079,6 +13079,7 @@ dependencies = [
  "tokio",
  "toml 0.8.2",
  "tower-http",
+ "zeroclaw-gateway",
 ]
 
 [[package]]
@@ -13206,7 +13207,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-api"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13222,7 +13223,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-channels"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "aes",
  "anyhow",
@@ -13292,7 +13293,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-config"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13351,7 +13352,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-gateway"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13372,6 +13373,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "rustls-pemfile",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -13381,6 +13383,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "toml 1.1.2+spec-1.1.0",
+ "toml_edit 0.25.11+spec-1.1.0",
  "tower",
  "tower-http",
  "tracing",
@@ -13399,7 +13402,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-hardware"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "aardvark-sys",
  "anyhow",
@@ -13429,7 +13432,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-infra"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -13446,7 +13449,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-macros"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -13455,7 +13458,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-memory"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13478,7 +13481,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-plugins"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13498,7 +13501,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-providers"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13555,7 +13558,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-runtime"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "aardvark-sys",
  "anyhow",
@@ -13635,7 +13638,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-tool-call-parser"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "regex",
  "serde",
@@ -13645,7 +13648,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-tools"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13688,7 +13691,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-tui"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13704,7 +13707,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclawlabs"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "aardvark-sys",
  "anyhow",

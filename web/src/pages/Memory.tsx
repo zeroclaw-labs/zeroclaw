@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Brain,
   Search,
@@ -6,9 +7,11 @@ import {
   Trash2,
   X,
   Filter,
+  MessageSquare,
 } from 'lucide-react';
 import type { MemoryEntry } from '@/types/api';
 import { getMemory, storeMemory, deleteMemory } from '@/lib/api';
+import { SESSION_ID_STORAGE_KEY } from '@/lib/ws';
 import { t } from '@/lib/i18n';
 
 function truncate(text: string, max: number): string {
@@ -22,6 +25,7 @@ function formatDate(iso: string): string {
 }
 
 export default function Memory() {
+  const navigate = useNavigate();
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -29,6 +33,21 @@ export default function Memory() {
   const [categoryFilter, setCategoryFilter] = useState('');
   const [showForm, setShowForm] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+
+  // Recover the agent chat session this memory was captured in. The chat
+  // page reads `getOrCreateSessionId()` (backed by SESSION_ID_STORAGE_KEY)
+  // on mount and hydrates messages via `getSessionMessages(sid)`, so
+  // overwriting the key + navigating to /agent is enough to load the
+  // saved transcript. (#6145)
+  const handleOpenChat = (sessionId: string) => {
+    try {
+      localStorage.setItem(SESSION_ID_STORAGE_KEY, sessionId);
+    } catch {
+      // localStorage unavailable (e.g. private mode); fall through to
+      // navigation, which will create a fresh session.
+    }
+    navigate('/agent');
+  };
 
   // Form state
   const [formKey, setFormKey] = useState('');
@@ -90,7 +109,7 @@ export default function Memory() {
   if (error && entries.length === 0) {
     return (
       <div className="p-6 animate-fade-in">
-        <div className="rounded-2xl border p-4" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
+        <div className="rounded-2xl border p-4" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
           {t('memory.load_error')}: {error}
         </div>
       </div>
@@ -134,7 +153,7 @@ export default function Memory() {
 
       {/* Error banner (non-fatal) */}
       {error && (
-        <div className="rounded-xl border p-3 text-sm animate-fade-in" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
+        <div className="rounded-xl border p-3 text-sm animate-fade-in" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
           {error}
         </div>
       )}
@@ -155,7 +174,7 @@ export default function Memory() {
               </button>
             </div>
             {formError && (
-              <div className="mb-4 rounded-xl border p-3 text-sm animate-fade-in" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
+              <div className="mb-4 rounded-xl border p-3 text-sm animate-fade-in" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
                 {formError}
               </div>
             )}
@@ -256,12 +275,23 @@ export default function Memory() {
                         </button>
                       </div>
                     ) : (
-                      <button
-                        onClick={() => setConfirmDelete(entry.key)}
-                        className="btn-icon"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
+                      <div className="flex items-center justify-end gap-1">
+                        {entry.session_id && (
+                          <button
+                            onClick={() => handleOpenChat(entry.session_id!)}
+                            className="btn-icon"
+                            title={`Open chat session ${entry.session_id.slice(0, 8)}…`}
+                          >
+                            <MessageSquare className="h-4 w-4" />
+                          </button>
+                        )}
+                        <button
+                          onClick={() => setConfirmDelete(entry.key)}
+                          className="btn-icon"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
                     )}
                   </td>
                 </tr>

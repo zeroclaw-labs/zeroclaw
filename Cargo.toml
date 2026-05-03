@@ -4,27 +4,27 @@ resolver = "2"
 exclude = ["plugins/image-gen-fal"]
 
 [workspace.package]
-version = "0.7.3"
+version = "0.7.4"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
 rust-version = "1.87"
 
 [workspace.dependencies]
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.7.3" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.7.3" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.7.3", default-features = false }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.7.3" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.7.3" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.7.3", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.7.3" }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.7.3", default-features = false }
-zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.7.3" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.7.3" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.7.3" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.7.3" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.7.3" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.7.3" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.7.4" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.7.4" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.7.4", default-features = false }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.7.4" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.7.4" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.7.4", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.7.4" }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.7.4", default-features = false }
+zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.7.4" }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.7.4" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.7.4" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.7.4" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.7.4" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.7.4" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 
 [package]
@@ -58,6 +58,11 @@ include = [
 [[bin]]
 name = "zeroclaw"
 path = "src/main.rs"
+
+[[bin]]
+name = "zeroclaw-acp-bridge"
+path = "src/bin/zeroclaw-acp-bridge.rs"
+required-features = ["acp-bridge"]
 
 [lib]
 name = "zeroclaw"
@@ -235,6 +240,7 @@ libc = "0.2"
 [features]
 default = [
     "agent-runtime",
+    "acp-bridge",
     "gateway",
     "tui-onboarding",
     "observability-prometheus",
@@ -271,6 +277,7 @@ gateway = [
 ]
 tui-onboarding = ["dep:zeroclaw-tui"]
 schema-export = ["zeroclaw-config/schema-export"]
+acp-bridge = ["dep:tokio-tungstenite"]
 
 # Channels — each forwards directly to zeroclaw-channels (1 hop)
 channel-email = ["zeroclaw-channels/channel-email"]

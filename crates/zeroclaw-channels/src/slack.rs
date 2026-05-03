@@ -30,6 +30,7 @@ pub struct SlackChannel {
     allowed_users: Vec<String>,
     thread_replies: bool,
     mention_only: bool,
+    strict_mention_in_thread: bool,
     group_reply_allowed_sender_ids: Vec<String>,
     user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
     workspace_dir: Option<PathBuf>,
@@ -173,6 +174,7 @@ impl SlackChannel {
             allowed_users,
             thread_replies: true,
             mention_only: false,
+            strict_mention_in_thread: false,
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
@@ -206,6 +208,14 @@ impl SlackChannel {
     /// Configure whether outbound replies stay in the originating Slack thread.
     pub fn with_thread_replies(mut self, thread_replies: bool) -> Self {
         self.thread_replies = thread_replies;
+        self
+    }
+
+    /// When true (and `mention_only` is also true), require an @-mention
+    /// for messages inside a Slack thread too. Default: false (threads
+    /// bypass the mention requirement so follow-ups don't need @).
+    pub fn with_strict_mention_in_thread(mut self, strict: bool) -> Self {
+        self.strict_mention_in_thread = strict;
         self
     }
 
@@ -2855,7 +2865,7 @@ impl SlackChannel {
                 let require_mention = self.mention_only
                     && is_group_message
                     && !allow_sender_without_mention
-                    && !is_thread_reply;
+                    && (!is_thread_reply || self.strict_mention_in_thread);
 
                 let Some(normalized_text) = self
                     .build_incoming_content(event, require_mention, bot_user_id)
@@ -3868,7 +3878,7 @@ impl Channel for SlackChannel {
                         let require_mention = self.mention_only
                             && is_group_message
                             && !allow_sender_without_mention
-                            && !is_thread_reply;
+                            && (!is_thread_reply || self.strict_mention_in_thread);
                         let Some(normalized_text) = self
                             .build_incoming_content(msg, require_mention, &bot_user_id)
                             .await
@@ -4180,6 +4190,14 @@ mod tests {
         let ch =
             SlackChannel::new("xoxb-fake".into(), None, vec![], vec![]).with_thread_replies(false);
         assert!(!ch.thread_replies);
+    }
+
+    #[test]
+    fn with_strict_mention_in_thread_sets_flag() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec![]);
+        assert!(!ch.strict_mention_in_thread);
+        let ch = ch.with_strict_mention_in_thread(true);
+        assert!(ch.strict_mention_in_thread);
     }
 
     #[test]
