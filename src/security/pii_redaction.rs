@@ -540,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn api_key_prefix_redacts_sk_and_AKIA() {
+    fn api_key_prefix_redacts_sk_and_akia() {
         let mut map = PiiRedactionMap::new();
         let redacted = redact_text(
             "키1=sk_test_ABCDEFGHIJ1234567890 키2=AKIA1234567890ABCDEF",

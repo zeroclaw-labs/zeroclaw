@@ -12,7 +12,7 @@ name = "zeroclaw_android"
 [dependencies]
 # Note: zeroclaw dep commented out until we integrate properly
 # zeroclaw = { path = "../.." }
-uniffi = { version = "0.27" }
+uniffi = { version = "0.27", features = ["cli"] }
 # Minimal tokio - only what we need
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "time"] }
 anyhow = "1"
