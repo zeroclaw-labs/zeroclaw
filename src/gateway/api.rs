@@ -13,6 +13,64 @@ use serde::{Deserialize, Serialize};
 
 const MASKED_SECRET: &str = "***MASKED***";
 
+// ── Error response helpers (PR-G2 — C3) ─────────────────────────
+//
+// SECURITY: never include the raw `anyhow`/`serde`/`toml` error
+// `Display` text in HTTP responses. Doing so leaks internal paths,
+// schema fragments, and parser internals to unauthenticated clients.
+// Instead, log the full error server-side via `tracing::error!` and
+// return a stable error code + a short, safe human message.
+//
+// Two helpers cover the common patterns this file has:
+//
+//   error_response(STATUS, "code", "human msg") — the basic shape.
+//   server_error_logged(STATUS, "code", "human msg", error)
+//       — same plus `tracing::error!(error = %e, ...)` server-side.
+//
+// Use the `_logged` variant whenever the error carries diagnostic
+// value the operator needs to see (config save failure, git clone
+// failure, decryption failure, etc.). Use the basic variant for
+// validation errors where the input itself is the diagnostic.
+
+/// Build a JSON error body in the shape `{"error": "code", "message": "..."}`.
+/// Both fields are operator-safe: `code` is a stable ASCII slug (e.g.
+/// "config_save_failed") that clients can branch on, and `message` is
+/// a short human-readable string that does NOT include any error
+/// `Display` payload from anyhow/serde/toml/etc.
+fn error_response(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": code,
+            "message": message.into(),
+        })),
+    )
+}
+
+/// Like `error_response` but additionally logs the full error
+/// server-side at `tracing::error!` level. The tracing field names
+/// (`code`, `error`) are stable so log aggregators can index them.
+fn server_error_logged(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+    e: impl std::fmt::Display,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let msg = message.into();
+    tracing::error!(target: "gateway.api", code, error = %e, "{msg}");
+    (
+        status,
+        Json(serde_json::json!({
+            "error": code,
+            "message": msg,
+        })),
+    )
+}
+
 // ── Bearer token auth extractor ─────────────────────────────────
 
 /// Extract and validate bearer token from Authorization header.
@@ -141,11 +199,13 @@ pub async fn handle_api_config_get(
     let toml_str = match toml::to_string_pretty(&masked_config) {
         Ok(s) => s,
         Err(e) => {
-            return (
+            return server_error_logged(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to serialize config: {e}")})),
+                "config_serialize_failed",
+                "Could not serialize current config",
+                e,
             )
-                .into_response();
+            .into_response();
         }
     };
 
@@ -170,22 +230,26 @@ pub async fn handle_api_config_put(
     let mut incoming_toml: toml::Value = match toml::from_str(&body) {
         Ok(v) => v,
         Err(e) => {
-            return (
+            return server_error_logged(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid TOML: {e}")})),
+                "config_invalid_toml",
+                "Submitted body is not valid TOML",
+                e,
             )
-                .into_response();
+            .into_response();
         }
     };
     normalize_dashboard_config_toml(&mut incoming_toml);
     let incoming: crate::config::Config = match incoming_toml.try_into() {
         Ok(c) => c,
         Err(e) => {
-            return (
+            return server_error_logged(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid TOML: {e}")})),
+                "config_invalid_schema",
+                "Submitted TOML does not match the config schema",
+                e,
             )
-                .into_response();
+            .into_response();
         }
     };
 
@@ -193,20 +257,24 @@ pub async fn handle_api_config_put(
     let new_config = hydrate_config_for_save(incoming, &current_config);
 
     if let Err(e) = new_config.validate() {
-        return (
+        return server_error_logged(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("Invalid config: {e}")})),
+            "config_validation_failed",
+            "Submitted config failed validation",
+            e,
         )
-            .into_response();
+        .into_response();
     }
 
     // Save to disk
     if let Err(e) = new_config.save().await {
-        return (
+        return server_error_logged(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+            "config_save_failed",
+            "Could not persist the updated config",
+            e,
         )
-            .into_response();
+        .into_response();
     }
 
     // Update in-memory config
@@ -521,21 +589,33 @@ pub async fn handle_api_workspace_put(
             {
                 Ok(o) => o,
                 Err(e) => {
-                    return (
+                    return server_error_logged(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": format!("Failed to run git clone: {e}")})),
+                        "git_clone_spawn_failed",
+                        "Could not start `git clone` — verify git is installed and on PATH",
+                        e,
                     )
-                        .into_response();
+                    .into_response();
                 }
             };
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return (
+                // Log the stderr server-side (it can include private remote
+                // URLs / SSH host fingerprints / etc.) and return a stable
+                // operator-safe code to the client.
+                tracing::error!(
+                    target: "gateway.api",
+                    code = "git_clone_failed",
+                    stderr = %stderr,
+                    "git clone exited non-zero"
+                );
+                return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("git clone failed: {stderr}")})),
+                    "git_clone_failed",
+                    "git clone exited non-zero — see server logs for stderr",
                 )
-                    .into_response();
+                .into_response();
             }
             clone_target
         }
@@ -770,11 +850,13 @@ pub async fn handle_api_cron_list(
                 .collect();
             Json(serde_json::json!({"jobs": jobs_json})).into_response()
         }
-        Err(e) => (
+        Err(e) => server_error_logged(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to list cron jobs: {e}")})),
+            "cron_list_failed",
+            "Could not list cron jobs",
+            e,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -805,11 +887,13 @@ pub async fn handle_api_cron_add(
             }
         }))
         .into_response(),
-        Err(e) => (
+        Err(e) => server_error_logged(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to add cron job: {e}")})),
+            "cron_add_failed",
+            "Could not add the cron job",
+            e,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -826,11 +910,13 @@ pub async fn handle_api_cron_delete(
     let config = state.config.lock().clone();
     match crate::cron::remove_job(&config, &id) {
         Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
-        Err(e) => (
+        Err(e) => server_error_logged(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to remove cron job: {e}")})),
+            "cron_remove_failed",
+            "Could not remove the cron job",
+            e,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
@@ -912,11 +998,13 @@ pub async fn handle_api_memory_list(
         // Search mode
         match state.mem.recall(query, 50, None).await {
             Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
-            Err(e) => (
+            Err(e) => server_error_logged(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Memory recall failed: {e}")})),
+                "memory_recall_failed",
+                "Could not query memory entries",
+                e,
             )
-                .into_response(),
+            .into_response(),
         }
     } else {
         // List mode
@@ -929,11 +1017,13 @@ pub async fn handle_api_memory_list(
 
         match state.mem.list(category.as_ref(), None).await {
             Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
-            Err(e) => (
+            Err(e) => server_error_logged(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Memory list failed: {e}")})),
+                "memory_list_failed",
+                "Could not list memory entries",
+                e,
             )
-                .into_response(),
+            .into_response(),
         }
     }
 }
@@ -965,11 +1055,13 @@ pub async fn handle_api_memory_store(
         .await
     {
         Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
-        Err(e) => (
+        Err(e) => server_error_logged(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Memory store failed: {e}")})),
+            "memory_store_failed",
+            "Could not store the memory entry",
+            e,
         )
-            .into_response(),
+        .into_response(),
     }
 }
 
