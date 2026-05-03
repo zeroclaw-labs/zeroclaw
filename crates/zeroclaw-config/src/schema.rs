@@ -134,7 +134,7 @@ pub struct Config {
     #[nested]
     pub runtime: RuntimeConfig,
 
-    /// Reliability settings: retries, fallback providers, backoff (`[reliability]`).
+    /// Reliability settings: retries, backoff, key rotation (`[reliability]`).
     #[serde(default)]
     #[nested]
     pub reliability: ReliabilityConfig,
@@ -840,17 +840,17 @@ impl Default for DelegateAgentConfig {
 
 impl Config {
     /// Reference to the conventional "default" agent config, with a static
-    /// fallback when the user hasn't defined one yet. This is the bridge
+    /// default when the user hasn't defined one yet. This is the bridge
     /// from V2's global `[agent]` section to V3's per-agent dispatch:
     /// callsites that don't yet thread the routed agent alias resolve here
     /// instead, preserving prior behavior while the rest of the runtime
     /// migrates to per-agent lookups.
     pub fn default_agent(&self) -> &DelegateAgentConfig {
         use std::sync::OnceLock;
-        static FALLBACK: OnceLock<DelegateAgentConfig> = OnceLock::new();
+        static DEFAULT: OnceLock<DelegateAgentConfig> = OnceLock::new();
         self.agents
             .get("default")
-            .unwrap_or_else(|| FALLBACK.get_or_init(DelegateAgentConfig::default))
+            .unwrap_or_else(|| DEFAULT.get_or_init(DelegateAgentConfig::default))
     }
 
     /// Resolve the active risk profile for a given agent or non-agent context.
@@ -861,13 +861,13 @@ impl Config {
     /// runtime, orchestrator startup) resolve via `agent_alias = None`,
     /// which returns the conventional `risk_profiles["default"]`.
     ///
-    /// Falls back to a static `RiskProfileConfig::default()` when neither the
+    /// Returns a static `RiskProfileConfig::default()` when neither the
     /// agent's profile nor the default exists. This mirrors `default_agent`
     /// — fresh installs get safe defaults rather than panicking.
     #[must_use]
     pub fn active_risk_profile(&self, agent_alias: Option<&str>) -> &RiskProfileConfig {
         use std::sync::OnceLock;
-        static FALLBACK: OnceLock<RiskProfileConfig> = OnceLock::new();
+        static DEFAULT: OnceLock<RiskProfileConfig> = OnceLock::new();
 
         if let Some(alias) = agent_alias
             && let Some(agent) = self.agents.get(alias)
@@ -879,7 +879,7 @@ impl Config {
 
         self.risk_profiles
             .get("default")
-            .unwrap_or_else(|| FALLBACK.get_or_init(RiskProfileConfig::default))
+            .unwrap_or_else(|| DEFAULT.get_or_init(RiskProfileConfig::default))
     }
 
     /// Resolve the active storage backend for the memory subsystem.
@@ -6079,28 +6079,21 @@ impl Default for RuntimeConfig {
 
 /// Reliability and supervision configuration (`[reliability]` section).
 ///
-/// Controls provider retries, fallback chains, API key rotation, and channel restart backoff.
+/// Controls provider retries, API key rotation, and channel restart backoff.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "reliability"]
 pub struct ReliabilityConfig {
-    /// Retries per provider before failing over.
+    /// Retries per provider before bailing.
     #[serde(default = "default_provider_retries")]
     pub provider_retries: u32,
     /// Base backoff (ms) for provider retry delay.
     #[serde(default = "default_provider_backoff_ms")]
     pub provider_backoff_ms: u64,
-    /// Fallback provider chain (e.g. `["anthropic", "openai"]`).
-    #[serde(default)]
-    pub fallback_providers: Vec<String>,
     /// Additional API keys for round-robin rotation on rate-limit (429) errors.
     /// The primary `api_key` is always tried first; these are extras.
     #[serde(default)]
     pub api_keys: Vec<String>,
-    /// Per-model fallback chains. When a model fails, try these alternatives in order.
-    /// Example: `{ "claude-opus-4-20250514" = ["claude-sonnet-4-20250514", "gpt-4o"] }`
-    #[serde(default)]
-    pub model_fallbacks: std::collections::HashMap<String, Vec<String>>,
     /// Initial backoff for channel/daemon restarts.
     #[serde(default = "default_channel_backoff_secs")]
     pub channel_initial_backoff_secs: u64,
@@ -6144,9 +6137,7 @@ impl Default for ReliabilityConfig {
         Self {
             provider_retries: default_provider_retries(),
             provider_backoff_ms: default_provider_backoff_ms(),
-            fallback_providers: Vec::new(),
             api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: default_channel_backoff_secs(),
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),
@@ -10288,17 +10279,6 @@ impl Config {
         }
     }
 
-    /// Ensure a default provider entry exists under `providers.models.default.default`,
-    /// creating it if necessary.
-    pub fn ensure_fallback_provider(&mut self) -> &mut ModelProviderConfig {
-        self.providers
-            .models
-            .entry("default".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default()
-    }
-
     /// Collect non-fatal validation warnings — config that loads and
     /// validates successfully (`validate()` returns `Ok(())`) but will fail
     /// at runtime because of a logical inconsistency the schema cannot
@@ -12180,7 +12160,7 @@ default_temperature = 0.7
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 30);
-        // Temperature migrated to the fallback provider entry
+        // Temperature migrated onto the primary provider entry
         assert!(
             (parsed
                 .providers
@@ -14144,13 +14124,12 @@ model = "primary-model"
         );
     }
 
-    /// `resolve_default_model` returns the fallback provider's model when set,
-    /// and falls through to the first available `models.*` entry otherwise.
-    /// Returning `None` is reserved for "no provider has any model configured",
-    /// which callers must surface as a configuration error rather than silently
-    /// substituting a vendor default.
+    /// `resolve_default_model` returns the first available `models.*` entry's
+    /// model. Returning `None` is reserved for "no provider has any model
+    /// configured", which callers must surface as a configuration error
+    /// rather than silently substituting a vendor default.
     #[test]
-    async fn resolve_default_model_prefers_fallback_then_first_available() {
+    async fn resolve_default_model_picks_first_available() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         // Empty config: no model anywhere -> None (caller errors loudly).
@@ -14165,7 +14144,7 @@ model = "primary-model"
             .insert("default".to_string(), ModelProviderConfig::default());
         assert_eq!(config.providers.resolve_default_model(), None);
 
-        // Add an entry with a model -> first-available wins when no fallback.
+        // Add an entry with a model -> first-available wins.
         config
             .providers
             .models

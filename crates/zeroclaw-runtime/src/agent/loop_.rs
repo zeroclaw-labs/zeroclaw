@@ -2091,7 +2091,7 @@ pub async fn run(
         Arc::from(platform::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(&config, None));
 
-    let fallback_provider_loop = config.providers.first_provider();
+    let primary_provider = config.providers.first_provider();
 
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
@@ -2099,7 +2099,7 @@ pub async fn run(
         &config.providers.embedding_routes,
         config.resolve_active_storage(),
         &config.workspace_dir,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
+        primary_provider.and_then(|e| e.api_key.as_deref()),
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
@@ -2139,7 +2139,7 @@ pub async fn run(
         &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
+        primary_provider.and_then(|e| e.api_key.as_deref()),
         &config,
         None,
     );
@@ -2250,7 +2250,7 @@ pub async fn run(
 
     let mut model_name = model_override
         .as_deref()
-        .or(fallback_provider_loop.and_then(|e| e.model.as_deref()))
+        .or(primary_provider.and_then(|e| e.model.as_deref()))
         .unwrap_or("anthropic/claude-sonnet-4")
         .to_string();
 
@@ -2259,8 +2259,8 @@ pub async fn run(
 
     let mut provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
         &provider_name,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-        fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+        primary_provider.and_then(|e| e.api_key.as_deref()),
+        primary_provider.and_then(|e| e.base_url.as_deref()),
         &config.reliability,
         &config.providers.model_routes,
         &model_name,
@@ -2643,8 +2643,8 @@ pub async fn run(
 
                         provider = zeroclaw_providers::create_routed_provider_with_options(
                             &new_provider,
-                            fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-                            fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+                            primary_provider.and_then(|e| e.api_key.as_deref()),
+                            primary_provider.and_then(|e| e.base_url.as_deref()),
                             &config.reliability,
                             &config.providers.model_routes,
                             &new_model,
@@ -2960,8 +2960,8 @@ pub async fn run(
 
                             provider = zeroclaw_providers::create_routed_provider_with_options(
                                 &new_provider,
-                                fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-                                fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+                                primary_provider.and_then(|e| e.api_key.as_deref()),
+                                primary_provider.and_then(|e| e.base_url.as_deref()),
                                 &config.reliability,
                                 &config.providers.model_routes,
                                 &new_model,
@@ -3117,14 +3117,14 @@ pub async fn process_message(
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(&config, None));
-    let fallback_provider_pm = config.providers.first_provider();
+    let primary_provider = config.providers.first_provider();
     let approval_manager = ApprovalManager::for_non_interactive(config.active_risk_profile(None));
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
         &config.providers.embedding_routes,
         config.resolve_active_storage(),
         &config.workspace_dir,
-        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
+        primary_provider.and_then(|e| e.api_key.as_deref()),
     )?);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
@@ -3154,7 +3154,7 @@ pub async fn process_message(
         &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
-        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
+        primary_provider.and_then(|e| e.api_key.as_deref()),
         &config,
         None,
     );
@@ -3235,7 +3235,7 @@ pub async fn process_message(
         .providers
         .first_provider_type()
         .unwrap_or("openrouter");
-    let model_name = match fallback_provider_pm
+    let model_name = match primary_provider
         .and_then(|e| e.model.as_deref())
         .map(str::trim)
         .filter(|m| !m.is_empty())
@@ -3265,8 +3265,8 @@ pub async fn process_message(
         zeroclaw_providers::provider_runtime_options_from_config(&config);
     let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
         provider_name,
-        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
-        fallback_provider_pm.and_then(|e| e.base_url.as_deref()),
+        primary_provider.and_then(|e| e.api_key.as_deref()),
+        primary_provider.and_then(|e| e.base_url.as_deref()),
         &config.reliability,
         &config.providers.model_routes,
         &model_name,

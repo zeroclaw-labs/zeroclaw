@@ -1430,9 +1430,13 @@ async fn main() -> Result<()> {
                 temperature,
                 ..
             } => {
-                let fallback = config.providers.first_provider();
-                let final_temperature = temperature
-                    .unwrap_or_else(|| fallback.and_then(|e| e.temperature).unwrap_or(0.7));
+                let final_temperature = temperature.unwrap_or_else(|| {
+                    config
+                        .providers
+                        .first_provider()
+                        .and_then(|e| e.temperature)
+                        .unwrap_or(0.7)
+                });
                 if let Some(p) = &provider {
                     // Upsert the requested provider type under "default" alias.
                     let entry = config
@@ -1446,11 +1450,11 @@ async fn main() -> Result<()> {
                         entry.model = Some(m.clone());
                     }
                     entry.temperature = Some(final_temperature);
-                } else {
-                    config.ensure_fallback_provider().temperature = Some(final_temperature);
-                    if let Some(m) = &model {
-                        config.ensure_fallback_provider().model = Some(m.clone());
-                    }
+                } else if config.providers.first_provider().is_none() {
+                    anyhow::bail!(
+                        "No model provider configured. Pass --provider <type> or run \
+                         `zeroclaw onboard providers` to configure one."
+                    );
                 }
 
                 let provider_name = config.providers.first_provider_type().unwrap_or("openai");
@@ -4244,13 +4248,20 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn agent_fallback_uses_config_default_temperature() {
-        // Test that when user doesn't provide --temperature,
-        // the fallback logic works correctly
+    fn agent_uses_first_provider_temperature_when_unset() {
+        // When the user doesn't pass --temperature, the kernel-only agent
+        // CLI walks `config.providers.first_provider().temperature` before
+        // bottoming out at 0.7.
         let mut config = Config::default();
-        config.ensure_fallback_provider().temperature = Some(1.5);
+        config
+            .providers
+            .models
+            .entry("openai".to_string())
+            .or_default()
+            .entry("default".to_string())
+            .or_default()
+            .temperature = Some(1.5);
 
-        // Simulate None temperature (user didn't provide --temperature)
         let user_temperature: Option<f64> = std::hint::black_box(None);
         let final_temperature = user_temperature.unwrap_or_else(|| {
             config

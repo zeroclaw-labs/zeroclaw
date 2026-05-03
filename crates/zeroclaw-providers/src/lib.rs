@@ -6,10 +6,9 @@
 //! `"anthropic"`, `"ollama"`, `"gemini"`). Provider aliases are resolved internally
 //! so that user-facing keys remain stable.
 //!
-//! The subsystem supports resilient multi-provider configurations through the
-//! [`ReliableProvider`] wrapper, which handles fallback
-//! chains and automatic retry. Model routing across providers is available via
-//! [`create_routed_provider`].
+//! Each provider call goes through the [`ReliableProvider`] wrapper, which adds
+//! automatic retry with exponential backoff and API-key rotation on rate limits.
+//! Model routing across multiple providers is available via [`create_routed_provider`].
 //!
 //! # Extension
 //!
@@ -740,11 +739,11 @@ impl Default for ProviderRuntimeOptions {
 pub fn provider_runtime_options_from_config(
     config: &zeroclaw_config::schema::Config,
 ) -> ProviderRuntimeOptions {
-    let fallback = config.providers.first_provider();
+    let primary = config.providers.first_provider();
     // Resolve merge_system_into_user from the active model provider profile
     // by matching api_url — apply_named_model_provider_profile() has already
     // run; providers.models retains all profiles.
-    let merge_system_into_user = fallback
+    let merge_system_into_user = primary
         .and_then(|e| e.base_url.as_deref())
         .map(str::trim)
         .filter(|u| !u.is_empty())
@@ -768,19 +767,17 @@ pub fn provider_runtime_options_from_config(
 
     ProviderRuntimeOptions {
         auth_profile_override: None,
-        provider_api_url: fallback.and_then(|e| e.base_url.clone()),
+        provider_api_url: primary.and_then(|e| e.base_url.clone()),
         zeroclaw_dir: config.config_path.parent().map(PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
-        provider_timeout_secs: Some(fallback.and_then(|e| e.timeout_secs).unwrap_or(120)),
-        extra_headers: fallback
-            .map(|e| e.extra_headers.clone())
-            .unwrap_or_default(),
-        api_path: fallback.and_then(|e| e.api_path.clone()),
-        provider_max_tokens: fallback.and_then(|e| e.max_tokens),
+        provider_timeout_secs: Some(primary.and_then(|e| e.timeout_secs).unwrap_or(120)),
+        extra_headers: primary.map(|e| e.extra_headers.clone()).unwrap_or_default(),
+        api_path: primary.and_then(|e| e.api_path.clone()),
+        provider_max_tokens: primary.and_then(|e| e.max_tokens),
         merge_system_into_user,
-        provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
+        provider_extra: primary.and_then(|e| e.provider_extra.clone()),
     }
 }
 
@@ -870,7 +867,7 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 /// Resolution order:
 /// 1. Explicitly provided `api_key` parameter (trimmed, filtered if empty)
 /// 2. Provider-specific environment variable (e.g., `ANTHROPIC_OAUTH_TOKEN`, `OPENROUTER_API_KEY`)
-/// 3. Generic fallback variables (`ZEROCLAW_API_KEY`, `API_KEY`)
+/// 3. Generic env variables (`ZEROCLAW_API_KEY`, `API_KEY`)
 ///
 /// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
 /// followed by `ANTHROPIC_API_KEY` (for regular API keys).
@@ -895,8 +892,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
             } else if name == "anthropic" || name == "openai" || name == "groq" {
                 // For well-known providers, prefer provider-specific env vars over the
                 // global api_key override, since the global key may belong to a different
-                // provider (e.g. a custom: gateway). This enables multi-provider setups
-                // where the primary uses a custom gateway and fallbacks use named providers.
+                // provider (e.g. a custom: gateway).
                 let env_candidates: &[&str] = match name {
                     "anthropic" => &["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
                     "openai" => &["OPENAI_API_KEY"],
@@ -1782,23 +1778,7 @@ fn create_provider_with_url_and_options(
     }
 }
 
-/// Parse `"provider:profile"` syntax for fallback entries.
-///
-/// Returns `(provider_name, Some(profile))` when the entry contains a colon-
-/// delimited profile, or `(original_str, None)` otherwise.  Entries starting
-/// with `custom:` or `anthropic-custom:` are left untouched because the colon
-/// is part of the URL scheme.
-fn parse_provider_profile(s: &str) -> (&str, Option<&str>) {
-    if s.starts_with("custom:") || s.starts_with("anthropic-custom:") {
-        return (s, None);
-    }
-    match s.split_once(':') {
-        Some((provider, profile)) if !profile.is_empty() => (provider, Some(profile)),
-        _ => (s, None),
-    }
-}
-
-/// Create provider chain with retry and fallback behavior.
+/// Wrap the primary provider in a retry/backoff harness.
 pub fn create_resilient_provider(
     primary_name: &str,
     api_key: Option<&str>,
@@ -1814,7 +1794,7 @@ pub fn create_resilient_provider(
     )
 }
 
-/// Create provider chain with retry/fallback behavior and auth runtime options.
+/// Wrap the primary provider in a retry/backoff harness, threading auth runtime options.
 pub fn create_resilient_provider_with_options(
     primary_name: &str,
     api_key: Option<&str>,
@@ -1822,66 +1802,26 @@ pub fn create_resilient_provider_with_options(
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
-
     let primary_provider = match primary_name {
         "openai-codex" | "openai_codex" | "codex" => {
             create_provider_with_options(primary_name, api_key, options)?
         }
         _ => create_provider_with_url_and_options(primary_name, api_key, api_url, options)?,
     };
-    providers.push((primary_name.to_string(), primary_provider));
-
-    for fallback in &reliability.fallback_providers {
-        if fallback == primary_name || providers.iter().any(|(name, _)| name == fallback) {
-            continue;
-        }
-
-        let (provider_name, profile_override) = parse_provider_profile(fallback);
-
-        // Each fallback provider resolves its own credential via provider-
-        // specific env vars (e.g. DEEPSEEK_API_KEY for "deepseek") instead
-        // of inheriting the primary provider's key. Passing `None` lets
-        // `resolve_provider_credential` check the correct env var for the
-        // fallback provider name.
-        //
-        // When a profile override is present (e.g. "openai-codex:second"),
-        // propagate it through `auth_profile_override` so the provider
-        // picks up the correct OAuth credential set.
-        let fallback_options = match profile_override {
-            Some(profile) => {
-                let mut opts = options.clone();
-                opts.auth_profile_override = Some(profile.to_string());
-                opts
-            }
-            None => options.clone(),
-        };
-
-        match create_provider_with_options(provider_name, None, &fallback_options) {
-            Ok(provider) => providers.push((fallback.clone(), provider)),
-            Err(_error) => {
-                tracing::warn!(
-                    fallback_provider = fallback,
-                    "Ignoring invalid fallback provider during initialization"
-                );
-            }
-        }
-    }
 
     let reliable = ReliableProvider::new(
-        providers,
+        vec![(primary_name.to_string(), primary_provider)],
         reliability.provider_retries,
         reliability.provider_backoff_ms,
     )
-    .with_api_keys(reliability.api_keys.clone())
-    .with_model_fallbacks(reliability.model_fallbacks.clone());
+    .with_api_keys(reliability.api_keys.clone());
 
     Ok(Box::new(reliable))
 }
 
 /// Create a RouterProvider if model routes are configured, otherwise return a
 /// standard resilient provider. The router wraps individual providers per route,
-/// each with its own retry/fallback chain.
+/// each with its own retry harness.
 pub fn create_routed_provider(
     primary_name: &str,
     api_key: Option<&str>,
@@ -3271,34 +3211,6 @@ mod tests {
     }
 
     #[test]
-    fn resilient_provider_ignores_duplicate_and_invalid_fallbacks() {
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec![
-                "openrouter".into(),
-                "nonexistent-provider".into(),
-                "openai".into(),
-                "openai".into(),
-            ],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        let provider = create_resilient_provider(
-            "openrouter",
-            Some("provider-test-credential"),
-            None,
-            &reliability,
-        );
-        assert!(provider.is_ok());
-    }
-
-    #[test]
     fn resilient_provider_errors_for_invalid_primary() {
         let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
         let provider = create_resilient_provider(
@@ -3308,76 +3220,6 @@ mod tests {
             &reliability,
         );
         assert!(provider.is_err());
-    }
-
-    /// Fallback providers resolve their own credentials via provider-specific
-    /// env vars rather than inheriting the primary provider's key.  A provider
-    /// that requires no key (e.g. lmstudio, ollama) must initialize
-    /// successfully even when the primary uses a completely different key.
-    #[test]
-    fn resilient_fallback_resolves_own_credential() {
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec!["lmstudio".into(), "ollama".into()],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        // Primary uses a ZAI key; fallbacks (lmstudio, ollama) should NOT
-        // receive this key; they resolve their own credentials independently.
-        let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
-        assert!(provider.is_ok());
-    }
-
-    /// `custom:` URL entries work as fallback providers, enabling arbitrary
-    /// OpenAI-compatible endpoints (e.g. local LM Studio on a Docker host).
-    #[test]
-    fn resilient_fallback_supports_custom_url() {
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec!["custom:http://host.docker.internal:1234/v1".into()],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        let provider =
-            create_resilient_provider("openai", Some("openai-test-key"), None, &reliability);
-        assert!(provider.is_ok());
-    }
-
-    /// Mixed fallback chain: named providers, custom URLs, and invalid entries
-    /// all coexist.  Invalid entries are silently ignored; valid ones initialize.
-    #[test]
-    fn resilient_fallback_mixed_chain() {
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec![
-                "deepseek".into(),
-                "custom:http://localhost:8080/v1".into(),
-                "nonexistent-provider".into(),
-                "lmstudio".into(),
-            ],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
-        assert!(provider.is_ok());
     }
 
     #[test]
@@ -3390,25 +3232,6 @@ mod tests {
     fn ollama_cloud_with_custom_url() {
         let provider =
             create_provider_with_url("ollama", Some("ollama-key"), Some("https://ollama.com"));
-        assert!(provider.is_ok());
-    }
-
-    /// Osaurus works as a fallback provider alongside other named providers.
-    #[test]
-    fn resilient_fallback_includes_osaurus() {
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec!["osaurus".into(), "lmstudio".into()],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
         assert!(provider.is_ok());
     }
 
@@ -3639,103 +3462,6 @@ mod tests {
         let input = "failed: github_pat_11AABBC_xyzzy789";
         let result = scrub_secret_patterns(input);
         assert_eq!(result, "failed: [REDACTED]");
-    }
-
-    // --- parse_provider_profile ---
-
-    #[test]
-    fn parse_provider_profile_plain_name() {
-        let (name, profile) = parse_provider_profile("gemini");
-        assert_eq!(name, "gemini");
-        assert_eq!(profile, None);
-    }
-
-    #[test]
-    fn parse_provider_profile_with_profile() {
-        let (name, profile) = parse_provider_profile("openai-codex:second");
-        assert_eq!(name, "openai-codex");
-        assert_eq!(profile, Some("second"));
-    }
-
-    #[test]
-    fn parse_provider_profile_custom_url_not_split() {
-        let input = "custom:https://my-api.example.com/v1";
-        let (name, profile) = parse_provider_profile(input);
-        assert_eq!(name, input);
-        assert_eq!(profile, None);
-    }
-
-    #[test]
-    fn parse_provider_profile_anthropic_custom_not_split() {
-        let input = "anthropic-custom:https://bedrock.example.com";
-        let (name, profile) = parse_provider_profile(input);
-        assert_eq!(name, input);
-        assert_eq!(profile, None);
-    }
-
-    #[test]
-    fn parse_provider_profile_empty_profile_ignored() {
-        let (name, profile) = parse_provider_profile("openai-codex:");
-        assert_eq!(name, "openai-codex:");
-        assert_eq!(profile, None);
-    }
-
-    #[test]
-    fn parse_provider_profile_extra_colons_kept() {
-        let (name, profile) = parse_provider_profile("provider:profile:extra");
-        assert_eq!(name, "provider");
-        assert_eq!(profile, Some("profile:extra"));
-    }
-
-    // --- resilient fallback with profile syntax ---
-
-    #[test]
-    fn resilient_fallback_with_profile_syntax() {
-        let _guard = env_lock();
-
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec!["openai-codex:second".into()],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        // openai-codex resolves its own OAuth credential; it should not
-        // fail even with a profile override that has no local token file.
-        // The provider initializes successfully and will attempt auth at
-        // request time.
-        let provider = create_resilient_provider("lmstudio", None, None, &reliability);
-        assert!(provider.is_ok());
-    }
-
-    #[test]
-    fn resilient_fallback_mixed_profiles_and_custom() {
-        let _guard = env_lock();
-
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec![
-                "openai-codex:second".into(),
-                "custom:http://localhost:8080/v1".into(),
-                "lmstudio".into(),
-                "nonexistent-provider".into(),
-            ],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        let provider = create_resilient_provider("ollama", None, None, &reliability);
-        assert!(provider.is_ok());
     }
 
     // ── API key prefix pre-flight ───────────────────────────

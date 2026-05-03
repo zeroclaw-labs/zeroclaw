@@ -19,7 +19,7 @@ use zeroclaw_config::schema::{
 use zeroclaw_memory::{Memory, NamespacedMemory};
 use zeroclaw_providers::{self, ChatMessage, Provider};
 
-/// Fallback temperature for sub-agent tool loops when the delegate config
+/// Default temperature for sub-agent tool loops when the delegate config
 /// leaves it unset; matches the longstanding agentic default that balances
 /// coherence with enough variety to explore tool options.
 const DELEGATE_AGENTIC_DEFAULT_TEMPERATURE: f64 = 0.7;
@@ -63,8 +63,8 @@ pub enum BackgroundTaskStatus {
 pub struct DelegateTool {
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
     security: Arc<SecurityPolicy>,
-    /// Global credential fallback (from config.api_key)
-    fallback_credential: Option<String>,
+    /// Global credential (from config.api_key) used when an agent has none set.
+    global_credential: Option<String>,
     /// Provider runtime options inherited from root config.
     provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions,
     /// Depth at which this tool instance lives in the delegation chain.
@@ -96,12 +96,12 @@ pub struct DelegateTool {
 impl DelegateTool {
     pub fn new(
         agents: HashMap<String, DelegateAgentConfig>,
-        fallback_credential: Option<String>,
+        global_credential: Option<String>,
         security: Arc<SecurityPolicy>,
     ) -> Self {
         Self::new_with_options(
             agents,
-            fallback_credential,
+            global_credential,
             security,
             zeroclaw_providers::ProviderRuntimeOptions::default(),
         )
@@ -109,14 +109,14 @@ impl DelegateTool {
 
     pub fn new_with_options(
         agents: HashMap<String, DelegateAgentConfig>,
-        fallback_credential: Option<String>,
+        global_credential: Option<String>,
         security: Arc<SecurityPolicy>,
         provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions,
     ) -> Self {
         Self {
             agents: Arc::new(agents),
             security,
-            fallback_credential,
+            global_credential,
             provider_runtime_options,
             depth: 0,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
@@ -138,13 +138,13 @@ impl DelegateTool {
     /// their DelegateTool via this method with `depth: parent.depth + 1`.
     pub fn with_depth(
         agents: HashMap<String, DelegateAgentConfig>,
-        fallback_credential: Option<String>,
+        global_credential: Option<String>,
         security: Arc<SecurityPolicy>,
         depth: u32,
     ) -> Self {
         Self::with_depth_and_options(
             agents,
-            fallback_credential,
+            global_credential,
             security,
             depth,
             zeroclaw_providers::ProviderRuntimeOptions::default(),
@@ -153,7 +153,7 @@ impl DelegateTool {
 
     pub fn with_depth_and_options(
         agents: HashMap<String, DelegateAgentConfig>,
-        fallback_credential: Option<String>,
+        global_credential: Option<String>,
         security: Arc<SecurityPolicy>,
         depth: u32,
         provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions,
@@ -161,7 +161,7 @@ impl DelegateTool {
         Self {
             agents: Arc::new(agents),
             security,
-            fallback_credential,
+            global_credential,
             provider_runtime_options,
             depth,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
@@ -272,7 +272,7 @@ impl DelegateTool {
                 type_key.to_string(),
                 cfg.api_key
                     .clone()
-                    .or_else(|| self.fallback_credential.clone()),
+                    .or_else(|| self.global_credential.clone()),
                 cfg.model.clone().unwrap_or_default(),
                 cfg.temperature,
             );
@@ -282,7 +282,7 @@ impl DelegateTool {
             .map_or(model_provider, |(t, _)| t);
         (
             type_key.to_string(),
-            self.fallback_credential.clone(),
+            self.global_credential.clone(),
             String::new(),
             None,
         )
@@ -796,7 +796,7 @@ impl DelegateTool {
         // Clone everything needed for the spawned task
         let agents = Arc::clone(&self.agents);
         let security = Arc::clone(&self.security);
-        let fallback_credential = self.fallback_credential.clone();
+        let global_credential = self.global_credential.clone();
         let provider_runtime_options = self.provider_runtime_options.clone();
         let depth = self.depth;
         let parent_tools = Arc::clone(&self.parent_tools);
@@ -816,7 +816,7 @@ impl DelegateTool {
             let inner = DelegateTool {
                 agents,
                 security,
-                fallback_credential,
+                global_credential,
                 provider_runtime_options,
                 depth,
                 parent_tools,
@@ -963,7 +963,7 @@ impl DelegateTool {
         for agent_name in &agent_names {
             let agents = Arc::clone(&self.agents);
             let security = Arc::clone(&self.security);
-            let fallback_credential = self.fallback_credential.clone();
+            let global_credential = self.global_credential.clone();
             let provider_runtime_options = self.provider_runtime_options.clone();
             let depth = self.depth;
             let parent_tools = Arc::clone(&self.parent_tools);
@@ -984,7 +984,7 @@ impl DelegateTool {
                 let inner = DelegateTool {
                     agents,
                     security,
-                    fallback_credential,
+                    global_credential,
                     provider_runtime_options,
                     depth,
                     parent_tools,

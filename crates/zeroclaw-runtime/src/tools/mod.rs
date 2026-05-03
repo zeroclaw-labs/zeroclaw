@@ -865,7 +865,7 @@ pub fn all_tools_with_runtime(
     }
 
     // Add delegation tool when agents are configured
-    let delegate_fallback_credential = fallback_api_key.and_then(|value| {
+    let delegate_global_credential = fallback_api_key.and_then(|value| {
         let trimmed_value = value.trim();
         (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
     });
@@ -882,7 +882,7 @@ pub fn all_tools_with_runtime(
         let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
         let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
-            delegate_fallback_credential.clone(),
+            delegate_global_credential.clone(),
             security.clone(),
             provider_runtime_options.clone(),
         )

@@ -7567,12 +7567,12 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let default_provider_impl = Arc::new(ModelCaptureProvider::default());
         let default_provider: Arc<dyn Provider> = default_provider_impl.clone();
-        let fallback_provider_impl = Arc::new(ModelCaptureProvider::default());
-        let fallback_provider: Arc<dyn Provider> = fallback_provider_impl.clone();
+        let alt_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let alt_provider: Arc<dyn Provider> = alt_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
         provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
-        provider_cache_seed.insert("openrouter".to_string(), fallback_provider);
+        provider_cache_seed.insert("openrouter".to_string(), alt_provider);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7665,7 +7665,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(route.model, "default-model");
 
         assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
-        assert_eq!(fallback_provider_impl.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(alt_provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

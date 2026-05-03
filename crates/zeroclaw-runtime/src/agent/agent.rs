@@ -484,14 +484,14 @@ impl Agent {
             session_cwd.unwrap_or(&config.workspace_dir),
         ));
 
-        let fallback_provider_ag = config.providers.first_provider();
+        let primary_provider = config.providers.first_provider();
         let memory: Arc<dyn Memory> =
             Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
                 &config.providers.embedding_routes,
                 config.resolve_active_storage(),
                 &config.workspace_dir,
-                fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
+                primary_provider.and_then(|e| e.api_key.as_deref()),
             )?);
 
         let composio_key = if config.composio.enabled {
@@ -524,7 +524,7 @@ impl Agent {
             &config.web_fetch,
             &security.workspace_dir,
             &config.agents,
-            fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
+            primary_provider.and_then(|e| e.api_key.as_deref()),
             config,
             None,
         );
@@ -595,7 +595,7 @@ impl Agent {
             .first_provider_type()
             .unwrap_or("openrouter");
 
-        let model_name = match fallback_provider_ag
+        let model_name = match primary_provider
             .and_then(|e| e.model.as_deref())
             .map(str::trim)
             .filter(|m| !m.is_empty())
@@ -627,8 +627,8 @@ impl Agent {
 
         let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
             provider_name,
-            fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
-            fallback_provider_ag.and_then(|e| e.base_url.as_deref()),
+            primary_provider.and_then(|e| e.api_key.as_deref()),
+            primary_provider.and_then(|e| e.base_url.as_deref()),
             &config.reliability,
             &config.providers.model_routes,
             &model_name,
@@ -691,11 +691,7 @@ impl Agent {
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.default_agent().clone())
             .model_name(model_name)
-            .temperature(
-                fallback_provider_ag
-                    .and_then(|e| e.temperature)
-                    .unwrap_or(0.7),
-            )
+            .temperature(primary_provider.and_then(|e| e.temperature).unwrap_or(0.7))
             .workspace_dir(security.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
