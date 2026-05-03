@@ -182,8 +182,14 @@ export default function Config() {
 
   const handlePick = async (item: PickerItem) => {
     if (!activeSection) return;
+    let alias: string | undefined;
+    if (activeSection.key === 'providers' || activeSection.key === 'channels') {
+      const raw = window.prompt(`Name this ${item.label} configuration (alias):`, 'default');
+      if (raw === null) return;
+      alias = raw.trim() || 'default';
+    }
     try {
-      const resp = await selectSectionItem(activeSection.key, item.key);
+      const resp = await selectSectionItem(activeSection.key, item.key, alias);
       setMode({ kind: 'form', item, fieldsPrefix: resp.fields_prefix });
     } catch (e) {
       if (e instanceof ApiError) {
@@ -619,10 +625,19 @@ function ConfiguredOnlyPicker({ section, onEdit }: ConfiguredOnlyPickerProps) {
           key={item.key}
           type="button"
           onClick={async () => {
+            let alias: string | undefined;
+            if (section.key === 'providers' || section.key === 'channels') {
+              const raw = window.prompt(
+                `Name this ${item.label} configuration (alias):`,
+                'default',
+              );
+              if (raw === null) return;
+              alias = raw.trim() || 'default';
+            }
             try {
               const resp = await (
                 await import('../lib/api')
-              ).selectSectionItem(section.key, item.key);
+              ).selectSectionItem(section.key, item.key, alias);
               onEdit(item, resp.fields_prefix);
             } catch (e) {
               const msg =

@@ -141,14 +141,25 @@ export default function Onboard() {
 
   const handlePick = async (item: PickerItem) => {
     if (!activeSection) return;
+    // Sections with multi-entry HashMap config require an alias so the user
+    // can have multiple named configurations of the same type.
+    let alias: string | undefined;
+    if (activeSection.key === 'providers' || activeSection.key === 'channels') {
+      const raw = window.prompt(
+        `Name this ${item.label} configuration (alias):`,
+        'default',
+      );
+      if (raw === null) return; // user cancelled
+      alias = raw.trim() || 'default';
+    }
     try {
-      const resp = await selectSectionItem(activeSection.key, item.key);
+      const resp = await selectSectionItem(activeSection.key, item.key, alias);
       setPicked({ item, fieldsPrefix: resp.fields_prefix });
     } catch (e) {
       if (e instanceof ApiError) {
-        setError(`Couldn't select ${item.label}: [${e.envelope.code}] ${e.envelope.message}`);
+        setError(`Couldn't open ${item.label}: [${e.envelope.code}] ${e.envelope.message}`);
       } else {
-        setError(`Couldn't select ${item.label}: ${e instanceof Error ? e.message : String(e)}`);
+        setError(`Couldn't open ${item.label}: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   };

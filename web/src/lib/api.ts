@@ -773,10 +773,19 @@ export interface SelectItemResponse {
   created: boolean;
 }
 
-export function selectSectionItem(section: string, key: string): Promise<SelectItemResponse> {
+export function selectSectionItem(
+  section: string,
+  key: string,
+  alias?: string,
+): Promise<SelectItemResponse> {
+  const body = alias ? JSON.stringify({ alias }) : undefined;
   return apiFetch<SelectItemResponse>(
     `/api/onboard/sections/${encodeURIComponent(section)}/items/${encodeURIComponent(key)}`,
-    { method: 'POST' },
+    {
+      method: 'POST',
+      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      body,
+    },
   );
 }
 
