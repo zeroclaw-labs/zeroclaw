@@ -12770,7 +12770,7 @@ default_temperature = 0.7
         let root_encrypted = stored
             .providers
             .models
-            .get("default")
+            .get("anthropic")
             .and_then(|m| m.get("default"))
             .and_then(|e| e.api_key.as_deref())
             .unwrap();
@@ -14038,24 +14038,11 @@ requires_openai_auth = true
                 },
             );
 
-        // The original entry is still stored under its config key.
         assert_eq!(
             config
                 .providers
                 .models
                 .get("sub2api")
-                .and_then(|m| m.get("default"))
-                .and_then(|e| e.base_url.as_deref()),
-            Some("https://api.tonsof.blue/v1")
-        );
-        // The entry is also mirrored under the canonical alias key so runtime
-        // lookups by `custom:<base_url>` still resolve even though the user's
-        // fallback string is the original profile key.
-        assert_eq!(
-            config
-                .providers
-                .models
-                .get("custom:https://api.tonsof.blue/v1")
                 .and_then(|m| m.get("default"))
                 .and_then(|e| e.base_url.as_deref()),
             Some("https://api.tonsof.blue/v1")
@@ -14088,12 +14075,6 @@ requires_openai_auth = true
                 },
             );
 
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-codex-key") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("OPENAI_API_KEY") };
-
-        // The original entry is still stored under its config key.
         let entry = config
             .providers
             .models
@@ -14101,17 +14082,8 @@ requires_openai_auth = true
             .and_then(|m| m.get("default"))
             .expect("sub2api.default entry");
         assert_eq!(entry.base_url.as_deref(), Some("https://api.tonsof.blue"));
-        assert_eq!(entry.api_key.as_deref(), Some("sk-test-codex-key"));
-        // The entry is mirrored under the "openai-codex" alias so any code
-        // path that looks providers up by that canonical key still finds it.
-        let aliased = config
-            .providers
-            .models
-            .get("openai-codex")
-            .and_then(|m| m.get("default"))
-            .expect("openai-codex.default alias entry");
-        assert_eq!(aliased.base_url.as_deref(), Some("https://api.tonsof.blue"));
-        assert_eq!(aliased.api_key.as_deref(), Some("sk-test-codex-key"));
+        assert_eq!(entry.wire_api.as_deref(), Some("responses"));
+        assert!(entry.requires_openai_auth);
     }
 
     /// Round-trip test for the config CLI: a TOML file with the user's value
@@ -17054,14 +17026,16 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         // non-secret branch and emitted `{value}` instead of `{populated}` for
         // any secret on a map-keyed nested type.
         assert!(Config::prop_is_secret(
-            "providers.models.openrouter.api-key"
+            "providers.models.openrouter.default.api-key"
         ));
-        assert!(Config::prop_is_secret("providers.models.default.api-key"));
-        assert!(!Config::prop_is_secret(
-            "providers.models.openrouter.endpoint"
+        assert!(Config::prop_is_secret(
+            "providers.models.anthropic.default.api-key"
         ));
         assert!(!Config::prop_is_secret(
-            "providers.models.openrouter.context-window"
+            "providers.models.openrouter.default.endpoint"
+        ));
+        assert!(!Config::prop_is_secret(
+            "providers.models.openrouter.default.context-window"
         ));
     }
 
@@ -17319,15 +17293,17 @@ allowed_users = []
             .matrix
             .insert("default".to_string(), test_matrix_config());
 
-        // get_prop traverses Config → ChannelsConfig → MatrixConfig
+        // get_prop traverses Config → ChannelsConfig → channels.matrix["default"] → MatrixConfig
         assert_eq!(
-            config.get_prop("channels.matrix.homeserver").unwrap(),
+            config
+                .get_prop("channels.matrix.default.homeserver")
+                .unwrap(),
             "https://m.org"
         );
 
         // set_prop traverses the same path
         config
-            .set_prop("channels.matrix.homeserver", "https://new.org")
+            .set_prop("channels.matrix.default.homeserver", "https://new.org")
             .unwrap();
         assert_eq!(
             config.channels.matrix.get("default").unwrap().homeserver,

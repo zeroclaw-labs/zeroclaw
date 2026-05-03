@@ -331,6 +331,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     // Two-level alias map: outer key = type (e.g. "anthropic"),
                     // inner key = alias (e.g. "default").  Paths look like
                     // `<prefix>.<field>.<outer>.<inner>.<leaf>`.
+                    let inner_ty_name = inner_ty.to_token_stream().to_string();
 
                     nested_collect.push(quote! {
                         for inner_map in self.#field_ident.values() {
@@ -433,6 +434,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     });
 
                     // map_key_sections: expose the outer path as a Map section.
+                    // value_type names the leaf type (T), not the intermediate
+                    // HashMap<String, T>, so the dashboard knows what shape it
+                    // is actually creating.
                     map_key_section_entries.push(quote! {
                         out.push(crate::config::MapKeySection {
                             path: {
@@ -445,7 +449,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 Box::leak(s.into_boxed_str())
                             },
                             kind: crate::config::MapKeyKind::Map,
-                            value_type: #value_ty_name,
+                            value_type: #inner_ty_name,
                             description: #field_doc,
                         });
                     });
