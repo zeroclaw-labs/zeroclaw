@@ -1105,11 +1105,18 @@ fn clawhub_download_url(source: &str) -> Result<String> {
     anyhow::bail!("unrecognised ClawhHub source format: {source}")
 }
 
+/// Normalize a registry-derived slug into a filesystem-safe skill directory
+/// name.
+///
+/// **Preserves hyphens** so the on-disk directory matches the install slug
+/// the user typed — `skills install clawhub:foo-bar` lands in
+/// `skills/foo-bar/`, not `skills/foo_bar/`. Without this, subsequent
+/// `skills audit foo-bar` and `skills remove foo-bar` invocations couldn't
+/// find the skill the user just installed.
 fn normalize_skill_name(s: &str) -> String {
     s.to_lowercase()
         .chars()
-        .map(|c| if c == '-' { '_' } else { c })
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect()
 }
 
