@@ -1,22 +1,30 @@
 //! SLM Executor — Gemma 4 loops through tool calls via a prompt-guided
 //! XML protocol.
 //!
-//! # Wiring status (E2 / Phase 3)
+//! # Wiring status (E2 / Phase 3 — CLOSED 2026-05-04)
 //!
-//! As of 2026-05-03 this module is implemented and unit-tested but is
-//! NOT YET instantiated or called by `gateway/openclaw_compat.rs::handle_api_chat`
-//! or `gateway/ws.rs::handle_socket`. ARCHITECTURE-v8 §923+ specifies
-//! that a Phase 3 wire-up must call `SlmExecutor::run` from those
-//! sites for Medium-/Specialized-class tasks before the cloud-LLM
-//! agent loop.
+//! Wired into the gateway. Instances live in
+//! `gateway::AppState::slm_executor: Option<Arc<SlmExecutor>>`
+//! (constructed in `gateway::run_gateway` around line 665 when
+//! `[gatekeeper].enabled = true`) and are consumed at the two
+//! Phase-3 dispatch sites ARCHITECTURE-v8 §923+ specifies:
 //!
-//! **Do not wire this in without first verifying that
-//! `safe_for_slm()`-based tool gating (see `run` below) is preserved.**
-//! The combination "executor wired into the gateway + filter omitted"
-//! would let an SLM invoke `shell` / `file_write` / `apply_patch` /
-//! `delegate` / `cron_*` against the user's interest. The unit test
-//! `safe_for_slm_filter_excludes_unsafe_tools` is the regression gate
-//! for that property.
+//! - REST chat:  `gateway/openclaw_compat.rs::handle_api_chat`
+//!               around line 753. Branches on
+//!               `(state.slm_executor, gatekeeper_decision)`.
+//! - WebSocket:  `gateway/ws.rs::handle_socket` around line 1422.
+//!
+//! Both call sites pass `tools` as a `&[&dyn Tool]` slice; the
+//! `safe_for_slm()` filter is applied unconditionally at the top
+//! of `run` below (it does not need to be re-applied at the call
+//! sites). The unit test `safe_for_slm_filter_excludes_unsafe_tools`
+//! is the regression gate for that property — DO NOT remove it.
+//!
+//! **Adding new call sites:** if a future flow wants to invoke
+//! the SLM executor, pass the full tool registry slice; the
+//! filter inside `run` will narrow it. The only error mode this
+//! shape forbids is *bypassing* `run` and calling `find_tool` on
+//! the unfiltered slice directly — don't do that.
 //!
 //! # Why prompt-guided, not native tool-calling?
 //!
