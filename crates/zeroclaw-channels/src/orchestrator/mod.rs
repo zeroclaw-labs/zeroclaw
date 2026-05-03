@@ -943,27 +943,13 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
                 "config.providers.models.api_key",
             )?;
         }
-        // Decrypt TTS provider API keys for runtime reload
-        if let Some(ref mut openai) = parsed.tts.openai {
-            decrypt_optional_secret_for_runtime_reload(
-                &store,
-                &mut openai.api_key,
-                "config.tts.openai.api_key",
-            )?;
-        }
-        if let Some(ref mut elevenlabs) = parsed.tts.elevenlabs {
-            decrypt_optional_secret_for_runtime_reload(
-                &store,
-                &mut elevenlabs.api_key,
-                "config.tts.elevenlabs.api_key",
-            )?;
-        }
-        if let Some(ref mut google) = parsed.tts.google {
-            decrypt_optional_secret_for_runtime_reload(
-                &store,
-                &mut google.api_key,
-                "config.tts.google.api_key",
-            )?;
+        // Decrypt TTS provider API keys for runtime reload (V3: per-instance
+        // entries under [providers.tts.<type>.<alias>]).
+        for (ty, alias_map) in parsed.providers.tts.iter_mut() {
+            for (alias, instance) in alias_map.iter_mut() {
+                let label = format!("config.providers.tts.{ty}.{alias}.api_key");
+                decrypt_optional_secret_for_runtime_reload(&store, &mut instance.api_key, &label)?;
+            }
         }
     }
 
@@ -4048,7 +4034,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
-                .with_tts(config.tts.clone())
+                .with_tts(config)
                 .with_workspace_dir(config.workspace_dir.clone())
                 .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
@@ -4502,7 +4488,7 @@ fn collect_configured_channels(
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
-                .with_tts(config.tts.clone())
+                .with_tts(config)
                 .with_workspace_dir(config.workspace_dir.clone())
                 .with_proxy_url(tg.proxy_url.clone())
                 .with_tool_command_specs(tool_specs.to_vec())
@@ -4718,7 +4704,7 @@ fn collect_configured_channels(
                                 wa.self_chat_mode,
                             )
                             .with_transcription(config.transcription.clone())
-                            .with_tts(config.tts.clone())
+                            .with_tts(config)
                             .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
                             .with_group_mention_patterns(wa.group_mention_patterns.clone()),
                         ),

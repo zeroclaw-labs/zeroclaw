@@ -81,8 +81,9 @@ pub struct WhatsAppWebChannel {
     /// Voice transcription (STT) config
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
-    /// Text-to-speech config for voice replies
-    tts_config: Option<zeroclaw_config::schema::TtsConfig>,
+    /// Text-to-speech runtime for voice replies (V3: built from
+    /// `providers.tts.<type>.<alias>`).
+    tts_manager: Option<Arc<super::tts::TtsManager>>,
     /// Chats awaiting a voice reply — maps chat JID to the latest substantive
     /// reply text. A background task debounces and sends the voice note after
     /// the agent finishes its turn (no new send() for 3 seconds).
@@ -154,7 +155,7 @@ impl WhatsAppWebChannel {
             tx: Arc::new(Mutex::new(None)),
             transcription: None,
             transcription_manager: None,
-            tts_config: None,
+            tts_manager: None,
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             dm_mention_patterns: Arc::new(Vec::new()),
@@ -186,10 +187,17 @@ impl WhatsAppWebChannel {
     }
 
     /// Configure text-to-speech for outgoing voice replies.
+    ///
+    /// Builds a [`super::tts::TtsManager`] from the V3
+    /// `[providers.tts.<type>.<alias>]` map. Disabled when `[tts].enabled = false`
+    /// or when the manager fails to construct (logged at warn).
     #[cfg(feature = "whatsapp-web")]
-    pub fn with_tts(mut self, config: zeroclaw_config::schema::TtsConfig) -> Self {
-        if config.enabled {
-            self.tts_config = Some(config);
+    pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
+        if config.tts.enabled {
+            match super::tts::TtsManager::from_config(config) {
+                Ok(m) => self.tts_manager = Some(Arc::new(m)),
+                Err(e) => tracing::warn!("WhatsApp Web TTS disabled: {e}"),
+            }
         }
         self
     }
@@ -475,9 +483,8 @@ impl WhatsAppWebChannel {
         client: &wa_rs::Client,
         to: &wa_rs_binary::jid::Jid,
         text: &str,
-        tts_config: &zeroclaw_config::schema::TtsConfig,
+        tts_manager: &super::tts::TtsManager,
     ) -> Result<()> {
-        let tts_manager = super::tts::TtsManager::new(tts_config)?;
         let audio_bytes = tts_manager.synthesize(text).await?;
         let audio_len = audio_bytes.len();
         tracing::info!("WhatsApp Web TTS: synthesized {} bytes of audio", audio_len);
@@ -942,7 +949,7 @@ impl Channel for WhatsAppWebChannel {
             .map(|vs| vs.contains(&message.recipient))
             .unwrap_or(false);
 
-        if is_voice_chat && self.tts_config.is_some() {
+        if is_voice_chat && self.tts_manager.is_some() {
             let content = &message.content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
@@ -968,7 +975,7 @@ impl Channel for WhatsAppWebChannel {
                 let client_clone = client.clone();
                 let to_clone = to.clone();
                 let recipient = message.recipient.clone();
-                let tts_config = self.tts_config.clone().unwrap();
+                let tts_manager = self.tts_manager.clone().unwrap();
                 tokio::spawn(async move {
                     // Wait 10 seconds — long enough for the agent to finish its
                     // full tool chain and send the final answer.
@@ -992,7 +999,7 @@ impl Channel for WhatsAppWebChannel {
                             &client_clone,
                             &to_clone,
                             &text,
-                            &tts_config,
+                            &tts_manager,
                         ))
                         .await
                         {

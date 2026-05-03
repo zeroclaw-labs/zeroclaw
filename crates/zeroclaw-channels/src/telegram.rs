@@ -382,7 +382,7 @@ pub struct TelegramChannel {
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
-    tts_config: Option<zeroclaw_config::schema::TtsConfig>,
+    tts_manager: Option<Arc<super::tts::TtsManager>>,
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pending_voice:
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
@@ -444,7 +444,7 @@ impl TelegramChannel {
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
             ack_reactions: true,
-            tts_config: None,
+            tts_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
@@ -525,9 +525,16 @@ impl TelegramChannel {
     }
 
     /// Configure text-to-speech for outgoing voice replies.
-    pub fn with_tts(mut self, config: zeroclaw_config::schema::TtsConfig) -> Self {
-        if config.enabled {
-            self.tts_config = Some(config);
+    ///
+    /// Builds a [`super::tts::TtsManager`] from the V3
+    /// `[providers.tts.<type>.<alias>]` map. Disabled when `[tts].enabled = false`
+    /// or when the manager fails to construct (logged at warn).
+    pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
+        if config.tts.enabled {
+            match super::tts::TtsManager::from_config(config) {
+                Ok(m) => self.tts_manager = Some(Arc::new(m)),
+                Err(e) => tracing::warn!("Telegram TTS disabled: {e}"),
+            }
         }
         self
     }
@@ -781,9 +788,8 @@ impl TelegramChannel {
         chat_id: &str,
         thread_id: Option<&str>,
         text: &str,
-        tts_config: &zeroclaw_config::schema::TtsConfig,
+        tts_manager: &crate::tts::TtsManager,
     ) -> anyhow::Result<()> {
-        let tts_manager = crate::tts::TtsManager::new(tts_config)?;
         let audio_bytes = tts_manager.synthesize(text).await?;
         let audio_len = audio_bytes.len();
         tracing::info!("Telegram TTS: synthesized {audio_len} bytes of audio");
@@ -2875,7 +2881,7 @@ impl Channel for TelegramChannel {
             .map(|vs| vs.contains(&message.recipient))
             .unwrap_or(false);
 
-        if is_voice_chat && self.tts_config.is_some() {
+        if is_voice_chat && self.tts_manager.is_some() {
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
             let is_substantive = content.len() > 40
@@ -2902,7 +2908,7 @@ impl Channel for TelegramChannel {
                 let chat_id_owned = chat_id.to_string();
                 let thread_id_owned = thread_id.map(str::to_string);
                 let recipient = message.recipient.clone();
-                let tts_config = self.tts_config.clone().unwrap();
+                let tts_manager = self.tts_manager.clone().unwrap();
                 tokio::spawn(async move {
                     // Wait 10 seconds — long enough for the agent to finish its
                     // full tool chain and send the final answer.
@@ -2928,7 +2934,7 @@ impl Channel for TelegramChannel {
                             &chat_id_owned,
                             thread_id_owned.as_deref(),
                             &text,
-                            &tts_config,
+                            &tts_manager,
                         )
                         .await
                         {

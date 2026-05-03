@@ -2073,6 +2073,156 @@ backend = "qdrant.missing"
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// V3 — TTS promotion: [tts.<backend>] → [providers.tts.<backend>.default]
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn v2_tts_openai_subsection_migrates_to_providers_tts() {
+    let cfg = migrate(
+        r#"
+schema_version = 2
+
+[tts]
+enabled = true
+
+[tts.openai]
+api_key = "sk-tts"
+model = "tts-1-hd"
+speed = 1.25
+"#,
+    );
+    assert!(cfg.tts.enabled);
+    let openai = cfg
+        .providers
+        .tts
+        .get("openai")
+        .unwrap()
+        .get("default")
+        .unwrap();
+    assert_eq!(openai.api_key.as_deref(), Some("sk-tts"));
+    assert_eq!(openai.model.as_deref(), Some("tts-1-hd"));
+    assert_eq!(openai.speed, Some(1.25));
+}
+
+#[test]
+fn v2_tts_elevenlabs_model_id_renames_to_model() {
+    let cfg = migrate(
+        r#"
+schema_version = 2
+
+[tts.elevenlabs]
+api_key = "xi"
+model_id = "eleven_multilingual_v2"
+stability = 0.7
+similarity_boost = 0.8
+"#,
+    );
+    let el = cfg
+        .providers
+        .tts
+        .get("elevenlabs")
+        .unwrap()
+        .get("default")
+        .unwrap();
+    assert_eq!(el.api_key.as_deref(), Some("xi"));
+    // V2 `model_id` lands on V3 unified `model` field.
+    assert_eq!(el.model.as_deref(), Some("eleven_multilingual_v2"));
+    assert_eq!(el.stability, Some(0.7));
+    assert_eq!(el.similarity_boost, Some(0.8));
+}
+
+#[test]
+fn v2_tts_default_provider_upgrades_bare_to_dotted() {
+    let cfg = migrate(
+        r#"
+schema_version = 2
+
+[tts]
+default_provider = "openai"
+default_voice = "nova"
+
+[tts.openai]
+api_key = "sk-tts"
+"#,
+    );
+    assert_eq!(cfg.tts.default_provider, "openai.default");
+    // default_voice promotes onto the resolved alias as a per-instance override.
+    let openai = cfg
+        .providers
+        .tts
+        .get("openai")
+        .unwrap()
+        .get("default")
+        .unwrap();
+    assert_eq!(openai.voice.as_deref(), Some("nova"));
+}
+
+#[test]
+fn v3_tts_alias_map_passes_through_unchanged() {
+    let cfg = migrate(
+        r#"
+schema_version = 3
+
+[tts]
+default_provider = "openai.work"
+
+[providers.tts.openai.work]
+api_key = "sk-work"
+voice = "shimmer"
+"#,
+    );
+    let openai_work = cfg
+        .providers
+        .tts
+        .get("openai")
+        .unwrap()
+        .get("work")
+        .unwrap();
+    assert_eq!(openai_work.api_key.as_deref(), Some("sk-work"));
+    assert_eq!(openai_work.voice.as_deref(), Some("shimmer"));
+    assert_eq!(cfg.tts.default_provider, "openai.work");
+}
+
+#[test]
+fn v2_tts_promotion_is_idempotent() {
+    let raw = r#"
+schema_version = 2
+
+[tts]
+enabled = true
+default_provider = "openai"
+default_voice = "nova"
+
+[tts.openai]
+api_key = "sk-tts"
+model = "tts-1"
+"#;
+    let once = migrate(raw);
+    let serialized = toml::to_string(&once).expect("serialize once");
+    let twice = migrate(&serialized);
+    let serialized_twice = toml::to_string(&twice).expect("serialize twice");
+    assert_eq!(
+        serialized, serialized_twice,
+        "tts promotion must be idempotent — re-migrating V3 output changed the table"
+    );
+}
+
+#[test]
+fn agent_tts_provider_field_round_trips() {
+    let cfg = migrate(
+        r#"
+schema_version = 3
+
+[agents.assistant]
+model_provider = "openrouter.default"
+tts_provider = "openai.work"
+"#,
+    );
+    let agent = cfg.agents.get("assistant").unwrap();
+    assert_eq!(agent.tts_provider, "openai.work");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tunnel migration
 // ─────────────────────────────────────────────────────────────────────────────
 

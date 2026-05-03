@@ -1173,6 +1173,11 @@ fn v2_to_v3_table(table: &mut toml::Table) {
     // V3 collapses those into alias-keyed `[storage.<backend>.<alias>]`.
     promote_v2_storage_subsystem(table);
 
+    // V3 TTS promotion:
+    // V2 had per-backend subsections under `[tts.<backend>]`. V3 promotes
+    // to `[providers.tts.<backend>.<alias>]` with a single union shape.
+    promote_v2_tts_subsystem(table);
+
     // V3 cron promotion:
     // - V2 had `[cron]` with subsystem knobs (enabled, catch_up_on_startup,
     //   max_run_history) plus `[[cron.jobs]]` array. V3 makes `[cron.<alias>]`
@@ -1301,6 +1306,98 @@ fn promote_v2_storage_subsystem(table: &mut toml::Table) {
     merge_into_default(storage, "sqlite", sqlite_default);
     merge_into_default(storage, "postgres", postgres_default);
     merge_into_default(storage, "qdrant", qdrant_default);
+}
+
+fn promote_v2_tts_subsystem(table: &mut toml::Table) {
+    // V2 backends → V3 alias map. Old field names map onto the unified
+    // TtsProviderConfig:
+    // - openai:     api_key, model, speed                  → api_key, model, speed
+    // - elevenlabs: api_key, model_id, stability, similarity_boost
+    //                                                        → api_key, model, stability, similarity_boost
+    // - google:     api_key, language_code                 → api_key, language_code
+    // - edge:       binary_path                            → binary_path
+    // - piper:      api_url                                → api_url
+    const BACKENDS: &[&str] = &["openai", "elevenlabs", "google", "edge", "piper"];
+
+    let mut promoted: std::collections::BTreeMap<&'static str, toml::Table> =
+        std::collections::BTreeMap::new();
+
+    if let Some(toml::Value::Table(tts)) = table.get_mut("tts") {
+        for &backend in BACKENDS {
+            let Some(toml::Value::Table(mut entry)) = tts.remove(backend) else {
+                continue;
+            };
+            // V2 elevenlabs.model_id → V3 generic .model field.
+            if backend == "elevenlabs"
+                && let Some(model_id) = entry.remove("model_id")
+            {
+                entry.entry("model".to_string()).or_insert(model_id);
+            }
+            promoted.insert(backend, entry);
+        }
+        // V2 had `default_provider = "openai"` (bare type). V3 carries
+        // a dotted alias ref. Upgrade in place when the value is a known
+        // bare backend name; leave dotted forms (V3-shaped) untouched.
+        if let Some(toml::Value::String(s)) = tts.get_mut("default_provider")
+            && BACKENDS.contains(&s.as_str())
+        {
+            *s = format!("{s}.default");
+        }
+        // V2 default_voice can be promoted to the active alias's voice
+        // override when the V3 alias doesn't already specify one. This is
+        // best-effort — only the inferred default-provider alias gets the
+        // voice. Other instances retain their own voice or fall back to
+        // [tts].default_voice at runtime.
+        let v2_default_voice = tts
+            .get("default_voice")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if let Some(voice) = v2_default_voice {
+            // Attempt to promote onto the dotted-alias entry resolved from
+            // default_provider. Look up the freshly-written value (post bare→dotted upgrade).
+            if let Some(toml::Value::String(dotted)) = tts.get("default_provider").cloned()
+                && let Some((ty, _alias)) = dotted.split_once('.')
+                && let Some(entry) = promoted.get_mut(ty)
+            {
+                entry
+                    .entry("voice".to_string())
+                    .or_insert(toml::Value::String(voice));
+            }
+        }
+    }
+
+    if promoted.is_empty() {
+        return;
+    }
+
+    let providers_root = table
+        .entry("providers")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let toml::Value::Table(providers) = providers_root else {
+        return;
+    };
+    let tts_map_root = providers
+        .entry("tts")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let toml::Value::Table(tts_map) = tts_map_root else {
+        return;
+    };
+
+    for (backend, entry) in promoted {
+        let backend_root = tts_map
+            .entry(backend.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(bt) = backend_root {
+            let default_entry = bt
+                .entry("default".to_string())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if let toml::Value::Table(de) = default_entry {
+                for (k, v) in entry {
+                    de.entry(k).or_insert(v);
+                }
+            }
+        }
+    }
 }
 
 fn promote_v2_cron_subsystem(table: &mut toml::Table) {

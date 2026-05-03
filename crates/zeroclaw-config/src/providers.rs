@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use zeroclaw_macros::Configurable;
 
-use super::schema::{EmbeddingRouteConfig, ModelProviderConfig, ModelRouteConfig};
+use super::schema::{
+    EmbeddingRouteConfig, ModelProviderConfig, ModelRouteConfig, TtsProviderConfig,
+};
 
 /// Top-level `[providers]` section. Wraps model provider profiles and routing rules.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
@@ -14,6 +16,14 @@ pub struct ProvidersConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub models: HashMap<String, HashMap<String, ModelProviderConfig>>,
+
+    /// Named TTS provider profiles: outer key = provider type, inner key = user alias.
+    /// V3 shape: `[providers.tts.<type>.<alias>]` e.g. `[providers.tts.openai.default]`.
+    /// Mirrors `models` for parallel runtime dispatch through agent `tts_provider`
+    /// alias references.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub tts: HashMap<String, HashMap<String, TtsProviderConfig>>,
 
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -2,13 +2,16 @@
 //!
 //! Supports OpenAI, ElevenLabs, Google Cloud TTS, Edge TTS (free, subprocess-based),
 //! and Piper TTS (local GPU-accelerated, OpenAI-compatible endpoint).
-//! Provider selection is driven by [`TtsConfig`] in `config.toml`.
+//!
+//! V3: per-instance configs live under `[providers.tts.<type>.<alias>]`; agents
+//! pick which instance to use via the `tts_provider` dotted alias reference.
+//! Global runtime knobs (default_voice, max_text_length, etc.) live on `[tts]`.
 
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 
-use zeroclaw_config::schema::TtsConfig;
+use zeroclaw_config::schema::{Config, TtsProviderConfig};
 
 /// Maximum text length before synthesis is rejected (default: 4096 chars).
 const DEFAULT_MAX_TEXT_LENGTH: usize = 4096;
@@ -47,7 +50,7 @@ pub struct OpenAiTtsProvider {
 impl OpenAiTtsProvider {
     /// Create a new OpenAI TTS provider from config, resolving the API key
     /// from config or `OPENAI_API_KEY` env var.
-    pub fn new(config: &zeroclaw_config::schema::OpenAiTtsConfig) -> Result<Self> {
+    pub fn new(config: &TtsProviderConfig) -> Result<Self> {
         let api_key = config
             .api_key
             .as_deref()
@@ -60,12 +63,18 @@ impl OpenAiTtsProvider {
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty())
             })
-            .context("Missing OpenAI TTS API key: set [tts.openai].api_key or OPENAI_API_KEY")?;
+            .context(
+                "Missing OpenAI TTS API key: set [providers.tts.openai.<alias>].api_key or OPENAI_API_KEY",
+            )?;
 
         Ok(Self {
             api_key,
-            model: config.model.clone(),
-            speed: config.speed,
+            model: config
+                .model
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| "tts-1".to_string()),
+            speed: config.speed.unwrap_or(1.0),
             client: reqwest::Client::builder()
                 .timeout(TTS_HTTP_TIMEOUT)
                 .build()
@@ -146,7 +155,7 @@ pub struct ElevenLabsTtsProvider {
 impl ElevenLabsTtsProvider {
     /// Create a new ElevenLabs TTS provider from config, resolving the API key
     /// from config or `ELEVENLABS_API_KEY` env var.
-    pub fn new(config: &zeroclaw_config::schema::ElevenLabsTtsConfig) -> Result<Self> {
+    pub fn new(config: &TtsProviderConfig) -> Result<Self> {
         let api_key = config
             .api_key
             .as_deref()
@@ -160,14 +169,18 @@ impl ElevenLabsTtsProvider {
                     .filter(|v| !v.is_empty())
             })
             .context(
-                "Missing ElevenLabs API key: set [tts.elevenlabs].api_key or ELEVENLABS_API_KEY",
+                "Missing ElevenLabs API key: set [providers.tts.elevenlabs.<alias>].api_key or ELEVENLABS_API_KEY",
             )?;
 
         Ok(Self {
             api_key,
-            model_id: config.model_id.clone(),
-            stability: config.stability,
-            similarity_boost: config.similarity_boost,
+            model_id: config
+                .model
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| "eleven_monolingual_v1".to_string()),
+            stability: config.stability.unwrap_or(0.5),
+            similarity_boost: config.similarity_boost.unwrap_or(0.5),
             client: reqwest::Client::builder()
                 .timeout(TTS_HTTP_TIMEOUT)
                 .build()
@@ -253,7 +266,7 @@ pub struct GoogleTtsProvider {
 impl GoogleTtsProvider {
     /// Create a new Google Cloud TTS provider from config, resolving the API key
     /// from config or `GOOGLE_TTS_API_KEY` env var.
-    pub fn new(config: &zeroclaw_config::schema::GoogleTtsConfig) -> Result<Self> {
+    pub fn new(config: &TtsProviderConfig) -> Result<Self> {
         let api_key = config
             .api_key
             .as_deref()
@@ -267,12 +280,16 @@ impl GoogleTtsProvider {
                     .filter(|v| !v.is_empty())
             })
             .context(
-                "Missing Google TTS API key: set [tts.google].api_key or GOOGLE_TTS_API_KEY",
+                "Missing Google TTS API key: set [providers.tts.google.<alias>].api_key or GOOGLE_TTS_API_KEY",
             )?;
 
         Ok(Self {
             api_key,
-            language_code: config.language_code.clone(),
+            language_code: config
+                .language_code
+                .clone()
+                .filter(|c| !c.trim().is_empty())
+                .unwrap_or_else(|| "en-US".to_string()),
             client: reqwest::Client::builder()
                 .timeout(TTS_HTTP_TIMEOUT)
                 .build()
@@ -370,21 +387,25 @@ impl EdgeTtsProvider {
     /// `binary_path` must be a bare command name (no path separators) matching
     /// one of `ALLOWED_BINARIES`. This prevents arbitrary executable
     /// paths like `/tmp/malicious/edge-tts` from passing the basename check.
-    pub fn new(config: &zeroclaw_config::schema::EdgeTtsConfig) -> Result<Self> {
-        let path = &config.binary_path;
-        if path.contains('/') || path.contains('\\') {
+    pub fn new(config: &TtsProviderConfig) -> Result<Self> {
+        let raw_path = config
+            .binary_path
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| "edge-tts".to_string());
+        if raw_path.contains('/') || raw_path.contains('\\') {
             bail!(
-                "Edge TTS binary_path must be a bare command name without path separators, got: {path}"
+                "Edge TTS binary_path must be a bare command name without path separators, got: {raw_path}"
             );
         }
-        if !Self::ALLOWED_BINARIES.contains(&path.as_str()) {
+        if !Self::ALLOWED_BINARIES.contains(&raw_path.as_str()) {
             bail!(
-                "Edge TTS binary_path must be one of {:?}, got: {path}",
+                "Edge TTS binary_path must be one of {:?}, got: {raw_path}",
                 Self::ALLOWED_BINARIES,
             );
         }
         Ok(Self {
-            binary_path: config.binary_path.clone(),
+            binary_path: raw_path,
         })
     }
 }
@@ -461,14 +482,20 @@ pub struct PiperTtsProvider {
 }
 
 impl PiperTtsProvider {
-    /// Create a new Piper TTS provider pointing at the given API URL.
-    pub fn new(api_url: &str) -> Self {
+    /// Create a new Piper TTS provider from config. Falls back to
+    /// `http://127.0.0.1:5000/v1/audio/speech` when no `api_url` is supplied.
+    pub fn new(config: &TtsProviderConfig) -> Self {
+        let api_url = config
+            .api_url
+            .clone()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:5000/v1/audio/speech".to_string());
         Self {
             client: reqwest::Client::builder()
                 .timeout(TTS_HTTP_TIMEOUT)
                 .build()
                 .expect("Failed to build HTTP client for Piper TTS"),
-            api_url: api_url.to_string(),
+            api_url,
         }
     }
 }
@@ -529,92 +556,95 @@ impl TtsProvider for PiperTtsProvider {
 // ── TtsManager ───────────────────────────────────────────────────
 
 /// Central manager for multi-provider TTS synthesis.
+///
+/// V3: providers are keyed by their dotted alias (`<type>.<alias>`, e.g.
+/// `openai.default`). `default_provider` carries that same dotted form.
+/// Per-provider voice overrides come from the `voice` field on each
+/// `TtsProviderConfig` instance.
 pub struct TtsManager {
     providers: HashMap<String, Box<dyn TtsProvider>>,
+    voice_by_alias: HashMap<String, String>,
     default_provider: String,
     default_voice: String,
     max_text_length: usize,
 }
 
 impl TtsManager {
-    /// Build a `TtsManager` from config, initializing all configured providers.
-    pub fn new(config: &TtsConfig) -> Result<Self> {
+    /// Build a `TtsManager` from `[providers.tts.<type>.<alias>]` instances
+    /// in `Config`. Each instance is registered under its dotted alias key
+    /// (`<type>.<alias>`). Failures to construct a particular instance are
+    /// logged at warn but do not abort the manager.
+    pub fn from_config(config: &Config) -> Result<Self> {
         let mut providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
+        let mut voice_by_alias: HashMap<String, String> = HashMap::new();
 
-        if let Some(ref openai_cfg) = config.openai {
-            match OpenAiTtsProvider::new(openai_cfg) {
-                Ok(p) => {
-                    providers.insert("openai".to_string(), Box::new(p));
-                }
-                Err(e) => {
-                    tracing::warn!("Skipping OpenAI TTS provider: {e}");
+        for (type_key, alias_map) in &config.providers.tts {
+            for (alias, instance) in alias_map {
+                let dotted = format!("{type_key}.{alias}");
+                let result: Result<Box<dyn TtsProvider>> = match type_key.as_str() {
+                    "openai" => OpenAiTtsProvider::new(instance).map(|p| Box::new(p) as _),
+                    "elevenlabs" => ElevenLabsTtsProvider::new(instance).map(|p| Box::new(p) as _),
+                    "google" => GoogleTtsProvider::new(instance).map(|p| Box::new(p) as _),
+                    "edge" => EdgeTtsProvider::new(instance).map(|p| Box::new(p) as _),
+                    "piper" => Ok(Box::new(PiperTtsProvider::new(instance)) as _),
+                    other => {
+                        tracing::warn!(
+                            "Skipping unknown TTS backend type '{other}' (alias: {alias})"
+                        );
+                        continue;
+                    }
+                };
+                match result {
+                    Ok(p) => {
+                        providers.insert(dotted.clone(), p);
+                        if let Some(voice) = instance
+                            .voice
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                        {
+                            voice_by_alias.insert(dotted, voice.to_string());
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Skipping TTS provider {dotted}: {e}");
+                    }
                 }
             }
         }
 
-        if let Some(ref elevenlabs_cfg) = config.elevenlabs {
-            match ElevenLabsTtsProvider::new(elevenlabs_cfg) {
-                Ok(p) => {
-                    providers.insert("elevenlabs".to_string(), Box::new(p));
-                }
-                Err(e) => {
-                    tracing::warn!("Skipping ElevenLabs TTS provider: {e}");
-                }
-            }
-        }
-
-        if let Some(ref google_cfg) = config.google {
-            match GoogleTtsProvider::new(google_cfg) {
-                Ok(p) => {
-                    providers.insert("google".to_string(), Box::new(p));
-                }
-                Err(e) => {
-                    tracing::warn!("Skipping Google TTS provider: {e}");
-                }
-            }
-        }
-
-        if let Some(ref edge_cfg) = config.edge {
-            match EdgeTtsProvider::new(edge_cfg) {
-                Ok(p) => {
-                    providers.insert("edge".to_string(), Box::new(p));
-                }
-                Err(e) => {
-                    tracing::warn!("Skipping Edge TTS provider: {e}");
-                }
-            }
-        }
-
-        if let Some(ref piper_cfg) = config.piper {
-            let provider = PiperTtsProvider::new(&piper_cfg.api_url);
-            providers.insert("piper".to_string(), Box::new(provider));
-        }
-
-        let max_text_length = if config.max_text_length == 0 {
+        let max_text_length = if config.tts.max_text_length == 0 {
             DEFAULT_MAX_TEXT_LENGTH
         } else {
-            config.max_text_length
+            config.tts.max_text_length
         };
 
         Ok(Self {
             providers,
-            default_provider: config.default_provider.clone(),
-            default_voice: config.default_voice.clone(),
+            voice_by_alias,
+            default_provider: config.tts.default_provider.clone(),
+            default_voice: config.tts.default_voice.clone(),
             max_text_length,
         })
     }
 
-    /// Synthesize text using the default provider and voice.
+    /// Synthesize text using the default dotted-alias provider and that
+    /// instance's voice (or the global default_voice fallback).
     pub async fn synthesize(&self, text: &str) -> Result<Vec<u8>> {
-        self.synthesize_with_provider(text, &self.default_provider, &self.default_voice)
+        let provider_alias = self.default_provider.as_str();
+        let voice = self
+            .voice_by_alias
+            .get(provider_alias)
+            .map_or(self.default_voice.as_str(), String::as_str);
+        self.synthesize_with_provider(text, provider_alias, voice)
             .await
     }
 
-    /// Synthesize text using a specific provider and voice.
+    /// Synthesize text using a specific dotted-alias provider and voice.
     pub async fn synthesize_with_provider(
         &self,
         text: &str,
-        provider: &str,
+        provider_alias: &str,
         voice: &str,
     ) -> Result<Vec<u8>> {
         if text.is_empty() {
@@ -629,10 +659,10 @@ impl TtsManager {
             );
         }
 
-        let tts = self.providers.get(provider).ok_or_else(|| {
+        let tts = self.providers.get(provider_alias).ok_or_else(|| {
             anyhow::anyhow!(
                 "TTS provider '{}' not configured (available: {})",
-                provider,
+                provider_alias,
                 self.available_providers().join(", ")
             )
         })?;
@@ -640,7 +670,7 @@ impl TtsManager {
         tts.synthesize(text, voice).await
     }
 
-    /// List names of all initialized providers.
+    /// List dotted aliases of all initialized providers.
     pub fn available_providers(&self) -> Vec<String> {
         let mut names: Vec<_> = self.providers.keys().cloned().collect();
         names.sort();
@@ -654,41 +684,60 @@ impl TtsManager {
 mod tests {
     use super::*;
 
-    fn default_tts_config() -> TtsConfig {
-        TtsConfig::default()
+    fn config_with_edge_alias() -> Config {
+        let mut cfg = Config::default();
+        cfg.tts.default_provider = "edge.default".to_string();
+        cfg.providers
+            .tts
+            .entry("edge".to_string())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                TtsProviderConfig {
+                    binary_path: Some("edge-tts".to_string()),
+                    ..TtsProviderConfig::default()
+                },
+            );
+        cfg
+    }
+
+    fn config_with_piper_alias() -> Config {
+        let mut cfg = Config::default();
+        cfg.tts.default_provider = "piper.default".to_string();
+        cfg.providers
+            .tts
+            .entry("piper".to_string())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                TtsProviderConfig {
+                    api_url: Some("http://127.0.0.1:5000/v1/audio/speech".to_string()),
+                    ..TtsProviderConfig::default()
+                },
+            );
+        cfg
     }
 
     #[test]
     fn tts_manager_creation_with_defaults() {
-        let config = default_tts_config();
-        let manager = TtsManager::new(&config).unwrap();
-        // No providers configured by default, so list is empty.
+        let config = Config::default();
+        let manager = TtsManager::from_config(&config).unwrap();
         assert!(manager.available_providers().is_empty());
     }
 
     #[test]
-    fn tts_manager_with_edge_provider() {
-        let mut config = default_tts_config();
-        config.default_provider = "edge".to_string();
-        config.edge = Some(zeroclaw_config::schema::EdgeTtsConfig {
-            binary_path: "edge-tts".into(),
-        });
-
-        let manager = TtsManager::new(&config).unwrap();
-        assert_eq!(manager.available_providers(), vec!["edge"]);
+    fn tts_manager_registers_alias_keyed_provider() {
+        let cfg = config_with_edge_alias();
+        let manager = TtsManager::from_config(&cfg).unwrap();
+        assert_eq!(manager.available_providers(), vec!["edge.default"]);
     }
 
     #[tokio::test]
     async fn tts_rejects_empty_text() {
-        let mut config = default_tts_config();
-        config.default_provider = "edge".to_string();
-        config.edge = Some(zeroclaw_config::schema::EdgeTtsConfig {
-            binary_path: "edge-tts".into(),
-        });
-
-        let manager = TtsManager::new(&config).unwrap();
+        let cfg = config_with_edge_alias();
+        let manager = TtsManager::from_config(&cfg).unwrap();
         let err = manager
-            .synthesize_with_provider("", "edge", "en-US-AriaNeural")
+            .synthesize_with_provider("", "edge.default", "en-US-AriaNeural")
             .await
             .unwrap_err();
         assert!(
@@ -699,17 +748,12 @@ mod tests {
 
     #[tokio::test]
     async fn tts_rejects_text_exceeding_max_length() {
-        let mut config = default_tts_config();
-        config.default_provider = "edge".to_string();
-        config.max_text_length = 10;
-        config.edge = Some(zeroclaw_config::schema::EdgeTtsConfig {
-            binary_path: "edge-tts".into(),
-        });
-
-        let manager = TtsManager::new(&config).unwrap();
+        let mut cfg = config_with_edge_alias();
+        cfg.tts.max_text_length = 10;
+        let manager = TtsManager::from_config(&cfg).unwrap();
         let long_text = "a".repeat(11);
         let err = manager
-            .synthesize_with_provider(&long_text, "edge", "en-US-AriaNeural")
+            .synthesize_with_provider(&long_text, "edge.default", "en-US-AriaNeural")
             .await
             .unwrap_err();
         assert!(
@@ -720,10 +764,10 @@ mod tests {
 
     #[tokio::test]
     async fn tts_rejects_unknown_provider() {
-        let config = default_tts_config();
-        let manager = TtsManager::new(&config).unwrap();
+        let cfg = Config::default();
+        let manager = TtsManager::from_config(&cfg).unwrap();
         let err = manager
-            .synthesize_with_provider("hello", "nonexistent", "voice")
+            .synthesize_with_provider("hello", "nonexistent.alias", "voice")
             .await
             .unwrap_err();
         assert!(
@@ -733,38 +777,27 @@ mod tests {
     }
 
     #[test]
-    fn piper_provider_creation() {
-        let provider = PiperTtsProvider::new("http://127.0.0.1:5000/v1/audio/speech");
+    fn piper_provider_creation_uses_default_url_when_unset() {
+        let provider = PiperTtsProvider::new(&TtsProviderConfig::default());
         assert_eq!(provider.name(), "piper");
         assert_eq!(provider.api_url, "http://127.0.0.1:5000/v1/audio/speech");
         assert_eq!(provider.supported_formats(), vec!["mp3", "wav", "opus"]);
-        // Piper voices depend on installed models; list is empty.
         assert!(provider.supported_voices().is_empty());
     }
 
     #[test]
-    fn tts_manager_with_piper_provider() {
-        let mut config = default_tts_config();
-        config.default_provider = "piper".to_string();
-        config.piper = Some(zeroclaw_config::schema::PiperTtsConfig {
-            api_url: "http://127.0.0.1:5000/v1/audio/speech".into(),
-        });
-
-        let manager = TtsManager::new(&config).unwrap();
-        assert_eq!(manager.available_providers(), vec!["piper"]);
+    fn tts_manager_with_piper_alias() {
+        let cfg = config_with_piper_alias();
+        let manager = TtsManager::from_config(&cfg).unwrap();
+        assert_eq!(manager.available_providers(), vec!["piper.default"]);
     }
 
     #[tokio::test]
     async fn tts_rejects_empty_text_for_piper() {
-        let mut config = default_tts_config();
-        config.default_provider = "piper".to_string();
-        config.piper = Some(zeroclaw_config::schema::PiperTtsConfig {
-            api_url: "http://127.0.0.1:5000/v1/audio/speech".into(),
-        });
-
-        let manager = TtsManager::new(&config).unwrap();
+        let cfg = config_with_piper_alias();
+        let manager = TtsManager::from_config(&cfg).unwrap();
         let err = manager
-            .synthesize_with_provider("", "piper", "default")
+            .synthesize_with_provider("", "piper.default", "default")
             .await
             .unwrap_err();
         assert!(
@@ -774,32 +807,20 @@ mod tests {
     }
 
     #[test]
-    fn piper_not_registered_when_config_is_none() {
-        let config = default_tts_config();
-        let manager = TtsManager::new(&config).unwrap();
-        assert!(!manager.available_providers().contains(&"piper".to_string()));
-    }
-
-    #[test]
     fn tts_config_defaults() {
-        let config = TtsConfig::default();
+        let config = zeroclaw_config::schema::TtsConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.default_provider, "openai");
+        assert!(config.default_provider.is_empty());
         assert_eq!(config.default_voice, "alloy");
         assert_eq!(config.default_format, "mp3");
         assert_eq!(config.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
-        assert!(config.openai.is_none());
-        assert!(config.elevenlabs.is_none());
-        assert!(config.google.is_none());
-        assert!(config.edge.is_none());
-        assert!(config.piper.is_none());
     }
 
     #[test]
     fn tts_manager_max_text_length_zero_uses_default() {
-        let mut config = default_tts_config();
-        config.max_text_length = 0;
-        let manager = TtsManager::new(&config).unwrap();
+        let mut cfg = Config::default();
+        cfg.tts.max_text_length = 0;
+        let manager = TtsManager::from_config(&cfg).unwrap();
         assert_eq!(manager.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
     }
 }
