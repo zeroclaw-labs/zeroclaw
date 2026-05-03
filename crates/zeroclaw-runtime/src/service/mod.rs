@@ -89,6 +89,29 @@ fn windows_task_name() -> &'static str {
     WINDOWS_TASK_NAME
 }
 
+fn windows_service_not_installed_message(task_name: &str) -> String {
+    format!(
+        "Windows service task \"{task_name}\" is not installed. Run `zeroclaw service install` first."
+    )
+}
+
+fn is_windows_task_missing_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("cannot find the file specified")
+        || lower.contains("system cannot find")
+        || message.contains("找不到")
+}
+
+fn ensure_windows_task_installed(task_name: &str) -> Result<()> {
+    match run_capture(Command::new("schtasks").args(["/Query", "/TN", task_name])) {
+        Ok(_) => Ok(()),
+        Err(err) if is_windows_task_missing_message(&err.to_string()) => {
+            bail!("{}", windows_service_not_installed_message(task_name))
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Returns whether the ZeroClaw daemon service is currently running.
 pub fn is_running() -> bool {
     if cfg!(target_os = "macos") {
@@ -158,7 +181,9 @@ pub fn start(config: &Config, init_system: InitSystem) -> Result<()> {
         start_linux(resolved)
     } else if cfg!(target_os = "windows") {
         let _ = config;
-        run_checked(Command::new("schtasks").args(["/Run", "/TN", windows_task_name()]))?;
+        let task_name = windows_task_name();
+        ensure_windows_task_installed(task_name)?;
+        run_checked(Command::new("schtasks").args(["/Run", "/TN", task_name]))?;
         println!("✅ Service started");
         Ok(())
     } else {
@@ -1362,19 +1387,36 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
 fn run_checked(command: &mut Command) -> Result<()> {
     let output = command.output().context("Failed to spawn command")?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Command failed: {}", stderr.trim());
+        anyhow::bail!("Command failed: {}", command_output_message(&output));
     }
     Ok(())
 }
 
 pub fn run_capture(command: &mut Command) -> Result<String> {
     let output = command.output().context("Failed to spawn command")?;
+    if !output.status.success() {
+        anyhow::bail!("Command failed: {}", command_output_message(&output));
+    }
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     if text.trim().is_empty() {
         text = String::from_utf8_lossy(&output.stderr).to_string();
     }
     Ok(text)
+}
+
+fn command_output_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let message = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    if message.is_empty() {
+        output.status.to_string()
+    } else {
+        message.to_string()
+    }
 }
 
 pub fn xml_escape(raw: &str) -> String {
@@ -1383,6 +1425,35 @@ pub fn xml_escape(raw: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    use std::process::Command;
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn run_capture_errors_on_non_zero_status() {
+        let err = run_capture(Command::new("sh").args(["-c", "echo nope 1>&2; exit 17"]))
+            .expect_err("non-zero exit should error");
+        assert!(err.to_string().contains("nope"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn run_capture_errors_on_non_zero_status_windows() {
+        let err = run_capture(Command::new("cmd").args(["/C", "echo nope 1>&2 & exit /b 17"]))
+            .expect_err("non-zero exit should error");
+        assert!(err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn windows_service_not_installed_message_mentions_install() {
+        let message = windows_service_not_installed_message(windows_task_name());
+        assert!(message.contains("ZeroClaw Daemon"));
+        assert!(message.contains("zeroclaw service install"));
+    }
 }
 
 #[cfg(all(test, zeroclaw_root_crate))]

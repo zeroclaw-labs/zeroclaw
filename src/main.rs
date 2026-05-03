@@ -1181,9 +1181,20 @@ fn apply_cmd_translations(cmd: clap::Command, prefix: &str) -> clap::Command {
     cmd
 }
 
+fn format_cli_error(error: &anyhow::Error) -> String {
+    format!("Error: {error:#}")
+}
+
 #[tokio::main]
+async fn main() {
+    if let Err(error) = Box::pin(run_main()).await {
+        eprintln!("{}", format_cli_error(&error));
+        std::process::exit(1);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-async fn main() -> Result<()> {
+async fn run_main() -> Result<()> {
     // Install default crypto provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
@@ -3917,6 +3928,15 @@ async fn run_gateway_if_enabled(
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn format_cli_error_omits_backtrace() {
+        let error = anyhow::anyhow!("service task is missing");
+        let text = format_cli_error(&error);
+
+        assert_eq!(text, "Error: service task is missing");
+        assert!(!text.contains("Stack backtrace"));
+    }
 
     #[test]
     #[cfg(feature = "agent-runtime")]

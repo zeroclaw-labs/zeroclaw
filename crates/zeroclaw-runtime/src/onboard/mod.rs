@@ -1884,6 +1884,27 @@ mod tests {
         assert_eq!(model_cfg.model.as_deref(), Some("gateway-large"));
     }
 
+    #[tokio::test]
+    async fn prompt_model_openai_codex_falls_back_to_manual_model_id() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        cfg.providers
+            .models
+            .insert("openai-codex".into(), ModelProviderConfig::default());
+        let mut ui = QuickUi::new().with("Model id", "gpt-5.4");
+
+        prompt_model(&mut cfg, &mut ui, "openai-codex")
+            .await
+            .unwrap();
+
+        let model_cfg = cfg
+            .providers
+            .models
+            .get("openai-codex")
+            .expect("OpenAI Codex provider entry should remain configured");
+        assert_eq!(model_cfg.model.as_deref(), Some("gpt-5.4"));
+    }
+
     /// Providers section driven entirely by CLI flags: the `--provider`,
     /// `--api-key`, and `--model` overrides fire up-front, bypassing the
     /// `ui.select` menu, the api-key prompt, and `prompt_model` (which
