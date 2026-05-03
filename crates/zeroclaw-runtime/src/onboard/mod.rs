@@ -788,6 +788,45 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
             }
         };
 
+        // Prompt for an alias name so multiple entries of the same provider
+        // type can coexist (e.g. "work" and "personal" for anthropic).
+        // When --provider is forced via CLI flags we skip the alias prompt
+        // and fall back to "default" so non-interactive callers keep working.
+        let alias = if flags.provider.is_some() {
+            "default".to_string()
+        } else {
+            let existing_aliases: Vec<String> = cfg
+                .providers
+                .models
+                .get(&picked)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            let suggestion = if existing_aliases.is_empty() {
+                "default".to_string()
+            } else {
+                format!("{}-2", existing_aliases[0])
+            };
+            match ui
+                .string("Alias (name for this configuration)", Some(&suggestion))
+                .await?
+            {
+                Answer::Back => {
+                    if flags.provider.is_some() {
+                        return Ok(Nav::Back);
+                    }
+                    continue;
+                }
+                Answer::Value(s) => {
+                    let trimmed = s.trim().to_string();
+                    if trimmed.is_empty() {
+                        suggestion
+                    } else {
+                        trimmed
+                    }
+                }
+            }
+        };
+
         // Seed the HashMap entry in memory so `prop_fields` can enumerate
         // its fields for the prompts below. Not persisted here — the first
         // `persist()` for a real value (api_key, model, …) carries it to
@@ -797,12 +836,12 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
             .providers
             .models
             .get(&picked)
-            .is_some_and(|m| m.contains_key("default"));
+            .is_some_and(|m| m.contains_key(&alias));
         cfg.providers
             .models
             .entry(picked.clone())
             .or_default()
-            .entry("default".to_string())
+            .entry(alias.clone())
             .or_default();
 
         // For fresh entries, pre-populate the provider's trait-level defaults
@@ -810,12 +849,12 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         // user overrides aren't clobbered. Lives in memory until the first
         // `persist()` carries the entry — defaults included — to disk.
         if is_new_entry {
-            let prefix = format!("providers.models.{picked}.default");
+            let prefix = format!("providers.models.{picked}.{alias}");
             field_visibility::apply_provider_trait_defaults(cfg, &picked, &prefix)?;
         }
         if let Some(base_url) = selected_base_url.as_deref() {
             cfg.set_prop(
-                &format!("providers.models.{picked}.default.base-url"),
+                &format!("providers.models.{picked}.{alias}.base-url"),
                 base_url,
             )?;
         }
@@ -836,7 +875,7 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         // Apply CLI-flag overrides up front, then skip those names in the
         // interactive pass so the user isn't re-prompted for what they already
         // passed on the command line.
-        let prefix = format!("providers.models.{picked}.default");
+        let prefix = format!("providers.models.{picked}.{alias}");
         let api_key_path = format!("{prefix}.api-key");
         if let Some(api_key) = &flags.api_key {
             persist(cfg, &api_key_path, api_key).await?;
@@ -1140,16 +1179,38 @@ async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Re
         }
 
         let picked = &all_channels[idx];
-        // Find first existing alias, or create one named after the channel type.
-        let alias = cfg
+        // Prompt for an alias so multiple instances of the same channel type
+        // can coexist (e.g. "team-slack" and "alerts-slack" for slack).
+        let existing_aliases: Vec<String> = cfg
             .prop_fields()
             .into_iter()
-            .find_map(|f| {
+            .filter_map(|f| {
                 f.name
                     .strip_prefix(&format!("channels.{picked}."))
                     .and_then(|rest| rest.split('.').next().map(String::from))
             })
-            .unwrap_or_else(|| picked.clone());
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let suggestion = if existing_aliases.is_empty() {
+            "default".to_string()
+        } else {
+            format!("{}-2", existing_aliases[0])
+        };
+        let alias = match ui
+            .string("Alias (name for this configuration)", Some(&suggestion))
+            .await?
+        {
+            Answer::Back => continue,
+            Answer::Value(s) => {
+                let trimmed = s.trim().to_string();
+                if trimmed.is_empty() {
+                    suggestion
+                } else {
+                    trimmed
+                }
+            }
+        };
         cfg.create_map_key(&format!("channels.{picked}"), &alias)
             .ok();
         let prefix = format!("channels.{picked}.{alias}");

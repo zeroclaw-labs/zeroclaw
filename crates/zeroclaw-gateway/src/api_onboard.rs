@@ -617,28 +617,55 @@ pub struct SectionItemPath {
 /// * `tunnel` → set_prop `tunnel.provider = <key>` (and init_defaults the
 ///   subsection if `<key>` is not "none"), return `tunnel.<key>` (or `tunnel`
 ///   for the `none` case).
+///
+/// The optional JSON body `{"alias": "<name>"}` names the entry being created,
+/// e.g. `"work"` for `providers.models.anthropic.work`. Omit to use `"default"`.
+#[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct SectionSelectBody {
+    pub alias: Option<String>,
+}
+
 pub async fn handle_section_select(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::extract::Path(SectionItemPath { section, key }): axum::extract::Path<SectionItemPath>,
+    body: Option<axum::extract::Json<SectionSelectBody>>,
 ) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
+    let alias = body
+        .and_then(|b| b.0.alias)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+
     let mut working = state.config.lock().clone();
 
     let (fields_prefix, created) = match section.as_str() {
         "providers" => {
+            // Arm 1: create the outer type bucket if it doesn't exist yet.
+            if let Err(msg) = working.create_map_key("providers.models", &key) {
+                return error_response(
+                    ConfigApiError::new(
+                        ConfigApiCode::PathNotFound,
+                        format!("could not select provider `{key}`: {msg}"),
+                    )
+                    .with_path("providers.models"),
+                );
+            }
+            // Arm 2: create the named alias entry inside the type bucket.
             let created = working
-                .create_map_key("providers.models", &key)
+                .create_map_key(&format!("providers.models.{key}"), &alias)
                 .map_err(|msg| {
                     error_response(
                         ConfigApiError::new(
                             ConfigApiCode::PathNotFound,
-                            format!("could not select provider `{key}`: {msg}"),
+                            format!("could not select provider `{key}` alias `{alias}`: {msg}"),
                         )
-                        .with_path("providers.models"),
+                        .with_path(format!("providers.models.{key}")),
                     )
                 });
             let created = match created {
@@ -649,9 +676,8 @@ pub async fn handle_section_select(
             // Ollama, default temperature / max_tokens / etc.) so the form
             // opens with sensible values instead of a sea of empty inputs.
             // Idempotent — only fills paths that are still unset, so a user
-            // who's already overridden a field doesn't get clobbered on
-            // re-select.
-            let prefix = format!("providers.models.{key}.default");
+            // who's already overridden a field doesn't get clobbered on re-select.
+            let prefix = format!("providers.models.{key}.{alias}");
             if let Err(e) =
                 zeroclaw_runtime::onboard::field_visibility::apply_provider_trait_defaults(
                     &mut working,
@@ -659,30 +685,18 @@ pub async fn handle_section_select(
                     &prefix,
                 )
             {
-                tracing::warn!(provider = %key, error = ?e, "failed to apply trait defaults; form will start blank");
+                tracing::warn!(provider = %key, alias = %alias, error = ?e, "failed to apply trait defaults; form will start blank");
             }
-            // Make the picked provider the runtime fallback so chat actually
             (prefix, created)
         }
         "channels" => {
-            // Find the first existing alias for this channel type, or create
-            // one named after the channel type itself.
-            let alias = working
-                .prop_fields()
-                .into_iter()
-                .find_map(|f| {
-                    f.name
-                        .strip_prefix(&format!("channels.{key}."))
-                        .and_then(|rest| rest.split('.').next().map(String::from))
-                })
-                .unwrap_or_else(|| key.clone());
             let created = working
                 .create_map_key(&format!("channels.{key}"), &alias)
                 .map_err(|msg| {
                     error_response(
                         ConfigApiError::new(
                             ConfigApiCode::PathNotFound,
-                            format!("could not select channel `{key}`: {msg}"),
+                            format!("could not select channel `{key}` alias `{alias}`: {msg}"),
                         )
                         .with_path(format!("channels.{key}")),
                     )
@@ -817,18 +831,25 @@ mod tests {
         let mut cfg = empty_cfg();
         assert!(cfg.channels.matrix.is_empty(), "fresh config: matrix unset");
 
-        cfg.create_map_key("channels.matrix", "matrix")
+        cfg.create_map_key("channels.matrix", "my-matrix-alias")
             .expect("create_map_key must succeed for channels.matrix");
         assert!(
-            cfg.channels.matrix.contains_key("matrix"),
+            cfg.channels.matrix.contains_key("my-matrix-alias"),
             "channels.matrix must have alias after create_map_key",
         );
 
         // The form would issue a PATCH whose set_prop call hits this path.
-        cfg.set_prop("channels.matrix.matrix.allowed-rooms", r#"["alice","bob"]"#)
-            .expect("set_prop on initialized matrix subsection must succeed");
+        cfg.set_prop(
+            "channels.matrix.my-matrix-alias.allowed-rooms",
+            r#"["alice","bob"]"#,
+        )
+        .expect("set_prop on initialized matrix subsection must succeed");
         assert_eq!(
-            cfg.channels.matrix.get("matrix").unwrap().allowed_rooms,
+            cfg.channels
+                .matrix
+                .get("my-matrix-alias")
+                .unwrap()
+                .allowed_rooms,
             vec!["alice".to_string(), "bob".to_string()],
         );
     }
@@ -926,7 +947,7 @@ mod tests {
     #[test]
     fn channels_picker_marks_configured_after_create_map_key() {
         let mut cfg = empty_cfg();
-        cfg.create_map_key("channels.matrix", "matrix")
+        cfg.create_map_key("channels.matrix", "my-matrix-alias")
             .expect("create_map_key must succeed for channels.matrix");
         let items = schema_walk_picker(&cfg, "channels");
         let matrix = items.iter().find(|i| i.key == "matrix").unwrap();

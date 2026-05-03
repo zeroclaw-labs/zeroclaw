@@ -67,9 +67,20 @@ pub fn memory_backend_excludes(backend: &str) -> Vec<&'static str> {
 /// the absolute paths to drop from the response.
 pub fn excluded_paths(cfg: &Config, prefix: &str) -> Vec<String> {
     if let Some(provider_key) = providers_models_key(prefix) {
+        // Use the full prefix as-is when it already includes the alias
+        // (providers.models.<type>.<alias>); otherwise fall back to the
+        // type-only prefix and let the caller pass a bare type path.
+        let alias_prefix = if prefix
+            .strip_prefix("providers.models.")
+            .is_some_and(|rest| rest.contains('.'))
+        {
+            prefix.to_string()
+        } else {
+            format!("providers.models.{provider_key}")
+        };
         return provider_family_excludes(provider_key)
             .into_iter()
-            .map(|leaf| format!("providers.models.{provider_key}.default.{leaf}"))
+            .map(|leaf| format!("{alias_prefix}.{leaf}"))
             .collect();
     }
 
@@ -252,18 +263,20 @@ mod tests {
     #[test]
     fn excluded_paths_for_provider_prefix() {
         let cfg = Config::default();
-        // V3: caller passes the alias-level prefix "providers.models.<type>.default"
-        let paths = excluded_paths(&cfg, "providers.models.ollama.default");
+        // Caller passes the full alias-level prefix: providers.models.<type>.<alias>.
+        // The alias is whatever the user named it — "my-ollama-alias" here to make
+        // clear that the string is an alias, not a type or hardcoded keyword.
+        let paths = excluded_paths(&cfg, "providers.models.ollama.my-ollama-alias");
         assert!(
             paths
                 .iter()
-                .any(|p| p == "providers.models.ollama.default.azure-openai-resource"),
+                .any(|p| p == "providers.models.ollama.my-ollama-alias.azure-openai-resource"),
             "expected azure-openai-resource excluded, got: {paths:?}"
         );
         assert!(
             paths
                 .iter()
-                .any(|p| p == "providers.models.ollama.default.wire-api"),
+                .any(|p| p == "providers.models.ollama.my-ollama-alias.wire-api"),
             "expected wire-api excluded, got: {paths:?}"
         );
     }
@@ -296,15 +309,21 @@ mod tests {
         // base_url empty. After apply, it should match the provider's
         // default_base_url() (http://localhost:11434).
         let mut cfg = Config::default();
-        // V3: create_map_key also pre-inserts the "default" alias.
+        // Simulate the two-step selection: outer type bucket + named alias.
         cfg.create_map_key("providers.models", "ollama")
-            .expect("create_map_key");
+            .expect("create outer bucket");
+        cfg.create_map_key("providers.models.ollama", "my-ollama-alias")
+            .expect("create alias");
 
-        apply_provider_trait_defaults(&mut cfg, "ollama", "providers.models.ollama.default")
-            .expect("apply defaults");
+        apply_provider_trait_defaults(
+            &mut cfg,
+            "ollama",
+            "providers.models.ollama.my-ollama-alias",
+        )
+        .expect("apply defaults");
 
         let base_url = cfg
-            .get_prop("providers.models.ollama.default.base-url")
+            .get_prop("providers.models.ollama.my-ollama-alias.base-url")
             .expect("base-url");
         assert!(
             base_url.contains("11434"),
@@ -313,7 +332,7 @@ mod tests {
 
         // Temperature should also be populated (Ollama overrides to 0.0).
         let temp = cfg
-            .get_prop("providers.models.ollama.default.temperature")
+            .get_prop("providers.models.ollama.my-ollama-alias.temperature")
             .expect("temperature");
         assert!(
             !temp.is_empty() && temp != "<unset>",
@@ -327,18 +346,24 @@ mod tests {
         // re-select / second call.
         let mut cfg = Config::default();
         cfg.create_map_key("providers.models", "ollama")
-            .expect("create_map_key");
+            .expect("create outer bucket");
+        cfg.create_map_key("providers.models.ollama", "my-ollama-alias")
+            .expect("create alias");
         cfg.set_prop(
-            "providers.models.ollama.default.base-url",
+            "providers.models.ollama.my-ollama-alias.base-url",
             "http://example:9999",
         )
         .expect("set base-url");
 
-        apply_provider_trait_defaults(&mut cfg, "ollama", "providers.models.ollama.default")
-            .expect("apply defaults");
+        apply_provider_trait_defaults(
+            &mut cfg,
+            "ollama",
+            "providers.models.ollama.my-ollama-alias",
+        )
+        .expect("apply defaults");
 
         let base_url = cfg
-            .get_prop("providers.models.ollama.default.base-url")
+            .get_prop("providers.models.ollama.my-ollama-alias.base-url")
             .expect("base-url");
         assert_eq!(
             base_url, "http://example:9999",
