@@ -30,6 +30,7 @@ pub struct SlackChannel {
     allowed_users: Vec<String>,
     thread_replies: bool,
     mention_only: bool,
+    strict_mention_in_thread: bool,
     group_reply_allowed_sender_ids: Vec<String>,
     user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
     workspace_dir: Option<PathBuf>,
@@ -56,6 +57,8 @@ pub struct SlackChannel {
     /// Emoji reaction name (without colons) that cancels an in-flight request.
     cancel_reaction: Option<String>,
     pending_approvals: Arc<AsyncMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    /// Seconds to wait for an operator reply to a `request_approval` prompt
+    /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
 }
 
@@ -171,6 +174,7 @@ impl SlackChannel {
             allowed_users,
             thread_replies: true,
             mention_only: false,
+            strict_mention_in_thread: false,
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
@@ -204,6 +208,14 @@ impl SlackChannel {
     /// Configure whether outbound replies stay in the originating Slack thread.
     pub fn with_thread_replies(mut self, thread_replies: bool) -> Self {
         self.thread_replies = thread_replies;
+        self
+    }
+
+    /// When true (and `mention_only` is also true), require an @-mention
+    /// for messages inside a Slack thread too. Default: false (threads
+    /// bypass the mention requirement so follow-ups don't need @).
+    pub fn with_strict_mention_in_thread(mut self, strict: bool) -> Self {
+        self.strict_mention_in_thread = strict;
         self
     }
 
@@ -455,7 +467,7 @@ impl SlackChannel {
     /// Update an existing Slack message in-place using `chat.update`.
     ///
     /// `channel` is the channel ID and `ts` is the timestamp of the original
-    /// message (returned by [`post_message`]).
+    /// message (returned by `post_message`).
     pub async fn update_message(&self, channel: &str, ts: &str, text: &str) -> anyhow::Result<()> {
         let body = serde_json::json!({
             "channel": channel,
@@ -2853,7 +2865,7 @@ impl SlackChannel {
                 let require_mention = self.mention_only
                     && is_group_message
                     && !allow_sender_without_mention
-                    && !is_thread_reply;
+                    && (!is_thread_reply || self.strict_mention_in_thread);
 
                 let Some(normalized_text) = self
                     .build_incoming_content(event, require_mention, bot_user_id)
@@ -3866,7 +3878,7 @@ impl Channel for SlackChannel {
                         let require_mention = self.mention_only
                             && is_group_message
                             && !allow_sender_without_mention
-                            && !is_thread_reply;
+                            && (!is_thread_reply || self.strict_mention_in_thread);
                         let Some(normalized_text) = self
                             .build_incoming_content(msg, require_mention, &bot_user_id)
                             .await
@@ -4178,6 +4190,14 @@ mod tests {
         let ch =
             SlackChannel::new("xoxb-fake".into(), None, vec![], vec![]).with_thread_replies(false);
         assert!(!ch.thread_replies);
+    }
+
+    #[test]
+    fn with_strict_mention_in_thread_sets_flag() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec![]);
+        assert!(!ch.strict_mention_in_thread);
+        let ch = ch.with_strict_mention_in_thread(true);
+        assert!(ch.strict_mention_in_thread);
     }
 
     #[test]

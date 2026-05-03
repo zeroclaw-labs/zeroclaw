@@ -1,0 +1,15 @@
+cli-wechat-pairing-required = 🔐 需要绑定 WeChat。一次性绑定码：{$code}
+cli-wechat-send-bind-command = 请在 WeChat 中发送 `{$command} <code>`。
+cli-wechat-qr-login = 📱 WeChat 二维码登录（{$attempt}/{$max}）
+cli-wechat-scan-to-connect = 请使用 WeChat 扫码连接。
+cli-wechat-qr-url = 二维码 URL：{$url}
+cli-wechat-qr-expired-giving-up = WeChat 二维码已过期 {$max} 次，停止重试。
+cli-wechat-qr-fetch-failed = 获取 WeChat 二维码失败。
+cli-wechat-qr-fetch-status-failed = 获取 WeChat 二维码失败（{$status}）：{$body}
+cli-wechat-missing-response-field = WeChat 响应缺少 {$field}。
+cli-wechat-scanned-confirm = 👀 已扫码！请在手机上确认...
+cli-wechat-qr-expired-refreshing = ⏳ 二维码已过期，正在刷新...
+cli-wechat-login-confirmed-missing-field = 登录已确认，但缺少 {$field}。
+cli-wechat-connected = ✅ WeChat 已连接！
+cli-wechat-bound-success = ✅ WeChat 账号绑定成功。现在可以和 ZeroClaw 对话了。
+cli-wechat-invalid-bind-code = ❌ 绑定码无效。请重试。

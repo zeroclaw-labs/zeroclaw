@@ -1,3 +1,14 @@
+//! PostgreSQL-backed memory implementation.
+//!
+//! Compiled in only when the crate is built with `--features memory-postgres`.
+//! Selected at runtime by setting `[memory].backend = "postgres"` and
+//! supplying `db_url` under `[storage.provider.config]`. Optional pgvector
+//! support is enabled via `[memory.postgres].vector_enabled`.
+//!
+//! Designed for multi-instance deployments where several agents need to share
+//! a single durable memory store with concurrent writes — the SQLite backend
+//! cannot serve that use case.
+
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -14,8 +25,10 @@ const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 
 /// PostgreSQL-backed persistent memory.
 ///
-/// This backend focuses on reliable CRUD and keyword recall using SQL, without
-/// requiring extension setup (for example pgvector).
+/// Reliable CRUD and keyword recall via SQL. Hybrid keyword + vector recall
+/// is available when pgvector is installed and `vector_enabled = true`;
+/// otherwise the backend falls back to keyword-only recall and logs a
+/// warning at construction.
 pub struct PostgresMemory {
     client: Arc<Mutex<Client>>,
     qualified_table: String,

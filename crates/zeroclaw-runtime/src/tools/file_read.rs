@@ -6,7 +6,7 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 
 const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Read file contents with path sandboxing
+/// Read file contents with workspace sandboxing.
 pub struct FileReadTool {
     security: Arc<SecurityPolicy>,
 }
@@ -14,6 +14,51 @@ pub struct FileReadTool {
 impl FileReadTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self { security }
+    }
+
+    /// Validate and resolve a caller-supplied path to an absolute candidate.
+    /// Mirrors the logic in `FileWriteTool::resolve_candidate`.
+    fn resolve_candidate(&self, path: &str) -> anyhow::Result<std::path::PathBuf> {
+        let workspace_dir = &self.security.workspace_dir;
+
+        if path.contains('\0') {
+            anyhow::bail!("Path not allowed: contains null byte");
+        }
+        if std::path::Path::new(path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            anyhow::bail!("Path not allowed by security policy: {path}");
+        }
+
+        let p = std::path::Path::new(path);
+        if p.is_absolute() {
+            let workspace_canonical = workspace_dir
+                .canonicalize()
+                .unwrap_or_else(|_| workspace_dir.clone());
+            if p.starts_with(&workspace_canonical) || p.starts_with(workspace_dir.as_path()) {
+                return Ok(p.to_path_buf());
+            }
+            for root in &self.security.allowed_roots {
+                let root_canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                if p.starts_with(&root_canonical) || p.starts_with(root.as_path()) {
+                    return Ok(p.to_path_buf());
+                }
+            }
+            anyhow::bail!("Path not allowed by security policy: {path}");
+        }
+
+        if let Ok(workspace_rootless) = workspace_dir.strip_prefix("/")
+            && let Ok(stripped) = p.strip_prefix(workspace_rootless)
+        {
+            return Ok(if stripped.as_os_str().is_empty() {
+                workspace_dir.clone()
+            } else {
+                workspace_dir.join(stripped)
+            });
+        }
+
+        Ok(workspace_dir.join(p))
     }
 }
 
@@ -33,7 +78,7 @@ impl Tool for FileReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
+                    "description": "Path to the file. Relative paths resolve from workspace root; absolute paths must be within the workspace."
                 },
                 "offset": {
                     "type": "integer",
@@ -62,14 +107,17 @@ impl Tool for FileReadTool {
             });
         }
 
-        // Security check: validate path is within workspace
-        if !self.security.is_path_allowed(path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
-            });
-        }
+        // Validate and build candidate path using workspace_dir directly.
+        let full_path = match self.resolve_candidate(path) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
 
         // Record action BEFORE canonicalization so that every non-trivially-rejected
         // request consumes rate limit budget. This prevents attackers from probing
@@ -82,9 +130,7 @@ impl Tool for FileReadTool {
             });
         }
 
-        let full_path = self.security.resolve_tool_path(path);
-
-        // Resolve path before reading to block symlink escapes.
+        // Canonicalize to resolve symlinks, then enforce workspace boundary.
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(p) => p,
             Err(e) => {
@@ -96,14 +142,24 @@ impl Tool for FileReadTool {
             }
         };
 
-        if !self.security.is_resolved_path_allowed(&resolved_path) {
+        let workspace_canonical = self
+            .security
+            .workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.security.workspace_dir.clone());
+
+        let in_workspace = resolved_path.starts_with(&workspace_canonical);
+        let in_allowed_root = !in_workspace
+            && self.security.allowed_roots.iter().any(|root| {
+                let rc = root.canonicalize().unwrap_or_else(|_| root.clone());
+                resolved_path.starts_with(&rc)
+            });
+
+        if !in_workspace && !in_allowed_root {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(
-                    self.security
-                        .resolved_path_violation_message(&resolved_path),
-                ),
+                error: Some(format!("Path escapes workspace directory: {path}")),
             });
         }
 
@@ -238,36 +294,38 @@ mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
 
-    fn test_security(workspace: std::path::PathBuf) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
+    fn test_tool(workspace: std::path::PathBuf) -> FileReadTool {
+        let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: workspace,
             ..SecurityPolicy::default()
-        })
+        });
+        FileReadTool::new(security)
     }
 
-    fn test_security_with(
+    fn test_tool_with(
         workspace: std::path::PathBuf,
         autonomy: AutonomyLevel,
         max_actions_per_hour: u32,
-    ) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
+    ) -> FileReadTool {
+        let security = Arc::new(SecurityPolicy {
             autonomy,
             workspace_dir: workspace,
             max_actions_per_hour,
             ..SecurityPolicy::default()
-        })
+        });
+        FileReadTool::new(security)
     }
 
     #[test]
     fn file_read_name() {
-        let tool = FileReadTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         assert_eq!(tool.name(), "file_read");
     }
 
     #[test]
     fn file_read_schema_has_path() {
-        let tool = FileReadTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["path"].is_object());
         assert!(schema["properties"]["offset"].is_object());
@@ -296,7 +354,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("1: hello world"));
@@ -312,7 +370,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool.execute(json!({"path": "nope.txt"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("Failed to resolve"));
@@ -326,7 +384,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "../../../etc/passwd"}))
             .await
@@ -339,8 +397,17 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_blocks_absolute_path() {
-        let tool = FileReadTool::new(test_security(std::env::temp_dir()));
-        let result = tool.execute(json!({"path": "/etc/passwd"})).await.unwrap();
+        let tool = test_tool(std::env::temp_dir());
+
+        #[cfg(unix)]
+        let target = "/etc/passwd";
+        #[cfg(windows)]
+        let target = {
+            let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+            std::path::PathBuf::from(sysroot).join(r"System32\drivers\etc\hosts")
+        };
+
+        let result = tool.execute(json!({"path": target})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
     }
@@ -354,11 +421,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileReadTool::new(test_security_with(
-            dir.clone(),
-            AutonomyLevel::Supervised,
-            0,
-        ));
+        let tool = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 0);
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
 
         assert!(!result.success);
@@ -382,7 +445,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileReadTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20));
+        let tool = test_tool_with(dir.clone(), AutonomyLevel::ReadOnly, 20);
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
 
         assert!(result.success);
@@ -393,7 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_missing_path_param() {
-        let tool = FileReadTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
@@ -405,7 +468,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("empty.txt"), "").await.unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool.execute(json!({"path": "empty.txt"})).await.unwrap();
         assert!(result.success);
         assert_eq!(result.output, "");
@@ -424,7 +487,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "sub/dir/deep.txt"}))
             .await
@@ -454,7 +517,7 @@ mod tests {
 
         symlink(outside.join("secret.txt"), workspace.join("escape.txt")).unwrap();
 
-        let tool = FileReadTool::new(test_security(workspace.clone()));
+        let tool = test_tool(workspace.clone());
         let result = tool.execute(json!({"path": "escape.txt"})).await.unwrap();
 
         assert!(!result.success);
@@ -470,8 +533,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_read_outside_workspace_allowed_when_workspace_only_disabled() {
-        let root = std::env::temp_dir().join("zeroclaw_test_file_read_allowed_roots_hint");
+    async fn file_read_blocks_outside_workspace_regardless_of_policy() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_read_blocks_outside");
         let workspace = root.join("workspace");
         let outside = root.join("outside");
         let outside_file = outside.join("notes.txt");
@@ -481,23 +544,15 @@ mod tests {
         tokio::fs::create_dir_all(&outside).await.unwrap();
         tokio::fs::write(&outside_file, "outside").await.unwrap();
 
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace,
-            workspace_only: false,
-            forbidden_paths: vec![],
-            ..SecurityPolicy::default()
-        });
-        let tool = FileReadTool::new(security);
+        let tool = test_tool(workspace.clone());
 
         let result = tool
             .execute(json!({"path": outside_file.to_string_lossy().to_string()}))
             .await
             .unwrap();
 
-        assert!(result.success);
-        assert!(result.error.is_none());
-        assert!(result.output.contains("outside"));
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("not allowed"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
@@ -509,11 +564,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         // Allow only 2 actions total
-        let tool = FileReadTool::new(test_security_with(
-            dir.clone(),
-            AutonomyLevel::Supervised,
-            2,
-        ));
+        let tool = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 2);
 
         // Both reads fail (file doesn't exist) but should consume budget
         let r1 = tool.execute(json!({"path": "nope1.txt"})).await.unwrap();
@@ -545,7 +596,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
 
         // Read lines 2-3
         let result = tool
@@ -599,7 +650,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "short.txt", "offset": 100}))
             .await
@@ -624,7 +675,7 @@ mod tests {
         let big = vec![b'x'; 10 * 1024 * 1024 + 1];
         tokio::fs::write(dir.join("huge.bin"), &big).await.unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool.execute(json!({"path": "huge.bin"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("File too large"));
@@ -640,12 +691,12 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/test_document.pdf");
+            .join("../../tests/fixtures/test_document.pdf");
         tokio::fs::copy(&fixture, dir.join("report.pdf"))
             .await
             .expect("copy PDF fixture");
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool.execute(json!({"path": "report.pdf"})).await.unwrap();
 
         assert!(
@@ -675,7 +726,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool.execute(json!({"path": "data.bin"})).await.unwrap();
 
         assert!(
@@ -731,7 +782,7 @@ mod tests {
                 _system_prompt: Option<&str>,
                 _message: &str,
                 _model: &str,
-                _temperature: f64,
+                _temperature: Option<f64>,
             ) -> anyhow::Result<String> {
                 Ok("fallback".into())
             }
@@ -740,7 +791,7 @@ mod tests {
                 &self,
                 request: ChatRequest<'_>,
                 _model: &str,
-                _temperature: f64,
+                _temperature: Option<f64>,
             ) -> anyhow::Result<ChatResponse> {
                 self.requests
                     .lock()
@@ -789,7 +840,7 @@ mod tests {
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/test_document.pdf");
+            .join("../../tests/fixtures/test_document.pdf");
         tokio::fs::copy(&fixture, workspace.join("report.pdf"))
             .await
             .expect("copy PDF fixture");
@@ -811,6 +862,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "file_read".into(),
                     arguments: r#"{"path": "report.pdf"}"#.into(),
+                    extra_content: None,
                 }],
                 usage: None,
                 reasoning_content: None,
@@ -904,6 +956,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "file_read".into(),
                     arguments: r#"{"path": "data.bin"}"#.into(),
+                    extra_content: None,
                 }],
                 usage: None,
                 reasoning_content: None,
@@ -982,7 +1035,7 @@ mod tests {
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/test_document.pdf");
+            .join("../../tests/fixtures/test_document.pdf");
         tokio::fs::copy(&fixture, workspace.join("report.pdf"))
             .await
             .expect("copy PDF fixture");
@@ -1034,7 +1087,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "test\0evil.txt"}))
             .await

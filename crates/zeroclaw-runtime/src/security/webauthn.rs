@@ -41,7 +41,7 @@ pub struct WebAuthnConfig {
     pub enabled: bool,
     /// Relying Party ID (typically the domain, e.g. "example.com").
     pub rp_id: String,
-    /// Relying Party origin URL (e.g. "https://example.com").
+    /// Relying Party origin URL (e.g. `"https://example.com"`).
     pub rp_origin: String,
     /// Human-readable relying party display name.
     pub rp_name: String,

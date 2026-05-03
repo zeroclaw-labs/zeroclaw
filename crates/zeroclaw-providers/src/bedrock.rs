@@ -22,7 +22,6 @@ const ENDPOINT_PREFIX: &str = "bedrock-runtime";
 /// SigV4 signing service name (AWS uses "bedrock", not "bedrock-runtime").
 const SIGNING_SERVICE: &str = "bedrock";
 const DEFAULT_REGION: &str = "us-east-1";
-const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 // ── Authentication ──────────────────────────────────────────────
 
@@ -375,7 +374,16 @@ enum SystemBlock {
 #[serde(rename_all = "camelCase")]
 struct InferenceConfig {
     max_tokens: u32,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+}
+
+/// Some Bedrock models (the Claude opus-4-7 family) reject `temperature` in
+/// `inferenceConfig` with a 400 "temperature is deprecated for this model".
+/// Substring match covers region/profile prefixes (e.g. `us.anthropic.…`)
+/// and version suffixes (e.g. `-v1:0`).
+fn bedrock_model_omits_temperature(model: &str) -> bool {
+    model.contains("claude-opus-4-7")
 }
 
 #[derive(Debug, Serialize)]
@@ -478,12 +486,12 @@ impl BedrockProvider {
         if let Some(token) = env_optional("BEDROCK_API_KEY") {
             return Self {
                 auth: Some(BedrockAuth::BearerToken(token)),
-                max_tokens: DEFAULT_MAX_TOKENS,
+                max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
             };
         }
         Self {
             auth: AwsCredentials::from_env().ok().map(BedrockAuth::SigV4),
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
         }
     }
 
@@ -492,13 +500,13 @@ impl BedrockProvider {
         if let Some(token) = env_optional("BEDROCK_API_KEY") {
             return Self {
                 auth: Some(BedrockAuth::BearerToken(token)),
-                max_tokens: DEFAULT_MAX_TOKENS,
+                max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
             };
         }
         let auth = AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4);
         Self {
             auth,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
         }
     }
 
@@ -506,7 +514,7 @@ impl BedrockProvider {
     pub fn with_bearer_token(token: &str) -> Self {
         Self {
             auth: Some(BedrockAuth::BearerToken(token.to_string())),
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
         }
     }
 
@@ -948,6 +956,7 @@ impl BedrockProvider {
                                 id: wrapper.tool_use.tool_use_id,
                                 name: wrapper.tool_use.name,
                                 arguments: wrapper.tool_use.input.to_string(),
+                                extra_content: None,
                             });
                         }
                     }
@@ -1106,8 +1115,9 @@ impl Provider for BedrockProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let auth = self.resolve_auth().await?;
 
         let system = system_prompt.map(|text| {
@@ -1133,7 +1143,11 @@ impl Provider for BedrockProvider {
             messages,
             inference_config: Some(InferenceConfig {
                 max_tokens: self.max_tokens,
-                temperature,
+                temperature: if bedrock_model_omits_temperature(model) {
+                    None
+                } else {
+                    Some(temperature)
+                },
             }),
             tool_config: None,
         };
@@ -1149,8 +1163,9 @@ impl Provider for BedrockProvider {
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let auth = self.resolve_auth().await?;
 
         let (system_blocks, mut converse_messages) = Self::convert_messages(request.messages);
@@ -1189,7 +1204,11 @@ impl Provider for BedrockProvider {
             messages: converse_messages,
             inference_config: Some(InferenceConfig {
                 max_tokens: self.max_tokens,
-                temperature,
+                temperature: if bedrock_model_omits_temperature(model) {
+                    None
+                } else {
+                    Some(temperature)
+                },
             }),
             tool_config,
         };
@@ -1376,11 +1395,11 @@ mod tests {
             let _env_lock = env_lock();
             BedrockProvider {
                 auth: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
             }
         };
         let result = provider
-            .chat_with_system(None, "hello", "anthropic.claude-sonnet-4-6", 0.7)
+            .chat_with_system(None, "hello", "anthropic.claude-sonnet-4-6", Some(0.7))
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1605,7 +1624,7 @@ mod tests {
             }],
             inference_config: Some(InferenceConfig {
                 max_tokens: 4096,
-                temperature: 0.7,
+                temperature: Some(0.7),
             }),
             tool_config: None,
         };
@@ -1613,6 +1632,59 @@ mod tests {
         assert!(!json.contains("system"));
         assert!(json.contains("Hello"));
         assert!(json.contains("maxTokens"));
+    }
+
+    // ── Opus 4.7 temperature-omission tests (issue #6095) ────────
+
+    #[test]
+    fn bedrock_model_omits_temperature_matches_opus_4_7() {
+        assert!(bedrock_model_omits_temperature(
+            "us.anthropic.claude-opus-4-7"
+        ));
+        assert!(bedrock_model_omits_temperature(
+            "anthropic.claude-opus-4-7-v1:0"
+        ));
+    }
+
+    #[test]
+    fn bedrock_model_omits_temperature_skips_other_models() {
+        assert!(!bedrock_model_omits_temperature(
+            "us.anthropic.claude-opus-4-6-v1"
+        ));
+        assert!(!bedrock_model_omits_temperature(
+            "us.anthropic.claude-sonnet-4-6-v1"
+        ));
+        assert!(!bedrock_model_omits_temperature(
+            "us.anthropic.claude-haiku-4-5-v1"
+        ));
+    }
+
+    #[test]
+    fn inference_config_serializes_without_temperature_when_none() {
+        let cfg = InferenceConfig {
+            max_tokens: 4096,
+            temperature: None,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("maxTokens"));
+        assert!(
+            !json.contains("temperature"),
+            "expected temperature to be omitted, got: {json}"
+        );
+    }
+
+    #[test]
+    fn inference_config_serializes_with_temperature_when_some() {
+        let cfg = InferenceConfig {
+            max_tokens: 4096,
+            temperature: Some(0.7),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("maxTokens"));
+        assert!(
+            json.contains("temperature"),
+            "expected temperature to be present, got: {json}"
+        );
     }
 
     #[test]
@@ -1716,7 +1788,7 @@ mod tests {
     async fn warmup_without_credentials_is_noop() {
         let provider = BedrockProvider {
             auth: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
         };
         let result = provider.warmup().await;
         assert!(result.is_ok());
@@ -1726,7 +1798,7 @@ mod tests {
     fn capabilities_reports_native_tool_calling() {
         let provider = BedrockProvider {
             auth: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
         };
         let caps = provider.capabilities();
         assert!(caps.native_tool_calling);

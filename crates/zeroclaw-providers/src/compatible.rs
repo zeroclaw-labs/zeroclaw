@@ -48,6 +48,9 @@ pub struct OpenAiCompatibleProvider {
     api_path: Option<String>,
     /// Maximum output tokens to include in API requests.
     max_tokens: Option<u32>,
+    /// models.dev catalog key for this provider (e.g. "xai").
+    /// When set, `list_models` fetches from the models.dev catalog.
+    models_dev_key: Option<String>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -119,6 +122,27 @@ fn apply_auth_to_request(
             Err(_) => req.header("Authorization", format!("Bearer {credential}")),
         },
     }
+}
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
+    let mut ids: Vec<String> = body
+        .data
+        .into_iter()
+        .map(|e| e.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort();
+    ids
 }
 
 impl OpenAiCompatibleProvider {
@@ -246,6 +270,7 @@ impl OpenAiCompatibleProvider {
             reasoning_effort: None,
             api_path: None,
             max_tokens: None,
+            models_dev_key: None,
         }
     }
 
@@ -293,6 +318,13 @@ impl OpenAiCompatibleProvider {
     /// Set the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Set the models.dev catalog key for this provider.
+    /// When set, `list_models` returns the catalog's model list for that key.
+    pub fn with_models_dev_key(mut self, key: &str) -> Self {
+        self.models_dev_key = Some(key.to_string());
         self
     }
 
@@ -672,6 +704,10 @@ struct ToolCall {
         skip_serializing_if = "Option::is_none"
     )]
     parameters: Option<serde_json::Value>,
+
+    /// See [`zeroclaw_api::ToolCall::extra_content`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra_content: Option<serde_json::Value>,
 }
 
 impl ToolCall {
@@ -867,6 +903,8 @@ struct StreamToolCallDelta {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+    #[serde(default)]
+    extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -882,6 +920,7 @@ struct StreamToolCallAccumulator {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    extra_content: Option<serde_json::Value>,
 }
 
 impl StreamToolCallAccumulator {
@@ -909,6 +948,11 @@ impl StreamToolCallAccumulator {
         {
             self.arguments.push_str(arguments_delta);
         }
+
+        // Last-write-wins: signature is opaque and delivered once per call.
+        if let Some(extra) = delta.extra_content.as_ref() {
+            self.extra_content = Some(extra.clone());
+        }
     }
 
     fn into_provider_tool_call(self) -> Option<ProviderToolCall> {
@@ -934,6 +978,7 @@ impl StreamToolCallAccumulator {
             id: self.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             name,
             arguments: normalized_arguments,
+            extra_content: self.extra_content,
         })
     }
 }
@@ -1514,6 +1559,9 @@ impl OpenAiCompatibleProvider {
                             name: None,
                             arguments: None,
                             parameters: None,
+                            // Round-trip extra_content (e.g. Gemini
+                            // thoughtSignature) — dropping it here was the bug.
+                            extra_content: tc.extra_content,
                         })
                         .collect::<Vec<_>>();
 
@@ -1590,30 +1638,51 @@ impl OpenAiCompatibleProvider {
         if self.native_tool_calling {
             return messages.to_vec();
         }
-        messages
-            .iter()
-            .filter_map(|msg| {
-                if msg.role == "tool" {
-                    return None;
+        let intermediate = messages.iter().filter_map(|msg| {
+            if msg.role == "tool" {
+                return None;
+            }
+            if msg.role == "assistant"
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content)
+                && value.get("tool_calls").is_some()
+            {
+                let text = value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                return if text.is_empty() {
+                    None
+                } else {
+                    Some(ChatMessage::assistant(&text))
+                };
+            }
+            Some(msg.clone())
+        });
+
+        // Coalesce adjacent assistant messages.
+        //
+        // A typical trace is:
+        //     user → assistant{content, tool_calls} → tool{result} → assistant{reply}
+        // After the filter_map above the `tool` message is gone and the first
+        // assistant has been rewritten to plain text, leaving two assistant
+        // messages in a row. Providers targeted by the `native_tool_calling =
+        // false` path (Anthropic upstream, MiniMax, and other OpenAI-compat
+        // wrappers) reject consecutive same-role messages with HTTP 400, so we
+        // merge them here. See #5825.
+        let mut coalesced: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+        for msg in intermediate {
+            match coalesced.last_mut() {
+                Some(last) if last.role == "assistant" && msg.role == "assistant" => {
+                    if !last.content.is_empty() && !msg.content.is_empty() {
+                        last.content.push_str("\n\n");
+                    }
+                    last.content.push_str(&msg.content);
                 }
-                if msg.role == "assistant"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content)
-                    && value.get("tool_calls").is_some()
-                {
-                    let text = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    return if text.is_empty() {
-                        None
-                    } else {
-                        Some(ChatMessage::assistant(&text))
-                    };
-                }
-                Some(msg.clone())
-            })
-            .collect()
+                _ => coalesced.push(msg),
+            }
+        }
+        coalesced
     }
 
     fn with_prompt_guided_tool_instructions(
@@ -1668,6 +1737,7 @@ impl OpenAiCompatibleProvider {
                     id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     name,
                     arguments: normalized_arguments,
+                    extra_content: tc.extra_content,
                 })
             })
             .collect::<Vec<_>>();
@@ -1714,13 +1784,42 @@ impl Provider for OpenAiCompatibleProvider {
         }
     }
 
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // When a credential is present, hit the provider's native /models endpoint
+        // (OpenAI-compatible: GET {base_url}/models).
+        if let Some(credential) = self.credential.as_deref() {
+            let url = format!("{}/models", self.base_url);
+            let response = self
+                .apply_auth_header(self.http_client().get(&url), Some(credential))
+                .send()
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("{} model list request failed: {url}: {e}", self.name)
+                })?;
+            if !response.status().is_success() {
+                let status = response.status();
+                anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);
+            }
+            let body: ModelsResponse = response.json().await.map_err(|e| {
+                anyhow::anyhow!("{} model list returned invalid JSON: {e}", self.name)
+            })?;
+            return Ok(normalize_model_ids(body));
+        }
+        // No credential — fall back to the models.dev catalog when available.
+        match &self.models_dev_key {
+            Some(key) => crate::models_dev::list_models_for(key).await,
+            None => anyhow::bail!("live model listing is not supported for this provider"),
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
@@ -1840,8 +1939,9 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
@@ -1940,8 +2040,9 @@ impl Provider for OpenAiCompatibleProvider {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
@@ -1987,7 +2088,9 @@ impl Provider for OpenAiCompatibleProvider {
                     "{} native tool call transport failed: {error}; falling back to history path",
                     self.name
                 );
-                let text = self.chat_with_history(messages, model, temperature).await?;
+                let text = self
+                    .chat_with_history(messages, model, Some(temperature))
+                    .await?;
                 return Ok(ProviderChatResponse {
                     text: Some(text),
                     tool_calls: vec![],
@@ -2029,6 +2132,7 @@ impl Provider for OpenAiCompatibleProvider {
                     id: uuid::Uuid::new_v4().to_string(),
                     name,
                     arguments,
+                    extra_content: tc.extra_content,
                 })
             })
             .collect::<Vec<_>>();
@@ -2045,8 +2149,9 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
@@ -2109,7 +2214,7 @@ impl Provider for OpenAiCompatibleProvider {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
                 let text = self
-                    .chat_with_history(&fallback_messages, model, temperature)
+                    .chat_with_history(&fallback_messages, model, Some(temperature))
                     .await?;
                 return Ok(ProviderChatResponse {
                     text: Some(text),
@@ -2174,13 +2279,14 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
 
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.clone();
 
         let merge = self.effective_merge_system(model);
@@ -2290,9 +2396,10 @@ impl Provider for OpenAiCompatibleProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.clone();
 
         let merge = self.effective_merge_system(model);
@@ -2390,9 +2497,10 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.clone();
 
         let merge = self.effective_merge_system(model);
@@ -2511,13 +2619,29 @@ mod tests {
     #[tokio::test]
     async fn chat_without_key_attempts_request() {
         let p = make_provider("Local", "http://127.0.0.1:1", None);
-        let result = p.chat_with_system(None, "hello", "default", 0.7).await;
+        let result = p
+            .chat_with_system(None, "hello", "default", Some(0.7))
+            .await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
             !err_msg.contains("API key not set"),
             "should not get credential error, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn normalize_model_ids_trims_filters_and_sorts() {
+        let body = serde_json::from_value(serde_json::json!({
+            "data": [
+                {"id": " zeta-model "},
+                {"id": ""},
+                {"id": "alpha-model"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(normalize_model_ids(body), vec!["alpha-model", "zeta-model"]);
     }
 
     #[test]
@@ -2701,7 +2825,7 @@ mod tests {
         ];
 
         for p in providers {
-            let result = p.chat_with_system(None, "test", "model", 0.7).await;
+            let result = p.chat_with_system(None, "test", "model", Some(0.7)).await;
             assert!(result.is_err(), "{} should fail (unreachable host)", p.name);
             let err_msg = result.unwrap_err().to_string();
             assert!(
@@ -3077,6 +3201,7 @@ mod tests {
                 name: None,
                 arguments: None,
                 parameters: None,
+                extra_content: None,
             }]),
             reasoning_content: None,
         };
@@ -3300,21 +3425,32 @@ mod tests {
             AuthStyle::Bearer,
         );
         let stripped = p.strip_native_tool_messages(&messages);
-        assert_eq!(stripped.len(), 5);
+        // tool message dropped; the pre-tool narration and the reply that
+        // follows the tool result are now coalesced into a single assistant
+        // message so the output never contains consecutive assistants (see
+        // #5825).
+        assert_eq!(stripped.len(), 4);
         assert_eq!(stripped[0].role, "system");
         assert_eq!(stripped[1].role, "user");
         assert_eq!(stripped[1].content, "search for cats");
-        // Assistant with tool_calls → plain text with only content
         assert_eq!(stripped[2].role, "assistant");
-        assert_eq!(stripped[2].content, "I'll search");
+        assert!(
+            stripped[2].content.starts_with("I'll search"),
+            "coalesced assistant must preserve the pre-tool narration; got {:?}",
+            stripped[2].content
+        );
+        assert!(
+            stripped[2]
+                .content
+                .contains("Here are the results about cats"),
+            "coalesced assistant must preserve the post-tool reply; got {:?}",
+            stripped[2].content
+        );
         assert!(
             !stripped[2].content.contains("tool_calls"),
             "tool_calls structure must be stripped"
         );
-        // tool message → dropped
-        assert_eq!(stripped[3].role, "assistant");
-        assert_eq!(stripped[3].content, "Here are the results about cats");
-        assert_eq!(stripped[4].role, "user");
+        assert_eq!(stripped[3].role, "user");
     }
 
     #[test]
@@ -3714,7 +3850,9 @@ mod tests {
             }
         })];
 
-        let result = p.chat_with_tools(&messages, &tools, "model", 0.7).await;
+        let result = p
+            .chat_with_tools(&messages, &tools, "model", Some(0.7))
+            .await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -3934,6 +4072,7 @@ mod tests {
             }),
             name: None,
             arguments: None,
+            extra_content: None,
         });
         acc.apply_delta(&StreamToolCallDelta {
             index: Some(0),
@@ -3944,6 +4083,7 @@ mod tests {
             }),
             name: None,
             arguments: None,
+            extra_content: None,
         });
 
         let tool_call = acc
@@ -3992,6 +4132,7 @@ mod tests {
                 name: None,
                 arguments: None,
                 parameters: None,
+                extra_content: None,
             }]),
         };
 
@@ -4171,6 +4312,7 @@ mod tests {
             name: None,
             arguments: None,
             parameters: None,
+            extra_content: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert!(!json.as_object().unwrap().contains_key("name"));
@@ -4192,6 +4334,7 @@ mod tests {
             name: Some("shell".to_string()),
             arguments: Some("{\"command\":\"ls\"}".to_string()),
             parameters: None,
+            extra_content: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert_eq!(json["name"], "shell");
@@ -4275,5 +4418,77 @@ mod tests {
     #[test]
     fn proxy_tool_event_done_sentinel_returns_none() {
         assert!(parse_proxy_tool_event("data: [DONE]").is_none());
+    }
+
+    /// Regression for #5825.
+    ///
+    /// When `native_tool_calling = false`, the filter pass rewrites
+    /// `assistant{tool_calls, content="I'll search"}` into `assistant("I'll
+    /// search")` and drops the following `tool{result}`. That leaves two
+    /// adjacent assistant messages in the output, which providers targeted
+    /// by this path (Anthropic upstream, MiniMax, other OpenAI-compat
+    /// wrappers) reject with HTTP 400.
+    #[test]
+    fn strip_native_tool_messages_coalesces_adjacent_assistants() {
+        let messages = vec![
+            ChatMessage::user("search for cats"),
+            ChatMessage::assistant(
+                r#"{"content":"I'll search","tool_calls":[{"id":"t1","name":"web_search","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"Found 10 results"}"#),
+            ChatMessage::assistant("Here are the results about cats"),
+        ];
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let stripped = p.strip_native_tool_messages(&messages);
+        let roles: Vec<&str> = stripped.iter().map(|m| m.role.as_str()).collect();
+        assert!(
+            !roles.windows(2).any(|w| w[0] == w[1]),
+            "no two consecutive messages should share a role; got {roles:?}"
+        );
+        // Sanity: user turn and merged assistant content both survive.
+        assert_eq!(roles, vec!["user", "assistant"]);
+        assert_eq!(stripped[0].content, "search for cats");
+        assert!(
+            stripped[1].content.contains("I'll search")
+                && stripped[1]
+                    .content
+                    .contains("Here are the results about cats"),
+            "merged assistant should preserve both the pre-tool narration and the final reply; \
+             got {:?}",
+            stripped[1].content
+        );
+    }
+
+    /// Complementary regression for #5825: when the narration content is
+    /// empty, the pre-tool assistant is dropped entirely and no coalesce is
+    /// needed. This test documents that the coalesce pass does not produce
+    /// spurious blank-line concatenation.
+    #[test]
+    fn strip_native_tool_messages_drops_empty_narration_cleanly() {
+        let messages = vec![
+            ChatMessage::user("search for cats"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"t1","name":"web_search","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"Found"}"#),
+            ChatMessage::assistant("Here are the results"),
+        ];
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let stripped = p.strip_native_tool_messages(&messages);
+        assert_eq!(
+            stripped.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["user", "assistant"]
+        );
+        assert_eq!(stripped[1].content, "Here are the results");
     }
 }
