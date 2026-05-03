@@ -387,7 +387,7 @@ fn section_group(key: &str) -> &'static str {
         | "sop"
         | "verifiable_intent" => "Agent",
         // Multi-agent / delegation.
-        "swarms" | "delegate" => "Multi-agent",
+        "delegate" => "Multi-agent",
         // Tool integrations.
         "browser" | "browser_delegate" | "http_request" | "image_gen" | "knowledge"
         | "link_enricher" | "mcp" | "media_pipeline" | "multimodal" | "plugins"

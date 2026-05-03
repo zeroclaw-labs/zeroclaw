@@ -1284,7 +1284,7 @@ guild_id = "12345"
 
 #[test]
 fn v2_swarm_config_dropped_with_no_panic() {
-    // V2 [swarms] are dropped silently; the rest of the config migrates cleanly.
+    // V2 `[swarms]` are dropped silently; the rest of the config migrates cleanly.
     let config = migrate(
         r#"
 api_key = "sk-test"
@@ -1295,7 +1295,6 @@ members = ["agent-a", "agent-b"]
 "#,
     );
 
-    assert!(config.swarms.is_empty());
     assert_eq!(
         config.providers.models["openrouter"]["default"]
             .api_key
@@ -1994,15 +1993,15 @@ memory_namespace = "writer"
 
 #[test]
 fn swarms_v2_dropped() {
-    let config = migrate(
+    // Migration must not panic when given a config with a `[swarms.*]` table.
+    // Swarm support was removed; the table is silently dropped.
+    let _ = migrate(
         r#"
 [swarms.my_swarm]
 strategy = "round_robin"
 members = ["agent_a", "agent_b"]
 "#,
     );
-
-    assert!(config.swarms.is_empty());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

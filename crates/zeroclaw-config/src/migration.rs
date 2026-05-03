@@ -60,6 +60,10 @@ pub const V1_LEGACY_KEYS: &[&str] = &[
     // migration of partially-shaped inputs.
     "autonomy",
     "agent",
+    // Swarm support has been removed; it will return in a future release.
+    // The V2→V3 migration drops `[swarms.*]` tables, but keep this here so
+    // the unknown-key detector doesn't warn before that drop runs.
+    "swarms",
 ];
 
 /// Run `prepare_table` on a raw config TOML string and deserialize the
@@ -824,15 +828,14 @@ fn v2_to_v3_table(table: &mut toml::Table) {
         }
     }
 
-    // Drop V2 [swarms.*] configs. The V3 swarm shape is incompatible and
-    // the migration cannot safely synthesize V3 from V2 swarm definitions.
+    // Drop legacy `[swarms.*]` configs. Swarm support has been removed; it
+    // will return in a follow-up release with a new shape.
     if let Some(toml::Value::Table(swarms)) = table.get("swarms")
         && !swarms.is_empty()
     {
         tracing::warn!(
             "v2→v3 migration: dropping {} swarm configuration(s). \
-             V3 swarms use a new shape — redefine them under [swarms.<alias>] \
-             after upgrading.",
+             Swarm support has been removed and will return in a future release.",
             swarms.len(),
         );
     }

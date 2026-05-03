@@ -643,7 +643,7 @@ pub async fn handle_drift(State(state): State<AppState>, headers: HeaderMap) -> 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct MapKeyQuery {
-    /// Map-keyed section path, e.g. `providers.models`, `agents`, `swarms`.
+    /// Map-keyed section path, e.g. `providers.models`, `agents`, `risk_profiles`.
     pub path: String,
     /// New key to insert under that section, e.g. `anthropic`.
     pub key: String,

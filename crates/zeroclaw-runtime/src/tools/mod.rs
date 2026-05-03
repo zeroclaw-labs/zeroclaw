@@ -102,7 +102,6 @@ pub use zeroclaw_tools::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
 };
-pub use zeroclaw_tools::swarm::SwarmTool;
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
 pub use zeroclaw_tools::weather_tool::WeatherTool;
@@ -900,22 +899,6 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
-
-    // Add swarm tool when swarms are configured
-    if !root_config.swarms.is_empty() {
-        let swarm_agents: HashMap<String, DelegateAgentConfig> = agents
-            .iter()
-            .map(|(name, cfg)| (name.clone(), cfg.clone()))
-            .collect();
-        tool_arcs.push(Arc::new(SwarmTool::new(
-            root_config.swarms.clone(),
-            swarm_agents,
-            delegate_fallback_credential,
-            security.clone(),
-            provider_runtime_options,
-            root_config.providers.models.clone(),
-        )));
-    }
 
     // Workspace management tool (conditionally registered when workspace isolation is enabled)
     if root_config.workspace.enabled {
