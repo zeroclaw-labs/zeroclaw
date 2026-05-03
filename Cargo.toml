@@ -34,6 +34,7 @@ name = "zeroclawlabs"
 # on crates.io. Flip or remove this once the multi-crate publish topology is
 # designed per RFC #5579.
 publish = false
+default-run = "zeroclaw"
 version.workspace = true
 edition.workspace = true
 authors = ["theonlyhennygod"]
