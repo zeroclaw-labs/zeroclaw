@@ -67,6 +67,8 @@ const GLM_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 const GLM_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
 const MOONSHOT_INTL_BASE_URL: &str = "https://api.moonshot.ai/v1";
 const MOONSHOT_CN_BASE_URL: &str = "https://api.moonshot.cn/v1";
+const STEPFUN_CN_BASE_URL: &str = "https://api.stepfun.com/v1";
+const STEPFUN_INTL_BASE_URL: &str = "https://api.stepfun.ai/v1";
 const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
@@ -1693,7 +1695,13 @@ fn create_provider_with_url_and_options(
         // ── Chinese AI providers ─────────────────────────────
         "stepfun" | "step" => Ok(compat(OpenAiCompatibleProvider::new(
             "Stepfun",
-            "https://api.stepfun.com/v1",
+            STEPFUN_CN_BASE_URL,
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "stepfun-intl" | "step-intl" => Ok(compat(OpenAiCompatibleProvider::new(
+            "Stepfun (International)",
+            STEPFUN_INTL_BASE_URL,
             key,
             AuthStyle::Bearer,
         ))),
@@ -2376,6 +2384,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "stepfun",
             display_name: "Stepfun",
             aliases: &["step"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "stepfun-intl",
+            display_name: "Stepfun (International)",
+            aliases: &["step-intl"],
             local: false,
         },
         ProviderInfo {
