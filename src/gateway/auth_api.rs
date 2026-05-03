@@ -703,7 +703,16 @@ pub async fn handle_auth_kakao_callback(
     if !token_resp.status().is_success() {
         let status = token_resp.status();
         let body_text = token_resp.text().await.unwrap_or_default();
-        tracing::error!("Kakao token exchange error ({status}): {body_text}");
+        // SECURITY: Kakao OAuth error responses can include partial token
+        // material, refresh tokens, or PII tied to the failed exchange.
+        // Log the status at error-level (operator-visible) but keep the
+        // body at debug-level only, so it never lands in default log
+        // streams. Operators investigating an outage can flip the level.
+        tracing::error!("Kakao token exchange error: {status}");
+        tracing::debug!(
+            target: "auth.kakao",
+            "Kakao token exchange error body (debug-only, may contain sensitive data): {body_text}"
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": format!("Kakao token exchange failed: {status}") })),
