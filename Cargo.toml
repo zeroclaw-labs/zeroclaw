@@ -94,6 +94,11 @@ hex = "0.4"
 # PBKDF2 for passphrase-based key derivation (patent-specified sync encryption)
 pbkdf2 = { version = "0.12", features = ["simple"] }
 
+# Argon2id for password hashing (modern KDF — replaces iterated SHA-256
+# in `src/auth/store.rs::hash_password`). Memory-hard so GPU-cracking
+# a stolen `users` table is impractical even with the row's salt.
+argon2 = { version = "0.5", default-features = false, features = ["std", "alloc"] }
+
 # CSPRNG for secure token generation
 rand = "0.10"
 

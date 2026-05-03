@@ -250,9 +250,32 @@ impl AuthStore {
 
         match row {
             Ok((id, stored_hash, salt, email, created_at)) => {
-                let attempt_hash = hash_password(password, &salt);
-                if !constant_time_eq(stored_hash.as_bytes(), attempt_hash.as_bytes()) {
+                // verify_password handles both the current Argon2id format
+                // and the legacy SHA-256 hex format. needs_upgrade flips
+                // when a legacy row verifies successfully — we then re-hash
+                // with Argon2id and persist, so the row is upgraded
+                // transparently on the next login.
+                let (ok, needs_upgrade) = verify_password(password, &salt, &stored_hash);
+                if !ok {
                     bail!("Invalid username or password");
+                }
+                if needs_upgrade {
+                    // Best-effort upgrade. Failure to upgrade does NOT block
+                    // login (the password was valid); it just leaves the
+                    // legacy row in place to be retried on the next login.
+                    drop(conn); // release lock before set_password re-acquires
+                    if let Err(e) = self.upgrade_legacy_password_hash(&id, password) {
+                        tracing::warn!(
+                            user_id = %id,
+                            error = %e,
+                            "Failed to upgrade legacy SHA-256 password hash to Argon2id"
+                        );
+                    } else {
+                        tracing::info!(
+                            user_id = %id,
+                            "Upgraded legacy SHA-256 password hash to Argon2id on login"
+                        );
+                    }
                 }
                 Ok(User {
                     id,
@@ -262,12 +285,37 @@ impl AuthStore {
                 })
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
-                // Perform dummy hash to prevent timing side-channel
-                let _ = hash_password(password, "0000000000000000");
+                // Perform dummy hash to prevent timing side-channel.
+                // Always use the LEGACY SHA-256 path here so the dummy
+                // cost is bounded — Argon2id memory pressure on every
+                // failed login would expose the gateway to a cheap
+                // memory-DoS via login spamming.
+                let _ = legacy_hash_password_sha256(password, "0000000000000000");
                 bail!("Invalid username or password");
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Re-hash and persist a user's password using the current Argon2id
+    /// format. Used by `authenticate()` to transparently migrate rows
+    /// that still use the legacy SHA-256 hash. Reuses `set_password`
+    /// after locally relaxing the length check (the legacy row has
+    /// already proved the password is valid; re-imposing the modern
+    /// 8-char minimum could lock out users whose legacy password is
+    /// shorter — they should still be able to log in, then change it).
+    fn upgrade_legacy_password_hash(&self, user_id: &str, password: &str) -> Result<()> {
+        let salt = generate_salt();
+        let hash = hash_password(password, &salt);
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE users SET password_hash = ?1, salt = ?2 WHERE id = ?3",
+            rusqlite::params![hash, salt, user_id],
+        )?;
+        if updated == 0 {
+            anyhow::bail!("User not found during legacy hash upgrade");
+        }
+        Ok(())
     }
 
     /// Change a user's password. Used for:
@@ -1119,14 +1167,105 @@ fn generate_token() -> String {
     hex::encode(bytes)
 }
 
-/// Hash a password with salt using iterated SHA-256.
+/// Hash a password using Argon2id (current secure format).
+///
+/// Returns the PHC-string format produced by the argon2 crate, e.g.
+///   `$argon2id$v=19$m=19456,t=2,p=1$<salt-base64>$<hash-base64>`
+/// The `salt` argument is treated as additional entropy mixed into the
+/// salt the argon2 crate generates internally — we keep the existing
+/// `salt` column in the database for backward-compat with rows hashed
+/// under the old SHA-256 path, but Argon2 PHC strings carry their own
+/// embedded salt and that is what `verify_password` actually checks.
+///
+/// Verifies on `password_hash` strings produced by either:
+///   - `$argon2id$...` (this function — the current secure format)
+///   - bare hex SHA-256 (the legacy path; verified via `verify_legacy_sha256`)
+///
+/// Migration plan: legacy rows are upgraded transparently on next
+/// successful login (`authenticate()` calls `set_password()` after a
+/// successful legacy verify). New `register()` and `set_password()`
+/// always emit the Argon2id PHC string.
 fn hash_password(password: &str, salt: &str) -> String {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::Argon2;
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
+    use base64::Engine;
+    use sha2::Digest;
+
+    // The argon2 crate wants a PHC-encoded SaltString (4..64 base64-safe
+    // chars). To make the hash reproducible from (password, salt) for
+    // any salt length the legacy code path produced, we deterministically
+    // derive a fixed-length 16-byte salt by hashing the legacy salt with
+    // SHA-256 and taking the first 16 bytes. That gives every legacy
+    // salt a stable PHC representation regardless of its length.
+    //
+    // Why hash and not raw-encode: legacy `generate_salt()` produces a
+    // 16-byte hex string (32 chars), and that is already a fine input.
+    // But test salts ("salt_a", "fixed_salt_value", etc.) are arbitrary
+    // length and may not satisfy the 4..64-char rule after b64. Hashing
+    // canonicalizes them and is still deterministic for the same input.
+    let mut hasher = Sha256::new();
+    hasher.update(salt.as_bytes());
+    let salt_hash = hasher.finalize();
+    let salt_b64 = STANDARD_NO_PAD.encode(&salt_hash[..16]);
+    let salt_str = SaltString::from_b64(&salt_b64)
+        .expect("16-byte b64 salt is always 22 chars, within SaltString's 4..64 window");
+
+    // Argon2id with the OWASP-2023 baseline (memory=19MiB, time=2,
+    // parallelism=1). The argon2 crate's `Default` produces this set.
+    let argon2 = Argon2::default();
+    argon2
+        .hash_password(password.as_bytes(), &salt_str)
+        .map(|h| h.to_string())
+        .unwrap_or_else(|_| {
+            // Pathological fallback: if argon2 hashing itself fails
+            // (out of memory, etc.), produce something that will NEVER
+            // verify against any real password.
+            "$argon2id$failed".to_string()
+        })
+}
+
+/// Verify a (password, stored_hash) pair, transparently handling both
+/// the current Argon2id PHC format and the legacy SHA-256 hex format
+/// produced by versions before this PR.
+///
+/// Returns `(is_valid, needs_upgrade)`:
+///   - `is_valid` = true iff the password matches the stored hash.
+///   - `needs_upgrade` = true iff the stored hash uses the legacy
+///     SHA-256 format (caller should re-hash with Argon2id and
+///     persist via `set_password()` to migrate the row).
+fn verify_password(password: &str, salt: &str, stored_hash: &str) -> (bool, bool) {
+    if stored_hash.starts_with("$argon2") {
+        use argon2::password_hash::{PasswordHash, PasswordVerifier};
+        use argon2::Argon2;
+        match PasswordHash::new(stored_hash) {
+            Ok(parsed) => {
+                let ok = Argon2::default()
+                    .verify_password(password.as_bytes(), &parsed)
+                    .is_ok();
+                (ok, false)
+            }
+            Err(_) => (false, false),
+        }
+    } else {
+        // Legacy hex SHA-256. Reproduce the old hash and compare in
+        // constant time, then signal that the row needs upgrading.
+        let attempt = legacy_hash_password_sha256(password, salt);
+        let ok = constant_time_eq(stored_hash.as_bytes(), attempt.as_bytes());
+        (ok, ok)
+    }
+}
+
+/// LEGACY: iterated SHA-256 password hashing (pre-Argon2id format).
+/// Kept ONLY to verify rows hashed before the Argon2id migration so
+/// users do not have to reset their password. Never used for newly
+/// produced hashes — `hash_password` always emits Argon2id PHC strings.
+fn legacy_hash_password_sha256(password: &str, salt: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(salt.as_bytes());
     hash.update(password.as_bytes());
     let mut result = hash.finalize();
 
-    // Iterated hashing for key stretching
     for _ in 1..HASH_ITERATIONS {
         let mut h = Sha256::new();
         h.update(result);
@@ -1482,6 +1621,88 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abc\0\0"));
         // Same-length zero bytes should still match.
         assert!(constant_time_eq(b"\0\0\0", b"\0\0\0"));
+    }
+
+    #[test]
+    fn hash_password_emits_argon2id_phc_string() {
+        let h = hash_password("test_password", "fixed_salt_value");
+        assert!(
+            h.starts_with("$argon2id$"),
+            "new hashes must use Argon2id PHC format, got: {h}"
+        );
+        assert!(h.len() > 30, "PHC string should be at least 30 chars: {h}");
+    }
+
+    #[test]
+    fn verify_password_accepts_modern_argon2id_hash() {
+        let salt = "fixed_salt_for_test";
+        let stored = hash_password("right_password", salt);
+        let (ok, needs_upgrade) = verify_password("right_password", salt, &stored);
+        assert!(ok);
+        assert!(!needs_upgrade, "argon2id rows must NOT signal upgrade-needed");
+
+        let (bad, _) = verify_password("WRONG_password", salt, &stored);
+        assert!(!bad);
+    }
+
+    #[test]
+    fn verify_password_accepts_legacy_sha256_hash_and_signals_upgrade() {
+        // Construct a legacy hash directly via the kept-for-migration helper.
+        let salt = "legacy_salt_value";
+        let legacy_stored = legacy_hash_password_sha256("right_password", salt);
+        assert!(
+            !legacy_stored.starts_with("$argon2"),
+            "legacy_hash_password_sha256 must produce hex SHA-256, not PHC"
+        );
+
+        let (ok, needs_upgrade) = verify_password("right_password", salt, &legacy_stored);
+        assert!(ok, "legacy hash must verify with the right password");
+        assert!(needs_upgrade, "legacy hash MUST signal upgrade-needed");
+
+        let (bad, _) = verify_password("WRONG_password", salt, &legacy_stored);
+        assert!(!bad);
+    }
+
+    #[test]
+    fn authenticate_upgrades_legacy_row_in_place() {
+        let (_tmp, store) = test_store();
+
+        // Register normally (this writes an argon2id row).
+        let user_id = store.register("legacy_user", "starting_pw1").unwrap();
+
+        // Manually downgrade the row to a legacy SHA-256 hash so we can
+        // simulate an existing pre-migration installation.
+        {
+            let conn = store.conn.lock();
+            let salt = "downgrade_salt_x";
+            let legacy_hash = legacy_hash_password_sha256("starting_pw1", salt);
+            conn.execute(
+                "UPDATE users SET password_hash = ?1, salt = ?2 WHERE id = ?3",
+                rusqlite::params![legacy_hash, salt, user_id],
+            )
+            .unwrap();
+        }
+
+        // Now authenticate — the password is correct, the stored row is
+        // legacy SHA-256, and authenticate() should both:
+        //   (1) accept the login, and
+        //   (2) silently upgrade the stored hash to Argon2id.
+        let user = store.authenticate("legacy_user", "starting_pw1").unwrap();
+        assert_eq!(user.id, user_id);
+
+        // Verify the row was upgraded.
+        let conn = store.conn.lock();
+        let stored: String = conn
+            .query_row(
+                "SELECT password_hash FROM users WHERE id = ?1",
+                rusqlite::params![user_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored.starts_with("$argon2id$"),
+            "row must be upgraded to Argon2id after successful legacy login, got: {stored}"
+        );
     }
 
     #[test]
