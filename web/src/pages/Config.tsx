@@ -491,7 +491,12 @@ function AliasListView({
     setLoading(true);
     getMapKeys(mapPath)
       .then((r) => { if (!cancelled) setAliases(r.keys); })
-      .catch(() => { if (!cancelled) setAliases([]); })
+      .catch((e) => {
+        if (!cancelled) {
+          setAliases([]);
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [mapPath]);
