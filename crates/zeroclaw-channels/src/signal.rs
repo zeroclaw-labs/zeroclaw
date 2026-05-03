@@ -72,12 +72,46 @@ struct DataMessage {
     group_info: Option<GroupInfo>,
     #[serde(default)]
     attachments: Option<Vec<serde_json::Value>>,
+    /// Poll-vote payload. signal-cli-rest-api surfaces poll responses
+    /// as `pollAnswer` on the inbound dataMessage; without this field
+    /// the deserializer silently dropped the data and consumers never
+    /// learned the user voted. Calciforge needs this to wire poll
+    /// rendering back to its agent-facing `ChoiceControl` flow.
+    #[serde(rename = "pollAnswer", default)]
+    poll_answer: Option<PollAnswer>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GroupInfo {
     #[serde(rename = "groupId", default)]
     group_id: Option<String>,
+}
+
+/// Inbound poll-vote payload.
+///
+/// signal-cli's JSON wraps the answer as the indices and (when
+/// `displayName` resolution succeeded server-side) the option titles.
+/// We accept both because we want the title for round-tripping the
+/// option's identifier back to the agent layer, but indices are a
+/// fallback when titles aren't materialized.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PollAnswer {
+    /// Server-assigned poll id this answer is for. Useful when the
+    /// agent layer needs to correlate this vote with the specific
+    /// poll it sent (multiple polls may be in flight per chat).
+    #[serde(rename = "pollId", default)]
+    pub poll_id: Option<u64>,
+    /// 0-based indices of the options the user selected. Single-choice
+    /// polls (the common case for agent prompts) yield a 1-element
+    /// vec; multi-select would yield more.
+    #[serde(rename = "selectedIndices", default)]
+    pub selected_indices: Vec<u32>,
+    /// Display titles of the selected options, if signal-cli expanded
+    /// them. May be empty in older signal-cli builds; consumers should
+    /// fall back to `selected_indices` against the original poll's
+    /// option list.
+    #[serde(rename = "selectedTitles", default)]
+    pub selected_titles: Vec<String>,
 }
 
 impl SignalChannel {
@@ -244,6 +278,15 @@ impl SignalChannel {
     }
 
     /// Process a single SSE envelope, returning a ChannelMessage if valid.
+    ///
+    /// Inbound shape may be plain text (`dataMessage.message`) OR a
+    /// poll-vote (`dataMessage.pollAnswer`). For poll-votes we emit a
+    /// synthetic message whose `content` is a documented sentinel:
+    /// `"[choice]<selected-title>"`. Calciforge's dispatcher recognises
+    /// the sentinel and resolves it back to the originating
+    /// `ChoiceOption.callback_data` / `command`. Consumers that don't
+    /// care about poll votes get the raw text path; the sentinel format
+    /// is documented so they can grep for and ignore it as needed.
     fn process_envelope(&self, envelope: &Envelope) -> Option<ChannelMessage> {
         // Skip story messages when configured
         if self.ignore_stories && envelope.story_message.is_some() {
@@ -255,12 +298,36 @@ impl SignalChannel {
         // Skip attachment-only messages when configured
         if self.ignore_attachments {
             let has_attachments = data_msg.attachments.as_ref().is_some_and(|a| !a.is_empty());
-            if has_attachments && data_msg.message.is_none() {
+            if has_attachments && data_msg.message.is_none() && data_msg.poll_answer.is_none() {
                 return None;
             }
         }
 
-        let text = data_msg.message.as_deref().filter(|t| !t.is_empty())?;
+        // Poll-vote branch: surface the user's selection as a synthetic
+        // message so the dispatcher's text-fallback matcher can resolve
+        // it. We prefer the title (round-trips back to ChoiceOption.label)
+        // and fall back to "[choice-index]N" so the matcher's number
+        // tier can still pick a match against the original control.
+        let poll_text: Option<String> = data_msg.poll_answer.as_ref().and_then(|pa| {
+            pa.selected_titles
+                .first()
+                .cloned()
+                .map(|title| format!("[choice]{title}"))
+                .or_else(|| {
+                    pa.selected_indices
+                        .first()
+                        .map(|idx| format!("[choice-index]{}", idx + 1))
+                })
+        });
+
+        let text: String = match poll_text {
+            Some(t) => t,
+            None => data_msg
+                .message
+                .as_deref()
+                .filter(|t| !t.is_empty())?
+                .to_string(),
+        };
         let sender = Self::sender(envelope)?;
 
         if !self.is_sender_allowed(&sender) {
@@ -290,13 +357,77 @@ impl SignalChannel {
             id: format!("sig_{timestamp}"),
             sender: sender.clone(),
             reply_target: target,
-            content: text.to_string(),
+            content: text,
             channel: "signal".to_string(),
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
         })
+    }
+
+    /// Send a multiple-choice poll to `recipient` (E.164 number, UUID,
+    /// or `group:<id>`).
+    ///
+    /// Sent via signal-cli-rest-api `/v2/send` with `pollDetails`.
+    /// The poll renders as native UI in modern Signal clients and
+    /// emits a `pollAnswer` event back through the SSE stream when
+    /// the user votes — see `process_envelope` for how that flows back
+    /// to consumers as a synthetic `[choice]<title>` `ChannelMessage`.
+    ///
+    /// `multiple_choice = false` → single-select poll (the common case
+    /// for "pick one of N" agent prompts). Pass `true` to allow
+    /// multi-select.
+    pub async fn send_poll(
+        &self,
+        recipient: &str,
+        question: &str,
+        options: &[String],
+        multiple_choice: bool,
+    ) -> anyhow::Result<()> {
+        if options.len() < 2 {
+            anyhow::bail!(
+                "Signal poll requires at least 2 options (got {}); render as text instead",
+                options.len()
+            );
+        }
+        let url = format!("{}/v2/send", self.http_url);
+        let body = match Self::parse_recipient_target(recipient) {
+            RecipientTarget::Direct(number) => serde_json::json!({
+                "number": &self.account,
+                "recipients": [number],
+                "message": "",
+                "pollDetails": {
+                    "question": question,
+                    "options": options,
+                    "multiple_choice": multiple_choice,
+                },
+            }),
+            RecipientTarget::Group(group_id) => serde_json::json!({
+                "number": &self.account,
+                "recipients": [format!("group.{group_id}")],
+                "message": "",
+                "pollDetails": {
+                    "question": question,
+                    "options": options,
+                    "multiple_choice": multiple_choice,
+                },
+            }),
+        };
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Signal send_poll request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Signal send_poll {} returned {}: {}", url, status, text);
+        }
+        Ok(())
     }
 }
 
