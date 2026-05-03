@@ -706,22 +706,6 @@ async fn workspace(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
 
 async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<Nav> {
     ui.heading(1, "Providers");
-    if flags.provider.is_none() && flags.api_key.is_none() && flags.model.is_none() {
-        match skip_if_configured(
-            cfg,
-            ui,
-            flags,
-            "providers",
-            "Providers",
-            section_has_signal(cfg, "providers"),
-        )
-        .await?
-        {
-            SkipNav::Skip => return Ok(Nav::Done),
-            SkipNav::Back => return Ok(Nav::Back),
-            SkipNav::Enter => {}
-        }
-    }
     // Surface both auth paths up front so users with an existing key go
     // straight to the api_key prompt, and users on OAuth-only providers
     // (Codex, Claude Code, etc.) know to use the separate login flow.
@@ -788,41 +772,59 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
             }
         };
 
-        // Prompt for an alias name so multiple entries of the same provider
-        // type can coexist (e.g. "work" and "personal" for anthropic).
-        // When --provider is forced via CLI flags we skip the alias prompt
-        // and fall back to "default" so non-interactive callers keep working.
+        // When --provider is forced via CLI flags skip the alias prompt.
+        // Otherwise show existing aliases as a selectable list with "+ Add new".
         let alias = if flags.provider.is_some() {
             "default".to_string()
         } else {
             let existing_aliases: Vec<String> = cfg
-                .providers
-                .models
-                .get(&picked)
-                .map(|m| m.keys().cloned().collect())
+                .get_map_keys(&format!("providers.models.{picked}"))
                 .unwrap_or_default();
-            let suggestion = if existing_aliases.is_empty() {
-                "default".to_string()
-            } else {
-                format!("{}-2", existing_aliases[0])
-            };
-            match ui
-                .string("Alias (name for this configuration)", Some(&suggestion))
-                .await?
-            {
-                Answer::Back => {
-                    if flags.provider.is_some() {
-                        return Ok(Nav::Back);
+            if existing_aliases.is_empty() {
+                let suggestion = "default".to_string();
+                match ui
+                    .string("Alias (name for this configuration)", Some(&suggestion))
+                    .await?
+                {
+                    Answer::Back => continue,
+                    Answer::Value(s) => {
+                        let trimmed = s.trim().to_string();
+                        if trimmed.is_empty() {
+                            suggestion
+                        } else {
+                            trimmed
+                        }
                     }
-                    continue;
                 }
-                Answer::Value(s) => {
-                    let trimmed = s.trim().to_string();
-                    if trimmed.is_empty() {
-                        suggestion
-                    } else {
-                        trimmed
+            } else {
+                let mut alias_options: Vec<SelectItem> = existing_aliases
+                    .iter()
+                    .map(|a| SelectItem::new(a.clone()))
+                    .collect();
+                let add_new_idx = alias_options.len();
+                alias_options.push(SelectItem::new("+ Add new"));
+                let alias_idx = match ui.select("Alias", &alias_options, Some(0)).await? {
+                    Answer::Back => continue,
+                    Answer::Value(i) => i,
+                };
+                if alias_idx == add_new_idx {
+                    let suggestion = format!("{}-2", existing_aliases[0]);
+                    match ui
+                        .string("Alias (name for this configuration)", Some(&suggestion))
+                        .await?
+                    {
+                        Answer::Back => continue,
+                        Answer::Value(s) => {
+                            let trimmed = s.trim().to_string();
+                            if trimmed.is_empty() {
+                                suggestion
+                            } else {
+                                trimmed
+                            }
+                        }
                     }
+                } else {
+                    existing_aliases[alias_idx].clone()
                 }
             }
         };
@@ -1100,22 +1102,8 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, provider: &str) 
     Ok(Nav::Done)
 }
 
-async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<Nav> {
+async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> Result<Nav> {
     ui.heading(1, "Channels");
-    match skip_if_configured(
-        cfg,
-        ui,
-        flags,
-        "channels",
-        "Channels",
-        section_has_signal(cfg, "channels"),
-    )
-    .await?
-    {
-        SkipNav::Skip => return Ok(Nav::Done),
-        SkipNav::Back => return Ok(Nav::Back),
-        SkipNav::Enter => {}
-    }
     loop {
         // Master list of all channels that exist in the schema, derived from
         // the static map_key_sections() metadata. Feature-gated channels drop
@@ -1179,36 +1167,55 @@ async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Re
         }
 
         let picked = &all_channels[idx];
-        // Prompt for an alias so multiple instances of the same channel type
-        // can coexist (e.g. "team-slack" and "alerts-slack" for slack).
+        // Show existing aliases as selectable; "+ Add new" appended at the end.
         let existing_aliases: Vec<String> = cfg
-            .prop_fields()
-            .into_iter()
-            .filter_map(|f| {
-                f.name
-                    .strip_prefix(&format!("channels.{picked}."))
-                    .and_then(|rest| rest.split('.').next().map(String::from))
-            })
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let suggestion = if existing_aliases.is_empty() {
-            "default".to_string()
-        } else {
-            format!("{}-2", existing_aliases[0])
-        };
-        let alias = match ui
-            .string("Alias (name for this configuration)", Some(&suggestion))
-            .await?
-        {
-            Answer::Back => continue,
-            Answer::Value(s) => {
-                let trimmed = s.trim().to_string();
-                if trimmed.is_empty() {
-                    suggestion
-                } else {
-                    trimmed
+            .get_map_keys(&format!("channels.{picked}"))
+            .unwrap_or_default();
+        let alias = if existing_aliases.is_empty() {
+            let suggestion = "default".to_string();
+            match ui
+                .string("Alias (name for this configuration)", Some(&suggestion))
+                .await?
+            {
+                Answer::Back => continue,
+                Answer::Value(s) => {
+                    let trimmed = s.trim().to_string();
+                    if trimmed.is_empty() {
+                        suggestion
+                    } else {
+                        trimmed
+                    }
                 }
+            }
+        } else {
+            let mut alias_options: Vec<SelectItem> = existing_aliases
+                .iter()
+                .map(|a| SelectItem::new(a.clone()))
+                .collect();
+            let add_new_idx = alias_options.len();
+            alias_options.push(SelectItem::new("+ Add new"));
+            let alias_idx = match ui.select("Alias", &alias_options, Some(0)).await? {
+                Answer::Back => continue,
+                Answer::Value(i) => i,
+            };
+            if alias_idx == add_new_idx {
+                let suggestion = format!("{}-2", existing_aliases[0]);
+                match ui
+                    .string("Alias (name for this configuration)", Some(&suggestion))
+                    .await?
+                {
+                    Answer::Back => continue,
+                    Answer::Value(s) => {
+                        let trimmed = s.trim().to_string();
+                        if trimmed.is_empty() {
+                            suggestion
+                        } else {
+                            trimmed
+                        }
+                    }
+                }
+            } else {
+                existing_aliases[alias_idx].clone()
             }
         };
         cfg.create_map_key(&format!("channels.{picked}"), &alias)
