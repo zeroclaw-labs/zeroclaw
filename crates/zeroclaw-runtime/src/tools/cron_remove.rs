@@ -126,10 +126,7 @@ mod tests {
     }
 
     fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::from_config(
-            &cfg.autonomy,
-            &cfg.workspace_dir,
-        ))
+        Arc::new(SecurityPolicy::from_config(cfg, None))
     }
 
     #[tokio::test]
@@ -170,7 +167,11 @@ mod tests {
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
-        config.autonomy.level = AutonomyLevel::ReadOnly;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = AutonomyLevel::ReadOnly;
         let cfg = Arc::new(config);
         let tool = CronRemoveTool::new(cfg.clone(), test_security(&cfg));
 
@@ -187,8 +188,16 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.level = AutonomyLevel::Full;
-        config.autonomy.max_actions_per_hour = 0;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = AutonomyLevel::Full;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .max_actions_per_hour = 0;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let cfg = Arc::new(config);
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();

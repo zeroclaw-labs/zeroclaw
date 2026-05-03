@@ -89,11 +89,6 @@ pub struct Config {
     #[nested]
     pub observability: ObservabilityConfig,
 
-    /// Autonomy and security policy configuration (`[autonomy]`).
-    #[serde(default)]
-    #[nested]
-    pub autonomy: AutonomyConfig,
-
     /// Trust scoring and regression detection configuration (`[trust]`).
     #[serde(default)]
     #[nested]
@@ -860,6 +855,35 @@ impl Config {
         self.agents
             .get("default")
             .unwrap_or_else(|| FALLBACK.get_or_init(DelegateAgentConfig::default))
+    }
+
+    /// Resolve the active risk profile for a given agent or non-agent context.
+    ///
+    /// V3 collapses V2's global `[autonomy]` config onto per-agent
+    /// `[risk_profiles.<alias>]` entries. Each agent's `risk_profile` field
+    /// names the profile that gates its actions. Non-agent contexts (cron
+    /// runtime, orchestrator startup) resolve via `agent_alias = None`,
+    /// which returns the conventional `risk_profiles["default"]`.
+    ///
+    /// Falls back to a static `RiskProfileConfig::default()` when neither the
+    /// agent's profile nor the default exists. This mirrors `default_agent`
+    /// — fresh installs get safe defaults rather than panicking.
+    #[must_use]
+    pub fn active_risk_profile(&self, agent_alias: Option<&str>) -> &RiskProfileConfig {
+        use std::sync::OnceLock;
+        static FALLBACK: OnceLock<RiskProfileConfig> = OnceLock::new();
+
+        if let Some(alias) = agent_alias
+            && let Some(agent) = self.agents.get(alias)
+            && !agent.risk_profile.trim().is_empty()
+            && let Some(profile) = self.risk_profiles.get(&agent.risk_profile)
+        {
+            return profile;
+        }
+
+        self.risk_profiles
+            .get("default")
+            .unwrap_or_else(|| FALLBACK.get_or_init(RiskProfileConfig::default))
     }
 
     /// Resolve the active storage backend for the memory subsystem.
@@ -5646,71 +5670,13 @@ impl Default for WebhookAuditConfig {
 }
 
 // ── Autonomy / Security ──────────────────────────────────────────
-
-/// Autonomy and security policy configuration (`[autonomy]` section).
-///
-/// Controls what the agent is allowed to do: shell commands, filesystem access,
-/// risk approval gates, and per-policy budgets.
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "autonomy"]
-#[serde(default)]
-pub struct AutonomyConfig {
-    /// Autonomy level: `read_only`, `supervised` (default), or `full`.
-    pub level: AutonomyLevel,
-    /// Restrict absolute filesystem paths to workspace-relative references. Default: `true`.
-    /// Resolved paths outside the workspace still require `allowed_roots`.
-    pub workspace_only: bool,
-    /// Allowlist of executable names permitted for shell execution.
-    pub allowed_commands: Vec<String>,
-    /// Explicit path denylist. Default includes system-critical paths and sensitive dotdirs.
-    pub forbidden_paths: Vec<String>,
-    /// Maximum actions allowed per hour per policy. Default: `100`.
-    pub max_actions_per_hour: u32,
-    /// Maximum cost per day in cents per policy. Default: `1000`.
-    pub max_cost_per_day_cents: u32,
-
-    /// Require explicit approval for medium-risk shell commands.
-    #[serde(default = "default_true")]
-    pub require_approval_for_medium_risk: bool,
-
-    /// Block high-risk shell commands even if allowlisted.
-    #[serde(default = "default_true")]
-    pub block_high_risk_commands: bool,
-
-    /// Additional environment variables allowed for shell tool subprocesses.
-    ///
-    /// These names are explicitly allowlisted and merged with the built-in safe
-    /// baseline (`PATH`, `HOME`, etc.) after `env_clear()`.
-    #[serde(default)]
-    pub shell_env_passthrough: Vec<String>,
-
-    /// Tools that never require approval (e.g. read-only tools).
-    #[serde(default = "default_auto_approve")]
-    pub auto_approve: Vec<String>,
-
-    /// Tools that always require interactive approval, even after "Always".
-    #[serde(default = "default_always_ask")]
-    pub always_ask: Vec<String>,
-
-    /// Extra directory roots the agent may read/write outside the workspace.
-    /// Supports absolute, `~/...`, and workspace-relative entries.
-    /// Resolved paths under any of these roots pass `is_resolved_path_allowed`.
-    #[serde(default)]
-    pub allowed_roots: Vec<String>,
-
-    /// Tools to exclude from non-CLI channels (e.g. Telegram, Discord).
-    ///
-    /// When a tool is listed here, non-CLI channels will not expose it to the
-    /// model in tool specs.
-    #[serde(default)]
-    pub non_cli_excluded_tools: Vec<String>,
-
-    /// Timeout in seconds for shell tool subprocesses. Default: 60.
-    #[serde(default = "default_shell_timeout_secs")]
-    pub shell_timeout_secs: u64,
-}
+//
+// V3: V2's global `[autonomy]` table is gone. All policy fields live on
+// per-agent `[risk_profiles.<alias>]` entries (see `RiskProfileConfig`
+// below); the migration synthesizes `risk_profiles.default` from V2's
+// `[autonomy] + [security.sandbox] + [security.resources]` blocks.
+// `Config::active_risk_profile(agent_alias)` resolves the active profile
+// for any callsite (agent-driven or non-agent contexts).
 
 fn default_shell_timeout_secs() -> u64 {
     60
@@ -5736,7 +5702,7 @@ fn default_always_ask() -> Vec<String> {
     vec![]
 }
 
-impl AutonomyConfig {
+impl RiskProfileConfig {
     /// Merge the built-in default `auto_approve` entries into the current
     /// list, preserving any user-supplied additions.
     pub fn ensure_default_auto_approve(&mut self) {
@@ -5758,35 +5724,18 @@ fn is_valid_env_var_name(name: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-impl Default for AutonomyConfig {
-    fn default() -> Self {
-        Self {
-            level: AutonomyLevel::Supervised,
-            workspace_only: true,
-            allowed_commands: crate::policy::default_allowed_commands(),
-            forbidden_paths: crate::policy::default_forbidden_paths(),
-            max_actions_per_hour: 20,
-            max_cost_per_day_cents: 500,
-            require_approval_for_medium_risk: true,
-            block_high_risk_commands: true,
-            shell_env_passthrough: vec![],
-            auto_approve: default_auto_approve(),
-            always_ask: default_always_ask(),
-            allowed_roots: Vec::new(),
-            non_cli_excluded_tools: Vec::new(),
-            shell_timeout_secs: default_shell_timeout_secs(),
-        }
-    }
-}
-
 // ── Profiles & Bundles ───────────────────────────────────────────
 
 /// Named risk/autonomy profile (`[risk_profiles.<alias>]`).
 ///
-/// Defines a reusable policy that agents, channels, or swarm members can
-/// reference by alias. Fields mirror `[autonomy]`; an empty list means
-/// "inherit from the active `[autonomy]` config at the point of application".
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+/// V3 unified policy surface. Replaces V2's global `[autonomy]` table:
+/// agents reference a profile by alias, the runtime resolves through it
+/// for shell command allowlists, approval gates, sandbox/resource limits,
+/// and delegation guardrails. The conventional `risk_profiles["default"]`
+/// is the resolution target for non-agent contexts (orchestrator init,
+/// cron worker startup); the `Default` impl below mirrors V2's
+/// safety-first defaults so a fresh install behaves the same.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "risk-profile"]
 #[serde(default)]
@@ -5842,6 +5791,37 @@ pub struct RiskProfileConfig {
     pub delegation_timeout_secs: Option<u64>,
     /// Agentic delegate run timeout in seconds. `None` inherits global.
     pub agentic_timeout_secs: Option<u64>,
+}
+
+impl Default for RiskProfileConfig {
+    fn default() -> Self {
+        Self {
+            level: AutonomyLevel::Supervised,
+            workspace_only: true,
+            allowed_commands: crate::policy::default_allowed_commands(),
+            forbidden_paths: crate::policy::default_forbidden_paths(),
+            max_actions_per_hour: 20,
+            max_cost_per_day_cents: 500,
+            require_approval_for_medium_risk: true,
+            block_high_risk_commands: true,
+            shell_env_passthrough: vec![],
+            auto_approve: default_auto_approve(),
+            always_ask: default_always_ask(),
+            allowed_roots: Vec::new(),
+            excluded_tools: Vec::new(),
+            shell_timeout_secs: default_shell_timeout_secs(),
+            sandbox_enabled: None,
+            sandbox_backend: None,
+            firejail_args: Vec::new(),
+            max_memory_mb: 0,
+            max_cpu_time_seconds: 0,
+            max_subprocesses: 0,
+            memory_monitoring: false,
+            max_delegation_depth: 0,
+            delegation_timeout_secs: None,
+            agentic_timeout_secs: None,
+        }
+    }
 }
 
 /// Named runtime/LLM execution profile (`[runtime_profiles.<alias>]`).
@@ -9622,7 +9602,6 @@ impl Default for Config {
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::ProvidersConfig::default(),
             observability: ObservabilityConfig::default(),
-            autonomy: AutonomyConfig::default(),
             trust: crate::scattered_types::TrustConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
@@ -10244,7 +10223,11 @@ impl Config {
             // Users who want to require approval for a default tool can
             // add it to `always_ask`, which takes precedence over
             // `auto_approve` in the approval decision (see approval/mod.rs).
-            config.autonomy.ensure_default_auto_approve();
+            config
+                .risk_profiles
+                .entry("default".to_string())
+                .or_default()
+                .ensure_default_auto_approve();
 
             // Detect unknown top-level config keys by comparing the raw
             // TOML table keys against what Config actually deserializes.
@@ -10394,18 +10377,21 @@ impl Config {
             }
         }
 
-        // Autonomy
-        if self.autonomy.max_actions_per_hour == 0 {
+        // Autonomy is enforced through per-agent risk_profiles in V3. Validate the
+        // active default profile if present; per-agent overrides validate against
+        // the same constraints when looked up at runtime.
+        let active_profile = self.active_risk_profile(None);
+        if active_profile.max_actions_per_hour == 0 {
             validation_bail!(
                 InvalidNumericRange,
-                "autonomy.max_actions_per_hour",
-                "autonomy.max_actions_per_hour must be greater than 0"
+                "risk_profiles.default.max_actions_per_hour",
+                "risk_profiles.default.max_actions_per_hour must be greater than 0"
             );
         }
-        for (i, env_name) in self.autonomy.shell_env_passthrough.iter().enumerate() {
+        for (i, env_name) in active_profile.shell_env_passthrough.iter().enumerate() {
             if !is_valid_env_var_name(env_name) {
                 anyhow::bail!(
-                    "autonomy.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
+                    "risk_profiles.default.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
                 );
             }
         }
@@ -11570,7 +11556,11 @@ mod tests {
         // be exercised against the typed deserializer without losing
         // sections that V2→V3 strips.
         let mut config: Config = toml::from_str(&merged).unwrap();
-        config.autonomy.ensure_default_auto_approve();
+        config
+            .risk_profiles
+            .entry("default".to_string())
+            .or_default()
+            .ensure_default_auto_approve();
         config
     }
 
@@ -11708,8 +11698,8 @@ mod tests {
     }
 
     #[test]
-    async fn autonomy_config_default() {
-        let a = AutonomyConfig::default();
+    async fn risk_profile_default_mirrors_v2_autonomy_safety_defaults() {
+        let a = RiskProfileConfig::default();
         assert_eq!(a.level, AutonomyLevel::Supervised);
         assert!(a.workspace_only);
         assert!(a.allowed_commands.contains(&"git".to_string()));
@@ -11965,21 +11955,29 @@ auto_save = true
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
             },
-            autonomy: AutonomyConfig {
-                level: AutonomyLevel::Full,
-                workspace_only: false,
-                allowed_commands: vec!["docker".into()],
-                forbidden_paths: vec!["/secret".into()],
-                max_actions_per_hour: 50,
-                max_cost_per_day_cents: 1000,
-                require_approval_for_medium_risk: false,
-                block_high_risk_commands: true,
-                shell_env_passthrough: vec!["DATABASE_URL".into()],
-                auto_approve: vec!["file_read".into()],
-                always_ask: vec![],
-                allowed_roots: vec![],
-                non_cli_excluded_tools: vec![],
-                shell_timeout_secs: default_shell_timeout_secs(),
+            risk_profiles: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "default".into(),
+                    RiskProfileConfig {
+                        level: AutonomyLevel::Full,
+                        workspace_only: false,
+                        allowed_commands: vec!["docker".into()],
+                        forbidden_paths: vec!["/secret".into()],
+                        max_actions_per_hour: 50,
+                        max_cost_per_day_cents: 1000,
+                        require_approval_for_medium_risk: false,
+                        block_high_risk_commands: true,
+                        shell_env_passthrough: vec!["DATABASE_URL".into()],
+                        auto_approve: vec!["file_read".into()],
+                        always_ask: vec![],
+                        allowed_roots: vec![],
+                        excluded_tools: vec![],
+                        shell_timeout_secs: 60,
+                        ..RiskProfileConfig::default()
+                    },
+                );
+                m
             },
             trust: crate::scattered_types::TrustConfig::default(),
             backup: BackupConfig::default(),
@@ -12091,7 +12089,6 @@ auto_save = true
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             swarms: HashMap::new(),
-            risk_profiles: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
             memory_namespaces: HashMap::new(),
@@ -12131,8 +12128,9 @@ auto_save = true
         assert_eq!(parsed.providers.models.len(), config.providers.models.len());
         assert_eq!(parsed.observability.backend, "log");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
-        assert_eq!(parsed.autonomy.level, AutonomyLevel::Full);
-        assert!(!parsed.autonomy.workspace_only);
+        let default_profile = parsed.risk_profiles.get("default").unwrap();
+        assert_eq!(default_profile.level, AutonomyLevel::Full);
+        assert!(!default_profile.workspace_only);
         assert_eq!(parsed.runtime.kind, "docker");
         assert!(parsed.heartbeat.enabled);
         assert_eq!(parsed.heartbeat.interval_minutes, 15);
@@ -12166,7 +12164,10 @@ default_temperature = 0.7
         );
         assert_eq!(parsed.observability.backend, "none");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
-        assert_eq!(parsed.autonomy.level, AutonomyLevel::Supervised);
+        assert_eq!(
+            parsed.active_risk_profile(None).level,
+            AutonomyLevel::Supervised
+        );
         assert_eq!(parsed.runtime.kind, "native");
         assert!(parsed.heartbeat.enabled);
         assert!(parsed.channels.cli);
@@ -12195,11 +12196,12 @@ default_temperature = 0.7
         );
     }
 
-    /// Regression test for #4171: the `[autonomy]` section must not be
-    /// silently dropped when parsing config TOML.
+    /// V2 `[autonomy]` migrates onto `[risk_profiles.default]` via the V2→V3
+    /// migration. The fields must round-trip without being silently dropped.
     #[test]
-    async fn autonomy_section_is_not_silently_ignored() {
+    async fn v2_autonomy_section_migrates_onto_risk_profiles_default() {
         let raw = r#"
+schema_version = 2
 default_temperature = 0.7
 
 [autonomy]
@@ -12207,23 +12209,14 @@ level = "full"
 max_actions_per_hour = 99
 auto_approve = ["file_read", "memory_recall", "http_request"]
 "#;
-        let parsed = parse_test_config(raw);
-        assert_eq!(
-            parsed.autonomy.level,
-            AutonomyLevel::Full,
-            "autonomy.level must be parsed from config (was silently defaulting to Supervised)"
-        );
-        assert_eq!(
-            parsed.autonomy.max_actions_per_hour, 99,
-            "autonomy.max_actions_per_hour must be parsed from config"
-        );
-        assert!(
-            parsed
-                .autonomy
-                .auto_approve
-                .contains(&"http_request".to_string()),
-            "autonomy.auto_approve must include http_request from config"
-        );
+        let parsed = crate::migration::migrate_to_current(raw).unwrap();
+        let profile = parsed
+            .risk_profiles
+            .get("default")
+            .expect("default profile");
+        assert_eq!(profile.level, AutonomyLevel::Full);
+        assert_eq!(profile.max_actions_per_hour, 99);
+        assert!(profile.auto_approve.contains(&"http_request".to_string()));
     }
 
     /// Regression test for #4247: when a user provides a custom auto_approve
@@ -12233,26 +12226,13 @@ auto_approve = ["file_read", "memory_recall", "http_request"]
         let raw = r#"
 default_temperature = 0.7
 
-[autonomy]
+[risk_profiles.default]
 auto_approve = ["my_custom_tool", "another_tool"]
 "#;
         let parsed = parse_test_config(raw);
-        // User entries are preserved
-        assert!(
-            parsed
-                .autonomy
-                .auto_approve
-                .contains(&"my_custom_tool".to_string()),
-            "user-supplied tool must remain in auto_approve"
-        );
-        assert!(
-            parsed
-                .autonomy
-                .auto_approve
-                .contains(&"another_tool".to_string()),
-            "user-supplied tool must remain in auto_approve"
-        );
-        // Defaults are merged in
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        assert!(profile.auto_approve.contains(&"my_custom_tool".to_string()));
+        assert!(profile.auto_approve.contains(&"another_tool".to_string()));
         for default_tool in &[
             "file_read",
             "memory_recall",
@@ -12261,11 +12241,8 @@ auto_approve = ["my_custom_tool", "another_tool"]
             "web_fetch",
         ] {
             assert!(
-                parsed
-                    .autonomy
-                    .auto_approve
-                    .contains(&String::from(*default_tool)),
-                "default tool '{default_tool}' must be present in auto_approve even when user provides custom list"
+                profile.auto_approve.contains(&String::from(*default_tool)),
+                "default tool '{default_tool}' must be present"
             );
         }
     }
@@ -12276,31 +12253,32 @@ auto_approve = ["my_custom_tool", "another_tool"]
         let raw = r#"
 default_temperature = 0.7
 
-[autonomy]
+[risk_profiles.default]
 auto_approve = []
 "#;
         let parsed = parse_test_config(raw);
-        let defaults = default_auto_approve();
-        for tool in &defaults {
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        for tool in &default_auto_approve() {
             assert!(
-                parsed.autonomy.auto_approve.contains(tool),
-                "default tool '{tool}' must be present even when user sets auto_approve = []"
+                profile.auto_approve.contains(tool),
+                "default tool '{tool}' must be present"
             );
         }
     }
 
-    /// When no autonomy section is provided, defaults are applied normally.
+    /// When no risk_profiles section is provided, defaults are applied to the
+    /// synthesized "default" profile.
     #[test]
-    async fn auto_approve_defaults_when_no_autonomy_section() {
+    async fn auto_approve_defaults_when_no_risk_profile_section() {
         let raw = r#"
 default_temperature = 0.7
 "#;
         let parsed = parse_test_config(raw);
-        let defaults = default_auto_approve();
-        for tool in &defaults {
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        for tool in &default_auto_approve() {
             assert!(
-                parsed.autonomy.auto_approve.contains(tool),
-                "default tool '{tool}' must be present when no [autonomy] section"
+                profile.auto_approve.contains(tool),
+                "default tool '{tool}' must be present"
             );
         }
     }
@@ -12312,24 +12290,27 @@ default_temperature = 0.7
         let raw = r#"
 default_temperature = 0.7
 
-[autonomy]
+[risk_profiles.default]
 auto_approve = ["weather", "file_read"]
 "#;
         let parsed = parse_test_config(raw);
-        let weather_count = parsed
-            .autonomy
-            .auto_approve
-            .iter()
-            .filter(|t| *t == "weather")
-            .count();
-        assert_eq!(weather_count, 1, "weather must not be duplicated");
-        let file_read_count = parsed
-            .autonomy
-            .auto_approve
-            .iter()
-            .filter(|t| *t == "file_read")
-            .count();
-        assert_eq!(file_read_count, 1, "file_read must not be duplicated");
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        assert_eq!(
+            profile
+                .auto_approve
+                .iter()
+                .filter(|t| *t == "weather")
+                .count(),
+            1
+        );
+        assert_eq!(
+            profile
+                .auto_approve
+                .iter()
+                .filter(|t| *t == "file_read")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -12633,7 +12614,6 @@ default_temperature = 0.7
             workspace_dir: dir.join("workspace"),
             config_path: config_path.clone(),
             observability: ObservabilityConfig::default(),
-            autonomy: AutonomyConfig::default(),
             trust: crate::scattered_types::TrustConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
@@ -13813,9 +13793,9 @@ default_temperature = 0.7
     }
 
     #[test]
-    async fn checklist_autonomy_default_is_workspace_scoped() {
-        let a = AutonomyConfig::default();
-        assert!(a.workspace_only, "Default autonomy must be workspace_only");
+    async fn checklist_risk_profile_default_is_workspace_scoped() {
+        let a = RiskProfileConfig::default();
+        assert!(a.workspace_only, "Default profile must be workspace_only");
         assert!(
             a.forbidden_paths.contains(&"/etc".to_string()),
             "Must block /etc"
@@ -16435,6 +16415,7 @@ require_otp_to_resume = true
     /// The TOML template baked into Docker images (Dockerfile + Dockerfile.debian).
     /// Kept here so changes to the Dockerfiles can be validated by `cargo test`.
     const DOCKER_CONFIG_TEMPLATE: &str = r#"
+schema_version = 3
 workspace_dir = "/zeroclaw-data/workspace"
 config_path = "/zeroclaw-data/.zeroclaw/config.toml"
 api_key = ""
@@ -16447,7 +16428,7 @@ port = 42617
 host = "[::]"
 allow_public_bind = true
 
-[autonomy]
+[risk_profiles.default]
 level = "supervised"
 auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]
 "#;
@@ -16457,8 +16438,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let cfg: Config = toml::from_str(DOCKER_CONFIG_TEMPLATE)
             .expect("Docker baked config.toml must be valid TOML that deserialises into Config");
 
-        // The [autonomy] section must be present and contain the expected tools.
-        let auto = &cfg.autonomy.auto_approve;
+        let auto = &cfg
+            .risk_profiles
+            .get("default")
+            .expect("Docker config must define [risk_profiles.default]")
+            .auto_approve;
         for tool in &[
             "file_read",
             "file_write",
@@ -16476,7 +16460,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         ] {
             assert!(
                 auto.iter().any(|t| t == tool),
-                "Docker config auto_approve missing expected tool: {tool}"
+                "Docker config risk_profiles.default.auto_approve missing expected tool: {tool}"
             );
         }
     }

@@ -5241,10 +5241,7 @@ pub async fn start_channels(
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    let security = Arc::new(SecurityPolicy::from_config(&config, None));
     let model = resolved_default_model(&config)?;
     let temperature = config
         .providers
@@ -5462,11 +5459,14 @@ pub async fn start_channels(
 
     // Filter out tools excluded for non-CLI channels so the system prompt
     // does not advertise them for channel-driven runs.
-    // Skip this filter when autonomy is `Full` — full-autonomy agents keep
-    // all tools available regardless of channel.
-    let excluded = &config.autonomy.non_cli_excluded_tools;
-    if !excluded.is_empty() && config.autonomy.level != AutonomyLevel::Full {
-        tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+    // Skip this filter when the active risk profile's autonomy is `Full` —
+    // full-autonomy agents keep all tools available regardless of channel.
+    {
+        let active_profile = config.active_risk_profile(None);
+        let excluded = &active_profile.excluded_tools;
+        if !excluded.is_empty() && active_profile.level != AutonomyLevel::Full {
+            tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+        }
     }
 
     let bootstrap_max_chars = if config.default_agent().compact_context {
@@ -5482,7 +5482,7 @@ pub async fn start_channels(
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
-        Some(&config.autonomy),
+        Some(config.active_risk_profile(None)),
         native_tools,
         config.skills.prompt_injection_mode,
         config.default_agent().compact_context,
@@ -5700,8 +5700,8 @@ pub async fn start_channels(
         } else {
             None
         },
-        non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
-        autonomy_level: config.autonomy.level,
+        non_cli_excluded_tools: Arc::new(config.active_risk_profile(None).excluded_tools.clone()),
+        autonomy_level: config.active_risk_profile(None).level,
         tool_call_dedup_exempt: Arc::new(config.default_agent().tool_call_dedup_exempt.clone()),
         model_routes: Arc::new(config.providers.model_routes.clone()),
         query_classification: config.query_classification.clone(),
@@ -5721,7 +5721,9 @@ pub async fn start_channels(
         } else {
             None
         },
-        approval_manager: Arc::new(ApprovalManager::for_non_interactive(&config.autonomy)),
+        approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+            config.active_risk_profile(None),
+        )),
         activated_tools: ch_activated_handle,
         cost_tracking: zeroclaw_runtime::cost::CostTracker::get_or_init_global(
             config.cost.clone(),
@@ -6318,7 +6320,7 @@ mod tests {
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -6444,7 +6446,7 @@ mod tests {
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -6527,7 +6529,7 @@ mod tests {
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -6627,7 +6629,7 @@ mod tests {
             show_tool_calls: true,
             session_store: Some(Arc::clone(&store)),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -7228,7 +7230,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -7320,7 +7322,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -7426,7 +7428,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -7517,7 +7519,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -7618,7 +7620,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -7740,7 +7742,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -7843,7 +7845,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -7961,7 +7963,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8064,7 +8066,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8160,7 +8162,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8382,7 +8384,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8496,7 +8498,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8628,7 +8630,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8759,7 +8761,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8867,7 +8869,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8956,7 +8958,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -9045,7 +9047,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -9441,9 +9443,9 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn full_autonomy_prompt_executes_allowed_tools_without_extra_approval() {
         let ws = make_workspace();
-        let config = zeroclaw_config::schema::AutonomyConfig {
+        let config = zeroclaw_config::schema::RiskProfileConfig {
             level: zeroclaw_runtime::security::AutonomyLevel::Full,
-            ..zeroclaw_config::schema::AutonomyConfig::default()
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
         let prompt = build_system_prompt_with_mode_and_autonomy(
             ws.path(),
@@ -9472,9 +9474,9 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn readonly_prompt_explains_policy_blocks_without_fake_approval() {
         let ws = make_workspace();
-        let config = zeroclaw_config::schema::AutonomyConfig {
+        let config = zeroclaw_config::schema::RiskProfileConfig {
             level: zeroclaw_runtime::security::AutonomyLevel::ReadOnly,
-            ..zeroclaw_config::schema::AutonomyConfig::default()
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
         let prompt = build_system_prompt_with_mode_and_autonomy(
             ws.path(),
@@ -9840,7 +9842,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -9986,7 +9988,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -10173,7 +10175,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -10291,7 +10293,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -10928,7 +10930,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -11026,7 +11028,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -11156,7 +11158,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -11334,7 +11336,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -11456,7 +11458,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -11570,7 +11572,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -11704,7 +11706,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -12026,7 +12028,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,

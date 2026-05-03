@@ -261,10 +261,7 @@ mod tests {
     }
 
     fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::from_config(
-            &cfg.autonomy,
-            &cfg.workspace_dir,
-        ))
+        Arc::new(SecurityPolicy::from_config(cfg, None))
     }
 
     #[tokio::test]
@@ -294,7 +291,11 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.allowed_commands = vec!["echo".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
@@ -323,7 +324,11 @@ mod tests {
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
-        config.autonomy.level = AutonomyLevel::ReadOnly;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = AutonomyLevel::ReadOnly;
         let cfg = Arc::new(config);
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
 
@@ -346,8 +351,16 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.level = AutonomyLevel::Supervised;
-        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = AutonomyLevel::Supervised;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into(), "touch".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let cfg = Arc::new(config);
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
@@ -387,10 +400,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         });
-        let security = Arc::new(SecurityPolicy::from_config(
-            &cfg.autonomy,
-            &cfg.workspace_dir,
-        ));
+        let security = Arc::new(SecurityPolicy::from_config(&cfg, None));
         let tool = CronUpdateTool::new(cfg, security);
         let schema = tool.parameters_schema();
 
@@ -488,8 +498,16 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.level = AutonomyLevel::Full;
-        config.autonomy.max_actions_per_hour = 0;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = AutonomyLevel::Full;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .max_actions_per_hour = 0;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let cfg = Arc::new(config);
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();

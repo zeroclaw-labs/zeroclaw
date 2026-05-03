@@ -1476,9 +1476,15 @@ mod tests {
     #[test]
     fn test_op_coercion_bool_typed_value_matches_stored() {
         let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.set_prop("autonomy.workspace-only", "true")
+        cfg.risk_profiles.insert(
+            "default".into(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        cfg.set_prop("risk-profiles.default.workspace-only", "true")
             .expect("set_prop bool");
-        let actual = cfg.get_prop("autonomy.workspace-only").expect("get_prop");
+        let actual = cfg
+            .get_prop("risk-profiles.default.workspace-only")
+            .expect("get_prop");
         let want_typed = json_to_setprop_string(&serde_json::json!(true), Some(PropKind::Bool))
             .expect("coerce bool true");
         assert_eq!(
@@ -1563,9 +1569,15 @@ mod tests {
     #[test]
     fn test_op_coercion_mismatched_value_correctly_fails() {
         let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.set_prop("autonomy.workspace-only", "true")
+        cfg.risk_profiles.insert(
+            "default".into(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        cfg.set_prop("risk-profiles.default.workspace-only", "true")
             .expect("set_prop");
-        let actual = cfg.get_prop("autonomy.workspace-only").expect("get_prop");
+        let actual = cfg
+            .get_prop("risk-profiles.default.workspace-only")
+            .expect("get_prop");
         let want = json_to_setprop_string(&serde_json::json!(false), Some(PropKind::Bool))
             .expect("coerce bool false");
         assert_ne!(

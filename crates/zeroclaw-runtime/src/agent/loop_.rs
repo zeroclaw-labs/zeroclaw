@@ -2089,10 +2089,7 @@ pub async fn run(
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    let security = Arc::new(SecurityPolicy::from_config(&config, None));
 
     let fallback_provider_loop = config.providers.first_provider();
 
@@ -2443,7 +2440,7 @@ pub async fn run(
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
-        Some(&config.autonomy),
+        Some(config.active_risk_profile(None)),
         native_tools,
         config.skills.prompt_injection_mode,
         config.default_agent().compact_context,
@@ -2463,7 +2460,9 @@ pub async fn run(
 
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = if interactive {
-        Some(ApprovalManager::from_config(&config.autonomy))
+        Some(ApprovalManager::from_risk_profile(
+            config.active_risk_profile(None),
+        ))
     } else {
         None
     };
@@ -3117,12 +3116,9 @@ pub async fn process_message(
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    let security = Arc::new(SecurityPolicy::from_config(&config, None));
     let fallback_provider_pm = config.providers.first_provider();
-    let approval_manager = ApprovalManager::for_non_interactive(&config.autonomy);
+    let approval_manager = ApprovalManager::for_non_interactive(config.active_risk_profile(None));
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
         &config.providers.embedding_routes,
@@ -3364,11 +3360,15 @@ pub async fn process_message(
     }
 
     // Filter out tools excluded for non-CLI channels (gateway counts as non-CLI).
-    // Skip when autonomy is `Full` — full-autonomy agents keep all tools.
-    if config.autonomy.level != AutonomyLevel::Full {
-        let excluded = &config.autonomy.non_cli_excluded_tools;
-        if !excluded.is_empty() {
-            tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+    // Skip when the active risk profile's autonomy is `Full` — full-autonomy
+    // agents keep all tools.
+    {
+        let active_profile = config.active_risk_profile(None);
+        if active_profile.level != AutonomyLevel::Full {
+            let excluded = &active_profile.excluded_tools;
+            if !excluded.is_empty() {
+                tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+            }
         }
     }
 
@@ -3385,7 +3385,7 @@ pub async fn process_message(
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
-        Some(&config.autonomy),
+        Some(config.active_risk_profile(None)),
         native_tools,
         config.skills.prompt_injection_mode,
         config.default_agent().compact_context,
@@ -3462,8 +3462,11 @@ pub async fn process_message(
         &config.default_agent().tool_filter_groups,
         effective_msg_ref,
     );
-    if config.autonomy.level != AutonomyLevel::Full {
-        excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
+    {
+        let active_profile = config.active_risk_profile(None);
+        if active_profile.level != AutonomyLevel::Full {
+            excluded_tools.extend(active_profile.excluded_tools.iter().cloned());
+        }
     }
 
     agent_turn(
@@ -5111,8 +5114,8 @@ mod tests {
                 tool_call_id: None,
             },
         ];
-        let approval_cfg = zeroclaw_config::schema::AutonomyConfig::default();
-        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
+        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
 
         assert!(!should_execute_tools_in_parallel(
             &calls,
@@ -5134,11 +5137,11 @@ mod tests {
                 tool_call_id: None,
             },
         ];
-        let approval_cfg = zeroclaw_config::schema::AutonomyConfig {
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
             level: crate::security::AutonomyLevel::Full,
-            ..zeroclaw_config::schema::AutonomyConfig::default()
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
-        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
 
         assert!(should_execute_tools_in_parallel(
             &calls,
@@ -5175,11 +5178,11 @@ mod tests {
             )),
         ];
 
-        let approval_cfg = zeroclaw_config::schema::AutonomyConfig {
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
             level: crate::security::AutonomyLevel::Full,
-            ..zeroclaw_config::schema::AutonomyConfig::default()
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
-        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -5483,7 +5486,7 @@ mod tests {
         ];
         let observer = NoopObserver;
         let approval_mgr = ApprovalManager::for_non_interactive(
-            &zeroclaw_config::schema::AutonomyConfig::default(),
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
         );
 
         let result = run_tool_call_loop(
@@ -6268,8 +6271,8 @@ mod tests {
     #[test]
     fn build_tool_instructions_includes_all_tools() {
         use crate::security::SecurityPolicy;
-        let security = Arc::new(SecurityPolicy::from_config(
-            &zeroclaw_config::schema::AutonomyConfig::default(),
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
@@ -6285,8 +6288,8 @@ mod tests {
     #[test]
     fn tools_to_openai_format_produces_valid_schema() {
         use crate::security::SecurityPolicy;
-        let security = Arc::new(SecurityPolicy::from_config(
-            &zeroclaw_config::schema::AutonomyConfig::default(),
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);

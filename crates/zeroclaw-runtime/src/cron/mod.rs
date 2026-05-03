@@ -27,7 +27,7 @@ pub use types::{
 /// Returns `Ok(())` if the command passes all checks, or an error describing
 /// why it was blocked.
 pub fn validate_shell_command(config: &Config, command: &str, approved: bool) -> Result<()> {
-    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    let security = SecurityPolicy::from_config(config, None);
     validate_shell_command_with_security(&security, command, approved)
 }
 
@@ -398,7 +398,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let security = SecurityPolicy::from_config(&config, None);
         assert!(security.is_command_allowed("echo safe"));
     }
 
@@ -406,7 +406,11 @@ mod tests {
     fn add_shell_job_requires_explicit_approval_for_medium_risk() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into(), "touch".into()];
 
         let denied = add_shell_job(
             &config,
@@ -443,7 +447,11 @@ mod tests {
     fn update_requires_explicit_approval_for_medium_risk() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into(), "touch".into()];
         let job = make_job(&config, "*/5 * * * *", None, "echo original");
 
         let denied = update_shell_job_with_approval(
@@ -480,7 +488,11 @@ mod tests {
     fn cli_update_requires_explicit_approval_for_medium_risk() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into(), "touch".into()];
         let job = make_job(&config, "*/5 * * * *", None, "echo original");
 
         let result = run_update(
@@ -514,8 +526,16 @@ mod tests {
     fn add_once_validated_blocks_disallowed_command() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into()];
-        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = crate::security::AutonomyLevel::Supervised;
 
         let result = add_once_validated(&config, "1h", "curl https://example.com", false);
         assert!(result.is_err());
@@ -542,7 +562,11 @@ mod tests {
     fn add_once_at_validated_blocks_medium_risk_without_approval() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into(), "touch".into()];
         let at = chrono::Utc::now() + chrono::Duration::hours(1);
 
         let denied = add_once_at_validated(&config, at, "touch at-medium", false);
@@ -562,8 +586,16 @@ mod tests {
     fn gateway_api_path_validates_shell_command() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into()];
-        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = crate::security::AutonomyLevel::Supervised;
 
         // Simulate gateway API path: add_shell_job_with_approval(approved=false)
         let result = add_shell_job_with_approval(
@@ -590,10 +622,18 @@ mod tests {
     fn scheduler_path_validates_shell_command() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into()];
-        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = crate::security::AutonomyLevel::Supervised;
 
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let security = SecurityPolicy::from_config(&config, None);
         // Simulate scheduler validation path
         let result =
             validate_shell_command_with_security(&security, "curl https://example.com", false);
@@ -636,8 +676,16 @@ mod tests {
     fn cli_agent_flag_bypasses_shell_security_validation() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into()];
-        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = crate::security::AutonomyLevel::Supervised;
 
         // Without --agent, a natural language string would be blocked by shell
         // security policy. With --agent, it routes to agent job and skips

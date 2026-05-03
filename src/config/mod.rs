@@ -10,8 +10,8 @@ pub mod traits;
 pub mod workspace;
 
 pub use schema::{
-    AssemblyAiSttConfig, AuditConfig, AutonomyConfig, BackupConfig, BrowserComputerUseConfig,
-    BrowserConfig, BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ClaudeCodeConfig,
+    AssemblyAiSttConfig, AuditConfig, BackupConfig, BrowserComputerUseConfig, BrowserConfig,
+    BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ClaudeCodeConfig,
     ClaudeCodeRunnerConfig, CloudOpsConfig, CodexCliConfig, ComposioConfig, Config,
     ConversationalAiConfig, CostConfig, CronJobDecl, CronScheduleDecl, DEFAULT_GWS_SERVICES,
     DataRetentionConfig, DeepgramSttConfig, DelegateAgentConfig, DelegateToolConfig, DiscordConfig,
@@ -28,8 +28,8 @@ pub use schema::{
     OpenVpnTunnelConfig, OtpConfig, OtpMethod, PacingConfig, PeripheralBoardConfig,
     PeripheralsConfig, PipelineConfig, PluginsConfig, PostgresStorageConfig, ProjectIntelConfig,
     ProxyConfig, ProxyScope, QdrantStorageConfig, QueryClassificationConfig, ReliabilityConfig,
-    ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
-    SearchMode, SecretsConfig, SecurityConfig, SecurityOpsConfig, ShellToolConfig,
+    ResourceLimitsConfig, RiskProfileConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
+    SchedulerConfig, SearchMode, SecretsConfig, SecurityConfig, SecurityOpsConfig, ShellToolConfig,
     SkillCreationConfig, SkillImprovementConfig, SkillsConfig, SkillsPromptInjectionMode,
     SlackConfig, SopConfig, SqliteStorageConfig, StorageConfig, StreamMode, SwarmConfig,
     SwarmStrategy, TelegramConfig, TextBrowserConfig, ToolFilterGroup, ToolFilterGroupMode,

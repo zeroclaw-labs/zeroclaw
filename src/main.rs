@@ -1969,7 +1969,8 @@ async fn main() -> Result<()> {
                 "🧾 Trace storage:  {} ({})",
                 config.observability.runtime_trace_mode, config.observability.runtime_trace_path
             );
-            println!("🛡️  Autonomy:      {:?}", config.autonomy.level);
+            let active_profile = config.active_risk_profile(None);
+            println!("🛡️  Autonomy:      {:?}", active_profile.level);
             println!("⚙️  Runtime:       {}", config.runtime.kind);
             if service::is_running() {
                 println!("🟢 Service:       running");
@@ -1993,22 +1994,22 @@ async fn main() -> Result<()> {
 
             println!();
             println!("Security:");
-            println!("  Workspace only:    {}", config.autonomy.workspace_only);
+            println!("  Workspace only:    {}", active_profile.workspace_only);
             println!(
                 "  Allowed roots:     {}",
-                if config.autonomy.allowed_roots.is_empty() {
+                if active_profile.allowed_roots.is_empty() {
                     "(none)".to_string()
                 } else {
-                    config.autonomy.allowed_roots.join(", ")
+                    active_profile.allowed_roots.join(", ")
                 }
             );
             println!(
                 "  Allowed commands:  {}",
-                config.autonomy.allowed_commands.join(", ")
+                active_profile.allowed_commands.join(", ")
             );
             println!(
                 "  Max actions/hour:  {}",
-                config.autonomy.max_actions_per_hour
+                active_profile.max_actions_per_hour
             );
             println!(
                 "  Cost tracking:     {}",

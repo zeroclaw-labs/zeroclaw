@@ -479,8 +479,8 @@ impl Agent {
             Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            config.active_risk_profile(None),
             session_cwd.unwrap_or(&config.workspace_dir),
         ));
 
@@ -664,10 +664,10 @@ impl Agent {
             None
         };
 
-        // Filter out excluded tools (non_cli_excluded_tools). The channel
-        // orchestrator applies this, but Agent::from_config (used by ws.rs)
-        // doesn't go through that path.
-        let excluded = &config.autonomy.non_cli_excluded_tools;
+        // Filter out tools excluded by the active risk profile. The channel
+        // orchestrator applies this for channel-driven runs, but Agent::from_config
+        // (used by ws.rs) doesn't go through that path.
+        let excluded = &config.active_risk_profile(None).excluded_tools;
         if !excluded.is_empty() {
             tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
         }
@@ -705,7 +705,7 @@ impl Agent {
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
             .security_summary(Some(security.prompt_summary()))
-            .autonomy_level(config.autonomy.level)
+            .autonomy_level(config.active_risk_profile(None).level)
             .activated_tools(activated_tools)
             .hook_runner(if config.hooks.enabled {
                 let mut runner = crate::hooks::HookRunner::new();
@@ -722,7 +722,7 @@ impl Agent {
                 None
             })
             .approval_manager(Some(Arc::new(ApprovalManager::for_non_interactive(
-                &config.autonomy,
+                config.active_risk_profile(None),
             ))))
             .build()?;
 
@@ -1922,9 +1922,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let tool_calls = Arc::new(AtomicUsize::new(0));
         let approval_requests = Arc::new(AtomicUsize::new(0));
-        let approval_cfg = zeroclaw_config::schema::AutonomyConfig {
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
             always_ask: vec!["echo".into()],
-            ..zeroclaw_config::schema::AutonomyConfig::default()
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
         let mut agent = Agent::builder()
             .provider(provider)
@@ -1979,9 +1979,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let tool_calls = Arc::new(AtomicUsize::new(0));
         let approval_requests = Arc::new(AtomicUsize::new(0));
-        let approval_cfg = zeroclaw_config::schema::AutonomyConfig {
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
             always_ask: vec!["echo".into()],
-            ..zeroclaw_config::schema::AutonomyConfig::default()
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
         let mut agent = Agent::builder()
             .provider(provider)

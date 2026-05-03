@@ -4,7 +4,7 @@
 //! and gateway/security/agent config boundary conditions.
 
 use zeroclaw::config::migration;
-use zeroclaw::config::{AutonomyConfig, ChannelsConfig, Config, GatewayConfig, SecurityConfig};
+use zeroclaw::config::{ChannelsConfig, Config, GatewayConfig, RiskProfileConfig, SecurityConfig};
 
 fn migrate(toml_str: &str) -> Config {
     migration::migrate_to_current(toml_str).expect("migration succeeds")
@@ -320,12 +320,12 @@ fn security_config_toml_roundtrip() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AutonomyConfig boundary tests (security policy via Config.autonomy)
+// RiskProfileConfig boundary tests (security policy via Config.autonomy)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn autonomy_config_default_is_supervised() {
-    let autonomy = AutonomyConfig::default();
+    let autonomy = RiskProfileConfig::default();
     assert_eq!(
         format!("{:?}", autonomy.level),
         "Supervised",
@@ -335,7 +335,7 @@ fn autonomy_config_default_is_supervised() {
 
 #[test]
 fn autonomy_config_default_max_actions_per_hour() {
-    let autonomy = AutonomyConfig::default();
+    let autonomy = RiskProfileConfig::default();
     assert!(
         autonomy.max_actions_per_hour > 0,
         "max_actions_per_hour should be positive"
@@ -344,7 +344,7 @@ fn autonomy_config_default_max_actions_per_hour() {
 
 #[test]
 fn autonomy_config_default_workspace_only() {
-    let autonomy = AutonomyConfig::default();
+    let autonomy = RiskProfileConfig::default();
     assert!(
         autonomy.workspace_only,
         "workspace_only should default to true"
@@ -354,14 +354,23 @@ fn autonomy_config_default_workspace_only() {
 #[test]
 fn autonomy_config_toml_roundtrip() {
     let mut config = Config::default();
-    config.autonomy.max_actions_per_hour = 50;
-    config.autonomy.workspace_only = false;
+    config
+        .risk_profiles
+        .entry("default".into())
+        .or_default()
+        .max_actions_per_hour = 50;
+    config
+        .risk_profiles
+        .entry("default".into())
+        .or_default()
+        .workspace_only = false;
 
     let toml_str = toml::to_string(&config).expect("config should serialize");
     let parsed: Config = toml::from_str(&toml_str).expect("should deserialize back");
 
-    assert_eq!(parsed.autonomy.max_actions_per_hour, 50);
-    assert!(!parsed.autonomy.workspace_only);
+    let profile = parsed.risk_profiles.get("default").unwrap();
+    assert_eq!(profile.max_actions_per_hour, 50);
+    assert!(!profile.workspace_only);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1614,11 +1614,12 @@ max_actions_per_hour = 100
         zeroclaw_config::autonomy::AutonomyLevel::Full
     );
     assert_eq!(profile.max_actions_per_hour, 100);
-    // [autonomy] is dropped; autonomy field on Config should be at its default.
+    // V3: [autonomy] is no longer a top-level field on Config; the migrated
+    // values land entirely on [risk_profiles.default].
     assert_eq!(
-        config.autonomy.level,
-        zeroclaw_config::autonomy::AutonomyLevel::Supervised,
-        "[autonomy] block must be removed; Config.autonomy should be default"
+        profile.level,
+        zeroclaw_config::autonomy::AutonomyLevel::Full,
+        "[autonomy].level must migrate onto risk_profiles.default.level"
     );
 }
 

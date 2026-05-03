@@ -1570,28 +1570,39 @@ impl SecurityPolicy {
         })
     }
 
-    /// Build from config sections
-    pub fn from_config(
-        autonomy_config: &crate::schema::AutonomyConfig,
+    /// Build a `SecurityPolicy` from a resolved risk profile.
+    ///
+    /// V3 unified policy entry point: every callsite that used V2's
+    /// `from_config(&autonomy_config, workspace)` now resolves a
+    /// [`crate::schema::RiskProfileConfig`] via
+    /// [`crate::schema::Config::active_risk_profile`] and passes it here.
+    pub fn from_risk_profile(
+        profile: &crate::schema::RiskProfileConfig,
         workspace_dir: &Path,
     ) -> Self {
         // When autonomy is Full, disable workspace_only so the agent can
-        // access paths outside the workspace.  Forbidden-path checks still
+        // access paths outside the workspace. Forbidden-path checks still
         // apply, preventing access to sensitive system directories.
         // See issue #5463.
-        let effective_workspace_only = if autonomy_config.level == AutonomyLevel::Full {
+        let effective_workspace_only = if profile.level == AutonomyLevel::Full {
             false
         } else {
-            autonomy_config.workspace_only
+            profile.workspace_only
+        };
+
+        let shell_timeout_secs = if profile.shell_timeout_secs == 0 {
+            60
+        } else {
+            profile.shell_timeout_secs
         };
 
         Self {
-            autonomy: autonomy_config.level,
+            autonomy: profile.level,
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: effective_workspace_only,
-            allowed_commands: autonomy_config.allowed_commands.clone(),
-            forbidden_paths: autonomy_config.forbidden_paths.clone(),
-            allowed_roots: autonomy_config
+            allowed_commands: profile.allowed_commands.clone(),
+            forbidden_paths: profile.forbidden_paths.clone(),
+            allowed_roots: profile
                 .allowed_roots
                 .iter()
                 .map(|root| {
@@ -1603,14 +1614,24 @@ impl SecurityPolicy {
                     }
                 })
                 .collect(),
-            max_actions_per_hour: autonomy_config.max_actions_per_hour,
-            max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
-            require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
-            block_high_risk_commands: autonomy_config.block_high_risk_commands,
-            shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
-            shell_timeout_secs: autonomy_config.shell_timeout_secs,
+            max_actions_per_hour: profile.max_actions_per_hour,
+            max_cost_per_day_cents: profile.max_cost_per_day_cents,
+            require_approval_for_medium_risk: profile.require_approval_for_medium_risk,
+            block_high_risk_commands: profile.block_high_risk_commands,
+            shell_env_passthrough: profile.shell_env_passthrough.clone(),
+            shell_timeout_secs,
             tracker: PerSenderTracker::new(),
         }
+    }
+
+    /// Convenience: resolve the active risk profile for a given agent (or
+    /// the conventional "default" when `agent_alias` is `None`) and build
+    /// a `SecurityPolicy` from it.
+    pub fn from_config(config: &crate::schema::Config, agent_alias: Option<&str>) -> Self {
+        Self::from_risk_profile(
+            config.active_risk_profile(agent_alias),
+            &config.workspace_dir,
+        )
     }
 
     /// Render a human-readable summary of the active security constraints
@@ -2178,7 +2199,7 @@ mod tests {
 
     #[test]
     fn from_config_maps_all_fields() {
-        let autonomy_config = crate::schema::AutonomyConfig {
+        let autonomy_config = crate::schema::RiskProfileConfig {
             level: AutonomyLevel::Full,
             workspace_only: false,
             allowed_commands: vec!["docker".into()],
@@ -2188,10 +2209,10 @@ mod tests {
             require_approval_for_medium_risk: false,
             block_high_risk_commands: false,
             shell_env_passthrough: vec!["DATABASE_URL".into()],
-            ..crate::schema::AutonomyConfig::default()
+            ..crate::schema::RiskProfileConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
-        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+        let policy = SecurityPolicy::from_risk_profile(&autonomy_config, &workspace);
 
         assert_eq!(policy.autonomy, AutonomyLevel::Full);
         assert!(!policy.workspace_only);
@@ -2209,12 +2230,12 @@ mod tests {
     fn from_config_full_autonomy_overrides_workspace_only() {
         // Issue #5463: Full autonomy should disable workspace_only even if the
         // config default keeps it true.
-        let autonomy_config = crate::schema::AutonomyConfig {
+        let autonomy_config = crate::schema::RiskProfileConfig {
             level: AutonomyLevel::Full,
-            ..crate::schema::AutonomyConfig::default()
+            ..crate::schema::RiskProfileConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
-        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+        let policy = SecurityPolicy::from_risk_profile(&autonomy_config, &workspace);
 
         assert_eq!(policy.autonomy, AutonomyLevel::Full);
         assert!(
@@ -2225,12 +2246,12 @@ mod tests {
 
     #[test]
     fn from_config_supervised_preserves_workspace_only() {
-        let autonomy_config = crate::schema::AutonomyConfig {
+        let autonomy_config = crate::schema::RiskProfileConfig {
             level: AutonomyLevel::Supervised,
-            ..crate::schema::AutonomyConfig::default()
+            ..crate::schema::RiskProfileConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
-        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+        let policy = SecurityPolicy::from_risk_profile(&autonomy_config, &workspace);
 
         assert!(
             policy.workspace_only,
@@ -2240,12 +2261,12 @@ mod tests {
 
     #[test]
     fn from_config_normalizes_allowed_roots() {
-        let autonomy_config = crate::schema::AutonomyConfig {
+        let autonomy_config = crate::schema::RiskProfileConfig {
             allowed_roots: vec!["~/Desktop".into(), "shared-data".into()],
-            ..crate::schema::AutonomyConfig::default()
+            ..crate::schema::RiskProfileConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
-        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+        let policy = SecurityPolicy::from_risk_profile(&autonomy_config, &workspace);
 
         let expected_home_root = if let Some(home) = std::env::var_os("HOME") {
             PathBuf::from(home).join("Desktop")
@@ -2984,7 +3005,7 @@ mod tests {
 
     #[test]
     fn from_config_creates_fresh_tracker() {
-        let autonomy_config = crate::schema::AutonomyConfig {
+        let autonomy_config = crate::schema::RiskProfileConfig {
             level: AutonomyLevel::Full,
             workspace_only: false,
             allowed_commands: vec![],
@@ -2993,10 +3014,10 @@ mod tests {
             max_cost_per_day_cents: 100,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
-            ..crate::schema::AutonomyConfig::default()
+            ..crate::schema::RiskProfileConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test");
-        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+        let policy = SecurityPolicy::from_risk_profile(&autonomy_config, &workspace);
         assert!(!policy.is_rate_limited());
     }
 

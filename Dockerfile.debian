@@ -103,7 +103,7 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace /zeroclaw-data/we
         'allow_public_bind = true' \
         'web_dist_dir = "/zeroclaw-data/web/dist"' \
         '' \
-        '[autonomy]' \
+        '[risk_profiles.default]' \
         'level = "supervised"' \
         'auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]' \
         > /zeroclaw-data/.zeroclaw/config.toml && \
