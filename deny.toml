@@ -17,20 +17,36 @@ ignore = [
     { id = "RUSTSEC-2024-0388", reason = "Transitive via matrix-sdk indexeddb dependency chain; tracked until matrix-sdk ecosystem removes derivative." },
     # paste v1.0.15 via wasmtime runtime stack.
     { id = "RUSTSEC-2024-0436", reason = "Transitive via wasmtime dependency stack; tracked until upstream removes or replaces paste." },
-    # rustls-webpki v0.102.8 — transitive dependency that survives our 0.103.x
-    # update (some consumer in the tree still pulls 0.102.8). The 0.103.13
-    # upgrade landed via cargo update on 2026-05-03; the 0.102.8 path remains
-    # to be audited and removed in a follow-up PR (cargo tree -i could not
-    # locate the consumer; needs a targeted dependency-graph trace).
-    # Tracked separately from the consumer-build's actual TLS path, which is
-    # rustls 0.23.x with the 0.103.13 webpki — i.e. the 0.102.8 instance is
-    # almost certainly only loaded by an internal/dev tool, not the runtime
-    # request path. Removing the four advisories below should not block the
-    # audit gate while we trace the consumer.
-    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102.8 transitive; consumer trace WIP, follow-up PR." },
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102.8 transitive; consumer trace WIP, follow-up PR." },
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102.8 transitive; consumer trace WIP, follow-up PR." },
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102.8 transitive; consumer trace WIP, follow-up PR." },
+    # rustls-webpki v0.102.8 — transitive via the OPT-IN `mqtt` feature only.
+    #
+    # Consumer trace (2026-05-04, PR-K2):
+    #   zeroclaw  --features=mqtt-->  rumqttc 0.25.1  -->  rustls-webpki 0.102.8
+    #
+    # rumqttc 0.25.1 is the latest published version on crates.io. It
+    # declares its `rustls-webpki` dep without a major-version bound for
+    # the modern (0.103.x / rustls 0.23) branch even though it ships
+    # compatibility with both 0.102.x and 0.103.x. Cargo's resolver
+    # therefore picks 0.102.8 to satisfy rumqttc and the modern 0.103.13
+    # to satisfy our other rustls users (reqwest, axum, tokio-tungstenite,
+    # etc.) — both versions coexist in the lock.
+    #
+    # CRITICAL: the `mqtt` feature is OPT-IN and NOT in `[features].default`
+    # (see Cargo.toml line 254 + 290). The default consumer build does NOT
+    # link rustls-webpki 0.102.8 at all; only operators that explicitly
+    # build with `--features mqtt` are exposed. The general MoA app and
+    # the Railway sync-relay path both run on the rustls 0.23 + 0.103.13
+    # branch, which is fully patched.
+    #
+    # We accept the four 0.102.8-only advisories below as the cost of
+    # keeping the optional MQTT subscriber working. Removal options
+    # tracked under a follow-up issue:
+    #   (a) wait for upstream rumqttc to release a 0.103-only resolution,
+    #   (b) switch to `rumqttc-v4-next` 0.31 (separate PR — API change),
+    #   (c) replace the MQTT subscriber with `paho-mqtt` and drop rumqttc.
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102.8 via OPT-IN [features].mqtt -> rumqttc 0.25.1; default build is unaffected. Removal tracked." },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102.8 via OPT-IN [features].mqtt -> rumqttc 0.25.1; default build is unaffected. Removal tracked." },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102.8 via OPT-IN [features].mqtt -> rumqttc 0.25.1; default build is unaffected. Removal tracked." },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102.8 via OPT-IN [features].mqtt -> rumqttc 0.25.1; default build is unaffected. Removal tracked." },
 ]
 
 [licenses]
