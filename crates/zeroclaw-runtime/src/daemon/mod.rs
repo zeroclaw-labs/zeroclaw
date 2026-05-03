@@ -972,7 +972,7 @@ fn load_jsonl_messages(path: &std::path::Path) -> Vec<zeroclaw_providers::traits
 /// channels are configured. Returns the first match in priority order.
 fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
     // Priority order: telegram > discord > slack > mattermost
-    if let Some(tg) = config.channels.telegram.get("default") {
+    if let Some(tg) = config.channels.telegram.values().next() {
         // Use the first allowed_user as target, or fall back to empty (broadcast)
         let target = tg.allowed_users.first().cloned().unwrap_or_default();
         if !target.is_empty() {

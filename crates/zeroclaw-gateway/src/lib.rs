@@ -615,7 +615,7 @@ pub async fn run_gateway(
     let event_buffer = Arc::new(sse::EventBuffer::new(500));
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
-        config.channels.webhook.get("default").and_then(|webhook| {
+        config.channels.webhook.values().next().and_then(|webhook| {
             webhook.secret.as_ref().and_then(|raw_secret| {
                 let trimmed_secret = raw_secret.trim();
                 (!trimmed_secret.is_empty())
@@ -647,7 +647,7 @@ pub async fn run_gateway(
             (!secret.is_empty()).then(|| secret.to_owned())
         })
         .or_else(|| {
-            config.channels.whatsapp.get("default").and_then(|wa| {
+            config.channels.whatsapp.values().next().and_then(|wa| {
                 wa.app_secret
                     .as_deref()
                     .map(str::trim)
@@ -658,7 +658,7 @@ pub async fn run_gateway(
         .map(Arc::from);
 
     // Linq channel (if configured)
-    let linq_channel: Option<Arc<LinqChannel>> = config.channels.linq.get("default").map(|lq| {
+    let linq_channel: Option<Arc<LinqChannel>> = config.channels.linq.values().next().map(|lq| {
         Arc::new(LinqChannel::new(
             lq.api_token.clone(),
             lq.from_phone.clone(),
@@ -675,7 +675,7 @@ pub async fn run_gateway(
             (!secret.is_empty()).then(|| secret.to_owned())
         })
         .or_else(|| {
-            config.channels.linq.get("default").and_then(|lq| {
+            config.channels.linq.values().next().and_then(|lq| {
                 lq.signing_secret
                     .as_deref()
                     .map(str::trim)
@@ -687,7 +687,7 @@ pub async fn run_gateway(
 
     // WATI channel (if configured)
     let wati_channel: Option<Arc<WatiChannel>> =
-        config.channels.wati.get("default").map(|wati_cfg| {
+        config.channels.wati.values().next().map(|wati_cfg| {
             Arc::new(
                 WatiChannel::new(
                     wati_cfg.api_token.clone(),
@@ -701,7 +701,7 @@ pub async fn run_gateway(
 
     // Nextcloud Talk channel (if configured)
     let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
-        config.channels.nextcloud_talk.get("default").map(|nc| {
+        config.channels.nextcloud_talk.values().next().map(|nc| {
             Arc::new(NextcloudTalkChannel::new(
                 nc.base_url.clone(),
                 nc.app_token.clone(),

@@ -4205,7 +4205,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
         "feishu" => {
             #[cfg(feature = "channel-lark")]
             {
-                if let Some(fs) = config.channels.feishu.get("default") {
+                if let Some(fs) = config.channels.feishu.values().next() {
                     return Ok(Arc::new(LarkChannel::from_feishu_config(fs)));
                 }
                 // Legacy: [channels_config.lark] with use_feishu = true
@@ -5518,7 +5518,7 @@ pub async fn start_channels(
             .collect();
 
     #[cfg(feature = "channel-nostr")]
-    if let Some(ns) = config.channels.nostr.get("default") {
+    if let Some(ns) = config.channels.nostr.values().next() {
         channels.push(Arc::new(
             NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
         ));
