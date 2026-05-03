@@ -57,7 +57,6 @@ impl Tool for MemoryRecallTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        let recall_query = if query.trim() == "*" { "" } else { query };
         let since = args.get("since").and_then(|v| v.as_str());
         let until = args.get("until").and_then(|v| v.as_str());
 
@@ -104,11 +103,7 @@ impl Tool for MemoryRecallTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(5, |v| v as usize);
 
-        match self
-            .memory
-            .recall(recall_query, limit, None, since, until)
-            .await
-        {
+        match self.memory.recall(query, limit, None, since, until).await {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
                 success: true,
                 output: "No memories found.".into(),
@@ -146,7 +141,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use tempfile::TempDir;
-    use zeroclaw_memory::{MemoryCategory, MemoryEntry, SqliteMemory};
+    use zeroclaw_memory::{MemoryCategory, MemoryEntry, SqliteMemory, is_recent_recall_query};
 
     fn seeded_mem() -> (TempDir, Arc<dyn Memory>) {
         let tmp = TempDir::new().unwrap();
@@ -183,7 +178,7 @@ mod tests {
             _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             *self.last_query.lock().unwrap() = Some(query.to_string());
-            if query.is_empty() {
+            if is_recent_recall_query(query) {
                 Ok(vec![MemoryEntry {
                     id: "recent".into(),
                     key: "recent".into(),
@@ -307,7 +302,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recall_star_query_is_normalized_before_backend() {
+    async fn recall_star_query_uses_backend_recent_query_contract() {
         let last_query = Arc::new(Mutex::new(None));
         let mem = Arc::new(QueryEchoMemory {
             last_query: last_query.clone(),
@@ -318,7 +313,7 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("recent memory"));
-        assert_eq!(*last_query.lock().unwrap(), Some(String::new()));
+        assert_eq!(*last_query.lock().unwrap(), Some("*".into()));
     }
 
     #[tokio::test]

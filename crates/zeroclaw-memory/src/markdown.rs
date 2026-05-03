@@ -1,4 +1,4 @@
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, is_recent_recall_query};
 use async_trait::async_trait;
 use chrono::Local;
 use std::path::{Path, PathBuf};
@@ -179,16 +179,13 @@ impl Memory for MarkdownMemory {
         }
 
         let all = self.read_all_entries().await?;
-        let trimmed_query = query.trim();
-        let is_recent_query = trimmed_query.is_empty() || trimmed_query == "*";
-        let query_lower = (!is_recent_query).then(|| query.to_lowercase());
-        let keywords: Vec<&str> = if is_recent_query {
+        let keywords: Vec<String> = if is_recent_recall_query(query) {
             Vec::new()
         } else {
-            query_lower
-                .as_deref()
-                .unwrap_or_default()
+            query
+                .to_lowercase()
                 .split_whitespace()
+                .map(str::to_string)
                 .collect()
         };
 
@@ -214,7 +211,7 @@ impl Memory for MarkdownMemory {
                 let content_lower = entry.content.to_lowercase();
                 let matched = keywords
                     .iter()
-                    .filter(|kw| content_lower.contains(**kw))
+                    .filter(|kw| content_lower.contains(kw.as_str()))
                     .count();
                 if matched > 0 {
                     #[allow(clippy::cast_precision_loss)]

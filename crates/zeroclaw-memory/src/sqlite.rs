@@ -1,5 +1,5 @@
 use super::embeddings::EmbeddingProvider;
-use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry};
+use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry, is_recent_recall_query};
 use super::vector;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -403,6 +403,10 @@ impl SqliteMemory {
         format!("%{}%", Self::escape_like_pattern(term))
     }
 
+    fn is_prefix_wildcard_term(term: &str) -> bool {
+        matches!(term.strip_suffix('*'), Some(prefix) if !prefix.is_empty())
+    }
+
     fn escape_like_pattern(term: &str) -> String {
         let mut escaped = String::with_capacity(term.len());
         for ch in term.chars() {
@@ -658,7 +662,7 @@ impl Memory for SqliteMemory {
         // Time-only query: list by time range when no keywords.
         // Treat only a bare "*" as the same recent-entry request; keep
         // real wildcard searches such as "wild*" on the keyword path.
-        if query.trim().is_empty() || query.trim() == "*" {
+        if is_recent_recall_query(query) {
             return self
                 .recall_by_time_only(limit, session_id, since, until)
                 .await;
@@ -812,6 +816,14 @@ impl Memory for SqliteMemory {
                     .map(str::to_string)
                     .collect();
                 if !raw_keywords.is_empty() {
+                    let needs_prefix_filter = raw_keywords
+                        .iter()
+                        .any(|keyword| Self::is_prefix_wildcard_term(keyword));
+                    let sql_limit = if needs_prefix_filter {
+                        limit.saturating_mul(8).min(limit.saturating_add(512))
+                    } else {
+                        limit
+                    };
                     let patterns: Vec<String> = raw_keywords
                         .iter()
                         .map(|keyword| Self::like_search_pattern(keyword))
@@ -857,7 +869,7 @@ impl Memory for SqliteMemory {
                         param_values.push(Box::new(u.to_string()));
                     }
                     #[allow(clippy::cast_possible_wrap)]
-                    param_values.push(Box::new(limit as i64));
+                    param_values.push(Box::new(sql_limit as i64));
                     let params_ref: Vec<&dyn rusqlite::types::ToSql> =
                         param_values.iter().map(AsRef::as_ref).collect();
                     let rows = stmt.query_map(params_ref.as_slice(), |row| {
@@ -880,13 +892,18 @@ impl Memory for SqliteMemory {
                             && entry.session_id.as_deref() != Some(sid) {
                                 continue;
                             }
-                        if !raw_keywords.iter().any(|keyword| {
-                            Self::like_fallback_matches(&entry.key, keyword)
-                                || Self::like_fallback_matches(&entry.content, keyword)
-                        }) {
+                        if needs_prefix_filter
+                            && !raw_keywords.iter().any(|keyword| {
+                                Self::like_fallback_matches(&entry.key, keyword)
+                                    || Self::like_fallback_matches(&entry.content, keyword)
+                            })
+                        {
                             continue;
                         }
                         results.push(entry);
+                        if results.len() >= limit {
+                            break;
+                        }
                     }
                 }
             }
@@ -1832,6 +1849,58 @@ mod tests {
         let results = mem.recall("wild*", 10, None, None, None).await.unwrap();
         assert!(results.iter().any(|entry| entry.key == "a1"));
         assert!(results.iter().all(|entry| entry.key != "b1"));
+    }
+
+    #[tokio::test]
+    async fn recall_prefix_wildcard_like_fallback_overfetches_filtered_rows() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            Arc::new(super::super::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Embedding,
+        )
+        .unwrap();
+        mem.store(
+            "real",
+            "fallback wildcard token",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        for i in 0..3 {
+            mem.store(
+                &format!("noise{i}"),
+                "fallback unwild token",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let conn = mem.conn.lock();
+            conn.execute(
+                "UPDATE memories SET updated_at = ?1 WHERE key = ?2",
+                rusqlite::params!["2026-05-03T00:00:00Z", "real"],
+            )
+            .unwrap();
+            for i in 0..3 {
+                conn.execute(
+                    "UPDATE memories SET updated_at = ?1 WHERE key = ?2",
+                    rusqlite::params![format!("2026-05-03T00:00:0{}Z", i + 1), format!("noise{i}")],
+                )
+                .unwrap();
+            }
+        }
+
+        let results = mem.recall("wild*", 1, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "real");
     }
 
     #[tokio::test]
