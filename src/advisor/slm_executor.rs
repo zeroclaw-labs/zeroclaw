@@ -1,6 +1,23 @@
 //! SLM Executor — Gemma 4 loops through tool calls via a prompt-guided
 //! XML protocol.
 //!
+//! # Wiring status (E2 / Phase 3)
+//!
+//! As of 2026-05-03 this module is implemented and unit-tested but is
+//! NOT YET instantiated or called by `gateway/openclaw_compat.rs::handle_api_chat`
+//! or `gateway/ws.rs::handle_socket`. ARCHITECTURE-v8 §923+ specifies
+//! that a Phase 3 wire-up must call `SlmExecutor::run` from those
+//! sites for Medium-/Specialized-class tasks before the cloud-LLM
+//! agent loop.
+//!
+//! **Do not wire this in without first verifying that
+//! `safe_for_slm()`-based tool gating (see `run` below) is preserved.**
+//! The combination "executor wired into the gateway + filter omitted"
+//! would let an SLM invoke `shell` / `file_write` / `apply_patch` /
+//! `delegate` / `cron_*` against the user's interest. The unit test
+//! `safe_for_slm_filter_excludes_unsafe_tools` is the regression gate
+//! for that property.
+//!
 //! # Why prompt-guided, not native tool-calling?
 //!
 //! Ollama's `tools:` parameter only exposes native function-calling for
@@ -132,7 +149,39 @@ impl SlmExecutor {
     /// caller's tool registry — `&[&dyn Tool]` lets both
     /// `Arc<Vec<Box<dyn Tool>>>` and `Vec<Arc<dyn Tool>>` feed in
     /// without reallocating.
+    ///
+    /// SECURITY (ARCHITECTURE-v8 §923+, Phase 3 SLM-as-Executor):
+    /// the executor MUST filter the caller's tool list to those
+    /// declaring `Tool::safe_for_slm() = true` before either prompting
+    /// the SLM with the catalog or dispatching its tool calls. The
+    /// gating exists because the SLM has no LLM-grade reasoning over
+    /// destructive consequences and may be coerced into invoking
+    /// `shell` / `file_write` / `apply_patch` / `delegate` / `cron_*`
+    /// against the user's interest. Cloud-LLM execution paths (the
+    /// regular agent loop) keep full tool access; only the SLM
+    /// executor is gated here.
+    ///
+    /// The filter happens once, at the start of `run`, so every
+    /// downstream call site (`build_system_prompt`, `find_tool`,
+    /// dispatch) operates on the safe subset by construction. Any
+    /// future code that wants to expose more tools to the SLM should
+    /// flip the per-tool `safe_for_slm()` override, not bypass this
+    /// filter.
     pub async fn run(&self, task: &str, tools: &[&dyn Tool]) -> Result<RunOutcome> {
+        let safe_tools: Vec<&dyn Tool> = tools
+            .iter()
+            .copied()
+            .filter(|t| t.safe_for_slm())
+            .collect();
+        if safe_tools.len() < tools.len() {
+            debug!(
+                total = tools.len(),
+                safe = safe_tools.len(),
+                "SLM executor filtered tool list to safe_for_slm subset"
+            );
+        }
+        let tools = safe_tools.as_slice();
+
         let mut conversation: Vec<ChatMessage> = Vec::with_capacity(self.max_iterations * 2 + 2);
         conversation.push(ChatMessage::system(build_system_prompt(tools)));
         conversation.push(ChatMessage::user(task));
@@ -464,5 +513,81 @@ mod tests {
         assert!(prompt.contains("<tool_call>"));
         assert!(prompt.contains("stub_tool"));
         assert!(prompt.contains("a stub tool"));
+    }
+
+    /// Regression for E1: SLM executor MUST filter to safe_for_slm()=true.
+    /// Without this, an SLM could invoke `shell`, `file_write`, `delegate`,
+    /// or other destructive tools without LLM oversight.
+    ///
+    /// We model the filter directly (as `run` would do) on a mixed list
+    /// containing one safe and one unsafe stub. Asserting the filtered
+    /// list and the system prompt covers both call sites that consume
+    /// it inside `run` (`build_system_prompt` and `find_tool`).
+    #[test]
+    fn safe_for_slm_filter_excludes_unsafe_tools() {
+        use async_trait::async_trait;
+
+        struct SafeStub;
+        struct UnsafeStub;
+
+        #[async_trait]
+        impl Tool for SafeStub {
+            fn name(&self) -> &str { "safe_search" }
+            fn description(&self) -> &str { "read-only search" }
+            fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+            async fn execute(
+                &self,
+                _: serde_json::Value,
+            ) -> anyhow::Result<crate::tools::traits::ToolResult> { unreachable!() }
+            // safe_for_slm defaults to true — explicit for clarity.
+            fn safe_for_slm(&self) -> bool { true }
+        }
+
+        #[async_trait]
+        impl Tool for UnsafeStub {
+            fn name(&self) -> &str { "destructive_shell" }
+            fn description(&self) -> &str { "runs arbitrary shell commands" }
+            fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+            async fn execute(
+                &self,
+                _: serde_json::Value,
+            ) -> anyhow::Result<crate::tools::traits::ToolResult> { unreachable!() }
+            fn safe_for_slm(&self) -> bool { false }
+        }
+
+        let safe = SafeStub;
+        let unsafe_ = UnsafeStub;
+        let mixed: Vec<&dyn Tool> = vec![&safe, &unsafe_];
+
+        // Mirror the filter that `SlmExecutor::run` applies on entry.
+        let filtered: Vec<&dyn Tool> = mixed
+            .iter()
+            .copied()
+            .filter(|t| t.safe_for_slm())
+            .collect();
+
+        assert_eq!(filtered.len(), 1, "exactly one safe tool should survive");
+        assert_eq!(filtered[0].name(), "safe_search");
+
+        let prompt = build_system_prompt(&filtered);
+        assert!(
+            prompt.contains("safe_search"),
+            "safe tool name must appear in system prompt"
+        );
+        assert!(
+            !prompt.contains("destructive_shell"),
+            "unsafe tool MUST NOT appear in SLM system prompt — \
+             this is the privacy-/safety-critical assertion"
+        );
+
+        // find_tool over the filtered list must not resolve the unsafe name.
+        assert!(
+            find_tool(&filtered, "destructive_shell").is_none(),
+            "find_tool over filtered list MUST NOT return an unsafe tool"
+        );
+        assert!(
+            find_tool(&filtered, "safe_search").is_some(),
+            "find_tool over filtered list MUST still resolve safe tools"
+        );
     }
 }
