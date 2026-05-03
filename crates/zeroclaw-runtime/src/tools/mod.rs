@@ -341,11 +341,8 @@ pub fn all_tools_with_runtime(
 ) {
     let has_shell_access = runtime.has_shell_access();
     let runtime_kind = root_config.runtime.kind.as_str();
-    let sandbox = create_sandbox(
-        &root_config.security,
-        runtime_kind,
-        Some(&security.workspace_dir),
-    );
+    let sandbox_cfg = root_config.active_risk_profile(None).sandbox_config();
+    let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(

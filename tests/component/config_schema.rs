@@ -299,23 +299,23 @@ fn gateway_path_prefix_accepts_none() {
 #[test]
 fn security_config_defaults() {
     let sec = SecurityConfig::default();
+    assert!(sec.audit.enabled, "audit should be enabled by default");
+    // V3: sandbox/resource limits live on risk_profiles entries, not SecurityConfig.
+    let profile = RiskProfileConfig::default();
     assert!(
-        sec.sandbox.enabled.is_none(),
+        profile.sandbox_enabled.is_none(),
         "sandbox enabled should auto-detect (None) by default"
     );
-    assert!(sec.audit.enabled, "audit should be enabled by default");
 }
 
 #[test]
 fn security_config_toml_roundtrip() {
     let mut sec = SecurityConfig::default();
-    sec.sandbox.enabled = Some(true);
     sec.audit.max_size_mb = 200;
 
     let toml_str = toml::to_string(&sec).expect("SecurityConfig should serialize");
     let parsed: SecurityConfig = toml::from_str(&toml_str).expect("should deserialize back");
 
-    assert_eq!(parsed.sandbox.enabled, Some(true));
     assert_eq!(parsed.audit.max_size_mb, 200);
 }
 

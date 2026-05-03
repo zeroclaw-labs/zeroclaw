@@ -1788,8 +1788,8 @@ async fn main() -> Result<()> {
             #[cfg(target_os = "linux")]
             {
                 use zeroclaw_config::schema::SandboxBackend;
-                let sandbox_docker =
-                    matches!(config.security.sandbox.backend, SandboxBackend::Docker);
+                let sandbox_cfg = config.active_risk_profile(None).sandbox_config();
+                let sandbox_docker = matches!(sandbox_cfg.backend, SandboxBackend::Docker);
                 let runtime_docker_mem = config.runtime.kind == "docker"
                     && config
                         .runtime

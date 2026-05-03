@@ -5713,6 +5713,63 @@ impl RiskProfileConfig {
             }
         }
     }
+
+    /// Synthesize a [`SandboxConfig`] from this profile's flattened sandbox
+    /// fields. V3 stores sandbox config flat on the profile; legacy
+    /// callsites that still want a `SandboxConfig` instance (sandbox detection
+    /// in `zeroclaw-runtime::security::detect`) can call this helper.
+    #[must_use]
+    pub fn sandbox_config(&self) -> SandboxConfig {
+        let backend = self
+            .sandbox_backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(parse_sandbox_backend)
+            .unwrap_or_default();
+        SandboxConfig {
+            enabled: self.sandbox_enabled,
+            backend,
+            firejail_args: self.firejail_args.clone(),
+        }
+    }
+
+    /// Synthesize a [`ResourceLimitsConfig`] from this profile's flattened
+    /// resource fields.
+    #[must_use]
+    pub fn resource_limits(&self) -> ResourceLimitsConfig {
+        ResourceLimitsConfig {
+            max_memory_mb: if self.max_memory_mb == 0 {
+                default_max_memory_mb()
+            } else {
+                self.max_memory_mb
+            },
+            max_cpu_time_seconds: if self.max_cpu_time_seconds == 0 {
+                default_max_cpu_time_seconds()
+            } else {
+                self.max_cpu_time_seconds
+            },
+            max_subprocesses: if self.max_subprocesses == 0 {
+                default_max_subprocesses()
+            } else {
+                self.max_subprocesses
+            },
+            memory_monitoring: self.memory_monitoring,
+        }
+    }
+}
+
+fn parse_sandbox_backend(name: &str) -> SandboxBackend {
+    match name.to_ascii_lowercase().as_str() {
+        "auto" => SandboxBackend::Auto,
+        "landlock" => SandboxBackend::Landlock,
+        "firejail" => SandboxBackend::Firejail,
+        "bubblewrap" => SandboxBackend::Bubblewrap,
+        "docker" => SandboxBackend::Docker,
+        "sandbox-exec" | "sandboxexec" | "seatbelt" => SandboxBackend::SandboxExec,
+        "none" => SandboxBackend::None,
+        _ => SandboxBackend::default(),
+    }
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -8292,21 +8349,16 @@ impl ChannelConfig for FeishuConfig {
 
 // ── Security Config ─────────────────────────────────────────────────
 
-/// Security configuration for sandboxing, resource limits, and audit logging
+/// Security configuration for audit logging, OTP, e-stop, IAM/SSO, and WebAuthn.
+///
+/// V3: V2's `[security.sandbox]` and `[security.resources]` subsections are
+/// gone. Sandbox backend and resource limits live on per-agent risk profiles
+/// (see `RiskProfileConfig::sandbox_*` and `RiskProfileConfig::max_*`); the
+/// runtime resolves them via `Config::active_risk_profile(agent_alias)`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security"]
 pub struct SecurityConfig {
-    /// Sandbox configuration
-    #[serde(default)]
-    #[nested]
-    pub sandbox: SandboxConfig,
-
-    /// Resource limits
-    #[serde(default)]
-    #[nested]
-    pub resources: ResourceLimitsConfig,
-
     /// Audit logging configuration
     #[serde(default)]
     #[nested]

@@ -1642,11 +1642,9 @@ max_memory_mb = 256
         .expect("risk profile synthesised from security subsections");
     assert_eq!(profile.sandbox_enabled, Some(true));
     assert_eq!(profile.max_memory_mb, 256);
-    // sandbox and resources subsections are removed from [security].
-    assert!(
-        !config.security.sandbox.enabled.unwrap_or(false) || profile.sandbox_enabled.is_some(),
-        "sandbox fields must be in the risk profile after synthesis"
-    );
+    // V3: [security.sandbox] / [security.resources] subsections no longer exist
+    // on SecurityConfig — sandbox_* and resource limits live exclusively on
+    // risk_profiles entries. The assertion above already covers preservation.
 }
 
 #[test]

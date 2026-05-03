@@ -3,23 +3,25 @@
 use crate::security::traits::Sandbox;
 use std::path::Path;
 use std::sync::Arc;
-use zeroclaw_config::schema::{SandboxBackend, SecurityConfig};
+use zeroclaw_config::schema::{SandboxBackend, SandboxConfig};
 
 /// Create a sandbox based on auto-detection or explicit config.
 ///
-/// `runtime_kind` is the `runtime.kind` string from the top-level config
-/// (e.g. `"native"`, `"docker"`). When the caller has set `runtime.kind = "native"`,
-/// Docker must never be selected as the sandbox backend during auto-detection —
-/// the user explicitly opted out of container wrapping.
+/// V3: takes a [`SandboxConfig`] (synthesized from the active risk profile via
+/// `RiskProfileConfig::sandbox_config()`). `runtime_kind` is the
+/// `runtime.kind` string from the top-level config. When the caller has set
+/// `runtime.kind = "native"`, Docker must never be selected as the sandbox
+/// backend during auto-detection — the user explicitly opted out of container
+/// wrapping.
 pub fn create_sandbox(
-    config: &SecurityConfig,
+    sandbox: &SandboxConfig,
     runtime_kind: &str,
     workspace_dir: Option<&Path>,
 ) -> Arc<dyn Sandbox> {
-    let backend = &config.sandbox.backend;
+    let backend = &sandbox.backend;
 
     // If explicitly disabled, return noop
-    if matches!(backend, SandboxBackend::None) || config.sandbox.enabled == Some(false) {
+    if matches!(backend, SandboxBackend::None) || sandbox.enabled == Some(false) {
         return Arc::new(super::traits::NoopSandbox);
     }
 
@@ -221,7 +223,6 @@ pub fn linux_memcg_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_config::schema::{SandboxConfig, SecurityConfig};
 
     #[test]
     fn detect_best_sandbox_returns_something() {
@@ -232,29 +233,23 @@ mod tests {
 
     #[test]
     fn explicit_none_returns_noop() {
-        let config = SecurityConfig {
-            sandbox: SandboxConfig {
-                enabled: Some(false),
-                backend: SandboxBackend::None,
-                firejail_args: Vec::new(),
-            },
-            ..Default::default()
+        let sandbox_cfg = SandboxConfig {
+            enabled: Some(false),
+            backend: SandboxBackend::None,
+            firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&config, "", None);
+        let sandbox = create_sandbox(&sandbox_cfg, "", None);
         assert_eq!(sandbox.name(), "none");
     }
 
     #[test]
     fn auto_mode_detects_something() {
-        let config = SecurityConfig {
-            sandbox: SandboxConfig {
-                enabled: None, // Auto-detect
-                backend: SandboxBackend::Auto,
-                firejail_args: Vec::new(),
-            },
-            ..Default::default()
+        let sandbox_cfg = SandboxConfig {
+            enabled: None, // Auto-detect
+            backend: SandboxBackend::Auto,
+            firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&config, "", None);
+        let sandbox = create_sandbox(&sandbox_cfg, "", None);
         // Should return some sandbox (at least NoopSandbox)
         assert!(sandbox.is_available());
     }
@@ -272,17 +267,13 @@ mod tests {
     fn explicit_docker_backend_is_not_blocked_by_native_runtime() {
         // Even with runtime.kind = "native", explicit `backend = "docker"` in config
         // is respected. Only the auto-detect path is gated by runtime_kind.
-        let config = SecurityConfig {
-            sandbox: SandboxConfig {
-                enabled: None,
-                backend: SandboxBackend::Docker,
-                firejail_args: Vec::new(),
-            },
-            ..Default::default()
+        let sandbox_cfg = SandboxConfig {
+            enabled: None,
+            backend: SandboxBackend::Docker,
+            firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&config, "native", None);
+        let sandbox = create_sandbox(&sandbox_cfg, "native", None);
         // If Docker is available, it will be selected; if not, NoopSandbox fallback.
-        // The point is that runtime.kind doesn't override explicit `backend = "docker"`.
         assert!(sandbox.is_available());
     }
 
