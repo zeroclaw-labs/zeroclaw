@@ -178,6 +178,38 @@ impl AuthStore {
             );",
         )?;
 
+        // ── User-bound sync master keys (PR-A2 — D1+D2 wiring) ──
+        //
+        // The patent requires a per-user master sync key that is
+        // identical across all of a user's devices, NOT a per-device
+        // random key. This table stores the 32-byte master key that
+        // gets transmitted to new devices over the pairing channel
+        // when they join the user's account. The key is base64-encoded
+        // so it round-trips through both SQLite TEXT columns and the
+        // pairing wire format without any binary-data handling on the
+        // intermediate hops.
+        //
+        // Schema notes:
+        //   - One row per user. The UNIQUE constraint on user_id keeps
+        //     it that way; if a user "rotates" their key (reset device,
+        //     etc.), the row is REPLACED, not duplicated.
+        //   - `key_b64` is base64(STANDARD_NO_PAD) of 32 raw bytes →
+        //     43 chars. We do NOT store the raw bytes because some
+        //     SQLite client tools mishandle BLOB columns containing
+        //     null bytes during ad-hoc inspection.
+        //   - `created_at` is the first time we saw this key. On
+        //     rotate-replace, this is the rotation time.
+        //
+        // The "delete on user deletion" cascade is the same pattern
+        // sessions/devices use.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS user_sync_keys (
+                user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                key_b64 TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );",
+        )?;
+
         // Ensure default admin exists (password: admin — must change on first login)
         let admin_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM admins",
@@ -647,6 +679,101 @@ impl AuthStore {
         let conn = self.conn.lock();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
         Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    // ── User-bound Sync Master Key (PR-A2 — D1+D2 wiring) ──────────
+    //
+    // The cross-device memory sync uses a SINGLE 32-byte master key
+    // per user account, shared across all of that user's devices via
+    // the pairing channel. These three methods are the storage seam:
+    //
+    //   1. `get_user_sync_key(user_id)`           — read on device add
+    //   2. `set_user_sync_key(user_id, key)`      — first-device init
+    //                                               or rotation
+    //   3. `get_or_create_user_sync_key(user_id)` — convenience for the
+    //                                               common path (read,
+    //                                               or generate+store
+    //                                               if missing)
+    //
+    // The transmission of the key over the pairing channel is the
+    // gateway/pairing module's responsibility (separate PR); these
+    // methods are the storage primitive that work owns.
+    //
+    // SECURITY: the key is the keying material that decrypts every
+    // sync delta the user ever produces. Never log it; never echo it
+    // to clients except as the explicit "I'm pairing this device"
+    // response. The base64 representation here is a wire-format
+    // convenience, not a secrecy claim — the key is a secret either
+    // way.
+
+    /// Read the user's master sync key, base64-decoded into a 32-byte
+    /// array. Returns `None` if the user has never had a key set
+    /// (which happens for accounts created before this column existed
+    /// AND for newly-created accounts that haven't run a sync handshake
+    /// yet). Returns `Err` if the column row exists but is malformed
+    /// (wrong base64, wrong byte count) — that condition signals
+    /// either tampering or a partial migration and should NOT be
+    /// silently ignored.
+    pub fn get_user_sync_key(&self, user_id: &str) -> Result<Option<[u8; 32]>> {
+        use base64::engine::general_purpose::STANDARD_NO_PAD;
+        use base64::Engine;
+        let conn = self.conn.lock();
+        let row: rusqlite::Result<String> = conn.query_row(
+            "SELECT key_b64 FROM user_sync_keys WHERE user_id = ?1",
+            rusqlite::params![user_id],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(b64) => {
+                let bytes = STANDARD_NO_PAD
+                    .decode(b64.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("user_sync_keys.key_b64 not valid base64: {e}"))?;
+                if bytes.len() != 32 {
+                    bail!(
+                        "user_sync_keys.key_b64 decoded to {} bytes, expected 32",
+                        bytes.len()
+                    );
+                }
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&bytes);
+                Ok(Some(out))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write the user's master sync key. Replaces any existing row
+    /// (rotation case). The key is base64-encoded for storage.
+    pub fn set_user_sync_key(&self, user_id: &str, key: &[u8; 32]) -> Result<()> {
+        use base64::engine::general_purpose::STANDARD_NO_PAD;
+        use base64::Engine;
+        let key_b64 = STANDARD_NO_PAD.encode(key);
+        let now = epoch_secs() as i64;
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO user_sync_keys (user_id, key_b64, created_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(user_id) DO UPDATE SET key_b64 = excluded.key_b64,
+                                                 created_at = excluded.created_at",
+            rusqlite::params![user_id, key_b64, now],
+        )?;
+        Ok(())
+    }
+
+    /// Convenience: read the user's master sync key, or generate +
+    /// persist a fresh CSPRNG key if none exists. The "first device
+    /// joins the account" flow uses this; subsequent devices use
+    /// `get_user_sync_key` (returning the same value) plus the
+    /// pairing channel to receive it.
+    pub fn get_or_create_user_sync_key(&self, user_id: &str) -> Result<[u8; 32]> {
+        if let Some(existing) = self.get_user_sync_key(user_id)? {
+            return Ok(existing);
+        }
+        let mut key = [0u8; 32];
+        rand::fill(&mut key);
+        self.set_user_sync_key(user_id, &key)?;
+        Ok(key)
     }
 
     // ── User Email Management ────────────────────────────────────────
@@ -1496,5 +1623,75 @@ mod tests {
         assert!(too_short.unwrap_err().to_string().contains("at least 8"));
         let exactly_eight = store.set_password(&user_id, "12345678");
         assert!(exactly_eight.is_ok(), "set_password must accept exactly 8 chars");
+    }
+
+    // ── PR-A2: user-bound sync master key tests (D1+D2 storage) ──
+
+    #[test]
+    fn user_sync_key_round_trip() {
+        let (_tmp, store) = test_store();
+        let user_id = store.register("alice", "initialpw1").unwrap();
+
+        // Initially no key.
+        assert!(store.get_user_sync_key(&user_id).unwrap().is_none());
+
+        // Set a known key, read it back identical.
+        let original = [42u8; 32];
+        store.set_user_sync_key(&user_id, &original).unwrap();
+        let read_back = store.get_user_sync_key(&user_id).unwrap();
+        assert_eq!(read_back, Some(original));
+    }
+
+    #[test]
+    fn user_sync_key_replaces_on_rotation() {
+        let (_tmp, store) = test_store();
+        let user_id = store.register("alice", "initialpw1").unwrap();
+
+        let v1 = [1u8; 32];
+        let v2 = [2u8; 32];
+        store.set_user_sync_key(&user_id, &v1).unwrap();
+        store.set_user_sync_key(&user_id, &v2).unwrap();
+        assert_eq!(store.get_user_sync_key(&user_id).unwrap(), Some(v2));
+    }
+
+    #[test]
+    fn get_or_create_returns_same_key_on_repeat() {
+        let (_tmp, store) = test_store();
+        let user_id = store.register("alice", "initialpw1").unwrap();
+
+        let k1 = store.get_or_create_user_sync_key(&user_id).unwrap();
+        let k2 = store.get_or_create_user_sync_key(&user_id).unwrap();
+        assert_eq!(
+            k1, k2,
+            "get_or_create must return the persisted key on second call, \
+             not a fresh CSPRNG one — that would break cross-device sync"
+        );
+    }
+
+    #[test]
+    fn get_or_create_generates_nonzero_key_on_first_call() {
+        let (_tmp, store) = test_store();
+        let user_id = store.register("alice", "initialpw1").unwrap();
+        let k = store.get_or_create_user_sync_key(&user_id).unwrap();
+        // Probability of CSPRNG giving 32 zero bytes is ~ 2^-256.
+        assert_ne!(k, [0u8; 32], "fresh key must not be all zeros");
+    }
+
+    #[test]
+    fn user_sync_key_is_per_user_isolated() {
+        let (_tmp, store) = test_store();
+        let alice = store.register("alice", "alicepass1").unwrap();
+        let bob = store.register("bob", "bobpassww1").unwrap();
+
+        let alice_k = store.get_or_create_user_sync_key(&alice).unwrap();
+        let bob_k = store.get_or_create_user_sync_key(&bob).unwrap();
+
+        assert_ne!(
+            alice_k, bob_k,
+            "two CSPRNG-generated keys must differ (otherwise the RNG is broken \
+             OR the get_or_create is sharing rows across users)"
+        );
+        assert_eq!(store.get_user_sync_key(&alice).unwrap(), Some(alice_k));
+        assert_eq!(store.get_user_sync_key(&bob).unwrap(), Some(bob_k));
     }
 }
