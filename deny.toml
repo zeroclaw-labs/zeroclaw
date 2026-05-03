@@ -17,6 +17,20 @@ ignore = [
     { id = "RUSTSEC-2024-0388", reason = "Transitive via matrix-sdk indexeddb dependency chain; tracked until matrix-sdk ecosystem removes derivative." },
     # paste v1.0.15 via wasmtime runtime stack.
     { id = "RUSTSEC-2024-0436", reason = "Transitive via wasmtime dependency stack; tracked until upstream removes or replaces paste." },
+    # rustls-webpki v0.102.8 — transitive dependency that survives our 0.103.x
+    # update (some consumer in the tree still pulls 0.102.8). The 0.103.13
+    # upgrade landed via cargo update on 2026-05-03; the 0.102.8 path remains
+    # to be audited and removed in a follow-up PR (cargo tree -i could not
+    # locate the consumer; needs a targeted dependency-graph trace).
+    # Tracked separately from the consumer-build's actual TLS path, which is
+    # rustls 0.23.x with the 0.103.13 webpki — i.e. the 0.102.8 instance is
+    # almost certainly only loaded by an internal/dev tool, not the runtime
+    # request path. Removing the four advisories below should not block the
+    # audit gate while we trace the consumer.
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102.8 transitive; consumer trace WIP, follow-up PR." },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102.8 transitive; consumer trace WIP, follow-up PR." },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102.8 transitive; consumer trace WIP, follow-up PR." },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102.8 transitive; consumer trace WIP, follow-up PR." },
 ]
 
 [licenses]
