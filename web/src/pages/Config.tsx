@@ -560,7 +560,6 @@ function AliasListView({
 
           {/* Inline new alias row */}
           <div className="flex items-center gap-2 px-4 py-3">
-            <Plus className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-accent)' }} />
             <input
               type="text"
               className="input-electric flex-1 px-3 py-1.5 text-sm"
