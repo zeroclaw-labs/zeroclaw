@@ -6781,6 +6781,9 @@ pub struct ChannelsConfig {
     #[display_name = "Webhooks"]
     #[description = "HTTP endpoint for triggers"]
     pub webhook: Option<WebhookConfig>,
+    /// OpenAI-compatible bridge channel configuration.
+    #[nested]
+    pub openai: Option<OpenaiChannelConfig>,
     /// iMessage channel configuration (macOS only).
     #[nested]
     #[display_name = "iMessage"]
@@ -7098,6 +7101,10 @@ impl ChannelsConfig {
             Box::new(ConfigWrapper::new(self.webhook.as_ref())),
             self.webhook.is_some(),
         ));
+        ret.push((
+            Box::new(ConfigWrapper::new(self.openai.as_ref())),
+            self.openai.as_ref().is_some_and(|c| c.enabled),
+        ));
         ret
     }
 }
@@ -7120,6 +7127,7 @@ impl Default for ChannelsConfig {
             slack: None,
             mattermost: None,
             webhook: None,
+            openai: None,
             imessage: None,
             matrix: None,
             signal: None,
@@ -7518,6 +7526,41 @@ impl ChannelConfig for WebhookConfig {
     }
     fn desc() -> &'static str {
         "HTTP endpoint"
+    }
+}
+
+/// OpenAI-compatible bridge channel configuration (`[channels.openai]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[display_name = "OpenAI"]
+#[description = "OpenAI-compatible HTTP endpoint (/openai/v1)"]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.openai"]
+pub struct OpenaiChannelConfig {
+    /// Whether this channel is active. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How to handle a system prompt supplied by the API caller.
+    ///
+    /// - `"zeroclaw"` (default) — always use ZeroClaw soul/identity;
+    ///   replace or insert, ignoring any caller-supplied system prompt.
+    /// - `"merge"` — prepend ZeroClaw soul to the caller's system prompt
+    ///   (or insert if the caller sent none).
+    /// - `"caller"` — pass the caller's system prompt through unchanged;
+    ///   skip ZeroClaw soul entirely.
+    #[serde(default = "default_system_prompt_mode")]
+    pub system_prompt_mode: String,
+}
+
+fn default_system_prompt_mode() -> String {
+    "zeroclaw".to_string()
+}
+
+impl ChannelConfig for OpenaiChannelConfig {
+    fn name() -> &'static str {
+        "OpenAI Channel"
+    }
+    fn desc() -> &'static str {
+        "OpenAI-compatible HTTP endpoint (/openai/v1)"
     }
 }
 
@@ -12633,6 +12676,7 @@ auto_save = true
                 #[cfg(feature = "voice-wake")]
                 voice_wake: None,
                 mqtt: None,
+                openai: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -13807,6 +13851,7 @@ allowed_users = ["@u:matrix.org"]
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
+            openai: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -14189,6 +14234,7 @@ bot_token = "xoxb-tok"
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
+            openai: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,

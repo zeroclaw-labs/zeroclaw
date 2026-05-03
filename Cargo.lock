@@ -13357,10 +13357,12 @@ name = "zeroclaw-gateway"
 version = "0.7.5"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "chrono",
  "directories",
+ "futures",
  "futures-util",
  "hex",
  "hmac 0.12.1",
