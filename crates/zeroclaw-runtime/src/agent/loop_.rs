@@ -2094,7 +2094,7 @@ pub async fn run(
         &config.workspace_dir,
     ));
 
-    let fallback_provider_loop = config.providers.fallback_provider();
+    let fallback_provider_loop = config.providers.first_provider();
 
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
@@ -2247,7 +2247,7 @@ pub async fn run(
     // ── Resolve provider ─────────────────────────────────────────
     let mut provider_name = provider_override
         .as_deref()
-        .or(config.providers.fallback_type())
+        .or(config.providers.first_provider_type())
         .unwrap_or("openrouter")
         .to_string();
 
@@ -3110,7 +3110,7 @@ pub async fn process_message(
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let fallback_provider_pm = config.providers.fallback_provider();
+    let fallback_provider_pm = config.providers.first_provider();
     let approval_manager = ApprovalManager::for_non_interactive(&config.autonomy);
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
@@ -3224,7 +3224,10 @@ pub async fn process_message(
         }
     }
 
-    let provider_name = config.providers.fallback_type().unwrap_or("openrouter");
+    let provider_name = config
+        .providers
+        .first_provider_type()
+        .unwrap_or("openrouter");
     let model_name = match fallback_provider_pm
         .and_then(|e| e.model.as_deref())
         .map(str::trim)
@@ -3244,11 +3247,9 @@ pub async fn process_message(
             }
             None => {
                 anyhow::bail!(
-                    "no model configured: providers.fallback = {:?} resolves with no model, \
-                     and no [[providers.models.*]] entry has a `model` field set. \
-                     Configure at least one [providers.models.<name>] model = \"...\" \
+                    "no model configured: providers.models is empty or has no `model` field set. \
+                     Configure at least one [providers.models.<type>.<alias>] model = \"...\" \
                      or define a [[model_routes]] hint.",
-                    config.providers.fallback,
                 )
             }
         },
@@ -3405,7 +3406,7 @@ pub async fn process_message(
     let effective_temperature = crate::agent::thinking::clamp_temperature(
         config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             + thinking_params.temperature_adjustment,

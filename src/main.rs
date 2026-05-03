@@ -1496,28 +1496,40 @@ async fn main() -> Result<()> {
                 temperature,
                 ..
             } => {
-                let fallback = config.providers.fallback_provider();
+                let fallback = config.providers.first_provider();
                 let final_temperature = temperature
                     .unwrap_or_else(|| fallback.and_then(|e| e.temperature).unwrap_or(0.7));
                 if let Some(p) = &provider {
-                    config.providers.fallback = vec![p.clone()];
+                    // Upsert the requested provider type under "default" alias.
+                    let entry = config
+                        .providers
+                        .models
+                        .entry(p.clone())
+                        .or_default()
+                        .entry("default".to_string())
+                        .or_default();
+                    if let Some(m) = &model {
+                        entry.model = Some(m.clone());
+                    }
+                    entry.temperature = Some(final_temperature);
+                } else {
+                    config.ensure_fallback_provider().temperature = Some(final_temperature);
+                    if let Some(m) = &model {
+                        config.ensure_fallback_provider().model = Some(m.clone());
+                    }
                 }
-                if let Some(m) = &model {
-                    config.ensure_fallback_provider().model = Some(m.clone());
-                }
-                config.ensure_fallback_provider().temperature = Some(final_temperature);
 
-                let provider_name = config.providers.fallback_type().unwrap_or("openai");
+                let provider_name = config.providers.first_provider_type().unwrap_or("openai");
                 let provider = zeroclaw::providers::create_provider(
                     provider_name,
                     config
                         .providers
-                        .fallback_provider()
+                        .first_provider()
                         .and_then(|e| e.api_key.as_deref()),
                 )?;
                 let model_name = config
                     .providers
-                    .fallback_provider()
+                    .first_provider()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("default");
                 match message {
@@ -1597,7 +1609,7 @@ async fn main() -> Result<()> {
             let final_temperature = temperature.unwrap_or_else(|| {
                 config
                     .providers
-                    .fallback_provider()
+                    .first_provider()
                     .and_then(|e| e.temperature)
                     .unwrap_or(0.7)
             });
@@ -1934,13 +1946,16 @@ async fn main() -> Result<()> {
             println!();
             println!(
                 "🤖 Provider:      {}",
-                config.providers.fallback_type().unwrap_or("openrouter")
+                config
+                    .providers
+                    .first_provider_type()
+                    .unwrap_or("openrouter")
             );
             println!(
                 "   Model:         {}",
                 config
                     .providers
-                    .fallback_provider()
+                    .first_provider()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("(default)")
             );
@@ -2079,7 +2094,7 @@ async fn main() -> Result<()> {
             let providers = providers::list_providers();
             let current = config
                 .providers
-                .fallback_type()
+                .first_provider_type()
                 .unwrap_or("openrouter")
                 .trim()
                 .to_ascii_lowercase();
@@ -4311,7 +4326,7 @@ mod tests {
         let final_temperature = user_temperature.unwrap_or_else(|| {
             config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
         });
@@ -4330,7 +4345,7 @@ mod tests {
         let final_temperature = user_temperature.unwrap_or_else(|| {
             config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
         });

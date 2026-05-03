@@ -116,7 +116,7 @@ pub async fn handle_api_status(
         .unwrap_or_else(zeroclaw_runtime::i18n::detect_locale);
 
     let body = serde_json::json!({
-        "provider": config.providers.fallback,
+        "provider": config.providers.first_provider_type(),
         "model": state.model,
         "temperature": state.temperature,
         "uptime_seconds": health.uptime_seconds,

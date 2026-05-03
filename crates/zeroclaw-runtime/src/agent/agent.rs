@@ -484,7 +484,7 @@ impl Agent {
             session_cwd.unwrap_or(&config.workspace_dir),
         ));
 
-        let fallback_provider_ag = config.providers.fallback_provider();
+        let fallback_provider_ag = config.providers.first_provider();
         let memory: Arc<dyn Memory> =
             Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
@@ -590,7 +590,10 @@ impl Agent {
             }
         }
 
-        let provider_name = config.providers.fallback_type().unwrap_or("openrouter");
+        let provider_name = config
+            .providers
+            .first_provider_type()
+            .unwrap_or("openrouter");
 
         let model_name = match fallback_provider_ag
             .and_then(|e| e.model.as_deref())
@@ -611,11 +614,9 @@ impl Agent {
                 }
                 None => {
                     anyhow::bail!(
-                        "no model configured: providers.fallback = {:?} resolves with no model, \
-                         and no [[providers.models.*]] entry has a `model` field set. \
-                         Configure at least one [providers.models.<name>] model = \"...\" \
-                         or define a [[model_routes]] hint.",
-                        config.providers.fallback,
+                        "no model configured: providers.models is empty or has no `model` field \
+                         set. Configure at least one [providers.models.<type>.<alias>] \
+                         model = \"...\" or define a [[model_routes]] hint.",
                     )
                 }
             },
@@ -1634,16 +1635,27 @@ pub async fn run(
 
     let mut effective_config = config;
     if let Some(p) = provider_override {
-        effective_config.providers.fallback = vec![p];
+        // When a provider override is specified, ensure that provider type exists
+        // in models and is set as the first (and only) entry for routing purposes.
+        if let Some((type_key, alias_key)) = p.split_once('.') {
+            effective_config
+                .providers
+                .models
+                .entry(type_key.to_string())
+                .or_default()
+                .entry(alias_key.to_string())
+                .or_default();
+        } else {
+            effective_config
+                .providers
+                .models
+                .entry(p.clone())
+                .or_default()
+                .entry("default".to_string())
+                .or_default();
+        }
     }
-    if let Some(fallback) = effective_config.providers.fallback.first().cloned()
-        && let Some((type_key, alias_key)) = fallback.split_once('.')
-        && let Some(entry) = effective_config
-            .providers
-            .models
-            .get_mut(type_key)
-            .and_then(|m| m.get_mut(alias_key))
-    {
+    if let Some(entry) = effective_config.providers.first_provider_mut() {
         if let Some(m) = model_override {
             entry.model = Some(m);
         }
@@ -1654,7 +1666,7 @@ pub async fn run(
 
     let provider_name = effective_config
         .providers
-        .fallback_type()
+        .first_provider_type()
         .unwrap_or("openrouter")
         .to_string();
     // `Agent::from_config` above has already errored if no model could be resolved,
@@ -1663,7 +1675,7 @@ pub async fn run(
     // never silently substitute a hardcoded vendor model.
     let model_name = effective_config
         .providers
-        .fallback_provider()
+        .first_provider()
         .and_then(|e| e.model.as_deref())
         .map(str::trim)
         .filter(|m| !m.is_empty())
@@ -2155,7 +2167,6 @@ mod tests {
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         let server_handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -2169,9 +2180,14 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = vec![format!("custom:http://{addr}")];
         {
-            let entry = config.ensure_fallback_provider();
+            let entry = config
+                .providers
+                .models
+                .entry("openrouter".to_string())
+                .or_default()
+                .entry("default".to_string())
+                .or_default();
             entry.api_key = Some("test-key".to_string());
             entry.model = Some("test-model".to_string());
             entry.extra_headers.insert(

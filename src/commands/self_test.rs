@@ -230,7 +230,7 @@ async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
         &config.workspace_dir,
         config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.api_key.as_deref()),
     ) {
         Ok(m) => m,

@@ -30,6 +30,33 @@ pub fn route_hashmap_path<'a>(
     Some((hm_key, inner_name))
 }
 
+/// For a `#[nested] HashMap<String, HashMap<String, T>>` field, parse a path
+/// `<my_prefix>.<field_name>.<outer_key>.<inner_key>.<inner_suffix>` and
+/// return (outer_key, inner_key, fully-qualified inner name for T::get_prop).
+///
+/// Returns `None` when the path doesn't match (wrong prefix or too few segments).
+pub fn route_double_hashmap_path<'a>(
+    name: &'a str,
+    my_prefix: &str,
+    field_name: &str,
+    inner_prefix: &str,
+) -> Option<(&'a str, &'a str, String)> {
+    let key_prefix = if my_prefix.is_empty() {
+        field_name.to_string()
+    } else {
+        format!("{my_prefix}.{field_name}")
+    };
+    let rest = name.strip_prefix(&key_prefix)?.strip_prefix('.')?;
+    let (outer_key, rest2) = rest.split_once('.')?;
+    let (inner_key, inner_suffix) = rest2.split_once('.')?;
+    let inner_name = if inner_prefix.is_empty() {
+        inner_suffix.to_string()
+    } else {
+        format!("{inner_prefix}.{inner_suffix}")
+    };
+    Some((outer_key, inner_key, inner_name))
+}
+
 /// Return a comma-separated string of valid enum variant names for display in error messages.
 #[cfg(feature = "schema-export")]
 pub fn enum_variants<T: schemars::JsonSchema>() -> String {

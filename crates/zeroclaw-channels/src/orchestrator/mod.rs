@@ -832,7 +832,7 @@ fn resolve_provider_alias(name: &str) -> Option<String> {
 fn resolved_default_provider(config: &Config) -> String {
     config
         .providers
-        .fallback_type()
+        .first_provider_type()
         .unwrap_or("openrouter")
         .to_string()
 }
@@ -840,15 +840,13 @@ fn resolved_default_provider(config: &Config) -> String {
 fn resolved_default_model(config: &Config) -> anyhow::Result<String> {
     config
         .providers
-        .fallback_provider()
+        .first_provider()
         .and_then(|e| e.model.clone())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no model configured: providers.fallback = {:?} resolves with no model, \
-                 and no [[providers.models.*]] entry has a `model` field set. \
-                 Configure at least one [providers.models.<name>] model = \"...\" \
+                "no model configured: providers.models is empty or has no `model` field set. \
+                 Configure at least one [providers.models.<type>.<alias>] model = \"...\" \
                  or define a [[model_routes]] hint.",
-                config.providers.fallback
             )
         })
 }
@@ -859,16 +857,16 @@ fn runtime_defaults_from_config(config: &Config) -> anyhow::Result<ChannelRuntim
         model: resolved_default_model(config)?,
         temperature: config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7),
         api_key: config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.api_key.clone()),
         api_url: config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.base_url.clone()),
         reliability: config.reliability.clone(),
     })
@@ -938,11 +936,11 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
     if let Some(zeroclaw_dir) = path.parent() {
         let store =
             zeroclaw_runtime::security::SecretStore::new(zeroclaw_dir, parsed.secrets.encrypt);
-        if let Some(fallback_entry) = parsed.providers.fallback_provider_mut() {
+        if let Some(fallback_entry) = parsed.providers.first_provider_mut() {
             decrypt_optional_secret_for_runtime_reload(
                 &store,
                 &mut fallback_entry.api_key,
-                "config.providers.fallback.api_key",
+                "config.providers.models.api_key",
             )?;
         }
         // Decrypt TTS provider API keys for runtime reload
@@ -5212,11 +5210,11 @@ pub async fn start_channels(
             &provider_name,
             config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.api_key.clone()),
             config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.base_url.clone()),
             config.reliability.clone(),
             provider_runtime_options.clone(),
@@ -5255,7 +5253,7 @@ pub async fn start_channels(
     let model = resolved_default_model(&config)?;
     let temperature = config
         .providers
-        .fallback_provider()
+        .first_provider()
         .and_then(|e| e.temperature)
         .unwrap_or(0.7);
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
@@ -5265,7 +5263,7 @@ pub async fn start_channels(
         &config.workspace_dir,
         config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.api_key.as_deref()),
     )?);
     let (composio_key, composio_entity_id) = if config.composio.enabled {
@@ -5299,7 +5297,7 @@ pub async fn start_channels(
         &config.agents,
         config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.api_key.as_deref()),
         &config,
         // Share the gateway's canvas store so frames pushed from
@@ -5672,11 +5670,11 @@ pub async fn start_channels(
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_key: config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.api_key.clone()),
         api_url: config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.base_url.clone()),
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,

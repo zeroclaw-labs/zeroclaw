@@ -69,7 +69,7 @@ pub fn excluded_paths(cfg: &Config, prefix: &str) -> Vec<String> {
     if let Some(provider_key) = providers_models_key(prefix) {
         return provider_family_excludes(provider_key)
             .into_iter()
-            .map(|leaf| format!("providers.models.{provider_key}.{leaf}"))
+            .map(|leaf| format!("providers.models.{provider_key}.default.{leaf}"))
             .collect();
     }
 
@@ -105,14 +105,17 @@ pub fn is_excluded(path: &str, excludes: &[String]) -> bool {
         .any(|e| path == e || (e.ends_with('.') && path.starts_with(e)))
 }
 
-/// Extract the `<key>` from a `providers.models.<key>` prefix. Returns
-/// `None` when the prefix isn't a per-model walk.
+/// Extract the provider type key from a `providers.models.<type>` or
+/// `providers.models.<type>.<alias>` prefix. Returns `None` when the
+/// prefix doesn't match a per-model walk.
 pub fn providers_models_key(prefix: &str) -> Option<&str> {
     let rest = prefix.strip_prefix("providers.models.")?;
-    if rest.is_empty() || rest.contains('.') {
+    if rest.is_empty() {
         return None;
     }
-    Some(rest)
+    // V3: "providers.models.<type>.<alias>" — return just the type segment.
+    // V2-compat: "providers.models.<type>" — return the bare segment.
+    Some(rest.split_once('.').map_or(rest, |(type_key, _)| type_key))
 }
 
 /// Walk a freshly-constructed defaults struct (from
@@ -249,16 +252,19 @@ mod tests {
     #[test]
     fn excluded_paths_for_provider_prefix() {
         let cfg = Config::default();
-        let paths = excluded_paths(&cfg, "providers.models.ollama");
+        // V3: caller passes the alias-level prefix "providers.models.<type>.default"
+        let paths = excluded_paths(&cfg, "providers.models.ollama.default");
         assert!(
             paths
                 .iter()
-                .any(|p| p == "providers.models.ollama.azure-openai-resource")
+                .any(|p| p == "providers.models.ollama.default.azure-openai-resource"),
+            "expected azure-openai-resource excluded, got: {paths:?}"
         );
         assert!(
             paths
                 .iter()
-                .any(|p| p == "providers.models.ollama.wire-api")
+                .any(|p| p == "providers.models.ollama.default.wire-api"),
+            "expected wire-api excluded, got: {paths:?}"
         );
     }
 
@@ -290,14 +296,15 @@ mod tests {
         // base_url empty. After apply, it should match the provider's
         // default_base_url() (http://localhost:11434).
         let mut cfg = Config::default();
+        // V3: create_map_key also pre-inserts the "default" alias.
         cfg.create_map_key("providers.models", "ollama")
             .expect("create_map_key");
 
-        apply_provider_trait_defaults(&mut cfg, "ollama", "providers.models.ollama")
+        apply_provider_trait_defaults(&mut cfg, "ollama", "providers.models.ollama.default")
             .expect("apply defaults");
 
         let base_url = cfg
-            .get_prop("providers.models.ollama.base-url")
+            .get_prop("providers.models.ollama.default.base-url")
             .expect("base-url");
         assert!(
             base_url.contains("11434"),
@@ -306,7 +313,7 @@ mod tests {
 
         // Temperature should also be populated (Ollama overrides to 0.0).
         let temp = cfg
-            .get_prop("providers.models.ollama.temperature")
+            .get_prop("providers.models.ollama.default.temperature")
             .expect("temperature");
         assert!(
             !temp.is_empty() && temp != "<unset>",
@@ -321,14 +328,17 @@ mod tests {
         let mut cfg = Config::default();
         cfg.create_map_key("providers.models", "ollama")
             .expect("create_map_key");
-        cfg.set_prop("providers.models.ollama.base-url", "http://example:9999")
-            .expect("set base-url");
+        cfg.set_prop(
+            "providers.models.ollama.default.base-url",
+            "http://example:9999",
+        )
+        .expect("set base-url");
 
-        apply_provider_trait_defaults(&mut cfg, "ollama", "providers.models.ollama")
+        apply_provider_trait_defaults(&mut cfg, "ollama", "providers.models.ollama.default")
             .expect("apply defaults");
 
         let base_url = cfg
-            .get_prop("providers.models.ollama.base-url")
+            .get_prop("providers.models.ollama.default.base-url")
             .expect("base-url");
         assert_eq!(
             base_url, "http://example:9999",
@@ -338,6 +348,7 @@ mod tests {
 
     #[test]
     fn providers_models_key_extracts_simple_segment() {
+        // V3: type-only prefix
         assert_eq!(
             providers_models_key("providers.models.ollama"),
             Some("ollama")
@@ -346,11 +357,19 @@ mod tests {
             providers_models_key("providers.models.azure_openai"),
             Some("azure_openai")
         );
-        // A nested path (provider's field) returns None — only the bare
-        // per-model prefix triggers the family filter.
+        // V3: type.alias prefix — extract just the type
         assert_eq!(
-            providers_models_key("providers.models.ollama.api-key"),
-            None
+            providers_models_key("providers.models.ollama.default"),
+            Some("ollama")
+        );
+        assert_eq!(
+            providers_models_key("providers.models.ollama.my-alias"),
+            Some("ollama")
+        );
+        // A nested path (provider's field) — still returns the type
+        assert_eq!(
+            providers_models_key("providers.models.ollama.default.api-key"),
+            Some("ollama")
         );
         assert_eq!(providers_models_key("providers.models"), None);
         assert_eq!(providers_models_key("providers"), None);

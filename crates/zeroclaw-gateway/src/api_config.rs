@@ -1317,10 +1317,6 @@ mod tests {
     #[test]
     fn json_pointer_to_dotted_handles_pointer_form() {
         assert_eq!(
-            json_pointer_to_dotted("/providers/fallback"),
-            "providers.fallback"
-        );
-        assert_eq!(
             json_pointer_to_dotted("/providers/models/openrouter/api-key"),
             "providers.models.openrouter.api-key"
         );
@@ -1329,8 +1325,8 @@ mod tests {
     #[test]
     fn json_pointer_to_dotted_passes_dotted_through() {
         assert_eq!(
-            json_pointer_to_dotted("providers.fallback"),
-            "providers.fallback"
+            json_pointer_to_dotted("providers.models.openrouter.api-key"),
+            "providers.models.openrouter.api-key"
         );
         assert_eq!(
             json_pointer_to_dotted("scheduler.max_concurrent"),
@@ -1445,45 +1441,6 @@ mod tests {
             json_to_setprop_string(&serde_json::json!("10.0.0.1"), Some(PropKind::String))
                 .expect("coerce string");
         assert_eq!(actual, want_typed);
-    }
-
-    #[test]
-    fn collect_warnings_surfaces_dangling_provider_fallback() {
-        // Pin the contract that drives the WARN-visibility fix: a config
-        // where `providers.fallback` references a key not present in
-        // `providers.models` returns a structured warning with a stable
-        // code, suitable for inclusion in PUT/PATCH/GET responses.
-        let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.set_prop("providers.fallback", "nonexistent")
-            .expect("set_prop fallback");
-
-        let warnings = cfg.collect_warnings();
-        let dangling = warnings
-            .iter()
-            .find(|w| w.code == "dangling_provider_fallback")
-            .expect("expected dangling_provider_fallback warning");
-        assert_eq!(dangling.path, "providers.fallback");
-        assert!(
-            dangling.message.contains("nonexistent"),
-            "warning message should name the dangling key, got {:?}",
-            dangling.message
-        );
-    }
-
-    #[test]
-    fn collect_warnings_empty_when_fallback_unset() {
-        // Default config has no `providers.fallback` set → no dangling
-        // warning (the check is gated on `Some(fallback_key)`). Pin the
-        // negative case so a regression that always-emits the warning
-        // gets caught.
-        let cfg = zeroclaw_config::schema::Config::default();
-        let warnings = cfg.collect_warnings();
-        assert!(
-            !warnings
-                .iter()
-                .any(|w| w.code == "dangling_provider_fallback"),
-            "default config should have no dangling-fallback warning, got {warnings:?}"
-        );
     }
 
     #[test]

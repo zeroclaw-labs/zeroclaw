@@ -458,8 +458,8 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Provider validity
-    let fallback_provider = config.providers.fallback_type();
-    let fallback_provider_doc = config.providers.fallback_provider();
+    let fallback_provider_doc = config.providers.first_provider();
+    let fallback_provider = config.providers.first_provider_type();
     if let Some(provider) = fallback_provider {
         if let Some(reason) = provider_validation_error(provider) {
             items.push(DiagItem::error(
@@ -1079,7 +1079,14 @@ mod tests {
     #[test]
     fn config_validation_catches_bad_temperature() {
         let mut config = Config::default();
-        config.providers.fallback = vec!["default.default".into()];
+        config.providers.models = Default::default();
+        config
+            .providers
+            .models
+            .entry("default.default".to_string())
+            .or_default()
+            .entry("default".to_string())
+            .or_default();
         config
             .providers
             .models
@@ -1098,7 +1105,14 @@ mod tests {
     #[test]
     fn config_validation_accepts_valid_temperature() {
         let mut config = Config::default();
-        config.providers.fallback = vec!["default.default".into()];
+        config.providers.models = Default::default();
+        config
+            .providers
+            .models
+            .entry("default.default".to_string())
+            .or_default()
+            .entry("default".to_string())
+            .or_default();
         config
             .providers
             .models
@@ -1127,7 +1141,14 @@ mod tests {
     #[test]
     fn config_validation_catches_unknown_provider() {
         let mut config = Config::default();
-        config.providers.fallback = vec!["totally-fake".into()];
+        config.providers.models = Default::default();
+        config
+            .providers
+            .models
+            .entry("totally-fake".to_string())
+            .or_default()
+            .entry("default".to_string())
+            .or_default();
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let prov_item = items
@@ -1140,7 +1161,14 @@ mod tests {
     #[test]
     fn config_validation_catches_malformed_custom_provider() {
         let mut config = Config::default();
-        config.providers.fallback = vec!["custom:".into()];
+        config.providers.models = Default::default();
+        config
+            .providers
+            .models
+            .entry("custom:".to_string())
+            .or_default()
+            .entry("default".to_string())
+            .or_default();
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
 
@@ -1155,7 +1183,14 @@ mod tests {
     #[test]
     fn config_validation_accepts_custom_provider() {
         let mut config = Config::default();
-        config.providers.fallback = vec!["custom:https://my-api.com".into()];
+        config.providers.models = Default::default();
+        config
+            .providers
+            .models
+            .entry("custom:https://my-api.com".to_string())
+            .or_default()
+            .entry("default".to_string())
+            .or_default();
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let prov_item = items.iter().find(|i| i.message.contains("is valid"));

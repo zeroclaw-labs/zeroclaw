@@ -473,7 +473,7 @@ impl AcpServer {
         let default_model = self
             .config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.model.clone());
 
         let mut zeroclaw_meta = serde_json::json!({
@@ -1124,7 +1124,6 @@ mod tests {
         let config = Config {
             workspace_dir: cwd.path().to_path_buf(),
             providers: zeroclaw_config::providers::ProvidersConfig {
-                fallback: vec!["openrouter.default".to_string()],
                 models: HashMap::from([(
                     "openrouter".to_string(),
                     HashMap::from([(
@@ -1246,9 +1245,9 @@ mod tests {
         let server = AcpServer::new(Config::default(), AcpServerConfig::default());
         let result = server.handle_initialize(&serde_json::json!({})).unwrap();
         assert!(
-            result["capabilities"].get("defaultModel").is_none(),
+            result["_meta"]["zeroclaw"].get("defaultModel").is_none(),
             "defaultModel must be absent when no provider is configured, got: {}",
-            result["capabilities"]["defaultModel"]
+            result["_meta"]["zeroclaw"]["defaultModel"]
         );
     }
 
@@ -1256,7 +1255,6 @@ mod tests {
     fn handle_initialize_default_model_reflects_configured_provider() {
         use zeroclaw_config::schema::ModelProviderConfig;
         let mut config = Config::default();
-        config.providers.fallback = vec!["myprovider.default".to_string()];
         config
             .providers
             .models
@@ -1271,7 +1269,7 @@ mod tests {
             );
         let server = AcpServer::new(config, AcpServerConfig::default());
         let result = server.handle_initialize(&serde_json::json!({})).unwrap();
-        assert_eq!(result["capabilities"]["defaultModel"], "llama3.2");
+        assert_eq!(result["_meta"]["zeroclaw"]["defaultModel"], "llama3.2");
     }
 
     #[test]
@@ -1420,7 +1418,6 @@ mod tests {
         let config = Config {
             workspace_dir: cwd.path().to_path_buf(),
             providers: zeroclaw_config::providers::ProvidersConfig {
-                fallback: vec!["anthropic.default".to_string()],
                 models: HashMap::from([(
                     "anthropic".to_string(),
                     HashMap::from([(

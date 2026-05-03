@@ -149,25 +149,9 @@ impl V1Compat {
         let mut config_table: toml::Table = toml::from_str(&raw).unwrap_or_default();
         config_table.insert("schema_version".into(), toml::Value::Integer(2));
 
-        // Downgrade providers.fallback: array → bare string (type key only, no alias suffix).
         if let Some(toml::Value::Table(providers)) = config_table.get_mut("providers") {
-            if let Some(fallback_val) = providers.get("fallback").cloned() {
-                let bare = match &fallback_val {
-                    toml::Value::Array(arr) => arr
-                        .first()
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.split_once('.').map_or(s, |(t, _)| t).to_string()),
-                    toml::Value::String(s) => {
-                        Some(s.split_once('.').map_or(s.as_str(), |(t, _)| t).to_string())
-                    }
-                    _ => None,
-                };
-                if let Some(bare) = bare {
-                    providers.insert("fallback".into(), toml::Value::String(bare));
-                } else {
-                    providers.remove("fallback");
-                }
-            }
+            // Strip any lingering fallback key from V2 configs during downgrade.
+            providers.remove("fallback");
 
             // Downgrade providers.models: nested alias map → flat (take "default" alias).
             if let Some(toml::Value::Table(models)) = providers.get_mut("models") {
@@ -298,9 +282,15 @@ impl V1Compat {
 
         if !has_v1_fields {
             if let Some(provider) = self.default_provider.take()
-                && self.config.providers.fallback.is_empty()
+                && self.config.providers.models.is_empty()
             {
-                self.config.providers.fallback = vec![format!("{provider}.default")];
+                self.config
+                    .providers
+                    .models
+                    .entry(provider.clone())
+                    .or_default()
+                    .entry("default".to_string())
+                    .or_default();
             }
             return;
         }
@@ -308,7 +298,12 @@ impl V1Compat {
         let fallback = self
             .default_provider
             .take()
-            .or_else(|| self.config.providers.fallback.first().cloned())
+            .or_else(|| {
+                self.config
+                    .providers
+                    .first_provider_type()
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| "default".to_string());
 
         // Fill gaps in the fallback entry from top-level V1 fields.
@@ -347,10 +342,6 @@ impl V1Compat {
             && let Some(headers) = self.extra_headers.take()
         {
             entry.extra_headers = headers;
-        }
-
-        if self.config.providers.fallback.is_empty() {
-            self.config.providers.fallback = vec![format!("{fallback}.default")];
         }
 
         // Move routing rules into providers.
@@ -953,90 +944,44 @@ pub fn prepare_table(table: &mut toml::Table) {
     // The claude-code provider is removed in V3; the Anthropic provider handles OAuth
     // tokens (sk-ant-oat01- prefix) natively, so no credential change is needed.
     // Also rewrite providers.fallback entries and old top-level default_provider field.
-    if let Some(toml::Value::Table(providers)) = table.get_mut("providers") {
-        if let Some(toml::Value::Table(models)) = providers.get_mut("models")
-            && let Some(entry) = models.remove("claude-code")
-        {
-            tracing::info!(
-                "v2→v3 migration: moving [providers.models.claude-code] to \
-                 [providers.models.anthropic.claude-code]. The anthropic provider \
-                 supports OAuth tokens (sk-ant-oat01-) natively."
-            );
-            let alias_map = models
-                .entry("anthropic".to_string())
-                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-            if let toml::Value::Table(alias_map) = alias_map {
-                alias_map.entry("claude-code".to_string()).or_insert(entry);
-            }
-        }
-        if let Some(toml::Value::Array(fallback)) = providers.get_mut("fallback") {
-            for entry in fallback.iter_mut() {
-                if let toml::Value::String(s) = entry
-                    && (s == "claude-code" || s.starts_with("claude-code."))
-                {
-                    *s = "anthropic.claude-code".to_string();
-                }
-            }
-        }
-        if let Some(toml::Value::String(s)) = providers.get_mut("fallback")
-            && (s == "claude-code" || s.starts_with("claude-code."))
-        {
-            *s = "anthropic.claude-code".to_string();
-        }
-    }
     if let Some(toml::Value::String(s)) = table.get_mut("default_provider")
         && s == "claude-code"
     {
         *s = "anthropic".to_string();
     }
 
-    // V3: Wrap flat [providers.models.<type>] entries into [providers.models.<type>.default].
-    // Same pattern as channel aliasing. Already-aliased (all-table) entries are skipped.
-    if let Some(toml::Value::Table(providers)) = table.get_mut("providers")
-        && let Some(toml::Value::Table(models)) = providers.get_mut("models")
-    {
-        let type_keys: Vec<String> = models.keys().cloned().collect();
-        for type_key in type_keys {
-            if let Some(toml::Value::Table(entry)) = models.get(&type_key)
-                && is_flat_provider_config(entry)
-            {
-                let flat = entry.clone();
-                let mut alias_map = toml::Table::new();
-                alias_map.insert("default".to_string(), toml::Value::Table(flat));
-                models.insert(type_key, toml::Value::Table(alias_map));
+    // V3: Rename claude-code provider to anthropic, wrap flat provider entries into
+    // `<type>.default` alias, and strip any lingering providers.fallback key.
+    if let Some(toml::Value::Table(providers)) = table.get_mut("providers") {
+        providers.remove("fallback");
+        if let Some(toml::Value::Table(models)) = providers.get_mut("models") {
+            // Rename claude-code → anthropic.claude-code alias.
+            if let Some(entry) = models.remove("claude-code") {
+                tracing::info!(
+                    "v2→v3 migration: moving [providers.models.claude-code] to \
+                     [providers.models.anthropic.claude-code]. The anthropic provider \
+                     supports OAuth tokens (sk-ant-oat01-) natively."
+                );
+                let alias_map = models
+                    .entry("anthropic".to_string())
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                if let toml::Value::Table(alias_map) = alias_map {
+                    alias_map.entry("claude-code".to_string()).or_insert(entry);
+                }
+            }
+            // Wrap flat [providers.models.<type>] entries into [providers.models.<type>.default].
+            let type_keys: Vec<String> = models.keys().cloned().collect();
+            for type_key in type_keys {
+                if let Some(toml::Value::Table(entry)) = models.get(&type_key)
+                    && is_flat_provider_config(entry)
+                {
+                    let flat = entry.clone();
+                    let mut alias_map = toml::Table::new();
+                    alias_map.insert("default".to_string(), toml::Value::Table(flat));
+                    models.insert(type_key, toml::Value::Table(alias_map));
+                }
             }
         }
-    }
-
-    // V3: Normalize providers.fallback — convert any bare string to a dotted alias,
-    // and ensure the value is an array (Vec<String>), which the V3 schema requires.
-    if let Some(toml::Value::Table(providers)) = table.get_mut("providers")
-        && let Some(val) = providers.get("fallback").cloned()
-    {
-        let normalized = match val {
-            toml::Value::String(s) => {
-                let dotted = if s.contains('.') {
-                    s
-                } else {
-                    format!("{s}.default")
-                };
-                toml::Value::Array(vec![toml::Value::String(dotted)])
-            }
-            toml::Value::Array(arr) => {
-                let updated = arr
-                    .into_iter()
-                    .map(|v| match v {
-                        toml::Value::String(s) if !s.contains('.') => {
-                            toml::Value::String(format!("{s}.default"))
-                        }
-                        other => other,
-                    })
-                    .collect();
-                toml::Value::Array(updated)
-            }
-            other => other,
-        };
-        providers.insert("fallback".into(), normalized);
     }
 
     // V3: Synthesize per-agent [providers.models.<type>.<agent>] from inline agent fields.

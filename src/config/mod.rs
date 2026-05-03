@@ -64,8 +64,7 @@ mod tests {
     fn reexported_config_default_is_constructible() {
         let config = Config::default();
 
-        // Config::default() no longer has provider cache fields; just verify providers is constructible
-        assert!(config.providers.fallback.is_empty() || !config.providers.fallback.is_empty());
+        assert!(config.providers.models.is_empty());
     }
 
     #[test]

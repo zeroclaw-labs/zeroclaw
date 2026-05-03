@@ -194,7 +194,7 @@ pub async fn handle_onboard_status(State(state): State<AppState>, headers: Heade
     let cfg = state.config.lock().clone();
 
     let has_completed = !cfg.onboard_state.completed_sections.is_empty();
-    let has_provider = !cfg.providers.fallback.is_empty() || !cfg.providers.models.is_empty();
+    let has_provider = !cfg.providers.models.is_empty();
 
     let (needs_onboarding, reason) = if has_completed {
         (false, "has_completed_sections")
@@ -501,15 +501,14 @@ fn memory_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
 }
 
 /// Generic schema-walk picker for sections like `channels` whose subsections
-/// are `#[nested] Option<T>` fields. Discovery: clone the config,
-/// init_defaults the section to materialize every Option<T> as Some(default),
-/// then read prop_fields() on the probe — every reachable subsection's name
-/// surfaces as a path segment under `<section>.`.
+/// are `#[nested] HashMap<String, T>` fields. Discovery: use `map_key_sections()`
+/// to enumerate all statically-known sub-sections under `<section>.` — this
+/// works for V3 HashMap-based channels without needing init_defaults to insert
+/// entries (HashMap fields start empty and init_defaults leaves them empty).
 fn schema_walk_picker(cfg: &zeroclaw_config::schema::Config, section: &str) -> Vec<PickerItem> {
-    let mut probe = cfg.clone();
-    probe.init_defaults(Some(section));
     let prefix_with_dot = format!("{section}.");
 
+    // Configured: any alias present on this type (has at least one entry in its HashMap).
     let configured: std::collections::BTreeSet<String> = cfg
         .prop_fields()
         .iter()
@@ -517,12 +516,18 @@ fn schema_walk_picker(cfg: &zeroclaw_config::schema::Config, section: &str) -> V
         .filter_map(|suffix| suffix.split_once('.').map(|(head, _)| head.to_string()))
         .collect();
 
-    let all: std::collections::BTreeSet<String> = probe
-        .prop_fields()
-        .iter()
-        .filter_map(|f| f.name.strip_prefix(&prefix_with_dot))
-        .filter_map(|suffix| suffix.split_once('.').map(|(head, _)| head.to_string()))
-        .collect();
+    // All known channel/section types from schema metadata — statically known,
+    // no HashMap entries needed.
+    let all: std::collections::BTreeSet<String> =
+        zeroclaw_config::schema::Config::map_key_sections()
+            .into_iter()
+            .filter_map(|s| {
+                s.path
+                    .strip_prefix(&prefix_with_dot)
+                    .filter(|rest| !rest.contains('.'))
+                    .map(String::from)
+            })
+            .collect();
 
     all.into_iter()
         .map(|name| {
@@ -646,7 +651,7 @@ pub async fn handle_section_select(
             // Idempotent — only fills paths that are still unset, so a user
             // who's already overridden a field doesn't get clobbered on
             // re-select.
-            let prefix = format!("providers.models.{key}");
+            let prefix = format!("providers.models.{key}.default");
             if let Err(e) =
                 zeroclaw_runtime::onboard::field_visibility::apply_provider_trait_defaults(
                     &mut working,
@@ -657,15 +662,6 @@ pub async fn handle_section_select(
                 tracing::warn!(provider = %key, error = ?e, "failed to apply trait defaults; form will start blank");
             }
             // Make the picked provider the runtime fallback so chat actually
-            // routes to it. Without this, picking Ollama in onboarding would
-            // create the entry but the chat path keeps using the prior
-            // fallback (or fails because none is set), and the user lands
-            // on "OpenRouter API key not set" trying to chat with a model
-            // they thought they'd configured. Mirrors `zeroclaw onboard`'s
-            // post-pick semantics.
-            if let Err(e) = working.set_prop("providers.fallback", &key) {
-                tracing::warn!(provider = %key, error = %e, "failed to set providers.fallback after pick");
-            }
             (prefix, created)
         }
         "channels" => {

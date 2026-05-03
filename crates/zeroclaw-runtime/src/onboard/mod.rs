@@ -490,7 +490,7 @@ async fn skip_if_configured(
 fn section_has_signal(cfg: &Config, section_key: &str) -> bool {
     match section_key {
         "workspace" => cfg.workspace.enabled,
-        "providers" => !cfg.providers.fallback.is_empty() && !cfg.providers.models.is_empty(),
+        "providers" => !cfg.providers.models.is_empty(),
         // `channels.cli: bool` is a default-true scalar that lives directly
         // under `channels.*`, so a bare `starts_with("channels.")` check
         // fires on every fresh install. Require a nested channel config
@@ -736,17 +736,21 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
     let entries = zeroclaw_providers::list_providers();
 
     loop {
-        let current_fallback = cfg.providers.fallback.first().cloned().unwrap_or_default();
+        let current_type = cfg
+            .providers
+            .first_provider_type()
+            .unwrap_or("")
+            .to_string();
 
         let (picked, selected_base_url) = match &flags.provider {
             Some(forced) => (forced.clone(), None),
             None => {
-                let current_idx = entries.iter().position(|p| p.name == current_fallback);
+                let current_idx = entries.iter().position(|p| p.name == current_type);
                 let mut options: Vec<SelectItem> = entries
                     .iter()
                     .map(|p| {
                         let configured = cfg.providers.models.contains_key(p.name);
-                        let is_active = p.name == current_fallback;
+                        let is_active = p.name == current_type;
                         let badge = match (is_active, configured) {
                             (true, _) => Some("[active]".into()),
                             (_, true) => Some("[configured]".into()),
@@ -806,20 +810,15 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         // user overrides aren't clobbered. Lives in memory until the first
         // `persist()` carries the entry — defaults included — to disk.
         if is_new_entry {
-            let prefix = format!("providers.models.{picked}");
+            let prefix = format!("providers.models.{picked}.default");
             field_visibility::apply_provider_trait_defaults(cfg, &picked, &prefix)?;
         }
         if let Some(base_url) = selected_base_url.as_deref() {
-            cfg.set_prop(&format!("providers.models.{picked}.base-url"), base_url)?;
+            cfg.set_prop(
+                &format!("providers.models.{picked}.default.base-url"),
+                base_url,
+            )?;
         }
-
-        // Persist the picked provider as the runtime fallback so chat
-        // requests actually route to it. Without this, the runtime keeps
-        // the prior fallback (often unset or stale) and the user lands on
-        // "API key not set" for a different provider they didn't pick.
-        // Carried to disk via `persist()` so a Ctrl+C mid-flow keeps the
-        // selection.
-        persist(cfg, "providers.fallback", &picked).await?;
 
         let display_name = entries
             .iter()
@@ -837,7 +836,7 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         // Apply CLI-flag overrides up front, then skip those names in the
         // interactive pass so the user isn't re-prompted for what they already
         // passed on the command line.
-        let prefix = format!("providers.models.{picked}");
+        let prefix = format!("providers.models.{picked}.default");
         let api_key_path = format!("{prefix}.api-key");
         if let Some(api_key) = &flags.api_key {
             persist(cfg, &api_key_path, api_key).await?;
@@ -891,10 +890,6 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                 continue;
             }
             Nav::Done => {}
-        }
-
-        if cfg.providers.fallback.first().map(String::as_str) != Some(picked.as_str()) {
-            persist(cfg, "providers.fallback", &picked).await?;
         }
 
         break;
@@ -969,7 +964,7 @@ fn provider_trait_defaults_for_prompts(provider: &str, prefix: &str) -> Vec<Fiel
 /// models_dev + native public endpoints). Falls back to a manual string
 /// input when the provider doesn't expose a no-auth list or the fetch fails.
 async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, provider: &str) -> Result<Nav> {
-    let model_path = format!("providers.models.{provider}.model");
+    let model_path = format!("providers.models.{provider}.default.model");
     let current = cfg.get_prop(&model_path).unwrap_or_default();
     let is_set = !current.is_empty() && current != "<unset>";
     // Resolve profile: support both dotted "type.alias" and bare type key → "default" alias.
@@ -1428,13 +1423,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn section_has_signal_providers_requires_fallback_and_models() {
+    async fn section_has_signal_providers_requires_models_entry() {
         let temp = TempDir::new().unwrap();
         let mut cfg = test_cfg(&temp);
-        assert!(!section_has_signal(&cfg, "providers"));
-        cfg.providers.fallback = vec!["anthropic".into()];
-        // A fallback name alone — with an empty models map — isn't a signal:
-        // the user could have set it and then wiped the per-model block.
         assert!(!section_has_signal(&cfg, "providers"));
         cfg.providers
             .models
@@ -1689,10 +1680,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            cfg.providers.fallback.first().map(String::as_str),
-            Some(provider.as_str())
-        );
         let model_cfg = cfg
             .providers
             .models
@@ -1760,10 +1747,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            cfg.providers.fallback.first().map(String::as_str),
-            Some("anthropic")
-        );
         let model_cfg = cfg
             .providers
             .models

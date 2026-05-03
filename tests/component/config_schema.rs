@@ -45,7 +45,7 @@ another_fake = 42
     assert!(
         (config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)
@@ -374,7 +374,7 @@ fn config_empty_toml_uses_default_temperature() {
     assert!(
         (config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)
@@ -396,7 +396,7 @@ fn config_only_temperature_parses() {
     assert!(
         (config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 1.2)
@@ -420,7 +420,7 @@ value = 123
     assert!(
         (config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.5)
@@ -578,7 +578,7 @@ fn config_empty_parses_with_all_defaults() {
     assert!(
         (config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)

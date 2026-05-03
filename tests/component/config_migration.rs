@@ -72,25 +72,25 @@ temperature = 0.3
     assert_eq!(
         config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.api_key.as_deref()),
         Some("sk-ant")
     );
     assert_eq!(
-        config.providers.fallback.first().map(String::as_str),
+        config.providers.first_provider_type(),
         Some("anthropic.default")
     );
     assert_eq!(
         config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.model.as_deref()),
         Some("claude-opus")
     );
     assert!(
         (config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.3)
@@ -133,7 +133,7 @@ model = "claude"
 
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(
-        config.providers.fallback.first().map(String::as_str),
+        config.providers.first_provider_type(),
         Some("openrouter.default")
     );
     assert_eq!(
@@ -153,7 +153,7 @@ api_key = "sk-orphan"
     );
 
     assert_eq!(
-        config.providers.fallback.first().map(String::as_str),
+        config.providers.first_provider_type(),
         Some("default.default")
     );
     assert_eq!(
@@ -179,7 +179,7 @@ model_provider = "ollama"
     );
 
     assert_eq!(
-        config.providers.fallback.first().map(String::as_str),
+        config.providers.first_provider_type(),
         Some("ollama.default")
     );
 }
@@ -262,7 +262,7 @@ allowed_users = ["@u:m"]
     let config = migrate(&migrated_toml);
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(
-        config.providers.fallback.first().map(String::as_str),
+        config.providers.first_provider_type(),
         Some("openrouter.default")
     );
     assert_eq!(
@@ -327,7 +327,7 @@ model = "claude-sonnet-4-6"
 "#,
     );
     assert_eq!(
-        config.providers.fallback.first().map(String::as_str),
+        config.providers.first_provider_type(),
         Some("anthropic.claude-code")
     );
 }
@@ -341,7 +341,7 @@ api_key = "sk-ant-oat01-example"
 "#,
     );
     assert_eq!(
-        config.providers.fallback.first().map(String::as_str),
+        config.providers.first_provider_type(),
         Some("anthropic.default")
     );
     assert!(config.providers.models.contains_key("anthropic"));
@@ -383,7 +383,6 @@ allowed_rooms = ["!existing:matrix.org"]
     );
 
     let mut expected = Config::default();
-    expected.providers.fallback = vec!["walk-provider.default".into()];
     let mut main_entry = ModelProviderConfig {
         api_key: Some("walk-key".into()),
         base_url: Some("https://walk.example.com".into()),
@@ -419,7 +418,6 @@ allowed_rooms = ["!existing:matrix.org"]
     // Provider fields are now resolved directly — no cache needed.
 
     // Compare providers.
-    assert_eq!(v0.providers.fallback, expected.providers.fallback);
     assert_eq!(v0.providers.models.len(), expected.providers.models.len());
     for (type_key, v0_alias_map) in &v0.providers.models {
         let exp_alias_map = expected
@@ -528,13 +526,13 @@ require_pairing = true
 
     assert_eq!(config.schema_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(
-        config.providers.fallback.first().map(String::as_str),
+        config.providers.first_provider_type(),
         Some("openrouter.default")
     );
     assert_eq!(
         config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.model.as_deref()),
         Some("anthropic/claude-sonnet-4.6")
     );
@@ -1281,7 +1279,7 @@ api_key = "sk-or"
     );
 
     assert_eq!(
-        config.providers.fallback.first().map(String::as_str),
+        config.providers.first_provider_type(),
         Some("openrouter.default"),
         "bare fallback key must be upgraded to dotted form"
     );
@@ -1379,7 +1377,7 @@ model = "claude-opus-4-5"
         Some("sk-ant")
     );
     assert_eq!(
-        config.providers.fallback.first().map(String::as_str),
+        config.providers.first_provider_type(),
         Some("anthropic.default"),
         "already-dotted fallback must not be modified"
     );

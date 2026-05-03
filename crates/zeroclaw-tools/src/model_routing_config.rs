@@ -279,9 +279,9 @@ impl ModelRoutingConfigTool {
 
         json!({
             "default": {
-                "provider": cfg.providers.fallback,
-                "model": cfg.providers.fallback_provider().and_then(|e| e.model.as_deref()),
-                "temperature": cfg.providers.fallback_provider().and_then(|e| e.temperature).unwrap_or(0.7),
+                "provider": cfg.providers.first_provider_type(),
+                "model": cfg.providers.first_provider().and_then(|e| e.model.as_deref()),
+                "temperature": cfg.providers.first_provider().and_then(|e| e.temperature).unwrap_or(0.7),
             },
             "query_classification": {
                 "enabled": cfg.query_classification.enabled,
@@ -393,36 +393,31 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        // Capture previous values for rollback on probe failure.
-        let previous_provider = cfg.providers.fallback.clone();
-        let previous_fallback_provider = cfg.providers.fallback_provider().cloned();
+        // Capture previous first-provider entry for rollback on probe failure.
+        let previous_first_provider = cfg.providers.first_provider().cloned();
 
-        let fallback_name = match &provider_update {
-            MaybeSet::Set(provider) => {
-                cfg.providers.fallback = vec![provider.clone()];
-                provider.clone()
+        // Determine which models entry to update.
+        let (type_k, alias_k) = match &provider_update {
+            MaybeSet::Set(provider) => provider
+                .split_once('.')
+                .map(|(t, a)| (t.to_string(), a.to_string()))
+                .unwrap_or_else(|| (provider.clone(), "default".to_string())),
+            MaybeSet::Null | MaybeSet::Unset => {
+                // Update whichever entry is already first, or create a placeholder.
+                cfg.providers
+                    .models
+                    .iter()
+                    .next()
+                    .and_then(|(t, aliases)| aliases.keys().next().map(|a| (t.clone(), a.clone())))
+                    .unwrap_or_else(|| ("default".to_string(), "default".to_string()))
             }
-            MaybeSet::Null => {
-                cfg.providers.fallback = vec![];
-                "default".to_string()
-            }
-            MaybeSet::Unset => cfg.providers.fallback.first().cloned().unwrap_or_else(|| {
-                let name = "default".to_string();
-                cfg.providers.fallback = vec![name.clone()];
-                name
-            }),
         };
-
-        let (type_k, alias_k) = fallback_name
-            .split_once('.')
-            .map(|(t, a)| (t.to_string(), a.to_string()))
-            .unwrap_or_else(|| (fallback_name.clone(), "default".to_string()));
         let entry = cfg
             .providers
             .models
-            .entry(type_k)
+            .entry(type_k.clone())
             .or_default()
-            .entry(alias_k)
+            .entry(alias_k.clone())
             .or_default();
 
         match model_update {
@@ -448,30 +443,20 @@ impl ModelRoutingConfigTool {
 
         // Probe the new model with a minimal API call to catch invalid model IDs
         // before the channel hot-reload picks up the change.
-        let current_provider = cfg.providers.fallback.first().cloned();
-        let current_model = cfg
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.model.clone());
-        if let (Some(provider_name), Some(model_name)) = (current_provider, current_model)
+        let current_model = cfg.providers.first_provider().and_then(|e| e.model.clone());
+        let provider_name = format!("{type_k}.{alias_k}");
+        if let Some(model_name) = current_model
             && let Err(probe_err) = self.probe_model(&provider_name, &model_name).await
         {
             if zeroclaw_providers::reliable::is_non_retryable(&probe_err) {
-                let reverted_model = previous_fallback_provider
+                let reverted_model = previous_first_provider
                     .as_ref()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("(none)")
                     .to_string();
 
-                // Rollback to previous config.
-                cfg.providers.fallback = previous_provider;
-                if let Some(prev_entry) = previous_fallback_provider
-                    && let Some(fb) = cfg.providers.fallback.first().cloned()
-                {
-                    let (type_k, alias_k) = fb
-                        .split_once('.')
-                        .map(|(t, a)| (t.to_string(), a.to_string()))
-                        .unwrap_or_else(|| (fb.clone(), "default".to_string()));
+                // Rollback: restore the previous entry for this type.alias slot.
+                if let Some(prev_entry) = previous_first_provider {
                     cfg.providers
                         .models
                         .entry(type_k)
@@ -516,7 +501,7 @@ impl ModelRoutingConfigTool {
         let api_key = self
             .config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.api_key.as_deref());
         if api_key.is_none_or(|k| k.trim().is_empty()) {
             return Ok(());
@@ -527,7 +512,7 @@ impl ModelRoutingConfigTool {
             api_key,
             self.config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.base_url.as_deref()),
         ) {
             Ok(p) => p,

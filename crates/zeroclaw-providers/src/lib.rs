@@ -740,7 +740,7 @@ impl Default for ProviderRuntimeOptions {
 pub fn provider_runtime_options_from_config(
     config: &zeroclaw_config::schema::Config,
 ) -> ProviderRuntimeOptions {
-    let fallback = config.providers.fallback_provider();
+    let fallback = config.providers.first_provider();
     // Resolve merge_system_into_user from the active model provider profile by
     // matching api_url — apply_named_model_provider_profile() has already run
     // and rewritten providers.fallback, but providers.models retains all profiles.

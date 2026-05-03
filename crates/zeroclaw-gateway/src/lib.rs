@@ -473,10 +473,13 @@ pub async fn run_gateway(
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    let fallback = config.providers.fallback_provider();
+    let fallback = config.providers.first_provider();
     let provider: Arc<dyn Provider> =
         Arc::from(zeroclaw_providers::create_resilient_provider_with_options(
-            config.providers.fallback_type().unwrap_or("openrouter"),
+            config
+                .providers
+                .first_provider_type()
+                .unwrap_or("openrouter"),
             fallback.and_then(|e| e.api_key.as_deref()),
             fallback.and_then(|e| e.base_url.as_deref()),
             &config.reliability,
@@ -537,7 +540,7 @@ pub async fn run_gateway(
         &config.agents,
         config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.api_key.as_deref()),
         &config,
         Some(canvas_store.clone()),
@@ -1594,7 +1597,7 @@ async fn handle_webhook(
         .config
         .lock()
         .providers
-        .fallback_type()
+        .first_provider_type()
         .unwrap_or("unknown")
         .to_string();
     let model_label = state.model.clone();

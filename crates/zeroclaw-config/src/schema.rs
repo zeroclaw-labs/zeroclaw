@@ -10378,26 +10378,14 @@ impl Config {
         }
     }
 
-    /// Ensure the fallback provider entry exists, creating it if necessary.
+    /// Ensure a default provider entry exists under `providers.models.default.default`,
+    /// creating it if necessary.
     pub fn ensure_fallback_provider(&mut self) -> &mut ModelProviderConfig {
-        let fallback = self
-            .providers
-            .fallback
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "default.default".into());
-        if self.providers.fallback.is_empty() {
-            self.providers.fallback = vec![fallback.clone()];
-        }
-        let (type_key, alias_key) = fallback
-            .split_once('.')
-            .map(|(t, a)| (t.to_string(), a.to_string()))
-            .unwrap_or_else(|| (fallback.clone(), "default".to_string()));
         self.providers
             .models
-            .entry(type_key)
+            .entry("default".to_string())
             .or_default()
-            .entry(alias_key)
+            .entry("default".to_string())
             .or_default()
     }
 
@@ -10414,31 +10402,7 @@ impl Config {
     /// Adding a new warning: append a check here, pick a stable `code`,
     /// and document the code in `validation_warnings.rs`.
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
-        use crate::validation_warnings::ValidationWarning;
-        let mut warnings = Vec::new();
-
-        // providers.fallback references a key not present in providers.models
-        if let Some(fallback_key) = self.providers.fallback.first() {
-            let (type_k, alias_k) = fallback_key
-                .split_once('.')
-                .unwrap_or((fallback_key.as_str(), "default"));
-            if !self
-                .providers
-                .models
-                .get(type_k)
-                .is_some_and(|m| m.contains_key(alias_k))
-            {
-                warnings.push(ValidationWarning::new(
-                    "dangling_provider_fallback",
-                    format!(
-                        "providers.fallback references '{fallback_key}' which does not exist in providers.models; provider resolution will fail at runtime"
-                    ),
-                    "providers.fallback",
-                ));
-            }
-        }
-
-        warnings
+        Vec::new()
     }
 
     /// Validate configuration values that would cause runtime failures.
@@ -10756,31 +10720,23 @@ impl Config {
         }
 
         // Ollama cloud-routing safety checks
-        if self
+        if let Some(entry) = self
             .providers
-            .fallback_type()
-            .is_some_and(|provider| provider.trim().eq_ignore_ascii_case("ollama"))
-            && self
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.model.as_deref())
-                .is_some_and(|model| model.trim().ends_with(":cloud"))
+            .models
+            .get("ollama")
+            .and_then(|m| m.values().next())
+            .filter(|e| {
+                e.model
+                    .as_deref()
+                    .is_some_and(|m| m.trim().ends_with(":cloud"))
+            })
         {
-            if is_local_ollama_endpoint(
-                self.providers
-                    .fallback_provider()
-                    .and_then(|e| e.base_url.as_deref()),
-            ) {
+            if is_local_ollama_endpoint(entry.base_url.as_deref()) {
                 anyhow::bail!(
                     "default_model uses ':cloud' with provider 'ollama', but api_url is local or unset. Set api_url to a remote Ollama endpoint (for example https://ollama.com)."
                 );
             }
-
-            if !has_ollama_cloud_credential(
-                self.providers
-                    .fallback_provider()
-                    .and_then(|e| e.api_key.as_deref()),
-            ) {
+            if !has_ollama_cloud_credential(entry.api_key.as_deref()) {
                 anyhow::bail!(
                     "default_model uses ':cloud' with provider 'ollama', but no API key is configured. Set api_key or OLLAMA_API_KEY."
                 );
@@ -11575,9 +11531,9 @@ mod tests {
     #[test]
     async fn config_default_has_sane_values() {
         let c = Config::default();
-        // V2: no fallback provider by default — set during onboarding.
-        assert!(c.providers.fallback.is_empty());
-        assert!(c.providers.fallback_provider().is_none());
+        // No provider configured by default — set during onboarding.
+        assert!(c.providers.models.is_empty());
+        assert!(c.providers.first_provider().is_none());
         assert!(!c.skills.open_skills_enabled);
         assert!(!c.skills.allow_scripts);
         assert_eq!(
@@ -11940,7 +11896,6 @@ auto_save = true
         let config = Config {
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::ProvidersConfig {
-                fallback: vec!["openrouter.default".into()],
                 models: {
                     let mut m = HashMap::new();
                     m.entry("openrouter".to_string())
@@ -12131,7 +12086,7 @@ auto_save = true
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed = parse_test_config(&toml_str);
 
-        assert_eq!(parsed.providers.fallback, config.providers.fallback);
+        assert_eq!(parsed.providers.models.len(), config.providers.models.len());
         assert_eq!(parsed.observability.backend, "log");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Full);
@@ -12163,7 +12118,7 @@ default_temperature = 0.7
         assert!(
             parsed
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.api_key.as_deref())
                 .is_none()
         );
@@ -12181,7 +12136,7 @@ default_temperature = 0.7
         assert!(
             (parsed
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
                 - 0.7)
@@ -12191,7 +12146,7 @@ default_temperature = 0.7
         assert_eq!(
             parsed
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.timeout_secs)
                 .unwrap_or(120),
             DEFAULT_DELEGATE_TIMEOUT_SECS
@@ -12345,7 +12300,7 @@ provider_timeout_secs = 300
         assert_eq!(
             parsed
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.timeout_secs)
                 .unwrap_or(120),
             300
@@ -12431,7 +12386,7 @@ X-Title = "zeroclaw"
         let parsed = parse_test_config(raw);
         let headers = &parsed
             .providers
-            .fallback_provider()
+            .first_provider()
             .expect("fallback provider")
             .extra_headers;
         assert_eq!(headers.len(), 2);
@@ -12448,7 +12403,7 @@ default_temperature = 0.7
         assert!(
             parsed
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .map(|e| e.extra_headers.is_empty())
                 .unwrap_or(true)
         );
@@ -12610,10 +12565,7 @@ default_temperature = 0.7
         fs::create_dir_all(&dir).await.unwrap();
 
         let config_path = dir.join("config.toml");
-        let mut providers = crate::providers::ProvidersConfig {
-            fallback: vec!["openrouter".into()],
-            ..Default::default()
-        };
+        let mut providers = crate::providers::ProvidersConfig::default();
         providers
             .models
             .entry("openrouter".into())
@@ -12751,7 +12703,6 @@ default_temperature = 0.7
             config_path: dir.join("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = vec!["anthropic.default".into()];
         config
             .providers
             .models
@@ -12914,7 +12865,6 @@ default_temperature = 0.7
             config_path: config_path.clone(),
             ..Default::default()
         };
-        config.providers.fallback = vec!["test.default".into()];
         config
             .providers
             .models
@@ -14043,14 +13993,14 @@ requires_openai_auth = true
 "#;
 
         let parsed = parse_test_config(raw);
-        assert_eq!(
-            parsed.providers.fallback.first().map(String::as_str),
-            Some("sub2api.default")
+        assert!(
+            parsed.providers.models.contains_key("sub2api"),
+            "expected sub2api in providers.models"
         );
         assert_eq!(
             parsed
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.model.as_deref()),
             Some("gpt-5.3-codex")
         );
@@ -14068,7 +14018,6 @@ requires_openai_auth = true
     async fn model_provider_profile_maps_to_custom_endpoint() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.providers.fallback = vec!["sub2api".to_string()];
         config
             .providers
             .models
@@ -14090,13 +14039,6 @@ requires_openai_auth = true
                 },
             );
 
-        // The user's literal fallback key is preserved; we no longer rewrite it
-        // to a canonical alias. This is the round-trip-safe contract that the
-        // `zeroclaw config get/set` CLI relies on.
-        assert_eq!(
-            config.providers.fallback.first().map(String::as_str),
-            Some("sub2api")
-        );
         // The original entry is still stored under its config key.
         assert_eq!(
             config
@@ -14119,14 +14061,13 @@ requires_openai_auth = true
                 .and_then(|e| e.base_url.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
-        assert!(config.providers.fallback_provider().is_some());
+        assert!(config.providers.first_provider().is_some());
     }
 
     #[test]
     async fn model_provider_profile_responses_uses_openai_codex_and_openai_key() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.providers.fallback = vec!["sub2api".to_string()];
         config
             .providers
             .models
@@ -14153,13 +14094,6 @@ requires_openai_auth = true
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("OPENAI_API_KEY") };
 
-        // The user's literal fallback key is preserved; we no longer rewrite it
-        // to "openai-codex". The Codex-app-server compatibility shim instead
-        // mirrors the resolved entry under that alias key for runtime lookups.
-        assert_eq!(
-            config.providers.fallback.first().map(String::as_str),
-            Some("sub2api")
-        );
         // The original entry is still stored under its config key.
         let entry = config
             .providers
@@ -14182,17 +14116,13 @@ requires_openai_auth = true
     }
 
     /// Round-trip test for the config CLI: a TOML file with the user's value
-    /// must deserialize, apply env overrides, and serialize back to the same
-    /// `providers.fallback`. This is the full path that backed the user-visible
-    /// `config set` -> `config get` divergence.
+    /// Round-trip test for the config CLI: a TOML file with a provider model
+    /// must deserialize, apply env overrides, and serialize back correctly.
     #[test]
-    async fn fallback_round_trips_through_load_apply_serialize() {
+    async fn provider_models_round_trips_through_load_apply_serialize() {
         let _env_guard = env_override_lock().await;
         let toml_in = r#"
 schema_version = 3
-
-[providers]
-fallback = "primary"
 
 [providers.models.primary.default]
 name = "alias-name"
@@ -14202,44 +14132,22 @@ model = "primary-model"
 
         let config: Config = toml::from_str(toml_in).expect("parse toml");
 
-        // What `config get providers.fallback` returns post-load.
         assert_eq!(
-            config.get_prop("providers.fallback").unwrap(),
-            "primary",
-            "config get providers.fallback must return the user's literal value",
+            config
+                .providers
+                .models
+                .get("primary")
+                .and_then(|m| m.get("default"))
+                .and_then(|e| e.model.as_deref()),
+            Some("primary-model"),
         );
 
         // What `config save` would write back to disk.
         let toml_out = toml::to_string(&config).expect("serialize toml");
         assert!(
-            toml_out.contains(r#"fallback = "primary""#),
-            "serialized config must keep fallback = \"primary\"; got:\n{toml_out}",
+            toml_out.contains("primary-model"),
+            "serialized config must keep model value; got:\n{toml_out}",
         );
-    }
-
-    /// `set_prop` followed by `get_prop` must return the value that was set,
-    /// even when the surrounding profile shape would historically have caused
-    /// the in-memory value to be rewritten.
-    #[test]
-    async fn set_prop_then_get_prop_round_trips_for_fallback() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("primary".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
-                    name: Some("alias-name".to_string()),
-                    model: Some("primary-model".to_string()),
-                    ..Default::default()
-                },
-            );
-        config.set_prop("providers.fallback", "primary").unwrap();
-
-        assert_eq!(config.get_prop("providers.fallback").unwrap(), "primary");
     }
 
     /// `resolve_default_model` returns the fallback provider's model when set,
@@ -14281,8 +14189,7 @@ model = "primary-model"
             Some("tertiary-model"),
         );
 
-        // Set fallback to a provider with its own model -> fallback wins.
-        config.providers.fallback = vec!["primary".to_string()];
+        // Add a provider with a model — resolve_default_model finds it.
         config
             .providers
             .models
@@ -14295,10 +14202,8 @@ model = "primary-model"
                     ..Default::default()
                 },
             );
-        assert_eq!(
-            config.providers.resolve_default_model().as_deref(),
-            Some("primary-model"),
-        );
+        // resolve_default_model returns the first non-empty model across all providers.
+        assert!(config.providers.resolve_default_model().is_some());
     }
 
     #[test]
@@ -14320,7 +14225,6 @@ model = "primary-model"
             config_path: PathBuf::from("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = vec!["anthropic.default".into()];
         config
             .providers
             .models
@@ -14344,7 +14248,9 @@ model = "primary-model"
         assert!(
             (parsed
                 .providers
-                .fallback_provider()
+                .models
+                .get("anthropic")
+                .and_then(|m| m.get("default"))
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
                 - 0.5)
@@ -14368,7 +14274,6 @@ model = "primary-model"
     async fn validate_ollama_cloud_model_requires_remote_api_url() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.providers.fallback = vec!["ollama".to_string()];
         config
             .providers
             .models
@@ -14394,7 +14299,6 @@ model = "primary-model"
     async fn validate_ollama_cloud_model_accepts_remote_endpoint_and_env_key() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.providers.fallback = vec!["ollama".to_string()];
         config
             .providers
             .models
@@ -14423,7 +14327,6 @@ model = "primary-model"
     async fn validate_rejects_unknown_model_provider_wire_api() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.providers.fallback = vec!["sub2api".to_string()];
         config
             .providers
             .models
@@ -14660,7 +14563,7 @@ default_model = "legacy-model"
         assert_eq!(
             config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.model.as_deref()),
             Some("legacy-model")
         );
@@ -14775,7 +14678,7 @@ default_model = "legacy-model"
         assert_eq!(
             config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.model.as_deref()),
             Some("persisted-profile")
         );
@@ -14903,7 +14806,7 @@ default_model = "persisted-profile"
         assert_eq!(
             config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.model.as_deref()),
             Some("persisted-profile")
         );
@@ -14926,7 +14829,6 @@ default_model = "persisted-profile"
     #[test]
     async fn validate_rejects_out_of_range_temperature() {
         let mut config = Config::default();
-        config.providers.fallback = vec!["test.default".into()];
         config
             .providers
             .models
@@ -14950,7 +14852,6 @@ default_model = "persisted-profile"
     #[test]
     async fn validate_rejects_negative_temperature() {
         let mut config = Config::default();
-        config.providers.fallback = vec!["test.default".into()];
         config
             .providers
             .models
@@ -14974,7 +14875,6 @@ default_model = "persisted-profile"
     #[test]
     async fn validate_accepts_valid_temperature() {
         let mut config = Config::default();
-        config.providers.fallback = vec!["test.default".into()];
         config
             .providers
             .models
@@ -15360,7 +15260,7 @@ default_model = "persisted-profile"
         // supplied via LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET env vars
         // instead; both fields default to "" when absent.
         let toml = r#"
-[channels_config.line]
+[channels_config.line.default]
 enabled = true
 channel_access_token = "ChannelAccessToken=="
 channel_secret = "abc123secret"
@@ -15385,7 +15285,7 @@ webhook_port = 8443
         // Minimal config — only the required secret fields are provided.
         // All optional fields should resolve to documented defaults.
         let toml = r#"
-[channels_config.line]
+[channels_config.line.default]
 channel_access_token = "tok"
 channel_secret = "sec"
 "#;
@@ -15411,7 +15311,7 @@ channel_secret = "sec"
     async fn line_config_allowlist_policy() {
         // dm_policy = allowlist with an explicit user ID list.
         let toml = r#"
-[channels_config.line]
+[channels_config.line.default]
 channel_access_token = "tok"
 channel_secret = "sec"
 dm_policy = "allowlist"
@@ -15427,7 +15327,7 @@ allowed_users = ["Uabc123", "Udef456"]
     async fn line_config_open_policies() {
         // dm_policy = open + group_policy = open — most permissive combination.
         let toml = r#"
-[channels_config.line]
+[channels_config.line.default]
 channel_access_token = "tok"
 channel_secret = "sec"
 dm_policy = "open"
@@ -15443,7 +15343,7 @@ group_policy = "open"
     async fn line_config_group_disabled() {
         // group_policy = disabled — bot ignores all group/room messages.
         let toml = r#"
-[channels_config.line]
+[channels_config.line.default]
 channel_access_token = "tok"
 channel_secret = "sec"
 group_policy = "disabled"
@@ -15529,7 +15429,7 @@ group_policy = "disabled"
             "test setup requires world-readable config"
         );
 
-        if let Some(entry) = config.providers.fallback_provider_mut() {
+        if let Some(entry) = config.providers.first_provider_mut() {
             entry.temperature = Some(0.6);
         }
         config.save().await.unwrap();
@@ -16714,26 +16614,18 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn config_tree_traversal_discovers_nested_secrets() {
         let mut config = Config::default();
-        // Set api_key on fallback provider
-        if config.providers.fallback.is_empty() {
-            if let Some(entry) = config.providers.fallback_provider_mut() {
-                entry.api_key = Some("test-key".into());
-            }
-        } else {
-            config.providers.fallback = vec!["anthropic.default".into()];
-            config
-                .providers
-                .models
-                .entry("anthropic".into())
-                .or_default()
-                .insert(
-                    "default".to_string(),
-                    ModelProviderConfig {
-                        api_key: Some("test-key".into()),
-                        ..Default::default()
-                    },
-                );
-        }
+        // Set api_key on first provider entry (or create one)
+        config
+            .providers
+            .models
+            .entry("anthropic".into())
+            .or_default()
+            .entry("default".to_string())
+            .or_insert_with(|| ModelProviderConfig {
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            })
+            .api_key = Some("test-key".into());
         config.channels.matrix.insert(
             "default".to_string(),
             MatrixConfig {
@@ -17274,9 +17166,22 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut config = Config::default();
         assert!(config.channels.matrix.is_empty());
 
+        // V3 channels are HashMaps — init_defaults cannot insert a default key
+        // (there is no meaningful default alias). Callers use create_map_key.
+        config
+            .create_map_key("channels.matrix", "default")
+            .expect("create_map_key should insert a default matrix entry");
+        assert!(
+            config.channels.matrix.contains_key("default"),
+            "create_map_key must add the 'default' alias"
+        );
+
+        // init_defaults on an already-populated map section is a no-op.
         let initialized = config.init_defaults(Some("channels.matrix"));
-        assert!(initialized.contains(&"channels.matrix"));
-        assert!(!config.channels.matrix.is_empty());
+        assert!(
+            !initialized.contains(&"channels.matrix"),
+            "init_defaults should not report channels.matrix when entry already exists"
+        );
     }
 
     #[test]
@@ -17285,9 +17190,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         // [channels.matrix] is present (possibly with all default fields),
         // then a PATCH from the dashboard hits set_prop.
         let toml_src = r#"
-schema_version = 2
+schema_version = 3
 
-[channels.matrix]
+[channels.matrix.default]
 enabled = false
 homeserver = ""
 access_token = ""
@@ -17315,13 +17220,14 @@ allowed_users = []
     #[test]
     async fn init_defaults_then_set_prop_round_trips_vec_string() {
         // Regression for #6175 Channels picker → form → save:
-        // 1. init_defaults creates channels.matrix = Some(MatrixConfig::default())
-        // 2. set_prop on channels.matrix.allowed-rooms must accept a JSON-array
+        // 1. create_map_key inserts channels.matrix["default"] = MatrixConfig::default()
+        // 2. set_prop on channels.matrix.default.allowed-rooms must accept a JSON-array
         //    string (the shape coerce_for_set_prop emits for Vec<String>).
         // 3. get_prop reads it back.
         let mut config = Config::default();
-        let initialized = config.init_defaults(Some("channels.matrix"));
-        assert!(initialized.contains(&"channels.matrix"));
+        config
+            .create_map_key("channels.matrix", "default")
+            .expect("create_map_key should insert a default matrix entry");
         assert!(config.channels.matrix.contains_key("default"));
 
         // prop_fields must surface the kebab path so the form can render it.
@@ -17569,7 +17475,7 @@ allowed_users = []
     #[test]
     async fn backfill_enabled_activates_channel_without_explicit_enabled() {
         let toml = r#"
-[channels.matrix]
+[channels.matrix.default]
 homeserver = "https://matrix.org"
 access_token = "tok"
 allowed_rooms = ["!r:m"]
@@ -17585,7 +17491,7 @@ allowed_users = ["@u:m"]
     #[test]
     async fn backfill_enabled_respects_explicit_false() {
         let toml = r#"
-[channels.matrix]
+[channels.matrix.default]
 homeserver = "https://matrix.org"
 access_token = "tok"
 allowed_rooms = ["!r:m"]
@@ -17614,7 +17520,7 @@ api_key = "sk-test"
     async fn backfill_enabled_works_with_toml_comments() {
         let toml = r#"
 # My matrix setup
-[channels.matrix]
+[channels.matrix.default]
 homeserver = "https://matrix.org"  # production server
 access_token = "tok"
 allowed_rooms = ["!r:m"]

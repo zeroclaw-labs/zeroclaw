@@ -418,12 +418,12 @@ pub fn all_tools_with_runtime(
     {
         let llm_task_provider = root_config
             .providers
-            .fallback_type()
+            .first_provider_type()
             .unwrap_or("openrouter")
             .to_string();
         let llm_task_model = root_config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.model.clone())
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
         let llm_task_runtime_options =
@@ -434,12 +434,12 @@ pub fn all_tools_with_runtime(
             llm_task_model,
             root_config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7),
             root_config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.api_key.clone()),
             llm_task_runtime_options,
         )));

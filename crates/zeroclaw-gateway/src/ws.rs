@@ -480,7 +480,7 @@ async fn process_chat_message(
         .config
         .lock()
         .providers
-        .fallback_type()
+        .first_provider_type()
         .unwrap_or("unknown")
         .to_string();
 
