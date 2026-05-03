@@ -5689,6 +5689,12 @@ pub async fn start_channels(
         .as_ref()
         .is_some_and(|mx| mx.interrupt_on_new_message);
 
+    if !config.channels.precheck_reply_intent {
+        tracing::info!(
+            "Reply-intent precheck disabled via [channels] precheck_reply_intent = false"
+        );
+    }
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
