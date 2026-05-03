@@ -27,6 +27,7 @@ tokio = { version = "1", features = ["time", "process", "sync", "rt", "net", "io
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", features = ["sink"] }
 tracing = "0.1"
+anyhow = "1"
 base64 = "0.22"
 rusqlite = { version = "0.31", features = ["bundled"] }
 tauri-plugin-dialog = "2"

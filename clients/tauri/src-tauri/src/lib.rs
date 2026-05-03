@@ -8,6 +8,7 @@ use rusqlite::Connection;
 
 mod device_link;
 mod embedding_status;
+mod local_chat_ws;
 
 /// Write a session token to disk and restrict permissions to owner-only (0o600) on Unix.
 fn persist_session_token(path: &Path, token: &str) -> std::io::Result<()> {
