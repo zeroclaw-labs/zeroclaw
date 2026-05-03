@@ -8,7 +8,7 @@ This directory **is** the registry. End users install with:
 zeroclaw skills install <name>
 ```
 
-The CLI sparse-checks out this subtree from `zeroclaw-labs/zeroclaw` (only the requested skill is downloaded — not the full repo) and installs it into `~/.zeroclaw/workspace/skills/<name>/`. Skills are not bundled into the binary and not mirrored to a separate registry repo: there is one source of truth, and you're looking at it.
+The CLI sparse-checks out the `skills/` subtree from `zeroclaw-labs/zeroclaw` — currently ~150 KB total versus the full source tree's hundreds of MB — and installs the requested skill into `~/.zeroclaw/workspace/skills/<name>/`. Skills are not bundled into the binary and not mirrored to a separate registry repo: there is one source of truth, and you're looking at it.
 
 ## Layout
 

@@ -1,13 +1,22 @@
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// Compact-mode helper for loading a skill's source file on demand.
+///
+/// Honors the same `skills.enabled` master switch and `skills.disabled`
+/// blocklist as the system-prompt loader, so a skill hidden from the prompt
+/// catalog cannot be re-fetched here. Without this enforcement, compact
+/// mode would let `read_skill("disabled-name")` succeed even after the user
+/// disabled the skill.
 pub struct ReadSkillTool {
     workspace_dir: PathBuf,
     open_skills_enabled: bool,
     open_skills_dir: Option<String>,
+    skills_enabled: bool,
+    skills_disabled: Vec<String>,
 }
 
 impl ReadSkillTool {
@@ -15,11 +24,15 @@ impl ReadSkillTool {
         workspace_dir: PathBuf,
         open_skills_enabled: bool,
         open_skills_dir: Option<String>,
+        skills_enabled: bool,
+        skills_disabled: Vec<String>,
     ) -> Self {
         Self {
             workspace_dir,
             open_skills_enabled,
             open_skills_dir,
+            skills_enabled,
+            skills_disabled,
         }
     }
 }
@@ -48,6 +61,19 @@ impl Tool for ReadSkillTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Master kill switch — refuse to read any skill body when the loader
+        // is disabled. Mirrors the short-circuit in load_skills_with_config.
+        if !self.skills_enabled {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "Skills are disabled (skills.enabled = false). Set skills.enabled = true in config to use read_skill."
+                        .to_string(),
+                ),
+            });
+        }
+
         let requested = args
             .get("name")
             .and_then(|value| value.as_str())
@@ -55,11 +81,42 @@ impl Tool for ReadSkillTool {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing 'name' parameter"))?;
 
+        // Reject explicitly-disabled names with a clear error before touching
+        // the filesystem. Case-insensitive match mirrors the lookup below.
+        if self
+            .skills_disabled
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(requested))
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Skill '{requested}' is in skills.disabled. Remove it from the blocklist to use this skill."
+                )),
+            });
+        }
+
         let skills = crate::skills::load_skills_with_open_skills_settings(
             &self.workspace_dir,
             self.open_skills_enabled,
             self.open_skills_dir.as_deref(),
         );
+
+        // Belt-and-suspenders: filter the loaded list by `skills.disabled` so
+        // any skill that loads through a path the early-reject didn't catch
+        // (e.g. a name normalisation difference between request and manifest)
+        // still gets blocked here.
+        let blocklist: HashSet<String> = self
+            .skills_disabled
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+
+        let skills: Vec<_> = skills
+            .into_iter()
+            .filter(|skill| !blocklist.contains(&skill.name.to_ascii_lowercase()))
+            .collect();
 
         let Some(skill) = skills
             .iter()
@@ -118,7 +175,15 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_tool(tmp: &TempDir) -> ReadSkillTool {
-        ReadSkillTool::new(tmp.path().join("workspace"), false, None)
+        ReadSkillTool::new(tmp.path().join("workspace"), false, None, true, Vec::new())
+    }
+
+    fn make_tool_with_disabled(tmp: &TempDir, disabled: Vec<String>) -> ReadSkillTool {
+        ReadSkillTool::new(tmp.path().join("workspace"), false, None, true, disabled)
+    }
+
+    fn make_tool_globally_disabled(tmp: &TempDir) -> ReadSkillTool {
+        ReadSkillTool::new(tmp.path().join("workspace"), false, None, false, Vec::new())
     }
 
     #[tokio::test]
@@ -182,6 +247,82 @@ description = "Ship safely"
         assert_eq!(
             result.error.as_deref(),
             Some("Unknown skill 'calendar'. Available skills: weather")
+        );
+    }
+
+    #[tokio::test]
+    async fn skills_globally_disabled_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("workspace/skills/weather");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Weather\n").unwrap();
+
+        let result = make_tool_globally_disabled(&tmp)
+            .execute(json!({ "name": "weather" }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Skills are disabled"),
+            "expected disabled error, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn explicitly_disabled_skill_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("workspace/skills/chatty");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Chatty\n").unwrap();
+
+        let tool = make_tool_with_disabled(&tmp, vec!["chatty".to_string()]);
+
+        let result = tool.execute(json!({ "name": "chatty" })).await.unwrap();
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap();
+        assert!(
+            err.contains("skills.disabled"),
+            "expected blocklist error, got: {err}"
+        );
+
+        // Case-insensitive match: requesting 'CHATTY' must also be blocked.
+        let result = tool.execute(json!({ "name": "CHATTY" })).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap().contains("skills.disabled"),
+            "case-insensitive disabled match failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_filter_hides_skill_from_listing_on_unknown_lookup() {
+        let tmp = TempDir::new().unwrap();
+        for name in &["weather", "blocked"] {
+            let dir = tmp.path().join("workspace/skills").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), format!("# {name}\n")).unwrap();
+        }
+        let tool = make_tool_with_disabled(&tmp, vec!["blocked".to_string()]);
+
+        let result = tool
+            .execute(json!({ "name": "nonexistent" }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap();
+        assert!(
+            err.contains("weather"),
+            "expected weather in available list, got: {err}"
+        );
+        assert!(
+            !err.contains("blocked"),
+            "disabled skill should not appear in available list, got: {err}"
         );
     }
 }
