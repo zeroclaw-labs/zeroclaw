@@ -203,7 +203,7 @@ fastembed = { version = "=5.8.0", optional = true }
 # Used by src/dispatch/mqtt.rs to subscribe to broker topics and publish each
 # message into the EventRouter. rustls TLS support pulls in the same backend
 # already used by reqwest, axum, and lettre — no additional TLS stack added.
-rumqttc = { version = "0.24", optional = true, default-features = false, features = ["use-rustls"] }
+rumqttc = { version = "0.25.1", optional = true, default-features = false, features = ["use-rustls"] }
 
 # USB device enumeration (hardware discovery) — only on platforms nusb supports
 # (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
