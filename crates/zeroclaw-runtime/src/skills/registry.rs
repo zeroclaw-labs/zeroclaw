@@ -529,22 +529,39 @@ impl SkillRegistry for AgentSkillsIoRegistry {
         skills_path: &Path,
         allow_scripts: bool,
     ) -> Result<(PathBuf, usize)> {
-        // Translate the source into a skillssh: triplet and delegate.
-        let translated = if let Some(rest) = source.strip_prefix("agentskills:") {
-            format!("skillssh:{}", rest.trim().trim_matches('/'))
+        // Extract the path portion from either the `agentskills:` prefix
+        // form or a full agentskills.io URL.
+        let path = if let Some(rest) = source.strip_prefix("agentskills:") {
+            rest.trim().trim_matches('/').to_string()
         } else if let Some(parsed) = Self::parse_url(source) {
-            let path = parsed
+            parsed
                 .path_segments()
                 .into_iter()
                 .flatten()
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
-                .join("/");
-            format!("skillssh:{path}")
+                .join("/")
         } else {
             anyhow::bail!("unrecognised agentskills.io source format: {source}")
         };
-        SkillsShRegistry.install(&translated, skills_path, allow_scripts)
+
+        // agentskills.io delegates downloads to skills.sh, which requires a
+        // `<owner>/<repo>/<skill>` triplet. Validate up front with an
+        // agentskills-shaped error so users don't see the internal
+        // skillssh: translation leak through (which previously made the
+        // error message look like they'd typed `skillssh:` when they
+        // hadn't).
+        let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if segs.len() != 3 {
+            anyhow::bail!(
+                "invalid agentskills.io source '{source}': expected \
+                 'agentskills:<owner>/<repo>/<skill>' \
+                 (e.g. agentskills:anthropics/skills/webapp-testing). Got {} segment(s).",
+                segs.len()
+            );
+        }
+
+        SkillsShRegistry.install(&format!("skillssh:{path}"), skills_path, allow_scripts)
     }
 }
 
@@ -969,11 +986,18 @@ impl SkillRegistry for CustomHttpRegistry {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Normalize a registry-derived slug into a filesystem-safe skill directory
+/// name.
+///
+/// **Preserves hyphens** so the on-disk directory matches the install slug
+/// the user typed — `skills install clawhub:foo-bar` lands in
+/// `skills/foo-bar/`, not `skills/foo_bar/`. Without this, subsequent
+/// `skills audit foo-bar` and `skills remove foo-bar` invocations couldn't
+/// find the skill the user just installed.
 fn normalize_skill_name(s: &str) -> String {
     s.to_lowercase()
         .chars()
-        .map(|c| if c == '-' { '_' } else { c })
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect()
 }
 
@@ -1011,7 +1035,10 @@ mod tests {
             "https://clawhub.ai/api/v1/download?slug=pskoett/self-improving-agent"
         );
         let dir = ClawhubRegistry::skill_dir_name("pskoett/self-improving-agent").unwrap();
-        assert_eq!(dir, "self_improving_agent");
+        // Hyphens are now preserved so the on-disk dir matches the install
+        // slug, allowing `skills audit/remove self-improving-agent` to
+        // resolve to the same directory after install.
+        assert_eq!(dir, "self-improving-agent");
     }
 
     #[test]
@@ -1054,9 +1081,58 @@ mod tests {
     }
 
     #[test]
-    fn normalize_names() {
-        assert_eq!(normalize_skill_name("My-Skill"), "my_skill");
+    fn normalize_names_preserves_hyphens() {
+        // Hyphens are now preserved so the on-disk dir matches the install
+        // slug. Previously this asserted "my_skill" — that broke
+        // `skills audit my-skill` and `skills remove my-skill` after a
+        // ClawhHub install of `clawhub:my-skill`.
+        assert_eq!(normalize_skill_name("My-Skill"), "my-skill");
         assert_eq!(normalize_skill_name("web_scraper"), "web_scraper");
+        assert_eq!(
+            normalize_skill_name("acong-hello-world"),
+            "acong-hello-world"
+        );
         assert_eq!(normalize_skill_name("foo/bar"), "foobar");
+        // Underscores and lowercasing are still applied.
+        assert_eq!(normalize_skill_name("FOO_BAR"), "foo_bar");
+        // Other punctuation is still stripped.
+        assert_eq!(normalize_skill_name("a.b@c"), "abc");
+    }
+
+    #[test]
+    fn agentskills_install_validates_three_segment_format() {
+        // The pre-fix routing silently translated `agentskills:hello-world`
+        // into `skillssh:hello-world` and then leaked the skills.sh-shaped
+        // error to the user. Now we validate up front and produce an
+        // agentskills-shaped message.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r = AgentSkillsIoRegistry;
+
+        let err = r
+            .install("agentskills:hello-world", tmp.path(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid agentskills.io source"),
+            "expected agentskills-shaped error, got: {err}"
+        );
+        assert!(
+            err.contains("<owner>/<repo>/<skill>"),
+            "expected format hint in error, got: {err}"
+        );
+        assert!(
+            !err.contains("skillssh:"),
+            "internal skillssh: translation should not leak into error: {err}"
+        );
+
+        // Two-segment input is also invalid.
+        let err = r
+            .install("agentskills:foo/bar", tmp.path(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid agentskills.io source") && err.contains("2 segment"),
+            "expected count in error, got: {err}"
+        );
     }
 }
