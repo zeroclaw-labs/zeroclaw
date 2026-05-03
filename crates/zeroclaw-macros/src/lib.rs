@@ -617,13 +617,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 if self.#field_ident.contains_key(map_key) {
                                     return Ok(false);
                                 }
-                                let value: #value_ty = serde_json::from_value(
-                                    serde_json::json!({}),
-                                ).map_err(|e| format!(
-                                    "default-construct {} failed: {e}",
-                                    stringify!(#value_ty)
-                                ))?;
-                                self.#field_ident.insert(map_key.to_string(), value);
+                                self.#field_ident.insert(map_key.to_string(), <#value_ty>::default());
                                 return Ok(true);
                             }
                         }

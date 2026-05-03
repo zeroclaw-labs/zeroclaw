@@ -665,11 +665,34 @@ pub async fn handle_section_select(
             (prefix, created)
         }
         "channels" => {
-            let prefix = format!("channels.{key}");
-            // init_defaults instantiates the subsection if it doesn't exist.
-            // The set returned tells us whether something was newly created.
-            let initialized = working.init_defaults(Some(&prefix));
-            (prefix, !initialized.is_empty())
+            // Find the first existing alias for this channel type, or create
+            // one named after the channel type itself.
+            let alias = working
+                .prop_fields()
+                .into_iter()
+                .find_map(|f| {
+                    f.name
+                        .strip_prefix(&format!("channels.{key}."))
+                        .and_then(|rest| rest.split('.').next().map(String::from))
+                })
+                .unwrap_or_else(|| key.clone());
+            let created = working
+                .create_map_key(&format!("channels.{key}"), &alias)
+                .map_err(|msg| {
+                    error_response(
+                        ConfigApiError::new(
+                            ConfigApiCode::PathNotFound,
+                            format!("could not select channel `{key}`: {msg}"),
+                        )
+                        .with_path(format!("channels.{key}")),
+                    )
+                });
+            let created = match created {
+                Ok(c) => c,
+                Err(resp) => return resp,
+            };
+            let prefix = format!("channels.{key}.{alias}");
+            (prefix, created)
         }
         "memory" => {
             // Set memory.backend to the picked key. Fields_prefix points at
@@ -787,31 +810,25 @@ mod tests {
     fn channels_select_initializes_subsection_so_set_prop_works() {
         // Regression for the channels init/set flow: after
         // handle_section_select for channels/matrix, the in-memory config
-        // must have channels.matrix = Some(...) so a subsequent set_prop on
+        // must have channels.matrix.<alias> so a subsequent set_prop on
         // channels.matrix.* succeeds rather than bailing "Unknown property".
-        // Calls init_defaults directly (the synchronous core of the select
+        // Uses create_map_key directly (the synchronous core of the select
         // endpoint) to keep the test free of HTTP machinery.
         let mut cfg = empty_cfg();
         assert!(cfg.channels.matrix.is_empty(), "fresh config: matrix unset");
 
-        let initialized = cfg.init_defaults(Some("channels.matrix"));
+        cfg.create_map_key("channels.matrix", "matrix")
+            .expect("create_map_key must succeed for channels.matrix");
         assert!(
-            initialized.contains(&"channels.matrix"),
-            "init_defaults must report channels.matrix initialized; got: {initialized:?}",
-        );
-        assert!(
-            cfg.channels.matrix.contains_key("default"),
-            "channels.matrix must have default after init_defaults",
+            cfg.channels.matrix.contains_key("matrix"),
+            "channels.matrix must have alias after create_map_key",
         );
 
         // The form would issue a PATCH whose set_prop call hits this path.
-        cfg.set_prop(
-            "channels.matrix.default.allowed-rooms",
-            r#"["alice","bob"]"#,
-        )
-        .expect("set_prop on initialized matrix subsection must succeed");
+        cfg.set_prop("channels.matrix.matrix.allowed-rooms", r#"["alice","bob"]"#)
+            .expect("set_prop on initialized matrix subsection must succeed");
         assert_eq!(
-            cfg.channels.matrix.get("default").unwrap().allowed_rooms,
+            cfg.channels.matrix.get("matrix").unwrap().allowed_rooms,
             vec!["alice".to_string(), "bob".to_string()],
         );
     }
@@ -907,15 +924,16 @@ mod tests {
     }
 
     #[test]
-    fn channels_picker_marks_configured_after_init_defaults() {
+    fn channels_picker_marks_configured_after_create_map_key() {
         let mut cfg = empty_cfg();
-        cfg.init_defaults(Some("channels.matrix"));
+        cfg.create_map_key("channels.matrix", "matrix")
+            .expect("create_map_key must succeed for channels.matrix");
         let items = schema_walk_picker(&cfg, "channels");
         let matrix = items.iter().find(|i| i.key == "matrix").unwrap();
         assert_eq!(
             matrix.badge.as_deref(),
             Some("configured"),
-            "matrix should be marked configured after init_defaults"
+            "matrix should be marked configured after create_map_key"
         );
     }
 

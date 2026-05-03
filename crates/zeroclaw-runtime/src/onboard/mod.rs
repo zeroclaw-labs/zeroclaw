@@ -1078,27 +1078,32 @@ async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Re
         SkipNav::Enter => {}
     }
     loop {
-        // Master list of all channels that exist in the schema. Probe on a
-        // clone: init_defaults(Some("channels")) forces every Option<T>
-        // subsection to Some(default), then prop_fields reveals the full
-        // set. Feature-gated channels drop out automatically.
+        // Master list of all channels that exist in the schema, derived from
+        // the static map_key_sections() metadata. Feature-gated channels drop
+        // out automatically because their fields aren't registered.
         let all_channels: Vec<String> = {
-            let mut probe = cfg.clone();
-            probe.init_defaults(Some("channels"));
-            probe
-                .prop_fields()
-                .iter()
-                .filter_map(|f| f.name.strip_prefix("channels."))
-                .filter_map(|suffix| suffix.split_once('.').map(|(head, _)| head.to_string()))
+            let prefix = "channels.";
+            zeroclaw_config::schema::Config::map_key_sections()
+                .into_iter()
+                .filter_map(|s| {
+                    s.path
+                        .strip_prefix(prefix)
+                        .filter(|rest| !rest.contains('.'))
+                        .map(String::from)
+                })
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect()
         };
-        let configured: std::collections::BTreeSet<String> = cfg
-            .prop_fields()
+        // A channel type is "configured" if the live config has any prop fields under it.
+        let live_fields: Vec<String> = cfg.prop_fields().into_iter().map(|f| f.name).collect();
+        let configured: std::collections::BTreeSet<String> = all_channels
             .iter()
-            .filter_map(|f| f.name.strip_prefix("channels."))
-            .filter_map(|suffix| suffix.split_once('.').map(|(head, _)| head.to_string()))
+            .filter(|name| {
+                let prefix = format!("channels.{name}.");
+                live_fields.iter().any(|f| f.starts_with(&prefix))
+            })
+            .cloned()
             .collect();
 
         let mut options: Vec<SelectItem> = all_channels
@@ -1109,11 +1114,11 @@ async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Re
                 // otherwise `[configured]` for a present-but-disabled block.
                 // Web `/onboard` renders the same tiers via
                 // `schema_walk_picker` in `crates/zeroclaw-gateway/src/api_onboard.rs`.
-                let is_active = cfg
-                    .get_prop(&format!("channels.{name}.enabled"))
-                    .ok()
-                    .as_deref()
-                    == Some("true");
+                let is_active = live_fields.iter().any(|f| {
+                    f.starts_with(&format!("channels.{name}."))
+                        && f.ends_with(".enabled")
+                        && cfg.get_prop(f).ok().as_deref() == Some("true")
+                });
                 if is_active {
                     SelectItem::with_badge(name.clone(), "[active]")
                 } else if configured.contains(name) {
@@ -1135,8 +1140,19 @@ async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Re
         }
 
         let picked = &all_channels[idx];
-        let prefix = format!("channels.{picked}");
-        cfg.init_defaults(Some(&prefix));
+        // Find first existing alias, or create one named after the channel type.
+        let alias = cfg
+            .prop_fields()
+            .into_iter()
+            .find_map(|f| {
+                f.name
+                    .strip_prefix(&format!("channels.{picked}."))
+                    .and_then(|rest| rest.split('.').next().map(String::from))
+            })
+            .unwrap_or_else(|| picked.clone());
+        cfg.create_map_key(&format!("channels.{picked}"), &alias)
+            .ok();
+        let prefix = format!("channels.{picked}.{alias}");
         cfg.save().await?;
         ui.heading(2, picked);
         // Back inside a channel's subfields bounces to the channel list
