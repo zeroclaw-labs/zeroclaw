@@ -314,19 +314,29 @@ impl WhatsAppChannel {
                     // DMs and group_mention_patterns for groups. When the
                     // applicable pattern set is non-empty, messages without a
                     // match are dropped and matched fragments are stripped.
+                    //
+                    // Bypass for native-interactive replies: a `[choice]<id>`
+                    // body comes from the user tapping a button or list row
+                    // we sent — the bot's own UI counts as an explicit
+                    // interaction with the bot, so the mention requirement
+                    // (intended to gate freeform messages) does not apply.
                     let is_group = Self::is_group_message(msg);
-                    let content = match Self::apply_mention_gating(
-                        &self.dm_mention_patterns,
-                        &self.group_mention_patterns,
-                        &content,
-                        is_group,
-                    ) {
-                        Some(c) => c,
-                        None => {
-                            tracing::debug!(
-                                "WhatsApp: message from {from} did not match mention patterns, dropping"
-                            );
-                            continue;
+                    let content = if content.starts_with("[choice]") {
+                        content
+                    } else {
+                        match Self::apply_mention_gating(
+                            &self.dm_mention_patterns,
+                            &self.group_mention_patterns,
+                            &content,
+                            is_group,
+                        ) {
+                            Some(c) => c,
+                            None => {
+                                tracing::debug!(
+                                    "WhatsApp: message from {from} did not match mention patterns, dropping"
+                                );
+                                continue;
+                            }
                         }
                     };
 
@@ -590,6 +600,18 @@ impl Channel for WhatsAppChannel {
         prompt: &str,
         options: &[(String, String)],
     ) -> anyhow::Result<()> {
+        let trimmed_prompt = prompt.trim();
+        // No options → send the prompt as plain text (or no-op when both
+        // empty); never render a "(reply with name or number)" hint with
+        // nothing under it. Mirrors the trait default's empty guard.
+        if options.is_empty() {
+            if trimmed_prompt.is_empty() {
+                return Ok(());
+            }
+            return self
+                .send(&SendMessage::new(trimmed_prompt, recipient))
+                .await;
+        }
         // WhatsApp Cloud interactive: ≤ 3 buttons OR up to 10×10 list rows.
         // 1 option falls through to plain text — there's no UX win to a
         // single-button interactive message.
@@ -603,29 +625,52 @@ impl Channel for WhatsAppChannel {
                 .await;
         }
         if options.len() > 3 {
-            // Pack into a single section for the list message. Operators
-            // who want grouped sections should call send_interactive_list
-            // directly; this default flattens.
-            let rows: Vec<InteractiveListRow> = options
-                .iter()
-                .map(|(id, label)| InteractiveListRow {
-                    id: id.clone(),
-                    title: label.clone(),
-                    description: None,
+            // List messages: max 10 rows per section, max 10 sections per
+            // message → up to 100 options. Chunk into sections of ≤10 rows
+            // each so we don't blow past the per-section row cap. Section
+            // titles mark the index range so list UIs render cleanly.
+            const MAX_ROWS_PER_SECTION: usize = 10;
+            const MAX_SECTIONS: usize = 10;
+            let max_total = MAX_ROWS_PER_SECTION * MAX_SECTIONS;
+            if options.len() > max_total {
+                anyhow::bail!(
+                    "WhatsApp send_choice: {} options exceeds list cap ({}); split the prompt or call send_interactive_list directly",
+                    options.len(),
+                    max_total
+                );
+            }
+            let sections: Vec<InteractiveListSection> = options
+                .chunks(MAX_ROWS_PER_SECTION)
+                .enumerate()
+                .map(|(chunk_idx, chunk)| {
+                    let start = chunk_idx * MAX_ROWS_PER_SECTION + 1;
+                    let end = start + chunk.len() - 1;
+                    let title = if options.len() <= MAX_ROWS_PER_SECTION {
+                        "Options".to_string()
+                    } else {
+                        format!("Options {start}–{end}")
+                    };
+                    InteractiveListSection {
+                        title,
+                        rows: chunk
+                            .iter()
+                            .map(|(id, label)| InteractiveListRow {
+                                id: id.clone(),
+                                title: label.clone(),
+                                description: None,
+                            })
+                            .collect(),
+                    }
                 })
                 .collect();
-            let section = InteractiveListSection {
-                title: "Options".to_string(),
-                rows,
-            };
             return self
-                .send_interactive_list(recipient, prompt, "Choose", &[section])
+                .send_interactive_list(recipient, prompt, "Choose", &sections)
                 .await;
         }
-        // 0 or 1 options → defer to plain text.
+        // Exactly 1 option → defer to plain text. (Empty case handled above.)
         let mut text = String::new();
-        if !prompt.trim().is_empty() {
-            text.push_str(prompt.trim());
+        if !trimmed_prompt.is_empty() {
+            text.push_str(trimmed_prompt);
             text.push_str("\n\n");
         }
         text.push_str("(reply with name or number)\n");
@@ -2180,5 +2225,116 @@ mod tests {
             .lock()
             .await
             .remove("test_share_tok");
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Interactive reply parsing — button_reply / list_reply paths
+    // ══════════════════════════════════════════════════════════
+
+    fn interactive_reply_payload(
+        kind: &str,
+        id: &str,
+        title: &str,
+        from: &str,
+    ) -> serde_json::Value {
+        // WhatsApp Cloud API reply shape for `interactive.button_reply` and
+        // `interactive.list_reply`. Both nest the selected option under the
+        // type-specific key with `id` (callback_id) and `title` (label).
+        serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": from,
+                            "id": "wamid.interactive",
+                            "timestamp": "1700000000",
+                            "type": "interactive",
+                            "interactive": {
+                                "type": kind,
+                                kind: { "id": id, "title": title }
+                            }
+                        }]
+                    }
+                }]
+            }]
+        })
+    }
+
+    #[test]
+    fn whatsapp_parse_interactive_button_reply_emits_choice_sentinel() {
+        let ch = make_channel();
+        let payload = interactive_reply_payload(
+            "button_reply",
+            "cf:agent:librarian",
+            "Librarian",
+            "1234567890",
+        );
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[choice]cf:agent:librarian");
+        assert_eq!(msgs[0].sender, "+1234567890");
+        assert_eq!(msgs[0].channel, "whatsapp");
+    }
+
+    #[test]
+    fn whatsapp_parse_interactive_list_reply_emits_choice_sentinel() {
+        let ch = make_channel();
+        let payload =
+            interactive_reply_payload("list_reply", "cf:session:backend", "backend", "1234567890");
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[choice]cf:session:backend");
+    }
+
+    #[test]
+    fn whatsapp_parse_interactive_reply_missing_id_dropped() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "1234567890",
+                            "timestamp": "1",
+                            "type": "interactive",
+                            "interactive": {
+                                "type": "button_reply",
+                                "button_reply": { "title": "no id here" }
+                            }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(
+            msgs.is_empty(),
+            "interactive reply without id must be dropped, got: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn whatsapp_interactive_reply_bypasses_dm_mention_gating() {
+        // With dm_mention_patterns set, a freeform body without the trigger
+        // is dropped — but a [choice]<id> body produced by an interactive
+        // reply must be passed through, because the user already explicitly
+        // tapped a button the bot rendered.
+        let ch = WhatsAppChannel::new(
+            "tok".into(),
+            "123".into(),
+            "ver".into(),
+            vec!["+1234567890".into()],
+        )
+        .with_dm_mention_patterns(vec!["@?ZeroClaw".into()]);
+        let payload = interactive_reply_payload(
+            "button_reply",
+            "cf:agent:librarian",
+            "Librarian",
+            "1234567890",
+        );
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1, "[choice] body must bypass mention-gating");
+        assert_eq!(msgs[0].content, "[choice]cf:agent:librarian");
     }
 }
