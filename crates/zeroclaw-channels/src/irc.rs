@@ -992,7 +992,6 @@ mod tests {
         use zeroclaw_config::schema::IrcConfig;
 
         let config = IrcConfig {
-            enabled: true,
             server: "irc.example.com".into(),
             port: 6697,
             nickname: "zcbot".into(),

@@ -2975,7 +2975,6 @@ mod tests {
     fn lark_config_serde() {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
         let lc = LarkConfig {
-            enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -3000,7 +2999,6 @@ mod tests {
     fn lark_config_toml_roundtrip() {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
         let lc = LarkConfig {
-            enabled: true,
             app_id: "app".into(),
             app_secret: "secret".into(),
             encrypt_key: None,
@@ -3037,7 +3035,6 @@ mod tests {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
 
         let cfg = LarkConfig {
-            enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -3064,7 +3061,6 @@ mod tests {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
 
         let cfg = LarkConfig {
-            enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -3090,7 +3086,6 @@ mod tests {
         use zeroclaw_config::schema::{FeishuConfig, LarkReceiveMode};
 
         let cfg = FeishuConfig {
-            enabled: true,
             app_id: "cli_feishu_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -3115,7 +3110,6 @@ mod tests {
         use zeroclaw_config::schema::{FeishuConfig, LarkReceiveMode};
 
         let cfg_true = FeishuConfig {
-            enabled: true,
             app_id: "cli_feishu_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -3328,7 +3322,6 @@ mod tests {
         );
 
         let feishu_cfg = zeroclaw_config::schema::FeishuConfig {
-            enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,

@@ -3157,7 +3157,6 @@ mod tests {
 
         fn cfg(password: Option<&str>, user_id: Option<&str>) -> MatrixConfig {
             MatrixConfig {
-                enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: None,
                 user_id: user_id.map(String::from),

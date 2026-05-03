@@ -678,10 +678,13 @@ impl Default for DelegateToolConfig {
 // ── Delegate Agents ──────────────────────────────────────────────
 
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "delegate-agent"]
 pub struct DelegateAgentConfig {
+    /// Whether this agent is active. Set false to disable without removing the definition.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Optional system prompt. Deprecated in V3 — move content to `agents/<alias>/AGENTS.md`.
     #[serde(default)]
     pub system_prompt: Option<String>,
@@ -713,6 +716,24 @@ pub struct DelegateAgentConfig {
     /// V3: memory namespace alias. Empty string = no namespace isolation.
     #[serde(default)]
     pub memory_namespace: String,
+}
+
+impl Default for DelegateAgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            system_prompt: None,
+            channels: Vec::new(),
+            model_provider: String::new(),
+            model_provider_fallback: Vec::new(),
+            risk_profile: String::new(),
+            runtime_profile: String::new(),
+            skill_bundle: String::new(),
+            knowledge_bundle: String::new(),
+            mcp_bundle: String::new(),
+            memory_namespace: String::new(),
+        }
+    }
 }
 
 fn default_delegate_timeout_secs() -> u64 {
@@ -6889,38 +6910,6 @@ pub struct ChannelsConfig {
 }
 
 impl ChannelsConfig {
-    /// Backfill `enabled = true` for channel aliases present in the raw TOML
-    /// that don't have an explicit `enabled` key. After the V3 migration each
-    /// channel type is a table of aliases (`[channels.<type>.<alias>]`), so
-    /// we iterate two levels: type → alias → check/set enabled.
-    pub fn backfill_enabled(&mut self, raw_toml: &str) {
-        let mut table = match raw_toml.parse::<toml::Table>() {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-        crate::migration::prepare_table(&mut table);
-        let channels = match table.get("channels").and_then(|v| v.as_table()) {
-            Some(t) => t,
-            None => return,
-        };
-        for (ch_type, type_val) in channels {
-            let Some(aliases) = type_val.as_table() else {
-                continue;
-            };
-            for (alias, alias_val) in aliases {
-                if !alias_val
-                    .as_table()
-                    .is_some_and(|t| t.contains_key("enabled"))
-                {
-                    let prop_path = format!("channels.{ch_type}.{alias}.enabled");
-                    if let Err(e) = self.set_prop(&prop_path, "true") {
-                        tracing::warn!("backfill_enabled: failed to set {prop_path}: {e}");
-                    }
-                }
-            }
-        }
-    }
-
     /// get channels' metadata and whether the default alias is configured, except webhook
     #[rustfmt::skip]
     pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
@@ -7141,9 +7130,6 @@ fn default_matrix_draft_update_interval_ms() -> u64 {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.telegram"]
 pub struct TelegramConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Telegram Bot API token (from @BotFather).
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -7199,9 +7185,6 @@ impl ChannelConfig for TelegramConfig {
 #[prefix = "channels.discord"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct DiscordConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Discord bot token (from Discord Developer Portal).
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -7283,9 +7266,6 @@ impl ChannelConfig for DiscordConfig {
 #[prefix = "channels.slack"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SlackConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Slack bot OAuth token (xoxb-...).
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -7370,9 +7350,6 @@ impl ChannelConfig for SlackConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.mattermost"]
 pub struct MattermostConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Mattermost server URL (e.g. `"https://mattermost.example.com"`).
     pub url: String,
     /// Mattermost bot access token. When unset, the channel falls back to
@@ -7440,9 +7417,6 @@ impl ChannelConfig for MattermostConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.webhook"]
 pub struct WebhookConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Port to listen on for incoming webhooks.
     pub port: u16,
     /// URL path to listen on (default: `/webhook`).
@@ -7482,9 +7456,6 @@ impl ChannelConfig for WebhookConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.imessage"]
 pub struct IMessageConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Allowed iMessage contacts (phone numbers or email addresses). Empty = deny all.
     pub allowed_contacts: Vec<String>,
 
@@ -7508,9 +7479,6 @@ impl ChannelConfig for IMessageConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.matrix"]
 pub struct MatrixConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Matrix homeserver URL (e.g. `"https://matrix.org"`).
     pub homeserver: String,
     /// Matrix access token for the bot account. When unset, the channel
@@ -7591,9 +7559,6 @@ impl ChannelConfig for MatrixConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.signal"]
 pub struct SignalConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Base URL for the signal-cli HTTP daemon (e.g. `"http://127.0.0.1:8686"`).
     pub http_url: String,
     /// E.164 phone number of the signal-cli account (e.g. "+1234567890").
@@ -7680,9 +7645,6 @@ pub enum WhatsAppChatPolicy {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.whatsapp"]
 pub struct WhatsAppConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Access token from Meta Business Suite (Cloud API mode)
     #[serde(default)]
     #[secret]
@@ -7781,9 +7743,6 @@ impl ChannelConfig for WhatsAppConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.linq"]
 pub struct LinqConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Linq Partner API token (Bearer auth)
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -7819,9 +7778,6 @@ impl ChannelConfig for LinqConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.wati"]
 pub struct WatiConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// WATI API token (Bearer auth).
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -7864,9 +7820,6 @@ impl ChannelConfig for WatiConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.nextcloud-talk"]
 pub struct NextcloudTalkConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Nextcloud base URL (e.g. `"https://cloud.example.com"`).
     pub base_url: String,
     /// Bot app token used for OCS API bearer auth.
@@ -7948,9 +7901,6 @@ impl WhatsAppConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.mqtt"]
 pub struct MqttConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// MQTT broker URL (e.g., `mqtt://localhost:1883` or `mqtts://broker.example.com:8883`).
     /// Use `mqtt://` for plain connections or `mqtts://` for TLS.
     pub broker_url: String,
@@ -8061,9 +8011,6 @@ fn default_mqtt_keep_alive_secs() -> u64 {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.irc"]
 pub struct IrcConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// IRC server hostname
     pub server: String,
     /// IRC server port (default: 6697 for TLS)
@@ -8136,9 +8083,6 @@ pub enum LarkReceiveMode {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.lark"]
 pub struct LarkConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// App ID from Lark/Feishu developer console
     pub app_id: String,
     /// App Secret from Lark/Feishu developer console
@@ -8226,9 +8170,6 @@ pub enum LineGroupPolicy {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.line"]
 pub struct LineConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Long-lived channel access token (from LINE Developers Console).
     /// Used for both the Reply API and the Push API fallback.
     /// Falls back to the `LINE_CHANNEL_ACCESS_TOKEN` environment variable if empty.
@@ -8293,9 +8234,6 @@ impl ChannelConfig for LineConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.feishu"]
 pub struct FeishuConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// App ID from Feishu developer console
     pub app_id: String,
     /// App Secret from Feishu developer console
@@ -8869,9 +8807,6 @@ impl Default for AuditConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.dingtalk"]
 pub struct DingTalkConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Client ID (AppKey) from DingTalk developer console
     pub client_id: String,
     /// Client Secret (AppSecret) from DingTalk developer console
@@ -8906,9 +8841,6 @@ impl ChannelConfig for DingTalkConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.wecom"]
 pub struct WeComConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Webhook key from WeCom Bot configuration
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -8941,9 +8873,6 @@ impl ChannelConfig for WeComConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.wechat"]
 pub struct WeChatConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Allowed WeChat user IDs (e.g. `"xxx@im.wechat"`).
     /// `"*"` = allow all. Empty = require pairing (`/bind <code>` from WeChat);
     /// the QR-login user is auto-added at first connect.
@@ -8980,9 +8909,6 @@ impl ChannelConfig for WeChatConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.qq"]
 pub struct QQConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// App ID from QQ Bot developer console
     pub app_id: String,
     /// App Secret from QQ Bot developer console
@@ -9017,9 +8943,6 @@ impl ChannelConfig for QQConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.twitter"]
 pub struct TwitterConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Twitter API v2 Bearer Token (OAuth 2.0)
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -9048,9 +8971,6 @@ impl ChannelConfig for TwitterConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.mochat"]
 pub struct MochatConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Mochat API base URL
     pub api_url: String,
     /// Mochat API token
@@ -9088,9 +9008,6 @@ impl ChannelConfig for MochatConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.reddit"]
 pub struct RedditConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Reddit OAuth2 client ID.
     pub client_id: String,
     /// Reddit OAuth2 client secret.
@@ -9129,9 +9046,6 @@ impl ChannelConfig for RedditConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.bluesky"]
 pub struct BlueskyConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Bluesky handle (e.g. `"mybot.bsky.social"`).
     pub handle: String,
     /// App-specific password (from Bluesky settings).
@@ -9161,11 +9075,6 @@ impl ChannelConfig for BlueskyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct VoiceDuplexConfig {
-    /// Enable full-duplex voice event handling over WebSocket.
-    /// Default: false. When false, voice events are rejected as unknown types.
-    #[serde(default)]
-    pub enabled: bool,
-
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
@@ -9254,9 +9163,6 @@ impl ChannelConfig for VoiceWakeConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.nostr"]
 pub struct NostrConfig {
-    /// Whether this channel is active. Default: false.
-    #[serde(default)]
-    pub enabled: bool,
     /// Private key in hex or nsec bech32 format
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -10319,12 +10225,6 @@ impl Config {
             // add it to `always_ask`, which takes precedence over
             // `auto_approve` in the approval decision (see approval/mod.rs).
             config.autonomy.ensure_default_auto_approve();
-
-            // Backward-compatible `enabled` backfill: if a channel section
-            // exists in the TOML but has no explicit `enabled` key, the user
-            // configured it before `enabled` was introduced — treat it as
-            // enabled so existing setups don't silently break.
-            config.channels.backfill_enabled(&contents);
 
             // Detect unknown top-level config keys by comparing the raw
             // TOML table keys against what Config actually deserializes.
@@ -11967,7 +11867,6 @@ auto_save = true
                 telegram: HashMap::from([(
                     "default".to_string(),
                     TelegramConfig {
-                        enabled: true,
                         bot_token: "123:ABC".into(),
                         allowed_users: vec!["user1".into()],
                         stream_mode: StreamMode::default(),
@@ -12722,7 +12621,6 @@ default_temperature = 0.7
         config.channels.feishu.insert(
             "default".to_string(),
             FeishuConfig {
-                enabled: true,
                 app_id: "cli_feishu_123".into(),
                 app_secret: "feishu-secret".into(),
                 encrypt_key: Some("feishu-encrypt".into()),
@@ -12907,7 +12805,6 @@ default_temperature = 0.7
     #[test]
     async fn telegram_config_serde() {
         let tc = TelegramConfig {
-            enabled: true,
             bot_token: "123:XYZ".into(),
             allowed_users: vec!["alice".into(), "bob".into()],
             stream_mode: StreamMode::Partial,
@@ -12940,7 +12837,6 @@ default_temperature = 0.7
     #[test]
     async fn discord_config_serde() {
         let dc = DiscordConfig {
-            enabled: true,
             bot_token: "discord-token".into(),
             guild_ids: vec!["12345".into()],
             channel_ids: vec![],
@@ -12966,7 +12862,6 @@ default_temperature = 0.7
     #[test]
     async fn discord_config_empty_guild_ids() {
         let dc = DiscordConfig {
-            enabled: true,
             bot_token: "tok".into(),
             guild_ids: Vec::new(),
             channel_ids: vec![],
@@ -12993,7 +12888,6 @@ default_temperature = 0.7
     #[test]
     async fn imessage_config_serde() {
         let ic = IMessageConfig {
-            enabled: true,
             allowed_contacts: vec!["+1234567890".into(), "user@icloud.com".into()],
             excluded_tools: vec![],
         };
@@ -13006,7 +12900,6 @@ default_temperature = 0.7
     #[test]
     async fn imessage_config_empty_contacts() {
         let ic = IMessageConfig {
-            enabled: true,
             allowed_contacts: vec![],
             excluded_tools: vec![],
         };
@@ -13018,7 +12911,6 @@ default_temperature = 0.7
     #[test]
     async fn imessage_config_wildcard() {
         let ic = IMessageConfig {
-            enabled: true,
             allowed_contacts: vec!["*".into()],
             excluded_tools: vec![],
         };
@@ -13030,7 +12922,6 @@ default_temperature = 0.7
     #[test]
     async fn matrix_config_serde() {
         let mc = MatrixConfig {
-            enabled: true,
             homeserver: "https://matrix.org".into(),
             access_token: Some("syt_token_abc".into()),
             user_id: Some("@bot:matrix.org".into()),
@@ -13065,7 +12956,6 @@ default_temperature = 0.7
     #[test]
     async fn matrix_config_toml_roundtrip() {
         let mc = MatrixConfig {
-            enabled: true,
             homeserver: "https://synapse.local:8448".into(),
             access_token: Some("tok".into()),
             user_id: None,
@@ -13122,7 +13012,6 @@ allowed_users = ["@u:matrix.org"]
     #[test]
     async fn signal_config_serde() {
         let sc = SignalConfig {
-            enabled: true,
             http_url: "http://127.0.0.1:8686".into(),
             account: "+1234567890".into(),
             group_ids: vec!["group123".into()],
@@ -13148,7 +13037,6 @@ allowed_users = ["@u:matrix.org"]
     #[test]
     async fn signal_config_toml_roundtrip() {
         let sc = SignalConfig {
-            enabled: true,
             http_url: "http://localhost:8080".into(),
             account: "+9876543210".into(),
             group_ids: Vec::new(),
@@ -13192,7 +13080,6 @@ allowed_users = ["@u:matrix.org"]
             imessage: HashMap::from([(
                 "default".to_string(),
                 IMessageConfig {
-                    enabled: true,
                     allowed_contacts: vec!["+1".into()],
                     excluded_tools: vec![],
                 },
@@ -13200,7 +13087,6 @@ allowed_users = ["@u:matrix.org"]
             matrix: HashMap::from([(
                 "default".to_string(),
                 MatrixConfig {
-                    enabled: true,
                     homeserver: "https://m.org".into(),
                     access_token: Some("tok".into()),
                     user_id: None,
@@ -13436,7 +13322,6 @@ bot_token = "xoxb-tok"
     #[test]
     async fn whatsapp_config_serde() {
         let wc = WhatsAppConfig {
-            enabled: true,
             access_token: Some("EAABx...".into()),
             phone_number_id: Some("123456789".into()),
             verify_token: Some("my-verify-token".into()),
@@ -13467,7 +13352,6 @@ bot_token = "xoxb-tok"
     #[test]
     async fn whatsapp_config_toml_roundtrip() {
         let wc = WhatsAppConfig {
-            enabled: true,
             access_token: Some("tok".into()),
             phone_number_id: Some("12345".into()),
             verify_token: Some("verify".into()),
@@ -13503,7 +13387,6 @@ bot_token = "xoxb-tok"
     #[test]
     async fn whatsapp_config_wildcard_allowed() {
         let wc = WhatsAppConfig {
-            enabled: true,
             access_token: Some("tok".into()),
             phone_number_id: Some("123".into()),
             verify_token: Some("ver".into()),
@@ -13531,7 +13414,6 @@ bot_token = "xoxb-tok"
     #[test]
     async fn whatsapp_config_backend_type_cloud_precedence_when_ambiguous() {
         let wc = WhatsAppConfig {
-            enabled: true,
             access_token: Some("tok".into()),
             phone_number_id: Some("123".into()),
             verify_token: Some("ver".into()),
@@ -13558,7 +13440,6 @@ bot_token = "xoxb-tok"
     #[test]
     async fn whatsapp_config_backend_type_web() {
         let wc = WhatsAppConfig {
-            enabled: true,
             access_token: None,
             phone_number_id: None,
             verify_token: None,
@@ -13597,7 +13478,6 @@ bot_token = "xoxb-tok"
             whatsapp: HashMap::from([(
                 "default".to_string(),
                 WhatsAppConfig {
-                    enabled: true,
                     access_token: Some("tok".into()),
                     phone_number_id: Some("123".into()),
                     verify_token: Some("ver".into()),
@@ -14576,7 +14456,6 @@ default_model = "legacy-model"
         config.channels.feishu.insert(
             "default".to_string(),
             FeishuConfig {
-                enabled: true,
                 app_id: "cli_feishu_123".into(),
                 app_secret: "feishu-secret".into(),
                 encrypt_key: Some("feishu-encrypt".into()),
@@ -15089,7 +14968,6 @@ default_model = "persisted-profile"
     #[test]
     async fn lark_config_serde() {
         let lc = LarkConfig {
-            enabled: true,
             app_id: "cli_123456".into(),
             app_secret: "secret_abc".into(),
             encrypt_key: Some("encrypt_key".into()),
@@ -15115,7 +14993,6 @@ default_model = "persisted-profile"
     #[test]
     async fn lark_config_toml_roundtrip() {
         let lc = LarkConfig {
-            enabled: true,
             app_id: "cli_123456".into(),
             app_secret: "secret_abc".into(),
             encrypt_key: Some("encrypt_key".into()),
@@ -15166,7 +15043,6 @@ default_model = "persisted-profile"
     #[test]
     async fn feishu_config_serde() {
         let fc = FeishuConfig {
-            enabled: true,
             app_id: "cli_feishu_123".into(),
             app_secret: "secret_abc".into(),
             encrypt_key: Some("encrypt_key".into()),
@@ -15190,7 +15066,6 @@ default_model = "persisted-profile"
     #[test]
     async fn feishu_config_toml_roundtrip() {
         let fc = FeishuConfig {
-            enabled: true,
             app_id: "cli_feishu_123".into(),
             app_secret: "secret_abc".into(),
             encrypt_key: Some("encrypt_key".into()),
@@ -15242,7 +15117,6 @@ webhook_port = 8443
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let ln = config.channels.line.get("default").unwrap();
-        assert!(ln.enabled);
         assert_eq!(ln.channel_access_token, "ChannelAccessToken==");
         assert_eq!(ln.channel_secret, "abc123secret");
         assert_eq!(ln.dm_policy, LineDmPolicy::Pairing);
@@ -15262,7 +15136,6 @@ channel_secret = "sec"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let ln = config.channels.line.get("default").unwrap();
-        assert!(!ln.enabled, "enabled should default to false");
         assert_eq!(
             ln.dm_policy,
             LineDmPolicy::Pairing,
@@ -15327,7 +15200,6 @@ group_policy = "disabled"
     #[test]
     async fn nextcloud_talk_config_serde() {
         let nc = NextcloudTalkConfig {
-            enabled: true,
             base_url: "https://cloud.example.com".into(),
             app_token: "app-token".into(),
             webhook_secret: Some("webhook-secret".into()),
@@ -15571,7 +15443,6 @@ require_otp_to_resume = true
         config.channels.telegram.insert(
             "default".to_string(),
             TelegramConfig {
-                enabled: true,
                 bot_token: plaintext_token.into(),
                 allowed_users: vec!["user1".into()],
                 stream_mode: StreamMode::default(),
@@ -16471,7 +16342,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn matrix_secret_fields_discovered() {
         let mx = MatrixConfig {
-            enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("tok".into()),
             user_id: None,
@@ -16504,7 +16374,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn matrix_secret_fields_empty_not_set() {
         let mx = MatrixConfig {
-            enabled: true,
             homeserver: "https://m.org".into(),
             access_token: None,
             user_id: None,
@@ -16530,7 +16399,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn set_secret_updates_field() {
         let mut mx = MatrixConfig {
-            enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("old".into()),
             user_id: None,
@@ -16557,7 +16425,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn set_secret_unknown_name_fails() {
         let mut mx = MatrixConfig {
-            enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("tok".into()),
             user_id: None,
@@ -16600,7 +16467,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix.insert(
             "default".to_string(),
             MatrixConfig {
-                enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: Some("mx-tok".into()),
                 user_id: None,
@@ -16633,7 +16499,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix.insert(
             "default".to_string(),
             MatrixConfig {
-                enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: Some("old".into()),
                 user_id: None,
@@ -16675,7 +16540,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix.insert(
             "default".to_string(),
             MatrixConfig {
-                enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: Some("old".into()),
                 user_id: None,
@@ -16726,7 +16590,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let store = crate::secrets::SecretStore::new(dir.path(), true);
 
         let mut mx = MatrixConfig {
-            enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("plaintext-token".into()),
             user_id: None,
@@ -16764,7 +16627,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let store = crate::secrets::SecretStore::new(dir.path(), true);
 
         let mut mx = MatrixConfig {
-            enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("plaintext-token".into()),
             user_id: None,
@@ -16798,7 +16660,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let store = crate::secrets::SecretStore::new(dir.path(), false);
 
         let mut mx = MatrixConfig {
-            enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("plaintext-token".into()),
             user_id: None,
@@ -16827,7 +16688,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     fn test_matrix_config() -> MatrixConfig {
         MatrixConfig {
-            enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("tok".into()),
             user_id: Some("@bot:m.org".into()),
@@ -16854,13 +16714,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let fields = mx.prop_fields();
         let by_name: std::collections::HashMap<&str, &crate::traits::PropFieldInfo> =
             fields.iter().map(|f| (f.name.as_str(), f)).collect();
-
-        // Bool field
-        let enabled = by_name["channels.matrix.enabled"];
-        assert_eq!(enabled.type_hint, "bool");
-        assert_eq!(enabled.display_value, "true");
-        assert!(!enabled.is_secret);
-        assert!(!enabled.is_enum());
 
         // String field
         let homeserver = by_name["channels.matrix.homeserver"];
@@ -16905,7 +16758,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mx.get_prop("channels.matrix.homeserver").unwrap(),
             "https://m.org"
         );
-        assert_eq!(mx.get_prop("channels.matrix.enabled").unwrap(), "true");
         assert_eq!(
             mx.get_prop("channels.matrix.draft-update-interval-ms")
                 .unwrap(),
@@ -16948,7 +16800,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn set_prop_bool_rejects_invalid() {
         let mut mx = test_matrix_config();
-        let err = mx.set_prop("channels.matrix.enabled", "yes").unwrap_err();
+        let err = mx
+            .set_prop("channels.matrix.interrupt-on-new-message", "yes")
+            .unwrap_err();
         assert!(err.to_string().contains("bool"));
     }
 
@@ -17013,7 +16867,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert!(MatrixConfig::prop_is_secret("channels.matrix.access-token"));
         assert!(MatrixConfig::prop_is_secret("channels.matrix.recovery-key"));
         assert!(!MatrixConfig::prop_is_secret("channels.matrix.homeserver"));
-        assert!(!MatrixConfig::prop_is_secret("channels.matrix.enabled"));
+        assert!(!MatrixConfig::prop_is_secret(
+            "channels.matrix.interrupt-on-new-message"
+        ));
     }
 
     #[test]
@@ -17448,125 +17304,51 @@ allowed_users = []
     }
 
     #[test]
-    async fn backfill_enabled_activates_channel_without_explicit_enabled() {
-        let toml = r#"
-[channels.matrix.default]
-homeserver = "https://matrix.org"
-access_token = "tok"
-allowed_rooms = ["!r:m"]
-allowed_users = ["@u:m"]
-"#;
-        let mut config: Config = toml::from_str(toml).unwrap();
-        assert!(!config.channels.matrix.get("default").unwrap().enabled);
-
-        config.channels.backfill_enabled(toml);
-        assert!(config.channels.matrix.get("default").unwrap().enabled);
-    }
-
-    #[test]
-    async fn backfill_enabled_respects_explicit_false() {
-        let toml = r#"
-[channels.matrix.default]
-homeserver = "https://matrix.org"
-access_token = "tok"
-allowed_rooms = ["!r:m"]
-allowed_users = ["@u:m"]
-enabled = false
-"#;
-        let mut config: Config = toml::from_str(toml).unwrap();
-        config.channels.backfill_enabled(toml);
-        assert!(
-            !config.channels.matrix.get("default").unwrap().enabled,
-            "explicit enabled=false must not be overwritten"
-        );
-    }
-
-    #[test]
-    async fn backfill_enabled_no_op_when_section_absent() {
-        let toml = r#"
-api_key = "sk-test"
-"#;
-        let mut config: Config = toml::from_str(toml).unwrap();
-        config.channels.backfill_enabled(toml);
-        assert!(config.channels.telegram.is_empty());
-    }
-
-    #[test]
-    async fn backfill_enabled_works_with_toml_comments() {
-        let toml = r#"
-# My matrix setup
-[channels.matrix.default]
-homeserver = "https://matrix.org"  # production server
-access_token = "tok"
-allowed_rooms = ["!r:m"]
-allowed_users = ["@u:m"]
-# enabled intentionally omitted
-"#;
-        let mut config: Config = toml::from_str(toml).unwrap();
-        assert!(!config.channels.matrix.get("default").unwrap().enabled);
-
-        config.channels.backfill_enabled(toml);
-        assert!(
-            config.channels.matrix.get("default").unwrap().enabled,
-            "backfill should activate channel even when config has comments"
-        );
-    }
-
-    #[test]
     async fn channel_approval_timeout_secs_defaults_to_300() {
-        // Omitting approval_timeout_secs from each config should deserialize to 300
-        let discord: DiscordConfig =
-            serde_json::from_str(r#"{"bot_token":"tok","enabled":true}"#).unwrap();
+        let discord: DiscordConfig = serde_json::from_str(r#"{"bot_token":"tok"}"#).unwrap();
         assert_eq!(discord.approval_timeout_secs, 300);
 
-        let slack: SlackConfig =
-            serde_json::from_str(r#"{"bot_token":"tok","enabled":true}"#).unwrap();
+        let slack: SlackConfig = serde_json::from_str(r#"{"bot_token":"tok"}"#).unwrap();
         assert_eq!(slack.approval_timeout_secs, 300);
 
-        let signal: SignalConfig = serde_json::from_str(
-            r#"{"http_url":"http://localhost","account":"+1","enabled":true}"#,
-        )
-        .unwrap();
+        let signal: SignalConfig =
+            serde_json::from_str(r#"{"http_url":"http://localhost","account":"+1"}"#).unwrap();
         assert_eq!(signal.approval_timeout_secs, 300);
 
         let matrix: MatrixConfig = serde_json::from_str(
-            r#"{"homeserver":"https://matrix.org","access_token":"tok","enabled":true,"allowed_users":[]}"#,
+            r#"{"homeserver":"https://matrix.org","access_token":"tok","allowed_users":[]}"#,
         )
         .unwrap();
         assert_eq!(matrix.approval_timeout_secs, 300);
 
-        let whatsapp: WhatsAppConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        let whatsapp: WhatsAppConfig = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 300);
     }
 
     #[test]
     async fn channel_approval_timeout_secs_explicit_override() {
-        let discord: DiscordConfig = serde_json::from_str(
-            r#"{"bot_token":"tok","enabled":true,"approval_timeout_secs":60}"#,
-        )
-        .unwrap();
+        let discord: DiscordConfig =
+            serde_json::from_str(r#"{"bot_token":"tok","approval_timeout_secs":60}"#).unwrap();
         assert_eq!(discord.approval_timeout_secs, 60);
 
-        let slack: SlackConfig = serde_json::from_str(
-            r#"{"bot_token":"tok","enabled":true,"approval_timeout_secs":120}"#,
-        )
-        .unwrap();
+        let slack: SlackConfig =
+            serde_json::from_str(r#"{"bot_token":"tok","approval_timeout_secs":120}"#).unwrap();
         assert_eq!(slack.approval_timeout_secs, 120);
 
         let signal: SignalConfig = serde_json::from_str(
-            r#"{"http_url":"http://localhost","account":"+1","enabled":true,"approval_timeout_secs":90}"#,
+            r#"{"http_url":"http://localhost","account":"+1","approval_timeout_secs":90}"#,
         )
         .unwrap();
         assert_eq!(signal.approval_timeout_secs, 90);
 
         let matrix: MatrixConfig = serde_json::from_str(
-            r#"{"homeserver":"https://matrix.org","access_token":"tok","enabled":true,"allowed_users":[],"approval_timeout_secs":45}"#,
+            r#"{"homeserver":"https://matrix.org","access_token":"tok","allowed_users":[],"approval_timeout_secs":45}"#,
         )
         .unwrap();
         assert_eq!(matrix.approval_timeout_secs, 45);
 
         let whatsapp: WhatsAppConfig =
-            serde_json::from_str(r#"{"enabled":true,"approval_timeout_secs":180}"#).unwrap();
+            serde_json::from_str(r#"{"approval_timeout_secs":180}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 180);
     }
 }

@@ -342,7 +342,6 @@ mod tests {
 
     fn test_config() -> ClawdTalkConfig {
         ClawdTalkConfig {
-            enabled: true,
             api_key: "test-key".to_string(),
             connection_id: "test-connection".to_string(),
             from_number: "+15551234567".to_string(),

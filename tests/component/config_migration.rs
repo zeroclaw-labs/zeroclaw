@@ -229,9 +229,9 @@ fn migrate_file_returns_none_when_current() {
 schema_version = 3
 
 [providers]
-fallback = "openrouter"
+fallback = ["openrouter.default"]
 
-[providers.models.openrouter]
+[providers.models.openrouter.default]
 api_key = "sk-test"
 "#;
     assert!(migration::migrate_file(raw).unwrap().is_none());
@@ -798,7 +798,7 @@ output = 0.6
 fn pricing_lives_on_model_provider_config() {
     let config = migrate(
         r#"
-schema_version = 3
+schema_version = 2
 
 [providers]
 fallback = "openrouter"
@@ -818,7 +818,7 @@ pricing = { opus = 15.0, sonnet = 3.0 }
 fn pricing_split_dimensions() {
     let config = migrate(
         r#"
-schema_version = 3
+schema_version = 2
 
 [providers]
 fallback = "anthropic"
@@ -838,7 +838,7 @@ pricing = { "opus.input" = 15.0, "opus.output" = 75.0 }
 fn pricing_validation_rejects_negative() {
     let config = migrate(
         r#"
-schema_version = 3
+schema_version = 2
 
 [providers]
 fallback = "openrouter"
@@ -864,10 +864,10 @@ pricing = { opus = -1.0 }
 
 #[test]
 fn already_v3_channel_plurality_unchanged() {
-    // A config already at V3 with the new shapes should round-trip cleanly.
+    // A V2 config using V3 field names (plurals) round-trips cleanly through migration.
     let config = migrate(
         r#"
-schema_version = 3
+schema_version = 2
 
 [channels.mattermost]
 url = "https://mm.example.com"
@@ -1130,7 +1130,6 @@ allowed_users = ["alice"]
         .telegram
         .get("default")
         .expect("default alias present");
-    assert!(tg.enabled);
     assert_eq!(tg.bot_token, "123:ABC");
     assert_eq!(tg.allowed_users, vec!["alice"]);
 }
@@ -1197,7 +1196,6 @@ guild_id = "12345"
         .discord
         .get("default")
         .expect("default alias present");
-    assert!(dc.enabled);
     assert_eq!(dc.bot_token, "discord-tok");
 }
 
@@ -1231,7 +1229,7 @@ members = ["agent-a", "agent-b"]
 fn v2_flat_provider_wrapped_under_default_alias() {
     let config = migrate(
         r#"
-schema_version = 3
+schema_version = 2
 
 [providers]
 fallback = "anthropic"
@@ -1289,7 +1287,7 @@ api_key = "sk-or"
 fn agent_provider_synthesised_into_model_provider_alias() {
     let config = migrate(
         r#"
-schema_version = 3
+schema_version = 2
 
 [providers]
 fallback = "anthropic"
@@ -1314,7 +1312,7 @@ provider = "anthropic"
 fn agent_with_unique_model_gets_per_agent_provider_alias() {
     let config = migrate(
         r#"
-schema_version = 3
+schema_version = 2
 
 [providers]
 fallback = "anthropic"
@@ -2179,6 +2177,50 @@ fn fixture_v3_has_aliased_channels() {
         out.contains("[channels.matrix.default]"),
         "V3 should have aliased matrix channel"
     );
+}
+
+#[test]
+fn fixture_v3_has_agent_per_enabled_channel() {
+    let out = generate(3);
+    // All 7 channels in v1.toml have enabled = true; migration synthesizes one agent per channel
+    for ch_type in &[
+        "discord",
+        "matrix",
+        "mattermost",
+        "reddit",
+        "signal",
+        "slack",
+        "telegram",
+    ] {
+        assert!(
+            out.contains(&format!("[agents.{ch_type}-default]")),
+            "V3 should have synthesized agent agents.{ch_type}-default"
+        );
+        assert!(
+            out.contains(&format!("channels = [\"{ch_type}.default\"]")),
+            "Synthesized agent for {ch_type} should reference {ch_type}.default"
+        );
+    }
+}
+
+#[test]
+fn fixture_v3_channel_configs_have_no_enabled_field() {
+    let out = generate(3);
+    let lines: Vec<&str> = out.lines().collect();
+    let mut in_channel_section = false;
+    for line in &lines {
+        if line.starts_with("[channels.") {
+            in_channel_section = true;
+        } else if line.starts_with('[') {
+            in_channel_section = false;
+        }
+        if in_channel_section {
+            assert!(
+                !line.trim_start().starts_with("enabled ="),
+                "Channel config should not contain enabled field: {line}"
+            );
+        }
+    }
 }
 
 #[test]

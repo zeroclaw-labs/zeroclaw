@@ -737,13 +737,21 @@ pub async fn run_gateway(
             })
             .map(Arc::from);
 
-    // Gmail Push channel (if configured and enabled)
-    let gmail_push_channel: Option<Arc<GmailPushChannel>> = config
-        .channels
-        .gmail_push
-        .get("default")
-        .filter(|gp| gp.enabled)
-        .map(|gp| Arc::new(GmailPushChannel::new(gp.clone())));
+    // Gmail Push channel (if configured and referenced by an enabled agent)
+    let gmail_push_channel: Option<Arc<GmailPushChannel>> = {
+        let active: std::collections::HashSet<String> = config
+            .agents
+            .values()
+            .filter(|a| a.enabled)
+            .flat_map(|a| a.channels.iter().cloned())
+            .collect();
+        config
+            .channels
+            .gmail_push
+            .iter()
+            .find(|(alias, _)| active.contains(&format!("gmail_push.{alias}")))
+            .map(|(_, gp)| Arc::new(GmailPushChannel::new(gp.clone())))
+    };
 
     // ── Session persistence for WS chat ─────────────────────
     let session_backend: Option<Arc<dyn SessionBackend>> = if config.gateway.session_persistence {

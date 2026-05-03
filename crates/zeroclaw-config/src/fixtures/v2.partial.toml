@@ -19,3 +19,24 @@ auth_token = "gateway-token-example"
 [cost]
 budget_cents_per_day = 1000
 alert_threshold_pct = 80
+
+[channels_config.discord]
+enabled = true
+
+[channels_config.matrix]
+enabled = true
+
+[channels_config.mattermost]
+enabled = true
+
+[channels_config.reddit]
+enabled = true
+
+[channels_config.signal]
+enabled = true
+
+[channels_config.slack]
+enabled = true
+
+[channels_config.telegram]
+enabled = true

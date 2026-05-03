@@ -279,7 +279,7 @@ const HIDDEN_TOP_LEVEL: &[&str] = &["schema-version", "onboard-state"];
 /// Sections whose picker semantics are non-generic and live in the
 /// per-section dispatch in `handle_section_picker` (catalog of providers,
 /// memory backend list, tunnel-with-none, channel sub-table walk).
-const SECTIONS_WITH_PICKER: &[&str] = &["providers", "channels", "memory", "tunnel"];
+const SECTIONS_WITH_PICKER: &[&str] = &["providers", "channels", "memory", "tunnel", "agents"];
 
 /// Humanize a section key for display (`google_workspace` → `Google workspace`).
 /// Keeps things simple and predictable; specific wording overrides go in
@@ -304,7 +304,9 @@ fn section_group(key: &str) -> &'static str {
         // The 6 foundation sections (TUI's `Section` enum) — every install
         // touches these. Named for the role they play, not for the wizard
         // that happens to walk them on first run.
-        "workspace" | "providers" | "channels" | "memory" | "hardware" | "tunnel" => "Foundation",
+        "workspace" | "providers" | "channels" | "memory" | "hardware" | "tunnel" | "agents" => {
+            "Foundation"
+        }
         // Agent loop, scheduling, and orchestration.
         "agent"
         | "autonomy"
@@ -321,7 +323,7 @@ fn section_group(key: &str) -> &'static str {
         | "sop"
         | "verifiable_intent" => "Agent",
         // Multi-agent / delegation.
-        "agents" | "swarms" | "delegate" => "Multi-agent",
+        "swarms" | "delegate" => "Multi-agent",
         // Tool integrations.
         "browser" | "browser_delegate" | "http_request" | "image_gen" | "knowledge"
         | "link_enricher" | "mcp" | "media_pipeline" | "multimodal" | "plugins"
@@ -437,6 +439,7 @@ pub async fn handle_section_picker(
             schema_walk_picker_with_none(&cfg, "tunnel", "tunnel.provider"),
             section_help("tunnel").to_string(),
         ),
+        "agents" => (agents_picker(&cfg), section_help("agents").to_string()),
         other => {
             return error_response(
                 ConfigApiError::new(
@@ -531,18 +534,10 @@ fn schema_walk_picker(cfg: &zeroclaw_config::schema::Config, section: &str) -> V
 
     all.into_iter()
         .map(|name| {
-            // Two-tier badge: `configured` = a block exists on disk for this
-            // item (auto-created on click + persisted). `active` = the block
-            // exists AND its `enabled` field is currently `true`. Items
-            // without an `enabled` field stay at `configured`. Surfaces the
-            // "is this actually doing anything?" distinction the contributor
-            // feedback on PR #6179 asked for, without changing init-on-click
-            // semantics (the macro-level fix lands in schema v3 / #5947).
-            let enabled_path = format!("{prefix_with_dot}{name}.enabled");
-            let is_active = cfg.get_prop(&enabled_path).ok().as_deref() == Some("true");
-            let badge = if is_active {
-                Some("active".to_string())
-            } else if configured.contains(&name) {
+            // V3: channel configs no longer carry an `enabled` field; a channel is
+            // active when an enabled agent references it. Badge = "configured" when
+            // at least one alias exists, absent otherwise.
+            let badge = if configured.contains(&name) {
                 Some("configured".to_string())
             } else {
                 None
@@ -555,6 +550,27 @@ fn schema_walk_picker(cfg: &zeroclaw_config::schema::Config, section: &str) -> V
             }
         })
         .collect()
+}
+
+/// Agents picker: walks `cfg.agents` and returns each alias with an activity badge.
+/// `active` = agent exists and `enabled = true`; `configured` = exists but disabled.
+fn agents_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
+    let mut items: Vec<PickerItem> = cfg
+        .agents
+        .iter()
+        .map(|(alias, agent)| PickerItem {
+            key: alias.clone(),
+            label: alias.clone(),
+            description: None,
+            badge: if agent.enabled {
+                Some("active".to_string())
+            } else {
+                Some("configured".to_string())
+            },
+        })
+        .collect();
+    items.sort_by(|a, b| a.key.cmp(&b.key));
+    items
 }
 
 /// `tunnel`-flavored picker: same as `schema_walk_picker` plus a synthetic

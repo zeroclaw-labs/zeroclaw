@@ -70,7 +70,6 @@ mod tests {
     #[test]
     fn reexported_channel_configs_are_constructible() {
         let telegram = TelegramConfig {
-            enabled: true,
             bot_token: "token".into(),
             allowed_users: vec!["alice".into()],
             stream_mode: StreamMode::default(),
@@ -84,7 +83,6 @@ mod tests {
         };
 
         let discord = DiscordConfig {
-            enabled: true,
             bot_token: "token".into(),
             guild_ids: vec!["123".into()],
             channel_ids: vec![],
@@ -103,7 +101,6 @@ mod tests {
         };
 
         let lark = LarkConfig {
-            enabled: true,
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             encrypt_key: None,
@@ -117,7 +114,6 @@ mod tests {
             excluded_tools: vec![],
         };
         let feishu = FeishuConfig {
-            enabled: true,
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             encrypt_key: None,
@@ -131,7 +127,6 @@ mod tests {
         };
 
         let nextcloud_talk = NextcloudTalkConfig {
-            enabled: true,
             base_url: "https://cloud.example.com".into(),
             app_token: "app-token".into(),
             webhook_secret: None,

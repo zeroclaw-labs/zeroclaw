@@ -235,7 +235,6 @@ retention_days = 90
 
 [channels_config.discord]
 bot_token = "discord-bot-token-example"
-enabled = true
 guild_id = "111111111111111111"
 interrupt_on_new_message = true
 mention_only = true
@@ -243,7 +242,6 @@ proxy_url = "http://proxy.example.com:3128"
 
 [channels_config.matrix]
 allowed_users = ["@admin:example.org"]
-enabled = true
 homeserver = "https://matrix.example.org"
 interrupt_on_new_message = true
 mention_only = false
@@ -255,7 +253,6 @@ user_id = "@bot:example.org"
 allowed_users = ["mm-user-example"]
 bot_token = "mm-token-example"
 channel_id = "mm-channel-example"
-enabled = true
 mention_only = false
 proxy_url = "http://proxy.example.com:3128"
 url = "https://mattermost.example.org"
@@ -263,7 +260,6 @@ url = "https://mattermost.example.org"
 [channels_config.reddit]
 client_id = "reddit-client-id"
 client_secret = "reddit-client-secret"
-enabled = true
 refresh_token = "reddit-refresh-token"
 subreddit = "example"
 username = "mybot"
@@ -271,7 +267,6 @@ username = "mybot"
 [channels_config.signal]
 account = "+15550000000"
 allowed_from = ["+15550000001"]
-enabled = true
 group_id = "signal-group-id-example"
 http_url = "http://localhost:8080"
 proxy_url = "http://proxy.example.com:3128"
@@ -282,7 +277,6 @@ app_token = "xapp-example"
 bot_token = "xoxb-example"
 cancel_reaction = "x"
 channel_id = "C0EXAMPLE1"
-enabled = true
 mention_only = false
 proxy_url = "http://proxy.example.com:3128"
 thread_replies = true
@@ -291,6 +285,5 @@ thread_replies = true
 ack_reactions = true
 allowed_users = ["123456789"]
 bot_token = "telegram-bot-token-example"
-enabled = true
 mention_only = false
 proxy_url = "http://proxy.example.com:3128"

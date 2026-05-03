@@ -207,27 +207,35 @@ pub async fn run(
         tracing::info!("Channels subsystem not wired; channel supervisor disabled");
     }
 
-    // Wire up MQTT SOP listener if configured and enabled
+    // Wire up MQTT SOP listener if configured and referenced by an enabled agent
     if let Some(mqtt_start) = subsystems.mqtt_start {
-        if let Some(mqtt_config) = config.channels.mqtt.get("default") {
-            if mqtt_config.enabled {
-                let mqtt_cfg = mqtt_config.clone();
-                let mqtt_start = std::sync::Arc::new(mqtt_start);
-                handles.push(spawn_component_supervisor(
-                    "mqtt",
-                    initial_backoff,
-                    max_backoff,
-                    move || {
-                        let cfg = mqtt_cfg.clone();
-                        let start = mqtt_start.clone();
-                        async move { start(cfg).await }
-                    },
-                ));
-            } else {
-                tracing::info!("MQTT channel configured but disabled (enabled = false)");
-                crate::health::mark_component_ok("mqtt");
+        let active_mqtt: std::collections::HashSet<String> = config
+            .agents
+            .values()
+            .filter(|a| a.enabled)
+            .flat_map(|a| a.channels.iter().cloned())
+            .collect();
+        let mut mqtt_started = false;
+        for (alias, mqtt_config) in &config.channels.mqtt {
+            if !active_mqtt.contains(&format!("mqtt.{alias}")) {
+                continue;
             }
-        } else {
+            let mqtt_cfg = mqtt_config.clone();
+            let mqtt_start = std::sync::Arc::new(mqtt_start);
+            handles.push(spawn_component_supervisor(
+                "mqtt",
+                initial_backoff,
+                max_backoff,
+                move || {
+                    let cfg = mqtt_cfg.clone();
+                    let start = mqtt_start.clone();
+                    async move { start(cfg).await }
+                },
+            ));
+            mqtt_started = true;
+            break;
+        }
+        if !mqtt_started {
             crate::health::mark_component_ok("mqtt");
         }
     } else {
@@ -1107,7 +1115,6 @@ mod tests {
         config.channels.telegram.insert(
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
-                enabled: true,
                 bot_token: "token".into(),
                 allowed_users: vec![],
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
@@ -1129,7 +1136,6 @@ mod tests {
         config.channels.dingtalk.insert(
             "default".to_string(),
             zeroclaw_config::schema::DingTalkConfig {
-                enabled: true,
                 client_id: "client_id".into(),
                 client_secret: "client_secret".into(),
                 allowed_users: vec!["*".into()],
@@ -1146,7 +1152,6 @@ mod tests {
         config.channels.mattermost.insert(
             "default".to_string(),
             zeroclaw_config::schema::MattermostConfig {
-                enabled: true,
                 url: "https://mattermost.example.com".into(),
                 bot_token: Some("token".into()),
                 login_id: None,
@@ -1169,7 +1174,6 @@ mod tests {
         config.channels.qq.insert(
             "default".to_string(),
             zeroclaw_config::schema::QQConfig {
-                enabled: true,
                 app_id: "app-id".into(),
                 app_secret: "app-secret".into(),
                 allowed_users: vec!["*".into()],
@@ -1186,7 +1190,6 @@ mod tests {
         config.channels.nextcloud_talk.insert(
             "default".to_string(),
             zeroclaw_config::schema::NextcloudTalkConfig {
-                enabled: true,
                 base_url: "https://cloud.example.com".into(),
                 app_token: "app-token".into(),
                 webhook_secret: None,
@@ -1205,7 +1208,6 @@ mod tests {
         config.channels.webhook.insert(
             "default".to_string(),
             zeroclaw_config::schema::WebhookConfig {
-                enabled: true,
                 port: 8080,
                 listen_path: None,
                 send_url: None,
@@ -1279,7 +1281,6 @@ mod tests {
         config.channels.telegram.insert(
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
-                enabled: true,
                 bot_token: "bot-token".into(),
                 allowed_users: vec![],
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
@@ -1303,7 +1304,6 @@ mod tests {
         config.channels.telegram.insert(
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
-                enabled: true,
                 bot_token: "bot-token".into(),
                 allowed_users: vec!["user123".into()],
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),

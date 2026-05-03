@@ -13,8 +13,9 @@
 //! ## How to add a new migration step
 //!
 //! 1. Bump [`CURRENT_SCHEMA_VERSION`].
-//! 2. Add structural TOML-level rewrites to `prepare_table()` (shape changes that
-//!    must happen before serde deserialization).
+//! 2. Add structural TOML-level rewrites to the appropriate `v{N}_to_v{M}_table()`
+//!    function (shape changes that must happen before serde deserialization).
+//!    `prepare_table()` dispatches to these based on `schema_version`.
 //! 3. Add a `fn vN_to_vM(config: &mut Config)` for any in-memory work that can
 //!    only run after deserialization, and gate it in `into_config()` on `from < M`.
 //!    V1 fields are the exception — they live on `V1Compat` and are handled by
@@ -351,6 +352,11 @@ impl V1Compat {
         if self.config.providers.embedding_routes.is_empty() && !self.embedding_routes.is_empty() {
             self.config.providers.embedding_routes = std::mem::take(&mut self.embedding_routes);
         }
+
+        // Populate providers.fallback so v2_to_v3() can normalize it to a dotted alias ref.
+        if !self.config.providers.fallback.contains(&fallback) {
+            self.config.providers.fallback.push(fallback);
+        }
     }
 }
 
@@ -431,15 +437,40 @@ fn is_flat_provider_config(t: &toml::Table) -> bool {
 
 /// V2 → V3 in-memory migration. TOML-level transforms run in `prepare_table`
 /// before deserialization; add post-deserialization work here as needed.
-fn v2_to_v3(_config: &mut super::schema::Config) {}
+fn v2_to_v3(config: &mut super::schema::Config) {
+    // Normalize providers.fallback entries from bare type names ("myprovider")
+    // to dotted type.alias refs ("myprovider.default") as required by V3.
+    for entry in &mut config.providers.fallback {
+        if !entry.contains('.') {
+            *entry = format!("{entry}.default");
+        }
+    }
+}
 
-/// Pre-deserialization table migration for nested field changes that
-/// `#[serde(flatten)]` cannot capture (e.g. removing a field from a nested
-/// struct and moving its value elsewhere).
+/// Pre-deserialization table migration dispatcher.
 ///
-/// Called on the raw `toml::Table` before it is deserialized into `V1Compat`.
+/// Reads `schema_version` from the raw table and calls only the transforms
+/// needed to bring it up to the current schema. Each version function is
+/// responsible for all TOML-level shape changes between those two versions.
+/// Called before deserialization into `V1Compat`.
 pub fn prepare_table(table: &mut toml::Table) {
-    // Migrate channels_config.matrix.room_id → channels_config.matrix.allowed_rooms
+    let version = table
+        .get("schema_version")
+        .and_then(|v| v.as_integer())
+        .unwrap_or(0) as u32;
+
+    if version < 2 {
+        v1_to_v2_table(table);
+    }
+    if version < 3 {
+        v2_to_v3_table(table);
+    }
+}
+
+/// V1 → V2 TOML-level transforms: scalar field renames that must happen before
+/// serde deserialization can see the V2 field names.
+fn v1_to_v2_table(table: &mut toml::Table) {
+    // channels_config.matrix.room_id → channels_config.matrix.allowed_rooms
     for key in &["channels_config", "channels"] {
         if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
             && let Some(toml::Value::Table(matrix)) = channels.get_mut("matrix")
@@ -448,7 +479,7 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // Migrate channels.slack.channel_id → channels.slack.channel_ids
+    // channels.slack.channel_id → channels.slack.channel_ids
     for key in &["channels_config", "channels"] {
         if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
             && let Some(toml::Value::Table(slack)) = channels.get_mut("slack")
@@ -457,7 +488,7 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Migrate channels.mattermost.channel_id → channels.mattermost.channel_ids
+    // channels.mattermost.channel_id → channels.mattermost.channel_ids
     for key in &["channels_config", "channels"] {
         if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
             && let Some(toml::Value::Table(mattermost)) = channels.get_mut("mattermost")
@@ -466,7 +497,7 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Migrate channels.discord.guild_id → channels.discord.guild_ids
+    // channels.discord.guild_id → channels.discord.guild_ids
     for key in &["channels_config", "channels"] {
         if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
             && let Some(toml::Value::Table(discord)) = channels.get_mut("discord")
@@ -475,7 +506,7 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Migrate channels.signal.group_id → channels.signal.{group_ids, dm_only}
+    // channels.signal.group_id → channels.signal.{group_ids, dm_only}
     // The legacy field overloaded a sentinel "dm" for DMs-only mode; split that
     // into a typed bool.
     for key in &["channels_config", "channels"] {
@@ -500,7 +531,7 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Migrate channels.reddit.subreddit → channels.reddit.subreddits
+    // channels.reddit.subreddit → channels.reddit.subreddits
     for key in &["channels_config", "channels"] {
         if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
             && let Some(toml::Value::Table(reddit)) = channels.get_mut("reddit")
@@ -509,24 +540,20 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Fold [channels.discord-history] into [channels.discord].
+    // Fold [channels.discord-history] into [channels.discord].
     // discord-history was a separate channel type that archived ALL messages.
     // V3 merges it into discord with `archive = true`.
     for key in &["channels_config", "channels"] {
         if let Some(toml::Value::Table(channels)) = table.get_mut(*key) {
-            // Pull the discord-history block out (try both hyphen and underscore).
             let dh = channels
                 .remove("discord-history")
                 .or_else(|| channels.remove("discord_history"));
             if let Some(toml::Value::Table(mut dh_table)) = dh {
-                // Migrate discord-history's own guild_id to guild_ids.
                 scalar_to_vec(&mut dh_table, "guild_id", "guild_ids");
-                // Drop fields that no longer exist on discord config.
                 dh_table.remove("store_dms");
                 dh_table.remove("respond_to_dms");
 
                 if let Some(toml::Value::Table(discord)) = channels.get_mut("discord") {
-                    // Both blocks present: fold archive flag + channel_ids into discord.
                     let dh_token = dh_table
                         .get("bot_token")
                         .and_then(|v| v.as_str())
@@ -539,13 +566,12 @@ pub fn prepare_table(table: &mut toml::Table) {
                         .to_string();
                     if !dh_token.is_empty() && dh_token != dc_token {
                         tracing::warn!(
-                            "v2→v3 migration: [channels.discord-history] has a different \
+                            "v1→v2 migration: [channels.discord-history] has a different \
                              bot_token than [channels.discord]. Discarding discord-history \
                              config; re-configure archive manually under [channels.discord]."
                         );
                     } else {
                         discord.insert("archive".to_string(), toml::Value::Boolean(true));
-                        // Merge channel_ids from discord-history if discord has none.
                         if let Some(dh_ids) = dh_table.remove("channel_ids")
                             && discord.get("channel_ids").is_none()
                         {
@@ -553,14 +579,17 @@ pub fn prepare_table(table: &mut toml::Table) {
                         }
                     }
                 } else {
-                    // Only discord-history exists: promote it to discord with archive=true.
                     dh_table.insert("archive".to_string(), toml::Value::Boolean(true));
                     channels.insert("discord".to_string(), toml::Value::Table(dh_table));
                 }
             }
         }
     }
+}
 
+/// V2 → V3 TOML-level transforms: aliasing wraps, section synthesis, field
+/// removals, and renames that must happen before deserialization into V1Compat.
+fn v2_to_v3_table(table: &mut toml::Table) {
     // Read non_cli_excluded_tools before the wrap so we can propagate it to
     // each channel alias's excluded_tools field. The flat autonomy field does
     // not survive V3 — it becomes a per-channel filter instead.
@@ -575,7 +604,7 @@ pub fn prepare_table(table: &mut toml::Table) {
     // after the aliasing wrap. Stored as (channel_type, agent_alias) pairs.
     let mut agent_bindings: Vec<(String, String)> = Vec::new();
 
-    // V3: Wrap V2 flat channel configs in a "default" alias.
+    // Wrap V2 flat channel configs in a "default" alias.
     // V2: [channels.discord] has flat fields (bot_token, enabled, …).
     // V3: [channels.discord.default] nests those fields one level deeper.
     // Detection: a V2 config has at least one non-table leaf at the top of the
@@ -605,7 +634,7 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Binding inversion — write channels = ["<type>.default"] onto each agent
+    // Binding inversion — write channels = ["<type>.default"] onto each agent
     // that was bound to a channel via the V2 channels.<type>.agent field.
     // Only updates agents that already exist in the table; does not create skeletons
     // (an agent without provider/model cannot deserialize as DelegateAgentConfig).
@@ -627,7 +656,7 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Synthesize [risk_profiles.default] from [autonomy] + [security.sandbox] +
+    // Synthesize [risk_profiles.default] from [autonomy] + [security.sandbox] +
     // [security.resources] if not already present.
     // non_cli_excluded_tools is propagated to per-channel excluded_tools above;
     // it does not survive in the risk profile.
@@ -653,7 +682,6 @@ pub fn prepare_table(table: &mut toml::Table) {
         {
             let mut profile = autonomy_snapshot.clone().unwrap_or_default();
             profile.remove("non_cli_excluded_tools");
-            // Merge sandbox fields (prefixed to avoid collisions with autonomy fields).
             if let Some(sandbox) = &sandbox_snapshot {
                 for (k, v) in sandbox {
                     let dest_key = if k == "enabled" {
@@ -666,7 +694,6 @@ pub fn prepare_table(table: &mut toml::Table) {
                     profile.entry(dest_key).or_insert_with(|| v.clone());
                 }
             }
-            // Merge resource-limits fields.
             if let Some(resources) = &resources_snapshot {
                 for (k, v) in resources {
                     profile.entry(k.clone()).or_insert_with(|| v.clone());
@@ -682,9 +709,9 @@ pub fn prepare_table(table: &mut toml::Table) {
         security.remove("resources");
     }
 
-    // V3: Per-agent risk-profile carve-out.
+    // Per-agent risk-profile carve-out.
     // Agents with inline max_depth or timeout overrides get their own risk profile
-    // named after the agent alias. allowed_tools stays on the agent delegate config.
+    // named after the agent alias.
     let agents_for_risk: Vec<(String, toml::Table)> =
         if let Some(toml::Value::Table(agents)) = table.get("agents") {
             agents
@@ -722,8 +749,7 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Synthesize [runtime_profiles.default] from [agent] if not already present.
-    // The entire [agent] table is the seed; all fields carry over as-is.
+    // Synthesize [runtime_profiles.default] from [agent] if not already present.
     let agent_snapshot = table.get("agent").and_then(|v| v.as_table()).cloned();
     if let Some(agent) = agent_snapshot {
         let runtime_profiles = table
@@ -738,9 +764,7 @@ pub fn prepare_table(table: &mut toml::Table) {
     // Remove V2 flat [agent] block after synthesis.
     table.remove("agent");
 
-    // V3: Per-agent runtime-profile carve-out.
-    // Agents whose max_iterations or agentic flag differs from the global [agent]
-    // block get their own runtime profile.
+    // Per-agent runtime-profile carve-out.
     let agents_for_runtime: Vec<(String, toml::Table)> =
         if let Some(toml::Value::Table(agents)) = table.get("agents") {
             agents
@@ -773,9 +797,8 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Bundle namespace synthesis.
+    // Bundle namespace synthesis.
     // [memory_namespaces.default] — minimal entry seeded from V2 [memory].
-    // Carries the backend type if set; the namespace key is the alias itself.
     {
         let backend = table
             .get("memory")
@@ -857,7 +880,7 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Migrate V2 [mcp.servers.<alias>] map format to V3 [[mcp.servers]] Vec format.
+    // Migrate V2 [mcp.servers.<alias>] map format to V3 [[mcp.servers]] Vec format.
     // V2: servers are a TOML table keyed by name. V3: servers are an array with an explicit
     // `name` field. Collect the V2 entries first (for bundle synthesis below), then replace.
     let v2_mcp_servers: Option<Vec<(String, toml::Table)>> = table
@@ -892,7 +915,6 @@ pub fn prepare_table(table: &mut toml::Table) {
     }
 
     // [mcp_bundles.default] ← lists all V2 mcp.servers.* alias keys.
-    // The bundle is a thin wrapper referencing all known server aliases by name.
     let mcp_server_aliases: Vec<String> = v2_mcp_servers
         .map(|entries| entries.into_iter().map(|(alias, _)| alias).collect())
         .unwrap_or_default();
@@ -917,9 +939,8 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Drop V2 [swarms.*] configs. The V3 swarm shape is incompatible and
+    // Drop V2 [swarms.*] configs. The V3 swarm shape is incompatible and
     // the migration cannot safely synthesize V3 from V2 swarm definitions.
-    // Operators must redefine swarms in the V3 shape after upgrading.
     if let Some(toml::Value::Table(swarms)) = table.get("swarms")
         && !swarms.is_empty()
     {
@@ -940,25 +961,87 @@ pub fn prepare_table(table: &mut toml::Table) {
         table.insert("channels".to_string(), val);
     }
 
-    // V3: Rename any "claude-code" model-provider type key to "anthropic".
-    // The claude-code provider is removed in V3; the Anthropic provider handles OAuth
-    // tokens (sk-ant-oat01- prefix) natively, so no credential change is needed.
-    // Also rewrite providers.fallback entries and old top-level default_provider field.
+    // Strip `enabled` from all channel alias configs and synthesize agent entries for
+    // previously-enabled channels. Agent alias = "{ch_type}-{alias}" (e.g. "telegram-default").
+    // Skip synthesis if the agent alias already exists in [agents].
+    // Channels with `enabled = false` are stripped but no agent is synthesized.
+    // Channels without an `enabled` key (V3-native configs) are treated as enabled.
+    {
+        use crate::helpers::validate_alias_key;
+
+        let mut to_synthesize: Vec<(String, String)> = Vec::new(); // (agent_alias, channel_ref)
+
+        if let Some(toml::Value::Table(channels)) = table.get_mut("channels") {
+            for (ch_type, ch_val) in channels.iter_mut() {
+                if let toml::Value::Table(alias_map) = ch_val {
+                    for (alias, alias_val) in alias_map.iter_mut() {
+                        if let toml::Value::Table(alias_cfg) = alias_val {
+                            let was_disabled = alias_cfg
+                                .remove("enabled")
+                                .and_then(|v| v.as_bool())
+                                .map(|b| !b)
+                                .unwrap_or(false);
+
+                            if !was_disabled {
+                                let agent_alias = format!("{ch_type}-{alias}");
+                                if validate_alias_key(&agent_alias).is_ok() {
+                                    let ch_ref = format!("{ch_type}.{alias}");
+                                    to_synthesize.push((agent_alias, ch_ref));
+                                } else {
+                                    tracing::warn!(
+                                        "v2→v3 migration: skipping agent synthesis for \
+                                         '{ch_type}.{alias}' — derived alias '{ch_type}-{alias}' \
+                                         is invalid"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !to_synthesize.is_empty() {
+            let agents = table
+                .entry("agents")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if let toml::Value::Table(agents_map) = agents {
+                for (agent_alias, ch_ref) in to_synthesize {
+                    if !agents_map.contains_key(&agent_alias) {
+                        let mut entry = toml::Table::new();
+                        entry.insert(
+                            "channels".to_string(),
+                            toml::Value::Array(vec![toml::Value::String(ch_ref)]),
+                        );
+                        entry.insert("enabled".to_string(), toml::Value::Boolean(true));
+                        agents_map.insert(agent_alias, toml::Value::Table(entry));
+                    }
+                }
+            }
+        }
+    }
+
+    // Rename any "claude-code" model-provider type key to "anthropic".
     if let Some(toml::Value::String(s)) = table.get_mut("default_provider")
         && s == "claude-code"
     {
         *s = "anthropic".to_string();
     }
 
-    // V3: Rename claude-code provider to anthropic, wrap flat provider entries into
+    // Rename claude-code provider to anthropic, wrap flat provider entries into
     // `<type>.default` alias, and normalize providers.fallback to Vec<String> with
     // dotted type.alias keys (V2 had a bare string; V3 has an array of dotted paths).
     if let Some(toml::Value::Table(providers)) = table.get_mut("providers") {
         // Normalize providers.fallback to an array if it's a bare string (V2 shape).
         if let Some(toml::Value::String(s)) = providers.get("fallback").cloned() {
+            let dotted = if s.contains('.') {
+                s
+            } else {
+                format!("{s}.default")
+            };
             providers.insert(
                 "fallback".into(),
-                toml::Value::Array(vec![toml::Value::String(s)]),
+                toml::Value::Array(vec![toml::Value::String(dotted)]),
             );
         }
         if let Some(toml::Value::Table(models)) = providers.get_mut("models") {
@@ -991,9 +1074,8 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Synthesize per-agent [providers.models.<type>.<agent>] from inline agent fields.
+    // Synthesize per-agent [providers.models.<type>.<agent>] from inline agent fields.
     // Agents with inline brain fields that differ from the type's .default get their own alias.
-    // Agents whose inline fields match .default (or are absent) get model_provider = "<type>.default".
     let agents_snapshot: Vec<(String, toml::Table)> = table
         .get("agents")
         .and_then(|v| v.as_table())
@@ -1107,11 +1189,8 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Drop the global `[cost.prices.*]` table. Pricing now lives on each
-    // `[providers.models.<provider>.<alias>]` block. The global-hash key
-    // (`"<provider>/<model>"`) does not carry the user's alias path, so no
-    // automatic remapping is attempted; emit one INFO log per dropped entry
-    // so operators can paste the values under the correct alias.
+    // Drop the global `[cost.prices.*]` table. Pricing now lives on each
+    // `[providers.models.<provider>.<alias>]` block.
     if let Some(toml::Value::Table(cost)) = table.get_mut("cost")
         && let Some(toml::Value::Table(prices)) = cost.remove("prices")
     {
@@ -1139,15 +1218,8 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // V3: Migrate legacy top-level [memory] pgvector fields to [memory.postgres]
+    // Migrate legacy top-level [memory] pgvector fields to [memory.postgres]
     // and db_url to [storage.provider.config].
-    // PR #4714 removed the Postgres backend, stripping pgvector_enabled,
-    // pgvector_dimensions, and db_url from [memory]. PR #6015 re-introduced
-    // them under [memory.postgres]. Configs that still carry the old top-level
-    // keys are moved here so nothing is silently dropped.
-    //
-    // Extract all three fields in one pass to release the borrow on `table`
-    // before writing to [storage.provider.config].
     let (legacy_pg_enabled, legacy_pg_dims, legacy_db_url) =
         if let Some(toml::Value::Table(memory)) = table.get_mut("memory") {
             (
@@ -1175,8 +1247,6 @@ pub fn prepare_table(table: &mut toml::Table) {
         }
     }
 
-    // Move db_url to [storage.provider.config].db_url; or_insert ensures we
-    // never overwrite a value the operator already set there.
     if let Some(url) = legacy_db_url {
         let storage = table
             .entry("storage")

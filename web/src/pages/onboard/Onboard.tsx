@@ -60,11 +60,13 @@ const ONBOARD_SECTION_ORDER = [
   'memory',
   'hardware',
   'tunnel',
-  // Personality is intentionally last — the structural sections above
-  // (workspace, providers, memory, …) are answered first so the markdown
-  // files the user authors here can reference whatever was just
+  // Personality is intentionally before Agents — structural sections are
+  // answered first so the markdown files can reference whatever was just
   // configured. Mirrors the CLI/TUI run_all() loop.
   'personality',
+  // Agents last: binds channel aliases, model providers, and profiles
+  // together. Requires the sections above to be configured first.
+  'agents',
 ] as const;
 
 // Sections handled by a dedicated component instead of the schema-driven

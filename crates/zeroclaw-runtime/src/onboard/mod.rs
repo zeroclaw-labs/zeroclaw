@@ -63,6 +63,7 @@ pub enum Section {
     Hardware,
     Tunnel,
     Personality,
+    Agents,
 }
 
 impl Section {
@@ -79,6 +80,7 @@ impl Section {
             Self::Hardware => Some("hardware"),
             Self::Tunnel => Some("tunnel"),
             Self::Personality => Some("personality"),
+            Self::Agents => Some("agents"),
         }
     }
 
@@ -99,6 +101,7 @@ impl Section {
             "hardware" => Some(Self::Hardware),
             "tunnel" => Some(Self::Tunnel),
             "personality" => Some(Self::Personality),
+            "agents" => Some(Self::Agents),
             _ => None,
         }
     }
@@ -156,6 +159,10 @@ pub async fn run(
             let _ = personality(cfg, ui, flags).await?;
             Ok(())
         }
+        Section::Agents => {
+            let _ = agents(cfg, ui, flags).await?;
+            Ok(())
+        }
     }
 }
 
@@ -177,6 +184,7 @@ async fn run_all(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Res
             // structural questions (workspace, providers, memory, …)
             // before authoring the markdown files that reference them.
             6 => personality(cfg, ui, flags).await?,
+            7 => agents(cfg, ui, flags).await?,
             _ => return Ok(()),
         };
         match nav {
@@ -1442,6 +1450,60 @@ async fn personality(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) ->
     Ok(Nav::Done)
 }
 
+async fn agents(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> Result<Nav> {
+    ui.heading(1, "Agents");
+    loop {
+        let existing_aliases: Vec<String> = cfg.get_map_keys("agents").unwrap_or_default();
+        let mut options: Vec<SelectItem> = existing_aliases
+            .iter()
+            .map(|a| {
+                let enabled_path = format!("agents.{a}.enabled");
+                let is_active = cfg.get_prop(&enabled_path).ok().as_deref() == Some("true");
+                if is_active {
+                    SelectItem::with_badge(a.clone(), "[active]")
+                } else {
+                    SelectItem::with_badge(a.clone(), "[configured]")
+                }
+            })
+            .collect();
+        let add_new_idx = options.len();
+        options.push(SelectItem::new("+ Add new"));
+        let done_idx = options.len();
+        options.push(SelectItem::new("Done"));
+
+        let idx = match ui.select("Agent", &options, Some(done_idx)).await? {
+            Answer::Back => return Ok(Nav::Back),
+            Answer::Value(i) => i,
+        };
+
+        if idx == done_idx {
+            break;
+        }
+
+        let alias = if idx == add_new_idx {
+            let suggestion = if existing_aliases.is_empty() {
+                "default".to_string()
+            } else {
+                format!("{}-2", existing_aliases[0])
+            };
+            let Some(a) = prompt_alias_name(ui, &suggestion).await? else {
+                continue;
+            };
+            a
+        } else {
+            existing_aliases[idx].clone()
+        };
+
+        cfg.create_map_key("agents", &alias).ok();
+        let prefix = format!("agents.{alias}");
+        cfg.save().await?;
+        ui.heading(2, &alias);
+        let _ = prompt_fields_under(cfg, ui, &prefix, &[], &[]).await?;
+    }
+    mark_completed(cfg, "agents").await?;
+    Ok(Nav::Done)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1951,20 +2013,16 @@ mod tests {
         );
     }
 
-    /// Smoke test: picking Mochat walks the enabled-gate fields and the
-    /// resulting config has `enabled = true`, the scripted base URL, and
-    /// the scripted API token round-tripped via `set_prop`. Doubles as a
-    /// regression guard for the orchestrator's mochat enabled-check — a
-    /// config with `enabled = true` must reach the registration branch,
-    /// one with the default `false` must not.
+    /// Smoke test: picking Mochat walks the config fields and the
+    /// resulting config has the scripted base URL and API token
+    /// round-tripped via `set_prop`.
     #[tokio::test]
-    async fn channels_mochat_selection_persists_enabled_url_and_token() {
+    async fn channels_mochat_selection_persists_url_and_token() {
         let temp = TempDir::new().unwrap();
         let mut cfg = test_cfg(&temp);
         let flags = Flags::default();
 
         let mut ui = QuickUi::new()
-            .with("enabled", "true")
             .with("api-url", "http://mochat-test:8080/v1")
             .with("api-token", "stub-mochat-token")
             .with_sequence("Channel", ["mochat", "Done"]);
@@ -1977,7 +2035,6 @@ mod tests {
             .mochat
             .get("default")
             .expect("mochat subsection should be initialized");
-        assert!(mc.enabled, "mochat enabled should round-trip via set_prop");
         assert_eq!(mc.api_url, "http://mochat-test:8080/v1");
         assert_eq!(mc.api_token, "stub-mochat-token");
     }
