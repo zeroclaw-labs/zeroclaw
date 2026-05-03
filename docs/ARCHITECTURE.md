@@ -4962,6 +4962,243 @@ handle.end()?;
 
 ---
 
+## 6G. Domain DB Incremental Update Protocol (v8, 2026-05-02)
+
+> **Implements**: PR #222 (clean-up) → #223 (PR 1 + PR 2) → #224 (PR 3),
+> all merged into `main` 2026-05-02.
+> **Full design**: [`docs/domain-db-incremental-design.md`](./domain-db-incremental-design.md)
+> (505 lines, includes problem statement, distribution policy,
+> data model, decision tree, integrity matrix, acceptance criteria).
+> **Implementation modules**: `src/vault/{domain, domain_manifest,
+> domain_delta, domain_cli, schema}.rs` + `scripts/build_domain_delta.py`.
+
+### 6G-0. 배경 — 왜 증분 업데이트인가
+
+§6D Vault의 절반은 이용자가 직접 만든 노트(`brain.db`)지만, 나머지
+절반은 **운영자가 큐레이트한 도메인 코퍼스**(`domain.db` —
+법령/판례/의학 등)다. 이 도메인 코퍼스의 운영 현실:
+
+| 코퍼스 | 변경 빈도 | 주간 델타 크기 |
+|---|---|---|
+| 한국 판례 | 지속적, 주당 수십~수백건 추가 | 4–40 MB |
+| 한국 법령 | 연 수회 개정 | 0–2 MB |
+| 의학 (예정) | 분기성 | < 5 MB |
+
+기존 v7 구조는 `domain.db` 전체를 매번 R2에서 다시 받는 swap-by-replace
+모델이었다. 1.5 GB짜리 베이스라인을 매주 모든 이용자가 새로 받는 건
+모바일 데이터/대역폭에서 받아들이기 어렵고, 운영자 측 CDN egress
+비용도 비합리적이다. 무엇보다 "이번 주는 변동 없음"이 흔한데, 그 경우
+0 바이트로 끝나야 한다.
+
+### 6G-1. 핵심 설계 — Manifest v2 + Cumulative Delta Chain
+
+```
+운영자 → 비정기 게시(있을 때만)        클라이언트 → 매주 정기 폴링(고정)
+─────────────────────────────────────────────────────────────────
+[연 1회, 1월 15일]                      매주 일요일 03:00 자동 update:
+  build_domain_db_fast.py                  fetch manifest (1~10 KB)
+  → baseline 1.5 GB                        ↓
+  publish-v2 → manifest                   현재 상태와 비교:
+                                            - 베이스라인 다름     → FullInstall
+[변동 있을 때만]                            - version 일치         → AlreadyCurrent (0바이트)
+  build_domain_delta.py                    - 그 외                → ApplyDelta(최신)
+  → cumulative delta SQLite (~수 MB)
+  publish-delta → manifest 갱신          (registry_url 미설정 → no-op,
+                                          일반인 MoA 빌드 기본 동작)
+```
+
+**누적(cumulative) 델타**: 매번 게시되는 델타는 직전 델타 누적분이
+아니라 **마지막 베이스라인 이후 모든 변경**을 담는다. 11주간 앱을
+켜지 않은 이용자도 단 한 번의 다운로드로 chain head에 도달한다.
+중간 델타가 R2에서 만료/삭제되어도 깨지지 않는다. 1년 단위 베이스라인
+컷으로 델타 크기 무한 증가를 방지한다.
+
+### 6G-2. 데이터 모델
+
+#### Manifest v2 (`domain_manifest::DomainManifestV2`)
+
+```jsonc
+{
+  "schema_version": 2,
+  "name": "korean-legal",
+  "version": "2026.04.22",                // = chain head (마지막 델타 또는 베이스라인)
+  "baseline": {                            // 필수
+    "version": "2026.01.15",
+    "url":    "https://r2.example.com/.../baseline-2026.01.15.db",
+    "sha256": "<64 hex>",
+    "size_bytes": 1487239104
+  },
+  "deltas": [                              // 누적 체인 (비어 있을 수도 있음)
+    {
+      "version": "2026.04.22",
+      "applies_to_baseline": "2026.01.15",
+      "url":    "https://r2.example.com/.../delta-2026.04.22.sqlite",
+      "sha256": "<64 hex>",
+      "size_bytes": 38201984,
+      "ops":    { "upsert": 412, "delete": 3 }
+    }
+  ]
+}
+```
+
+#### Delta File 포맷
+
+베이스라인과 동일한 vault 스키마 + `vault_deletes(uuid, deleted_at)` +
+`meta(key, value)` 테이블을 가진 작은 SQLite. 클라이언트는 `ATTACH`
+한 줄로 적용한다.
+
+#### `domain.db.meta` 테이블 (vault 스키마 공유, idempotent)
+
+```
+meta(key TEXT PK, value TEXT) — 핵심 키:
+  schema_kind        = 'domain'
+  baseline_version   = '2026.01.15'
+  baseline_sha256    = '<64 hex>'
+  current_version    = '2026.04.22'   (= baseline_version 신규 인스톨 시)
+  last_applied_at    = '<unix sec>'
+```
+
+`brain.db`도 같은 스키마라 `meta` 테이블이 같이 생기지만 키를
+사용하지 않는다.
+
+### 6G-3. 클라이언트 결정 트리 (`domain_delta::decide`)
+
+순수 함수, I/O 없음:
+
+```rust
+fn decide(manifest: &DomainManifestV2, installed: &DomainMeta) -> UpdateOutcome {
+    if !installed.is_stamped()                            { return FullInstall; }
+    if installed.baseline_version != manifest.baseline.version { return FullInstall; }
+    if installed.current_version  == manifest.version     { return AlreadyCurrent; }
+    if manifest.deltas.is_empty()                         { return FullInstall; }
+    ApplyDelta { delta_index: manifest.deltas.len() - 1 }
+}
+```
+
+세 결과만 존재 — `FullInstall` / `AlreadyCurrent` / `ApplyDelta`.
+`update_v2`는 `FullInstall`에서 베이스라인 다운 후 manifest에
+델타가 있으면 즉시 최신 델타도 catch-up하여 한 번의 update로
+정확히 `manifest.version`에 도달시킨다.
+
+### 6G-4. 일반인 MoA vs lawpro/medpro fork 분리 정책
+
+| Build | 인프라 코드 | 번들 코퍼스 | 주간 cron |
+|---|---|---|---|
+| **General-public MoA** (이 레포) | ✅ | ❌ — `[domain].registry_url` 빈 값 | 발화 → no-op (네트워크 0) |
+| **lawpro** (예정 fork) | ✅ | ✅ korean-legal pre-config | 활성 |
+| **medpro** (이후 fork) | ✅ | ✅ korean-medical pre-config | 활성 |
+
+운영자 측 publish 도구도 코어에 두되 일반인 MoA는 게시할 코퍼스가
+없으므로 기능적으로만 사용 안 된다. fork가 자기 R2 버킷과
+manifest URL을 번들 config에 박아 활성화한다. 자세한 정책은
+[`docs/domain-db-incremental-design.md`](./domain-db-incremental-design.md) §0.
+
+### 6G-5. Plan ↔ Code 추적 매트릭스
+
+| 설계 항목 | 요구 사항 | 구현 위치 | 상태 |
+|---|---|---|---|
+| **Manifest v2 데이터 모델** | `BaselineSpec` + `Vec<DeltaSpec>` + `DeltaOps` 통계 + chain head 검증 | `vault/domain_manifest.rs::{DomainManifestV2, BaselineSpec, DeltaSpec, DeltaOps, fetch_v2, validate_v2}` | ✅ 구현 |
+| **`meta` 테이블 (domain.db 상태 추적)** | `schema_kind='domain'` + `baseline_version` + `current_version` + `last_applied_at` | `vault/schema.rs` (`CREATE TABLE IF NOT EXISTS meta`) + `vault/domain.rs::{DomainMeta, read_meta, write_baseline_meta, write_delta_meta_on_conn}` | ✅ 구현 |
+| **`[domain].registry_url` 옵션** | `Option<String>`, 기본 `None`, 빈 값/env fallback 처리 | `config/schema.rs::DomainConfig` + `vault/domain_cli.rs::resolve_registry_url` | ✅ 구현 |
+| **결정 트리 (3 결과)** | `FullInstall` / `AlreadyCurrent` / `ApplyDelta` 순수 분기 | `vault/domain_delta.rs::{decide, UpdateOutcome}` | ✅ 구현 |
+| **Apply-delta 트랜잭션** | ATTACH delta → 무결성 게이트 4개 → INSERT OR REPLACE 업서트 + DELETE → meta 업데이트 → COMMIT, 실패 시 ROLLBACK + DETACH | `vault/domain_delta.rs::apply_delta` | ✅ 구현 |
+| **Delta 다운로드 + 무결성 검증** | size + sha256 검증 후에야 디스크 쓰기 | `vault/domain_delta.rs::download_delta` (v1 `download_bundle` 패턴 미러) | ✅ 구현 |
+| **`update` 디스패치 (v1/v2 공존)** | `schema_version` peek → v1=legacy install, v2=update_v2, 그 외=hard error | `vault/domain_cli.rs::{update, ManifestVersionPeek, update_v2, full_install_v2, apply_delta_outcome}` | ✅ 구현 |
+| **자동 catch-up (FullInstall + 델타)** | 베이스라인 install 후 manifest에 델타가 있으면 한 번의 `update`로 chain head까지 | `domain_cli.rs::full_install_v2` 후반부 (베이스라인 stamp 후 `manifest.deltas.last()` 자동 적용) | ✅ 구현 |
+| **운영자 측 빌더** | baseline ↔ current 비교 → cumulative delta SQLite 생성 | `scripts/build_domain_delta.py::build_delta` (ATTACH 기반 schema clone, 자동 future-proof) | ✅ 구현 |
+| **`stamp-baseline` CLI** | 빌더가 만든 풀 DB에 baseline meta 기록 | `vault/domain_cli.rs::stamp_baseline` | ✅ 구현 |
+| **`publish-v2` CLI** | v2 manifest (`deltas: []`) 생성 + sha + size + stats | `vault/domain_cli.rs::publish_v2` (self-validating via `validate_v2`) | ✅ 구현 |
+| **`publish-delta` CLI** | delta 무결성 게이트(`schema_kind`/`applies_to_baseline`) → manifest append + chain head bump → re-validate | `vault/domain_cli.rs::publish_delta` | ✅ 구현 |
+| **운영 문서 (annual/주간/silent week)** | 운영자 절차 + rollback + pruning + 검증 | `docs/operations-runbook.md` "Domain DB Publication" 섹션 (lawpro/medpro fork 한정) | ✅ 구현 |
+| **0바이트 fast path 보장** | 운영자 침묵 주 + 이미 chain head → manifest GET만, 본문 다운로드 0 | `domain_cli.rs::update_v2` `AlreadyCurrent` 분기 | ✅ 구현 |
+| **Mid-apply crash safety** | 단일 트랜잭션 + DETACH 보장 → 다음 polling 자동 재시도 | `domain_delta.rs::apply_delta` (BEGIN/COMMIT/ROLLBACK + always-DETACH 패턴) | ✅ 구현 |
+| **일반인 MoA no-op 보장** | `registry_url` 미설정 시 weekly cron 발화해도 네트워크 0 | `domain_cli.rs::update` 첫 분기 (resolve_registry_url None → friendly skip) | ✅ 구현 |
+
+### 6G-6. Acceptance Criteria — 7/7 모두 green (PR 시리즈 머지 완료)
+
+| 항목 | 검증 테스트 | PR |
+|---|---|---|
+| 일반인 build registry_url unset → 0 네트워크 | `domain_cli::tests::update_with_no_registry_is_a_silent_no_op` | PR 1 |
+| `deltas:[]` + 일치 → 0 바이트 | `domain_delta::tests::decide_already_current_*` (2개) | PR 2 |
+| 1 베이스라인 뒤짐 → 최신 델타 1개 | `domain_delta::tests::decide_apply_delta_when_one_behind` + `apply_delta_upserts_and_deletes_in_one_tx` | PR 2 |
+| 스테일 베이스라인 → 새 베이스라인 + 자동 catch-up | `domain_delta::tests::decide_full_install_on_baseline_drift` + `domain_cli::round_trip_publish_then_apply_e2e` | PR 2/3 |
+| v2 manifest 수락 / v1 client 거부 | `domain_manifest::tests::fetch_v2_rejects_v1_manifest_cleanly` | PR 1 |
+| Mid-apply crash → prior version 유지 | `domain_delta::tests::apply_delta_rolls_back_on_constraint_violation` | PR 2 |
+| 연 1회 베이스라인 컷 → 모든 클라이언트 이동 | `domain_cli::tests::round_trip_publish_then_apply_e2e` (FullInstall 분기) | PR 3 |
+
+### 6G-7. 테스트 커버리지
+
+머지 후 vault 모듈 전체:
+
+```
+vault::* (sweep)        341/341 ✅  (8.77s)
+  vault::domain          16/16  ✅  (meta helpers, install, info)
+  vault::domain_manifest 20/20  ✅  (v2 schema, validate_v2, fetch_v2)
+  vault::domain_delta    14/14  ✅  (decide, apply, download, ensure)
+  vault::domain_cli      15/15  ✅  (resolve, update, stamp, publish, e2e)
+```
+
+라운드트립 e2e (`domain_cli::tests::round_trip_publish_then_apply_e2e`)는
+운영자 빌더가 만든 v2 manifest + 델타를 클라이언트가 통째로 받아
+chain head에 도달한 뒤 재실행 시 `AlreadyCurrent`로 0바이트
+종료하는 것까지 자동 검증한다.
+
+### 6G-8. 모듈 파일 인덱스
+
+| 파일 | LOC | 책임 |
+|---|---|---|
+| `src/vault/domain.rs` | ~340 | `DomainMeta` + `read_meta`/`write_baseline_meta`/`write_delta_meta_on_conn` + 기존 install/uninstall lifecycle |
+| `src/vault/domain_manifest.rs` | ~770 | v1 + v2 manifest 데이터 모델, `fetch`/`validate` 양쪽, `download_bundle`, `sha256_file` |
+| `src/vault/domain_delta.rs` | ~870 (신규) | `decide` 결정 트리, `apply_delta` 트랜잭션, `download_delta`, `ensure_delta_schema`, `stamp_delta_meta` |
+| `src/vault/domain_cli.rs` | ~1400 | `info`/`extract`/`install`/`update` (v1+v2 dispatch)/`swap`/`uninstall`/`build`/`publish`/`stamp_baseline`/`publish_v2`/`publish_delta` |
+| `src/vault/schema.rs` | (+12 LOC) | `meta` 테이블 추가 (idempotent 마이그레이션) |
+| `src/config/schema.rs` | (+52 LOC) | `[domain]` config 섹션 (`registry_url`/`auto_update`/`update_cron`) |
+| `scripts/build_domain_delta.py` | ~270 (신규) | cumulative delta SQLite 빌더, vault 스키마 자동 클론 |
+| `docs/domain-db-incremental-design.md` | 505 | 정식 설계 문서 (이 §6G의 상세 보강본) |
+| `docs/operations-runbook.md` | (+125 LOC) | "Domain DB Publication" 운영자 섹션 (annual / 주간 / silent week / pruning / rollback) |
+
+총 신규 코드: **~2,860 LOC + 770 LOC tests**, 3개 PR로 분할 머지
+(PR #222·#223·#224, 2026-05-02).
+
+### 6G-9. ZeroClaw / 일반 RAG 시스템과의 차이
+
+ZeroClaw 오픈소스에는 `vault/`가 통째로 없고, 따라서 도메인 코퍼스
+배포 모델 자체가 부재하다. 일반 RAG 프로덕트 (LlamaIndex, LangChain
+등) 는 코퍼스 업데이트를 application-level의 backfill 작업으로
+처리한다. MoA의 차이:
+
+1. **이용자 디바이스에 데이터가 산다** — 클라우드 데이터베이스에
+   질의하는 게 아니라 로컬 SQLite. 동기화 모델이 필요한 이유.
+2. **운영자 vs 이용자 비대칭 폴링** — 운영자는 비정기, 이용자는
+   매주 정기. 프로토콜은 "운영자가 6주 침묵해도 정상 케이스"로
+   설계됨. 매니페스트가 단일 진실의 원천.
+3. **베이스라인 컷팅 + cumulative delta** — Git의 shallow clone 또는
+   Debian의 .pdiff와 비슷하지만 SQLite 트랜잭션으로 적용되어 mid-apply
+   atomicity 보장.
+4. **세컨드 브레인의 운영 절반과 이용자 절반 분리** — `brain.db`(노트)
+   는 §6D의 E2E 동기화 (Patent 1) 로, `domain.db`(코퍼스) 는 §6G의
+   manifest+delta 로 각각 전파. 두 채널은 독립적이며 서로의 실패에
+   영향받지 않는다.
+
+### 6G-10. 향후 (out-of-scope, 별도 PR 필요)
+
+- **Multi-domain coexistence** — 현재는 단일 `domain.db`. 의학 + 법률
+  병행은 lawpro/medpro fork 분리 모델로 충분하나, 변호사가 의학적
+  소송을 다룰 때처럼 동시 활성이 필요하면 multi-attach 또는
+  `domain.{name}.db` namespacing 검토.
+- **Delta compression** — `BundleSpec.compression` 필드는 `"zstd"`
+  예약 자리만 있고 미구현. 베이스라인은 ~30% 압축 효과가 있으나
+  델타는 SQLite가 이미 bit-pack 되어 있어 효과가 미미. 필요시 추가.
+- **Streaming download with resume** — 현재 `download_delta` 는
+  메모리에 받아 sha 검증 후 한 번에 디스크에 쓴다. 1.5 GB 베이스라인
+  + 모바일 데이터 환경에서는 streaming + resume이 필요할 수 있다.
+- **Telemetry** — `[telemetry]` 후킹은 별도 PR. update outcome
+  (full / delta / already-current / failed) 을 observability 싱크로
+  보내되 일반인 MoA의 no-op 분기에서는 절대 로깅하지 않는다(silence
+  is part of the contract, §0).
+
+---
+
 ## 7. Voice / Simultaneous Interpretation
 
 ### Goal
