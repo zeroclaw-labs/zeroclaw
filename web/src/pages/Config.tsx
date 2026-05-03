@@ -71,6 +71,23 @@ const GROUP_ORDER = [
   'Other',
 ] as const;
 
+// Within the Foundation group we want a dependency-driven order rather
+// than alphabetical: agents reference everything above them, so they
+// land last. Mirrors the wizard order in
+// `crates/zeroclaw-runtime/src/onboard/mod.rs::run_all` and
+// `web/src/pages/onboard/Onboard.tsx`'s ONBOARD_SECTION_ORDER. Sections
+// not in this list fall back to alphabetical sort.
+const FOUNDATION_ORDER: Record<string, number> = {
+  workspace: 0,
+  providers: 1,
+  channels: 2,
+  memory: 3,
+  hardware: 4,
+  tunnel: 5,
+  personality: 6,
+  agents: 7,
+};
+
 export default function Config() {
   // URL params drive the view. No internal mode state for picker/form —
   // the address bar is the source of truth.
@@ -415,7 +432,14 @@ export default function Config() {
                     ? s.group === 'Other' || !known.has(s.group as typeof GROUP_ORDER[number])
                     : s.group === groupName,
                 )
-                .sort((a, b) => a.label.localeCompare(b.label));
+                .sort((a, b) => {
+                  if (groupName === 'Foundation') {
+                    const ai = FOUNDATION_ORDER[a.key] ?? Number.MAX_SAFE_INTEGER;
+                    const bi = FOUNDATION_ORDER[b.key] ?? Number.MAX_SAFE_INTEGER;
+                    if (ai !== bi) return ai - bi;
+                  }
+                  return a.label.localeCompare(b.label);
+                });
               if (items.length === 0) return null;
               return (
                 <div key={groupName}>
