@@ -30,7 +30,9 @@ pub fn create_sandbox(
             {
                 #[cfg(target_os = "linux")]
                 {
-                    if let Ok(sandbox) = super::landlock::LandlockSandbox::new() {
+                    if let Ok(sandbox) = super::landlock::LandlockSandbox::with_workspace(
+                        workspace_dir.map(Path::to_path_buf),
+                    ) {
                         return Arc::new(sandbox);
                     }
                 }
@@ -85,7 +87,8 @@ pub fn create_sandbox(
         SandboxBackend::SandboxExec => {
             #[cfg(target_os = "macos")]
             {
-                if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::new() {
+                if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::with_workspace(workspace_dir)
+                {
                     return Arc::new(sandbox);
                 }
             }
@@ -114,7 +117,9 @@ fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<
         // Try Landlock first (native, no dependencies)
         #[cfg(feature = "sandbox-landlock")]
         {
-            if let Ok(sandbox) = super::landlock::LandlockSandbox::probe() {
+            if let Ok(sandbox) = super::landlock::LandlockSandbox::with_workspace(
+                workspace_dir.map(Path::to_path_buf),
+            ) {
                 tracing::info!("Landlock sandbox enabled (Linux kernel 5.13+)");
                 return Arc::new(sandbox);
             }
@@ -139,7 +144,7 @@ fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<
         }
 
         // Try sandbox-exec (Seatbelt) — built into macOS
-        if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::probe() {
+        if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::with_workspace(workspace_dir) {
             tracing::info!("macOS sandbox-exec (Seatbelt) enabled");
             return Arc::new(sandbox);
         }

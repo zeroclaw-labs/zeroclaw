@@ -544,6 +544,7 @@ impl AnthropicProvider {
                         id: block.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                         name,
                         arguments: arguments.to_string(),
+                        extra_content: None,
                     });
                 }
                 _ => {}
@@ -647,6 +648,7 @@ impl AnthropicProvider {
                                         id,
                                         name,
                                         arguments: input,
+                                        extra_content: None,
                                     })))
                                     .await;
                             }
@@ -702,6 +704,7 @@ impl AnthropicProvider {
                                 id,
                                 name,
                                 arguments: input,
+                                extra_content: None,
                             })))
                             .await;
                     }
