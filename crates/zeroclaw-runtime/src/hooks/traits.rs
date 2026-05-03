@@ -39,6 +39,15 @@ pub trait HookHandler: Send + Sync {
     async fn on_message_sent(&self, _channel: &str, _recipient: &str, _content: &str) {}
     async fn on_heartbeat_tick(&self) {}
 
+    /// Fired before context compression begins.
+    /// Allows hooks to persist important state before older messages are summarized.
+    async fn on_before_compaction(
+        &self,
+        _estimated_tokens: usize,
+        _max_tokens: usize,
+        _usage_ratio: f64,
+    ) {}
+
     // --- Modifying hooks (sequential by priority, can cancel) ---
     async fn before_model_resolve(
         &self,
