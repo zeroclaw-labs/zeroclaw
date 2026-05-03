@@ -13,6 +13,7 @@ import { ArrowLeft, ChevronRight, Plus, Sparkles } from 'lucide-react';
 import {
   ApiError,
   getDrift,
+  getMapKeys,
   getSections,
   selectSectionItem,
   type ConfigApiError,
@@ -20,6 +21,7 @@ import {
   type PickerItem,
   type SectionInfo,
 } from '../lib/api';
+import AliasPromptDialog from '../components/AliasPromptDialog';
 import FieldForm from '../components/onboard/FieldForm';
 import ReloadDaemonButton from '../components/onboard/ReloadDaemonButton';
 import SectionPicker from '../components/onboard/SectionPicker';
@@ -51,6 +53,16 @@ type Mode =
   // already-configured carry the badge so the user knows what's there.
   | { kind: 'picker' }
   | { kind: 'form'; item: PickerItem; fieldsPrefix: string };
+
+// Pending alias selection: user picked a provider/channel type, we fetched
+// the existing aliases and are waiting for them to choose one or name a new one.
+type AliasPending = {
+  item: PickerItem;
+  sectionKey: string;
+  existingAliases: string[];
+  // When set, show AliasPromptDialog for a new alias name
+  namingNew: boolean;
+};
 
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
 // from the gateway lands in one of these buckets (anything else falls
@@ -87,6 +99,7 @@ export default function Config() {
   const [sections, setSections] = useState<SectionInfo[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [mode, setMode] = useState<Mode>({ kind: 'section-overview' });
+  const [aliasPending, setAliasPending] = useState<AliasPending | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // Single page-level drift state. Refreshed on every section change,
@@ -180,24 +193,60 @@ export default function Config() {
     }
   };
 
-  const handlePick = async (item: PickerItem) => {
-    if (!activeSection) return;
-    let alias: string | undefined;
-    if (activeSection.key === 'providers' || activeSection.key === 'channels') {
-      const raw = window.prompt(`Name this ${item.label} configuration (alias):`, 'default');
-      if (raw === null) return;
-      alias = raw.trim() || 'default';
-    }
+  // Open the form for item+alias. Called once the alias is known.
+  const openForm = async (item: PickerItem, sectionKey: string, alias: string) => {
     try {
-      const resp = await selectSectionItem(activeSection.key, item.key, alias);
+      const resp = await selectSectionItem(sectionKey, item.key, alias);
+      setAliasPending(null);
       setMode({ kind: 'form', item, fieldsPrefix: resp.fields_prefix });
     } catch (e) {
+      setAliasPending(null);
       if (e instanceof ApiError) {
         setError(`Couldn't open ${item.label}: [${e.envelope.code}] ${e.envelope.message}`);
       } else {
         setError(`Couldn't open ${item.label}: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
+  };
+
+  // Fetch existing aliases for a provider/channel type, then show alias picker.
+  const startAliasPick = async (item: PickerItem, sectionKey: string) => {
+    const mapPath =
+      sectionKey === 'providers'
+        ? `providers.models.${item.key}`
+        : `channels.${item.key}`;
+    let existingAliases: string[] = [];
+    try {
+      const resp = await getMapKeys(mapPath);
+      existingAliases = resp.keys;
+    } catch {
+      // If the path has no aliases yet (404/not-found), treat as empty
+    }
+    if (existingAliases.length === 0) {
+      setAliasPending({ item, sectionKey, existingAliases: [], namingNew: true });
+    } else {
+      setAliasPending({ item, sectionKey, existingAliases, namingNew: false });
+    }
+  };
+
+  const handlePick = (item: PickerItem) => {
+    if (!activeSection) return;
+    if (activeSection.key === 'providers' || activeSection.key === 'channels') {
+      void startAliasPick(item, activeSection.key);
+      return;
+    }
+    void (async () => {
+      try {
+        const resp = await selectSectionItem(activeSection.key, item.key);
+        setMode({ kind: 'form', item, fieldsPrefix: resp.fields_prefix });
+      } catch (e) {
+        if (e instanceof ApiError) {
+          setError(`Couldn't open ${item.label}: [${e.envelope.code}] ${e.envelope.message}`);
+        } else {
+          setError(`Couldn't open ${item.label}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    })();
   };
 
   if (loading) {
@@ -402,6 +451,11 @@ export default function Config() {
                 onEdit={(item, prefix) =>
                   setMode({ kind: 'form', item, fieldsPrefix: prefix })
                 }
+                onPickWithAlias={
+                  activeSection.key === 'providers' || activeSection.key === 'channels'
+                    ? (item) => void startAliasPick(item, activeSection.key)
+                    : undefined
+                }
               />
             ) : mode.kind === 'picker' ? (
               <div className="flex flex-col gap-3">
@@ -442,6 +496,36 @@ export default function Config() {
           </div>
         )}
       </main>
+
+      {/* Alias picker overlay — shown when a provider/channel type was selected */}
+      {aliasPending && !aliasPending.namingNew && (
+        <AliasPicker
+          item={aliasPending.item}
+          sectionKey={aliasPending.sectionKey}
+          existingAliases={aliasPending.existingAliases}
+          onSelect={(alias) => void openForm(aliasPending.item, aliasPending.sectionKey, alias)}
+          onAddNew={() => setAliasPending((p) => p && { ...p, namingNew: true })}
+          onCancel={() => setAliasPending(null)}
+        />
+      )}
+      {aliasPending?.namingNew && (
+        <AliasPromptDialog
+          label={aliasPending.item.label}
+          suggestion={
+            aliasPending.existingAliases.length > 0
+              ? `${aliasPending.existingAliases[0]}-2`
+              : 'default'
+          }
+          onConfirm={(alias) => void openForm(aliasPending.item, aliasPending.sectionKey, alias)}
+          onCancel={() => {
+            if (aliasPending.existingAliases.length > 0) {
+              setAliasPending((p) => p && { ...p, namingNew: false });
+            } else {
+              setAliasPending(null);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -501,9 +585,10 @@ interface SectionOverviewProps {
   section: SectionInfo;
   onAdd: () => void;
   onEdit: (item: PickerItem, fieldsPrefix: string) => void;
+  onPickWithAlias?: (item: PickerItem) => void;
 }
 
-function SectionOverview({ section, onAdd, onEdit }: SectionOverviewProps) {
+function SectionOverview({ section, onAdd, onEdit, onPickWithAlias }: SectionOverviewProps) {
   // The overview is just the section picker filtered to configured items.
   // Reuse SectionPicker by treating its "Done" button as "+ Add new". For
   // simplicity, embed the picker directly with the picker semantics tuned
@@ -529,7 +614,7 @@ function SectionOverview({ section, onAdd, onEdit }: SectionOverviewProps) {
       {/* The picker handles fetching, filtering, click. Treat onPick as
           "edit this item" — selectSectionItem returns the existing fields
           prefix idempotently when the entry already exists. */}
-      <ConfiguredOnlyPicker section={section} onEdit={onEdit} />
+      <ConfiguredOnlyPicker section={section} onEdit={onEdit} onPickWithAlias={onPickWithAlias} />
     </div>
   );
 }
@@ -537,13 +622,14 @@ function SectionOverview({ section, onAdd, onEdit }: SectionOverviewProps) {
 interface ConfiguredOnlyPickerProps {
   section: SectionInfo;
   onEdit: (item: PickerItem, fieldsPrefix: string) => void;
+  onPickWithAlias?: (item: PickerItem) => void;
 }
 
 /**
  * Strips the picker down to items that are already configured (badge =
  * "configured" or "active"). Empty state guides the user to + Add.
  */
-function ConfiguredOnlyPicker({ section, onEdit }: ConfiguredOnlyPickerProps) {
+function ConfiguredOnlyPicker({ section, onEdit, onPickWithAlias }: ConfiguredOnlyPickerProps) {
   const [items, setItems] = useState<PickerItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -625,19 +711,14 @@ function ConfiguredOnlyPicker({ section, onEdit }: ConfiguredOnlyPickerProps) {
           key={item.key}
           type="button"
           onClick={async () => {
-            let alias: string | undefined;
-            if (section.key === 'providers' || section.key === 'channels') {
-              const raw = window.prompt(
-                `Name this ${item.label} configuration (alias):`,
-                'default',
-              );
-              if (raw === null) return;
-              alias = raw.trim() || 'default';
+            if ((section.key === 'providers' || section.key === 'channels') && onPickWithAlias) {
+              onPickWithAlias(item);
+              return;
             }
             try {
               const resp = await (
                 await import('../lib/api')
-              ).selectSectionItem(section.key, item.key, alias);
+              ).selectSectionItem(section.key, item.key);
               onEdit(item, resp.fields_prefix);
             } catch (e) {
               const msg =
@@ -671,6 +752,105 @@ function ConfiguredOnlyPicker({ section, onEdit }: ConfiguredOnlyPickerProps) {
           />
         </button>
       ))}
+    </div>
+  );
+}
+
+// Inline alias list shown after a user picks a provider/channel type.
+// Lists existing aliases as clickable rows; "Add new alias" at the bottom.
+function AliasPicker({
+  item,
+  sectionKey,
+  existingAliases,
+  onSelect,
+  onAddNew,
+  onCancel,
+}: {
+  item: PickerItem;
+  sectionKey: string;
+  existingAliases: string[];
+  onSelect: (alias: string) => void;
+  onAddNew: () => void;
+  onCancel: () => void;
+}) {
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCancel();
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [onCancel]);
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Select ${item.label} alias`}
+      className="fixed inset-0 z-50 flex items-center justify-center"
+      onClick={onCancel}
+    >
+      <div
+        className="absolute inset-0"
+        style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(8px)' }}
+      />
+      <div
+        className="relative w-full max-w-sm mx-4 rounded-3xl border shadow-2xl"
+        style={{ background: 'var(--pc-bg-base)', borderColor: 'var(--pc-border)' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div
+          className="flex items-center justify-between px-6 py-4 border-b"
+          style={{ borderColor: 'var(--pc-border)' }}
+        >
+          <h2 className="text-sm font-semibold" style={{ color: 'var(--pc-text-primary)' }}>
+            {item.label} — select alias
+          </h2>
+          <button
+            type="button"
+            onClick={onCancel}
+            className="h-8 w-8 rounded-xl flex items-center justify-center transition-colors"
+            style={{ color: 'var(--pc-text-muted)', background: 'transparent', border: 'none', cursor: 'pointer' }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--pc-bg-elevated)')}
+            onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+          >
+            ✕
+          </button>
+        </div>
+        <div className="flex flex-col divide-y" style={{ borderColor: 'var(--pc-border)' }}>
+          {existingAliases.map((alias) => (
+            <button
+              key={alias}
+              type="button"
+              onClick={() => onSelect(alias)}
+              className="flex items-center justify-between gap-3 px-6 py-3 text-left text-sm transition-colors"
+              style={{ color: 'var(--pc-text-primary)', background: 'transparent', border: 'none', cursor: 'pointer' }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--pc-bg-elevated)')}
+              onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+            >
+              <span>{alias}</span>
+              <code
+                className="text-xs"
+                style={{ color: 'var(--pc-text-faint)' }}
+              >
+                {sectionKey === 'providers'
+                  ? `providers.models.${item.key}.${alias}`
+                  : `channels.${item.key}.${alias}`}
+              </code>
+            </button>
+          ))}
+          <button
+            type="button"
+            onClick={onAddNew}
+            className="flex items-center gap-2 px-6 py-3 text-sm"
+            style={{ color: 'var(--pc-accent)', background: 'transparent', border: 'none', cursor: 'pointer' }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--pc-bg-elevated)')}
+            onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+          >
+            <Plus className="h-4 w-4" />
+            Add new alias
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

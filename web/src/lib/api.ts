@@ -789,6 +789,41 @@ export function selectSectionItem(
   );
 }
 
+// ── Map-keyed alias CRUD ─────────────────────────────────────────────
+
+export interface MapKeysResponse {
+  path: string;
+  keys: string[];
+}
+
+export function getMapKeys(path: string): Promise<MapKeysResponse> {
+  return apiFetch<MapKeysResponse>(
+    `/api/config/map-keys?path=${encodeURIComponent(path)}`,
+  );
+}
+
+export interface MapKeyMutResponse {
+  path: string;
+  key: string;
+  renamed?: boolean;
+  created?: boolean;
+}
+
+export function deleteMapKey(path: string, key: string): Promise<MapKeyMutResponse> {
+  return apiFetch<MapKeyMutResponse>(
+    `/api/config/map-key?path=${encodeURIComponent(path)}&key=${encodeURIComponent(key)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export function renameMapKey(path: string, from: string, to: string): Promise<MapKeyMutResponse> {
+  return apiFetch<MapKeyMutResponse>('/api/config/rename-map-key', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, from, to }),
+  });
+}
+
 // ── Daemon admin (localhost-only on the gateway) ─────────────────────
 
 export interface AdminResponse {
