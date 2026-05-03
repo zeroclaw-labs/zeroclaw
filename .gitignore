@@ -68,3 +68,10 @@ model_pricing.toml
 
 # Local design / UI screenshot working folder (Korean: 디자인_캡처사진)
 디자인_캡처사진/
+
+# Android NDK build output. `scripts/android/build-ndk.sh` populates
+# clients/android/app/src/main/jniLibs/<abi>/libzeroclaw_android.so
+# on every run; we do NOT want to commit large native binaries.
+# Keep the directory tracked (via the .gitkeep below) so Gradle has
+# a stable mount point.
+clients/android/app/src/main/jniLibs/**/*.so
