@@ -144,17 +144,9 @@ export default function Onboard() {
   };
 
   const openWithAlias = async (item: PickerItem, sectionKey: string, alias: string) => {
-    try {
-      const resp = await selectSectionItem(sectionKey, item.key, alias);
-      setPickedType(null);
-      setPicked({ item, fieldsPrefix: resp.fields_prefix });
-    } catch (e) {
-      if (e instanceof ApiError) {
-        setError(`Couldn't open ${item.label}: [${e.envelope.code}] ${e.envelope.message}`);
-      } else {
-        setError(`Couldn't open ${item.label}: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    }
+    const resp = await selectSectionItem(sectionKey, item.key, alias);
+    setPickedType(null);
+    setPicked({ item, fieldsPrefix: resp.fields_prefix });
   };
 
   const handlePick = async (item: PickerItem) => {
@@ -438,7 +430,7 @@ export default function Onboard() {
                 sectionKey={pickedType.sectionKey}
                 typeKey={pickedType.item.key}
                 typeLabel={pickedType.item.label}
-                onSelectAlias={(alias) => void openWithAlias(pickedType.item, pickedType.sectionKey, alias)}
+                onSelectAlias={(alias) => openWithAlias(pickedType.item, pickedType.sectionKey, alias)}
               />
             ) : (
               <SectionPicker
@@ -465,11 +457,13 @@ function OnboardAliasListView({
   sectionKey: string;
   typeKey: string;
   typeLabel: string;
-  onSelectAlias: (alias: string) => void;
+  onSelectAlias: (alias: string) => Promise<void>;
 }) {
   const [aliases, setAliases] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [newAlias, setNewAlias] = useState('');
+  const [aliasError, setAliasError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const mapPath = sectionKey === 'providers'
     ? `providers.models.${typeKey}`
@@ -485,9 +479,16 @@ function OnboardAliasListView({
     return () => { cancelled = true; };
   }, [mapPath]);
 
-  const submit = () => {
+  const submit = async () => {
     const trimmed = newAlias.trim() || (aliases.length === 0 ? 'default' : `${aliases[0]}-2`);
-    onSelectAlias(trimmed);
+    setAliasError(null);
+    try {
+      await onSelectAlias(trimmed);
+    } catch (e) {
+      setAliasError(
+        e instanceof ApiError ? e.envelope.message : (e instanceof Error ? e.message : String(e)),
+      );
+    }
   };
 
   return (
@@ -501,12 +502,29 @@ function OnboardAliasListView({
             style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
         </div>
       ) : (
-        <div className="surface-panel divide-y" style={{ borderColor: 'var(--pc-border)' }}>
+        <>
+          {error && (
+            <div
+              className="rounded-xl border p-3 text-sm"
+              style={{ background: 'rgba(239,68,68,0.08)', borderColor: 'rgba(239,68,68,0.2)', color: '#f87171' }}
+            >
+              {error}
+            </div>
+          )}
+          <div className="surface-panel divide-y" style={{ borderColor: 'var(--pc-border)' }}>
           {aliases.map((alias) => (
             <button
               key={alias}
               type="button"
-              onClick={() => onSelectAlias(alias)}
+              onClick={() => {
+                onSelectAlias(alias).catch((e) => {
+                  setError(
+                    e instanceof ApiError
+                      ? `[${e.envelope.code}] ${e.envelope.message}`
+                      : (e instanceof Error ? e.message : String(e)),
+                  );
+                });
+              }}
               className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left text-sm transition-colors hover:opacity-90"
             >
               <div>
@@ -518,22 +536,28 @@ function OnboardAliasListView({
               <ChevronRight className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-text-muted)' }} />
             </button>
           ))}
-          <div className="flex items-center gap-2 px-4 py-3">
-            <input
-              type="text"
-              className="input-electric flex-1 px-3 py-1.5 text-sm"
-              placeholder={aliases.length === 0 ? 'default' : `${aliases[0]}-2`}
-              value={newAlias}
-              onChange={(e) => setNewAlias(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
-              // eslint-disable-next-line jsx-a11y/no-autofocus
-              autoFocus={aliases.length === 0}
-            />
-            <button type="button" onClick={submit} className="btn-electric text-sm px-3 py-1.5 flex-shrink-0">
-              Add
-            </button>
+          <div className="flex flex-col gap-1 px-4 py-3">
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                className="input-electric flex-1 px-3 py-1.5 text-sm"
+                placeholder={aliases.length === 0 ? 'default' : `${aliases[0]}-2`}
+                value={newAlias}
+                onChange={(e) => { setNewAlias(e.target.value); setAliasError(null); }}
+                onKeyDown={(e) => { if (e.key === 'Enter') void submit(); }}
+                // eslint-disable-next-line jsx-a11y/no-autofocus
+                autoFocus={aliases.length === 0}
+              />
+              <button type="button" onClick={() => void submit()} className="btn-electric text-sm px-3 py-1.5 flex-shrink-0">
+                Add
+              </button>
+            </div>
+            {aliasError && (
+              <p className="text-xs" style={{ color: 'var(--color-status-error)' }}>{aliasError}</p>
+            )}
           </div>
         </div>
+        </>
       )}
     </div>
   );

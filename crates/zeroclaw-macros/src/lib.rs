@@ -462,17 +462,23 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 format!("{prefix}.{}", #field_name_lit)
                             };
                             if section_path == outer_expected {
+                                // map_key here is the type name (e.g. "anthropic") — no alias
+                                // is implied. Create an empty inner map; callers add aliases
+                                // separately via a second create_map_key on the inner path.
                                 let already_exists = self.#field_ident.contains_key(map_key);
                                 if !already_exists {
-                                    let mut inner_map = std::collections::HashMap::new();
-                                    inner_map.insert("default".to_string(), <#inner_ty>::default());
-                                    self.#field_ident.insert(map_key.to_string(), inner_map);
+                                    self.#field_ident.insert(
+                                        map_key.to_string(),
+                                        std::collections::HashMap::new(),
+                                    );
                                 }
                                 return Ok(!already_exists);
                             }
                             let inner_expected_prefix = format!("{outer_expected}.");
                             if let Some(outer_key) = section_path.strip_prefix(&inner_expected_prefix) {
                                 if let Some(inner_map) = self.#field_ident.get_mut(outer_key) {
+                                    crate::config::validate_alias_key(map_key)
+                                        .map_err(|e| e)?;
                                     if inner_map.contains_key(map_key) {
                                         return Ok(false);
                                     }
@@ -548,6 +554,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             let inner_expected_prefix = format!("{outer_expected}.");
                             if let Some(outer_key) = section_path.strip_prefix(&inner_expected_prefix) {
                                 if let Some(inner_map) = self.#field_ident.get_mut(outer_key) {
+                                    crate::config::validate_alias_key(new_key)
+                                        .map_err(|e| e)?;
                                     if inner_map.contains_key(new_key) {
                                         return Err(format!("alias `{new_key}` already exists"));
                                     }
@@ -698,6 +706,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 format!("{prefix}.{}", #field_name_lit)
                             };
                             if section_path == expected {
+                                crate::config::validate_alias_key(map_key)
+                                    .map_err(|e| e)?;
                                 if self.#field_ident.contains_key(map_key) {
                                     return Ok(false);
                                 }
@@ -748,6 +758,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 format!("{prefix}.{}", #field_name_lit)
                             };
                             if section_path == expected {
+                                crate::config::validate_alias_key(new_key)
+                                    .map_err(|e| e)?;
                                 if self.#field_ident.contains_key(new_key) {
                                     return Err(format!("alias `{new_key}` already exists"));
                                 }

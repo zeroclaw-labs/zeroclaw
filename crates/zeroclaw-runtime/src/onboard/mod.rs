@@ -643,6 +643,30 @@ async fn prompt_custom_openai_base_url(ui: &mut dyn OnboardUi) -> Result<Option<
 }
 
 /// Record that a section finished so the next run's skip gate can fire.
+/// Prompt for an alias name, validating it in a loop until the user enters a
+/// valid value or backs out. Returns `Some(alias)` on success, `None` on Back.
+async fn prompt_alias_name(ui: &mut dyn OnboardUi, suggestion: &str) -> Result<Option<String>> {
+    loop {
+        match ui
+            .string("Alias (name for this configuration)", Some(suggestion))
+            .await?
+        {
+            Answer::Back => return Ok(None),
+            Answer::Value(s) => {
+                let trimmed = if s.trim().is_empty() {
+                    suggestion.to_string()
+                } else {
+                    s.trim().to_string()
+                };
+                match zeroclaw_config::helpers::validate_alias_key(&trimmed) {
+                    Ok(()) => return Ok(Some(trimmed)),
+                    Err(msg) => ui.warn(&format!("Invalid alias: {msg}")),
+                }
+            }
+        }
+    }
+}
+
 async fn mark_completed(cfg: &mut Config, section_key: &str) -> Result<()> {
     if cfg
         .onboard_state
@@ -781,21 +805,10 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                 .get_map_keys(&format!("providers.models.{picked}"))
                 .unwrap_or_default();
             if existing_aliases.is_empty() {
-                let suggestion = "default".to_string();
-                match ui
-                    .string("Alias (name for this configuration)", Some(&suggestion))
-                    .await?
-                {
-                    Answer::Back => continue,
-                    Answer::Value(s) => {
-                        let trimmed = s.trim().to_string();
-                        if trimmed.is_empty() {
-                            suggestion
-                        } else {
-                            trimmed
-                        }
-                    }
-                }
+                let Some(a) = prompt_alias_name(ui, "default").await? else {
+                    continue;
+                };
+                a
             } else {
                 let mut alias_options: Vec<SelectItem> = existing_aliases
                     .iter()
@@ -809,20 +822,10 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                 };
                 if alias_idx == add_new_idx {
                     let suggestion = format!("{}-2", existing_aliases[0]);
-                    match ui
-                        .string("Alias (name for this configuration)", Some(&suggestion))
-                        .await?
-                    {
-                        Answer::Back => continue,
-                        Answer::Value(s) => {
-                            let trimmed = s.trim().to_string();
-                            if trimmed.is_empty() {
-                                suggestion
-                            } else {
-                                trimmed
-                            }
-                        }
-                    }
+                    let Some(a) = prompt_alias_name(ui, &suggestion).await? else {
+                        continue;
+                    };
+                    a
                 } else {
                     existing_aliases[alias_idx].clone()
                 }
@@ -1187,21 +1190,10 @@ async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> R
             .get_map_keys(&format!("channels.{picked}"))
             .unwrap_or_default();
         let alias = if existing_aliases.is_empty() {
-            let suggestion = "default".to_string();
-            match ui
-                .string("Alias (name for this configuration)", Some(&suggestion))
-                .await?
-            {
-                Answer::Back => continue,
-                Answer::Value(s) => {
-                    let trimmed = s.trim().to_string();
-                    if trimmed.is_empty() {
-                        suggestion
-                    } else {
-                        trimmed
-                    }
-                }
-            }
+            let Some(a) = prompt_alias_name(ui, "default").await? else {
+                continue;
+            };
+            a
         } else {
             let mut alias_options: Vec<SelectItem> = existing_aliases
                 .iter()
@@ -1215,20 +1207,10 @@ async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> R
             };
             if alias_idx == add_new_idx {
                 let suggestion = format!("{}-2", existing_aliases[0]);
-                match ui
-                    .string("Alias (name for this configuration)", Some(&suggestion))
-                    .await?
-                {
-                    Answer::Back => continue,
-                    Answer::Value(s) => {
-                        let trimmed = s.trim().to_string();
-                        if trimmed.is_empty() {
-                            suggestion
-                        } else {
-                            trimmed
-                        }
-                    }
-                }
+                let Some(a) = prompt_alias_name(ui, &suggestion).await? else {
+                    continue;
+                };
+                a
             } else {
                 existing_aliases[alias_idx].clone()
             }
@@ -2240,6 +2222,75 @@ mod tests {
         assert!(
             entry.is_none(),
             "in-progress 'fresh' alias must be removed after ESC (never persisted)"
+        );
+    }
+
+    // Alias key validation — backend enforcement via create_map_key. These tests
+    // exercise the generated macro code path that calls validate_alias_key before
+    // inserting, so invalid aliases can never reach the config HashMap.
+
+    #[test]
+    fn create_map_key_rejects_alias_with_dot() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        let result = cfg.create_map_key("channels.discord", "my.alias");
+        assert!(result.is_err(), "dot in alias must be rejected");
+        assert!(
+            cfg.channels.discord.is_empty(),
+            "no entry should be inserted"
+        );
+    }
+
+    #[test]
+    fn create_map_key_rejects_alias_with_slash() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        let result = cfg.create_map_key("channels.discord", "prod/main");
+        assert!(result.is_err(), "slash in alias must be rejected");
+    }
+
+    #[test]
+    fn create_map_key_rejects_alias_with_space() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        let result = cfg.create_map_key("channels.discord", "my alias");
+        assert!(result.is_err(), "space in alias must be rejected");
+    }
+
+    #[test]
+    fn create_map_key_rejects_alias_starting_with_hyphen() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        let result = cfg.create_map_key("channels.discord", "-bad");
+        assert!(result.is_err(), "leading hyphen in alias must be rejected");
+    }
+
+    #[test]
+    fn create_map_key_accepts_valid_alias() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        let result = cfg.create_map_key("channels.discord", "prod-alerts");
+        assert!(result.is_ok(), "valid alias must be accepted");
+        assert!(cfg.channels.discord.contains_key("prod-alerts"));
+    }
+
+    #[test]
+    fn create_map_key_rejects_invalid_on_providers_double_nested() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        // First create the outer type bucket.
+        cfg.providers
+            .models
+            .insert("anthropic".into(), Default::default());
+        // Now try to add an alias with a dot in the name.
+        let result = cfg.create_map_key("providers.models.anthropic", "my.alias");
+        assert!(
+            result.is_err(),
+            "dot in double-nested alias must be rejected"
+        );
+        assert!(
+            !cfg.providers.models["anthropic"].contains_key("my.alias"),
+            "no entry should be inserted into the inner map"
         );
     }
 

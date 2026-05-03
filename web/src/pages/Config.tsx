@@ -274,7 +274,12 @@ export default function Config() {
         <AliasListView
           sectionKey={activeSection.key}
           typeKey={typeParam}
-          onSelectAlias={(alias) => void goToAlias(activeSection.key, typeParam, alias)}
+          onSelectAlias={async (alias) => {
+            await selectSectionItem(activeSection.key, typeParam, alias);
+            navigate(
+              `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(typeParam)}/${encodeURIComponent(alias)}`,
+            );
+          }}
           onBack={() => navigate(`/config/${encodeURIComponent(activeSection.key)}`)}
         />
       );
@@ -474,13 +479,14 @@ function AliasListView({
 }: {
   sectionKey: string;
   typeKey: string;
-  onSelectAlias: (alias: string) => void;
+  onSelectAlias: (alias: string) => Promise<void>;
   onBack: () => void;
 }) {
   const [aliases, setAliases] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [newAlias, setNewAlias] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [aliasError, setAliasError] = useState<string | null>(null);
 
   const mapPath = sectionKey === 'providers'
     ? `providers.models.${typeKey}`
@@ -501,9 +507,16 @@ function AliasListView({
     return () => { cancelled = true; };
   }, [mapPath]);
 
-  const submit = () => {
-    const trimmed = newAlias.trim() || 'default';
-    onSelectAlias(trimmed);
+  const submit = async () => {
+    const trimmed = newAlias.trim() || (aliases.length === 0 ? 'default' : `${aliases[0]}-2`);
+    setAliasError(null);
+    try {
+      await onSelectAlias(trimmed);
+    } catch (e) {
+      setAliasError(
+        e instanceof ApiError ? e.envelope.message : (e instanceof Error ? e.message : String(e)),
+      );
+    }
   };
 
   return (
@@ -542,7 +555,15 @@ function AliasListView({
             <button
               key={alias}
               type="button"
-              onClick={() => onSelectAlias(alias)}
+              onClick={() => {
+                onSelectAlias(alias).catch((e) => {
+                  setError(
+                    e instanceof ApiError
+                      ? `[${e.envelope.code}] ${e.envelope.message}`
+                      : (e instanceof Error ? e.message : String(e)),
+                  );
+                });
+              }}
               className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left text-sm transition-colors hover:opacity-90"
             >
               <div>
@@ -559,22 +580,27 @@ function AliasListView({
           ))}
 
           {/* Inline new alias row */}
-          <div className="flex items-center gap-2 px-4 py-3">
-            <input
-              type="text"
-              className="input-electric flex-1 px-3 py-1.5 text-sm"
-              placeholder={aliases.length === 0 ? 'default' : `${aliases[0]}-2`}
-              value={newAlias}
-              onChange={(e) => setNewAlias(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
-            />
-            <button
-              type="button"
-              onClick={submit}
-              className="btn-electric text-sm px-3 py-1.5 flex-shrink-0"
-            >
-              Add
-            </button>
+          <div className="flex flex-col gap-1 px-4 py-3">
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                className="input-electric flex-1 px-3 py-1.5 text-sm"
+                placeholder={aliases.length === 0 ? 'default' : `${aliases[0]}-2`}
+                value={newAlias}
+                onChange={(e) => { setNewAlias(e.target.value); setAliasError(null); }}
+                onKeyDown={(e) => { if (e.key === 'Enter') void submit(); }}
+              />
+              <button
+                type="button"
+                onClick={() => void submit()}
+                className="btn-electric text-sm px-3 py-1.5 flex-shrink-0"
+              >
+                Add
+              </button>
+            </div>
+            {aliasError && (
+              <p className="text-xs" style={{ color: 'var(--color-status-error)' }}>{aliasError}</p>
+            )}
           </div>
         </div>
       )}
