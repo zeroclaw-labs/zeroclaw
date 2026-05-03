@@ -5928,6 +5928,12 @@ pub struct SkillBundleConfig {
 ///
 /// Isolates agent memory operations within a named namespace, preventing
 /// cross-contamination between agents sharing the same backend.
+///
+/// V3 model: namespaces are tags within the active memory backend — they
+/// do not pick a different backend. SQL backends column-tag rows with
+/// the namespace value; qdrant uses per-namespace collections; markdown
+/// uses per-namespace directories. The per-backend isolation primitive
+/// is the runtime backend's responsibility.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory-namespace"]
@@ -5935,8 +5941,19 @@ pub struct SkillBundleConfig {
 pub struct MemoryNamespaceConfig {
     /// Namespace key used to scope memory operations.
     pub namespace: String,
-    /// Optional backend override. When unset, inherits `[memory].backend`.
+    /// Optional backend override (DEPRECATED — V3 namespaces share the
+    /// global backend; this field will be removed once runtime backend
+    /// routing migrates to per-agent storage selection).
     pub backend: Option<String>,
+    /// Days to retain entries before purge for this namespace. `None`
+    /// inherits the global `[memory].purge_after_days` policy.
+    pub retention_days: Option<u32>,
+    /// Reject writes against this namespace at the runtime backend layer.
+    /// Reads remain unaffected — useful for archival namespaces.
+    pub read_only: bool,
+    /// Memory categories to pin from purge in this namespace (entries
+    /// tagged with any of these stay regardless of `retention_days`).
+    pub pinned_categories: Vec<String>,
 }
 
 /// Named knowledge bundle (`[knowledge_bundles.<alias>]`).
