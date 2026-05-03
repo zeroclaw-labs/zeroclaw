@@ -87,6 +87,27 @@ impl SecretStore {
         if let Some(hex_str) = value.strip_prefix("enc2:") {
             self.decrypt_chacha20(hex_str)
         } else if let Some(hex_str) = value.strip_prefix("enc:") {
+            // Surface a one-line operator-visible warning every time
+            // a legacy XOR-encrypted secret is read. Callers that want
+            // automatic upgrade should use `decrypt_and_migrate` instead;
+            // this path returns plaintext but does NOT re-encrypt.
+            //
+            // Why warn here: prior to this fix the legacy path was
+            // silently honored by every config-load code path
+            // (`config/schema.rs::decrypt_optional_secret`, etc.),
+            // hiding the security debt from operators. Logging it
+            // makes the technical-debt visible and gives operators
+            // the cue to run `zeroclaw config migrate-secrets`
+            // (or equivalent operator action) to upgrade.
+            tracing::warn!(
+                target: "security.secrets",
+                "Reading a legacy `enc:` (XOR) encrypted secret. \
+                 This format is insecure and will be removed. \
+                 Run `zeroclaw config migrate-secrets` to upgrade to \
+                 `enc2:` (ChaCha20-Poly1305), or call \
+                 `SecretStore::decrypt_and_migrate` if you have a \
+                 persist-back path."
+            );
             self.decrypt_legacy_xor(hex_str)
         } else {
             Ok(value.to_string())
