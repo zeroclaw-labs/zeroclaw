@@ -3190,7 +3190,12 @@ async fn process_channel_message(
                         None, // shared_budget
                         target_channel.as_deref(),
                         ctx.receipt_generator.as_ref(),
-                        Some(&tool_receipts_collector),
+                        // Collector is meaningful only when the generator is
+                        // active. Pass None when receipts are disabled so the
+                        // call site reflects that coupling explicitly.
+                        ctx.receipt_generator
+                            .as_ref()
+                            .map(|_| &tool_receipts_collector),
                     ),
                     ),
                     ),
@@ -3517,13 +3522,22 @@ async fn process_channel_message(
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
                 // Send tool receipts as a separate message in the same thread.
-                if let Some(ref block) = receipts_block {
-                    let _ = channel
+                // The block is the operator-facing audit surface for the feature,
+                // so a dropped send must leave a log signal rather than silently
+                // disappear.
+                if let Some(ref block) = receipts_block
+                    && let Err(e) = channel
                         .send(
                             &SendMessage::new(block, &msg.reply_target)
                                 .in_thread(msg.thread_ts.clone()),
                         )
-                        .await;
+                        .await
+                {
+                    tracing::warn!(
+                        channel = channel.name(),
+                        error = %e,
+                        "failed to send tool receipts block"
+                    );
                 }
             }
         }
@@ -7342,6 +7356,252 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(reply.contains("BTC is currently around"));
         assert!(!reply.contains("\"tool_calls\""));
         assert!(!reply.contains("mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_renders_trailing_tool_receipts_block_when_enabled() {
+        // Activated path: a real ReceiptGenerator + show_receipts_in_response=true
+        // must produce a second send carrying the "Tool receipts:" block with a
+        // valid zc-receipt-* token. Pre-#6214 this was dead code from the test
+        // suite because every ChannelRuntimeContext literal pinned the feature
+        // off; this test guards the integration so a regression in the block
+        // render or send call surfaces in CI rather than in production.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            // Full autonomy + auto-approve mock_price so the loop actually
+            // reaches execute_one_tool. The other tests in this file pass
+            // under Supervised because ToolCallingProvider returns the BTC
+            // reply regardless of whether the tool ran (the LLM only needs
+            // to see a `[Tool results]` user message — even a "denied"
+            // payload triggers the deterministic response). Receipts only
+            // generate on the actual execute path, so we need the gate
+            // open here.
+            autonomy_level: AutonomyLevel::Full,
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            hooks: None,
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&{
+                let mut autonomy = zeroclaw_config::schema::AutonomyConfig::default();
+                autonomy.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+                autonomy.auto_approve.push("mock_price".to_string());
+                autonomy
+            })),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: Some(
+                zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new(),
+            ),
+            show_receipts_in_response: true,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-42".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        // Two sends: the model's reply and the trailing receipts block.
+        assert!(
+            sent_messages.len() >= 2,
+            "expected at least 2 sends (reply + receipts block), got {}: {:?}",
+            sent_messages.len(),
+            sent_messages
+        );
+
+        let receipts_message = sent_messages
+            .iter()
+            .find(|m| m.contains("Tool receipts:"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `Tool receipts:` send found; got {:?}",
+                    sent_messages.as_slice()
+                )
+            });
+        assert!(
+            receipts_message.starts_with("chat-42:"),
+            "receipts block must be sent to the same reply target as the agent reply, got {receipts_message}"
+        );
+        assert!(
+            receipts_message.contains("---\nTool receipts:"),
+            "receipts block must be prefixed with the documented `---\\nTool receipts:` separator, got {receipts_message}"
+        );
+        assert!(
+            receipts_message.contains("zc-receipt-"),
+            "receipts block must carry at least one zc-receipt-* HMAC token (proves the generator actually ran), got {receipts_message}"
+        );
+        assert!(
+            receipts_message.contains("mock_price"),
+            "receipts block should name the tool that produced the receipt, got {receipts_message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_omits_receipts_block_when_disabled() {
+        // Backward-compat: with show_receipts_in_response=false (default), no
+        // trailing receipts message is sent — even when a generator is active
+        // and the loop ran tools. This is the path every other test relies on
+        // implicitly; assert it once explicitly.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            // Match the enabled-test setup so the tool actually runs; the
+            // assertion below proves the receipt-block send is gated on
+            // `show_receipts_in_response` and not on whether the loop saw
+            // any receipts.
+            autonomy_level: AutonomyLevel::Full,
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            hooks: None,
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&{
+                let mut autonomy = zeroclaw_config::schema::AutonomyConfig::default();
+                autonomy.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+                autonomy.auto_approve.push("mock_price".to_string());
+                autonomy
+            })),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: Some(
+                zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new(),
+            ),
+            show_receipts_in_response: false,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-42".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            !sent_messages.iter().any(|m| m.contains("Tool receipts:")),
+            "no receipts block must be sent when show_receipts_in_response=false; got {:?}",
+            sent_messages.as_slice()
+        );
     }
 
     #[tokio::test]
