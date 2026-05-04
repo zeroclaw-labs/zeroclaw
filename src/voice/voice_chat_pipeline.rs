@@ -92,6 +92,10 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::providers::Provider;
+use crate::voice::pipeline::{detect_language, LanguageCode};
+use crate::voice::voice_messages::{
+    ask_user_to_repeat, confirm_interpretation_fallback, confirm_interpretation_prefix,
+};
 
 // ── Public types ────────────────────────────────────────────────────
 
@@ -109,14 +113,15 @@ use crate::providers::Provider;
 /// user specified:
 ///
 ///   * `0` → first voice attempt. If Gemma is uncertain, the pipeline
-///     returns `AskUserToRepeat` ("잘 들리지 않습니다…").
+///     returns `AskUserToRepeat` ("잘 들리지 않습니다…", or the
+///     equivalent in the speaker's detected language).
 ///   * `1` → user spoke again (still uncertain). The pipeline returns
 ///     `ConfirmInterpretation` with Gemma's paraphrase ("혹시 이렇게
-///     이해하는 것이 맞습니까? '<paraphrase>'"). The gateway then
-///     waits for the user's yes/no/correction reply and concatenates
-///     it into the next turn's STT text before re-running the pipeline
-///     — so the LLM receives both Gemma's interpretation and the
-///     user's confirmation in one prompt.
+///     이해하는 것이 맞습니까? '<paraphrase>'", localized). The
+///     gateway then waits for the user's yes/no/correction reply and
+///     concatenates it into the next turn's STT text before
+///     re-running the pipeline — so the LLM receives both Gemma's
+///     interpretation and the user's confirmation in one prompt.
 ///   * `>= 2` → we've already exhausted the cheap re-ask paths.
 ///     Commit to ComplexLlm so the user is never stuck in a loop.
 ///
@@ -133,6 +138,19 @@ pub struct SttResult {
     /// call sites that don't track retry state behave like a fresh turn.
     #[serde(default)]
     pub voice_retry_count: u8,
+    /// Language hint from the gateway's session config (the user's
+    /// declared `source_language`). Used as the fallback when
+    /// per-turn script-based detection cannot resolve a language —
+    /// e.g. short ambiguous Latin-script utterances. `None` falls
+    /// through to `LanguageCode::En`.
+    ///
+    /// In bidirectional interpretation the gateway may NOT know the
+    /// speaker per turn (Gemini Live decides which language is which
+    /// internally). In that case the gateway should pass `None` and
+    /// rely on script detection alone, accepting that
+    /// short-Latin-script edge cases will fall back to English.
+    #[serde(default)]
+    pub default_language: Option<LanguageCode>,
 }
 
 /// Validation outcome from the Gemma self-check stage.
@@ -150,6 +168,12 @@ pub struct ValidationResult {
     /// as the body of the `ConfirmInterpretation` re-ask. Empty when
     /// Gemma did not produce one (or when the route doesn't need it).
     pub interpreted_meaning: String,
+    /// The language the pipeline detected for the speaker's
+    /// utterance, used to localize the re-ask phrasing on the
+    /// `AskUserToRepeat` and `ConfirmInterpretation` routes.
+    /// Falls back to `default_language` from `SttResult`, then to
+    /// `LanguageCode::En`.
+    pub detected_language: LanguageCode,
     /// Wall-clock time the validation step itself took.
     pub validation_time_ms: u64,
 }
@@ -183,6 +207,14 @@ pub struct VoiceChatResponse {
     pub stt_confidence: f32,
     pub answer: String,
     pub route: QueryRoute,
+    /// The language the pipeline used to render the `answer` field
+    /// when the route is `AskUserToRepeat` or `ConfirmInterpretation`.
+    /// On `SimpleGemma` / `ComplexLlm` this is still the speaker's
+    /// detected language but the answer text itself is the LLM's
+    /// reply (whose language is the LLM's choice, not necessarily
+    /// the speaker's). Useful for the gateway to pass to the TTS
+    /// stage as a voice/language hint.
+    pub detected_language: LanguageCode,
     pub total_latency_ms: u64,
     pub breakdown: LatencyBreakdown,
 }
@@ -274,31 +306,39 @@ impl VoiceChatPipeline {
             QueryRoute::AskUserToRepeat => {
                 // Cost-saving + UX: first re-ask. Gemma was uncertain
                 // it understood the user. Hand back a fixed re-ask
-                // phrase instead of paying for an LLM call on a
+                // phrase in the *speaker's* own language (so a Korean
+                // speaker hears Korean, an English speaker hears
+                // English) instead of paying for an LLM call on a
                 // noisy/ambiguous transcript. The gateway is
                 // responsible for routing this through TTS *and* the
                 // chat thread, and for incrementing
                 // `voice_retry_count` on the next voice turn so the
                 // staircase advances to ConfirmInterpretation.
                 debug!(
+                    lang = validation.detected_language.as_str(),
                     "voice-chat: route C1 — ask user to repeat (uncertain, retry_count=0)"
                 );
-                ASK_USER_TO_REPEAT_MESSAGE.to_string()
+                ask_user_to_repeat(validation.detected_language).to_string()
             }
             QueryRoute::ConfirmInterpretation => {
                 // Second-attempt confirmation: still uncertain after
                 // the user re-spoke. Show Gemma's paraphrase wrapped
-                // in the fixed prefix; gateway captures yes/no/correction
-                // and feeds it into the next turn so the LLM ultimately
+                // in the fixed prefix (spoken in the speaker's own
+                // language); gateway captures yes/no/correction and
+                // feeds it into the next turn so the LLM ultimately
                 // sees both readings.
                 debug!(
+                    lang = validation.detected_language.as_str(),
                     "voice-chat: route C2 — confirm interpretation (uncertain, retry_count=1)"
                 );
                 let paraphrase = validation.interpreted_meaning.trim();
                 if paraphrase.is_empty() {
-                    CONFIRM_INTERPRETATION_FALLBACK_MESSAGE.to_string()
+                    confirm_interpretation_fallback(validation.detected_language).to_string()
                 } else {
-                    format!("{CONFIRM_INTERPRETATION_PREFIX} '{paraphrase}'")
+                    format!(
+                        "{prefix} '{paraphrase}'",
+                        prefix = confirm_interpretation_prefix(validation.detected_language)
+                    )
                 }
             }
             QueryRoute::ComplexLlm => {
@@ -325,6 +365,7 @@ impl VoiceChatPipeline {
             stt_confidence: stt.confidence,
             answer,
             route: validation.route,
+            detected_language: validation.detected_language,
             total_latency_ms: total_ms,
             breakdown: LatencyBreakdown {
                 stt_ms: stt.processing_time_ms,
@@ -379,12 +420,23 @@ impl VoiceChatPipeline {
 
         let route = decide_route(&parsed, stt.voice_retry_count);
 
+        // Detect speaker language from the STT text. We fall back to
+        // the gateway-provided default first, then to English. This
+        // is what the re-ask catalog keys on so the user always hears
+        // the prompt in their own language (per the bidirectional
+        // interpretation requirement: speaker A in Korean hears the
+        // re-ask in Korean; speaker B replies in English and hears
+        // the re-ask in English on their own turn).
+        let lang_default = stt.default_language.unwrap_or(LanguageCode::En);
+        let detected_language = detect_language(&stt.text, lang_default);
+
         Ok(ValidationResult {
             is_valid: parsed.is_grammatically_complete,
             confidence: parsed.confidence,
             is_simple_query: matches!(route, QueryRoute::SimpleGemma),
             route,
             interpreted_meaning: parsed.interpreted_meaning,
+            detected_language,
             validation_time_ms,
         })
     }
@@ -478,30 +530,19 @@ const GEMMA_DIRECT_ANSWER_SYSTEM_PROMPT: &str = "\
 답변은 짧고 정확해야 하며, 불필요한 인사말은 생략하세요.\n\
 사용자가 다시 묻지 않도록 한 번에 핵심을 전달하세요.";
 
-/// First-attempt re-ask phrase, fixed by user spec (2026-05-04).
-/// Returned as the answer body when the route is `AskUserToRepeat`.
-/// Costs nothing (no LLM call) and gives the user a chance to either
-/// re-speak more clearly or switch to typed input.
-const ASK_USER_TO_REPEAT_MESSAGE: &str =
-    "잘 들리지 않습니다. 혹시 다시 말씀해주시거나 \
-     아니면 텍스트로 입력해주시면 감사하겠습니다.";
-
-/// Second-attempt confirmation prefix, fixed by user spec (2026-05-04).
-/// The full phrase is built at runtime as
-/// `"{prefix} '{interpreted_meaning}'"` so the user sees Gemma's best
-/// reading verbatim and can confirm/correct it. Still no LLM call;
-/// the gateway captures the user's reply and bundles it into the
-/// next turn so the eventual ComplexLlm prompt has both sides.
-const CONFIRM_INTERPRETATION_PREFIX: &str =
-    "혹시 이렇게 이해하는 것이 맞습니까?";
-
-/// Fallback used when the route is `ConfirmInterpretation` but Gemma
-/// failed to produce any paraphrase at all (empty `interpreted_meaning`).
-/// Degrades gracefully to the same first-attempt phrase so the user is
-/// never shown a dangling "혹시 이렇게 이해하는 것이 맞습니까? ''".
-const CONFIRM_INTERPRETATION_FALLBACK_MESSAGE: &str =
-    "여전히 잘 들리지 않습니다. \
-     텍스트로 입력해주시면 더 정확하게 도와드릴 수 있습니다.";
+// ── Re-ask phrasing ────────────────────────────────────────────────
+//
+// Until 2026-05-05 these three messages were Korean-only constants
+// in this module. They have moved to `voice_messages.rs`, which keys
+// them by the speaker's detected `LanguageCode` so a Korean speaker
+// hears Korean and an English speaker hears English on the same
+// session (necessary for bidirectional interpretation, where the
+// speaker language flips per turn).
+//
+// Callers should use `voice_messages::ask_user_to_repeat`,
+// `voice_messages::confirm_interpretation_prefix`, and
+// `voice_messages::confirm_interpretation_fallback` rather than
+// re-declaring constants here.
 
 /// System prompt for the cloud LLM fallback. The user wrote this
 /// verbatim; it is reproduced exactly because every line is
@@ -843,28 +884,140 @@ mod tests {
     /// Mirrors the exact format string used in the
     /// `ConfirmInterpretation` arm of `validate_and_answer`. Kept as
     /// a small inline closure so a future refactor of the format
-    /// string updates one place.
-    fn confirm_interpretation_message(paraphrase: &str) -> String {
+    /// string updates one place. Lang-aware as of PR-B.
+    fn confirm_interpretation_message(paraphrase: &str, lang: LanguageCode) -> String {
         let trimmed = paraphrase.trim();
         if trimmed.is_empty() {
-            CONFIRM_INTERPRETATION_FALLBACK_MESSAGE.to_string()
+            confirm_interpretation_fallback(lang).to_string()
         } else {
-            format!("{CONFIRM_INTERPRETATION_PREFIX} '{trimmed}'")
+            format!("{prefix} '{trimmed}'", prefix = confirm_interpretation_prefix(lang))
         }
     }
 
     #[test]
-    fn confirm_interpretation_with_paraphrase_includes_quote() {
-        let msg = confirm_interpretation_message("대한민국 사람의 역사");
-        assert!(msg.starts_with(CONFIRM_INTERPRETATION_PREFIX));
+    fn confirm_interpretation_with_paraphrase_includes_quote_in_korean() {
+        let msg = confirm_interpretation_message("대한민국 사람의 역사", LanguageCode::Ko);
+        assert!(msg.starts_with(confirm_interpretation_prefix(LanguageCode::Ko)));
         assert!(msg.contains("'대한민국 사람의 역사'"));
+    }
+
+    #[test]
+    fn confirm_interpretation_with_paraphrase_includes_quote_in_english() {
+        let msg = confirm_interpretation_message("the history of Korean people", LanguageCode::En);
+        // English speaker → English prefix, English-quoted body.
+        assert!(msg.starts_with("Did you mean"));
+        assert!(msg.contains("'the history of Korean people'"));
     }
 
     #[test]
     fn confirm_interpretation_falls_back_when_paraphrase_empty() {
         // Must never produce "혹시 이렇게 이해하는 것이 맞습니까? ''" —
         // that would be a worse UX than the first re-ask phrase.
-        let msg = confirm_interpretation_message("   ");
-        assert_eq!(msg, CONFIRM_INTERPRETATION_FALLBACK_MESSAGE);
+        let msg = confirm_interpretation_message("   ", LanguageCode::Ko);
+        assert_eq!(msg, confirm_interpretation_fallback(LanguageCode::Ko));
+    }
+
+    // ── PR-B: speaker-language localization ────────────────────────
+
+    /// Build a fully-resolved `ValidationResult` mimicking what
+    /// `validate_and_route` would have produced, so we can exercise
+    /// the language-detection + message-localization path without
+    /// standing up a Gemma provider.
+    fn validation_with(
+        route: QueryRoute,
+        text_for_lang_detect: &str,
+        default_lang: LanguageCode,
+        interpreted_meaning: &str,
+    ) -> ValidationResult {
+        let detected = detect_language(text_for_lang_detect, default_lang);
+        ValidationResult {
+            is_valid: true,
+            confidence: 0.9,
+            is_simple_query: matches!(route, QueryRoute::SimpleGemma),
+            route,
+            interpreted_meaning: interpreted_meaning.to_string(),
+            detected_language: detected,
+            validation_time_ms: 1,
+        }
+    }
+
+    #[test]
+    fn ask_user_to_repeat_message_localizes_to_korean_speaker() {
+        // Korean STT text -> detect Ko -> Korean re-ask phrase.
+        let v = validation_with(
+            QueryRoute::AskUserToRepeat,
+            "오늘 날씨가 어때요",
+            LanguageCode::En,
+            "",
+        );
+        assert_eq!(v.detected_language, LanguageCode::Ko);
+        let msg = ask_user_to_repeat(v.detected_language);
+        assert!(msg.contains("잘 들리지 않습니다"));
+    }
+
+    #[test]
+    fn ask_user_to_repeat_message_localizes_to_japanese_speaker() {
+        let v = validation_with(
+            QueryRoute::AskUserToRepeat,
+            "今日の天気はどうですか",
+            LanguageCode::En,
+            "",
+        );
+        assert_eq!(v.detected_language, LanguageCode::Ja);
+        assert!(ask_user_to_repeat(v.detected_language).contains("聞き取れません"));
+    }
+
+    #[test]
+    fn ask_user_to_repeat_message_falls_back_to_english_for_short_latin_input() {
+        // Short ASCII text — script detector cannot resolve, falls
+        // through to the gateway-provided default. Caller passed En
+        // as default → English re-ask.
+        let v = validation_with(
+            QueryRoute::AskUserToRepeat,
+            "ok",
+            LanguageCode::En,
+            "",
+        );
+        assert_eq!(v.detected_language, LanguageCode::En);
+        assert!(ask_user_to_repeat(v.detected_language).contains("I didn't catch that"));
+    }
+
+    #[test]
+    fn ask_user_to_repeat_message_honors_default_when_script_indeterminate() {
+        // Same short ASCII input but the gateway hinted Korean
+        // (e.g. user's session source_language is `ko`). Detector
+        // returns Korean via the default, so the re-ask is Korean.
+        let v = validation_with(
+            QueryRoute::AskUserToRepeat,
+            "ok",
+            LanguageCode::Ko,
+            "",
+        );
+        assert_eq!(v.detected_language, LanguageCode::Ko);
+        assert!(ask_user_to_repeat(v.detected_language).contains("잘 들리지 않습니다"));
+    }
+
+    #[test]
+    fn confirm_interpretation_message_localizes_to_arabic_speaker() {
+        let v = validation_with(
+            QueryRoute::ConfirmInterpretation,
+            "ما هو الطقس اليوم",
+            LanguageCode::En,
+            "تسأل عن طقس اليوم",
+        );
+        assert_eq!(v.detected_language, LanguageCode::Ar);
+        let msg = confirm_interpretation_message(&v.interpreted_meaning, v.detected_language);
+        assert!(msg.starts_with(confirm_interpretation_prefix(LanguageCode::Ar)));
+        assert!(msg.contains("'تسأل عن طقس اليوم'"));
+    }
+
+    #[test]
+    fn stt_result_default_language_is_optional_for_backwards_compat() {
+        // Old callers that don't set the new field must still
+        // deserialize cleanly. (We exercise the `serde(default)`
+        // attribute by parsing JSON missing the key.)
+        let json = r#"{"text":"hello","confidence":0.9,"processing_time_ms":42,"voice_retry_count":0}"#;
+        let parsed: SttResult = serde_json::from_str(json).expect("backwards-compat parse");
+        assert!(parsed.default_language.is_none());
     }
 }
