@@ -1898,51 +1898,119 @@ async fn build_memory_context(
     min_relevance_score: f64,
     session_id: Option<&str>,
 ) -> String {
-    let mut context = String::new();
+    build_memory_context_for_sessions(mem, user_msg, min_relevance_score, &[session_id]).await
+}
 
-    if let Ok(entries) = mem.recall(user_msg, 5, session_id, None, None).await {
-        let mut included = 0usize;
-        let mut used_chars = 0usize;
+async fn build_memory_context_for_sessions(
+    mem: &dyn Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+    session_ids: &[Option<&str>],
+) -> String {
+    let mut entries = Vec::new();
+    let mut seen_keys = HashSet::new();
 
-        for entry in entries.iter().filter(|e| match e.score {
-            Some(score) => score >= min_relevance_score,
-            None => true, // keep entries without a score (e.g. non-vector backends)
-        }) {
-            if included >= MEMORY_CONTEXT_MAX_ENTRIES {
-                break;
-            }
-
-            if should_skip_memory_context_entry(&entry.key, &entry.content) {
-                continue;
-            }
-
-            let content = if entry.content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
-                truncate_with_ellipsis(&entry.content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
-            } else {
-                entry.content.clone()
-            };
-
-            let line = format!("- {}: {}\n", entry.key, content);
-            let line_chars = line.chars().count();
-            if used_chars + line_chars > MEMORY_CONTEXT_MAX_CHARS {
-                break;
-            }
-
-            if included == 0 {
-                context.push_str("[Memory context]\n");
-            }
-
-            context.push_str(&line);
-            used_chars += line_chars;
-            included += 1;
+    match session_ids {
+        [] => {}
+        [session_id] => {
+            let recalled = mem.recall(user_msg, 5, *session_id, None, None).await;
+            append_recalled_memory_entries(&mut entries, &mut seen_keys, recalled);
         }
-
-        if included > 0 {
-            context.push_str("[/Memory context]\n\n");
+        [first_session_id, second_session_id] => {
+            let (first_entries, second_entries) = tokio::join!(
+                mem.recall(user_msg, 5, *first_session_id, None, None),
+                mem.recall(user_msg, 5, *second_session_id, None, None)
+            );
+            append_recalled_memory_entries(&mut entries, &mut seen_keys, first_entries);
+            append_recalled_memory_entries(&mut entries, &mut seen_keys, second_entries);
+        }
+        _ => {
+            for session_id in session_ids {
+                let recalled = mem.recall(user_msg, 5, *session_id, None, None).await;
+                append_recalled_memory_entries(&mut entries, &mut seen_keys, recalled);
+            }
         }
     }
 
+    format_memory_context(&entries, min_relevance_score)
+}
+
+fn append_recalled_memory_entries(
+    entries: &mut Vec<zeroclaw_memory::MemoryEntry>,
+    seen_keys: &mut HashSet<String>,
+    recalled: Result<Vec<zeroclaw_memory::MemoryEntry>>,
+) {
+    if let Ok(recalled) = recalled {
+        for entry in recalled {
+            if seen_keys.insert(entry.key.clone()) {
+                entries.push(entry);
+            }
+        }
+    }
+}
+
+fn format_memory_context(
+    entries: &[zeroclaw_memory::MemoryEntry],
+    min_relevance_score: f64,
+) -> String {
+    let mut context = String::new();
+
+    let mut included = 0usize;
+    let mut used_chars = 0usize;
+
+    for entry in entries.iter().filter(|e| match e.score {
+        Some(score) => score >= min_relevance_score,
+        None => true, // keep entries without a score (e.g. non-vector backends)
+    }) {
+        if included >= MEMORY_CONTEXT_MAX_ENTRIES {
+            break;
+        }
+
+        if should_skip_memory_context_entry(&entry.key, &entry.content) {
+            continue;
+        }
+
+        let content = if entry.content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
+            truncate_with_ellipsis(&entry.content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
+        } else {
+            entry.content.clone()
+        };
+
+        let line = format!("- {}: {}\n", entry.key, content);
+        let line_chars = line.chars().count();
+        if used_chars + line_chars > MEMORY_CONTEXT_MAX_CHARS {
+            break;
+        }
+
+        if included == 0 {
+            context.push_str("[Memory context]\n");
+        }
+
+        context.push_str(&line);
+        used_chars += line_chars;
+        included += 1;
+    }
+
+    if included > 0 {
+        context.push_str("[/Memory context]\n\n");
+    }
+
     context
+}
+
+fn is_group_reply_target(reply_target: &str) -> bool {
+    reply_target.contains("@g.us") || reply_target.starts_with("group:")
+}
+
+fn sender_memory_session_ids<'a>(
+    msg: &'a zeroclaw_api::channel::ChannelMessage,
+    history_key: &'a str,
+) -> Vec<Option<&'a str>> {
+    if is_group_reply_target(&msg.reply_target) {
+        vec![Some(&msg.sender)]
+    } else {
+        vec![Some(history_key), Some(&msg.sender)]
+    }
 }
 
 /// Extract a compact summary of tool interactions from history messages added
@@ -2812,16 +2880,16 @@ async fn process_channel_message(
     // ── Dual-scope memory recall ──────────────────────────────────
     // Always recall before each LLM call (not just first turn).
     // For group chats: merge sender-scope + group-scope memories.
-    // For DMs: sender-scope only.
-    let is_group_chat =
-        msg.reply_target.contains("@g.us") || msg.reply_target.starts_with("group:");
+    // For DMs: recall from the current conversation scope plus sender scope.
+    let is_group_chat = is_group_reply_target(&msg.reply_target);
 
     let mem_recall_start = Instant::now();
-    let sender_memory_fut = build_memory_context(
+    let sender_session_ids = sender_memory_session_ids(&msg, &history_key);
+    let sender_memory_fut = build_memory_context_for_sessions(
         ctx.memory.as_ref(),
         &msg.content,
         ctx.min_relevance_score,
-        Some(&msg.sender),
+        sender_session_ids.as_slice(),
     );
 
     let (sender_memory, group_memory) = if is_group_chat {
@@ -2844,7 +2912,7 @@ async fn process_channel_message(
         "⏱ Memory recall completed"
     );
 
-    // Merge sender + group memories, avoiding duplicates
+    // Merge sender and group memory context blocks.
     let memory_context = if group_memory.is_empty() {
         sender_memory
     } else if sender_memory.is_empty() {
@@ -9770,6 +9838,105 @@ BTC is currently around $65,000 based on latest tool output."#
         let context = build_memory_context(&mem, "age", 0.0, None).await;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("Age is 45"));
+    }
+
+    #[tokio::test]
+    async fn autosaved_conversation_memory_is_recalled_by_sender_scope() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg_1".into(),
+            sender: "U123".into(),
+            reply_target: "C456".into(),
+            content: "Project codename is quartz".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let history_key = conversation_history_key(&msg);
+
+        mem.store(
+            &conversation_memory_key(&msg),
+            &msg.content,
+            MemoryCategory::Conversation,
+            Some(&history_key),
+        )
+        .await
+        .unwrap();
+
+        let session_ids = sender_memory_session_ids(&msg, &history_key);
+        let context = build_memory_context_for_sessions(&mem, "quartz", 0.0, &session_ids).await;
+
+        assert!(
+            context.contains("Project codename is quartz"),
+            "sender recall should include autosaved memories stored under the current session key, got: {context}"
+        );
+    }
+
+    #[tokio::test]
+    async fn autosaved_group_conversation_memory_stays_session_scoped() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let group_a_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg_1".into(),
+            sender: "U123".into(),
+            reply_target: "group:alpha".into(),
+            content: "Group alpha codename is quartz".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let group_b_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg_2".into(),
+            sender: "U123".into(),
+            reply_target: "group:beta".into(),
+            content: "What was the codename?".into(),
+            channel: "slack".into(),
+            timestamp: 2,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let group_a_history_key = conversation_history_key(&group_a_msg);
+        let group_b_history_key = conversation_history_key(&group_b_msg);
+
+        mem.store(
+            &conversation_memory_key(&group_a_msg),
+            &group_a_msg.content,
+            MemoryCategory::Conversation,
+            Some(&group_a_history_key),
+        )
+        .await
+        .unwrap();
+
+        let group_b_sender_session_ids =
+            sender_memory_session_ids(&group_b_msg, &group_b_history_key);
+        assert_eq!(group_b_sender_session_ids, vec![Some("U123")]);
+
+        let sender_context =
+            build_memory_context_for_sessions(&mem, "quartz", 0.0, &group_b_sender_session_ids)
+                .await;
+        let group_context =
+            build_memory_context(&mem, "quartz", 0.0, Some(&group_b_history_key)).await;
+        let source_group_context =
+            build_memory_context(&mem, "quartz", 0.0, Some(&group_a_history_key)).await;
+
+        assert!(
+            sender_context.is_empty(),
+            "sender scope must not leak autosaved group memory from another group, got: {sender_context}"
+        );
+        assert!(
+            group_context.is_empty(),
+            "target group scope must not include another group's autosaved memory, got: {group_context}"
+        );
+        assert!(
+            source_group_context.contains("Group alpha codename is quartz"),
+            "source group scope should still recall its own autosaved memory, got: {source_group_context}"
+        );
     }
 
     /// Auto-saved photo messages must not surface through memory context,
