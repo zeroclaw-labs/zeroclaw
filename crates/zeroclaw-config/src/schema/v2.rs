@@ -1144,7 +1144,20 @@ fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut
 
     let mut tts_aliased = toml::Table::new();
     for ty in V3_TTS_TYPES {
-        if let Some(value) = tts_table.remove(*ty) {
+        if let Some(mut value) = tts_table.remove(*ty) {
+            // V2 ElevenLabsTtsConfig.model_id → V3 TtsProviderConfig.model.
+            // Other V2 sub-types (OpenAi, Google, Edge, Piper) used field
+            // names that survive into V3's unified TtsProviderConfig as-is.
+            if *ty == "elevenlabs"
+                && let Some(t) = value.as_table_mut()
+                && let Some(v) = t.remove("model_id")
+            {
+                t.entry("model".to_string()).or_insert(v);
+                tracing::info!(
+                    target: "migration",
+                    "tts.elevenlabs.model_id renamed to tts.elevenlabs.model"
+                );
+            }
             let mut wrapped = toml::Table::new();
             wrapped.insert("default".to_string(), value);
             tts_aliased.insert((*ty).to_string(), toml::Value::Table(wrapped));
@@ -1196,15 +1209,16 @@ fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut
 /// Existing V3-shaped fields take precedence over the legacy fold (so a
 /// user who already wrote `[storage.qdrant.default]` doesn't get clobbered).
 fn fold_v2_storage_subsystems(passthrough: &mut toml::Table) {
-    let (memory_qdrant, memory_postgres) = match passthrough
+    let (memory_qdrant, memory_postgres, memory_sqlite_timeout) = match passthrough
         .get_mut("memory")
         .and_then(toml::Value::as_table_mut)
     {
-        Some(memory) => {
-            memory.remove("sqlite_open_timeout_secs");
-            (memory.remove("qdrant"), memory.remove("postgres"))
-        }
-        None => (None, None),
+        Some(memory) => (
+            memory.remove("qdrant"),
+            memory.remove("postgres"),
+            memory.remove("sqlite_open_timeout_secs"),
+        ),
+        None => (None, None, None),
     };
 
     let storage_provider = match passthrough
@@ -1215,7 +1229,11 @@ fn fold_v2_storage_subsystems(passthrough: &mut toml::Table) {
         None => None,
     };
 
-    if memory_qdrant.is_none() && memory_postgres.is_none() && storage_provider.is_none() {
+    if memory_qdrant.is_none()
+        && memory_postgres.is_none()
+        && memory_sqlite_timeout.is_none()
+        && storage_provider.is_none()
+    {
         return;
     }
 
@@ -1231,6 +1249,15 @@ fn fold_v2_storage_subsystems(passthrough: &mut toml::Table) {
         tracing::info!(
             target: "migration",
             "[memory.qdrant] promoted to [storage.qdrant.default]"
+        );
+    }
+    if let Some(timeout_value) = memory_sqlite_timeout {
+        let mut sqlite_fields = toml::Table::new();
+        sqlite_fields.insert("open_timeout_secs".to_string(), timeout_value);
+        merge_storage_default(storage_table, "sqlite", sqlite_fields);
+        tracing::info!(
+            target: "migration",
+            "memory.sqlite_open_timeout_secs → [storage.sqlite.default].open_timeout_secs"
         );
     }
     if let Some(toml::Value::Table(postgres_vector_data)) = memory_postgres {

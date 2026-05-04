@@ -339,8 +339,8 @@ fn t8_tts_subsystem_promoted_to_providers() {
         "V2 [tts.openai].api_key did not land at providers.tts.openai.default.api_key"
     );
 
-    // ElevenLabs model_id should also be carried over.
-    let eleven_model = value
+    // ElevenLabs V2 `model_id` must be renamed to V3 `model`.
+    let eleven_default = value
         .get("providers")
         .and_then(toml::Value::as_table)
         .and_then(|t| t.get("tts"))
@@ -349,9 +349,16 @@ fn t8_tts_subsystem_promoted_to_providers() {
         .and_then(toml::Value::as_table)
         .and_then(|t| t.get("default"))
         .and_then(toml::Value::as_table)
-        .and_then(|t| t.get("model_id"))
-        .and_then(toml::Value::as_str);
-    assert_eq!(eleven_model, Some("eleven_monolingual_v1"));
+        .expect("providers.tts.elevenlabs.default present");
+    assert_eq!(
+        eleven_default.get("model").and_then(toml::Value::as_str),
+        Some("eleven_monolingual_v1"),
+        "V2 tts.elevenlabs.model_id must be renamed to V3 model on TtsProviderConfig"
+    );
+    assert!(
+        !eleven_default.contains_key("model_id"),
+        "V2 model_id must not survive into V3 (it has no slot on TtsProviderConfig)"
+    );
 }
 
 #[test]
@@ -399,6 +406,22 @@ fn t9_memory_postgres_vector_fields_promoted() {
         "V2 [memory.postgres] vector_enabled must land at V3 storage.postgres.default.vector_enabled"
     );
     assert_eq!(pg.vector_dimensions, 1536);
+}
+
+#[test]
+fn t9_memory_sqlite_open_timeout_promoted() {
+    let cfg = v3_config();
+    let sqlite = cfg
+        .storage
+        .sqlite
+        .get("default")
+        .expect("storage.sqlite.default exists after sqlite_open_timeout_secs fold");
+    assert_eq!(
+        sqlite.open_timeout_secs,
+        Some(60),
+        "V2 memory.sqlite_open_timeout_secs must land at \
+         storage.sqlite.default.open_timeout_secs"
+    );
 }
 
 #[test]
