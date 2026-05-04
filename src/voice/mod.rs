@@ -34,6 +34,7 @@ pub mod simul_session;
 pub mod tts_engine;
 pub mod tts_router;
 pub mod typecast_interp;
+pub mod voice_chat_pipeline;
 
 // ── Shared voice event type ──────────────────────────────────────
 
@@ -84,3 +85,8 @@ pub use simul::{CommittedSegment, SegmentationConfig, SegmentationEngine};
 pub use simul_session::{SimulSession, SimulSessionConfig};
 #[allow(unused_imports)]
 pub use typecast_interp::{TypecastInterpConfig, TypecastInterpSession};
+#[allow(unused_imports)]
+pub use voice_chat_pipeline::{
+    LatencyBreakdown, QueryRoute, SttResult, ValidationResult, VoiceChatPipeline,
+    VoiceChatResponse,
+};
