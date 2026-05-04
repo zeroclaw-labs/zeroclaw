@@ -38,9 +38,13 @@ COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 COPY tools/fill-translations/Cargo.toml tools/fill-translations/Cargo.toml
 COPY xtask/Cargo.toml xtask/Cargo.toml
 # Create dummy targets for all workspace members so manifest parsing succeeds.
-RUN mkdir -p src benches apps/tauri/src tools/fill-translations/src xtask/src \
+# `src/bin/zeroclaw-acp-bridge.rs` is required because the `acp-bridge` feature
+# is in the root crate's default set; cargo selects the bin target during the
+# pre-fetch build even with only the workspace lib stubbed.
+RUN mkdir -p src src/bin benches apps/tauri/src tools/fill-translations/src xtask/src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
+    && echo "fn main() {}" > src/bin/zeroclaw-acp-bridge.rs \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
     && echo "fn main() {}" > apps/tauri/src/main.rs \
     && echo "fn main() {}" > apps/tauri/build.rs \
