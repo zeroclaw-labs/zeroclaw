@@ -55,6 +55,35 @@
 //! repo already ships `crate::voice::gemma_asr::GemmaAsrSession`,
 //! which is the production STT path. This module's pipeline starts
 //! from the SttResult that path produces.
+//!
+//! # Cloud LLM is always available — the operator-key fallback
+//!
+//! **There is no "user has no cloud LLM" branch in this pipeline.**
+//! MoA's contract for the ComplexLlm route is that the cloud LLM is
+//! *always* reachable, because:
+//!
+//!   1. If the user has set their own provider key in Settings, the
+//!      caller injects a direct provider (Anthropic / OpenAI / Gemini)
+//!      backed by that key. No credit deduction.
+//!   2. If the user has NOT set a cloud provider key, the caller
+//!      injects a `crate::providers::proxy::ProxyProvider` that routes
+//!      the request through the Railway `/api/llm/proxy` endpoint
+//!      (currently backed by the operator's Gemini 3.1 Flash key).
+//!      Credits are deducted at the operator-key 2.2× multiplier
+//!      (`OPERATOR_KEY_CREDIT_MULTIPLIER` in
+//!      `crate::billing::llm_router`).
+//!
+//! Concretely: this pipeline takes a non-optional `llm: Arc<dyn Provider>`
+//! and trusts the caller (today: the voice gateway / WS handler) to have
+//! resolved that decision the same way `src/agent/loop_.rs` does for
+//! text chat — see the `let provider: Box<dyn Provider> = if let
+//! (Some(proxy_url), Some(proxy_token)) = ...` block there.
+//!
+//! Returning a deterministic apology when the cloud LLM is "missing"
+//! would be wrong: it would silently bypass the operator-key billing
+//! path and hand the user a useless TTS turn. If the LLM call itself
+//! fails (network down, proxy 5xx, etc.) we propagate the error —
+//! the gateway layer is responsible for any user-facing fallback copy.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -72,11 +101,38 @@ use crate::providers::Provider;
 /// these per finalized utterance. `confidence` is on the [0.0, 1.0]
 /// scale; producers that don't expose a confidence score should pass
 /// 1.0 (fully confident) so the pipeline doesn't penalize them.
+///
+/// `voice_retry_count` is the gateway's running counter of how many
+/// times *in a row* the user has re-spoken the same intent on this
+/// turn (i.e. successive voice utterances after the pipeline asked
+/// them to repeat or confirm). It drives the staircase fallback the
+/// user specified:
+///
+///   * `0` → first voice attempt. If Gemma is uncertain, the pipeline
+///     returns `AskUserToRepeat` ("잘 들리지 않습니다…").
+///   * `1` → user spoke again (still uncertain). The pipeline returns
+///     `ConfirmInterpretation` with Gemma's paraphrase ("혹시 이렇게
+///     이해하는 것이 맞습니까? '<paraphrase>'"). The gateway then
+///     waits for the user's yes/no/correction reply and concatenates
+///     it into the next turn's STT text before re-running the pipeline
+///     — so the LLM receives both Gemma's interpretation and the
+///     user's confirmation in one prompt.
+///   * `>= 2` → we've already exhausted the cheap re-ask paths.
+///     Commit to ComplexLlm so the user is never stuck in a loop.
+///
+/// If the user types instead of re-speaking, the gateway should
+/// dispatch through the text chat path entirely; this pipeline never
+/// sees that turn. So `voice_retry_count` only counts *voice* retries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SttResult {
     pub text: String,
     pub confidence: f32,
     pub processing_time_ms: u64,
+    /// How many voice re-attempts have happened on this conversational
+    /// turn already. `0` for a fresh turn. Defaults to `0` so older
+    /// call sites that don't track retry state behave like a fresh turn.
+    #[serde(default)]
+    pub voice_retry_count: u8,
 }
 
 /// Validation outcome from the Gemma self-check stage.
@@ -90,6 +146,10 @@ pub struct ValidationResult {
     pub is_simple_query: bool,
     /// Routing decision from the JSON.
     pub route: QueryRoute,
+    /// Gemma's best paraphrase of what it thinks the user said. Used
+    /// as the body of the `ConfirmInterpretation` re-ask. Empty when
+    /// Gemma did not produce one (or when the route doesn't need it).
+    pub interpreted_meaning: String,
     /// Wall-clock time the validation step itself took.
     pub validation_time_ms: u64,
 }
@@ -99,6 +159,19 @@ pub struct ValidationResult {
 pub enum QueryRoute {
     /// Gemma 4 will answer directly on-device.
     SimpleGemma,
+    /// First-attempt re-ask: Gemma was uncertain it understood the
+    /// user (ambiguous words, or `query_type = unclear`). Hand back
+    /// the fixed phrase "잘 들리지 않습니다…" so the gateway can ask
+    /// the user to repeat or switch to text. No paid LLM call.
+    AskUserToRepeat,
+    /// Second-attempt confirmation: the user re-spoke and Gemma is
+    /// *still* uncertain. Instead of asking blindly again, the
+    /// pipeline returns Gemma's best paraphrase wrapped in a "혹시
+    /// 이렇게 이해하는 것이 맞습니까?" prompt. The gateway is then
+    /// expected to capture the user's yes/no/correction and feed both
+    /// back into the next turn (so the LLM ultimately sees both
+    /// Gemma's reading and the user's confirmation). No paid LLM call.
+    ConfirmInterpretation,
     /// Send to the cloud LLM with the STT-tolerant prompt.
     ComplexLlm,
 }
@@ -135,31 +208,43 @@ pub struct VoiceChatPipeline {
     /// Gemma 4 model id (e.g. `"gemma4:e4b"`). Reused for validate
     /// and direct-answer calls.
     gemma_model: String,
-    /// Provider for the cloud LLM fallback (Anthropic / OpenAI /
-    /// Gemini, depending on user account configuration). When `None`,
-    /// the ComplexLlm route bails — the caller should treat that as
-    /// "answer offline-only with the STT text raw".
-    llm: Option<Arc<dyn Provider>>,
-    /// Cloud LLM model id (e.g. `"claude-opus-4-7"`).
-    llm_model: Option<String>,
+    /// Provider for the cloud LLM fallback. The caller resolves this
+    /// per the operator-key fallback contract documented at module
+    /// level: a user-key-backed direct provider when the user has set
+    /// their own key, or a `ProxyProvider` pointed at the Railway LLM
+    /// proxy (currently Gemini 3.1 Flash) when they have not. The
+    /// pipeline does NOT distinguish between the two; both look like
+    /// `dyn Provider` from here, and the credit-deduction side effect
+    /// (2.2× at `OPERATOR_KEY_CREDIT_MULTIPLIER`) is applied
+    /// gateway-side via `record_usage` in the proxy path.
+    llm: Arc<dyn Provider>,
+    /// Cloud LLM model id. For the operator-fallback path this is the
+    /// platform default for `TaskCategory::Interpretation` /
+    /// `GeneralChat` (currently a Gemini 3.1 Flash variant) — see
+    /// `crate::billing::llm_router::default_model_for_task`. For the
+    /// user-key path it's whatever model the user selected.
+    llm_model: String,
 }
 
 impl VoiceChatPipeline {
-    /// Construct a pipeline. The `llm` / `llm_model` pair is optional;
-    /// when absent, the `ComplexLlm` route returns the STT text
-    /// verbatim with a deterministic apology (so the caller can still
-    /// TTS something).
+    /// Construct a pipeline.
+    ///
+    /// `llm` / `llm_model` are required: every voice turn that routes
+    /// to ComplexLlm must reach a cloud model, either via the user's
+    /// own key or via the operator's Railway proxy. See module-level
+    /// docs for the resolution contract the caller is expected to
+    /// follow.
     pub fn new(
         gemma: Arc<dyn Provider>,
         gemma_model: impl Into<String>,
-        llm: Option<Arc<dyn Provider>>,
-        llm_model: Option<String>,
+        llm: Arc<dyn Provider>,
+        llm_model: impl Into<String>,
     ) -> Self {
         Self {
             gemma,
             gemma_model: gemma_model.into(),
             llm,
-            llm_model,
+            llm_model: llm_model.into(),
         }
     }
 
@@ -185,6 +270,36 @@ impl VoiceChatPipeline {
                 self.gemma_direct_answer(&stt.text)
                     .await
                     .context("voice-chat direct-answer stage failed")?
+            }
+            QueryRoute::AskUserToRepeat => {
+                // Cost-saving + UX: first re-ask. Gemma was uncertain
+                // it understood the user. Hand back a fixed re-ask
+                // phrase instead of paying for an LLM call on a
+                // noisy/ambiguous transcript. The gateway is
+                // responsible for routing this through TTS *and* the
+                // chat thread, and for incrementing
+                // `voice_retry_count` on the next voice turn so the
+                // staircase advances to ConfirmInterpretation.
+                debug!(
+                    "voice-chat: route C1 — ask user to repeat (uncertain, retry_count=0)"
+                );
+                ASK_USER_TO_REPEAT_MESSAGE.to_string()
+            }
+            QueryRoute::ConfirmInterpretation => {
+                // Second-attempt confirmation: still uncertain after
+                // the user re-spoke. Show Gemma's paraphrase wrapped
+                // in the fixed prefix; gateway captures yes/no/correction
+                // and feeds it into the next turn so the LLM ultimately
+                // sees both readings.
+                debug!(
+                    "voice-chat: route C2 — confirm interpretation (uncertain, retry_count=1)"
+                );
+                let paraphrase = validation.interpreted_meaning.trim();
+                if paraphrase.is_empty() {
+                    CONFIRM_INTERPRETATION_FALLBACK_MESSAGE.to_string()
+                } else {
+                    format!("{CONFIRM_INTERPRETATION_PREFIX} '{paraphrase}'")
+                }
             }
             QueryRoute::ComplexLlm => {
                 debug!("voice-chat: route B — cloud LLM with STT-tolerant prompt");
@@ -258,23 +373,18 @@ impl VoiceChatPipeline {
                 query_type: QueryType::Unclear,
                 can_answer_directly: false,
                 confidence: 0.0,
+                interpreted_meaning: String::new(),
             }
         });
 
-        let route = if parsed.can_answer_directly
-            && !parsed.has_ambiguous_words
-            && matches!(parsed.query_type, QueryType::SimpleFactual | QueryType::SimpleCommand)
-        {
-            QueryRoute::SimpleGemma
-        } else {
-            QueryRoute::ComplexLlm
-        };
+        let route = decide_route(&parsed, stt.voice_retry_count);
 
         Ok(ValidationResult {
             is_valid: parsed.is_grammatically_complete,
             confidence: parsed.confidence,
             is_simple_query: matches!(route, QueryRoute::SimpleGemma),
             route,
+            interpreted_meaning: parsed.interpreted_meaning,
             validation_time_ms,
         })
     }
@@ -308,43 +418,35 @@ impl VoiceChatPipeline {
         }
     }
 
-    /// Stage [3-B] — cloud LLM fallback. Uses the STT-error-tolerant
-    /// system prompt the user supplied; the user prompt branches on
-    /// the validation confidence (≥ 0.85 vs < 0.85) per the spec.
+    /// Stage [3-B] — cloud LLM call with the STT-error-tolerant
+    /// prompt. Uses the user-supplied system prompt verbatim; the user
+    /// prompt branches on the validation confidence (≥ 0.85 vs < 0.85)
+    /// per the spec.
+    ///
+    /// The `llm` provider is whatever the caller resolved per the
+    /// operator-key fallback contract (see module-level docs):
+    /// the user's own provider when they have set a cloud key, or a
+    /// `ProxyProvider` to the Railway LLM proxy (currently Gemini 3.1
+    /// Flash, billed at the 2.2× operator multiplier) when they have
+    /// not. Both look identical from here. Errors propagate; the
+    /// gateway layer owns any user-facing copy for "the cloud call
+    /// failed".
     async fn llm_robust_answer(
         &self,
         stt_text: &str,
         validation: &ValidationResult,
     ) -> Result<String> {
-        let (llm, model) = match (self.llm.as_ref(), self.llm_model.as_ref()) {
-            (Some(llm), Some(model)) => (llm, model),
-            _ => {
-                // No LLM configured — return a deterministic hand-off
-                // apology so the TTS stage produces audible output and
-                // the user knows to retry / type. Better than a panic
-                // or an empty TTS turn.
-                warn!(
-                    "voice-chat: ComplexLlm route requested but no cloud LLM \
-                     configured; returning offline apology"
-                );
-                return Ok(format!(
-                    "죄송합니다. 네트워크가 끊겨 있어 자세한 답변을 드릴 수 없어요. \
-                     말씀하신 내용은 \"{stt_text}\" 로 들었어요. 다시 말씀해 주시거나, \
-                     온라인 상태에서 다시 시도해 주세요."
-                ));
-            }
-        };
-
         let user_prompt = build_llm_user_prompt(stt_text, validation.confidence);
 
-        llm.chat_with_system(
-            Some(LLM_STT_TOLERANT_SYSTEM_PROMPT),
-            &user_prompt,
-            model,
-            0.7,
-        )
-        .await
-        .context("Cloud LLM fallback call failed")
+        self.llm
+            .chat_with_system(
+                Some(LLM_STT_TOLERANT_SYSTEM_PROMPT),
+                &user_prompt,
+                &self.llm_model,
+                0.7,
+            )
+            .await
+            .context("Cloud LLM call failed (operator-fallback path or user-key path)")
     }
 }
 
@@ -363,7 +465,10 @@ const VALIDATION_SYSTEM_PROMPT: &str = "\
   has_ambiguous_words: 의미가 불분명하거나 STT 오류로 의심되는 단어가 있는가\n\
   query_type: simple_factual | simple_command | complex_reasoning | unclear\n\
   can_answer_directly: 너 자신이 (작은 SLM이) 정확히 답할 수 있는가\n\
-  confidence: 위 판단들에 대한 너의 자신감 (0.0~1.0)";
+  confidence: 위 판단들에 대한 너의 자신감 (0.0~1.0)\n\
+  interpreted_meaning: 사용자의 의도를 네가 이해한 그대로 한 문장으로 \
+요약 (자신감이 낮거나 의미가 모호해도 최선의 추측을 적을 것; 정말 \
+아무 의미도 못 잡았다면 빈 문자열)";
 
 /// System prompt for the Gemma direct-answer step. Prevents the model
 /// from going off on a tangent when the validation routed a simple
@@ -372,6 +477,31 @@ const GEMMA_DIRECT_ANSWER_SYSTEM_PROMPT: &str = "\
 당신은 사용자의 음성 질문에 즉시 답변하는 한국어 음성 어시스턴트입니다.\n\
 답변은 짧고 정확해야 하며, 불필요한 인사말은 생략하세요.\n\
 사용자가 다시 묻지 않도록 한 번에 핵심을 전달하세요.";
+
+/// First-attempt re-ask phrase, fixed by user spec (2026-05-04).
+/// Returned as the answer body when the route is `AskUserToRepeat`.
+/// Costs nothing (no LLM call) and gives the user a chance to either
+/// re-speak more clearly or switch to typed input.
+const ASK_USER_TO_REPEAT_MESSAGE: &str =
+    "잘 들리지 않습니다. 혹시 다시 말씀해주시거나 \
+     아니면 텍스트로 입력해주시면 감사하겠습니다.";
+
+/// Second-attempt confirmation prefix, fixed by user spec (2026-05-04).
+/// The full phrase is built at runtime as
+/// `"{prefix} '{interpreted_meaning}'"` so the user sees Gemma's best
+/// reading verbatim and can confirm/correct it. Still no LLM call;
+/// the gateway captures the user's reply and bundles it into the
+/// next turn so the eventual ComplexLlm prompt has both sides.
+const CONFIRM_INTERPRETATION_PREFIX: &str =
+    "혹시 이렇게 이해하는 것이 맞습니까?";
+
+/// Fallback used when the route is `ConfirmInterpretation` but Gemma
+/// failed to produce any paraphrase at all (empty `interpreted_meaning`).
+/// Degrades gracefully to the same first-attempt phrase so the user is
+/// never shown a dangling "혹시 이렇게 이해하는 것이 맞습니까? ''".
+const CONFIRM_INTERPRETATION_FALLBACK_MESSAGE: &str =
+    "여전히 잘 들리지 않습니다. \
+     텍스트로 입력해주시면 더 정확하게 도와드릴 수 있습니다.";
 
 /// System prompt for the cloud LLM fallback. The user wrote this
 /// verbatim; it is reproduced exactly because every line is
@@ -425,6 +555,39 @@ fn build_llm_user_prompt(stt_text: &str, confidence: f32) -> String {
     }
 }
 
+// ── Routing decision ────────────────────────────────────────────────
+
+/// Decide the route from a parsed validation + the current
+/// voice-retry counter. Pulled out as a free function so the unit
+/// tests can drive it directly without standing up a `Provider` mock.
+///
+/// Staircase (ordered, first match wins):
+///   1. `SimpleGemma` — Gemma is sure it can answer and the query
+///      is plain (`can_answer_directly && !ambiguous && simple_*`).
+///   2. `AskUserToRepeat` — uncertain (`ambiguous || unclear`) on
+///      the user's first voice attempt (`retry_count == 0`).
+///   3. `ConfirmInterpretation` — uncertain *again* on the second
+///      voice attempt (`retry_count == 1`).
+///   4. `ComplexLlm` — everything else: complex reasoning,
+///      `retry_count >= 2` (we've exhausted the cheap re-ask paths
+///      and must commit), and the JSON-parse-failed safe default.
+fn decide_route(parsed: &ParsedValidation, voice_retry_count: u8) -> QueryRoute {
+    let is_uncertain = parsed.has_ambiguous_words
+        || matches!(parsed.query_type, QueryType::Unclear);
+    if parsed.can_answer_directly
+        && !parsed.has_ambiguous_words
+        && matches!(parsed.query_type, QueryType::SimpleFactual | QueryType::SimpleCommand)
+    {
+        QueryRoute::SimpleGemma
+    } else if is_uncertain && voice_retry_count == 0 {
+        QueryRoute::AskUserToRepeat
+    } else if is_uncertain && voice_retry_count == 1 {
+        QueryRoute::ConfirmInterpretation
+    } else {
+        QueryRoute::ComplexLlm
+    }
+}
+
 // ── Validation JSON parsing ─────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,6 +616,9 @@ struct ParsedValidation {
     query_type: QueryType,
     can_answer_directly: bool,
     confidence: f32,
+    /// Gemma's best paraphrase of the user's intent ("내가 이해한
+    /// 것을 적자면…"). Empty string when missing from the JSON.
+    interpreted_meaning: String,
 }
 
 /// Robust JSON extraction from a model reply. Real SLMs sometimes
@@ -498,6 +664,12 @@ fn parse_validation_json(raw: &str) -> Result<ParsedValidation> {
             .and_then(|x| x.as_f64())
             .map(|f| f as f32)
             .unwrap_or(0.0),
+        interpreted_meaning: v
+            .get("interpreted_meaning")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
     })
 }
 
@@ -505,67 +677,61 @@ fn parse_validation_json(raw: &str) -> Result<ParsedValidation> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn route_simple_when_can_answer_and_clear_and_simple_factual() {
-        let parsed = ParsedValidation {
+    fn parsed_with(
+        ambiguous: bool,
+        qt: QueryType,
+        can_answer: bool,
+        meaning: &str,
+    ) -> ParsedValidation {
+        ParsedValidation {
             is_grammatically_complete: true,
-            has_ambiguous_words: false,
-            query_type: QueryType::SimpleFactual,
-            can_answer_directly: true,
-            confidence: 0.92,
-        };
-        let route = if parsed.can_answer_directly
-            && !parsed.has_ambiguous_words
-            && matches!(parsed.query_type, QueryType::SimpleFactual | QueryType::SimpleCommand)
-        {
-            QueryRoute::SimpleGemma
-        } else {
-            QueryRoute::ComplexLlm
-        };
-        assert_eq!(route, QueryRoute::SimpleGemma);
+            has_ambiguous_words: ambiguous,
+            query_type: qt,
+            can_answer_directly: can_answer,
+            confidence: 0.85,
+            interpreted_meaning: meaning.to_string(),
+        }
     }
 
     #[test]
-    fn route_to_llm_when_ambiguous_word_flagged() {
+    fn route_simple_when_can_answer_and_clear_and_simple_factual() {
+        let parsed = parsed_with(false, QueryType::SimpleFactual, true, "");
+        assert_eq!(decide_route(&parsed, 0), QueryRoute::SimpleGemma);
+    }
+
+    #[test]
+    fn route_to_ask_repeat_when_ambiguous_word_flagged_first_attempt() {
         // The "대한사람" case from the user's spec: Gemma's check
         // says "yes, can answer" but flags ambiguous_words=true.
-        // We MUST escalate.
-        let parsed = ParsedValidation {
-            is_grammatically_complete: true,
-            has_ambiguous_words: true,
-            query_type: QueryType::SimpleFactual,
-            can_answer_directly: true,
-            confidence: 0.7,
-        };
-        let route = if parsed.can_answer_directly
-            && !parsed.has_ambiguous_words
-            && matches!(parsed.query_type, QueryType::SimpleFactual | QueryType::SimpleCommand)
-        {
-            QueryRoute::SimpleGemma
-        } else {
-            QueryRoute::ComplexLlm
-        };
-        assert_eq!(route, QueryRoute::ComplexLlm);
+        // First attempt → AskUserToRepeat (cheap re-ask, no LLM bill).
+        let parsed = parsed_with(true, QueryType::SimpleFactual, true, "");
+        assert_eq!(decide_route(&parsed, 0), QueryRoute::AskUserToRepeat);
+    }
+
+    #[test]
+    fn route_to_confirm_when_ambiguous_again_on_second_attempt() {
+        // Same "대한사람"-class ambiguity, but the user already
+        // re-spoke once. Don't ask blindly again — show Gemma's
+        // paraphrase and ask for confirmation.
+        let parsed = parsed_with(true, QueryType::SimpleFactual, true, "대한민국 사람의 역사");
+        assert_eq!(decide_route(&parsed, 1), QueryRoute::ConfirmInterpretation);
+    }
+
+    #[test]
+    fn route_to_llm_when_ambiguous_after_two_retries() {
+        // Exhausted both cheap re-asks; commit to LLM so the user is
+        // never trapped in a re-ask loop.
+        let parsed = parsed_with(true, QueryType::Unclear, false, "");
+        assert_eq!(decide_route(&parsed, 2), QueryRoute::ComplexLlm);
     }
 
     #[test]
     fn route_to_llm_when_complex_reasoning_even_if_clear() {
-        let parsed = ParsedValidation {
-            is_grammatically_complete: true,
-            has_ambiguous_words: false,
-            query_type: QueryType::ComplexReasoning,
-            can_answer_directly: false,
-            confidence: 0.95,
-        };
-        let route = if parsed.can_answer_directly
-            && !parsed.has_ambiguous_words
-            && matches!(parsed.query_type, QueryType::SimpleFactual | QueryType::SimpleCommand)
-        {
-            QueryRoute::SimpleGemma
-        } else {
-            QueryRoute::ComplexLlm
-        };
-        assert_eq!(route, QueryRoute::ComplexLlm);
+        // ComplexReasoning is not "uncertain" (Gemma understood it
+        // fine, it's just out of its depth) so the re-ask staircase
+        // does not trigger — straight to ComplexLlm even at retry 0.
+        let parsed = parsed_with(false, QueryType::ComplexReasoning, false, "");
+        assert_eq!(decide_route(&parsed, 0), QueryRoute::ComplexLlm);
     }
 
     #[test]
@@ -641,5 +807,64 @@ mod tests {
         let p = build_validation_prompt("안녕하세요", 0.83);
         assert!(p.contains("안녕하세요"));
         assert!(p.contains("83.00%"));
+    }
+
+    #[test]
+    fn parse_validation_extracts_interpreted_meaning() {
+        let raw = r#"{
+            "is_grammatically_complete": false,
+            "has_ambiguous_words": true,
+            "query_type": "unclear",
+            "can_answer_directly": false,
+            "confidence": 0.4,
+            "interpreted_meaning": "대한민국 사람의 역사를 묻는 듯"
+        }"#;
+        let parsed = parse_validation_json(raw).unwrap();
+        assert_eq!(parsed.interpreted_meaning, "대한민국 사람의 역사를 묻는 듯");
+    }
+
+    #[test]
+    fn parse_validation_missing_interpreted_meaning_is_empty_string() {
+        // Older Gemma replies (before we added the field to the
+        // prompt) won't include it — must degrade to empty string,
+        // not panic, so the ConfirmInterpretation branch can fall
+        // back to the "여전히 잘 들리지 않습니다…" message.
+        let raw = r#"{
+            "is_grammatically_complete": true,
+            "has_ambiguous_words": false,
+            "query_type": "simple_factual",
+            "can_answer_directly": true,
+            "confidence": 0.9
+        }"#;
+        let parsed = parse_validation_json(raw).unwrap();
+        assert_eq!(parsed.interpreted_meaning, "");
+    }
+
+    /// Mirrors the exact format string used in the
+    /// `ConfirmInterpretation` arm of `validate_and_answer`. Kept as
+    /// a small inline closure so a future refactor of the format
+    /// string updates one place.
+    fn confirm_interpretation_message(paraphrase: &str) -> String {
+        let trimmed = paraphrase.trim();
+        if trimmed.is_empty() {
+            CONFIRM_INTERPRETATION_FALLBACK_MESSAGE.to_string()
+        } else {
+            format!("{CONFIRM_INTERPRETATION_PREFIX} '{trimmed}'")
+        }
+    }
+
+    #[test]
+    fn confirm_interpretation_with_paraphrase_includes_quote() {
+        let msg = confirm_interpretation_message("대한민국 사람의 역사");
+        assert!(msg.starts_with(CONFIRM_INTERPRETATION_PREFIX));
+        assert!(msg.contains("'대한민국 사람의 역사'"));
+    }
+
+    #[test]
+    fn confirm_interpretation_falls_back_when_paraphrase_empty() {
+        // Must never produce "혹시 이렇게 이해하는 것이 맞습니까? ''" —
+        // that would be a worse UX than the first re-ask phrase.
+        let msg = confirm_interpretation_message("   ");
+        assert_eq!(msg, CONFIRM_INTERPRETATION_FALLBACK_MESSAGE);
     }
 }
