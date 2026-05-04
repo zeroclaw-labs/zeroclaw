@@ -1,317 +1,71 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2 } from 'lucide-react';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import type { WsMessage } from '@/types/api';
-import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
-import { generateUUID } from '@/lib/uuid';
+import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
-import { abortSession, getSessionMessages } from '@/lib/api';
-import ToolCallCard from '@/components/ToolCallCard';
-import type { ToolCallInfo } from '@/components/ToolCallCard';
-import {
-  loadChatHistory,
-  mapServerMessagesToPersisted,
-  persistedToUiMessages,
-  saveChatHistory,
-  uiMessagesToPersisted,
-} from '@/lib/chatHistoryStorage';
 
-interface ChatMessage {
-  id: string;
-  role: 'user' | 'agent';
-  content: string;
-  thinking?: string;
-  markdown?: boolean;
-  toolCall?: ToolCallInfo;
-  timestamp: Date;
-}
+import ToolCallCard from '@/components/ToolCallCard';
 
 const DRAFT_KEY = 'agent-chat';
 
 export default function AgentChat() {
-  const sessionIdRef = useRef(getOrCreateSessionId());
-  const { draft, saveDraft, clearDraft } = useDraft(DRAFT_KEY);
-  const [messages, setMessages] = useState<ChatMessage[]>(() => {
-    const persisted = loadChatHistory(sessionIdRef.current);
-    return persisted.length > 0 ? persistedToUiMessages(persisted) : [];
-  });
-  const [historyReady, setHistoryReady] = useState(false);
-  const [input, setInput] = useState(draft);
-  const [typing, setTyping] = useState(false);
-  const [connected, setConnected] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const {
+    messages,
+    sendMessage,
+    connected,
+    error,
+    typing,
+    streamingContent,
+    streamingThinking,
+    currentModel,
+    availableModels,
+    switchModel,
+    modelLoading,
+    deleteMessage,
+    clearAllMessages,
+    abortSession,
+  } = useAgent();
 
-  const wsRef = useRef<WebSocketClient | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const { draft, saveDraft, clearDraft } = useDraft(DRAFT_KEY);
+  const [input, setInput] = useState(draft);
+  const [showModelDropdown, setShowModelDropdown] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [compact, setCompact] = useState(() => {
     try { return localStorage.getItem('zeroclaw_chat_compact') === '1'; } catch { return false; }
   });
-  const pendingContentRef = useRef('');
-  const pendingThinkingRef = useRef('');
-  // Snapshot of thinking captured at chunk_reset, so it survives the reset.
-  const capturedThinkingRef = useRef('');
-  const [streamingContent, setStreamingContent] = useState('');
-  const [streamingThinking, setStreamingThinking] = useState('');
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const modelDropdownRef = useRef<HTMLDivElement>(null);
 
   // Persist draft to in-memory store so it survives route changes
   useEffect(() => {
     saveDraft(input);
   }, [input, saveDraft]);
 
-  // Hydrate chat from server (preferred) or localStorage fallback
-  useEffect(() => {
-    const sid = sessionIdRef.current;
-    let cancelled = false;
-
-    (async () => {
-      try {
-        const res = await getSessionMessages(sid);
-        if (cancelled) return;
-        if (res.session_persistence && res.messages.length > 0) {
-          setMessages((prev) =>
-            prev.length > 0 ? prev : persistedToUiMessages(mapServerMessagesToPersisted(res.messages)),
-          );
-        } else if (!res.session_persistence) {
-          setMessages((prev) => {
-            if (prev.length > 0) return prev;
-            const ls = loadChatHistory(sid);
-            return ls.length ? persistedToUiMessages(ls) : prev;
-          });
-        }
-      } catch {
-        if (!cancelled) {
-          setMessages((prev) => {
-            if (prev.length > 0) return prev;
-            const ls = loadChatHistory(sid);
-            return ls.length ? persistedToUiMessages(ls) : prev;
-          });
-        }
-      } finally {
-        if (!cancelled) setHistoryReady(true);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // Mirror transcript to localStorage (bounded); server remains source of truth when persistence is on
-  useEffect(() => {
-    if (!historyReady) return;
-    saveChatHistory(sessionIdRef.current, uiMessagesToPersisted(messages));
-  }, [messages, historyReady]);
-
-  useEffect(() => {
-    const ws = new WebSocketClient();
-
-    ws.onOpen = () => {
-      setConnected(true);
-      setError(null);
-    };
-
-    ws.onClose = (ev: CloseEvent) => {
-      setConnected(false);
-      if (ev.code !== 1000 && ev.code !== 1001) {
-        setError(`Connection closed unexpectedly (code: ${ev.code}). Please check your configuration.`);
-      }
-    };
-
-    ws.onError = () => {
-      setError(t('agent.connection_error'));
-    };
-
-    ws.onMessage = (msg: WsMessage) => {
-      switch (msg.type) {
-        case 'session_start':
-        case 'connected':
-          break;
-
-        case 'thinking':
-          setTyping(true);
-          pendingThinkingRef.current += msg.content ?? '';
-          setStreamingThinking(pendingThinkingRef.current);
-          break;
-
-        case 'chunk':
-          setTyping(true);
-          pendingContentRef.current += msg.content ?? '';
-          setStreamingContent(pendingContentRef.current);
-          break;
-
-        case 'chunk_reset':
-          // Server signals that the authoritative done message follows.
-          // Snapshot thinking before clearing display state.
-          capturedThinkingRef.current = pendingThinkingRef.current;
-          pendingContentRef.current = '';
-          pendingThinkingRef.current = '';
-          setStreamingContent('');
-          setStreamingThinking('');
-          break;
-
-        case 'message':
-        case 'done': {
-          const content = msg.full_response ?? msg.content ?? pendingContentRef.current;
-          const thinking = capturedThinkingRef.current || pendingThinkingRef.current || undefined;
-          if (content) {
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: generateUUID(),
-                role: 'agent',
-                content,
-                thinking,
-                markdown: true,
-                timestamp: new Date(),
-              },
-            ]);
-          }
-          pendingContentRef.current = '';
-          pendingThinkingRef.current = '';
-          capturedThinkingRef.current = '';
-          setStreamingContent('');
-          setStreamingThinking('');
-          setTyping(false);
-          break;
-        }
-
-        case 'tool_call': {
-          const toolName = msg.name ?? 'unknown';
-          const toolArgs = msg.args;
-          setMessages((prev) => {
-            // Dedup: backend streaming may re-send tool_call events before execution.
-            // Skip if an unresolved card with the same name+args already exists.
-            const argsKey = JSON.stringify(toolArgs ?? {});
-            const isDuplicate = prev.some(
-              (m) => m.toolCall
-                && m.toolCall.output === undefined
-                && m.toolCall.name === toolName
-                && JSON.stringify(m.toolCall.args ?? {}) === argsKey,
-            );
-            if (isDuplicate) return prev;
-
-            return [
-              ...prev,
-              {
-                id: generateUUID(),
-                role: 'agent' as const,
-                content: `${t('agent.tool_call_prefix')} ${toolName}(${argsKey})`,
-                toolCall: { name: toolName, args: toolArgs },
-                timestamp: new Date(),
-              },
-            ];
-          });
-          break;
-        }
-
-        case 'tool_result': {
-          setMessages((prev) => {
-            // Forward scan: find the FIRST unresolved toolCall (order-guaranteed by backend)
-            const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
-            if (idx !== -1) {
-              const updated = [...prev];
-              const existing = prev[idx]!;
-              updated[idx] = {
-                ...existing,
-                toolCall: { ...existing.toolCall!, output: msg.output ?? '' },
-              };
-              return updated;
-            }
-            // Fallback: no unresolved call found — append standalone card
-            return [
-              ...prev,
-              {
-                id: generateUUID(),
-                role: 'agent' as const,
-                content: `${t('agent.tool_result_prefix')} ${msg.output ?? ''}`,
-                toolCall: { name: msg.name ?? 'unknown', output: msg.output ?? '' },
-                timestamp: new Date(),
-              },
-            ];
-          });
-          break;
-        }
-
-        case 'cron_result': {
-          const cronOutput = msg.output ?? '';
-          if (cronOutput) {
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: generateUUID(),
-                role: 'agent' as const,
-                content: cronOutput,
-                markdown: true,
-                timestamp: new Date(msg.timestamp ?? Date.now()),
-              },
-            ]);
-          }
-          break;
-        }
-
-        case 'error':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: 'agent',
-              content: `${t('agent.error_prefix')} ${msg.message ?? t('agent.unknown_error')}`,
-              timestamp: new Date(),
-            },
-          ]);
-          if (msg.code === 'AGENT_INIT_FAILED' || msg.code === 'AUTH_ERROR' || msg.code === 'PROVIDER_ERROR') {
-            setError(`Configuration error: ${msg.message}. Please check your provider settings (API key, model, etc.).`);
-          } else if (msg.code === 'INVALID_JSON' || msg.code === 'UNKNOWN_MESSAGE_TYPE' || msg.code === 'EMPTY_CONTENT') {
-            setError(`Message error: ${msg.message}`);
-          }
-          setTyping(false);
-          pendingContentRef.current = '';
-          pendingThinkingRef.current = '';
-          setStreamingContent('');
-          setStreamingThinking('');
-          break;
-      }
-    };
-
-    ws.connect();
-    wsRef.current = ws;
-
-    return () => {
-      ws.disconnect();
-    };
-  }, []);
-
+  // Scroll to bottom on new messages / streaming
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typing, streamingContent]);
 
+  // Close model dropdown when clicking outside
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (modelDropdownRef.current && !modelDropdownRef.current.contains(e.target as Node)) {
+        setShowModelDropdown(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
   const handleSend = () => {
     const trimmed = input.trim();
-    if (!trimmed || !wsRef.current?.connected) return;
+    if (!trimmed || !connected) return;
 
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: generateUUID(),
-        role: 'user',
-        content: trimmed,
-        timestamp: new Date(),
-      },
-    ]);
-
-    try {
-      wsRef.current.sendMessage(trimmed);
-      setTyping(true);
-      pendingContentRef.current = '';
-      pendingThinkingRef.current = '';
-    } catch {
-      setError(t('agent.send_error'));
-    }
-
+    sendMessage(trimmed);
     setInput('');
     clearDraft();
     if (inputRef.current) {
@@ -343,7 +97,6 @@ export default function AgentChat() {
 
     if (navigator.clipboard?.writeText) {
       navigator.clipboard.writeText(content).then(onSuccess).catch(() => {
-        // Fallback for insecure contexts (HTTP)
         fallbackCopy(content) && onSuccess();
       });
     } else {
@@ -352,25 +105,25 @@ export default function AgentChat() {
   }, []);
 
   const handleDeleteMessage = useCallback((msgId: string) => {
-    setMessages((prev) => prev.filter((m) => m.id !== msgId));
-  }, []);
+    deleteMessage(msgId);
+  }, [deleteMessage]);
 
   const handleClearAll = useCallback(() => {
-    setMessages([]);
-  }, []);
+    clearAllMessages();
+  }, [clearAllMessages]);
 
   // Stop button: POST /api/sessions/{id}/abort. The gateway cancels the
   // in-flight turn, the WS handler sends an `error` frame which our
   // onMessage handler already maps to typing=false.
   const handleAbort = useCallback(async () => {
     try {
-      await abortSession(sessionIdRef.current);
+      await abortSession();
     } catch {
       // Best-effort: surface nothing if the abort itself fails. The
       // user can retry, and any leaked typing state clears on the next
       // server frame.
     }
-  }, []);
+  }, [abortSession]);
 
   const toggleCompact = useCallback(() => {
     setCompact((prev) => {
@@ -401,8 +154,90 @@ export default function AgentChat() {
     }
   }
 
+  const handleModelSwitch = async (model: string) => {
+    setShowModelDropdown(false);
+    if (model === currentModel) return;
+    try {
+      await switchModel(model);
+    } catch {
+      // Error is already set by switchModel internally
+    }
+  };
+
   return (
     <div className="flex flex-col h-[calc(100vh-3.5rem)]">
+      {/* Header with model selector */}
+      <div className="flex items-center justify-between px-4 py-2 border-b" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
+        <div className="flex items-center gap-2">
+          <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
+          <span className="text-sm font-medium" style={{ color: 'var(--pc-text-primary)' }}>ZeroClaw Agent</span>
+        </div>
+
+        <div className="relative" ref={modelDropdownRef}>
+          <button
+            type="button"
+            onClick={() => setShowModelDropdown((v) => !v)}
+            disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
+            className="flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors disabled:opacity-50"
+            style={{
+              background: 'var(--pc-bg-elevated)',
+              borderColor: 'var(--pc-border)',
+              color: 'var(--pc-text-secondary)',
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.borderColor = 'var(--pc-accent-dim)';
+              e.currentTarget.style.color = 'var(--pc-text-primary)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.borderColor = 'var(--pc-border)';
+              e.currentTarget.style.color = 'var(--pc-text-secondary)';
+            }}
+          >
+            <span className="max-w-[180px] truncate">
+              {modelLoading
+                ? t('agent.model_switching')
+                : (currentModel ?? (availableModels.length === 0 ? t('agent.model_loading') : t('agent.select_model')))}
+            </span>
+            <ChevronDown className="h-3 w-3" />
+          </button>
+
+          {showModelDropdown && availableModels.length > 0 && (
+            <div
+              className="absolute right-0 mt-1.5 rounded-xl border shadow-lg z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto"
+              style={{
+                background: 'var(--pc-bg-elevated)',
+                borderColor: 'var(--pc-border)',
+              }}
+            >
+              {availableModels.map((model) => (
+                <button
+                  key={model}
+                  type="button"
+                  onClick={() => handleModelSwitch(model)}
+                  className="w-full text-left px-3 py-2 text-xs transition-colors"
+                  style={{
+                    color: model === currentModel ? 'var(--pc-accent)' : 'var(--pc-text-primary)',
+                    background: model === currentModel ? 'var(--pc-accent-glow)' : 'transparent',
+                  }}
+                  onMouseEnter={(e) => {
+                    if (model !== currentModel) {
+                      e.currentTarget.style.background = 'var(--pc-bg-surface)';
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    if (model !== currentModel) {
+                      e.currentTarget.style.background = 'transparent';
+                    }
+                  }}
+                >
+                  {model}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
       {/* Connection status bar */}
       {error && (
         <div className="px-4 py-2 border-b flex items-center gap-2 text-sm animate-fade-in" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>

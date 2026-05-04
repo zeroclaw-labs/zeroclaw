@@ -9,6 +9,7 @@ import { getAdminPairCode, getOnboardStatus } from './lib/api';
 import { basePath } from './lib/basePath';
 import { setLocale, type Locale } from './lib/i18n';
 import { Router } from './router/router';
+import { AgentProvider } from './contexts/AgentContext';
 
 // Locale context
 interface LocaleContextType {
@@ -210,17 +211,19 @@ function AppContent() {
   }
 
   return (
-    <DraftContext.Provider value={draftStore}>
-      <LocaleContext.Provider value={{ locale, setAppLocale }}>
-        <FreshInstallRedirect />
-        <Router />
-      </LocaleContext.Provider>
-    </DraftContext.Provider>
+    <AgentProvider>
+      <DraftContext.Provider value={draftStore}>
+        <LocaleContext.Provider value={{ locale, setAppLocale }}>
+          <FreshInstallRedirect />
+          <Router />
+        </LocaleContext.Provider>
+      </DraftContext.Provider>
+    </AgentProvider>
   );
 }
 
 // Redirects fresh installs (no completed onboarding sections, no provider
-// configured) from the default `/` landing to `/onboard`. The daemon
+// configured) from the default ``/` landing to `/onboard`. The daemon
 // always writes a default config.toml on init, so file existence isn't
 // the right signal — we ask the gateway via /api/onboard/status which
 // inspects the in-memory config for explicit user-driven markers
