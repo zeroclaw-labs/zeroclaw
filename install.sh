@@ -148,7 +148,7 @@ detect_target_triple() {
 # ── Pre-built binary install ──────────────────────────────────────
 
 install_prebuilt() {
-  local triple version asset_name asset_url sha256_url tmp_dir
+  local triple version asset_name asset_url sha256_url tmp_dir web_data_dir
   triple=$(detect_target_triple)
 
   if [ -z "$triple" ]; then
@@ -175,9 +175,23 @@ install_prebuilt() {
   info "Source:   $asset_url"
   echo
 
+  # Resolve platform-correct web data directory to match gateway auto-detect
+  case "$(uname -s)" in
+    Darwin)
+      web_data_dir="${HOME}/Library/Application Support/zeroclaw/web/dist"
+      ;;
+    MINGW*|CYGWIN*|MSYS*)
+      web_data_dir="${LOCALAPPDATA}/zeroclaw/web/dist"
+      ;;
+    *)
+      web_data_dir="${XDG_DATA_HOME:-${PREFIX}/.local/share}/zeroclaw/web/dist"
+      ;;
+  esac
+
   if [ "$DRY_RUN" = true ]; then
     info "[dry-run] Would download $asset_url"
     info "[dry-run] Would install to $CARGO_HOME/bin/zeroclaw"
+    info "[dry-run] Would install web dashboard to $web_data_dir"
     return 0
   fi
 
@@ -216,6 +230,13 @@ install_prebuilt() {
   tar -xzf "$tmp_dir/$asset_name" -C "$tmp_dir"
   mkdir -p "$CARGO_HOME/bin"
   install -m 755 "$tmp_dir/zeroclaw" "$CARGO_HOME/bin/zeroclaw"
+
+  # Install web dashboard assets bundled in the release tarball
+  if [ -d "$tmp_dir/web/dist" ]; then
+    mkdir -p "$web_data_dir"
+    cp -r "$tmp_dir/web/dist/." "$web_data_dir/"
+    info "Web dashboard installed to $web_data_dir"
+  fi
 
   rm -rf "$tmp_dir"
   trap - EXIT

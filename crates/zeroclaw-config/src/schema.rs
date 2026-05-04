@@ -2994,7 +2994,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), or "searxng" (self-hosted)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), or "searxng" (self-hosted)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Brave Search API key (required if provider is "brave")
@@ -3002,6 +3002,11 @@ pub struct WebSearchConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub brave_api_key: Option<String>,
+    /// Tavily Search API key (required if provider is "tavily")
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub tavily_api_key: Option<String>,
     /// SearXNG instance URL (required if provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -3031,6 +3036,7 @@ impl Default for WebSearchConfig {
             enabled: true,
             provider: default_web_search_provider(),
             brave_api_key: None,
+            tavily_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -12820,6 +12826,7 @@ default_temperature = 0.7
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
+        config.web_search.tavily_api_key = Some("tavily-credential".into());
         config.storage.postgres.insert(
             "default".to_string(),
             PostgresStorageConfig {
@@ -12905,6 +12912,13 @@ default_temperature = 0.7
         assert_eq!(
             store.decrypt(web_search_encrypted).unwrap(),
             "brave-credential"
+        );
+
+        let tavily_encrypted = stored.web_search.tavily_api_key.as_deref().unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(tavily_encrypted));
+        assert_eq!(
+            store.decrypt(tavily_encrypted).unwrap(),
+            "tavily-credential"
         );
 
         let worker_provider = stored

@@ -1440,12 +1440,10 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        "xai" | "grok" => Ok(compat(OpenAiCompatibleProvider::new(
-            "xAI",
-            "https://api.x.ai",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "xai" | "grok" => Ok(compat(
+            OpenAiCompatibleProvider::new("xAI", "https://api.x.ai/v1", key, AuthStyle::Bearer)
+                .with_models_dev_key("xai"),
+        )),
         "deepseek" => Ok(compat(OpenAiCompatibleProvider::new(
             "DeepSeek",
             "https://api.deepseek.com",
