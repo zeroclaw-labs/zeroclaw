@@ -1,6 +1,8 @@
 use crate::cost::CostTracker;
 use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
-use std::sync::Arc;
+use parking_lot::Mutex;
+use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
 use zeroclaw_config::schema::ModelPricing;
 
 // ── Cost tracking via task-local ──
@@ -63,11 +65,7 @@ pub fn record_tool_loop_cost_usage(
     );
 
     if pricing.is_none() {
-        tracing::debug!(
-            provider = provider_name,
-            model,
-            "Cost tracking recorded token usage with zero pricing (no pricing entry found)"
-        );
+        warn_once_missing_pricing(provider_name, model);
     }
 
     if let Err(error) = ctx.tracker.record_usage(cost_usage.clone()) {
@@ -79,6 +77,40 @@ pub fn record_tool_loop_cost_usage(
     }
 
     Some((cost_usage.total_tokens, cost_usage.cost_usd))
+}
+
+/// First-time WARN, subsequent DEBUG, per `(provider, model)` pair.
+///
+/// The default pricing catalog has no entries for most non-OpenAI/Anthropic/
+/// Google models. Operators only realize their cost-tracking surface is
+/// reporting zero when they happen to enable DEBUG logging — a pure-DEBUG
+/// signal is too quiet for "your cost enforcement is silently inert" to
+/// register. Promote the first sighting per-pair to WARN with a config-path
+/// pointer; all subsequent same-pair occurrences stay at DEBUG so the warn
+/// stream doesn't get spammy.
+fn warn_once_missing_pricing(provider: &str, model: &str) {
+    static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let key = (provider.to_string(), model.to_string());
+    let first_sighting = seen.lock().insert(key);
+    if first_sighting {
+        tracing::warn!(
+            provider,
+            model,
+            "Cost tracking: no pricing entry found for {provider}/{model} — \
+             token usage will be recorded with zero cost and budget enforcement \
+             is inert for this model. Add a pricing entry to config.toml under \
+             `[cost.prices.\"{provider}/{model}\"]` with `input = <USD per 1M tokens>` \
+             and `output = <USD per 1M tokens>` to enable cost tracking. \
+             This warning fires once per (provider, model) pair per process.",
+        );
+    } else {
+        tracing::debug!(
+            provider,
+            model,
+            "Cost tracking recorded token usage with zero pricing (no pricing entry found)",
+        );
+    }
 }
 
 /// Check budget before an LLM call. Returns `None` when no cost tracking
