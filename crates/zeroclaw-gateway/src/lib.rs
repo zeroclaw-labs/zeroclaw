@@ -15,6 +15,7 @@ pub mod api_pairing;
 pub mod api_personality;
 #[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
+pub mod api_system;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 pub mod auth_rate_limit;
@@ -431,6 +432,10 @@ pub struct AppState {
     pub cancel_tokens: Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
     >,
+    /// Tracks an in-progress self-update so the dashboard can render live
+    /// progress and a second `POST /api/system/update` returns 409 instead of
+    /// kicking off a parallel run.
+    pub update_state: Arc<api_system::UpdateState>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -964,6 +969,7 @@ pub async fn run_gateway(
         web_dist_dir,
         canvas_store,
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        update_state: Arc::new(api_system::UpdateState::new()),
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -1014,6 +1020,17 @@ pub async fn run_gateway(
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
+        // ── System / self-update ──
+        .route("/api/system/version", get(api_system::handle_get_version))
+        .route("/api/system/update", post(api_system::handle_post_update))
+        .route(
+            "/api/system/update/status",
+            get(api_system::handle_get_update_status),
+        )
+        .route(
+            "/api/system/update/stream",
+            get(api_system::handle_get_update_stream),
+        )
         .route(
             "/api/config",
             patch(api_config::handle_patch).options(api_config::handle_options_config),
@@ -2591,6 +2608,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            update_state: Arc::new(api_system::UpdateState::new()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2665,6 +2683,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            update_state: Arc::new(api_system::UpdateState::new()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3124,6 +3143,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            update_state: Arc::new(api_system::UpdateState::new()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3206,6 +3226,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            update_state: Arc::new(api_system::UpdateState::new()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3300,6 +3321,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            update_state: Arc::new(api_system::UpdateState::new()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3366,6 +3388,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            update_state: Arc::new(api_system::UpdateState::new()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3437,6 +3460,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            update_state: Arc::new(api_system::UpdateState::new()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3513,6 +3537,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            update_state: Arc::new(api_system::UpdateState::new()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3586,6 +3611,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            update_state: Arc::new(api_system::UpdateState::new()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };

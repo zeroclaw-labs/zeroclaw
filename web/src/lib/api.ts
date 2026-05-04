@@ -182,6 +182,63 @@ export function getHealth(): Promise<HealthSnapshot> {
 }
 
 // ---------------------------------------------------------------------------
+// System / self-update
+// ---------------------------------------------------------------------------
+
+export interface SystemVersion {
+  current: string;
+  latest: string;
+  update_available: boolean;
+  latest_published_at: string | null;
+  download_url: string | null;
+}
+
+export type UpdatePhase =
+  | 'preflight'
+  | 'download'
+  | 'backup'
+  | 'validate'
+  | 'swap'
+  | 'smoke_test'
+  | 'done'
+  | 'failed'
+  | 'rolled_back';
+
+export interface UpdateLogLine {
+  task_id: string;
+  phase: UpdatePhase;
+  level: 'info' | 'warn' | 'error';
+  message: string;
+  timestamp: string;
+}
+
+export interface UpdateStatus {
+  status: 'idle' | 'running' | 'succeeded' | 'failed';
+  task_id: string | null;
+  phase: UpdatePhase | null;
+  started_at: string | null;
+  log_tail: UpdateLogLine[];
+}
+
+export function getSystemVersion(): Promise<SystemVersion> {
+  return apiFetch<SystemVersion>('/api/system/version');
+}
+
+export function postSystemUpdate(
+  body: { version?: string; force?: boolean } = {},
+): Promise<{ task_id: string }> {
+  return apiFetch<{ task_id: string }>('/api/system/update', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export function getSystemUpdateStatus(): Promise<UpdateStatus> {
+  return apiFetch<UpdateStatus>('/api/system/update/status');
+}
+
+// ---------------------------------------------------------------------------
 // Config — per-property CRUD (issue #6175). Whole-file getConfig/putConfig
 // removed; the gateway no longer exposes those endpoints.
 // ---------------------------------------------------------------------------

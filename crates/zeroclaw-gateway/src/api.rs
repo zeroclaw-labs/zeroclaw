@@ -1298,6 +1298,7 @@ mod tests {
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            update_state: Arc::new(crate::api_system::UpdateState::new()),
             reload_tx: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -1563,5 +1564,83 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── /api/system/* tests ─────────────────────────────────────
+
+    /// `POST /api/system/update` with no `Authorization` header must return
+    /// 401 when pairing is required.
+    #[tokio::test]
+    async fn system_update_without_token_returns_401() {
+        use crate::api_system::handle_post_update;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+
+        let mut state = test_state(config);
+        state.pairing = Arc::new(PairingGuard::new(true, &["valid-token".to_string()]));
+
+        let response = handle_post_update(State(state), HeaderMap::new(), None)
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A second `POST /api/system/update` while one is in progress must
+    /// return 409 Conflict.
+    #[tokio::test]
+    async fn system_update_returns_409_when_already_running() {
+        use crate::api_system::handle_post_update;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+
+        let state = test_state(config);
+        // Mark an active run directly so the test doesn't depend on a real
+        // download succeeding.
+        state
+            .update_state
+            .try_start("preexisting")
+            .expect("first start should succeed");
+
+        let response = handle_post_update(State(state), HeaderMap::new(), None)
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    /// `GET /api/system/update/status` returns "idle" before any run.
+    #[tokio::test]
+    async fn system_update_status_idle_before_any_run() {
+        use crate::api_system::handle_get_update_status;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+
+        let response = handle_get_update_status(State(state), HeaderMap::new())
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["status"], "idle");
     }
 }

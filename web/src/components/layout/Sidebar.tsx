@@ -14,6 +14,7 @@ import {
   Wrench,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
+import { SidebarUpdate } from './SidebarUpdate';
 
 interface NavItem {
   to: string;
@@ -129,6 +130,12 @@ export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
             />
           ))}
         </nav>
+        <div
+          className="border-t shrink-0"
+          style={{ borderColor: 'var(--pc-border)' }}
+        >
+          <SidebarUpdate collapsed={collapsed} />
+        </div>
         <SidebarFooter collapsed={collapsed} layout="desktop" />
       </aside>
 
@@ -153,6 +160,12 @@ export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
             />
           ))}
         </nav>
+        <div
+          className="border-t shrink-0"
+          style={{ borderColor: 'var(--pc-border)' }}
+        >
+          <SidebarUpdate collapsed={false} />
+        </div>
         <SidebarFooter collapsed={false} layout="mobile" />
       </aside>
     </>
