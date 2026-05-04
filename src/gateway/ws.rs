@@ -1731,14 +1731,17 @@ pub async fn handle_ws_voice(
 /// Server -> Client: {"type":"audio_out","sessionId":"...","seq":0,"pcm16le":"base64..."}
 /// Server -> Client: {"type":"session_ended","sessionId":"...","totalSegments":5}
 /// ```
-/// Unified session handle — wraps either Gemini-based or Deepgram-based session.
+/// Unified session handle for the two interpretation paths MoA ships:
 ///
-/// Both providers share the same `send_audio` / `event_rx` / `stop` interface,
-/// so this enum lets the voice WebSocket handler route to either without duplication.
+///   * `Gemini` — Gemini Live S2S (one-shot speech-in / speech-out).
+///   * `TypecastPipeline` — Gemma 4 STT (on-device, free) → LLM
+///     translation → Typecast TTS (paid; opt-in for "interpret in my
+///     own cloned voice").
+///
+/// Both share `send_audio` / `event_rx` / `stop` so the WebSocket
+/// handler routes through this enum without duplication.
 enum VoiceSessionHandle {
     Gemini(crate::voice::simul_session::SimulSession),
-    Deepgram(crate::voice::deepgram_simul::DeepgramSimulSession),
-    Gemma(crate::voice::gemma_simul::GemmaSimulSession),
     TypecastPipeline(crate::voice::typecast_interp::TypecastInterpSession),
 }
 
@@ -1746,8 +1749,6 @@ impl VoiceSessionHandle {
     async fn send_audio(&self, pcm_data: Vec<u8>) -> anyhow::Result<()> {
         match self {
             Self::Gemini(s) => s.send_audio(pcm_data).await,
-            Self::Deepgram(s) => s.send_audio(pcm_data).await,
-            Self::Gemma(s) => s.send_audio(pcm_data).await,
             Self::TypecastPipeline(s) => s.send_audio(pcm_data).await,
         }
     }
@@ -1758,8 +1759,6 @@ impl VoiceSessionHandle {
     {
         match self {
             Self::Gemini(s) => s.event_rx.clone(),
-            Self::Deepgram(s) => s.event_rx.clone(),
-            Self::Gemma(s) => s.event_rx.clone(),
             Self::TypecastPipeline(s) => s.event_rx.clone(),
         }
     }
@@ -1767,22 +1766,60 @@ impl VoiceSessionHandle {
     async fn stop(&self) {
         match self {
             Self::Gemini(s) => s.stop().await,
-            Self::Deepgram(s) => s.stop().await,
-            Self::Gemma(s) => s.stop().await,
             Self::TypecastPipeline(s) => s.stop().await,
         }
     }
 }
 
+/// Resolve the Ollama endpoint + Gemma model tag the device installer
+/// committed to. Honor `OLLAMA_BASE_URL` / `GEMMA_ASR_MODEL` env
+/// overrides first (useful for tests and remote-Ollama setups), then
+/// fall back to the persisted `LocalLlmConfig` written by
+/// `local_llm::setup` at first-run, and finally to the conservative
+/// default tag (`gemma4:e4b`) so a fresh install without persisted
+/// config still works.
+async fn resolve_gemma_asr_endpoint() -> (String, String) {
+    let base_url = std::env::var("OLLAMA_BASE_URL")
+        .unwrap_or_else(|_| crate::voice::gemma_asr::DEFAULT_OLLAMA_URL.to_string());
+
+    if let Ok(env_model) = std::env::var("GEMMA_ASR_MODEL") {
+        if !env_model.trim().is_empty() {
+            return (base_url, env_model);
+        }
+    }
+
+    let model = match crate::local_llm::LocalLlmConfig::default_path() {
+        Ok(path) => match crate::local_llm::LocalLlmConfig::load(&path).await {
+            Ok(cfg) => cfg.default_model,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "LocalLlmConfig load failed; using default Gemma ASR tag"
+                );
+                crate::voice::gemma_asr::DEFAULT_MODEL.to_string()
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Cannot determine LocalLlmConfig path; using default Gemma ASR tag"
+            );
+            crate::voice::gemma_asr::DEFAULT_MODEL.to_string()
+        }
+    };
+
+    (base_url, model)
+}
+
 async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
     use crate::voice::{
-        deepgram_simul::{DeepgramSimulConfig, DeepgramSimulSession},
         events::{ClientMessage, ServerMessage},
-        gemma_simul::{GemmaSimulConfig, GemmaSimulSession},
         pipeline::{Domain, Formality, LanguageCode, VoiceAge, VoiceGender},
         simul::SegmentationConfig,
         simul_session::{SimulSession, SimulSessionConfig},
-        typecast_interp::{TypecastInterpConfig, TypecastInterpSession},
+        typecast_interp::{
+            select_fallback_voice_id, TypecastInterpConfig, TypecastInterpSession,
+        },
     };
     use base64::Engine;
 
@@ -1843,32 +1880,47 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                     handle.abort();
                 }
 
-                // Determine provider: explicit from client, or config default
+                // Determine provider: explicit from client, or config default.
+                // Default is Gemini Live (lowest latency, single-API-key path).
+                // The other supported value is "typecast_pipeline" — the
+                // user opts in via the "내 목소리로 통역" toggle in the UI.
                 let provider_str = provider
                     .as_deref()
                     .or(voice_config.default_provider.as_deref())
                     .unwrap_or("gemini");
-
-                // Resolve primary API key based on provider
-                let api_key = match provider_str {
-                    "deepgram" => voice_config
-                        .deepgram_api_key
-                        .clone()
-                        .or_else(|| std::env::var("DEEPGRAM_API_KEY").ok())
-                        .unwrap_or_default(),
-                    "typecast_pipeline" => voice_config
-                        .deepgram_api_key
-                        .clone()
-                        .or_else(|| std::env::var("DEEPGRAM_API_KEY").ok())
-                        .unwrap_or_default(),
-                    _ => voice_config.gemini_api_key.clone().unwrap_or_default(),
+                let provider_str = match provider_str {
+                    "gemini" | "typecast_pipeline" => provider_str,
+                    other => {
+                        tracing::warn!(
+                            requested = other,
+                            "Unknown voice provider; falling back to gemini"
+                        );
+                        "gemini"
+                    }
                 };
 
-                if api_key.is_empty() {
-                    let key_name = match provider_str {
-                        "deepgram" | "typecast_pipeline" => "Deepgram",
-                        _ => "Gemini",
-                    };
+                // Resolve primary API key based on provider. Both paths
+                // need a Gemini key:
+                //   * "gemini"            → Gemini Live S2S
+                //   * "typecast_pipeline" → Gemini for the LLM
+                //                           translation step (Gemma 4
+                //                           handles STT on-device free,
+                //                           Typecast handles TTS).
+                let gemini_api_key = voice_config
+                    .gemini_api_key
+                    .clone()
+                    .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+                    .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
+                    .unwrap_or_default();
+                let typecast_api_key = std::env::var("TYPECAST_API_KEY").unwrap_or_default();
+
+                let missing_key: Option<&str> = match provider_str {
+                    "gemini" if gemini_api_key.is_empty() => Some("Gemini"),
+                    "typecast_pipeline" if gemini_api_key.is_empty() => Some("Gemini"),
+                    "typecast_pipeline" if typecast_api_key.is_empty() => Some("Typecast"),
+                    _ => None,
+                };
+                if let Some(key_name) = missing_key {
                     let err = ServerMessage::Error {
                         session_id: session_id.clone(),
                         code: "NO_API_KEY".into(),
@@ -1922,70 +1974,92 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                     .and_then(VoiceAge::from_str_opt)
                     .unwrap_or_default();
 
-                // Start the session with the selected provider
+                // Start the session with the selected provider.
                 let session_result: anyhow::Result<VoiceSessionHandle> = match provider_str {
-                    "deepgram" => {
-                        let dg_config = DeepgramSimulConfig {
-                            session_id: session_id.clone(),
-                            api_key,
-                            source_lang: src_lang,
-                            model: voice_config.deepgram_model.clone(),
-                            segmentation,
-                        };
-                        DeepgramSimulSession::start(dg_config)
-                            .await
-                            .map(VoiceSessionHandle::Deepgram)
-                    }
-
-                    "gemma" => {
-                        // PR #6: on-device STT via Gemma 4 E4B (replaces Deepgram).
-                        // Reads Ollama base URL + model from env so config layout
-                        // can stay frozen until the broader voice config refactor.
-                        let base_url = std::env::var("OLLAMA_BASE_URL")
-                            .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
-                        let model = std::env::var("GEMMA_ASR_MODEL")
-                            .unwrap_or_else(|_| "gemma4:e4b".to_string());
-                        let cfg = GemmaSimulConfig {
-                            session_id: session_id.clone(),
-                            source_lang: src_lang,
-                            base_url,
-                            model,
-                        };
-                        // segmentation engine and Deepgram api_key are not needed
-                        // here — Gemma utterance-segments internally via VAD.
-                        let _ = (segmentation, api_key);
-                        GemmaSimulSession::start(cfg)
-                            .await
-                            .map(VoiceSessionHandle::Gemma)
-                    }
-
                     "typecast_pipeline" => {
-                        // STT+LLM+TTS mode: Deepgram → LLM translation → Typecast TTS
-                        let typecast_key = std::env::var("TYPECAST_API_KEY").unwrap_or_default();
-                        let llm_key = std::env::var("GEMINI_API_KEY")
-                            .or_else(|_| std::env::var("GOOGLE_API_KEY"))
-                            .unwrap_or_default();
+                        // Gemma 4 STT (on-device, free) → LLM translation
+                        // → Typecast TTS (own-voice clone or auto-matched
+                        // fallback). The Gemma model tier is whatever
+                        // `local_llm::setup` resolved for this device's RAM
+                        // at install time (E2B / E4B / future); we read it
+                        // from the persisted LocalLlmConfig here so the
+                        // gateway does not redo the hardware probe.
+                        let (gemma_base_url, gemma_model) =
+                            resolve_gemma_asr_endpoint().await;
+
+                        // Resolve the fallback Typecast voice_id once,
+                        // before the session starts. This is what the old
+                        // TODO ("resolve from cached voice list") meant —
+                        // without it the TTS step had no voice id and
+                        // produced silent audio.
+                        let fallback_voice_id = if voice_clone_id.is_some() {
+                            None
+                        } else {
+                            match select_fallback_voice_id(
+                                &typecast_api_key,
+                                gender_val,
+                                age_val,
+                                tgt_lang,
+                            )
+                            .await
+                            {
+                                Ok(Some(id)) => Some(id),
+                                Ok(None) => {
+                                    let err = ServerMessage::Error {
+                                        session_id: session_id.clone(),
+                                        code: "NO_TYPECAST_VOICE".into(),
+                                        message: format!(
+                                            "Typecast has no matching {gender:?} voice for \
+                                             target language {lang}. Pick a voice manually \
+                                             in Settings or upload a voice clone.",
+                                            gender = gender_val,
+                                            lang = tgt_lang.as_str()
+                                        ),
+                                    };
+                                    let _ = socket
+                                        .send(Message::Text(
+                                            serde_json::to_string(&err)
+                                                .unwrap_or_default()
+                                                .into(),
+                                        ))
+                                        .await;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "Typecast voice fallback resolution failed; \
+                                         session will fail-fast on first TTS call"
+                                    );
+                                    None
+                                }
+                            }
+                        };
+
                         let llm_model = std::env::var("TYPECAST_INTERP_LLM_MODEL")
                             .unwrap_or_else(|_| "gemini-3.1-flash-lite-preview".to_string());
                         let llm_base = std::env::var("TYPECAST_INTERP_LLM_BASE_URL")
-                            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
+                            .unwrap_or_else(|_| {
+                                "https://generativelanguage.googleapis.com".to_string()
+                            });
 
                         let tc_config = TypecastInterpConfig {
                             session_id: session_id.clone(),
-                            deepgram_api_key: api_key,
-                            deepgram_model: voice_config.deepgram_model.clone(),
+                            gemma_base_url,
+                            gemma_model,
                             source_lang: src_lang,
                             target_lang: tgt_lang,
-                            typecast_api_key: typecast_key,
+                            typecast_api_key: typecast_api_key.clone(),
                             voice_clone_id: voice_clone_id.clone(),
                             voice_gender: gender_val,
                             voice_age: age_val,
-                            fallback_voice_id: None, // TODO: resolve from cached voice list
-                            llm_api_key: llm_key,
+                            fallback_voice_id,
+                            llm_api_key: gemini_api_key.clone(),
                             llm_model,
                             llm_base_url: llm_base,
                             segmentation,
-                            bidirectional: mode == crate::voice::events::InterpretationMode::Bidirectional,
+                            bidirectional: mode
+                                == crate::voice::events::InterpretationMode::Bidirectional,
                         };
                         TypecastInterpSession::start(tc_config)
                             .await
@@ -1993,7 +2067,7 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                     }
 
                     _ => {
-                        // Default: Gemini Live (full S2S interpretation)
+                        // Default: Gemini Live (full S2S interpretation).
                         let domain_val = domain
                             .as_deref()
                             .map(|d| match d {
@@ -2016,7 +2090,7 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
 
                         let config = SimulSessionConfig {
                             session_id: session_id.clone(),
-                            api_key,
+                            api_key: gemini_api_key.clone(),
                             source_lang: src_lang,
                             target_lang: tgt_lang,
                             mode,
@@ -2112,8 +2186,10 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
             }
 
             ClientMessage::ActivitySignal { .. } => {
-                // Activity signals are informational; Gemini handles VAD internally.
-                // Deepgram uses server-side endpointing — no client signals needed.
+                // Activity signals are informational. Gemini Live runs VAD
+                // server-side; Gemma ASR (via TypecastPipeline) runs RMS
+                // VAD client-of-Gemma side. No path needs an explicit
+                // signal from the browser today.
             }
         }
     }

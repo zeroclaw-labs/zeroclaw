@@ -18,7 +18,14 @@ interface Transcript {
 }
 
 type ConnectionStatus = "idle" | "connecting" | "ready" | "listening" | "stopping" | "error";
-type VoiceProvider = "gemini" | "openai" | "deepgram";
+// Backend supports two interpretation paths today:
+//   * "gemini"            — Gemini Live S2S (default; lowest latency)
+//   * "typecast_pipeline" — Gemma 4 STT + LLM translate + Typecast TTS
+//                           (own-voice clone; user opts in via the
+//                            "내 목소리로 통역" toggle)
+// "openai" is reserved for a future GPT Realtime hookup; the backend
+// currently routes it to Gemini.
+type VoiceProvider = "gemini" | "openai" | "typecast_pipeline";
 
 // "auto" = auto-detect language from speech input
 const LANGUAGES = [
@@ -143,7 +150,11 @@ export function Interpreter({
 }: InterpreterProps) {
   void onBack; // available for future navigation
   const [status, setStatus] = useState<ConnectionStatus>("idle");
-  const [provider, setProvider] = useState<VoiceProvider>("deepgram");
+  // Default to Gemini Live (one-shot S2S). Toggling "내 목소리로 통역"
+  // (`useOwnVoice` below) flips this to "typecast_pipeline" so the
+  // backend routes through Gemma STT → LLM → Typecast TTS.
+  const [provider, setProvider] = useState<VoiceProvider>("gemini");
+  const [useOwnVoice, setUseOwnVoice] = useState(false);
   // Default: auto-detect source language, translate to English, bidirectional
   const [sourceLang, setSourceLang] = useState("auto");
   const [targetLang, setTargetLang] = useState("en");
@@ -158,20 +169,36 @@ export function Interpreter({
   const [micPermissionDenied, setMicPermissionDenied] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const sessionIdRef = useRef<string>(""); // shared session ID for Deepgram audio_chunk
+  const sessionIdRef = useRef<string>(""); // shared session ID for audio_chunk envelopes
   const audioContextRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const playbackCtxRef = useRef<AudioContext | null>(null);
   const micMutedRef = useRef(false); // mute mic while audio plays back
   const speakerModeRef = useRef(true); // ref mirror for use in callbacks
-  const activeProviderRef = useRef<VoiceProvider>("deepgram");
+  const activeProviderRef = useRef<VoiceProvider>("gemini");
   const inputSampleRateRef = useRef(16000); // from server ready message
   const transcriptEndRef = useRef<HTMLDivElement>(null);
-  const micVadRef = useRef<MicVADType | null>(null); // Silero VAD instance (Deepgram mode)
+  // Silero VAD ref kept for the (currently retired) Deepgram path.
+  // Will be removed once `@ricky0123/vad-web` has no in-tree caller.
+  const micVadRef = useRef<MicVADType | null>(null);
 
   // Keep ref in sync with state for use inside callbacks
   useEffect(() => { speakerModeRef.current = speakerMode; }, [speakerMode]);
+
+  // "내 목소리로 통역" toggle drives the provider choice. When the
+  // user turns it on we route to the Typecast pipeline (Gemma STT +
+  // LLM + Typecast TTS). Turning it off goes back to Gemini Live.
+  // We don't fight the user if they explicitly pick a different
+  // provider via some future advanced UI — they can always un-toggle.
+  useEffect(() => {
+    if (useOwnVoice) {
+      setProvider("typecast_pipeline");
+    } else if (provider === "typecast_pipeline") {
+      setProvider("gemini");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [useOwnVoice]);
 
   // Auto-scroll transcripts
   useEffect(() => {
@@ -288,8 +315,9 @@ export function Interpreter({
       const sessionId = crypto.randomUUID();
       sessionIdRef.current = sessionId;
 
-      // Both Deepgram and Gemini use /ws/voice — the provider field in session_start
-      // tells the backend which STT engine to use.
+      // All providers share /ws/voice — the `provider` field in
+      // session_start tells the backend which interpretation pipeline
+      // to spin up.
       const wsUrl = serverUrl.replace(/^http/, "ws") + `/ws/voice?token=${token}`;
       addTranscript("system", "Opening WebSocket...");
       const ws = new WebSocket(wsUrl);
@@ -309,7 +337,10 @@ export function Interpreter({
         };
         ws.send(JSON.stringify(startMsg));
         setStatus("ready");
-        const providerLabel = provider === "deepgram" ? "Deepgram + Silero VAD" : "Gemini 3.1 Flash Live";
+        const providerLabel =
+          provider === "typecast_pipeline"
+            ? "Gemma 4 STT + Typecast (own-voice clone)"
+            : "Gemini 3.1 Flash Live";
         addTranscript("system", `WebSocket connected — starting ${providerLabel}...`);
       };
 
@@ -331,14 +362,15 @@ export function Interpreter({
               // ── Common events (both providers) ──
               case "session_ready": {
                 setStatus("listening");
-                const vadMode = provider === "deepgram" ? "Silero VAD (client)" : provider === "openai" ? "semantic VAD (server)" : "RMS VAD (client)";
+                const vadMode =
+                  provider === "openai"
+                    ? "semantic VAD (server)"
+                    : provider === "typecast_pipeline"
+                      ? "Gemma RMS VAD (on-device)"
+                      : "RMS VAD (client)";
                 addTranscript("system", `Session ready — ${vadMode}, input 16kHz`);
-                if (provider === "deepgram") {
-                  startMicrophoneDeepgram();
-                } else {
-                  inputSampleRateRef.current = 16000;
-                  startMicrophone();
-                }
+                inputSampleRateRef.current = 16000;
+                startMicrophone();
                 break;
               }
 
@@ -541,89 +573,16 @@ export function Interpreter({
     }
   }, [addTranscript, echoCancellation, autoGainControl, noiseSuppression]);
 
-  // ── Deepgram mode: Silero VAD microphone capture ──────────────
-  // Uses @ricky0123/vad-web (Silero VAD v5 ONNX model) for accurate
-  // speech detection. On speech end, sends the complete speech segment
-  // as PCM16 base64 to the backend via the voice WebSocket.
-  const startMicrophoneDeepgram = useCallback(async () => {
-    try {
-      addTranscript("system", "Loading Silero VAD model...");
-      const { MicVAD } = await import("@ricky0123/vad-web");
-
-      let chunkSeq = 0;
-      const vad = await MicVAD.new({
-        model: "v5",
-        baseAssetPath: "/vad/",
-        onnxWASMBasePath: "/",
-        startOnLoad: true,
-
-        onSpeechStart: () => {
-          addTranscript("system", "VAD: speech started");
-        },
-
-        onSpeechEnd: (audio: Float32Array) => {
-          // audio is Float32Array at 16kHz mono (-1 to 1)
-          const ws = wsRef.current;
-          if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-          // Convert Float32 → PCM16LE
-          const pcm16 = new Int16Array(audio.length);
-          for (let i = 0; i < audio.length; i++) {
-            const s = Math.max(-1, Math.min(1, audio[i]));
-            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-          }
-
-          // Base64 encode
-          const bytes = new Uint8Array(pcm16.buffer);
-          let binary = "";
-          for (let i = 0; i < bytes.length; i++) {
-            binary += String.fromCharCode(bytes[i]);
-          }
-          const b64 = btoa(binary);
-
-          // Send as audio_chunk message
-          ws.send(JSON.stringify({
-            type: "audio_chunk",
-            sessionId: sessionIdRef.current,
-            seq: chunkSeq++,
-            ts: Date.now(),
-            pcm16le: b64,
-          }));
-
-          const durationMs = (audio.length / 16000 * 1000).toFixed(0);
-          addTranscript("system", `VAD: speech end — sent ${durationMs}ms audio (${pcm16.byteLength} bytes)`);
-        },
-
-        onVADMisfire: () => {
-          addTranscript("system", "VAD: misfire (speech too short)");
-        },
-      });
-
-      micVadRef.current = vad;
-      addTranscript("system", "Silero VAD active — listening with AI speech detection...");
-      setStatus("listening");
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error("Silero VAD error:", e);
-      addTranscript("system", `Silero VAD error: ${msg}`);
-
-      if (msg.includes("NotAllowedError") || msg.includes("Permission denied")) {
-        setMicPermissionDenied(true);
-      } else {
-        setError(`Microphone error: ${msg}`);
-      }
-      setStatus("error");
-    }
-  }, [addTranscript]);
-
   // Stop microphone only — keep WS and playback alive for remaining translation
   const stopMicrophone = useCallback(() => {
-    // Cleanup Silero VAD (Deepgram mode)
+    // Cleanup Silero VAD (legacy Deepgram mode — retained for safety
+    // until the @ricky0123/vad-web dependency is removed in the
+    // chat-voice cleanup PR).
     if (micVadRef.current) {
       micVadRef.current.destroy();
       micVadRef.current = null;
     }
-    // Cleanup AudioWorklet (Gemini mode)
+    // Cleanup AudioWorklet (Gemini / Typecast pipeline mode)
     if (workletNodeRef.current) {
       workletNodeRef.current.disconnect();
       workletNodeRef.current = null;
@@ -816,17 +775,30 @@ export function Interpreter({
         </div>
 
         <div className="interpreter-row">
-          <select
-            value={provider}
-            onChange={(e) => setProvider(e.target.value as VoiceProvider)}
-            disabled={isActive}
-            className="provider-select"
-            title={locale === "ko" ? "음성 AI 공급자 (본인 API 키 필요)" : "Voice AI provider (requires your own API key)"}
+          {/* "내 목소리로 통역" — when on, route through Typecast
+              pipeline (Gemma STT + LLM + Typecast TTS in user's
+              cloned voice). When off, use Gemini Live S2S. */}
+          <label
+            className={`own-voice-toggle ${useOwnVoice ? "active" : ""}`}
+            title={
+              locale === "ko"
+                ? "내 목소리로 통역 (Typecast 음성 클론 사용 — 약간 느림, 추가 비용)"
+                : "Interpret in my own cloned voice (Typecast voice clone — slightly slower, extra cost)"
+            }
           >
-            <option value="deepgram">🎯 Deepgram + Silero VAD</option>
-            <option value="gemini">🤖 Gemini 3.1 Flash Live</option>
-            <option value="openai">🧠 GPT Realtime</option>
-          </select>
+            <input
+              type="checkbox"
+              checked={useOwnVoice}
+              onChange={(e) => setUseOwnVoice(e.target.checked)}
+              disabled={isActive}
+            />
+            <span>
+              🎙️{" "}
+              {locale === "ko"
+                ? "내 목소리로 통역"
+                : "Interpret in my voice"}
+            </span>
+          </label>
 
           <button
             className={`audio-mode-btn ${speakerMode ? "speaker" : "earphone"}`}
@@ -844,9 +816,20 @@ export function Interpreter({
 
         {/* User API key notice */}
         <div className="api-key-notice">
-          {locale === "ko"
-            ? `⚠️ ${provider === "deepgram" ? "Deepgram" : provider === "gemini" ? "Gemini" : "OpenAI"} API 키가 필요합니다 (설정에서 입력)`
-            : `⚠️ Requires your own ${provider === "deepgram" ? "Deepgram" : provider === "gemini" ? "Gemini" : "OpenAI"} API key (enter in Settings)`}
+          {(() => {
+            // Both paths need a Gemini key (Gemini Live, or Gemini for
+            // the LLM translation step inside the Typecast pipeline).
+            // Typecast pipeline ALSO needs a Typecast key for TTS.
+            const needsTypecast = provider === "typecast_pipeline";
+            if (locale === "ko") {
+              return needsTypecast
+                ? "⚠️ Gemini API 키 + Typecast API 키가 필요합니다 (설정에서 입력)"
+                : "⚠️ Gemini API 키가 필요합니다 (설정에서 입력)";
+            }
+            return needsTypecast
+              ? "⚠️ Requires your own Gemini + Typecast API keys (enter in Settings)"
+              : "⚠️ Requires your own Gemini API key (enter in Settings)";
+          })()}
         </div>
       </div>
 

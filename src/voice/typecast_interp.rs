@@ -1,15 +1,22 @@
-//! STT+LLM+TTS interpretation session (Mode 2).
+//! STT+LLM+TTS interpretation session (Typecast pipeline).
 //!
-//! Combines Deepgram STT with LLM-based translation and Typecast TTS
-//! to produce interpreted speech in the user's cloned voice (or a
-//! best-matching fallback voice).
+//! Combines on-device Gemma 4 STT with LLM-based translation and
+//! Typecast TTS to produce interpreted speech in the user's cloned
+//! voice (or a best-matching fallback voice).
+//!
+//! Until 2026-05 this pipeline used Deepgram for STT. Gemma 4 (E2B/E4B
+//! audio-capable tier) replaced it because (a) Gemma is free / on-device
+//! and (b) everyday interpretation speech is well within its accuracy
+//! envelope. The cost/latency profile is now: zero STT cost + ~1.5–3 s
+//! per utterance (Gemma is request/response, not streaming) + LLM
+//! translation + Typecast TTS.
 //!
 //! ## Architecture
 //!
 //! ```text
 //! Client mic ─▸ audio_chunk ─▸ TypecastInterpSession
 //!                                    │
-//!                       Deepgram STT (segmentation)
+//!                       Gemma 4 STT (on-device, Ollama)
 //!                                    │
 //!                            CommitSrc (source text)
 //!                                    │
@@ -28,14 +35,16 @@
 //! 1. **Voice clone** (`voice_clone_id`): user's cloned voice via Typecast
 //!    voice cloning API (`tts_mode: "audio_file"`).
 //! 2. **Auto-matched fallback**: selects the best Typecast voice based on
-//!    user's gender, age, and target language from the cached voice list.
+//!    user's gender, age, and target language. Resolved by the gateway
+//!    via [`select_fallback_voice_id`] before session start.
 
 use base64::Engine;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
-use super::deepgram_stt::{DeepgramConfig, DeepgramSttSession, SttEvent};
+use super::deepgram_stt::SttEvent;
 use super::events::ServerMessage;
+use super::gemma_asr::{GemmaAsrConfig, GemmaAsrSession, DEFAULT_OLLAMA_URL};
 use super::pipeline::{LanguageCode, VoiceAge, VoiceGender};
 use super::simul::{SegmentationConfig, SegmentationEngine};
 
@@ -46,11 +55,16 @@ use super::simul::{SegmentationConfig, SegmentationEngine};
 pub struct TypecastInterpConfig {
     /// Unique session identifier.
     pub session_id: String,
-    /// Deepgram API key (for STT).
-    pub deepgram_api_key: String,
-    /// Deepgram model (e.g. "nova-3").
-    pub deepgram_model: String,
-    /// Source language code (what the user speaks).
+    /// Ollama base URL for Gemma STT (no trailing slash). Defaults
+    /// to `http://127.0.0.1:11434` when empty.
+    pub gemma_base_url: String,
+    /// Gemma 4 audio-capable model tag (e.g. `"gemma4:e4b"` /
+    /// `"gemma4:e2b"`). The gateway resolves the right tier per
+    /// device RAM via `LocalLlmConfig::default_model` and passes it
+    /// here; `gemma_asr` itself does not pick a tier.
+    pub gemma_model: String,
+    /// Source language code (what the user speaks). Passed to Gemma
+    /// as a transcription hint.
     pub source_lang: LanguageCode,
     /// Target language code (translation output).
     pub target_lang: LanguageCode,
@@ -64,7 +78,9 @@ pub struct TypecastInterpConfig {
     /// User's voice age for auto-matching.
     pub voice_age: VoiceAge,
     /// Fallback Typecast voice_id (pre-resolved from voice list).
-    /// Set by the gateway after querying /api/voices/list.
+    /// Set by the gateway via [`select_fallback_voice_id`] before
+    /// session start. Required when `voice_clone_id` is None;
+    /// otherwise TTS will fail with an empty voice id.
     pub fallback_voice_id: Option<String>,
     /// LLM API key for translation (Gemini / OpenAI / etc.).
     pub llm_api_key: String,
@@ -72,7 +88,10 @@ pub struct TypecastInterpConfig {
     pub llm_model: String,
     /// LLM API base URL.
     pub llm_base_url: String,
-    /// Segmentation configuration.
+    /// Segmentation configuration. Applied to Gemma `Final` events
+    /// the same way it was applied to Deepgram finals: each finalized
+    /// utterance is appended to the segmenter and committed by
+    /// length / silence rules.
     pub segmentation: SegmentationConfig,
     /// Bidirectional mode.
     pub bidirectional: bool,
@@ -195,6 +214,93 @@ pub fn voice_match_score(
     }
 
     score
+}
+
+// ── Fallback voice resolution ────────────────────────────────────
+
+/// Pick the best Typecast `voice_id` for a user when they have NOT
+/// supplied a clone — fetches `/v2/voices` (filtered by gender +
+/// target language, model `ssfm-v30`) and picks the highest-scoring
+/// candidate per [`voice_match_score`].
+///
+/// The gateway calls this once per session before constructing
+/// [`TypecastInterpConfig`], so the interp loop never hits the
+/// "no voice id → silent TTS" branch the previous TODO described.
+///
+/// Returns `Ok(Some(voice_id))` on a real match, `Ok(None)` when the
+/// catalog has no matching voices (caller should surface a clear
+/// error to the client), `Err` on transport / parse failure.
+pub async fn select_fallback_voice_id(
+    typecast_api_key: &str,
+    user_gender: VoiceGender,
+    user_age: VoiceAge,
+    target_lang: LanguageCode,
+) -> anyhow::Result<Option<String>> {
+    if typecast_api_key.is_empty() {
+        anyhow::bail!("Typecast API key not configured");
+    }
+
+    let gender_param = match user_gender {
+        VoiceGender::Male => "male",
+        VoiceGender::Female => "female",
+    };
+    let lang_iso3 = lang_to_typecast_iso3(target_lang);
+
+    // Pull a generous window per gender+language. The catalog is
+    // small enough (<1000 voices) that paging is unnecessary.
+    let url = format!(
+        "https://api.typecast.ai/v2/voices?model=ssfm-v30&gender={gender_param}&language={lang_iso3}"
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("X-API-KEY", typecast_api_key)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Typecast /v2/voices error {status}: {body}");
+    }
+
+    let payload: serde_json::Value = resp.json().await?;
+    let voices = payload
+        .get("voices")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut best: Option<(u32, String)> = None;
+    for voice in voices.iter() {
+        let voice_id = match voice.get("voice_id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => continue,
+        };
+        let voice_gender = voice.get("gender").and_then(|v| v.as_str()).unwrap_or("");
+        let voice_age = voice.get("age").and_then(|v| v.as_str()).unwrap_or("");
+        let use_cases: Vec<String> = voice
+            .get("use_cases")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let score = voice_match_score(voice_gender, voice_age, &use_cases, user_gender, user_age);
+        if score == 0 {
+            continue;
+        }
+        match &best {
+            Some((best_score, _)) if *best_score >= score => {}
+            _ => best = Some((score, voice_id.to_string())),
+        }
+    }
+
+    Ok(best.map(|(_, id)| id))
 }
 
 // ── TTS call ──────────────────────────────────────────────────────
@@ -364,64 +470,57 @@ impl TypecastInterpSession {
     pub async fn start(config: TypecastInterpConfig) -> anyhow::Result<Self> {
         let session_id = config.session_id.clone();
 
-        // Build Deepgram config
-        let dg_lang = if config.source_lang == LanguageCode::Ko
-            || config.source_lang == LanguageCode::En
-        {
-            super::deepgram_stt::language_code_to_deepgram(&config.source_lang).to_string()
+        // Build Gemma ASR config — model tier is whatever the gateway
+        // resolved for this device. Pass the source language as a
+        // transcription hint so Gemma stays on script.
+        let gemma_base_url = if config.gemma_base_url.trim().is_empty() {
+            DEFAULT_OLLAMA_URL.to_string()
         } else {
-            "multi".to_string()
+            config.gemma_base_url.clone()
         };
-
-        let dg_config = DeepgramConfig {
-            api_key: config.deepgram_api_key.clone(),
-            model: config.deepgram_model.clone(),
-            language: dg_lang,
-            interim_results: true,
-            smart_format: true,
-            punctuate: true,
-            endpointing_ms: Some(300),
-            utterance_end_ms: Some(1000),
-            vad_events: true,
-            diarize: false,
-            encoding: super::deepgram_stt::INPUT_ENCODING.to_string(),
-            sample_rate: super::deepgram_stt::INPUT_SAMPLE_RATE,
-            channels: 1,
+        let asr_config = GemmaAsrConfig {
+            session_id: session_id.clone(),
+            base_url: gemma_base_url,
+            model: config.gemma_model.clone(),
+            language_hint: Some(config.source_lang.as_str().to_string()),
+            ..Default::default()
         };
 
         tracing::info!(
             session_id = %session_id,
             source = config.source_lang.as_str(),
             target = config.target_lang.as_str(),
+            gemma_model = %config.gemma_model,
             has_voice_clone = config.voice_clone_id.is_some(),
-            "Starting Typecast interpretation session (STT+LLM+TTS)"
+            has_fallback_voice = config.fallback_voice_id.is_some(),
+            "Starting Typecast interpretation session (Gemma STT + LLM + Typecast TTS)"
         );
 
-        let dg_session = DeepgramSttSession::connect(session_id.clone(), &dg_config).await?;
+        let asr_session = GemmaAsrSession::start(asr_config).await?;
 
         let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(512);
         let (event_tx, event_rx) = mpsc::channel::<ServerMessage>(256);
         let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
 
         let segmentation = Arc::new(Mutex::new(SegmentationEngine::new(config.segmentation.clone())));
-        let dg_session = Arc::new(dg_session);
+        let asr_session = Arc::new(asr_session);
         let config = Arc::new(config);
 
         // Spawn audio forwarder
-        let dg_for_audio = Arc::clone(&dg_session);
+        let asr_for_audio = Arc::clone(&asr_session);
         tokio::spawn(async move {
-            Self::audio_forwarder(audio_rx, dg_for_audio).await;
+            Self::audio_forwarder(audio_rx, asr_for_audio).await;
         });
 
         // Spawn event processor (STT → segmentation → LLM → TTS)
-        let dg_for_events = Arc::clone(&dg_session);
+        let asr_for_events = Arc::clone(&asr_session);
         let seg_for_events = Arc::clone(&segmentation);
         let event_tx_events = event_tx.clone();
         let sid_events = session_id.clone();
         let cfg_events = Arc::clone(&config);
         tokio::spawn(async move {
             Self::event_processor(
-                dg_for_events,
+                asr_for_events,
                 seg_for_events,
                 event_tx_events,
                 sid_events,
@@ -477,15 +576,17 @@ impl TypecastInterpSession {
 
     async fn audio_forwarder(
         mut audio_rx: mpsc::Receiver<Vec<u8>>,
-        dg: Arc<DeepgramSttSession>,
+        asr: Arc<GemmaAsrSession>,
     ) {
         while let Some(pcm) = audio_rx.recv().await {
-            if let Err(e) = dg.send_audio(pcm).await {
-                tracing::warn!(error = %e, "Failed to forward audio to Deepgram");
+            if let Err(e) = asr.send_audio(pcm).await {
+                tracing::warn!(error = %e, "Failed to forward audio to Gemma ASR");
                 break;
             }
         }
-        let _ = dg.finalize().await;
+        // Gemma ASR has no finalize() — closing the audio channel
+        // simply lets its background loop drain and exit.
+        asr.close().await;
     }
 
     // ── Internal: translate + synthesize a committed segment ──────
@@ -532,17 +633,33 @@ impl TypecastInterpSession {
             })
             .await;
 
-        // 2. Typecast TTS synthesis
-        let voice_id = config
+        // 2. Typecast TTS synthesis. The gateway is supposed to have
+        // resolved a fallback_voice_id via select_fallback_voice_id()
+        // before construction; if both clone + fallback are missing,
+        // surface a real error instead of silently skipping audio.
+        let voice_id = match config
             .voice_clone_id
             .as_deref()
             .or(config.fallback_voice_id.as_deref())
-            .unwrap_or("");
-
-        if voice_id.is_empty() {
-            tracing::warn!(session_id = %session_id, "No voice ID for TTS — skipping audio");
-            return;
-        }
+        {
+            Some(id) if !id.is_empty() => id,
+            _ => {
+                tracing::error!(
+                    session_id = %session_id,
+                    "No Typecast voice id available (no clone, no fallback resolved)"
+                );
+                let _ = event_tx
+                    .send(ServerMessage::Error {
+                        session_id: session_id.to_string(),
+                        code: "TTS_NO_VOICE_ID".into(),
+                        message: "No Typecast voice available for this user / target language. \
+                                  Please pick a voice in Settings or use voice cloning."
+                            .to_string(),
+                    })
+                    .await;
+                return;
+            }
+        };
 
         let tgt_iso3 = lang_to_typecast_iso3(config.target_lang);
 
@@ -585,14 +702,15 @@ impl TypecastInterpSession {
     // ── Internal: event processor ─────────────────────────────────
 
     async fn event_processor(
-        dg: Arc<DeepgramSttSession>,
+        asr: Arc<GemmaAsrSession>,
         segmentation: Arc<Mutex<SegmentationEngine>>,
         event_tx: mpsc::Sender<ServerMessage>,
         session_id: String,
         config: Arc<TypecastInterpConfig>,
     ) {
+        let mut rx = asr.event_rx.lock().await;
         loop {
-            let event = match dg.recv_event().await {
+            let event = match rx.recv().await {
                 Some(e) => e,
                 None => break,
             };
@@ -707,7 +825,7 @@ impl TypecastInterpSession {
                     let _ = event_tx
                         .send(ServerMessage::Error {
                             session_id: session_id.clone(),
-                            code: "DEEPGRAM_STT_ERROR".into(),
+                            code: "GEMMA_STT_ERROR".into(),
                             message,
                         })
                         .await;
@@ -793,5 +911,91 @@ impl TypecastInterpSession {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_match_score_zero_on_gender_mismatch() {
+        // Female user, male voice → hard reject regardless of other fields.
+        let s = voice_match_score(
+            "male",
+            "young_adult",
+            &["Conversational".to_string()],
+            VoiceGender::Female,
+            VoiceAge::YoungAdult,
+        );
+        assert_eq!(s, 0);
+    }
+
+    #[test]
+    fn voice_match_score_prefers_conversational_over_announcer() {
+        let conv = voice_match_score(
+            "female",
+            "young_adult",
+            &["Conversational".to_string()],
+            VoiceGender::Female,
+            VoiceAge::YoungAdult,
+        );
+        let news = voice_match_score(
+            "female",
+            "young_adult",
+            &["News Reporter".to_string()],
+            VoiceGender::Female,
+            VoiceAge::YoungAdult,
+        );
+        assert!(
+            conv > news,
+            "Conversational should outrank News Reporter for interpretation; \
+             conv={conv} news={news}"
+        );
+    }
+
+    #[test]
+    fn voice_match_score_age_exact_beats_age_off_by_one() {
+        let exact = voice_match_score(
+            "female",
+            "middle_age",
+            &["Conversational".to_string()],
+            VoiceGender::Female,
+            VoiceAge::MiddleAge,
+        );
+        let off_by_one = voice_match_score(
+            "female",
+            "young_adult",
+            &["Conversational".to_string()],
+            VoiceGender::Female,
+            VoiceAge::MiddleAge,
+        );
+        assert!(
+            exact > off_by_one,
+            "Exact age match should outrank off-by-one; exact={exact} off={off_by_one}"
+        );
+    }
+
+    #[test]
+    fn voice_match_score_excludes_game_only_voice() {
+        // Voice whose ONLY use case is "Game" → hard exclude.
+        let s = voice_match_score(
+            "female",
+            "young_adult",
+            &["Game".to_string()],
+            VoiceGender::Female,
+            VoiceAge::YoungAdult,
+        );
+        assert_eq!(s, 0);
+    }
+
+    #[test]
+    fn lang_to_typecast_iso3_covers_supported_codes() {
+        // Spot-check a few to make sure no panic on the common path.
+        assert_eq!(lang_to_typecast_iso3(LanguageCode::Ko), "kor");
+        assert_eq!(lang_to_typecast_iso3(LanguageCode::En), "eng");
+        assert_eq!(lang_to_typecast_iso3(LanguageCode::Ja), "jpn");
+        assert_eq!(lang_to_typecast_iso3(LanguageCode::Zh), "cmn");
+        assert_eq!(lang_to_typecast_iso3(LanguageCode::ZhTw), "cmn");
     }
 }

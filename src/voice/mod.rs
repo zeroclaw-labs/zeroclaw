@@ -19,12 +19,10 @@
 
 pub mod conference;
 pub mod cosyvoice2;
-pub mod deepgram_simul;
 pub mod deepgram_stt;
 pub mod events;
 pub mod gemini_live;
 pub mod gemma_asr;
-pub mod gemma_simul;
 pub mod kokoro_tts;
 pub mod openai_realtime;
 pub mod pipeline;
@@ -67,8 +65,6 @@ pub use events::{ClientMessage, InterpretationMode, ServerMessage};
 #[allow(unused_imports)]
 pub use gemini_live::{ConnectionState, GeminiLiveSession, VadConfig, VadSensitivity};
 #[allow(unused_imports)]
-pub use deepgram_simul::{DeepgramSimulConfig, DeepgramSimulSession};
-#[allow(unused_imports)]
 pub use deepgram_stt::{DeepgramConfig, DeepgramSttSession, SttEvent};
 #[allow(unused_imports)]
 pub use gemma_asr::{GemmaAsrConfig, GemmaAsrSession};
@@ -84,7 +80,9 @@ pub use simul::{CommittedSegment, SegmentationConfig, SegmentationEngine};
 #[allow(unused_imports)]
 pub use simul_session::{SimulSession, SimulSessionConfig};
 #[allow(unused_imports)]
-pub use typecast_interp::{TypecastInterpConfig, TypecastInterpSession};
+pub use typecast_interp::{
+    select_fallback_voice_id, TypecastInterpConfig, TypecastInterpSession,
+};
 #[allow(unused_imports)]
 pub use voice_chat_pipeline::{
     LatencyBreakdown, QueryRoute, SttResult, ValidationResult, VoiceChatPipeline,

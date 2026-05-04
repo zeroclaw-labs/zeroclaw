@@ -16961,17 +16961,28 @@ pub struct VoiceConfig {
     /// OpenAI API key override (falls back to OPENAI_API_KEY env var).
     #[serde(default)]
     pub openai_api_key: Option<String>,
-    /// Deepgram API key for STT (falls back to DEEPGRAM_API_KEY env var).
+    /// Deepgram API key for chat voice input STT only (the
+    /// `/ws/stt` handler in `gateway/ws.rs`). NOT used by the
+    /// interpretation pipeline — interpretation uses Gemini Live or
+    /// Gemma 4 (via TypecastPipeline). Slated for removal in the
+    /// chat-voice cleanup PR; do not add new consumers.
     #[serde(default)]
     pub deepgram_api_key: Option<String>,
-    /// Deepgram model (default: "nova-3").
+    /// Deepgram model for chat voice input STT (default: "nova-3").
+    /// Same scope/lifecycle as `deepgram_api_key` above.
     #[serde(default = "default_deepgram_model")]
     pub deepgram_model: String,
-    /// Default voice provider: "gemini", "openai", or "deepgram" (default: "gemini").
+    /// Default voice interpretation provider. Supported values:
+    ///   * `"gemini"` (default) — Gemini Live S2S, lowest latency.
+    ///   * `"typecast_pipeline"` — Gemma 4 STT + LLM translation +
+    ///     Typecast TTS (own-voice clone). User opts in via the
+    ///     "내 목소리로 통역" toggle in the Interpreter UI.
     #[serde(default)]
     pub default_provider: Option<String>,
-    /// Default STT provider: "deepgram", "gemini", or "openai" (default: "deepgram").
-    /// Used for chat voice input and standalone speech-to-text.
+    /// Default STT provider for chat voice input (separate from the
+    /// interpretation pipeline). Currently `"deepgram"` is the only
+    /// implemented backend; the chat voice path will move to Gemma 4
+    /// in a follow-up cleanup PR.
     #[serde(default = "default_stt_provider")]
     pub stt_provider: String,
     /// VAD silence duration in ms (how long silence = end-of-speech).
