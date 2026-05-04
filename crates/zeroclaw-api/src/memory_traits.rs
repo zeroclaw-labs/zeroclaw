@@ -167,6 +167,20 @@ pub trait Memory: Send + Sync {
     /// Health check
     async fn health_check(&self) -> bool;
 
+    /// Rebuild backend indexes: FTS tables and any missing embedding vectors.
+    ///
+    /// Intended as a manual fixup after bulk writes that didn't go through
+    /// the normal `store()` path (e.g. `zeroclaw migrate openclaw`, which
+    /// uses `NoopEmbedding` for speed and leaves `embedding = NULL` behind).
+    /// Returns the number of entries that were re-embedded; backends
+    /// without a vector index or with nothing to fill in return 0.
+    ///
+    /// Default: no-op. Overridden by backends that maintain separate
+    /// derived indexes (e.g. `SqliteMemory`).
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
     /// Store a conversation trace as procedural memory.
     ///
     /// Backends that support procedural storage override this

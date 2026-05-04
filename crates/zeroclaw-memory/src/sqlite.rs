@@ -431,59 +431,6 @@ impl SqliteMemory {
         Ok(scored)
     }
 
-    /// Safe reindex: rebuild FTS5 + embeddings with rollback on failure
-    #[allow(dead_code)]
-    pub async fn reindex(&self) -> anyhow::Result<usize> {
-        // Step 1: Rebuild FTS5
-        {
-            let conn = self.conn.clone();
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let conn = conn.lock();
-                conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")?;
-                Ok(())
-            })
-            .await??;
-        }
-
-        // Step 2: Re-embed all memories that lack embeddings
-        if self.embedder.dimensions() == 0 {
-            return Ok(0);
-        }
-
-        let conn = self.conn.clone();
-        let entries: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
-            let conn = conn.lock();
-            let mut stmt =
-                conn.prepare("SELECT id, content FROM memories WHERE embedding IS NULL")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            Ok::<_, anyhow::Error>(rows.filter_map(std::result::Result::ok).collect())
-        })
-        .await??;
-
-        let mut count = 0;
-        for (id, content) in &entries {
-            if let Ok(Some(emb)) = self.get_or_compute_embedding(content).await {
-                let bytes = vector::vec_to_bytes(&emb);
-                let conn = self.conn.clone();
-                let id = id.clone();
-                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    let conn = conn.lock();
-                    conn.execute(
-                        "UPDATE memories SET embedding = ?1 WHERE id = ?2",
-                        params![bytes, id],
-                    )?;
-                    Ok(())
-                })
-                .await??;
-                count += 1;
-            }
-        }
-
-        Ok(count)
-    }
-
     /// List memories by time range (used when query is empty).
     async fn recall_by_time_only(
         &self,
@@ -998,6 +945,68 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())
             .await
             .unwrap_or(false)
+    }
+
+    /// Rebuild backend indexes: FTS tables and missing embedding vectors.
+    ///
+    /// Step 1 rebuilds the FTS5 index unconditionally (idempotent, cheap).
+    /// Step 2 fills in vectors for every row with `embedding IS NULL` using
+    /// the configured embedder. If interrupted, re-running is safe — only
+    /// rows still missing a vector are re-processed. Intended to be run
+    /// after bulk writes that didn't go through `store()` (e.g. `zeroclaw
+    /// migrate openclaw`, which uses `NoopEmbedding` for speed). Returns
+    /// the number of rows that received a new embedding; returns 0 if the
+    /// embedder has no dimensions (Noop) or if everything is already
+    /// embedded.
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        // Step 1: Rebuild FTS5 (always safe, cheap)
+        {
+            let conn = self.conn.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let conn = conn.lock();
+                conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")?;
+                Ok(())
+            })
+            .await??;
+        }
+
+        // Step 2: Re-embed memories with NULL vectors, if embedder is configured
+        if self.embedder.dimensions() == 0 {
+            return Ok(0);
+        }
+
+        let conn = self.conn.clone();
+        let entries: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt =
+                conn.prepare("SELECT id, content FROM memories WHERE embedding IS NULL")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            Ok::<_, anyhow::Error>(rows.filter_map(std::result::Result::ok).collect())
+        })
+        .await??;
+
+        let mut count = 0;
+        for (id, content) in &entries {
+            if let Ok(Some(emb)) = self.get_or_compute_embedding(content).await {
+                let bytes = vector::vec_to_bytes(&emb);
+                let conn = self.conn.clone();
+                let id = id.clone();
+                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let conn = conn.lock();
+                    conn.execute(
+                        "UPDATE memories SET embedding = ?1 WHERE id = ?2",
+                        params![bytes, id],
+                    )?;
+                    Ok(())
+                })
+                .await??;
+                count += 1;
+            }
+        }
+
+        Ok(count)
     }
 
     async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
