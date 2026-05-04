@@ -70,6 +70,29 @@ fn npm_install(web_dir: &Path) -> Result<()> {
     run_cmd(Command::new(bin("npm")).current_dir(web_dir).arg("install"))
 }
 
+/// Whether `web/node_modules` is missing or stale relative to `package-lock.json`.
+///
+/// npm writes a `node_modules/.package-lock.json` sentinel after every successful
+/// install. If it's absent, or if the checked-in `package-lock.json` is newer
+/// (a pull or merge updated dependencies), the install needs to re-run.
+fn node_modules_needs_install(web_dir: &Path) -> bool {
+    let node_modules = web_dir.join("node_modules");
+    if !node_modules.exists() {
+        return true;
+    }
+    let sentinel = node_modules.join(".package-lock.json");
+    let lock = web_dir.join("package-lock.json");
+    let (Ok(sentinel_meta), Ok(lock_meta)) = (sentinel.metadata(), lock.metadata()) else {
+        // Sentinel missing → install never completed cleanly. Lock missing → treat
+        // node_modules as authoritative (no signal to re-install).
+        return !sentinel.exists() && lock.exists();
+    };
+    match (sentinel_meta.modified(), lock_meta.modified()) {
+        (Ok(sentinel_t), Ok(lock_t)) => lock_t > sentinel_t,
+        _ => false,
+    }
+}
+
 fn npm_run(web_dir: &Path, script: &str) -> Result<()> {
     println!("==> npm run {script}");
     run_cmd(
@@ -88,7 +111,7 @@ fn npx(web_dir: &Path, args: &[&str]) -> Result<()> {
 
 fn gen_api(web_dir: &Path, spec_path: &Path) -> Result<()> {
     require_tool("npm", "https://nodejs.org/ or `nvm install --lts`")?;
-    if !web_dir.join("node_modules").exists() {
+    if node_modules_needs_install(web_dir) {
         npm_install(web_dir)?;
     }
     let out_rel = PathBuf::from("src/lib/api-generated.ts");
