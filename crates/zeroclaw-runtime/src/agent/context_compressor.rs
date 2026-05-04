@@ -416,23 +416,50 @@ fn align_boundary_forward(messages: &[ChatMessage], idx: usize) -> usize {
 /// already-protected `tool_result` blocks remain in the tail, creating
 /// the 400 "unexpected tool_use_id in tool_result blocks" failure mode
 /// at the root of #5813.
+///
+/// A tool-call-owning assistant is detected by *either* of:
+/// 1. Embedded JSON: `content` parses as JSON and contains a non-empty
+///    `tool_calls` array. This is how the OpenAI-compat reader (see
+///    `crates/zeroclaw-providers/src/openai.rs::convert_messages`) expects
+///    the history writer to serialize assistant-with-tool-calls messages.
+/// 2. Trailing tool messages: we just stepped over one or more `tool`
+///    messages while walking backward. By protocol a `tool` message can
+///    only follow an `assistant(tool_calls)`, so the preceding assistant
+///    owns those results regardless of how its content was serialized.
+///    This second path exists because, in practice, some provider code
+///    paths persist tool-call-owning assistants as plain-text content
+///    (without the JSON `tool_calls` field). Without this fallback those
+///    pairs get split — the assistant is summarized while the tool result
+///    remains in the protected tail — producing an outbound payload that
+///    strict servers reject (e.g. MiniMax returns HTTP 400 code 2013
+///    `invalid message role: system` after the resulting tool loop).
 fn align_boundary_backward(messages: &[ChatMessage], idx: usize) -> usize {
     let mut i = idx;
     loop {
+        let before_tools = i;
         while i > 0 && messages[i].role == "tool" {
             i -= 1;
         }
-        if messages[i].role == "assistant"
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&messages[i].content)
-            && v.get("tool_calls")
-                .and_then(|a| a.as_array())
-                .is_some_and(|a| !a.is_empty())
-        {
-            if i == 0 {
-                break;
+        let saw_tool = i != before_tools;
+
+        if messages[i].role == "assistant" {
+            let has_json_tool_calls =
+                serde_json::from_str::<serde_json::Value>(&messages[i].content)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("tool_calls")
+                            .and_then(|a| a.as_array())
+                            .map(|a| !a.is_empty())
+                    })
+                    .unwrap_or(false);
+
+            if saw_tool || has_json_tool_calls {
+                if i == 0 {
+                    break;
+                }
+                i -= 1;
+                continue;
             }
-            i -= 1;
-            continue;
         }
         break;
     }
@@ -716,6 +743,38 @@ mod tests {
         ];
         // No tool_calls on the assistant — boundary should not retreat.
         assert_eq!(align_boundary_backward(&messages, 2), 2);
+    }
+
+    /// Regression: the OpenAI-compat / MiniMax path can persist a
+    /// tool-call-owning assistant with plain-text content (no embedded
+    /// JSON `tool_calls` field). When such an assistant sits just
+    /// before the compression boundary and is followed by `tool`
+    /// messages in the protected tail, the boundary must retreat past
+    /// the assistant — otherwise the assistant gets summarized while
+    /// its tool result remains in the protected tail, producing the
+    /// orphaned-pair state that downstream strict servers reject
+    /// (MiniMax returns HTTP 400 code 2013 `invalid message role:
+    /// system` after the resulting tool loop).
+    #[test]
+    fn test_align_boundary_backward_plaintext_assistant_before_tool() {
+        let messages = vec![
+            msg("system", "sys"),
+            msg("user", "question"),
+            msg("assistant", "Let me check"),
+            msg("tool", "result payload"),
+            msg("assistant", "final"),
+        ];
+        // Initial boundary (protect_last_n = 2) lands on the tool at
+        // idx 3. Walking backward: idx 3 is tool → skip; idx 2 is a
+        // plain-text assistant. With JSON-only detection this returned
+        // 2 (the assistant was summarized while the tool stayed in the
+        // tail, creating the orphan). The fix recognizes the trailing
+        // tool as proof of ownership and retreats past the assistant.
+        let aligned = align_boundary_backward(&messages, 3);
+        assert!(
+            aligned < 2,
+            "boundary should retreat past plain-text assistant+tool pair, got {aligned}"
+        );
     }
 
     #[test]
