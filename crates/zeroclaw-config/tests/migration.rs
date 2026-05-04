@@ -1008,6 +1008,120 @@ channel_ids = ["aaaa"]
 }
 
 // ─────────────────────────────────────────────────────────────
+// V1/V2 colon-URL provider strings — `(custom|anthropic-custom):<url>`.
+// Pre-fix the migration used the raw colon-URL string as the V3 outer
+// provider key, then synthesized `model_provider = "<type>:<url>.<alias>"`.
+// V3's `split_once('.')` resolution then tokenized at the first URL dot
+// (e.g. inside `api.z.ai`), making the reference unresolvable. The fix
+// splits the URL into `base_url` on the alias entry and uses only the
+// prefix as the V3 type key, keeping `<type>.<alias>` parseable (#6266
+// review).
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn anthropic_custom_colon_url_default_provider_splits_into_base_url() {
+    let raw = r#"
+default_provider = "anthropic-custom:https://api.z.ai/api/anthropic"
+default_model = "claude-sonnet-4"
+api_key = "sk-zai-test"
+"#;
+    let cfg =
+        migrate_to_current(raw).expect("migration succeeds despite colon-URL default_provider");
+    let entry = cfg
+        .providers
+        .models
+        .get("anthropic-custom")
+        .and_then(|m| m.get("default"))
+        .expect(
+            "V3 outer key must be the dot-free prefix `anthropic-custom`, not the raw colon-URL string",
+        );
+    assert_eq!(
+        entry.base_url.as_deref(),
+        Some("https://api.z.ai/api/anthropic"),
+        "the URL portion of the V2 colon-URL form must land in base_url on the alias entry"
+    );
+    assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4"));
+    assert_eq!(entry.api_key.as_deref(), Some("sk-zai-test"));
+}
+
+#[test]
+fn custom_colon_url_default_provider_splits_into_base_url() {
+    let raw = r#"
+default_provider = "custom:http://localhost:8080/v1"
+default_model = "local-model"
+"#;
+    let cfg =
+        migrate_to_current(raw).expect("migration succeeds for plain `custom:` colon-URL form");
+    let entry = cfg
+        .providers
+        .models
+        .get("custom")
+        .and_then(|m| m.get("default"))
+        .expect("V3 outer key must be `custom`, not the raw colon-URL");
+    assert_eq!(
+        entry.base_url.as_deref(),
+        Some("http://localhost:8080/v1"),
+        "the URL portion of the V2 colon-URL form must land in base_url"
+    );
+    assert_eq!(entry.model.as_deref(), Some("local-model"));
+}
+
+#[test]
+fn agent_inline_brain_colon_url_provider_splits_into_base_url() {
+    // Per-agent colon-URL: synthesize_agent_brains used the raw string as
+    // the V3 outer provider key. Same dot-bearing-key bug — must split.
+    let raw = r#"
+schema_version = 2
+
+[agents.researcher]
+provider = "anthropic-custom:https://api.z.ai/api/anthropic"
+model = "claude-opus-4"
+api_key = "sk-zai-agent"
+"#;
+    let v3 = migrate_v2(raw);
+    let agent = v3
+        .get("agents")
+        .and_then(|v| v.get("researcher"))
+        .expect("agents.researcher present");
+    let model_provider = agent
+        .get("model_provider")
+        .and_then(|v| v.as_str())
+        .expect("model_provider reference is a string");
+    let (type_key, alias_key) = model_provider
+        .split_once('.')
+        .expect("model_provider must split cleanly on the type/alias dot");
+    assert_eq!(
+        type_key, "anthropic-custom",
+        "type segment must be the dot-free prefix, not the colon-URL form"
+    );
+    assert_eq!(alias_key, "agent_researcher");
+    assert!(
+        !alias_key.contains('/'),
+        "the URL must not bleed into the alias segment, got alias `{alias_key}`"
+    );
+
+    let synthesized = v3
+        .get("providers")
+        .and_then(|v| v.get("models"))
+        .and_then(|v| v.get("anthropic-custom"))
+        .and_then(|v| v.get("agent_researcher"))
+        .expect("providers.models.anthropic-custom.agent_researcher synthesized");
+    assert_eq!(
+        synthesized.get("base_url").and_then(toml::Value::as_str),
+        Some("https://api.z.ai/api/anthropic"),
+        "the colon-URL's URL portion must land in base_url on the synthesized alias entry"
+    );
+    assert_eq!(
+        synthesized.get("model").and_then(toml::Value::as_str),
+        Some("claude-opus-4")
+    );
+    assert_eq!(
+        synthesized.get("api_key").and_then(toml::Value::as_str),
+        Some("sk-zai-agent")
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
 // signal "dm" sentinel — separate test because the V1 fixture above
 // uses a non-"dm" value to exercise the array fold path. This test
 // inlines a minimal V1 input to exercise the sentinel branch.
