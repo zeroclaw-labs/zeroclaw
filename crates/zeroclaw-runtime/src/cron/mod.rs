@@ -22,12 +22,17 @@ pub use types::{
     deserialize_maybe_stringified,
 };
 
-/// Validate a shell command against the full security policy (allowlist + risk gate).
-///
-/// Returns `Ok(())` if the command passes all checks, or an error describing
-/// why it was blocked.
-pub fn validate_shell_command(config: &Config, command: &str, approved: bool) -> Result<()> {
-    let security = SecurityPolicy::from_config(config, None);
+/// Validate a shell command against an agent's security policy
+/// (allowlist + risk gate). `agent_alias` names the agent under whose
+/// risk profile the command will run. Returns `Ok(())` if the command
+/// passes all checks, or an error describing why it was blocked.
+pub fn validate_shell_command(
+    config: &Config,
+    agent_alias: &str,
+    command: &str,
+    approved: bool,
+) -> Result<()> {
+    let security = SecurityPolicy::for_agent(config, agent_alias)?;
     validate_shell_command_with_security(&security, command, approved)
 }
 
@@ -80,32 +85,37 @@ pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()>
 
 /// Create a validated shell job, enforcing security policy before persistence.
 ///
-/// All entrypoints that create shell cron jobs should route through this
-/// function to guarantee consistent policy enforcement.
+/// `agent_alias` names the agent under whose risk profile the command
+/// will be validated and executed. All entrypoints that create shell
+/// cron jobs should route through this function to guarantee consistent
+/// policy enforcement.
 pub fn add_shell_job_with_approval(
     config: &Config,
+    agent_alias: &str,
     name: Option<String>,
     schedule: Schedule,
     command: &str,
     delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
-    validate_shell_command(config, command, approved)?;
+    validate_shell_command(config, agent_alias, command, approved)?;
     validate_delivery_config(delivery.as_ref())?;
     store::add_shell_job(config, name, schedule, command, delivery)
 }
 
 /// Update a shell job's command with security validation.
 ///
-/// Validates the new command (if changed) before persisting.
+/// Validates the new command (if changed) against the named agent's
+/// risk profile before persisting.
 pub fn update_shell_job_with_approval(
     config: &Config,
+    agent_alias: &str,
     job_id: &str,
     patch: CronJobPatch,
     approved: bool,
 ) -> Result<CronJob> {
     if let Some(command) = patch.command.as_deref() {
-        validate_shell_command(config, command, approved)?;
+        validate_shell_command(config, agent_alias, command, approved)?;
     }
     update_job(config, job_id, patch)
 }
@@ -113,56 +123,65 @@ pub fn update_shell_job_with_approval(
 /// Create a one-shot validated shell job from a delay string (e.g. "30m").
 pub fn add_once_validated(
     config: &Config,
+    agent_alias: &str,
     delay: &str,
     command: &str,
     approved: bool,
 ) -> Result<CronJob> {
     let duration = parse_delay(delay)?;
     let at = chrono::Utc::now() + duration;
-    add_once_at_validated(config, at, command, approved)
+    add_once_at_validated(config, agent_alias, at, command, approved)
 }
 
 /// Create a one-shot validated shell job at an absolute timestamp.
 pub fn add_once_at_validated(
     config: &Config,
+    agent_alias: &str,
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
     approved: bool,
 ) -> Result<CronJob> {
     let schedule = Schedule::At { at };
-    add_shell_job_with_approval(config, None, schedule, command, None, approved)
+    add_shell_job_with_approval(config, agent_alias, None, schedule, command, None, approved)
 }
 
 // Convenience wrappers for CLI paths (default approved=false).
 
 pub fn add_shell_job(
     config: &Config,
+    agent_alias: &str,
     name: Option<String>,
     schedule: Schedule,
     command: &str,
 ) -> Result<CronJob> {
-    add_shell_job_with_approval(config, name, schedule, command, None, false)
+    add_shell_job_with_approval(config, agent_alias, name, schedule, command, None, false)
 }
 
-pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {
+pub fn add_job(
+    config: &Config,
+    agent_alias: &str,
+    expression: &str,
+    command: &str,
+) -> Result<CronJob> {
     let schedule = Schedule::Cron {
         expr: expression.to_string(),
         tz: None,
     };
-    add_shell_job(config, None, schedule, command)
+    add_shell_job(config, agent_alias, None, schedule, command)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-pub fn add_once(config: &Config, delay: &str, command: &str) -> Result<CronJob> {
-    add_once_validated(config, delay, command, false)
+pub fn add_once(config: &Config, agent_alias: &str, delay: &str, command: &str) -> Result<CronJob> {
+    add_once_validated(config, agent_alias, delay, command, false)
 }
 
 pub fn add_once_at(
     config: &Config,
+    agent_alias: &str,
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
 ) -> Result<CronJob> {
-    add_once_at_validated(config, at, command, false)
+    add_once_at_validated(config, agent_alias, at, command, false)
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {
@@ -398,7 +417,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            &config.workspace_dir,
+        );
         assert!(security.is_command_allowed("echo safe"));
     }
 
@@ -633,7 +655,10 @@ mod tests {
             .or_default()
             .level = crate::security::AutonomyLevel::Supervised;
 
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            &config.workspace_dir,
+        );
         // Simulate scheduler validation path
         let result =
             validate_shell_command_with_security(&security, "curl https://example.com", false);

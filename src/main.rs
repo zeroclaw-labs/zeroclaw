@@ -327,6 +327,11 @@ Examples:
   zeroclaw agent -p anthropic --model claude-sonnet-4-20250514
   zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0")]
     Agent {
+        /// Configured agent alias to run as (must match `[agents.<alias>]`).
+        /// Required: V3 has no default agent.
+        #[arg(short = 'a', long)]
+        agent: String,
+
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
         message: Option<String>,
@@ -1424,12 +1429,18 @@ async fn main() -> Result<()> {
         // Kernel-only mode: minimal CLI agent without channels/tools/gateway
         match cli.command {
             Commands::Agent {
+                agent: agent_alias,
                 message,
                 provider,
                 model,
                 temperature,
                 ..
             } => {
+                if config.agent(&agent_alias).is_none() {
+                    anyhow::bail!(
+                        "`zeroclaw agent --agent {agent_alias}` is not configured (no [agents.{agent_alias}] entry)"
+                    );
+                }
                 let final_temperature = temperature.unwrap_or_else(|| {
                     config
                         .providers
@@ -1537,6 +1548,7 @@ async fn main() -> Result<()> {
         | Commands::MarkdownSchema => unreachable!(),
 
         Commands::Agent {
+            agent: agent_alias,
             message,
             session_state_file,
             provider,
@@ -1552,6 +1564,15 @@ async fn main() -> Result<()> {
                     .unwrap_or(0.7)
             });
 
+            // Validate up-front: bail with a clear message if the alias
+            // isn't configured. The runtime would error too, but this
+            // catches typos before any subsystem spins up.
+            if config.agent(&agent_alias).is_none() {
+                anyhow::bail!(
+                    "`zeroclaw agent --agent {agent_alias}` is not configured (no [agents.{agent_alias}] entry)"
+                );
+            }
+
             // Wire CLI channel for interactive mode
             zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
                 Box::new(zeroclaw_channels::cli::CliChannel::new())
@@ -1559,6 +1580,7 @@ async fn main() -> Result<()> {
 
             Box::pin(agent::run(
                 config,
+                &agent_alias,
                 message,
                 provider,
                 model,
@@ -1721,8 +1743,15 @@ async fn main() -> Result<()> {
             #[cfg(target_os = "linux")]
             {
                 use zeroclaw_config::schema::SandboxBackend;
-                let sandbox_cfg = config.active_risk_profile(None).sandbox_config();
-                let sandbox_docker = matches!(sandbox_cfg.backend, SandboxBackend::Docker);
+                // Any enabled agent whose risk_profile uses the docker
+                // sandbox triggers the warning — we just need to know
+                // *some* agent is using it.
+                let sandbox_docker = config
+                    .agents
+                    .iter()
+                    .filter(|(_, a)| a.enabled)
+                    .filter_map(|(alias, _)| config.risk_profile_for_agent(alias))
+                    .any(|p| matches!(p.sandbox_config().backend, SandboxBackend::Docker));
                 let runtime_docker_mem = config.runtime.kind == "docker"
                     && config
                         .runtime
@@ -1902,8 +1931,27 @@ async fn main() -> Result<()> {
                 "🧾 Trace storage:  {} ({})",
                 config.observability.runtime_trace_mode, config.observability.runtime_trace_path
             );
-            let active_profile = config.active_risk_profile(None);
-            println!("🛡️  Autonomy:      {:?}", active_profile.level);
+            // Per-agent autonomy: each enabled agent picks its own
+            // risk_profile, so list them rather than collapsing to one.
+            let mut agent_aliases: Vec<&String> = config
+                .agents
+                .iter()
+                .filter(|(_, a)| a.enabled)
+                .map(|(alias, _)| alias)
+                .collect();
+            agent_aliases.sort();
+            if agent_aliases.is_empty() {
+                println!("🛡️  Agents:        (none configured)");
+            } else {
+                let summary: Vec<String> = agent_aliases
+                    .iter()
+                    .map(|alias| match config.risk_profile_for_agent(alias) {
+                        Some(p) => format!("{alias}={:?}", p.level),
+                        None => format!("{alias}=<no risk_profile>"),
+                    })
+                    .collect();
+                println!("🛡️  Agents:        {}", summary.join(", "));
+            }
             println!("⚙️  Runtime:       {}", config.runtime.kind);
             if service::is_running() {
                 println!("🟢 Service:       running");
@@ -1926,24 +1974,28 @@ async fn main() -> Result<()> {
             );
 
             println!();
-            println!("Security:");
-            println!("  Workspace only:    {}", active_profile.workspace_only);
-            println!(
-                "  Allowed roots:     {}",
-                if active_profile.allowed_roots.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    active_profile.allowed_roots.join(", ")
-                }
-            );
-            println!(
-                "  Allowed commands:  {}",
-                active_profile.allowed_commands.join(", ")
-            );
-            println!(
-                "  Max actions/hour:  {}",
-                active_profile.max_actions_per_hour
-            );
+            // Per-agent security: each enabled agent's risk profile.
+            for alias in &agent_aliases {
+                let Some(profile) = config.risk_profile_for_agent(alias) else {
+                    println!("Security ({alias}): <no risk_profile>");
+                    continue;
+                };
+                println!("Security ({alias}):");
+                println!("  Workspace only:    {}", profile.workspace_only);
+                println!(
+                    "  Allowed roots:     {}",
+                    if profile.allowed_roots.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        profile.allowed_roots.join(", ")
+                    }
+                );
+                println!(
+                    "  Allowed commands:  {}",
+                    profile.allowed_commands.join(", ")
+                );
+                println!("  Max actions/hour:  {}", profile.max_actions_per_hour);
+            }
             println!(
                 "  Cost tracking:     {}",
                 if config.cost.enabled {
@@ -4204,8 +4256,15 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_with_temperature() {
-        let cli = Cli::try_parse_from(["zeroclaw", "agent", "--temperature", "0.5"])
-            .expect("agent command with temperature should parse");
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "agent",
+            "--agent",
+            "morning-shift",
+            "--temperature",
+            "0.5",
+        ])
+        .expect("agent command with temperature should parse");
 
         match cli.command {
             Commands::Agent { temperature, .. } => {
@@ -4218,8 +4277,15 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_without_temperature() {
-        let cli = Cli::try_parse_from(["zeroclaw", "agent", "--message", "hello"])
-            .expect("agent command without temperature should parse");
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "agent",
+            "--agent",
+            "morning-shift",
+            "--message",
+            "hello",
+        ])
+        .expect("agent command without temperature should parse");
 
         match cli.command {
             Commands::Agent { temperature, .. } => {
@@ -4232,9 +4298,15 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_session_state_file() {
-        let cli =
-            Cli::try_parse_from(["zeroclaw", "agent", "--session-state-file", "session.json"])
-                .expect("agent command with session state file should parse");
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "agent",
+            "--agent",
+            "morning-shift",
+            "--session-state-file",
+            "session.json",
+        ])
+        .expect("agent command with session state file should parse");
 
         match cli.command {
             Commands::Agent {

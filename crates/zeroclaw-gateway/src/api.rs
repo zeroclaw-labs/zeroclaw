@@ -68,6 +68,9 @@ pub struct CronRunsQuery {
 
 #[derive(Deserialize)]
 pub struct CronAddBody {
+    /// Configured agent alias the cron job will run as. Required —
+    /// V3 has no default agent.
+    pub agent: String,
     pub name: Option<String>,
     pub schedule: String,
     pub command: Option<String>,
@@ -82,6 +85,9 @@ pub struct CronAddBody {
 
 #[derive(Deserialize)]
 pub struct CronPatchBody {
+    /// Configured agent alias whose risk profile gates the new shell
+    /// command (when `command` is being patched). Required.
+    pub agent: String,
     pub name: Option<String>,
     pub schedule: Option<String>,
     pub command: Option<String>,
@@ -186,6 +192,7 @@ pub async fn handle_api_cron_add(
     }
 
     let CronAddBody {
+        agent: agent_alias,
         name,
         schedule,
         command,
@@ -199,6 +206,15 @@ pub async fn handle_api_cron_add(
     } = body;
 
     let config = state.config.lock().clone();
+    if config.agent(&agent_alias).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!(
+                "Unknown agent {agent_alias:?} (no [agents.{agent_alias}] entry configured)"
+            )})),
+        )
+            .into_response();
+    }
     let schedule = zeroclaw_runtime::cron::Schedule::Cron {
         expr: schedule,
         tz: None,
@@ -259,7 +275,13 @@ pub async fn handle_api_cron_add(
         };
 
         zeroclaw_runtime::cron::add_shell_job_with_approval(
-            &config, name, schedule, command, delivery, false,
+            &config,
+            &agent_alias,
+            name,
+            schedule,
+            command,
+            delivery,
+            false,
         )
     };
 
@@ -436,6 +458,17 @@ pub async fn handle_api_cron_patch(
     }
 
     let config = state.config.lock().clone();
+    if config.agent(&body.agent).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!(
+                "Unknown agent {a:?} (no [agents.{a}] entry configured)",
+                a = body.agent
+            )})),
+        )
+            .into_response();
+    }
+    let agent_alias = body.agent.clone();
 
     // Build the schedule from the provided expression string (if any).
     let schedule = match body.schedule {
@@ -474,7 +507,13 @@ pub async fn handle_api_cron_patch(
         ..zeroclaw_runtime::cron::CronJobPatch::default()
     };
 
-    match zeroclaw_runtime::cron::update_shell_job_with_approval(&config, &id, patch, false) {
+    match zeroclaw_runtime::cron::update_shell_job_with_approval(
+        &config,
+        &agent_alias,
+        &id,
+        patch,
+        false,
+    ) {
         Ok(job) => Json(serde_json::json!({"status": "ok", "job": job})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1261,6 +1300,35 @@ mod tests {
         }
     }
 
+    /// Wire a minimal agent + provider + risk_profile into a test config
+    /// so cron-add API tests have an `agent` reference to bind to.
+    fn with_test_agent(
+        mut config: zeroclaw_config::schema::Config,
+    ) -> zeroclaw_config::schema::Config {
+        config
+            .providers
+            .models
+            .entry("openrouter".to_string())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                zeroclaw_config::schema::ModelProviderConfig::default(),
+            );
+        config.risk_profiles.insert(
+            "test-profile".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "openrouter.default".to_string(),
+                risk_profile: "test-profile".to_string(),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
     fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
         AppState {
             config: Arc::new(Mutex::new(config)),
@@ -1323,7 +1391,7 @@ mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let state = test_state(config);
+        let state = test_state(with_test_agent(config));
 
         let add_response = handle_api_cron_add(
             State(state.clone()),
@@ -1331,6 +1399,7 @@ mod tests {
             Json(
                 serde_json::from_value::<CronAddBody>(serde_json::json!({
                     "name": "test-job",
+                    "agent": "test-agent",
                     "schedule": "*/5 * * * *",
                     "command": "echo hello",
                     "delivery": {
@@ -1372,7 +1441,7 @@ mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let state = test_state(config);
+        let state = test_state(with_test_agent(config));
 
         let response = handle_api_cron_add(
             State(state.clone()),
@@ -1380,6 +1449,7 @@ mod tests {
             Json(
                 serde_json::from_value::<CronAddBody>(serde_json::json!({
                     "name": "agent-job",
+                    "agent": "test-agent",
                     "schedule": "*/5 * * * *",
                     "job_type": "agent",
                     "command": "ignored shell command",
@@ -1410,7 +1480,7 @@ mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let state = test_state(config);
+        let state = test_state(with_test_agent(config));
 
         let response = handle_api_cron_add(
             State(state.clone()),
@@ -1418,6 +1488,7 @@ mod tests {
             Json(
                 serde_json::from_value::<CronAddBody>(serde_json::json!({
                     "name": "invalid-delivery-job",
+                    "agent": "test-agent",
                     "schedule": "*/5 * * * *",
                     "command": "echo hello",
                     "delivery": {
@@ -1457,7 +1528,7 @@ mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let state = test_state(config);
+        let state = test_state(with_test_agent(config));
 
         let response = handle_api_cron_add(
             State(state.clone()),
@@ -1465,6 +1536,7 @@ mod tests {
             Json(
                 serde_json::from_value::<CronAddBody>(serde_json::json!({
                     "name": "invalid-delivery-job",
+                    "agent": "test-agent",
                     "schedule": "*/5 * * * *",
                     "command": "echo hello",
                     "delivery": {
@@ -1505,10 +1577,11 @@ mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let state = test_state(config);
+        let state = test_state(with_test_agent(config));
 
         let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
             &state.config.lock().clone(),
+            "test-agent",
             None,
             zeroclaw_runtime::cron::Schedule::Cron {
                 expr: "*/5 * * * *".to_string(),
@@ -1519,6 +1592,20 @@ mod tests {
             true,
         )
         .expect("job added");
+
+        // Imperative jobs get UUID ids; the scheduler resolves owning
+        // agent by reverse-lookup against `agent.cron_jobs`. Wire the
+        // freshly-created job's id into test-agent so execute_job_now
+        // can find its owner. (Carrying agent on the DB row is a
+        // follow-up.)
+        state
+            .config
+            .lock()
+            .agents
+            .get_mut("test-agent")
+            .expect("test-agent configured by with_test_agent")
+            .cron_jobs
+            .push(job.id.clone());
 
         let response =
             handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
@@ -1552,7 +1639,7 @@ mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let state = test_state(config);
+        let state = test_state(with_test_agent(config));
 
         let response = handle_api_cron_run(
             State(state),

@@ -9,7 +9,7 @@ use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write as IoWrite;
@@ -444,8 +444,8 @@ impl Agent {
         }
     }
 
-    pub async fn from_config(config: &Config) -> Result<Self> {
-        Self::from_config_with_session_cwd(config, None).await
+    pub async fn from_config(config: &Config, agent_alias: &str) -> Result<Self> {
+        Self::from_config_with_session_cwd(config, agent_alias, None).await
     }
 
     /// Build an Agent with an optional per-session working directory override.
@@ -460,9 +460,10 @@ impl Agent {
     /// IDE-provided `cwd` without relocating the agent's data directory.
     pub async fn from_config_with_session_cwd(
         config: &Config,
+        agent_alias: &str,
         session_cwd: Option<&Path>,
     ) -> Result<Self> {
-        Self::from_config_with_session_cwd_and_mcp(config, session_cwd, true).await
+        Self::from_config_with_session_cwd_and_mcp(config, agent_alias, session_cwd, true).await
     }
 
     /// Build an Agent while optionally skipping eager MCP initialization.
@@ -472,15 +473,27 @@ impl Agent {
     /// they time out, so ACP uses this with `initialize_mcp = false`.
     pub async fn from_config_with_session_cwd_and_mcp(
         config: &Config,
+        agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
     ) -> Result<Self> {
+        let agent_cfg = config
+            .agent(agent_alias)
+            .with_context(|| format!("agents.{agent_alias} is not configured"))?;
+        let risk_profile = config
+            .risk_profile_for_agent(agent_alias)
+            .with_context(|| {
+                format!(
+                    "agents.{agent_alias}.risk_profile does not name a configured risk_profiles entry"
+                )
+            })?;
+
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::from_risk_profile(
-            config.active_risk_profile(None),
+            risk_profile,
             session_cwd.unwrap_or(&config.workspace_dir),
         ));
 
@@ -515,6 +528,8 @@ impl Agent {
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
+            risk_profile,
+            agent_alias,
             runtime,
             memory.clone(),
             composio_key,
@@ -635,7 +650,7 @@ impl Agent {
             &provider_runtime_options,
         )?;
 
-        let dispatcher_choice = config.default_agent().tool_dispatcher.as_str();
+        let dispatcher_choice = agent_cfg.tool_dispatcher.as_str();
         let tool_dispatcher: Box<dyn ToolDispatcher> = match dispatcher_choice {
             "native" => Box::new(NativeToolDispatcher),
             "xml" => Box::new(XmlToolDispatcher),
@@ -664,10 +679,10 @@ impl Agent {
             None
         };
 
-        // Filter out tools excluded by the active risk profile. The channel
-        // orchestrator applies this for channel-driven runs, but Agent::from_config
-        // (used by ws.rs) doesn't go through that path.
-        let excluded = &config.active_risk_profile(None).excluded_tools;
+        // Filter out tools excluded by this agent's risk profile. The
+        // channel orchestrator applies this for channel-driven runs, but
+        // Agent::from_config (used by ws.rs) doesn't go through that path.
+        let excluded = &risk_profile.excluded_tools;
         if !excluded.is_empty() {
             tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
         }
@@ -689,7 +704,7 @@ impl Agent {
                 config.memory.min_relevance_score,
             )))
             .prompt_builder(SystemPromptBuilder::with_defaults())
-            .config(config.default_agent().clone())
+            .config(agent_cfg.clone())
             .model_name(model_name)
             .temperature(primary_provider.and_then(|e| e.temperature).unwrap_or(0.7))
             .workspace_dir(security.workspace_dir.clone())
@@ -701,7 +716,7 @@ impl Agent {
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
             .security_summary(Some(security.prompt_summary()))
-            .autonomy_level(config.active_risk_profile(None).level)
+            .autonomy_level(risk_profile.level)
             .activated_tools(activated_tools)
             .hook_runner(if config.hooks.enabled {
                 let mut runner = crate::hooks::HookRunner::new();
@@ -718,7 +733,7 @@ impl Agent {
                 None
             })
             .approval_manager(Some(Arc::new(ApprovalManager::for_non_interactive(
-                config.active_risk_profile(None),
+                risk_profile,
             ))))
             .build()?;
 
@@ -1622,6 +1637,7 @@ impl Agent {
 
 pub async fn run(
     config: Config,
+    agent_alias: &str,
     message: Option<String>,
     provider_override: Option<String>,
     model_override: Option<String>,
@@ -1658,7 +1674,7 @@ pub async fn run(
         entry.temperature = Some(temperature);
     }
 
-    let mut agent = Agent::from_config(&effective_config).await?;
+    let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
 
     let provider_name = effective_config
         .providers
@@ -2205,7 +2221,28 @@ mod tests {
         config.memory.backend = "none".to_string();
         config.memory.auto_save = false;
 
-        let mut agent = Agent::from_config(&config)
+        // V3 requires an explicit agent. Wire up a minimal agent that
+        // points at the synthesized provider entry, then construct
+        // Agent::from_config against it.
+        config.risk_profiles.insert(
+            "test-profile".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let provider_alias = config
+            .providers
+            .models
+            .keys()
+            .next()
+            .expect("provider configured above")
+            .clone();
+        let agent_cfg = zeroclaw_config::schema::DelegateAgentConfig {
+            model_provider: format!("{provider_alias}.default"),
+            risk_profile: "test-profile".to_string(),
+            ..zeroclaw_config::schema::DelegateAgentConfig::default()
+        };
+        config.agents.insert("test-agent".to_string(), agent_cfg);
+
+        let mut agent = Agent::from_config(&config, "test-agent")
             .await
             .expect("agent from config");
         let response = agent.turn("hello").await.expect("agent turn");

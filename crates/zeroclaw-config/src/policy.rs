@@ -1624,14 +1624,17 @@ impl SecurityPolicy {
         }
     }
 
-    /// Convenience: resolve the active risk profile for a given agent (or
-    /// the conventional "default" when `agent_alias` is `None`) and build
-    /// a `SecurityPolicy` from it.
-    pub fn from_config(config: &crate::schema::Config, agent_alias: Option<&str>) -> Self {
-        Self::from_risk_profile(
-            config.active_risk_profile(agent_alias),
-            &config.workspace_dir,
-        )
+    /// Resolve the risk profile owned by `agent_alias` and build a
+    /// `SecurityPolicy` from it. Bails when the agent isn't configured or
+    /// when its `risk_profile` field doesn't name a configured profile —
+    /// V3 has no global fallback, every security context is per-agent.
+    pub fn for_agent(config: &crate::schema::Config, agent_alias: &str) -> anyhow::Result<Self> {
+        let profile = config.risk_profile_for_agent(agent_alias).ok_or_else(|| {
+            anyhow::anyhow!(
+                "agents.{agent_alias} has no resolvable risk_profile (load-time validation should have caught this)"
+            )
+        })?;
+        Ok(Self::from_risk_profile(profile, &config.workspace_dir))
     }
 
     /// Render a human-readable summary of the active security constraints

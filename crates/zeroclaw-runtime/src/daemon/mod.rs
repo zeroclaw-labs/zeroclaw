@@ -375,6 +375,18 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     };
     use std::sync::Arc;
 
+    let agent_alias = config.heartbeat.agent.trim().to_string();
+    if agent_alias.is_empty() {
+        anyhow::bail!(
+            "heartbeat worker requires `[heartbeat] agent = \"<alias>\"` naming a configured agent"
+        );
+    }
+    if config.agent(&agent_alias).is_none() {
+        anyhow::bail!(
+            "[heartbeat] agent = {agent_alias:?} is not configured ([agents.{agent_alias}] missing)"
+        );
+    }
+
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
     let engine = HeartbeatEngine::new(
@@ -483,6 +495,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             );
             let phase1_fut = Box::pin(crate::agent::run(
                 config.clone(),
+                &agent_alias,
                 Some(decision_prompt),
                 None,
                 None,
@@ -606,6 +619,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 .unwrap_or(0.7);
             let phase2_fut = Box::pin(crate::agent::run(
                 config.clone(),
+                &agent_alias,
                 Some(prompt),
                 None,
                 None,

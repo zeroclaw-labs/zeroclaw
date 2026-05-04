@@ -80,14 +80,15 @@ fn security_secrets_encryption_default() {
     );
 }
 
-/// Full config resolves to a default risk profile with safe defaults.
+/// `RiskProfileConfig::default()` defaults to Supervised — the safe baseline
+/// used as the seed for migration-synthesized risk profiles.
 #[test]
-fn security_full_config_has_default_risk_profile() {
-    let config = Config::default();
+fn security_default_risk_profile_is_supervised() {
+    let profile = RiskProfileConfig::default();
     assert_eq!(
-        format!("{:?}", config.active_risk_profile(None).level),
+        format!("{:?}", profile.level),
         "Supervised",
-        "Default active risk profile should be Supervised"
+        "Default RiskProfileConfig autonomy level should be Supervised"
     );
 }
 

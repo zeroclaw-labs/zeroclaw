@@ -272,6 +272,8 @@ pub fn register_skill_tools(
 pub fn all_tools(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
     composio_entity_id: Option<&str>,
@@ -294,6 +296,8 @@ pub fn all_tools(
     all_tools_with_runtime(
         config,
         security,
+        risk_profile,
+        agent_alias,
         Arc::new(NativeRuntime::new()),
         memory,
         composio_key,
@@ -318,6 +322,8 @@ pub fn all_tools(
 pub fn all_tools_with_runtime(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
     runtime: Arc<dyn RuntimeAdapter>,
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
@@ -340,7 +346,7 @@ pub fn all_tools_with_runtime(
 ) {
     let has_shell_access = runtime.has_shell_access();
     let runtime_kind = root_config.runtime.kind.as_str();
-    let sandbox_cfg = root_config.active_risk_profile(None).sandbox_config();
+    let sandbox_cfg = risk_profile.sandbox_config();
     let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
@@ -362,10 +368,18 @@ pub fn all_tools_with_runtime(
             PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
             security.clone(),
         )),
-        Arc::new(CronAddTool::new(config.clone(), security.clone())),
+        Arc::new(CronAddTool::new(
+            config.clone(),
+            security.clone(),
+            agent_alias,
+        )),
         Arc::new(CronListTool::new(config.clone())),
         Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
-        Arc::new(CronUpdateTool::new(config.clone(), security.clone())),
+        Arc::new(CronUpdateTool::new(
+            config.clone(),
+            security.clone(),
+            agent_alias,
+        )),
         Arc::new(CronRunTool::new(config.clone(), security.clone())),
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
@@ -373,7 +387,11 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryExportTool::new(memory.clone())),
         Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
-        Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
+        Arc::new(ScheduleTool::new(
+            security.clone(),
+            root_config.clone(),
+            agent_alias,
+        )),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
@@ -1029,6 +1047,8 @@ mod tests {
         let (tools, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
             mem,
             None,
             None,
@@ -1072,6 +1092,8 @@ mod tests {
         let (tools, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
             mem,
             None,
             None,
@@ -1216,6 +1238,8 @@ mod tests {
         let (tools, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
             mem,
             None,
             None,
@@ -1250,6 +1274,8 @@ mod tests {
         let (tools, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
             mem,
             None,
             None,
@@ -1286,6 +1312,8 @@ mod tests {
         let (tools, _, _, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
             mem,
             None,
             None,
@@ -1321,6 +1349,8 @@ mod tests {
         let (tools, _, _, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
             mem,
             None,
             None,

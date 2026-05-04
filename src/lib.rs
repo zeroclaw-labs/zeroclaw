@@ -338,16 +338,20 @@ Examples:
     Add {
         /// Cron expression
         expression: String,
+        /// Configured agent alias the cron job runs as. Required — V3
+        /// has no default agent.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
         /// Optional IANA timezone (e.g. America/Los_Angeles)
         #[arg(long)]
         tz: Option<String>,
-        /// Treat the argument as an agent prompt instead of a shell command
+        /// Treat the argument as an agent prompt instead of a shell command.
         #[arg(long)]
-        agent: bool,
-        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
-        /// Command (shell) or prompt (agent) to run
+        /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
     /// Add a one-shot scheduled task at an RFC3339 timestamp
@@ -357,18 +361,21 @@ Add a one-shot task that fires at a specific UTC timestamp.
 The timestamp must be in RFC 3339 format (e.g. 2025-01-15T14:00:00Z).
 
 Examples:
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
-  zeroclaw cron add-at 2025-12-31T23:59:00Z 'Happy New Year!'")]
+  zeroclaw cron add-at --agent morning-shift 2025-01-15T14:00:00Z 'Send reminder'
+  zeroclaw cron add-at --agent morning-shift --prompt 2025-12-31T23:59:00Z 'Happy New Year!'")]
     AddAt {
         /// One-shot timestamp in RFC3339 format
         at: String,
-        /// Treat the argument as an agent prompt instead of a shell command
+        /// Configured agent alias the cron job runs as.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
+        /// Treat the argument as an agent prompt instead of a shell command.
         #[arg(long)]
-        agent: bool,
-        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
-        /// Command (shell) or prompt (agent) to run
+        /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
     /// Add a fixed-interval scheduled task
@@ -378,18 +385,21 @@ Add a task that repeats at a fixed interval.
 Interval is specified in milliseconds. For example, 60000 = 1 minute.
 
 Examples:
-  zeroclaw cron add-every 60000 'Ping heartbeat'     # every minute
-  zeroclaw cron add-every 3600000 'Hourly report'    # every hour")]
+  zeroclaw cron add-every --agent triage 60000 'Ping heartbeat'
+  zeroclaw cron add-every --agent triage 3600000 'Hourly report'")]
     AddEvery {
         /// Interval in milliseconds
         every_ms: u64,
-        /// Treat the argument as an agent prompt instead of a shell command
+        /// Configured agent alias the cron job runs as.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
+        /// Treat the argument as an agent prompt instead of a shell command.
         #[arg(long)]
-        agent: bool,
-        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
-        /// Command (shell) or prompt (agent) to run
+        /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
     /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
@@ -400,19 +410,21 @@ Accepts human-readable durations: s (seconds), m (minutes), \
 h (hours), d (days).
 
 Examples:
-  zeroclaw cron once 30m 'Run backup in 30 minutes'
-  zeroclaw cron once 2h 'Follow up on deployment'
-  zeroclaw cron once 1d 'Daily check'")]
+  zeroclaw cron once --agent ops-bot 30m 'Run backup in 30 minutes'
+  zeroclaw cron once --agent researcher --prompt 2h 'Follow up on deployment'")]
     Once {
         /// Delay duration
         delay: String,
-        /// Treat the argument as an agent prompt instead of a shell command
+        /// Configured agent alias the cron job runs as.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
+        /// Treat the argument as an agent prompt instead of a shell command.
         #[arg(long)]
-        agent: bool,
-        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
-        /// Command (shell) or prompt (agent) to run
+        /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
     /// Remove a scheduled task
@@ -433,6 +445,10 @@ Examples:
     Update {
         /// Task ID
         id: String,
+        /// Configured agent alias whose risk profile gates the new
+        /// shell command (when --command is provided). Required.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
         /// New cron expression
         #[arg(long)]
         expression: Option<String>,

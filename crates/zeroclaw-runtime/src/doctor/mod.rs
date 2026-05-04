@@ -1143,7 +1143,7 @@ mod tests {
         check_config_semantics(&config, &mut items);
         let prov_item = items
             .iter()
-            .find(|i| i.message.contains("default provider"));
+            .find(|i| i.message.contains("provider \"totally-fake\" is invalid"));
         assert!(prov_item.is_some());
         assert_eq!(prov_item.unwrap().severity, Severity::Error);
     }
@@ -1162,10 +1162,9 @@ mod tests {
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
 
-        let prov_item = items.iter().find(|item| {
-            item.message
-                .contains("default provider \"custom:\" is invalid")
-        });
+        let prov_item = items
+            .iter()
+            .find(|item| item.message.contains("provider \"custom:\" is invalid"));
         assert!(prov_item.is_some());
         assert_eq!(prov_item.unwrap().severity, Severity::Error);
     }

@@ -498,7 +498,40 @@ pub async fn run_gateway(
     )?);
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(&config, None));
+    // Gateway is infrastructure — it doesn't run as an agent. Endpoints
+    // that need an agent context (`/webhook?agent=`, `/ws/chat?agent=`,
+    // ACP `session/new`, agent-scoped tools/memory) take it from the
+    // request. The shared SecurityPolicy / risk_profile / tools_registry
+    // built here are V2 vestiges driving the legacy single-agent
+    // `/api/tools` listing and the `run_gateway_chat_with_tools` test
+    // mock; per-request agent dispatch is tracked as a follow-up. Pick
+    // the migration-synthesized "default" agent when present, else the
+    // first enabled agent — purely to seed AppState for those legacy
+    // surfaces; new V3 endpoints don't read from this state.
+    let agent_alias = config
+        .agents
+        .keys()
+        .find(|k| k.as_str() == "default")
+        .or_else(|| {
+            config
+                .agents
+                .iter()
+                .find(|(_, a)| a.enabled)
+                .map(|(alias, _)| alias)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("gateway start requires at least one configured [agents.<alias>] entry")
+        })?
+        .clone();
+    let risk_profile = config
+        .risk_profile_for_agent(&agent_alias)
+        .with_context(|| {
+            format!(
+                "agents.{agent_alias}.risk_profile does not name a configured risk_profiles entry"
+            )
+        })?
+        .clone();
+    let security = Arc::new(SecurityPolicy::for_agent(&config, &agent_alias)?);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -526,6 +559,8 @@ pub async fn run_gateway(
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
+        &risk_profile,
+        &agent_alias,
         runtime,
         Arc::clone(&mem),
         composio_key,
@@ -1488,8 +1523,32 @@ async fn run_gateway_chat_with_tools(
     #[cfg(not(test))]
     {
         let config = state.config.lock().clone();
+        // V2 vestige: webhook chat / SSE / pairing endpoints don't yet
+        // accept an explicit agent in the request payload. Pick the
+        // migration-synthesized "default" agent (or first enabled) until
+        // the per-request agent dispatch refactor lands.
+        let agent_alias = config
+            .agents
+            .keys()
+            .find(|k| k.as_str() == "default")
+            .or_else(|| {
+                config
+                    .agents
+                    .iter()
+                    .find(|(_, a)| a.enabled)
+                    .map(|(alias, _)| alias)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "webhook chat requires at least one configured [agents.<alias>] entry"
+                )
+            })?
+            .clone();
         Box::pin(zeroclaw_runtime::agent::process_message(
-            config, message, session_id,
+            config,
+            &agent_alias,
+            message,
+            session_id,
         ))
         .await
     }

@@ -849,15 +849,15 @@ fn v2_to_v3_table(table: &mut toml::Table) {
         table.insert("channels".to_string(), val);
     }
 
-    // Strip `enabled` from all channel alias configs and synthesize agent entries for
-    // previously-enabled channels. Agent alias = "{ch_type}-{alias}" (e.g. "telegram-default").
-    // Skip synthesis if the agent alias already exists in [agents].
-    // Channels with `enabled = false` are stripped but no agent is synthesized.
-    // Channels without an `enabled` key (V3-native configs) are treated as enabled.
+    // Strip `enabled` from all channel alias configs and collect every
+    // previously-enabled channel onto the single migration-synthesized
+    // [agents.default] (V2 had a global agent; V3's default agent owns
+    // every V2 channel that was active). Channels with `enabled = false`
+    // are stripped but not attached. Channels without an `enabled` key
+    // (V3-native configs) are treated as enabled. User-supplied
+    // [agents.default].channels always wins (we union under it).
     {
-        use crate::helpers::validate_alias_key;
-
-        let mut to_synthesize: Vec<(String, String)> = Vec::new(); // (agent_alias, channel_ref)
+        let mut active_channels: Vec<String> = Vec::new();
 
         if let Some(toml::Value::Table(channels)) = table.get_mut("channels") {
             for (ch_type, ch_val) in channels.iter_mut() {
@@ -871,17 +871,7 @@ fn v2_to_v3_table(table: &mut toml::Table) {
                                 .unwrap_or(false);
 
                             if !was_disabled {
-                                let agent_alias = format!("{ch_type}-{alias}");
-                                if validate_alias_key(&agent_alias).is_ok() {
-                                    let ch_ref = format!("{ch_type}.{alias}");
-                                    to_synthesize.push((agent_alias, ch_ref));
-                                } else {
-                                    tracing::warn!(
-                                        "v2→v3 migration: skipping agent synthesis for \
-                                         '{ch_type}.{alias}' — derived alias '{ch_type}-{alias}' \
-                                         is invalid"
-                                    );
-                                }
+                                active_channels.push(format!("{ch_type}.{alias}"));
                             }
                         }
                     }
@@ -889,21 +879,39 @@ fn v2_to_v3_table(table: &mut toml::Table) {
             }
         }
 
-        if !to_synthesize.is_empty() {
+        if !active_channels.is_empty() {
+            active_channels.sort();
             let agents = table
                 .entry("agents")
                 .or_insert_with(|| toml::Value::Table(toml::Table::new()));
             if let toml::Value::Table(agents_map) = agents {
-                for (agent_alias, ch_ref) in to_synthesize {
-                    if !agents_map.contains_key(&agent_alias) {
-                        let mut entry = toml::Table::new();
-                        entry.insert(
-                            "channels".to_string(),
-                            toml::Value::Array(vec![toml::Value::String(ch_ref)]),
-                        );
-                        entry.insert("enabled".to_string(), toml::Value::Boolean(true));
-                        agents_map.insert(agent_alias, toml::Value::Table(entry));
+                let default_agent = agents_map
+                    .entry("default".to_string())
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                if let toml::Value::Table(agent_table) = default_agent {
+                    let existing: Vec<String> = agent_table
+                        .get("channels")
+                        .and_then(toml::Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut union: Vec<String> = existing;
+                    for ch in active_channels {
+                        if !union.iter().any(|e| e == &ch) {
+                            union.push(ch);
+                        }
                     }
+                    union.sort();
+                    agent_table.insert(
+                        "channels".to_string(),
+                        toml::Value::Array(union.into_iter().map(toml::Value::String).collect()),
+                    );
+                    agent_table
+                        .entry("enabled".to_string())
+                        .or_insert(toml::Value::Boolean(true));
                 }
             }
         }
@@ -1115,6 +1123,136 @@ fn v2_to_v3_table(table: &mut toml::Table) {
     // - Move `[[cron.jobs]]` array into `[cron.<id>]` map (id field removed,
     //   the alias key preserves stable identity).
     promote_v2_cron_subsystem(table);
+
+    // Final pass: ensure the migration-synthesized [agents.default] has the
+    // alias-refs it needs to pass V3 validation. A V2→V3 migration always
+    // produces exactly one Agent (named "default") that owns everything
+    // V2 had. We bind:
+    //   - model_provider = first available `<type>.<inner>` from
+    //     [providers.models] (validation requires it)
+    //   - risk_profile   = "default" if [risk_profiles.default] exists
+    //   - runtime_profile = "default" if [runtime_profiles.default] exists
+    //   - memory_namespace = "default" if [memory_namespaces.default] exists
+    // User-supplied values on agents.default always win.
+    synthesize_default_agent_alias_refs(table);
+
+    // V3 requires `[heartbeat] agent = "<alias>"` whenever heartbeat is
+    // enabled. V2 had no such field — heartbeat ran against the global
+    // singleton agent. Synthesize the binding to the migration-created
+    // "default" agent. User-supplied `heartbeat.agent` always wins.
+    {
+        let agents_has_default = table
+            .get("agents")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|m| m.contains_key("default"));
+        if agents_has_default {
+            let hb = table
+                .entry("heartbeat")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if let toml::Value::Table(hb_table) = hb {
+                hb_table
+                    .entry("agent".to_string())
+                    .or_insert(toml::Value::String("default".to_string()));
+            }
+        }
+    }
+}
+
+/// Ensure the migration-synthesized [agents.default] (created elsewhere
+/// in v2_to_v3_table when V2 channels or an [agent] block were present)
+/// carries the alias-refs V3 validation requires. Idempotent: never
+/// overwrites user-supplied values; only fills empty/absent ones.
+fn synthesize_default_agent_alias_refs(table: &mut toml::Table) {
+    // V3 requires every enabled agent to reference a risk_profile. If
+    // V2 didn't have [autonomy] / [security.sandbox] / [security.resources]
+    // (so the per-section synthesis didn't run), we still need a
+    // `risk_profiles.default` for the synthesized default agent to bind to.
+    // Use RiskProfileConfig defaults — Supervised autonomy, safe sandbox.
+    let needs_default_risk = !table
+        .get("risk_profiles")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|m| m.contains_key("default"));
+    if needs_default_risk {
+        let risk_profiles = table
+            .entry("risk_profiles")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(profiles) = risk_profiles {
+            profiles
+                .entry("default".to_string())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        }
+    }
+    // Pick the first available `<type>.<inner>` from providers.models so
+    // the synthesized agent has a model_provider (mandatory). Done as a
+    // best-effort: empty providers.models leaves model_provider = "" and
+    // validation surfaces it.
+    let first_provider_ref: Option<String> = table
+        .get("providers")
+        .and_then(toml::Value::as_table)
+        .and_then(|p| p.get("models"))
+        .and_then(toml::Value::as_table)
+        .and_then(|models| {
+            let mut keys: Vec<&String> = models.keys().collect();
+            keys.sort();
+            keys.into_iter().find_map(|ty| {
+                let alias_map = models.get(ty)?.as_table()?;
+                let mut aliases: Vec<&String> = alias_map.keys().collect();
+                aliases.sort();
+                let inner = aliases.into_iter().find(|a| a.as_str() != "models")?;
+                Some(format!("{ty}.{inner}"))
+            })
+        });
+    let has_default_risk = table
+        .get("risk_profiles")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|m| m.contains_key("default"));
+    let has_default_runtime = table
+        .get("runtime_profiles")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|m| m.contains_key("default"));
+    let has_default_namespace = table
+        .get("memory_namespaces")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|m| m.contains_key("default"));
+
+    // Always materialize agents.default — V3 needs at least one agent
+    // for the runtime to function, and V2's global state migrates to it.
+    let agents = table
+        .entry("agents")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let toml::Value::Table(agents_map) = agents else {
+        return;
+    };
+    let default_agent = agents_map
+        .entry("default".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let toml::Value::Table(agent_table) = default_agent else {
+        return;
+    };
+
+    if let Some(mp) = first_provider_ref {
+        agent_table
+            .entry("model_provider".to_string())
+            .or_insert(toml::Value::String(mp));
+    }
+    if has_default_risk {
+        agent_table
+            .entry("risk_profile".to_string())
+            .or_insert(toml::Value::String("default".to_string()));
+    }
+    if has_default_runtime {
+        agent_table
+            .entry("runtime_profile".to_string())
+            .or_insert(toml::Value::String("default".to_string()));
+    }
+    if has_default_namespace {
+        agent_table
+            .entry("memory_namespace".to_string())
+            .or_insert(toml::Value::String("default".to_string()));
+    }
+    agent_table
+        .entry("enabled".to_string())
+        .or_insert(toml::Value::Boolean(true));
 }
 
 fn promote_v2_storage_subsystem(table: &mut toml::Table) {

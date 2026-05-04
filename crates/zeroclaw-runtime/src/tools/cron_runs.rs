@@ -122,11 +122,30 @@ mod tests {
     use zeroclaw_config::schema::Config;
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
-        let config = Config {
+        let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.providers.models.insert(
+            "openrouter".to_string(),
+            std::collections::HashMap::from([(
+                "default".to_string(),
+                zeroclaw_config::schema::ModelProviderConfig::default(),
+            )]),
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "openrouter.default".to_string(),
+                risk_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
@@ -137,7 +156,7 @@ mod tests {
     async fn lists_runs_with_truncation() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+        let job = cron::add_job(&cfg, "test-agent", "*/5 * * * *", "echo ok").unwrap();
 
         let long_output = "x".repeat(1000);
         let now = Utc::now();

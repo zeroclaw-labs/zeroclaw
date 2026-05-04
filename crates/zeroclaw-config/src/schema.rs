@@ -839,47 +839,59 @@ impl Default for DelegateAgentConfig {
 }
 
 impl Config {
-    /// Reference to the conventional "default" agent config, with a static
-    /// default when the user hasn't defined one yet. This is the bridge
-    /// from V2's global `[agent]` section to V3's per-agent dispatch:
-    /// callsites that don't yet thread the routed agent alias resolve here
-    /// instead, preserving prior behavior while the rest of the runtime
-    /// migrates to per-agent lookups.
-    pub fn default_agent(&self) -> &DelegateAgentConfig {
-        use std::sync::OnceLock;
-        static DEFAULT: OnceLock<DelegateAgentConfig> = OnceLock::new();
-        self.agents
-            .get("default")
-            .unwrap_or_else(|| DEFAULT.get_or_init(DelegateAgentConfig::default))
+    /// Resolve the risk profile for an explicit agent alias.
+    ///
+    /// Each agent's `risk_profile` field names a `[risk_profiles.<alias>]`
+    /// entry that gates its actions. There is no "global" risk profile in
+    /// V3: every callsite must come through an agent. When the agent has
+    /// no profile set or names a missing entry, returns `None` and the
+    /// caller decides how to handle it (validation rejects this shape at
+    /// load time; the runtime treating `None` as a config error).
+    #[must_use]
+    pub fn risk_profile_for_agent(&self, agent_alias: &str) -> Option<&RiskProfileConfig> {
+        let agent = self.agents.get(agent_alias)?;
+        let profile_alias = agent.risk_profile.trim();
+        if profile_alias.is_empty() {
+            return None;
+        }
+        self.risk_profiles.get(profile_alias)
     }
 
-    /// Resolve the active risk profile for a given agent or non-agent context.
-    ///
-    /// V3 collapses V2's global `[autonomy]` config onto per-agent
-    /// `[risk_profiles.<alias>]` entries. Each agent's `risk_profile` field
-    /// names the profile that gates its actions. Non-agent contexts (cron
-    /// runtime, orchestrator startup) resolve via `agent_alias = None`,
-    /// which returns the conventional `risk_profiles["default"]`.
-    ///
-    /// Returns a static `RiskProfileConfig::default()` when neither the
-    /// agent's profile nor the default exists. This mirrors `default_agent`
-    /// — fresh installs get safe defaults rather than panicking.
+    /// Reverse-lookup the agent alias that owns a configured channel
+    /// (`<type>.<alias>`). Returns the first agent listing the channel in
+    /// its `channels` field. `None` when no agent owns the channel —
+    /// orphaned channels are a config error the orchestrator surfaces at
+    /// startup.
     #[must_use]
-    pub fn active_risk_profile(&self, agent_alias: Option<&str>) -> &RiskProfileConfig {
-        use std::sync::OnceLock;
-        static DEFAULT: OnceLock<RiskProfileConfig> = OnceLock::new();
+    pub fn agent_for_channel(&self, channel_alias: &str) -> Option<&str> {
+        self.agents
+            .iter()
+            .find(|(_, agent)| agent.enabled && agent.channels.iter().any(|c| c == channel_alias))
+            .map(|(alias, _)| alias.as_str())
+    }
 
-        if let Some(alias) = agent_alias
-            && let Some(agent) = self.agents.get(alias)
-            && !agent.risk_profile.trim().is_empty()
-            && let Some(profile) = self.risk_profiles.get(&agent.risk_profile)
-        {
-            return profile;
-        }
+    /// Reverse-lookup the agent alias that owns a declaratively-configured
+    /// cron job (`[cron.<alias>]`). Returns the first agent listing the
+    /// alias in its `cron_jobs` field. `None` when no agent claims the
+    /// job — orphaned cron jobs are skipped at scheduler time with a
+    /// warning. Imperative jobs (created at runtime via `cron_add`) have
+    /// UUID-shaped ids that won't match any agent's `cron_jobs`; the
+    /// scheduler treats those separately (carrying their owning agent
+    /// alongside the DB row is a follow-up).
+    #[must_use]
+    pub fn agent_for_cron_job(&self, cron_alias: &str) -> Option<&str> {
+        self.agents
+            .iter()
+            .find(|(_, agent)| agent.enabled && agent.cron_jobs.iter().any(|c| c == cron_alias))
+            .map(|(alias, _)| alias.as_str())
+    }
 
-        self.risk_profiles
-            .get("default")
-            .unwrap_or_else(|| DEFAULT.get_or_init(RiskProfileConfig::default))
+    /// Resolve a delegate-agent config by alias. `None` when the alias
+    /// isn't configured — callers should treat this as a config error
+    /// rather than synthesizing a default.
+    #[must_use]
+    pub fn agent(&self, agent_alias: &str) -> Option<&DelegateAgentConfig> {
+        self.agents.get(agent_alias)
     }
 
     /// Resolve the active storage backend for the memory subsystem.
@@ -6311,8 +6323,15 @@ pub struct ClassificationRule {
 #[prefix = "heartbeat"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct HeartbeatConfig {
-    /// Enable periodic heartbeat pings. Default: `true`.
+    /// Enable periodic heartbeat pings. Default: `false`. When enabled,
+    /// `agent` must name a configured agent — V3 has no default agent
+    /// for heartbeat to fall through to.
+    #[serde(default)]
     pub enabled: bool,
+    /// Configured agent alias the heartbeat worker runs as. Required
+    /// when `enabled = true`; refers to a `[agents.<alias>]` entry.
+    #[serde(default)]
+    pub agent: String,
     /// Interval in minutes between heartbeat pings. Minimum: `1`. Default: `30`.
     #[serde(default = "default_heartbeat_interval")]
     pub interval_minutes: u32,
@@ -6398,7 +6417,8 @@ fn default_heartbeat_task_timeout() -> u64 {
 impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
+            agent: String::new(),
             interval_minutes: default_heartbeat_interval(),
             two_phase: true,
             message: None,
@@ -10330,6 +10350,25 @@ impl Config {
                 "gateway.host must not be empty"
             );
         }
+        // Heartbeat agent: when heartbeat is enabled, the agent field
+        // must name a configured agent.
+        if self.heartbeat.enabled {
+            let hb_agent = self.heartbeat.agent.trim();
+            if hb_agent.is_empty() {
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    "heartbeat.agent",
+                    "heartbeat.agent must reference a configured agent when heartbeat.enabled = true"
+                );
+            }
+            if !self.agents.contains_key(hb_agent) {
+                validation_bail!(
+                    DanglingReference,
+                    "heartbeat.agent",
+                    "heartbeat.agent = {hb_agent:?} but no [agents.{hb_agent}] entry is configured"
+                );
+            }
+        }
         if let Some(ref prefix) = self.gateway.path_prefix {
             // Validate the raw value — no silent trimming so the stored
             // value is exactly what was validated.
@@ -10364,22 +10403,26 @@ impl Config {
             }
         }
 
-        // Autonomy is enforced through per-agent risk_profiles in V3. Validate the
-        // active default profile if present; per-agent overrides validate against
-        // the same constraints when looked up at runtime.
-        let active_profile = self.active_risk_profile(None);
-        if active_profile.max_actions_per_hour == 0 {
-            validation_bail!(
-                InvalidNumericRange,
-                "risk_profiles.default.max_actions_per_hour",
-                "risk_profiles.default.max_actions_per_hour must be greater than 0"
-            );
-        }
-        for (i, env_name) in active_profile.shell_env_passthrough.iter().enumerate() {
-            if !is_valid_env_var_name(env_name) {
-                anyhow::bail!(
-                    "risk_profiles.default.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
+        // Validate every configured risk profile. Each profile stands on
+        // its own — V3 has no "active" or "default" risk profile concept;
+        // an agent's `risk_profile` field names exactly which one applies.
+        let mut profile_aliases: Vec<&String> = self.risk_profiles.keys().collect();
+        profile_aliases.sort();
+        for profile_alias in profile_aliases {
+            let profile = &self.risk_profiles[profile_alias];
+            if profile.max_actions_per_hour == 0 {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("risk_profiles.{profile_alias}.max_actions_per_hour"),
+                    "risk_profiles.{profile_alias}.max_actions_per_hour must be greater than 0"
                 );
+            }
+            for (i, env_name) in profile.shell_env_passthrough.iter().enumerate() {
+                if !is_valid_env_var_name(env_name) {
+                    anyhow::bail!(
+                        "risk_profiles.{profile_alias}.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
+                    );
+                }
             }
         }
 
@@ -11158,6 +11201,18 @@ impl Config {
                     );
                 }
             }
+
+            // risk_profile is mandatory for enabled agents — V3 has no
+            // global fallback, so an enabled agent with no profile can't
+            // gate its actions. Run this check last so the more specific
+            // dangling/format errors above surface first.
+            if agent.enabled && agent.risk_profile.trim().is_empty() {
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("agents.{alias}.risk-profile"),
+                    "agents.{alias}.risk_profile must reference a configured [risk_profiles.<alias>] entry",
+                );
+            }
         }
 
         Ok(())
@@ -11713,7 +11768,11 @@ mod tests {
     #[test]
     async fn heartbeat_config_default() {
         let h = HeartbeatConfig::default();
-        assert!(h.enabled);
+        // V3 defaults heartbeat to disabled. Enabling requires the user
+        // to also bind it to a configured agent — there is no default
+        // agent for heartbeat to fall through to.
+        assert!(!h.enabled);
+        assert!(h.agent.is_empty());
         assert_eq!(h.interval_minutes, 30);
         assert!(h.message.is_none());
         assert!(h.target.is_none());
@@ -12149,12 +12208,20 @@ default_temperature = 0.7
         );
         assert_eq!(parsed.observability.backend, "none");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
+        // Migration synthesizes risk_profiles.default from the V2-shape
+        // [autonomy] block; assert against the named entry rather than a
+        // global "active" profile (V3 has no such concept).
         assert_eq!(
-            parsed.active_risk_profile(None).level,
+            parsed
+                .risk_profiles
+                .get("default")
+                .expect("migration synthesized risk_profiles.default")
+                .level,
             AutonomyLevel::Supervised
         );
         assert_eq!(parsed.runtime.kind, "native");
-        assert!(parsed.heartbeat.enabled);
+        // V3 defaults heartbeat to disabled.
+        assert!(!parsed.heartbeat.enabled);
         assert!(parsed.channels.cli);
         assert!(parsed.memory.hygiene_enabled);
         assert_eq!(parsed.memory.archive_after_days, 7);

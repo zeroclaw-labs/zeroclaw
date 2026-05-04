@@ -2378,10 +2378,15 @@ mod tests {
                 "default".into(),
                 zeroclaw_config::schema::ModelProviderConfig::default(),
             );
+        config.risk_profiles.insert(
+            "default".into(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
         config.agents.insert(
             "ok".into(),
             DelegateAgentConfig {
                 model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );

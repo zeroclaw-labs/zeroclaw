@@ -271,12 +271,19 @@ default_temperature = 0.7
 "#;
     let parsed: Config = toml::from_str(minimal_toml).expect("minimal TOML should parse");
 
-    // No `[agents.default]` defined — `default_agent()` returns the
-    // static fallback, which is `DelegateAgentConfig::default()`.
-    let agent = parsed.default_agent();
-    assert_eq!(agent.max_tool_iterations, 10);
-    assert_eq!(agent.max_history_messages, 50);
-    assert!(agent.compact_context);
+    // V3 has no static-default agent shim. With no `[agents.<alias>]`
+    // defined the lookup misses; the test asserts the absence rather
+    // than the previous shim's defaults.
+    assert!(
+        parsed.agents.is_empty(),
+        "minimal TOML should not synthesize any agent"
+    );
+    // The DelegateAgentConfig defaults still apply when an agent IS
+    // configured but omits a tunable.
+    let default_agent_cfg = zeroclaw_config::schema::DelegateAgentConfig::default();
+    assert_eq!(default_agent_cfg.max_tool_iterations, 10);
+    assert_eq!(default_agent_cfg.max_history_messages, 50);
+    assert!(default_agent_cfg.compact_context);
 }
 
 #[test]

@@ -539,6 +539,34 @@ impl AcpServer {
             .to_string_lossy()
             .into_owned();
 
+        // V3 has no default agent — every ACP session is bound to an
+        // explicit agent. Accept `agentAlias` (camelCase) or `agent_alias`
+        // / `agent` from the JSON-RPC params object.
+        let agent_alias = params
+            .get("agentAlias")
+            .or_else(|| params.get("agent_alias"))
+            .or_else(|| params.get("agent"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| RpcError {
+                code: INVALID_PARAMS,
+                message: "session/new requires `agentAlias` (alias of a configured \
+                          [agents.<alias>] entry)"
+                    .to_string(),
+                data: None,
+            })?
+            .to_string();
+        if self.config.agent(&agent_alias).is_none() {
+            return Err(RpcError {
+                code: INVALID_PARAMS,
+                message: format!(
+                    "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured"
+                ),
+                data: None,
+            });
+        }
+
         let session_id = Uuid::new_v4().to_string();
 
         // Build agent from global config, with the session's cwd pinned as
@@ -547,6 +575,7 @@ impl AcpServer {
         // `config.workspace_dir`.
         let agent = Agent::from_config_with_session_cwd_and_mcp(
             &self.config,
+            &agent_alias,
             Some(std::path::Path::new(&workspace_dir)),
             false,
         )
@@ -1121,7 +1150,7 @@ mod tests {
     #[tokio::test]
     async fn session_new_does_not_wait_for_configured_mcp_servers() {
         let cwd = tempfile::tempdir().unwrap();
-        let config = Config {
+        let mut config = Config {
             workspace_dir: cwd.path().to_path_buf(),
             providers: zeroclaw_config::providers::ProvidersConfig {
                 models: HashMap::from([(
@@ -1149,12 +1178,25 @@ mod tests {
             },
             ..Default::default()
         };
+        config.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "openrouter.default".to_string(),
+                risk_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
         let server = AcpServer::new(config, AcpServerConfig::default());
 
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             server.handle_session_new(&serde_json::json!({
                 "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent",
                 "mcpServers": []
             })),
         )
@@ -1415,7 +1457,7 @@ mod tests {
     #[tokio::test]
     async fn session_stop_finds_session_during_active_prompt_turn() {
         let cwd = tempfile::tempdir().unwrap();
-        let config = Config {
+        let mut config = Config {
             workspace_dir: cwd.path().to_path_buf(),
             providers: zeroclaw_config::providers::ProvidersConfig {
                 models: HashMap::from([(
@@ -1432,12 +1474,25 @@ mod tests {
             },
             ..Default::default()
         };
+        config.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "anthropic.default".to_string(),
+                risk_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
         let server = Arc::new(AcpServer::new(config, AcpServerConfig::default()));
 
         // Create a real session via the normal path.
         let new_result = server
             .handle_session_new(&serde_json::json!({
-                "cwd": cwd.path().to_string_lossy()
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
             }))
             .await
             .expect("session/new must succeed");

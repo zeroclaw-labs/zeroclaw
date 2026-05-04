@@ -26,7 +26,6 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let security = Arc::new(SecurityPolicy::from_config(&config, None));
 
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
@@ -75,7 +74,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
     //    without the `max_tasks` limit so every missed job fires once.
     //    Controlled by `[scheduler] catch_up_on_startup` (default: true).
     if config.scheduler.catch_up_on_startup {
-        catch_up_overdue_jobs(&config, &security, &event_tx).await;
+        catch_up_overdue_jobs(&config, &event_tx).await;
     } else {
         tracing::info!("Scheduler startup: catch-up disabled by config");
     }
@@ -94,19 +93,26 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             }
         };
 
-        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT, &event_tx).await;
+        process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
     }
+}
+
+/// Resolve which agent owns a given cron job. Declarative jobs are owned
+/// by the agent listing the cron alias in its `cron_jobs` field.
+/// Imperative jobs (created at runtime via the `cron_add` tool) currently
+/// have UUID ids that won't match any agent's `cron_jobs`; the scheduler
+/// skips those with a warning and the user must explicitly bind them by
+/// adding the alias to an agent's `cron_jobs` list (or carry the owning
+/// agent on the DB row — tracked as a follow-up).
+fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str> {
+    config.agent_for_cron_job(&job.id)
 }
 
 /// Fetch **all** overdue jobs (ignoring `max_tasks`) and execute them.
 ///
 /// Called once at scheduler startup so that jobs missed during downtime
 /// (e.g. late boot, daemon restart) are caught up immediately.
-async fn catch_up_overdue_jobs(
-    config: &Config,
-    security: &Arc<SecurityPolicy>,
-    event_tx: &EventBroadcast,
-) {
+async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
     let now = Utc::now();
     let jobs = match all_overdue_jobs(config, now) {
         Ok(jobs) => jobs,
@@ -126,19 +132,33 @@ async fn catch_up_overdue_jobs(
         "Scheduler startup: catching up overdue jobs"
     );
 
-    process_due_jobs(config, security, jobs, SCHEDULER_COMPONENT, event_tx).await;
+    process_due_jobs(config, jobs, SCHEDULER_COMPONENT, event_tx).await;
 
     tracing::info!("Scheduler startup: catch-up complete");
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
-    let security = SecurityPolicy::from_config(config, None);
-    Box::pin(execute_job_with_retry(config, &security, job)).await
+    let Some(agent_alias) = resolve_owning_agent(config, job) else {
+        return (
+            false,
+            format!(
+                "cron job {id:?} has no owning agent; add the alias to an [agents.<x>].cron_jobs list",
+                id = job.id
+            ),
+        );
+    };
+    let agent_alias = agent_alias.to_string();
+    let security = match SecurityPolicy::for_agent(config, &agent_alias) {
+        Ok(s) => s,
+        Err(e) => return (false, format!("agent {agent_alias} risk profile: {e}")),
+    };
+    Box::pin(execute_job_with_retry(config, &security, &agent_alias, job)).await
 }
 
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
+    agent_alias: &str,
     job: &CronJob,
 ) -> (bool, String) {
     let mut last_output = String::new();
@@ -148,7 +168,7 @@ async fn execute_job_with_retry(
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command(config, security, job).await,
-            JobType::Agent => Box::pin(run_agent_job(config, security, job)).await,
+            JobType::Agent => Box::pin(run_agent_job(config, security, agent_alias, job)).await,
         };
         last_output = output;
 
@@ -173,7 +193,6 @@ async fn execute_job_with_retry(
 
 async fn process_due_jobs(
     config: &Config,
-    security: &Arc<SecurityPolicy>,
     jobs: Vec<CronJob>,
     component: &str,
     event_tx: &EventBroadcast,
@@ -182,19 +201,41 @@ async fn process_due_jobs(
     crate::health::mark_component_ok(component);
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
-    let mut in_flight = stream::iter(jobs.into_iter().map(|job| {
+    let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
+        // Resolve owning agent per-job. Skip orphans with a warning so a
+        // mis-configured job can't take down the scheduler loop.
+        let Some(agent_alias) = resolve_owning_agent(config, &job) else {
+            tracing::warn!(
+                job_id = %job.id,
+                "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list"
+            );
+            return None;
+        };
+        let agent_alias = agent_alias.to_owned();
+        let security = match SecurityPolicy::for_agent(config, &agent_alias) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::warn!(
+                    job_id = %job.id,
+                    agent = %agent_alias,
+                    error = %e,
+                    "Cron job: failed to build SecurityPolicy for owning agent"
+                );
+                return None;
+            }
+        };
         let config = config.clone();
-        let security = Arc::clone(security);
         let component = component.to_owned();
-        async move {
+        Some(async move {
             Box::pin(execute_and_persist_job(
                 &config,
                 security.as_ref(),
+                &agent_alias,
                 &job,
                 &component,
             ))
             .await
-        }
+        })
     }))
     .buffer_unordered(max_concurrent);
 
@@ -218,6 +259,7 @@ async fn process_due_jobs(
 async fn execute_and_persist_job(
     config: &Config,
     security: &SecurityPolicy,
+    agent_alias: &str,
     job: &CronJob,
     component: &str,
 ) -> (String, bool, String) {
@@ -225,7 +267,8 @@ async fn execute_and_persist_job(
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
-    let (success, output) = Box::pin(execute_job_with_retry(config, security, job)).await;
+    let (success, output) =
+        Box::pin(execute_job_with_retry(config, security, agent_alias, job)).await;
     let finished_at = Utc::now();
     let success = Box::pin(persist_job_result(
         config,
@@ -243,6 +286,7 @@ async fn execute_and_persist_job(
 async fn run_agent_job(
     config: &Config,
     security: &SecurityPolicy,
+    agent_alias: &str,
     job: &CronJob,
 ) -> (bool, String) {
     if !security.can_act() {
@@ -323,6 +367,7 @@ async fn run_agent_job(
         SessionTarget::Main | SessionTarget::Isolated => {
             Box::pin(crate::agent::run(
                 cron_config,
+                agent_alias,
                 Some(prefixed_prompt),
                 None,
                 model_override,
@@ -665,11 +710,32 @@ mod tests {
     use zeroclaw_config::schema::Config;
 
     async fn test_config(tmp: &TempDir) -> Config {
-        let config = Config {
+        let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        // Seed a configured test-agent so cron utilities that resolve
+        // SecurityPolicy via `for_agent("test-agent")` succeed.
+        config.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.providers.models.insert(
+            "openrouter".to_string(),
+            std::collections::HashMap::from([(
+                "default".to_string(),
+                zeroclaw_config::schema::ModelProviderConfig::default(),
+            )]),
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "openrouter.default".to_string(),
+                risk_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
@@ -779,7 +845,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let job = test_job("echo scheduler-ok");
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(success);
@@ -792,7 +864,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let job = test_job("ls definitely_missing_file_for_scheduler_test");
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
@@ -810,7 +888,13 @@ mod tests {
             .or_default()
             .allowed_commands = vec!["sleep".into()];
         let job = test_job("sleep 1");
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
         let (success, output) =
             run_job_command_with_timeout(&config, &security, &job, Duration::from_millis(50)).await;
@@ -828,7 +912,13 @@ mod tests {
             .or_default()
             .allowed_commands = vec!["echo".into()];
         let job = test_job("curl https://evil.example");
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
@@ -846,7 +936,13 @@ mod tests {
             .or_default()
             .allowed_commands = vec!["cat".into()];
         let job = test_job("cat /etc/passwd");
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
@@ -865,7 +961,13 @@ mod tests {
             .or_default()
             .allowed_commands = vec!["grep".into()];
         let job = test_job("grep --file=/etc/passwd root ./src");
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
@@ -884,7 +986,13 @@ mod tests {
             .or_default()
             .allowed_commands = vec!["grep".into()];
         let job = test_job("grep -f/etc/passwd root ./src");
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
@@ -903,7 +1011,13 @@ mod tests {
             .or_default()
             .allowed_commands = vec!["cat".into()];
         let job = test_job("cat ~root/.ssh/id_rsa");
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
@@ -922,7 +1036,13 @@ mod tests {
             .or_default()
             .allowed_commands = vec!["cat".into()];
         let job = test_job("cat </etc/passwd");
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
@@ -940,7 +1060,13 @@ mod tests {
             .or_default()
             .level = crate::security::AutonomyLevel::ReadOnly;
         let job = test_job("echo should-not-run");
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
@@ -958,7 +1084,13 @@ mod tests {
             .or_default()
             .max_actions_per_hour = 0;
         let job = test_job("echo should-not-run");
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
@@ -977,7 +1109,13 @@ mod tests {
             .entry("default".into())
             .or_default()
             .allowed_commands = vec!["sh".into()];
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
         tokio::fs::write(
             config.workspace_dir.join("retry-once.sh"),
@@ -987,7 +1125,13 @@ mod tests {
         .unwrap();
         let job = test_job("sh ./retry-once.sh");
 
-        let (success, output) = Box::pin(execute_job_with_retry(&config, &security, &job)).await;
+        let (success, output) = Box::pin(execute_job_with_retry(
+            &config,
+            &security,
+            "test-agent",
+            &job,
+        ))
+        .await;
         assert!(success);
         assert!(output.contains("recovered"));
     }
@@ -998,11 +1142,23 @@ mod tests {
         let mut config = test_config(&tmp).await;
         config.reliability.scheduler_retries = 1;
         config.reliability.provider_backoff_ms = 1;
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
         let job = test_job("ls always_missing_for_retry_test");
 
-        let (success, output) = Box::pin(execute_job_with_retry(&config, &security, &job)).await;
+        let (success, output) = Box::pin(execute_job_with_retry(
+            &config,
+            &security,
+            "test-agent",
+            &job,
+        ))
+        .await;
         assert!(!success);
         assert!(output.contains("always_missing_for_retry_test"));
     }
@@ -1014,9 +1170,16 @@ mod tests {
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
-        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
+        let (success, output) =
+            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
         assert!(!success);
         assert!(output.contains("agent job failed:"));
     }
@@ -1033,9 +1196,16 @@ mod tests {
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
-        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
+        let (success, output) =
+            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -1053,9 +1223,16 @@ mod tests {
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Say hello".into());
-        let security = SecurityPolicy::from_config(&config, None);
+        let security = SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            &config.workspace_dir,
+        );
 
-        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
+        let (success, output) =
+            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
@@ -1065,11 +1242,10 @@ mod tests {
     async fn process_due_jobs_marks_component_ok_even_when_idle() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        let security = Arc::new(SecurityPolicy::from_config(&config, None));
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        process_due_jobs(&config, &security, Vec::new(), &component, &None).await;
+        process_due_jobs(&config, Vec::new(), &component, &None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -1083,11 +1259,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let job = test_job("ls definitely_missing_file_for_scheduler_component_health_test");
-        let security = Arc::new(SecurityPolicy::from_config(&config, None));
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        process_due_jobs(&config, &security, vec![job], &component, &None).await;
+        process_due_jobs(&config, vec![job], &component, &None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -1098,7 +1273,7 @@ mod tests {
     async fn persist_job_result_records_run_and_reschedules_shell_job() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        let job = cron::add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
@@ -1169,7 +1344,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
-        let job = cron::add_once_at(&config, at, "echo one-shot-shell").unwrap();
+        let job = cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell").unwrap();
         assert!(job.delete_after_run);
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -1185,7 +1360,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
-        let job = cron::add_once_at(&config, at, "echo one-shot-shell").unwrap();
+        let job = cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell").unwrap();
         assert!(job.delete_after_run);
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -1367,7 +1542,13 @@ mod tests {
 
         // Create 3 jobs with "every minute" schedule
         for i in 0..3 {
-            let _ = cron::add_job(&config, "* * * * *", &format!("echo catchup-{i}")).unwrap();
+            let _ = cron::add_job(
+                &config,
+                "test-agent",
+                "* * * * *",
+                &format!("echo catchup-{i}"),
+            )
+            .unwrap();
         }
 
         // Verify normal due_jobs is limited to max_tasks=1
@@ -1387,15 +1568,22 @@ mod tests {
     #[tokio::test]
     async fn broadcast_sends_cron_result_on_success() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let job = test_job("echo broadcast-ok");
-        let security = Arc::new(SecurityPolicy::from_config(&config, None));
+        // Bind the synthetic test job to test-agent so process_due_jobs's
+        // owning-agent lookup succeeds (jobs without an owner are skipped).
+        config
+            .agents
+            .get_mut("test-agent")
+            .unwrap()
+            .cron_jobs
+            .push(job.id.clone());
         let component = unique_component("broadcast-ok");
 
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, &security, vec![job], &component, &event_tx).await;
+        process_due_jobs(&config, vec![job], &component, &event_tx).await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
@@ -1408,15 +1596,20 @@ mod tests {
     #[tokio::test]
     async fn broadcast_sends_cron_result_on_failure() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
         let job = test_job("ls definitely_missing_file_for_broadcast_fail_test");
-        let security = Arc::new(SecurityPolicy::from_config(&config, None));
+        config
+            .agents
+            .get_mut("test-agent")
+            .unwrap()
+            .cron_jobs
+            .push(job.id.clone());
         let component = unique_component("broadcast-fail");
 
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, &security, vec![job], &component, &event_tx).await;
+        process_due_jobs(&config, vec![job], &component, &event_tx).await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
@@ -1430,11 +1623,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let job = test_job("echo no-broadcast");
-        let security = Arc::new(SecurityPolicy::from_config(&config, None));
         let component = unique_component("broadcast-none");
 
         // event_tx = None — should complete without panic.
-        process_due_jobs(&config, &security, vec![job], &component, &None).await;
+        process_due_jobs(&config, vec![job], &component, &None).await;
     }
 
     #[tokio::test]
@@ -1442,7 +1634,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let job = test_job("echo no-subscribers");
-        let security = Arc::new(SecurityPolicy::from_config(&config, None));
         let component = unique_component("broadcast-no-sub");
 
         let (tx, _) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
@@ -1450,7 +1641,7 @@ mod tests {
         // process_due_jobs must not panic when there are no subscribers.
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, &security, vec![job], &component, &event_tx).await;
+        process_due_jobs(&config, vec![job], &component, &event_tx).await;
         // If we got here without panic, the test passes.
     }
 }

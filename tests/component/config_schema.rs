@@ -395,7 +395,12 @@ fn config_empty_toml_uses_default_temperature() {
 #[test]
 fn config_minimal_toml_with_temperature_uses_defaults() {
     let config = migrate("default_temperature = 0.7\ndefault_provider = \"test\"\n");
-    assert_eq!(config.default_agent().max_tool_iterations, 10);
+    // Migration synthesizes [agents.default] from the V2 shape; assert
+    // its tunables match DelegateAgentConfig defaults.
+    let agent = config
+        .agent("default")
+        .expect("migration synthesized agents.default");
+    assert_eq!(agent.max_tool_iterations, 10);
     assert_eq!(config.gateway.port, 42617);
 }
 
@@ -412,7 +417,10 @@ fn config_only_temperature_parses() {
             .abs()
             < f64::EPSILON
     );
-    assert_eq!(config.default_agent().max_tool_iterations, 10);
+    let agent = config
+        .agent("default")
+        .expect("migration synthesized agents.default");
+    assert_eq!(agent.max_tool_iterations, 10);
 }
 
 #[test]

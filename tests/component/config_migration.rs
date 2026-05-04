@@ -463,6 +463,9 @@ allowed_rooms = ["!existing:matrix.org"]
     );
 
     let mut expected = Config::default();
+    // V2→V3 migration synthesizes [heartbeat] agent = "default" since
+    // heartbeat.enabled defaults to true and V3 requires the binding.
+    expected.heartbeat.agent = "default".to_string();
     let mut main_entry = ModelProviderConfig {
         api_key: Some("walk-key".into()),
         base_url: Some("https://walk.example.com".into()),
@@ -2647,6 +2650,10 @@ fn cfg_with_provider() -> Config {
         .entry("openrouter".into())
         .or_default()
         .insert("default".into(), ModelProviderConfig::default());
+    // These tests focus on agent-validation rules, not heartbeat;
+    // disable heartbeat so its `agent` field requirement doesn't
+    // trip ahead of the per-agent checks.
+    c.heartbeat.enabled = false;
     c
 }
 

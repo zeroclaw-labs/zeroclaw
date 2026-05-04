@@ -35,7 +35,7 @@ use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use regex::Regex;
 use std::collections::HashSet;
@@ -2075,6 +2075,7 @@ pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
 #[allow(clippy::too_many_lines)]
 pub async fn run(
     config: Config,
+    agent_alias: &str,
     message: Option<String>,
     provider_override: Option<String>,
     model_override: Option<String>,
@@ -2084,12 +2085,25 @@ pub async fn run(
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
 ) -> Result<String> {
+    let agent = config
+        .agent(agent_alias)
+        .with_context(|| format!("agents.{agent_alias} is not configured"))?
+        .clone();
+    let risk_profile = config
+        .risk_profile_for_agent(agent_alias)
+        .with_context(|| {
+            format!(
+                "agents.{agent_alias}.risk_profile does not name a configured risk_profiles entry"
+            )
+        })?
+        .clone();
+
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(&config, None));
+    let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
 
     let primary_provider = config.providers.first_provider();
 
@@ -2130,6 +2144,8 @@ pub async fn run(
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
+        &risk_profile,
+        agent_alias,
         runtime,
         mem.clone(),
         composio_key,
@@ -2427,7 +2443,7 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
-    let bootstrap_max_chars = if config.default_agent().compact_context {
+    let bootstrap_max_chars = if agent.compact_context {
         Some(6000)
     } else {
         None
@@ -2440,11 +2456,11 @@ pub async fn run(
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
-        Some(config.active_risk_profile(None)),
+        Some(&risk_profile),
         native_tools,
         config.skills.prompt_injection_mode,
-        config.default_agent().compact_context,
-        config.default_agent().max_system_prompt_chars,
+        agent.compact_context,
+        agent.max_system_prompt_chars,
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -2460,9 +2476,7 @@ pub async fn run(
 
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = if interactive {
-        Some(ApprovalManager::from_risk_profile(
-            config.active_risk_profile(None),
-        ))
+        Some(ApprovalManager::from_risk_profile(&risk_profile))
     } else {
         None
     };
@@ -2516,7 +2530,7 @@ pub async fn run(
         let thinking_level = crate::agent::thinking::resolve_thinking_level(
             thinking_directive,
             None,
-            &config.default_agent().thinking,
+            &agent.thinking,
         );
         let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
         let effective_temperature = crate::agent::thinking::clamp_temperature(
@@ -2552,11 +2566,7 @@ pub async fn run(
             memory_session_id.as_deref(),
         )
         .await;
-        let rag_limit = if config.default_agent().compact_context {
-            2
-        } else {
-            5
-        };
+        let rag_limit = if agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
             .map(|r| build_hardware_context(r, &effective_msg, &board_names, rag_limit))
@@ -2575,19 +2585,14 @@ pub async fn run(
         ];
 
         // Prune history for token efficiency (when enabled).
-        if config.default_agent().history_pruning.enabled {
-            let _stats = crate::agent::history_pruner::prune_history(
-                &mut history,
-                &config.default_agent().history_pruning,
-            );
+        if agent.history_pruning.enabled {
+            let _stats =
+                crate::agent::history_pruner::prune_history(&mut history, &agent.history_pruning);
         }
 
         // Compute per-turn excluded MCP tools from tool_filter_groups.
-        let excluded_tools = compute_excluded_mcp_tools(
-            &tools_registry,
-            &config.default_agent().tool_filter_groups,
-            &effective_msg,
-        );
+        let excluded_tools =
+            compute_excluded_mcp_tools(&tools_registry, &agent.tool_filter_groups, &effective_msg);
 
         #[allow(unused_assignments)]
         let mut response = String::new();
@@ -2608,17 +2613,17 @@ pub async fn run(
                         channel_name,
                         None,
                         &config.multimodal,
-                        config.default_agent().max_tool_iterations,
+                        agent.max_tool_iterations,
                         None,
                         None,
                         None,
                         &excluded_tools,
-                        &config.default_agent().tool_call_dedup_exempt,
+                        &agent.tool_call_dedup_exempt,
                         activated_handle.as_ref(),
                         Some(model_switch_callback.clone()),
                         &config.pacing,
-                        config.default_agent().max_tool_result_chars,
-                        config.default_agent().max_context_tokens,
+                        agent.max_tool_result_chars,
+                        agent.max_context_tokens,
                         None, // shared_budget
                         None, // channel: CLI mode — uses prompt_cli
                         None, // receipt_generator
@@ -2800,7 +2805,7 @@ pub async fn run(
             let thinking_level = crate::agent::thinking::resolve_thinking_level(
                 thinking_directive,
                 None,
-                &config.default_agent().thinking,
+                &agent.thinking,
             );
             let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
             let turn_temperature = crate::agent::thinking::clamp_temperature(
@@ -2843,11 +2848,7 @@ pub async fn run(
                 memory_session_id.as_deref(),
             )
             .await;
-            let rag_limit = if config.default_agent().compact_context {
-                2
-            } else {
-                5
-            };
+            let rag_limit = if agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
                 .map(|r| build_hardware_context(r, &effective_input, &board_names, rag_limit))
@@ -2865,7 +2866,7 @@ pub async fn run(
             // Compute per-turn excluded MCP tools from tool_filter_groups.
             let excluded_tools = compute_excluded_mcp_tools(
                 &tools_registry,
-                &config.default_agent().tool_filter_groups,
+                &agent.tool_filter_groups,
                 &effective_input,
             );
 
@@ -2924,17 +2925,17 @@ pub async fn run(
                             channel_name,
                             None,
                             &config.multimodal,
-                            config.default_agent().max_tool_iterations,
+                            agent.max_tool_iterations,
                             Some(cancel_token.clone()),
                             Some(delta_tx.clone()),
                             None,
                             &excluded_tools,
-                            &config.default_agent().tool_call_dedup_exempt,
+                            &agent.tool_call_dedup_exempt,
                             activated_handle.as_ref(),
                             Some(model_switch_callback.clone()),
                             &config.pacing,
-                            config.default_agent().max_tool_result_chars,
-                            config.default_agent().max_context_tokens,
+                            agent.max_tool_result_chars,
+                            agent.max_context_tokens,
                             None, // shared_budget
                             None, // channel: interactive CLI — uses prompt_cli
                             None, // receipt_generator
@@ -2987,8 +2988,8 @@ pub async fn run(
                             );
                             let mut compressor =
                                 crate::agent::context_compressor::ContextCompressor::new(
-                                    config.default_agent().context_compression.clone(),
-                                    config.default_agent().max_context_tokens,
+                                    agent.context_compression.clone(),
+                                    agent.max_context_tokens,
                                 )
                                 .with_memory(mem.clone());
                             let error_msg = format!("{e}");
@@ -3046,8 +3047,8 @@ pub async fn run(
             // Context compression before hard trimming to preserve long-context signal.
             {
                 let compressor = crate::agent::context_compressor::ContextCompressor::new(
-                    config.default_agent().context_compression.clone(),
-                    config.default_agent().max_context_tokens,
+                    agent.context_compression.clone(),
+                    agent.max_context_tokens,
                 )
                 .with_memory(mem.clone());
                 match compressor
@@ -3068,16 +3069,13 @@ pub async fn run(
                             error = %e,
                             "Context compression failed, falling back to history trim"
                         );
-                        trim_history(
-                            &mut history,
-                            config.default_agent().max_history_messages / 2,
-                        );
+                        trim_history(&mut history, agent.max_history_messages / 2);
                     }
                 }
             }
 
             // Hard cap as a safety net.
-            trim_history(&mut history, config.default_agent().max_history_messages);
+            trim_history(&mut history, agent.max_history_messages);
 
             // Restore base system prompt (remove per-turn thinking prefix).
             if thinking_params.system_prompt_prefix.is_some()
@@ -3109,16 +3107,30 @@ pub async fn run(
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(
     config: Config,
+    agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
 ) -> Result<String> {
+    let agent = config
+        .agent(agent_alias)
+        .with_context(|| format!("agents.{agent_alias} is not configured"))?
+        .clone();
+    let risk_profile = config
+        .risk_profile_for_agent(agent_alias)
+        .with_context(|| {
+            format!(
+                "agents.{agent_alias}.risk_profile does not name a configured risk_profiles entry"
+            )
+        })?
+        .clone();
+
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(&config, None));
+    let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
     let primary_provider = config.providers.first_provider();
-    let approval_manager = ApprovalManager::for_non_interactive(config.active_risk_profile(None));
+    let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
         &config.providers.embedding_routes,
@@ -3145,6 +3157,8 @@ pub async fn process_message(
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
+        &risk_profile,
+        agent_alias,
         runtime,
         mem.clone(),
         composio_key,
@@ -3363,7 +3377,7 @@ pub async fn process_message(
     // Skip when the active risk profile's autonomy is `Full` — full-autonomy
     // agents keep all tools.
     {
-        let active_profile = config.active_risk_profile(None);
+        let active_profile = &risk_profile;
         if active_profile.level != AutonomyLevel::Full {
             let excluded = &active_profile.excluded_tools;
             if !excluded.is_empty() {
@@ -3372,7 +3386,7 @@ pub async fn process_message(
         }
     }
 
-    let bootstrap_max_chars = if config.default_agent().compact_context {
+    let bootstrap_max_chars = if agent.compact_context {
         Some(6000)
     } else {
         None
@@ -3385,11 +3399,11 @@ pub async fn process_message(
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
-        Some(config.active_risk_profile(None)),
+        Some(&risk_profile),
         native_tools,
         config.skills.prompt_injection_mode,
-        config.default_agent().compact_context,
-        config.default_agent().max_system_prompt_chars,
+        agent.compact_context,
+        agent.max_system_prompt_chars,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
@@ -3408,11 +3422,8 @@ pub async fn process_message(
             }
             None => (None, message.to_string()),
         };
-    let thinking_level = crate::agent::thinking::resolve_thinking_level(
-        thinking_directive,
-        None,
-        &config.default_agent().thinking,
-    );
+    let thinking_level =
+        crate::agent::thinking::resolve_thinking_level(thinking_directive, None, &agent.thinking);
     let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
     let effective_temperature = crate::agent::thinking::clamp_temperature(
         config
@@ -3436,11 +3447,7 @@ pub async fn process_message(
         session_id,
     )
     .await;
-    let rag_limit = if config.default_agent().compact_context {
-        2
-    } else {
-        5
-    };
+    let rag_limit = if agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
         .map(|r| build_hardware_context(r, effective_msg_ref, &board_names, rag_limit))
@@ -3459,11 +3466,11 @@ pub async fn process_message(
     ];
     let mut excluded_tools = compute_excluded_mcp_tools(
         &tools_registry,
-        &config.default_agent().tool_filter_groups,
+        &agent.tool_filter_groups,
         effective_msg_ref,
     );
     {
-        let active_profile = config.active_risk_profile(None);
+        let active_profile = &risk_profile;
         if active_profile.level != AutonomyLevel::Full {
             excluded_tools.extend(active_profile.excluded_tools.iter().cloned());
         }
@@ -3481,10 +3488,10 @@ pub async fn process_message(
         "daemon",
         None,
         &config.multimodal,
-        config.default_agent().max_tool_iterations,
+        agent.max_tool_iterations,
         Some(&approval_manager),
         &excluded_tools,
-        &config.default_agent().tool_call_dedup_exempt,
+        &agent.tool_call_dedup_exempt,
         activated_handle_pm.as_ref(),
         None,
         None, // channel: process_message path has no channel ref
