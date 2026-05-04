@@ -78,9 +78,8 @@ ZeroClaw supports layered secret management for local development.
 
 1. Explicit key passed from config or CLI.
 2. Provider-specific env vars (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …).
-3. Generic env vars (`ZEROCLAW_API_KEY`, `API_KEY`).
 
-Provider/model overrides via `ZEROCLAW_PROVIDER`, `PROVIDER`, `ZEROCLAW_MODEL`. See `.env.example` for the supported list.
+Set credentials in your config file (`~/.zeroclaw/config.toml` by default; custom workspaces override the path) under `[providers.models.<type>.<alias>]`. Generic env-var fallbacks (`ZEROCLAW_API_KEY`, `API_KEY`) and the V1/V2 `ZEROCLAW_PROVIDER` / `PROVIDER` / `ZEROCLAW_MODEL` overrides were removed in V3.
 
 **Never commit:** `.env`, API keys / tokens / passwords / OAuth tokens / webhook signing secrets, `~/.zeroclaw/.secret_key`, or any personal identifier in tests or fixtures. The full content discipline is in **[Privacy & PII](docs/book/src/contributing/privacy.md)**.
 
