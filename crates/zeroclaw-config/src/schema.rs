@@ -18642,10 +18642,10 @@ allowed_users = ["@u:m"]
             Some(pricing(3.0, 15.0)),
         );
         // Operator pinned a different rate at the top level — must survive.
-        config.cost.prices.insert(
-            "anthropic/claude-sonnet-4-5".into(),
-            pricing(2.0, 8.0),
-        );
+        config
+            .cost
+            .prices
+            .insert("anthropic/claude-sonnet-4-5".into(), pricing(2.0, 8.0));
 
         let combined = config.combined_pricing();
         let entry = combined.get("anthropic/claude-sonnet-4-5").unwrap();
