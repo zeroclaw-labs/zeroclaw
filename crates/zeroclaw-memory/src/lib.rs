@@ -66,7 +66,10 @@ pub use retrieval::{RetrievalConfig, RetrievalPipeline};
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
-pub use traits::{ExportFilter, MemoryCategory, MemoryEntry, ProceduralMessage};
+pub use traits::{
+    ExportFilter, MemoryCategory, MemoryEntry, ProceduralMessage, is_recent_recall_query,
+    normalize_recent_recall_query,
+};
 
 use anyhow::Context;
 use std::path::Path;
