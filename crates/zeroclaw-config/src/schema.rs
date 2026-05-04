@@ -2067,6 +2067,16 @@ pub struct IdentityConfig {
     /// Inline AIEOS JSON (alternative to file path)
     #[serde(default)]
     pub aieos_inline: Option<String>,
+    /// Custom bootstrap files to inject (OpenClaw format only).
+    /// When set, replaces the default list. Files that don't exist are handled
+    /// per `suppress_missing_files`. BOOTSTRAP.md is always checked separately.
+    /// Default: ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md", "MEMORY.md"]
+    #[serde(default)]
+    pub bootstrap_files: Option<Vec<String>>,
+    /// When true, missing bootstrap files are silently skipped instead of
+    /// injecting "[File not found: X]" markers into the prompt. Default: false.
+    #[serde(default)]
+    pub suppress_missing_files: bool,
 }
 
 fn default_identity_format() -> String {
@@ -2079,6 +2089,8 @@ impl Default for IdentityConfig {
             format: default_identity_format(),
             aieos_path: None,
             aieos_inline: None,
+            bootstrap_files: None,
+            suppress_missing_files: false,
         }
     }
 }

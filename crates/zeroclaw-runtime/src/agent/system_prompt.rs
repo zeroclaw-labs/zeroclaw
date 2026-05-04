@@ -10,29 +10,44 @@ use crate::skills::Skill;
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
+/// Default bootstrap files when none are configured in `[identity]`.
+const DEFAULT_BOOTSTRAP_FILES: &[&str] = &[
+    "AGENTS.md",
+    "SOUL.md",
+    "TOOLS.md",
+    "IDENTITY.md",
+    "USER.md",
+    "MEMORY.md",
+];
+
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
     workspace_dir: &std::path::Path,
     max_chars_per_file: usize,
+    custom_files: Option<&[String]>,
+    suppress_missing: bool,
 ) {
     prompt.push_str(
         "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
     );
 
-    let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
-
-    for filename in &bootstrap_files {
-        inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
+    if let Some(files) = custom_files {
+        // Configurable list from [identity] bootstrap_files
+        for filename in files {
+            inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file, suppress_missing);
+        }
+    } else {
+        // Default hardcoded list (backwards compatible)
+        for filename in DEFAULT_BOOTSTRAP_FILES {
+            inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file, suppress_missing);
+        }
     }
 
     // BOOTSTRAP.md — only if it exists (first-run ritual)
     let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
     if bootstrap_path.exists() {
-        inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file);
+        inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file, suppress_missing);
     }
-
-    // MEMORY.md — curated long-term memory (main session only)
-    inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
 }
 
 /// Load workspace identity files and build a system prompt.
@@ -253,6 +268,10 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // ── 5. Bootstrap files (injected into context) ──────────────
     prompt.push_str("## Project Context\n\n");
 
+    // Extract configurable options from identity config
+    let custom_bootstrap = identity_config.and_then(|c| c.bootstrap_files.as_deref());
+    let suppress_missing = identity_config.is_some_and(|c| c.suppress_missing_files);
+
     // Check if AIEOS identity is configured
     if let Some(config) = identity_config {
         if identity::is_aieos_configured(config) {
@@ -266,10 +285,9 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                     }
                 }
                 Ok(None) => {
-                    // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
-                    // Fall back to OpenClaw bootstrap files
+                    // No AIEOS identity loaded — fall back to OpenClaw bootstrap files
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars, custom_bootstrap, suppress_missing);
                 }
                 Err(e) => {
                     // Log error but don't fail - fall back to OpenClaw
@@ -277,18 +295,18 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                         "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
                     );
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars, custom_bootstrap, suppress_missing);
                 }
             }
         } else {
             // OpenClaw format
             let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-            load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+            load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars, custom_bootstrap, suppress_missing);
         }
     } else {
-        // No identity config - use OpenClaw format
+        // No identity config - use OpenClaw format with defaults
         let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars, None, false);
     }
 
     // ── 6. Date & Time ──────────────────────────────────────────
@@ -355,12 +373,15 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     }
 }
 
-/// Inject a single workspace file into the prompt with truncation and missing-file markers.
+/// Inject a single workspace file into the prompt with truncation.
+/// When `suppress_missing` is true, missing files are silently skipped.
+/// When false, a `[File not found]` marker is injected (legacy behavior).
 fn inject_workspace_file(
     prompt: &mut String,
     workspace_dir: &std::path::Path,
     filename: &str,
     max_chars: usize,
+    suppress_missing: bool,
 ) {
     use std::fmt::Write;
 
@@ -394,8 +415,11 @@ fn inject_workspace_file(
             }
         }
         Err(_) => {
-            // Missing-file marker (matches OpenClaw behavior)
-            let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
+            if !suppress_missing {
+                // Legacy behavior: inject a marker so the agent knows the file is expected
+                let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
+            }
+            // When suppress_missing is true, skip silently — no noise in the prompt
         }
     }
 }
