@@ -48,6 +48,11 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// Provider-specific opaque extension fields that must round-trip
+    /// unchanged on follow-up turns (e.g. Gemini 3 `thoughtSignature`
+    /// carried as `extra_content.google.thought_signature`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 /// Raw token counts from a single LLM API response.

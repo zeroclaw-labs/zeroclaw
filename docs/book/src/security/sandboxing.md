@@ -19,10 +19,10 @@ You can force a backend:
 
 ```toml
 [security.sandbox]
-backend = "bubblewrap"        # or "landlock", "firejail", "docker", "seatbelt", "noop"
+backend = "bubblewrap"        # or "landlock", "firejail", "docker", "sandbox-exec", "none"
 ```
 
-Set `backend = "noop"` to disable sandboxing entirely (part of [YOLO mode](../getting-started/yolo.md)).
+Set `backend = "none"` to disable sandboxing entirely (part of [YOLO mode](../getting-started/yolo.md)).
 
 ## What the sandbox confines
 
@@ -107,7 +107,7 @@ Native macOS sandbox (`sandbox-exec`). Profiles are SBPL — we bundle one for t
 
 Limitation: some CLI tools (older versions of `git`, some Homebrew-linked binaries) don't cooperate with Seatbelt's file-access rules. If you see "Operation not permitted" errors from the agent's shell calls on macOS, check if the tool needs broader filesystem access and consider switching to Docker.
 
-### `noop`
+### `none`
 
 No sandboxing. Tools run with the full privileges of the ZeroClaw service user. This is what YOLO mode enables. Loud, obvious, intentional.
 

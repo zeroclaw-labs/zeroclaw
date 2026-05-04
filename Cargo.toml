@@ -34,6 +34,7 @@ name = "zeroclawlabs"
 # on crates.io. Flip or remove this once the multi-crate publish topology is
 # designed per RFC #5579.
 publish = false
+default-run = "zeroclaw"
 version.workspace = true
 edition.workspace = true
 authors = ["theonlyhennygod"]
@@ -58,6 +59,11 @@ include = [
 [[bin]]
 name = "zeroclaw"
 path = "src/main.rs"
+
+[[bin]]
+name = "zeroclaw-acp-bridge"
+path = "src/bin/zeroclaw-acp-bridge.rs"
+required-features = ["acp-bridge"]
 
 [lib]
 name = "zeroclaw"
@@ -235,6 +241,7 @@ libc = "0.2"
 [features]
 default = [
     "agent-runtime",
+    "acp-bridge",
     "gateway",
     "tui-onboarding",
     "observability-prometheus",
@@ -271,6 +278,7 @@ gateway = [
 ]
 tui-onboarding = ["dep:zeroclaw-tui"]
 schema-export = ["zeroclaw-config/schema-export"]
+acp-bridge = ["dep:tokio-tungstenite"]
 
 # Channels — each forwards directly to zeroclaw-channels (1 hop)
 channel-email = ["zeroclaw-channels/channel-email"]
