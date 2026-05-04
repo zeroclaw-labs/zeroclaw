@@ -195,7 +195,11 @@ mod tests {
         fs::write(nm.join(".package-lock.json"), "{}").unwrap();
         // Wait a measurable tick, then bump lock mtime.
         sleep(Duration::from_millis(20));
-        fs::write(dir.path().join("package-lock.json"), "{ \"updated\": true }").unwrap();
+        fs::write(
+            dir.path().join("package-lock.json"),
+            "{ \"updated\": true }",
+        )
+        .unwrap();
         assert!(
             node_modules_needs_install(dir.path()),
             "stale node_modules (sentinel older than lock) must reinstall"
