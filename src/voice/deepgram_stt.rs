@@ -682,12 +682,19 @@ impl Drop for DeepgramSttSession {
 
 /// Map our internal LanguageCode to Deepgram's BCP-47 language code.
 ///
-/// Deepgram supports a wide range of languages. For `auto` or `multi`,
-/// use `"multi"` which enables automatic language detection with the
-/// multilingual nova-3 model.
+/// Deepgram supports a subset of the languages our LanguageCode enum
+/// covers. For codes Deepgram does not support, this function returns
+/// `"multi"` — Deepgram's multilingual auto-detect model — so chat
+/// voice input still works rather than failing on language selection.
+///
+/// This function lives in a module that is scheduled for removal
+/// (Phase 3 of the 2026-05 voice cleanup replaces Deepgram with
+/// Gemma 4). It is kept exhaustive across the enum only to satisfy
+/// the compiler until that PR lands.
 pub fn language_code_to_deepgram(code: &super::pipeline::LanguageCode) -> &'static str {
     use super::pipeline::LanguageCode;
     match code {
+        // Deepgram-supported (BCP-47)
         LanguageCode::Ko => "ko",
         LanguageCode::Ja => "ja",
         LanguageCode::Zh => "zh",
@@ -713,6 +720,66 @@ pub fn language_code_to_deepgram(code: &super::pipeline::LanguageCode) -> &'stat
         LanguageCode::Uk => "uk",
         LanguageCode::Tr => "tr",
         LanguageCode::Ar => "ar",
+        // 2026-05 expansion — fall back to Deepgram's "multi" model
+        // for languages it doesn't natively support. Deepgram will
+        // detect the language from the audio. This module is being
+        // retired in Phase 3 anyway, so accuracy on the long tail
+        // is less important than "code compiles + chat voice works".
+        LanguageCode::Mn
+        | LanguageCode::My
+        | LanguageCode::Km
+        | LanguageCode::Lo
+        | LanguageCode::Bn
+        | LanguageCode::Ta
+        | LanguageCode::Te
+        | LanguageCode::Mr
+        | LanguageCode::Gu
+        | LanguageCode::Kn
+        | LanguageCode::Ml
+        | LanguageCode::Pa
+        | LanguageCode::Or
+        | LanguageCode::Si
+        | LanguageCode::Ur
+        | LanguageCode::Ne
+        | LanguageCode::Sd
+        | LanguageCode::No
+        | LanguageCode::Fi
+        | LanguageCode::Is
+        | LanguageCode::Ga
+        | LanguageCode::Cy
+        | LanguageCode::Mt
+        | LanguageCode::Eu
+        | LanguageCode::Ca
+        | LanguageCode::Gl
+        | LanguageCode::Hu
+        | LanguageCode::Ro
+        | LanguageCode::Sk
+        | LanguageCode::Sl
+        | LanguageCode::Hr
+        | LanguageCode::Sr
+        | LanguageCode::Bs
+        | LanguageCode::Sq
+        | LanguageCode::Et
+        | LanguageCode::Lv
+        | LanguageCode::Lt
+        | LanguageCode::Be
+        | LanguageCode::Bg
+        | LanguageCode::Mk
+        | LanguageCode::El
+        | LanguageCode::Hy
+        | LanguageCode::Ka
+        | LanguageCode::He
+        | LanguageCode::Fa
+        | LanguageCode::Kk
+        | LanguageCode::Uz
+        | LanguageCode::Az
+        | LanguageCode::Sw
+        | LanguageCode::Am
+        | LanguageCode::Yo
+        | LanguageCode::Ha
+        | LanguageCode::Zu
+        | LanguageCode::Af
+        | LanguageCode::So => "multi",
     }
 }
 

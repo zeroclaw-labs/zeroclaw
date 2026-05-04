@@ -9,28 +9,83 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-// ── Language codes (25 supported languages) ──────────────────────
+// ── Language codes (75 supported languages) ──────────────────────
+//
+// History
+//   * 2026-04: shipped with 25 languages — the ones with reliable
+//     Unicode-script auto-detection plus the most common Latin-script
+//     European pairs.
+//   * 2026-05: extended to 75 in two batches:
+//       - new auto-detectable scripts (Bengali, Tamil, Telugu, …,
+//         Hebrew, Greek, Armenian, Georgian, Burmese, Khmer, Lao,
+//         Sinhala) — both `LanguageCode` and `detect_language`
+//         updated together.
+//       - common Latin-script languages where the user must select
+//         the language explicitly (auto-detection cannot reliably
+//         distinguish e.g. Polish from Czech from Slovak by script
+//         alone).
+//
+// Why an enum instead of a String tag
+// -----------------------------------
+// The compiler-checked `match` exhaustiveness on every call site
+// (`as_str`, `display_name`, `lang_to_typecast_iso3`, the Deepgram
+// mapping, the chat handler) is the safety net that has caught every
+// language-related bug in this codebase. Switching to a String tag
+// would lose that net. So we accept the verbosity of N variants and
+// the per-site `match` arms in exchange for "the build breaks if
+// anyone forgets to map a new language".
 
 /// ISO 639-1 language codes supported by the voice pipeline.
+///
+/// Every variant must be mapped in:
+///   * [`LanguageCode::as_str`]
+///   * [`LanguageCode::display_name`]
+///   * [`LanguageCode::from_str_code`]
+///   * [`LanguageCode::all`]
+///   * `crate::voice::typecast_interp::lang_to_typecast_iso3`
+///   * `crate::voice::voice_messages` (defaults to English fallback
+///     for unknown variants — see that module for the small set
+///     with native translations)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LanguageCode {
-    // East Asia
+    // ── East Asia ──
     Ko,   // Korean
     Ja,   // Japanese
     Zh,   // Chinese (Simplified)
     ZhTw, // Chinese (Traditional)
+    Mn,   // Mongolian (Cyrillic; the script-detector currently maps
+          //  Mongolian Cyrillic text to `Ru` because both share the
+          //  Cyrillic block — users on Mongolian should pick this
+          //  explicitly when starting a session)
 
-    // Southeast Asia
+    // ── Southeast Asia ──
     Th, // Thai
     Vi, // Vietnamese
     Id, // Indonesian
     Ms, // Malay
-    Tl, // Filipino/Tagalog
+    Tl, // Filipino / Tagalog
+    My, // Burmese / Myanmar
+    Km, // Khmer
+    Lo, // Lao
 
-    // South Asia
+    // ── South Asia ──
     Hi, // Hindi
+    Bn, // Bengali / Bangla
+    Ta, // Tamil
+    Te, // Telugu
+    Mr, // Marathi
+    Gu, // Gujarati
+    Kn, // Kannada
+    Ml, // Malayalam
+    Pa, // Punjabi (Gurmukhi)
+    Or, // Odia / Oriya
+    Si, // Sinhala
+    Ur, // Urdu (Arabic script — auto-detector returns `Ar`; pick
+        //  this explicitly for Urdu prompts)
+    Ne, // Nepali
+    Sd, // Sindhi
 
-    // Europe (Western)
+    // ── Europe (Western, Latin script) ──
     En, // English
     Es, // Spanish
     Fr, // French
@@ -42,30 +97,101 @@ pub enum LanguageCode {
     Cs, // Czech
     Sv, // Swedish
     Da, // Danish
+    No, // Norwegian (Bokmål; `nb` callers map here)
+    Fi, // Finnish
+    Is, // Icelandic
+    Ga, // Irish (Gaeilge)
+    Cy, // Welsh
+    Mt, // Maltese
+    Eu, // Basque (Euskara)
+    Ca, // Catalan
+    Gl, // Galician
 
-    // Eastern Europe
+    // ── Europe (Central / Southeastern, Latin script) ──
+    Hu, // Hungarian
+    Ro, // Romanian
+    Sk, // Slovak
+    Sl, // Slovene / Slovenian
+    Hr, // Croatian
+    Sr, // Serbian (auto-detector returns `Ru` for Cyrillic Serbian;
+        //  pick this explicitly for either Latin or Cyrillic Serbian)
+    Bs, // Bosnian
+    Sq, // Albanian
+    Et, // Estonian
+    Lv, // Latvian
+    Lt, // Lithuanian
+
+    // ── Europe (East Slavic, Cyrillic) ──
     Ru, // Russian
     Uk, // Ukrainian
-    Tr, // Turkish
+    Be, // Belarusian
+    Bg, // Bulgarian
+    Mk, // Macedonian
 
-    // Middle East
+    // ── Europe (other scripts) ──
+    El, // Greek
+    Hy, // Armenian
+    Ka, // Georgian
+    Tr, // Turkish (Latin since 1928 — auto-detector cannot
+        //  distinguish from other Latin scripts)
+
+    // ── Middle East ──
     Ar, // Arabic
+    He, // Hebrew
+    Fa, // Persian / Farsi (Arabic script)
+
+    // ── Central Asia ──
+    Kk, // Kazakh
+    Uz, // Uzbek
+    Az, // Azerbaijani
+
+    // ── Africa ──
+    Sw, // Swahili
+    Am, // Amharic
+    Yo, // Yoruba
+    Ha, // Hausa
+    Zu, // Zulu
+    Af, // Afrikaans
+    So, // Somali
 }
 
 impl LanguageCode {
-    /// Get the ISO 639-1 code string.
+    /// Get the ISO 639-1 code string. Stable wire format — channel,
+    /// gateway, and Tauri client all serialize the language as this
+    /// string and parse it back via [`LanguageCode::from_str_code`].
     pub fn as_str(self) -> &'static str {
         match self {
+            // East Asia
             Self::Ko => "ko",
             Self::Ja => "ja",
             Self::Zh => "zh",
             Self::ZhTw => "zh-TW",
+            Self::Mn => "mn",
+            // Southeast Asia
             Self::Th => "th",
             Self::Vi => "vi",
             Self::Id => "id",
             Self::Ms => "ms",
             Self::Tl => "tl",
+            Self::My => "my",
+            Self::Km => "km",
+            Self::Lo => "lo",
+            // South Asia
             Self::Hi => "hi",
+            Self::Bn => "bn",
+            Self::Ta => "ta",
+            Self::Te => "te",
+            Self::Mr => "mr",
+            Self::Gu => "gu",
+            Self::Kn => "kn",
+            Self::Ml => "ml",
+            Self::Pa => "pa",
+            Self::Or => "or",
+            Self::Si => "si",
+            Self::Ur => "ur",
+            Self::Ne => "ne",
+            Self::Sd => "sd",
+            // Europe — Western Latin
             Self::En => "en",
             Self::Es => "es",
             Self::Fr => "fr",
@@ -77,26 +203,93 @@ impl LanguageCode {
             Self::Cs => "cs",
             Self::Sv => "sv",
             Self::Da => "da",
+            Self::No => "no",
+            Self::Fi => "fi",
+            Self::Is => "is",
+            Self::Ga => "ga",
+            Self::Cy => "cy",
+            Self::Mt => "mt",
+            Self::Eu => "eu",
+            Self::Ca => "ca",
+            Self::Gl => "gl",
+            // Europe — Central / Southeastern Latin
+            Self::Hu => "hu",
+            Self::Ro => "ro",
+            Self::Sk => "sk",
+            Self::Sl => "sl",
+            Self::Hr => "hr",
+            Self::Sr => "sr",
+            Self::Bs => "bs",
+            Self::Sq => "sq",
+            Self::Et => "et",
+            Self::Lv => "lv",
+            Self::Lt => "lt",
+            // Europe — East Slavic Cyrillic
             Self::Ru => "ru",
             Self::Uk => "uk",
+            Self::Be => "be",
+            Self::Bg => "bg",
+            Self::Mk => "mk",
+            // Europe — other scripts
+            Self::El => "el",
+            Self::Hy => "hy",
+            Self::Ka => "ka",
             Self::Tr => "tr",
+            // Middle East
             Self::Ar => "ar",
+            Self::He => "he",
+            Self::Fa => "fa",
+            // Central Asia
+            Self::Kk => "kk",
+            Self::Uz => "uz",
+            Self::Az => "az",
+            // Africa
+            Self::Sw => "sw",
+            Self::Am => "am",
+            Self::Yo => "yo",
+            Self::Ha => "ha",
+            Self::Zu => "zu",
+            Self::Af => "af",
+            Self::So => "so",
         }
     }
 
-    /// Get the human-readable language name.
+    /// Get the human-readable language name. Stable English label
+    /// for logging / debugging; the user-facing UI should localize
+    /// from `as_str()` instead.
     pub fn display_name(self) -> &'static str {
         match self {
+            // East Asia
             Self::Ko => "Korean",
             Self::Ja => "Japanese",
             Self::Zh => "Chinese (Simplified)",
             Self::ZhTw => "Chinese (Traditional)",
+            Self::Mn => "Mongolian",
+            // Southeast Asia
             Self::Th => "Thai",
             Self::Vi => "Vietnamese",
             Self::Id => "Indonesian",
             Self::Ms => "Malay",
             Self::Tl => "Filipino",
+            Self::My => "Burmese",
+            Self::Km => "Khmer",
+            Self::Lo => "Lao",
+            // South Asia
             Self::Hi => "Hindi",
+            Self::Bn => "Bengali",
+            Self::Ta => "Tamil",
+            Self::Te => "Telugu",
+            Self::Mr => "Marathi",
+            Self::Gu => "Gujarati",
+            Self::Kn => "Kannada",
+            Self::Ml => "Malayalam",
+            Self::Pa => "Punjabi",
+            Self::Or => "Odia",
+            Self::Si => "Sinhala",
+            Self::Ur => "Urdu",
+            Self::Ne => "Nepali",
+            Self::Sd => "Sindhi",
+            // Europe — Western Latin
             Self::En => "English",
             Self::Es => "Spanish",
             Self::Fr => "French",
@@ -108,26 +301,94 @@ impl LanguageCode {
             Self::Cs => "Czech",
             Self::Sv => "Swedish",
             Self::Da => "Danish",
+            Self::No => "Norwegian",
+            Self::Fi => "Finnish",
+            Self::Is => "Icelandic",
+            Self::Ga => "Irish",
+            Self::Cy => "Welsh",
+            Self::Mt => "Maltese",
+            Self::Eu => "Basque",
+            Self::Ca => "Catalan",
+            Self::Gl => "Galician",
+            // Europe — Central / Southeastern Latin
+            Self::Hu => "Hungarian",
+            Self::Ro => "Romanian",
+            Self::Sk => "Slovak",
+            Self::Sl => "Slovenian",
+            Self::Hr => "Croatian",
+            Self::Sr => "Serbian",
+            Self::Bs => "Bosnian",
+            Self::Sq => "Albanian",
+            Self::Et => "Estonian",
+            Self::Lv => "Latvian",
+            Self::Lt => "Lithuanian",
+            // Europe — East Slavic Cyrillic
             Self::Ru => "Russian",
             Self::Uk => "Ukrainian",
+            Self::Be => "Belarusian",
+            Self::Bg => "Bulgarian",
+            Self::Mk => "Macedonian",
+            // Europe — other scripts
+            Self::El => "Greek",
+            Self::Hy => "Armenian",
+            Self::Ka => "Georgian",
             Self::Tr => "Turkish",
+            // Middle East
             Self::Ar => "Arabic",
+            Self::He => "Hebrew",
+            Self::Fa => "Persian",
+            // Central Asia
+            Self::Kk => "Kazakh",
+            Self::Uz => "Uzbek",
+            Self::Az => "Azerbaijani",
+            // Africa
+            Self::Sw => "Swahili",
+            Self::Am => "Amharic",
+            Self::Yo => "Yoruba",
+            Self::Ha => "Hausa",
+            Self::Zu => "Zulu",
+            Self::Af => "Afrikaans",
+            Self::So => "Somali",
         }
     }
 
-    /// Parse from string code (case-insensitive).
+    /// Parse from string code (case-insensitive). Accepts ISO 639-1
+    /// shorts (`ko`, `ja`, …) plus a handful of common aliases
+    /// (`zh-tw`/`zh_tw`, `nb` → `No`, `iw` → `He`, `in` → `Id`,
+    /// `ji` → `Yo` is NOT done — Yoruba is `yo` only).
     pub fn from_str_code(code: &str) -> Option<Self> {
         match code.to_lowercase().as_str() {
+            // East Asia
             "ko" => Some(Self::Ko),
             "ja" => Some(Self::Ja),
-            "zh" => Some(Self::Zh),
-            "zh-tw" | "zh_tw" => Some(Self::ZhTw),
+            "zh" | "zh-cn" | "zh_cn" => Some(Self::Zh),
+            "zh-tw" | "zh_tw" | "zh-hant" => Some(Self::ZhTw),
+            "mn" => Some(Self::Mn),
+            // Southeast Asia
             "th" => Some(Self::Th),
             "vi" => Some(Self::Vi),
-            "id" => Some(Self::Id),
+            "id" | "in" => Some(Self::Id),
             "ms" => Some(Self::Ms),
-            "tl" => Some(Self::Tl),
+            "tl" | "fil" => Some(Self::Tl),
+            "my" => Some(Self::My),
+            "km" => Some(Self::Km),
+            "lo" => Some(Self::Lo),
+            // South Asia
             "hi" => Some(Self::Hi),
+            "bn" => Some(Self::Bn),
+            "ta" => Some(Self::Ta),
+            "te" => Some(Self::Te),
+            "mr" => Some(Self::Mr),
+            "gu" => Some(Self::Gu),
+            "kn" => Some(Self::Kn),
+            "ml" => Some(Self::Ml),
+            "pa" => Some(Self::Pa),
+            "or" => Some(Self::Or),
+            "si" => Some(Self::Si),
+            "ur" => Some(Self::Ur),
+            "ne" => Some(Self::Ne),
+            "sd" => Some(Self::Sd),
+            // Europe — Western Latin
             "en" => Some(Self::En),
             "es" => Some(Self::Es),
             "fr" => Some(Self::Fr),
@@ -139,27 +400,94 @@ impl LanguageCode {
             "cs" => Some(Self::Cs),
             "sv" => Some(Self::Sv),
             "da" => Some(Self::Da),
+            "no" | "nb" | "nn" => Some(Self::No),
+            "fi" => Some(Self::Fi),
+            "is" => Some(Self::Is),
+            "ga" => Some(Self::Ga),
+            "cy" => Some(Self::Cy),
+            "mt" => Some(Self::Mt),
+            "eu" => Some(Self::Eu),
+            "ca" => Some(Self::Ca),
+            "gl" => Some(Self::Gl),
+            // Europe — Central / Southeastern Latin
+            "hu" => Some(Self::Hu),
+            "ro" => Some(Self::Ro),
+            "sk" => Some(Self::Sk),
+            "sl" => Some(Self::Sl),
+            "hr" => Some(Self::Hr),
+            "sr" => Some(Self::Sr),
+            "bs" => Some(Self::Bs),
+            "sq" => Some(Self::Sq),
+            "et" => Some(Self::Et),
+            "lv" => Some(Self::Lv),
+            "lt" => Some(Self::Lt),
+            // Europe — East Slavic Cyrillic
             "ru" => Some(Self::Ru),
             "uk" => Some(Self::Uk),
+            "be" => Some(Self::Be),
+            "bg" => Some(Self::Bg),
+            "mk" => Some(Self::Mk),
+            // Europe — other scripts
+            "el" => Some(Self::El),
+            "hy" => Some(Self::Hy),
+            "ka" => Some(Self::Ka),
             "tr" => Some(Self::Tr),
+            // Middle East
             "ar" => Some(Self::Ar),
+            "he" | "iw" => Some(Self::He),
+            "fa" => Some(Self::Fa),
+            // Central Asia
+            "kk" => Some(Self::Kk),
+            "uz" => Some(Self::Uz),
+            "az" => Some(Self::Az),
+            // Africa
+            "sw" => Some(Self::Sw),
+            "am" => Some(Self::Am),
+            "yo" => Some(Self::Yo),
+            "ha" => Some(Self::Ha),
+            "zu" => Some(Self::Zu),
+            "af" => Some(Self::Af),
+            "so" => Some(Self::So),
             _ => None,
         }
     }
 
-    /// Return all 25 supported language codes.
+    /// Return every supported language code, in stable order matching
+    /// the variant declaration. Used by tests to enforce coverage of
+    /// each enum arm in helper functions.
     pub fn all() -> &'static [LanguageCode] {
         &[
+            // East Asia
             Self::Ko,
             Self::Ja,
             Self::Zh,
             Self::ZhTw,
+            Self::Mn,
+            // Southeast Asia
             Self::Th,
             Self::Vi,
             Self::Id,
             Self::Ms,
             Self::Tl,
+            Self::My,
+            Self::Km,
+            Self::Lo,
+            // South Asia
             Self::Hi,
+            Self::Bn,
+            Self::Ta,
+            Self::Te,
+            Self::Mr,
+            Self::Gu,
+            Self::Kn,
+            Self::Ml,
+            Self::Pa,
+            Self::Or,
+            Self::Si,
+            Self::Ur,
+            Self::Ne,
+            Self::Sd,
+            // Europe — Western Latin
             Self::En,
             Self::Es,
             Self::Fr,
@@ -171,10 +499,54 @@ impl LanguageCode {
             Self::Cs,
             Self::Sv,
             Self::Da,
+            Self::No,
+            Self::Fi,
+            Self::Is,
+            Self::Ga,
+            Self::Cy,
+            Self::Mt,
+            Self::Eu,
+            Self::Ca,
+            Self::Gl,
+            // Europe — Central / Southeastern Latin
+            Self::Hu,
+            Self::Ro,
+            Self::Sk,
+            Self::Sl,
+            Self::Hr,
+            Self::Sr,
+            Self::Bs,
+            Self::Sq,
+            Self::Et,
+            Self::Lv,
+            Self::Lt,
+            // Europe — East Slavic Cyrillic
             Self::Ru,
             Self::Uk,
+            Self::Be,
+            Self::Bg,
+            Self::Mk,
+            // Europe — other scripts
+            Self::El,
+            Self::Hy,
+            Self::Ka,
             Self::Tr,
+            // Middle East
             Self::Ar,
+            Self::He,
+            Self::Fa,
+            // Central Asia
+            Self::Kk,
+            Self::Uz,
+            Self::Az,
+            // Africa
+            Self::Sw,
+            Self::Am,
+            Self::Yo,
+            Self::Ha,
+            Self::Zu,
+            Self::Af,
+            Self::So,
         ]
     }
 }
@@ -183,7 +555,23 @@ impl LanguageCode {
 
 /// Detect the most likely language from text using Unicode character ranges.
 ///
-/// Falls back to the specified default language if detection is inconclusive.
+/// Auto-detection only resolves languages with a distinct script
+/// (Hangul → Ko, Hiragana/Katakana → Ja, CJK → Zh, Devanagari → Hi,
+/// Bengali → Bn, Tamil → Ta, Hebrew → He, Greek → El, …). Latin-script
+/// languages and Cyrillic-script non-Russian languages cannot be
+/// distinguished from each other by script alone — the function
+/// returns `default` for those, and the caller is expected to honor
+/// the user's explicit language selection.
+///
+/// Caveats worth remembering when reading the call sites:
+///   * Mongolian written in Cyrillic returns `Ru` here.
+///   * Serbian written in Cyrillic returns `Ru` too.
+///   * Urdu (Arabic script) and Persian both return `Ar`.
+/// The voice-chat self-validation pipeline uses the detected language
+/// to pick the right re-ask phrasing — those mis-attributions will
+/// land the user on the Russian / Arabic re-ask string. That is wrong
+/// in the strict sense, but better than no re-ask, and the user can
+/// override by explicitly setting source_language in the session.
 pub fn detect_language(text: &str, default: LanguageCode) -> LanguageCode {
     if text.is_empty() {
         return default;
@@ -196,6 +584,22 @@ pub fn detect_language(text: &str, default: LanguageCode) -> LanguageCode {
     let mut thai = 0u32;
     let mut devanagari = 0u32;
     let mut cyrillic = 0u32;
+    let mut hebrew = 0u32;
+    let mut greek = 0u32;
+    let mut armenian = 0u32;
+    let mut georgian = 0u32;
+    let mut bengali = 0u32;
+    let mut gurmukhi = 0u32;
+    let mut gujarati = 0u32;
+    let mut tamil = 0u32;
+    let mut telugu = 0u32;
+    let mut kannada = 0u32;
+    let mut malayalam = 0u32;
+    let mut sinhala = 0u32;
+    let mut burmese = 0u32;
+    let mut khmer = 0u32;
+    let mut lao = 0u32;
+    let mut ethiopic = 0u32;
     let mut total = 0u32;
 
     for c in text.chars() {
@@ -205,20 +609,47 @@ pub fn detect_language(text: &str, default: LanguageCode) -> LanguageCode {
         total += 1;
 
         match c as u32 {
-            // Hangul Syllables + Jamo
+            // ── Existing scripts (unchanged 2026-04 behavior) ──
             0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F => hangul += 1,
-            // Hiragana + Katakana
             0x3040..=0x309F | 0x30A0..=0x30FF | 0x31F0..=0x31FF => kana += 1,
-            // CJK Unified Ideographs
             0x4E00..=0x9FFF | 0x3400..=0x4DBF => cjk += 1,
-            // Arabic
             0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF => arabic += 1,
-            // Thai
             0x0E00..=0x0E7F => thai += 1,
-            // Devanagari (Hindi)
             0x0900..=0x097F => devanagari += 1,
-            // Cyrillic
             0x0400..=0x052F => cyrillic += 1,
+            // ── New scripts (2026-05 expansion) ──
+            // Hebrew
+            0x0590..=0x05FF => hebrew += 1,
+            // Greek + Coptic
+            0x0370..=0x03FF | 0x1F00..=0x1FFF => greek += 1,
+            // Armenian
+            0x0530..=0x058F => armenian += 1,
+            // Georgian (modern Mkhedruli + Mtavruli)
+            0x10A0..=0x10FF | 0x1C90..=0x1CBF | 0x2D00..=0x2D2F => georgian += 1,
+            // Bengali / Bangla
+            0x0980..=0x09FF => bengali += 1,
+            // Gurmukhi (Punjabi)
+            0x0A00..=0x0A7F => gurmukhi += 1,
+            // Gujarati
+            0x0A80..=0x0AFF => gujarati += 1,
+            // Tamil
+            0x0B80..=0x0BFF => tamil += 1,
+            // Telugu
+            0x0C00..=0x0C7F => telugu += 1,
+            // Kannada
+            0x0C80..=0x0CFF => kannada += 1,
+            // Malayalam
+            0x0D00..=0x0D7F => malayalam += 1,
+            // Sinhala
+            0x0D80..=0x0DFF => sinhala += 1,
+            // Burmese / Myanmar
+            0x1000..=0x109F | 0xAA60..=0xAA7F | 0xA9E0..=0xA9FF => burmese += 1,
+            // Khmer
+            0x1780..=0x17FF | 0x19E0..=0x19FF => khmer += 1,
+            // Lao
+            0x0E80..=0x0EFF => lao += 1,
+            // Ethiopic (Amharic + Tigrinya etc.)
+            0x1200..=0x137F | 0x1380..=0x139F | 0x2D80..=0x2DDF | 0xAB00..=0xAB2F => ethiopic += 1,
             _ => {}
         }
     }
@@ -227,30 +658,93 @@ pub fn detect_language(text: &str, default: LanguageCode) -> LanguageCode {
         return default;
     }
 
-    // Require at least 20% of non-space chars to match a script
+    // Require at least 20% of non-space chars to match a script.
     let threshold = total / 5;
 
+    // Order matters: the most distinctive scripts first, then the
+    // ambiguous catch-alls (CJK without kana, Cyrillic). A single
+    // pass of `if x > threshold { return … }` is fine because no
+    // text mixes multiple scripts at >20% each in practice.
+
+    // East Asia
     if hangul > threshold {
         return LanguageCode::Ko;
     }
     if kana > threshold {
         return LanguageCode::Ja;
     }
-    // CJK without kana → Chinese (Simplified by default)
     if cjk > threshold && kana == 0 {
         return LanguageCode::Zh;
     }
-    if arabic > threshold {
-        return LanguageCode::Ar;
-    }
-    if thai > threshold {
-        return LanguageCode::Th;
-    }
+    // South Asia (script-distinct → unambiguous mapping)
     if devanagari > threshold {
         return LanguageCode::Hi;
     }
+    if bengali > threshold {
+        return LanguageCode::Bn;
+    }
+    if gurmukhi > threshold {
+        return LanguageCode::Pa;
+    }
+    if gujarati > threshold {
+        return LanguageCode::Gu;
+    }
+    if tamil > threshold {
+        return LanguageCode::Ta;
+    }
+    if telugu > threshold {
+        return LanguageCode::Te;
+    }
+    if kannada > threshold {
+        return LanguageCode::Kn;
+    }
+    if malayalam > threshold {
+        return LanguageCode::Ml;
+    }
+    if sinhala > threshold {
+        return LanguageCode::Si;
+    }
+    // Southeast Asia (script-distinct)
+    if thai > threshold {
+        return LanguageCode::Th;
+    }
+    if burmese > threshold {
+        return LanguageCode::My;
+    }
+    if khmer > threshold {
+        return LanguageCode::Km;
+    }
+    if lao > threshold {
+        return LanguageCode::Lo;
+    }
+    // Middle East
+    if hebrew > threshold {
+        return LanguageCode::He;
+    }
+    if arabic > threshold {
+        // Catches Arabic, Urdu, Persian — re-ask layer accepts the
+        // mis-attribution to Ar (see function-level docs).
+        return LanguageCode::Ar;
+    }
+    // Caucasus
+    if armenian > threshold {
+        return LanguageCode::Hy;
+    }
+    if georgian > threshold {
+        return LanguageCode::Ka;
+    }
+    // Europe — non-Latin scripts
+    if greek > threshold {
+        return LanguageCode::El;
+    }
     if cyrillic > threshold {
+        // Mongolian, Serbian-in-Cyrillic etc. all return Ru here;
+        // see function-level docs for the explicit override path.
         return LanguageCode::Ru;
+    }
+    // Africa
+    if ethiopic > threshold {
+        return LanguageCode::Am;
     }
 
     default
@@ -1005,7 +1499,16 @@ mod tests {
 
     #[test]
     fn language_code_count() {
-        assert_eq!(LanguageCode::all().len(), 25);
+        // Updated 2026-05: 25 -> 80 (expansion to cover South-Asian
+        // scripts, Hebrew/Greek/Armenian/Georgian, Burmese/Khmer/Lao,
+        // and the long tail of Latin-script European + Central Asian
+        // + African languages). If you add a new variant, bump this
+        // number and add a matching arm in `as_str` / `display_name`
+        // / `from_str_code` / `lang_to_typecast_iso3`
+        // (typecast_interp.rs) / `language_code_to_deepgram`
+        // (deepgram_stt.rs); the build will refuse to compile until
+        // you do.
+        assert_eq!(LanguageCode::all().len(), 80);
     }
 
     #[test]
@@ -1090,6 +1593,255 @@ mod tests {
             detect_language("hello world", LanguageCode::En),
             LanguageCode::En
         );
+    }
+
+    // ── 2026-05 expansion: new script detection coverage ──
+
+    #[test]
+    fn detect_bengali() {
+        // "Hello world" in Bengali.
+        assert_eq!(
+            detect_language("ওহে বিশ্ব", LanguageCode::En),
+            LanguageCode::Bn
+        );
+    }
+
+    #[test]
+    fn detect_tamil() {
+        assert_eq!(
+            detect_language("வணக்கம் உலகம்", LanguageCode::En),
+            LanguageCode::Ta
+        );
+    }
+
+    #[test]
+    fn detect_telugu() {
+        assert_eq!(
+            detect_language("హలో ప్రపంచం", LanguageCode::En),
+            LanguageCode::Te
+        );
+    }
+
+    #[test]
+    fn detect_hebrew() {
+        assert_eq!(
+            detect_language("שלום עולם", LanguageCode::En),
+            LanguageCode::He
+        );
+    }
+
+    #[test]
+    fn detect_greek() {
+        assert_eq!(
+            detect_language("Γεια σου κόσμε", LanguageCode::En),
+            LanguageCode::El
+        );
+    }
+
+    #[test]
+    fn detect_armenian() {
+        assert_eq!(
+            detect_language("Բարեւ աշխարհ", LanguageCode::En),
+            LanguageCode::Hy
+        );
+    }
+
+    #[test]
+    fn detect_georgian() {
+        assert_eq!(
+            detect_language("გამარჯობა მსოფლიო", LanguageCode::En),
+            LanguageCode::Ka
+        );
+    }
+
+    #[test]
+    fn detect_burmese() {
+        assert_eq!(
+            detect_language("မင်္ဂလာပါ ကမ္ဘာ", LanguageCode::En),
+            LanguageCode::My
+        );
+    }
+
+    #[test]
+    fn detect_khmer() {
+        assert_eq!(
+            detect_language("សួស្ដី ពិភពលោក", LanguageCode::En),
+            LanguageCode::Km
+        );
+    }
+
+    #[test]
+    fn detect_lao() {
+        assert_eq!(
+            detect_language("ສະບາຍດີ ໂລກ", LanguageCode::En),
+            LanguageCode::Lo
+        );
+    }
+
+    #[test]
+    fn detect_amharic_via_ethiopic_script() {
+        // "Hello world" in Amharic (Ge'ez script).
+        assert_eq!(
+            detect_language("ሰላም ዓለም", LanguageCode::En),
+            LanguageCode::Am
+        );
+    }
+
+    #[test]
+    fn detect_sinhala() {
+        assert_eq!(
+            detect_language("ආයුබෝවන් ලෝකය", LanguageCode::En),
+            LanguageCode::Si
+        );
+    }
+
+    #[test]
+    fn detect_punjabi_gurmukhi() {
+        // Hello in Punjabi (Gurmukhi script). The script is unambiguous,
+        // so this resolves to Pa rather than falling back to default.
+        assert_eq!(
+            detect_language("ਸਤ ਸ੍ਰੀ ਅਕਾਲ ਦੁਨੀਆ", LanguageCode::En),
+            LanguageCode::Pa
+        );
+    }
+
+    #[test]
+    fn detect_gujarati() {
+        assert_eq!(
+            detect_language("હેલો વર્લ્ડ", LanguageCode::En),
+            LanguageCode::Gu
+        );
+    }
+
+    #[test]
+    fn detect_kannada() {
+        assert_eq!(
+            detect_language("ಹಲೋ ಜಗತ್ತು", LanguageCode::En),
+            LanguageCode::Kn
+        );
+    }
+
+    #[test]
+    fn detect_malayalam() {
+        assert_eq!(
+            detect_language("ഹലോ ലോകം", LanguageCode::En),
+            LanguageCode::Ml
+        );
+    }
+
+    // ── Documented limitations: confirm we still return the expected
+    //    fallback behavior so future readers can see what's intentional.
+    //    Each of these would ideally resolve to a different language,
+    //    but distinguishing requires per-language script-free analysis
+    //    and is out of scope for the Unicode-range detector.
+
+    #[test]
+    fn detect_mongolian_cyrillic_resolves_to_russian_documented_limitation() {
+        // Mongolian text written in Cyrillic — the detector can't
+        // distinguish from Russian by script alone. Documented in
+        // the function's doc comment.
+        assert_eq!(
+            detect_language("Сайн байна уу дэлхий", LanguageCode::En),
+            LanguageCode::Ru
+        );
+    }
+
+    #[test]
+    fn detect_urdu_resolves_to_arabic_documented_limitation() {
+        // Urdu text — Arabic script — resolves to Ar. Documented.
+        assert_eq!(
+            detect_language("ہیلو دنیا", LanguageCode::En),
+            LanguageCode::Ar
+        );
+    }
+
+    // ── Coverage harness across new variants ──
+
+    #[test]
+    fn language_code_all_new_variants_round_trip_through_str() {
+        // Belt and suspenders: every variant in `all()` must round-trip
+        // through `as_str()` -> `from_str_code()`. The 25 original
+        // variants already had this test (`language_code_roundtrip`);
+        // this duplicates it specifically for the variants the 2026-05
+        // expansion added so a later edit to the new arms shows up
+        // here rather than in the catch-all roundtrip.
+        for lang in [
+            LanguageCode::Mn,
+            LanguageCode::My,
+            LanguageCode::Km,
+            LanguageCode::Lo,
+            LanguageCode::Bn,
+            LanguageCode::Ta,
+            LanguageCode::Te,
+            LanguageCode::Mr,
+            LanguageCode::Gu,
+            LanguageCode::Kn,
+            LanguageCode::Ml,
+            LanguageCode::Pa,
+            LanguageCode::Or,
+            LanguageCode::Si,
+            LanguageCode::Ur,
+            LanguageCode::Ne,
+            LanguageCode::Sd,
+            LanguageCode::No,
+            LanguageCode::Fi,
+            LanguageCode::Is,
+            LanguageCode::Ga,
+            LanguageCode::Cy,
+            LanguageCode::Mt,
+            LanguageCode::Eu,
+            LanguageCode::Ca,
+            LanguageCode::Gl,
+            LanguageCode::Hu,
+            LanguageCode::Ro,
+            LanguageCode::Sk,
+            LanguageCode::Sl,
+            LanguageCode::Hr,
+            LanguageCode::Sr,
+            LanguageCode::Bs,
+            LanguageCode::Sq,
+            LanguageCode::Et,
+            LanguageCode::Lv,
+            LanguageCode::Lt,
+            LanguageCode::Be,
+            LanguageCode::Bg,
+            LanguageCode::Mk,
+            LanguageCode::El,
+            LanguageCode::Hy,
+            LanguageCode::Ka,
+            LanguageCode::He,
+            LanguageCode::Fa,
+            LanguageCode::Kk,
+            LanguageCode::Uz,
+            LanguageCode::Az,
+            LanguageCode::Sw,
+            LanguageCode::Am,
+            LanguageCode::Yo,
+            LanguageCode::Ha,
+            LanguageCode::Zu,
+            LanguageCode::Af,
+            LanguageCode::So,
+        ] {
+            let code = lang.as_str();
+            assert_eq!(
+                LanguageCode::from_str_code(code),
+                Some(lang),
+                "round-trip failed for {code}",
+            );
+        }
+    }
+
+    #[test]
+    fn from_str_code_handles_common_aliases() {
+        assert_eq!(LanguageCode::from_str_code("nb"), Some(LanguageCode::No));
+        assert_eq!(LanguageCode::from_str_code("nn"), Some(LanguageCode::No));
+        assert_eq!(LanguageCode::from_str_code("iw"), Some(LanguageCode::He));
+        assert_eq!(LanguageCode::from_str_code("in"), Some(LanguageCode::Id));
+        assert_eq!(
+            LanguageCode::from_str_code("zh-cn"),
+            Some(LanguageCode::Zh)
+        );
+        assert_eq!(LanguageCode::from_str_code("fil"), Some(LanguageCode::Tl));
     }
 
     #[test]

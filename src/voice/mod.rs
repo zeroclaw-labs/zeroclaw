@@ -5,7 +5,10 @@
 //!
 //! ## Design
 //! - Trait-driven voice provider abstraction (`VoiceProvider`)
-//! - 25-language support with Unicode-based language detection
+//! - 75-language support with Unicode-based script detection (the
+//!   25-language original set was extended in 2026-05; see
+//!   `pipeline::LanguageCode` for the full list and the per-script
+//!   detection coverage)
 //! - Bidirectional interpretation mode (A <-> B language auto-switch)
 //! - Formality levels (formal / neutral / casual)
 //! - Domain specialization (general / business / medical / legal / technical)
@@ -33,6 +36,7 @@ pub mod tts_engine;
 pub mod tts_router;
 pub mod typecast_interp;
 pub mod voice_chat_pipeline;
+pub mod voice_messages;
 
 // ── Shared voice event type ──────────────────────────────────────
 
@@ -87,4 +91,8 @@ pub use typecast_interp::{
 pub use voice_chat_pipeline::{
     LatencyBreakdown, QueryRoute, SttResult, ValidationResult, VoiceChatPipeline,
     VoiceChatResponse,
+};
+#[allow(unused_imports)]
+pub use voice_messages::{
+    ask_user_to_repeat, confirm_interpretation_fallback, confirm_interpretation_prefix,
 };
