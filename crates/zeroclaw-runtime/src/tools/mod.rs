@@ -528,6 +528,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(WebSearchTool::new_with_config(
             root_config.web_search.provider.clone(),
             root_config.web_search.brave_api_key.clone(),
+            root_config.web_search.tavily_api_key.clone(),
             root_config.web_search.searxng_instance_url.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,

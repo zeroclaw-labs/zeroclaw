@@ -83,6 +83,7 @@
 - [STM32 Nucleo](./hardware/nucleo-setup.md)
 - [Android](./hardware/android-setup.md)
 - [Aardvark](./hardware/aardvark.md)
+- [Raspberry Pi](./hardware/raspberry-pi-setup.md)
 
 # SOP (Standard Operating Procedures)
 
