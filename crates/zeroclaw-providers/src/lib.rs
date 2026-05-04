@@ -1113,6 +1113,19 @@ pub fn create_provider_with_url(
     create_provider_with_url_and_options(name, api_key, api_url, &ProviderRuntimeOptions::default())
 }
 
+/// Pick the effective xAI/Grok endpoint, honoring a configured `base_url`
+/// override (typically from `[providers.models.xai].base_url` or
+/// `[providers.models.grok].base_url`) and falling back to the public API.
+///
+/// Empty/whitespace-only overrides are treated as unset so a misconfigured
+/// `base_url = ""` doesn't silently route requests to nowhere.
+fn xai_base_url(configured: Option<&str>) -> &str {
+    configured
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .unwrap_or("https://api.x.ai")
+}
+
 /// Factory: create provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
 fn create_provider_with_url_and_options(
@@ -1423,7 +1436,7 @@ fn create_provider_with_url_and_options(
         ))),
         "xai" | "grok" => Ok(compat(OpenAiCompatibleProvider::new(
             "xAI",
-            "https://api.x.ai",
+            xai_base_url(api_url),
             key,
             AuthStyle::Bearer,
         ))),
@@ -4067,6 +4080,77 @@ mod tests {
         );
         assert_eq!(resolution.api_key.as_deref(), Some("xai-test"));
         assert_eq!(resolution.base_url.as_deref(), Some("https://api.x.ai/v1"));
+    }
+
+    // ── xai_base_url helper (Audacity88 follow-up on #6092) ──────────
+    //
+    // The `xai` / `grok` factory arm previously hardcoded `"https://api.x.ai"`
+    // and ignored its `api_url` parameter, so the resolver-level URL flow
+    // proved by `resolve_fallback_named_xai_alias_with_base_url_keeps_named_dispatch`
+    // never actually reached the constructed provider. The factory now reads
+    // through `xai_base_url`. The tests below cover the helper's contract
+    // directly because the factory returns `Box<dyn Provider>` (the trait
+    // does not surface `base_url`); guarding the helper guarantees the
+    // factory's URL pick is correct.
+
+    #[test]
+    fn xai_base_url_returns_default_when_none() {
+        assert_eq!(xai_base_url(None), "https://api.x.ai");
+    }
+
+    #[test]
+    fn xai_base_url_returns_default_when_empty_or_whitespace() {
+        assert_eq!(xai_base_url(Some("")), "https://api.x.ai");
+        assert_eq!(xai_base_url(Some("   ")), "https://api.x.ai");
+        assert_eq!(xai_base_url(Some("\t\n")), "https://api.x.ai");
+    }
+
+    #[test]
+    fn xai_base_url_honors_configured_override() {
+        assert_eq!(
+            xai_base_url(Some("https://my-proxy.example.com/x")),
+            "https://my-proxy.example.com/x",
+            "configured `[providers.models.xai].base_url` must override the public default"
+        );
+    }
+
+    #[test]
+    fn xai_base_url_trims_whitespace_around_override() {
+        assert_eq!(
+            xai_base_url(Some("  https://api.x.ai/v1  ")),
+            "https://api.x.ai/v1",
+            "leading/trailing whitespace in the override must be trimmed"
+        );
+    }
+
+    #[test]
+    fn create_provider_for_xai_with_base_url_does_not_error() {
+        // End-to-end: the factory consumes `api_url` for the xai/grok arm.
+        // We can't inspect the boxed provider's base_url through the trait,
+        // but we can prove the factory accepts the configured override and
+        // builds a provider — combined with the helper tests above this
+        // closes the URL-flow path Audacity88 flagged.
+        let provider = create_provider_with_url_and_options(
+            "xai",
+            Some("xai-key"),
+            Some("https://my-proxy.example.com/x"),
+            &ProviderRuntimeOptions::default(),
+        );
+        assert!(
+            provider.is_ok(),
+            "xai factory must accept a configured base_url"
+        );
+
+        let provider = create_provider_with_url_and_options(
+            "grok",
+            Some("xai-key"),
+            Some("https://my-proxy.example.com/x"),
+            &ProviderRuntimeOptions::default(),
+        );
+        assert!(
+            provider.is_ok(),
+            "grok alias must accept a configured base_url"
+        );
     }
 
     #[test]
