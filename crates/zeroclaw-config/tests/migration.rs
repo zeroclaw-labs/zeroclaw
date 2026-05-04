@@ -14,6 +14,7 @@ use zeroclaw_config::migration::{
     migrate_file, migrate_file_in_place, migrate_to_current,
 };
 use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::v2::V2Config;
 
 const V1_FIXTURE: &str = include_str!("fixtures/v1.toml");
 
@@ -26,6 +27,14 @@ fn v3_value() -> toml::Value {
         .expect("migrate_file succeeds")
         .expect("migration ran (V1 → V3)");
     toml::from_str(&migrated).expect("migrate_file output parses as TOML")
+}
+
+/// Run a V2-shape TOML literal through `V2Config::migrate()` directly. Used by
+/// V2→V3-only transform tests where threading data through a V1 fixture would
+/// fake a starting state that no real user ever wrote.
+fn migrate_v2(input: &str) -> toml::Value {
+    let v2: V2Config = toml::from_str(input).expect("V2 input parses as V2Config");
+    v2.migrate().expect("V2 → V3 migration succeeds")
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -96,30 +105,60 @@ fn v1_default_provider_target_holds_globals() {
 }
 
 #[test]
-fn v1_model_providers_alias_wrapped() {
-    let cfg = v3_config();
-    let anth = cfg
-        .providers
-        .models
-        .get("anthropic")
-        .and_then(|m| m.get("default"))
-        .expect("anthropic.default present");
-    assert_eq!(anth.api_key.as_deref(), Some("sk-ant-v1-test"));
-    assert_eq!(anth.model.as_deref(), Some("claude-sonnet-4-5"));
+fn v2_model_providers_alias_wrapped() {
+    let v3 = migrate_v2(
+        r#"
+[providers.models.anthropic]
+api_key = "sk-ant-v2-test"
+model = "claude-sonnet-4-5"
+"#,
+    );
+    let anth = v3
+        .get("providers")
+        .and_then(toml::Value::as_table)
+        .and_then(|p| p.get("models"))
+        .and_then(toml::Value::as_table)
+        .and_then(|m| m.get("anthropic"))
+        .and_then(toml::Value::as_table)
+        .and_then(|a| a.get("default"))
+        .and_then(toml::Value::as_table)
+        .expect("providers.models.anthropic.default present after V2→V3");
+    assert_eq!(
+        anth.get("api_key").and_then(toml::Value::as_str),
+        Some("sk-ant-v2-test")
+    );
+    assert_eq!(
+        anth.get("model").and_then(toml::Value::as_str),
+        Some("claude-sonnet-4-5")
+    );
 }
 
 #[test]
 fn claude_code_folded_under_anthropic() {
-    let cfg = v3_config();
-    let cc = cfg
-        .providers
-        .models
+    let v3 = migrate_v2(
+        r#"
+[providers.models.claude-code]
+api_key = "sk-cc-v2-test"
+"#,
+    );
+    let providers_models = v3
+        .get("providers")
+        .and_then(toml::Value::as_table)
+        .and_then(|p| p.get("models"))
+        .and_then(toml::Value::as_table)
+        .expect("providers.models present after V2→V3");
+    let cc = providers_models
         .get("anthropic")
-        .and_then(|m| m.get("claude-code"))
-        .expect("claude-code folded under anthropic.claude-code");
-    assert_eq!(cc.api_key.as_deref(), Some("sk-cc-v1-test"));
+        .and_then(toml::Value::as_table)
+        .and_then(|a| a.get("claude-code"))
+        .and_then(toml::Value::as_table)
+        .expect("claude-code folded under providers.models.anthropic.claude-code");
+    assert_eq!(
+        cc.get("api_key").and_then(toml::Value::as_str),
+        Some("sk-cc-v2-test")
+    );
     assert!(
-        !cfg.providers.models.contains_key("claude-code"),
+        !providers_models.contains_key("claude-code"),
         "standalone claude-code provider must not appear in V3"
     );
 }
@@ -395,17 +434,31 @@ fn t9_memory_qdrant_promoted_to_storage() {
 
 #[test]
 fn t9_memory_postgres_vector_fields_promoted() {
-    let cfg = v3_config();
-    let pg = cfg
-        .storage
-        .postgres
-        .get("default")
+    let v3 = migrate_v2(
+        r#"
+[memory.postgres]
+vector_enabled = true
+vector_dimensions = 1536
+"#,
+    );
+    let pg = v3
+        .get("storage")
+        .and_then(toml::Value::as_table)
+        .and_then(|s| s.get("postgres"))
+        .and_then(toml::Value::as_table)
+        .and_then(|p| p.get("default"))
+        .and_then(toml::Value::as_table)
         .expect("[memory.postgres] vector fields promoted to [storage.postgres.default]");
-    assert!(
-        pg.vector_enabled,
+    assert_eq!(
+        pg.get("vector_enabled").and_then(toml::Value::as_bool),
+        Some(true),
         "V2 [memory.postgres] vector_enabled must land at V3 storage.postgres.default.vector_enabled"
     );
-    assert_eq!(pg.vector_dimensions, 1536);
+    assert_eq!(
+        pg.get("vector_dimensions")
+            .and_then(toml::Value::as_integer),
+        Some(1536)
+    );
 }
 
 #[test]
