@@ -707,7 +707,7 @@ export function getCatalogModels(provider: string): Promise<ModelsResponse> {
 // generated TS is committed — both are regenerated on every
 // `cargo web build` / `cargo web check`. tsc fails here if the
 // hand-maintained shapes below stop matching.
-// export type { paths as ApiPaths, components as ApiComponents } from './api-generated';
+export type { paths as ApiPaths, components as ApiComponents } from './api-generated';
 
 // ── Onboard sections + picker (mirrors the TUI flow) ────────────────
 
@@ -1030,25 +1030,5 @@ export function getCliTools(): Promise<CliTool[]> {
   return apiFetch<CliTool[] | { cli_tools: CliTool[] }>('/api/cli-tools').then((data) => {
     const result = unwrapField(data, 'cli_tools');
     return Array.isArray(result) ? result : [];
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Legacy whole-file config (backward compatibility)
-// ---------------------------------------------------------------------------
-
-/** @deprecated Use getProp/putProp or patchConfig for per-property access. */
-export function getConfig(): Promise<string> {
-  return apiFetch<string | { format?: string; content: string }>('/api/config').then((data) =>
-    typeof data === 'string' ? data : data.content,
-  );
-}
-
-/** @deprecated Use putProp or patchConfig for per-property updates. */
-export function putConfig(toml: string): Promise<void> {
-  return apiFetch<void>('/api/config', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/toml' },
-    body: toml,
   });
 }
