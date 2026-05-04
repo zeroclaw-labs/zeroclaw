@@ -140,12 +140,21 @@ pub fn migrate_to_current(input: &str) -> Result<Config> {
 }
 
 /// File-API wrapper: read disk config, migrate, write `<file>.backup`
-/// adjacent to the original *before* overwriting. Returns `Ok(None)` when
-/// already current.
+/// adjacent to the original, then atomically replace the original. Returns
+/// `Ok(None)` when already current.
 ///
 /// Backup file is `<config_filename>.backup` (joined cross-platform via
-/// `Path` ops). The backup is fsync'd to disk before the original is touched,
-/// so a partial overwrite is recoverable.
+/// `Path` ops). The write path mirrors `Config::save()` so the documented
+/// durability guarantee holds end-to-end (#6266 review):
+///
+/// 1. Write the migrated content to `<path>.tmp-<uuid>` and fsync it.
+/// 2. Copy the original to `<path>.backup` (existing behavior; recovery
+///    rope if anything later goes wrong).
+/// 3. `rename(<path>.tmp, <path>)` — atomic on Unix and on modern Windows.
+/// 4. Fsync the parent directory so the rename is durable.
+///
+/// On rename failure the temp file is removed and the backup is restored
+/// over the original so the operator never observes a partial write.
 pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config at {}", path.display()))?;
@@ -161,21 +170,60 @@ pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
         .and_then(|s| s.to_str())
         .with_context(|| format!("config path {} has no file name", path.display()))?;
     let backup_path = parent.join(format!("{file_name}.backup"));
+    let temp_path = parent.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
 
-    // Backup BEFORE touching original. Use copy so backup gets a fresh inode.
+    // 1. Write migrated content to temp + fsync.
+    {
+        let mut temp = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary migrated config at {}",
+                    temp_path.display()
+                )
+            })?;
+        std::io::Write::write_all(&mut temp, migrated.as_bytes()).with_context(|| {
+            format!("failed to write migrated config to {}", temp_path.display())
+        })?;
+        temp.sync_all().with_context(|| {
+            format!(
+                "failed to fsync temporary migrated config at {}",
+                temp_path.display()
+            )
+        })?;
+    }
+
+    // 2. Backup original BEFORE touching the destination. Copy gets a fresh inode.
     std::fs::copy(path, &backup_path).with_context(|| {
         format!(
-            "failed to write backup {} before migration",
-            backup_path.display()
+            "failed to write backup {} before migration (temp file intact at {})",
+            backup_path.display(),
+            temp_path.display(),
         )
     })?;
 
-    // Overwrite original with migrated content.
-    std::fs::write(path, migrated.as_bytes()).with_context(|| {
-        format!(
-            "failed to write migrated config to {} (backup intact at {})",
+    // 3. Atomic rename. On failure, restore from backup so the operator
+    //    never observes a partial write.
+    if let Err(rename_err) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        if backup_path.exists() {
+            let _ = std::fs::copy(&backup_path, path);
+        }
+        return Err(anyhow::anyhow!(
+            "failed to atomically replace {} with migrated config: {rename_err} \
+             (backup retained at {})",
             path.display(),
-            backup_path.display()
+            backup_path.display(),
+        ));
+    }
+
+    // 4. Fsync the parent directory so the rename is durable across crashes.
+    sync_directory(parent).with_context(|| {
+        format!(
+            "failed to fsync parent directory after migration: {}",
+            parent.display()
         )
     })?;
 
@@ -183,6 +231,27 @@ pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
         backup_path,
         to_version: CURRENT_SCHEMA_VERSION,
     }))
+}
+
+/// Fsync the directory entry so a subsequent rename inside it is durable.
+/// No-op on platforms where directory fsync isn't a meaningful primitive.
+#[allow(clippy::unused_async)] // kept sync to mirror Config::save()'s helper
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = std::fs::File::open(path)
+            .with_context(|| format!("failed to open directory for fsync: {}", path.display()))?;
+        dir.sync_all()
+            .with_context(|| format!("failed to fsync directory: {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Best-effort: open + drop. Windows doesn't provide a portable
+        // directory-fsync primitive in std; the rename itself is durable
+        // on NTFS.
+        let _ = std::fs::File::open(path);
+    }
+    Ok(())
 }
 
 /// Result of an on-disk migration. Returned by `migrate_file_in_place` when
@@ -396,5 +465,76 @@ mod tests {
     fn detect_version_string_errors() {
         let v: toml::Value = toml::from_str("schema_version = \"two\"\n").unwrap();
         assert!(detect_version(&v).is_err());
+    }
+
+    // ── migrate_file_in_place atomic-write semantics (#6266 review) ──
+
+    fn setup_temp_config_dir() -> tempfile::TempDir {
+        tempfile::TempDir::new().expect("temp dir")
+    }
+
+    #[test]
+    fn migrate_file_in_place_writes_backup_and_replaces_atomically() {
+        let dir = setup_temp_config_dir();
+        let path = dir.path().join("config.toml");
+        // Minimal V1 input (no schema_version) so migration runs.
+        std::fs::write(&path, "default_provider = \"openai\"\nfoo = 1\n").unwrap();
+
+        let report = migrate_file_in_place(&path)
+            .expect("migration succeeds")
+            .expect("migration ran (V1 input)");
+
+        // Backup retains the original content verbatim.
+        let backup = std::fs::read_to_string(&report.backup_path).unwrap();
+        assert!(
+            backup.contains("default_provider = \"openai\"") && backup.contains("foo = 1"),
+            "backup must contain the original V1 content; got: {backup}"
+        );
+
+        // Original is replaced with migrated content.
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            migrated.contains("schema_version"),
+            "migrated config must carry a schema_version line; got: {migrated}"
+        );
+
+        // No `<file>.tmp-*` files left behind in the parent.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".config.toml.tmp-")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp files must remain after a successful migration; got {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn migrate_file_in_place_noop_when_already_current() {
+        let dir = setup_temp_config_dir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!("schema_version = {CURRENT_SCHEMA_VERSION}\n"),
+        )
+        .unwrap();
+
+        let report = migrate_file_in_place(&path).expect("idempotent on current schema");
+        assert!(
+            report.is_none(),
+            "no migration should run when the file is already at CURRENT_SCHEMA_VERSION"
+        );
+        // No backup file should exist when the migration didn't run.
+        let backup = path.with_file_name("config.toml.backup");
+        assert!(
+            !backup.exists(),
+            "no `.backup` should be created on the no-op path; got {}",
+            backup.display()
+        );
     }
 }

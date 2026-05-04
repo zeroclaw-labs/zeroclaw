@@ -1208,18 +1208,89 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
 
     match migrated {
         Some(new_content) => {
+            // Atomic write path mirrors `Config::save()` and `migration::migrate_file_in_place`
+            // (#6266 review): write temp + fsync → backup → atomic rename → fsync directory.
+            // Without this sequence the documented durability guarantee on the comment above
+            // doesn't hold: a copy-then-write window leaves both the original and the new
+            // content vulnerable to power loss.
             let backup_path = config_path.with_extension("toml.bak");
+            let parent = match config_path.parent() {
+                Some(p) => p.to_path_buf(),
+                None => {
+                    return error_response(ConfigApiError::new(
+                        ConfigApiCode::InternalError,
+                        format!("config path has no parent: {}", config_path.display()),
+                    ));
+                }
+            };
+            let file_name = match config_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => {
+                    return error_response(ConfigApiError::new(
+                        ConfigApiCode::InternalError,
+                        format!("config path has no file name: {}", config_path.display()),
+                    ));
+                }
+            };
+            let temp_path = parent.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
+
+            // 1. Write migrated content to temp + fsync.
+            match tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp_path)
+                .await
+            {
+                Ok(mut temp) => {
+                    use tokio::io::AsyncWriteExt;
+                    if let Err(e) = temp.write_all(new_content.as_bytes()).await {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return error_response(ConfigApiError::new(
+                            ConfigApiCode::InternalError,
+                            format!("failed to write migrated config to temp: {e}"),
+                        ));
+                    }
+                    if let Err(e) = temp.sync_all().await {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return error_response(ConfigApiError::new(
+                            ConfigApiCode::InternalError,
+                            format!("failed to fsync migrated config temp: {e}"),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return error_response(ConfigApiError::new(
+                        ConfigApiCode::InternalError,
+                        format!("failed to create temp config file: {e}"),
+                    ));
+                }
+            }
+
+            // 2. Backup BEFORE replacing the original.
             if let Err(e) = tokio::fs::copy(&config_path, &backup_path).await {
+                let _ = tokio::fs::remove_file(&temp_path).await;
                 return error_response(ConfigApiError::new(
                     ConfigApiCode::InternalError,
                     format!("failed to write backup: {e}"),
                 ));
             }
-            if let Err(e) = tokio::fs::write(&config_path, &new_content).await {
+
+            // 3. Atomic rename. On failure, restore from backup.
+            if let Err(e) = tokio::fs::rename(&temp_path, &config_path).await {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                if backup_path.exists() {
+                    let _ = tokio::fs::copy(&backup_path, &config_path).await;
+                }
                 return error_response(ConfigApiError::new(
                     ConfigApiCode::InternalError,
-                    format!("failed to write migrated config: {e}"),
+                    format!("failed to atomically replace config: {e}"),
                 ));
+            }
+
+            // 4. Fsync the parent directory so the rename is durable.
+            #[cfg(unix)]
+            if let Ok(dir) = tokio::fs::File::open(&parent).await {
+                let _ = dir.sync_all().await;
             }
 
             // Re-read into memory so subsequent requests see the migrated state.
