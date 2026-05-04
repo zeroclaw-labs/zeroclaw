@@ -221,6 +221,48 @@ pub fn ensure_disk_at_current_version(path: &Path) -> Result<()> {
     );
 }
 
+/// Fold a `from_key: String` value into a `to_key: Vec<String>` array on the
+/// same table. Used for the singular→plural channel transforms (V1→V2:
+/// `matrix.room_id` → `allowed_rooms`, `slack.channel_id` → `channel_ids`;
+/// V2→V3: `discord.guild_id` → `guild_ids`, etc.).
+///
+/// - Removes `from_key` from the table.
+/// - If the value was a non-empty string, appends it to `to_key`'s array
+///   (creating the array if missing). Existing entries are preserved; the new
+///   value is deduplicated against current contents.
+/// - Empty strings, non-string types, and missing `from_key` are no-ops.
+///
+/// Returns `true` if a value was actually folded (caller may emit a log line).
+pub(crate) fn fold_string_into_array(
+    table: &mut toml::Table,
+    from_key: &str,
+    to_key: &str,
+) -> bool {
+    let value = match table.remove(from_key) {
+        Some(toml::Value::String(s)) if !s.is_empty() => s,
+        Some(other) => {
+            // Non-string: re-insert under from_key untouched (caller may handle).
+            table.insert(from_key.to_string(), other);
+            return false;
+        }
+        None => return false,
+    };
+    let entry = table
+        .entry(to_key.to_string())
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    if let Some(arr) = entry.as_array_mut() {
+        let already_present = arr.iter().any(|v| v.as_str() == Some(value.as_str()));
+        if !already_present {
+            arr.push(toml::Value::String(value));
+        }
+        true
+    } else {
+        // Existing to_key wasn't an array (unusual). Reinsert from_key as-is.
+        table.insert(from_key.to_string(), toml::Value::String(value));
+        false
+    }
+}
+
 /// Run the typed migration chain from `from` up to `CURRENT_SCHEMA_VERSION`.
 /// `from` must be < `CURRENT_SCHEMA_VERSION` (caller checks).
 fn run_chain(value: toml::Value, from: u32) -> Result<toml::Value> {

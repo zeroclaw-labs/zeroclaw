@@ -36,6 +36,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::migration::fold_string_into_array;
 use crate::schema::v2::V2Config;
 
 /// V1 partial typed lens. Anything not explicitly named flows through
@@ -158,9 +159,16 @@ impl V1Config {
             Some(toml::Value::Table(providers))
         };
 
-        // Rename channels_config → channels (passthrough into V2Config.passthrough,
-        // since V2Config doesn't model channels explicitly until V2→V3 step).
-        if let Some(channels_value) = channels_config {
+        // Rename channels_config → channels and apply V1→V2 nested folds:
+        //   T1: channels.matrix.room_id (String) → channels.matrix.allowed_rooms[]
+        //   T2: channels.slack.channel_id (Option<String>) → channels.slack.channel_ids[]
+        // V2 removed both singular fields. The transform only fires when the
+        // legacy field carries a non-empty string; missing/empty/non-string
+        // values are no-ops.
+        if let Some(mut channels_value) = channels_config {
+            if let Some(channels_table) = channels_value.as_table_mut() {
+                apply_v1_to_v2_channel_folds(channels_table);
+            }
             passthrough.insert("channels".to_string(), channels_value);
             tracing::info!(target: "migration", "channels_config → channels");
         }
@@ -221,5 +229,34 @@ impl V1Config {
         }
 
         v2
+    }
+}
+
+/// Apply V1→V2 nested folds to the channels table in place.
+///
+/// - **T1** `matrix.room_id: String` → `matrix.allowed_rooms: Vec<String>`.
+/// - **T2** `slack.channel_id: Option<String>` → `slack.channel_ids: Vec<String>`.
+///
+/// V2 removed both singular fields entirely; if we leave them on the table,
+/// V2 deserialization either drops them silently (data loss) or — once V3
+/// alias-wraps the channel — they become part of an unmodeled inner table
+/// where they'll never round-trip back. This pass moves them to their
+/// V2-canonical destinations before the V2 lens sees the data.
+fn apply_v1_to_v2_channel_folds(channels: &mut toml::Table) {
+    if let Some(toml::Value::Table(matrix)) = channels.get_mut("matrix")
+        && fold_string_into_array(matrix, "room_id", "allowed_rooms")
+    {
+        tracing::info!(
+            target: "migration",
+            "channels.matrix.room_id folded into channels.matrix.allowed_rooms[]"
+        );
+    }
+    if let Some(toml::Value::Table(slack)) = channels.get_mut("slack")
+        && fold_string_into_array(slack, "channel_id", "channel_ids")
+    {
+        tracing::info!(
+            target: "migration",
+            "channels.slack.channel_id folded into channels.slack.channel_ids[]"
+        );
     }
 }

@@ -156,6 +156,12 @@ impl V2Config {
             tracing::info!(target: "migration", "[autonomy] → [risk_profiles.default]");
         }
 
+        // 1a. T13: fold V2 [security.sandbox] and [security.resources] into
+        //     risk_profiles.default (V3 RiskProfileConfig absorbed both).
+        //     Runs AFTER autonomy fold so the synthesized profile already
+        //     exists and we just enrich it with sandbox/resource fields.
+        fold_security_into_risk_profile(&mut passthrough);
+
         // 2. agent → runtime_profiles.default
         if let Some(agent_value) = agent {
             let mut runtime_profiles = passthrough
@@ -193,6 +199,20 @@ impl V2Config {
             tracing::info!(target: "migration", "[cron] restructured into [cron.<alias>] + [scheduler]");
         }
 
+        // 4a. T12: drop V2 reliability fallback fields (provider fallback
+        //     was eradicated in V3 per `f8c66f1dd`). Reliability block
+        //     itself stays and continues to deserialize as `ReliabilityConfig`.
+        if let Some(toml::Value::Table(reliability_table)) = passthrough.get_mut("reliability") {
+            let dropped_fb = reliability_table.remove("fallback_providers").is_some();
+            let dropped_mf = reliability_table.remove("model_fallbacks").is_some();
+            if dropped_fb || dropped_mf {
+                tracing::info!(
+                    target: "migration",
+                    "[reliability] {{fallback_providers, model_fallbacks}} dropped (provider fallback eradicated in V3)"
+                );
+            }
+        }
+
         // 5. providers → restructure (drop fallback, alias models, fold cost.prices, fold per-agent inline brain)
         let mut new_providers = providers
             .and_then(|v| match v {
@@ -226,12 +246,25 @@ impl V2Config {
         if !aliased_models.is_empty() {
             new_providers.insert("models".to_string(), toml::Value::Table(aliased_models));
         }
+
+        // 6a. T8: TTS subsystem promotion — V2 `[tts.<type>]` per-provider
+        //     blocks → V3 `[providers.tts.<type>.<alias>]`. The bare
+        //     `tts.default_provider = "openai"` scalar gets rewritten as
+        //     dotted alias `"openai.default"` (V3 uses dotted aliases).
+        fold_v2_tts_into_providers(&mut passthrough, &mut new_providers);
+
         if !new_providers.is_empty() {
             passthrough.insert("providers".to_string(), toml::Value::Table(new_providers));
         }
         if let Some(remaining_cost) = cost_passthrough {
             passthrough.insert("cost".to_string(), remaining_cost);
         }
+
+        // 6b. T9 + T10: storage subsystem promotion. V2 `[memory.qdrant]`,
+        //     `[memory.postgres]`, and `[storage.provider.config]` all fold
+        //     into V3 `[storage.<backend>.<alias>]` with appropriate field
+        //     adapters per backend.
+        fold_v2_storage_subsystems(&mut passthrough);
 
         // 7. channels → alias-wrap each channel type, fold discord_history
         if let Some(channels_value) = channels {
@@ -279,16 +312,32 @@ fn restructure_cron(cron_value: toml::Value) -> (toml::Table, toml::Table) {
     };
 
     // V2 had `[[cron.jobs]]` array. Each entry becomes `[cron.<key>]`.
+    // T11: V3 keys jobs by their HashMap alias; the V2 `id: String` field
+    // is redundant under that scheme and was removed in V3 — drop it from
+    // each job's table before insertion.
     if let Some(toml::Value::Array(jobs)) = cron_table.remove("jobs") {
         for (i, job) in jobs.into_iter().enumerate() {
+            // Pick alias key: name slug → id → fallback `job_N`.
             let key = job
                 .get("name")
                 .and_then(toml::Value::as_str)
                 .map(slugify)
+                .or_else(|| {
+                    job.get("id")
+                        .and_then(toml::Value::as_str)
+                        .map(ToString::to_string)
+                })
                 .unwrap_or_else(|| format!("job_{}", i + 1));
-            // De-duplicate keys with a numeric suffix.
             let key = ensure_unique_key(&new_cron, key);
-            new_cron.insert(key, job);
+            // T11 strip: the id field is no longer part of CronJobDecl in V3.
+            let stripped = match job {
+                toml::Value::Table(mut t) => {
+                    t.remove("id");
+                    toml::Value::Table(t)
+                }
+                other => other,
+            };
+            new_cron.insert(key, stripped);
         }
     }
 
@@ -526,8 +575,23 @@ fn fold_pricing_into_models(aliased_models: &mut toml::Table, prices: toml::Tabl
 }
 
 /// Wrap V2 `Option<T>` channel sections into V3 `HashMap<String, T>` keyed by
-/// `"default"`. Folds `discord_history` into `discord.default.archive = true`.
-/// Preserves `cli: bool` as-is (V3 keeps it as a bool toggle).
+/// `"default"`. Applies, per channel instance:
+///
+/// - **discord_history fold**: `[channels.discord_history]` → `[channels.discord]`
+///   with `archive = true`. Effective `enabled` is the OR of both sides so a
+///   user with only `discord_history.enabled = true` still ends up with an
+///   enabled merged discord block.
+/// - **T3–T6 singular→plural folds** per channel type (`discord.guild_id` →
+///   `guild_ids[]`, `mattermost.channel_id` → `channel_ids[]`,
+///   `reddit.subreddit` → `subreddits[]`, `signal.group_id` → `group_ids[]`
+///   or `dm_only=true` for the `"dm"` sentinel).
+/// - **T7 enabled filter**: V3 dropped `enabled: bool` from every channel
+///   config. V2 default was `false`. Channels whose V2 `enabled` was not
+///   explicitly `true` are dropped from the V3 HashMap entirely; channels
+///   that survive have their `enabled` field stripped (V3 has no slot for it).
+///   Per-drop INFO log names the channel type and reason.
+///
+/// `cli: bool` is preserved at the top-level `channels.cli`, not aliased.
 fn alias_wrap_channels(channels_value: toml::Value) -> toml::Table {
     let mut channels_table = match channels_value {
         toml::Value::Table(t) => t,
@@ -535,56 +599,42 @@ fn alias_wrap_channels(channels_value: toml::Value) -> toml::Table {
     };
     let mut new_channels = toml::Table::new();
 
-    // `cli` is a top-level bool, not aliased.
+    // CLI is a top-level bool, not aliased.
     if let Some(cli) = channels_table.remove("cli") {
         new_channels.insert("cli".to_string(), cli);
     }
 
-    // discord_history → fold into discord.default with archive=true.
-    let history = channels_table.remove("discord_history");
+    // Fold discord_history into discord BEFORE the enabled filter so a
+    // discord_history-only user with `enabled=true` survives into V3.
+    fold_discord_history(&mut channels_table);
 
+    // Per-channel-type processing: T3–T6 folds, T7 enabled filter, alias-wrap.
     for ct in V3_CHANNEL_TYPES {
-        if let Some(value) = channels_table.remove(*ct) {
-            let mut wrapped = toml::Table::new();
-            wrapped.insert("default".to_string(), value);
-            new_channels.insert((*ct).to_string(), toml::Value::Table(wrapped));
-        }
-    }
-
-    if let Some(history_value) = history {
-        let discord_entry = new_channels
-            .entry("discord".to_string())
-            .or_insert_with(|| {
+        let Some(value) = channels_table.remove(*ct) else {
+            continue;
+        };
+        let mut instance = match value {
+            toml::Value::Table(t) => t,
+            other => {
+                // Unexpected shape — wrap raw value under "default" without
+                // any of the V3 transforms. This preserves data; V3
+                // deserialize will surface the type error.
                 let mut wrapped = toml::Table::new();
-                wrapped.insert(
-                    "default".to_string(),
-                    toml::Value::Table(toml::Table::new()),
-                );
-                toml::Value::Table(wrapped)
-            });
-        if let Some(discord_table) = discord_entry.as_table_mut() {
-            let default_entry = discord_table
-                .entry("default".to_string())
-                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-            if let Some(default_table) = default_entry.as_table_mut() {
-                default_table.insert("archive".to_string(), toml::Value::Boolean(true));
-                if let toml::Value::Table(history_table) = history_value {
-                    for (k, v) in history_table {
-                        // Don't overwrite any explicit discord.default key.
-                        default_table.entry(k).or_insert(v);
-                    }
-                }
+                wrapped.insert("default".to_string(), other);
+                new_channels.insert((*ct).to_string(), toml::Value::Table(wrapped));
+                continue;
             }
+        };
+        apply_v2_to_v3_channel_folds(ct, &mut instance);
+        if !drain_enabled_keep(ct, &mut instance) {
+            continue;
         }
-        tracing::info!(
-            target: "migration",
-            "[channels.discord_history] folded into [channels.discord.default] (archive=true)"
-        );
+        let mut wrapped = toml::Table::new();
+        wrapped.insert("default".to_string(), toml::Value::Table(instance));
+        new_channels.insert((*ct).to_string(), toml::Value::Table(wrapped));
     }
 
-    // Any unmodeled channel-section keys: pass through under their original
-    // top-level key (no alias-wrap, since V3 may reject them, but better than
-    // silently dropping data).
+    // Unmodeled channel-section keys: pass through under their original key.
     if !channels_table.is_empty() {
         let leftover_keys: Vec<String> = channels_table.keys().cloned().collect();
         tracing::info!(
@@ -600,10 +650,182 @@ fn alias_wrap_channels(channels_value: toml::Value) -> toml::Table {
     new_channels
 }
 
-/// Strip inline brain fields (`provider`, `model`, `temperature`, `api_key`)
-/// from each agent. For each agent that had a `provider`, synthesize a new
-/// entry under `providers.models.<provider>.agent_<id>` with the brain
-/// fields, and replace the agent's brain with `model_provider = "<provider>.agent_<id>"`.
+/// Fold V2 `[channels.discord_history]` into `[channels.discord]` in place.
+/// Sets `archive = true`. Effective `enabled` = `discord.enabled` OR
+/// `discord_history.enabled`. Existing discord keys win over history keys
+/// for non-`enabled` fields (so a user-set discord.bot_token isn't
+/// overwritten by history's bot_token).
+fn fold_discord_history(channels: &mut toml::Table) {
+    let history_value = match channels.remove("discord_history") {
+        Some(v) => v,
+        None => return,
+    };
+
+    let history_enabled = history_value
+        .as_table()
+        .and_then(|t| t.get("enabled"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    let discord_enabled = channels
+        .get("discord")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("enabled"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    let effective_enabled = discord_enabled || history_enabled;
+
+    let discord_entry = channels
+        .entry("discord".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let Some(discord_table) = discord_entry.as_table_mut() {
+        discord_table.insert("archive".to_string(), toml::Value::Boolean(true));
+        if let toml::Value::Table(history_table) = history_value {
+            for (k, v) in history_table {
+                if k == "enabled" {
+                    // Handled explicitly via effective_enabled below.
+                    continue;
+                }
+                discord_table.entry(k).or_insert(v);
+            }
+        }
+        discord_table.insert(
+            "enabled".to_string(),
+            toml::Value::Boolean(effective_enabled),
+        );
+    }
+    tracing::info!(
+        target: "migration",
+        "[channels.discord_history] folded into [channels.discord] (archive=true, effective enabled={effective_enabled})"
+    );
+}
+
+/// Apply V2→V3 singular→plural folds to a channel-instance table in place.
+///
+/// - **T3** discord.guild_id → guild_ids[]
+/// - **T4** mattermost.channel_id → channel_ids[]
+/// - **T5** reddit.subreddit → subreddits[]
+/// - **T6** signal.group_id → group_ids[] (or `dm_only=true` for the
+///   legacy `"dm"` sentinel value).
+fn apply_v2_to_v3_channel_folds(channel_type: &str, instance: &mut toml::Table) {
+    use crate::migration::fold_string_into_array;
+    match channel_type {
+        "discord" => {
+            if fold_string_into_array(instance, "guild_id", "guild_ids") {
+                tracing::info!(
+                    target: "migration",
+                    "channels.discord.guild_id folded into channels.discord.guild_ids[]"
+                );
+            }
+        }
+        "mattermost" => {
+            if fold_string_into_array(instance, "channel_id", "channel_ids") {
+                tracing::info!(
+                    target: "migration",
+                    "channels.mattermost.channel_id folded into channels.mattermost.channel_ids[]"
+                );
+            }
+        }
+        "reddit" => {
+            if fold_string_into_array(instance, "subreddit", "subreddits") {
+                tracing::info!(
+                    target: "migration",
+                    "channels.reddit.subreddit folded into channels.reddit.subreddits[]"
+                );
+            }
+        }
+        "signal" => {
+            // Special: V2 group_id="dm" was a sentinel meaning "DMs only".
+            // V3 splits that into a typed dm_only bool. Other group_id
+            // values fold into group_ids[] like the simpler renames.
+            if let Some(toml::Value::String(group_id)) = instance.remove("group_id")
+                && !group_id.is_empty()
+            {
+                if group_id == "dm" {
+                    instance.insert("dm_only".to_string(), toml::Value::Boolean(true));
+                    tracing::info!(
+                        target: "migration",
+                        "channels.signal.group_id=\"dm\" → channels.signal.dm_only=true"
+                    );
+                } else {
+                    let entry = instance
+                        .entry("group_ids".to_string())
+                        .or_insert_with(|| toml::Value::Array(Vec::new()));
+                    if let Some(arr) = entry.as_array_mut() {
+                        let already = arr.iter().any(|v| v.as_str() == Some(group_id.as_str()));
+                        if !already {
+                            arr.push(toml::Value::String(group_id));
+                        }
+                    }
+                    tracing::info!(
+                        target: "migration",
+                        "channels.signal.group_id folded into channels.signal.group_ids[]"
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// **T7**: V3 removed `enabled: bool` from every channel config. V2's default
+/// was `false`; activation in V3 is implicit by HashMap presence. Strip
+/// `enabled` from the instance and decide whether the channel survives:
+///
+/// - `enabled = true` → keep, no log.
+/// - `enabled = false` → drop, log naming the channel type.
+/// - `enabled` missing → drop (V2 default false), log.
+/// - `enabled` non-bool → keep (treat as "configured"), log the unexpected
+///   type rather than dropping data.
+fn drain_enabled_keep(channel_type: &str, instance: &mut toml::Table) -> bool {
+    match instance.remove("enabled") {
+        Some(toml::Value::Boolean(true)) => true,
+        Some(toml::Value::Boolean(false)) => {
+            tracing::info!(
+                target: "migration",
+                "channels.{channel_type} dropped (V2 enabled=false; V3 has no off-switch other than absence)"
+            );
+            false
+        }
+        Some(other) => {
+            tracing::info!(
+                target: "migration",
+                "channels.{channel_type}.enabled was {other:?} (non-bool); treating as enabled for V3"
+            );
+            true
+        }
+        None => {
+            tracing::info!(
+                target: "migration",
+                "channels.{channel_type} dropped (V2 enabled defaulted to false; V3 has no off-switch other than absence)"
+            );
+            false
+        }
+    }
+}
+
+/// Strip V2-specific fields from each agent and synthesize the V3 alias
+/// references / per-agent runtime overrides.
+///
+/// - **Brain fold** (already covered before T14): for each agent with a
+///   `provider` string, synthesize a `providers.models.<provider>.agent_<id>`
+///   entry with `{model, api_key, temperature}` and replace the agent's
+///   brain with `model_provider = "<provider>.agent_<id>"`.
+/// - **T14a max_iterations rename**: V2 `max_iterations: usize` →
+///   V3 `max_tool_iterations: usize` (V3 keeps it inline on
+///   `DelegateAgentConfig`, just renamed).
+/// - **T14b runtime override synthesis**: V2 `agentic`, `allowed_tools`,
+///   `timeout_secs`, `agentic_timeout_secs` are removed from
+///   `DelegateAgentConfig` in V3 — they belong on `RuntimeProfileConfig`.
+///   When any are set, synthesize a per-agent runtime profile at
+///   `runtime_profiles.agent_<id>` and point `runtime_profile = "agent_<id>"`.
+/// - **T14c risk override synthesis**: V2 `max_depth` → per-agent
+///   `risk_profiles.agent_<id>.max_delegation_depth`, with `risk_profile`
+///   pointing at `agent_<id>`.
+/// - **T14d skills_directory drop**: V3 wants `skill_bundles: Vec<String>`
+///   alias references; the V2 path-on-disk has no clean V3 equivalent.
+///   Logged and dropped.
+/// - **T14e memory_namespace type widening**: V2 `Option<String>` → V3
+///   `String`. `None`/missing maps to `""` (V3's "no namespace" sentinel).
 fn synthesize_agent_brains(
     agents: HashMap<String, toml::Value>,
     passthrough: &mut toml::Table,
@@ -617,11 +839,12 @@ fn synthesize_agent_brains(
                 continue;
             }
         };
+
+        // Brain fold: provider/model/api_key/temperature → model-provider alias
         let provider = agent_table.remove("provider");
         let model = agent_table.remove("model");
         let api_key = agent_table.remove("api_key");
         let temperature = agent_table.remove("temperature");
-
         if let Some(toml::Value::String(provider_type)) = provider {
             let provider_alias = format!("agent_{}", alias);
             let mut entry = toml::Table::new();
@@ -634,8 +857,6 @@ fn synthesize_agent_brains(
             if let Some(t) = temperature {
                 entry.insert("temperature".to_string(), t);
             }
-
-            // Insert into providers.models.<provider_type>.<provider_alias>.
             let providers_value = passthrough
                 .entry("providers".to_string())
                 .or_insert_with(|| toml::Value::Table(toml::Table::new()));
@@ -652,7 +873,6 @@ fn synthesize_agent_brains(
                     }
                 }
             }
-
             agent_table.insert(
                 "model_provider".to_string(),
                 toml::Value::String(format!("{provider_type}.{provider_alias}")),
@@ -662,13 +882,170 @@ fn synthesize_agent_brains(
                 "agents.{alias}: inline brain → providers.models.{provider_type}.{provider_alias}"
             );
         } else if let Some(other) = provider {
-            // Non-string provider — preserve as-is.
             agent_table.insert("provider".to_string(), other);
+        }
+
+        // T14a: max_iterations → max_tool_iterations (V3 inline rename).
+        if let Some(v) = agent_table.remove("max_iterations") {
+            agent_table
+                .entry("max_tool_iterations".to_string())
+                .or_insert(v);
+            tracing::info!(
+                target: "migration",
+                "agents.{alias}.max_iterations → agents.{alias}.max_tool_iterations"
+            );
+        }
+
+        // T14b: runtime overrides → per-agent runtime_profile.
+        let runtime_overrides = extract_runtime_overrides(&mut agent_table);
+        if let Some(overrides) = runtime_overrides {
+            let profile_alias = format!("agent_{}", alias);
+            install_profile_entry(passthrough, "runtime_profiles", &profile_alias, overrides);
+            agent_table.insert(
+                "runtime_profile".to_string(),
+                toml::Value::String(profile_alias.clone()),
+            );
+            tracing::info!(
+                target: "migration",
+                "agents.{alias} runtime overrides → runtime_profiles.{profile_alias}"
+            );
+        }
+
+        // T14c: max_depth → per-agent risk_profile.max_delegation_depth.
+        if let Some(max_depth) = agent_table.remove("max_depth") {
+            let mut overrides = toml::Table::new();
+            overrides.insert("max_delegation_depth".to_string(), max_depth);
+            let profile_alias = format!("agent_{}", alias);
+            install_profile_entry(passthrough, "risk_profiles", &profile_alias, overrides);
+            agent_table
+                .entry("risk_profile".to_string())
+                .or_insert_with(|| toml::Value::String(profile_alias.clone()));
+            tracing::info!(
+                target: "migration",
+                "agents.{alias}.max_depth → risk_profiles.{profile_alias}.max_delegation_depth"
+            );
+        }
+
+        // T14d: skills_directory has no V3 alias equivalent. Drop with log.
+        if agent_table.remove("skills_directory").is_some() {
+            tracing::info!(
+                target: "migration",
+                "agents.{alias}.skills_directory dropped — V3 uses skill_bundles alias references; \
+                 add a [skill_bundles.<alias>] entry pointing at the directory and reference it here"
+            );
+        }
+
+        // T14f: every V3 agent must reference a configured risk_profile and
+        //   runtime_profile (V3 dangling-reference validation rejects unset
+        //   or empty alias references). For agents that didn't trigger the
+        //   T14b/T14c per-agent profile synthesis, default to "default" and
+        //   ensure both entries exist.
+        let agent_risk = agent_table
+            .get("risk_profile")
+            .and_then(toml::Value::as_str)
+            .map(ToString::to_string)
+            .filter(|s| !s.is_empty());
+        let risk_alias = agent_risk.unwrap_or_else(|| "default".to_string());
+        ensure_profile_entry(passthrough, "risk_profiles", &risk_alias);
+        agent_table.insert("risk_profile".to_string(), toml::Value::String(risk_alias));
+
+        let agent_runtime = agent_table
+            .get("runtime_profile")
+            .and_then(toml::Value::as_str)
+            .map(ToString::to_string)
+            .filter(|s| !s.is_empty());
+        let runtime_alias = agent_runtime.unwrap_or_else(|| "default".to_string());
+        ensure_profile_entry(passthrough, "runtime_profiles", &runtime_alias);
+        agent_table.insert(
+            "runtime_profile".to_string(),
+            toml::Value::String(runtime_alias),
+        );
+
+        // T14e: memory_namespace type widening (Option<String> → String).
+        // V3 wants a bare string; missing or unset becomes "". Also
+        // synthesize an empty memory_namespaces.<ns> entry when an agent
+        // references one, since V3 dangling-reference validation rejects
+        // unresolved alias references.
+        let referenced_ns = match agent_table.get("memory_namespace") {
+            Some(toml::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            Some(toml::Value::String(_)) => None,
+            Some(_) => {
+                agent_table.insert(
+                    "memory_namespace".to_string(),
+                    toml::Value::String(String::new()),
+                );
+                None
+            }
+            None => None,
+        };
+        if let Some(ns) = referenced_ns {
+            ensure_memory_namespace(passthrough, &ns);
         }
 
         new_agents.insert(alias, toml::Value::Table(agent_table));
     }
     new_agents
+}
+
+/// Ensure `memory_namespaces.<alias>` exists with at least `namespace = "<alias>"`.
+/// V3 `MemoryNamespaceConfig` requires a `namespace` field — when an agent
+/// references a namespace alias and the user hasn't defined it explicitly,
+/// synthesize a minimal entry so V3 dangling-reference validation passes.
+fn ensure_memory_namespace(passthrough: &mut toml::Table, alias: &str) {
+    let section_value = passthrough
+        .entry("memory_namespaces".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let Some(section_table) = section_value.as_table_mut() {
+        let entry_value = section_table
+            .entry(alias.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let Some(entry_table) = entry_value.as_table_mut() {
+            entry_table
+                .entry("namespace".to_string())
+                .or_insert_with(|| toml::Value::String(alias.to_string()));
+        }
+    }
+}
+
+/// Pull V2 `DelegateAgentConfig` fields that V3 moved onto
+/// `RuntimeProfileConfig` out of the agent table. Returns `Some(table)` if
+/// any V3 runtime-profile field was set; `None` otherwise.
+fn extract_runtime_overrides(agent: &mut toml::Table) -> Option<toml::Table> {
+    let mut out = toml::Table::new();
+    for (v2_key, v3_key) in [
+        ("agentic", "agentic"),
+        ("allowed_tools", "allowed_tools"),
+        ("timeout_secs", "timeout_secs"),
+        ("agentic_timeout_secs", "agentic_timeout_secs"),
+    ] {
+        if let Some(v) = agent.remove(v2_key) {
+            out.insert(v3_key.to_string(), v);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Insert (or merge) a profile entry at `passthrough.<section>.<alias>`.
+/// Existing keys win — `fields` only fills in missing slots.
+fn install_profile_entry(
+    passthrough: &mut toml::Table,
+    section: &str,
+    alias: &str,
+    fields: toml::Table,
+) {
+    let section_value = passthrough
+        .entry(section.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let Some(section_table) = section_value.as_table_mut() {
+        let alias_value = section_table
+            .entry(alias.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let Some(alias_table) = alias_value.as_table_mut() {
+            for (k, v) in fields {
+                alias_table.entry(k).or_insert(v);
+            }
+        }
+    }
 }
 
 /// Insert `(key, value)` pairs from `extras` into a sub-table at `top.<section>`.
@@ -744,6 +1121,316 @@ fn synthesize_default_agent_if_needed(passthrough: &toml::Table) -> toml::Table 
         "synthesized [agents.default] from V1/V2 implicit single-agent semantics"
     );
     agents
+}
+
+/// V3 TTS provider type keys. Matches the V2 `TtsConfig` per-provider
+/// option fields.
+const V3_TTS_TYPES: &[&str] = &["openai", "elevenlabs", "google", "edge", "piper"];
+
+/// **T8**: V2 `[tts.<type>]` sub-blocks → V3 `[providers.tts.<type>.default]`.
+///
+/// V2 `TtsConfig` had per-provider `Option<*TtsConfig>` fields (`openai`,
+/// `elevenlabs`, `google`, `edge`, `piper`); V3 unifies them under a single
+/// `TtsProviderConfig` keyed by `<type>.<alias>` like the model providers.
+///
+/// `[tts]` top-level scalars (`enabled`, `default_voice`, `default_format`,
+/// `max_text_length`) stay on `[tts]`. The `default_provider` scalar gets
+/// rewritten from a bare type name (`"openai"`) to a dotted alias
+/// (`"openai.default"`) to match the V3 reference format.
+fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut toml::Table) {
+    let Some(toml::Value::Table(tts_table)) = passthrough.get_mut("tts") else {
+        return;
+    };
+
+    let mut tts_aliased = toml::Table::new();
+    for ty in V3_TTS_TYPES {
+        if let Some(value) = tts_table.remove(*ty) {
+            let mut wrapped = toml::Table::new();
+            wrapped.insert("default".to_string(), value);
+            tts_aliased.insert((*ty).to_string(), toml::Value::Table(wrapped));
+        }
+    }
+
+    if let Some(toml::Value::String(s)) = tts_table.get_mut("default_provider")
+        && !s.is_empty()
+        && !s.contains('.')
+    {
+        *s = format!("{s}.default");
+        tracing::info!(
+            target: "migration",
+            "tts.default_provider rewritten as dotted alias"
+        );
+    }
+
+    if !tts_aliased.is_empty() {
+        new_providers.insert("tts".to_string(), toml::Value::Table(tts_aliased));
+        tracing::info!(
+            target: "migration",
+            "[tts.<type>] sub-blocks promoted to [providers.tts.<type>.default]"
+        );
+    }
+}
+
+/// **T9 + T10**: Fold V2 `[memory.qdrant]`, `[memory.postgres]`, and
+/// `[storage.provider.config]` into V3 `[storage.<backend>.<alias>]`.
+///
+/// V2 had three sources of storage configuration that V3 unifies under a
+/// single typed map per backend:
+///
+/// - `[memory.qdrant]`: V2 `QdrantConfig {url, collection, api_key}` —
+///   ships directly to `[storage.qdrant.default]` (V3 `QdrantStorageConfig`
+///   takes the same field names).
+/// - `[memory.postgres]`: V2 `PostgresMemoryConfig {vector_enabled, vector_dimensions}` —
+///   contributes only the vector fields; the remaining `db_url`, `schema`,
+///   `table` come from `[storage.provider.config]` if the user set
+///   `provider = "postgres"` there.
+/// - `[storage.provider.config]`: V2 `StorageProviderConfig {provider, db_url,
+///   schema, table, connect_timeout_secs}` — the `provider` field selects the
+///   V3 backend; remaining fields are adapted per-backend (sqlite extracts
+///   path from a `sqlite://...` URL; qdrant maps `db_url` → `url`; postgres
+///   maps the fields directly).
+///
+/// `[memory.sqlite_open_timeout_secs]` is dropped (V3 moved it onto
+/// `SqliteStorageConfig.open_timeout_secs`).
+///
+/// Existing V3-shaped fields take precedence over the legacy fold (so a
+/// user who already wrote `[storage.qdrant.default]` doesn't get clobbered).
+fn fold_v2_storage_subsystems(passthrough: &mut toml::Table) {
+    let (memory_qdrant, memory_postgres) = match passthrough
+        .get_mut("memory")
+        .and_then(toml::Value::as_table_mut)
+    {
+        Some(memory) => {
+            memory.remove("sqlite_open_timeout_secs");
+            (memory.remove("qdrant"), memory.remove("postgres"))
+        }
+        None => (None, None),
+    };
+
+    let storage_provider = match passthrough
+        .get_mut("storage")
+        .and_then(toml::Value::as_table_mut)
+    {
+        Some(storage) => storage.remove("provider"),
+        None => None,
+    };
+
+    if memory_qdrant.is_none() && memory_postgres.is_none() && storage_provider.is_none() {
+        return;
+    }
+
+    let storage_entry = passthrough
+        .entry("storage".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let Some(storage_table) = storage_entry.as_table_mut() else {
+        return;
+    };
+
+    if let Some(toml::Value::Table(qdrant_data)) = memory_qdrant {
+        merge_storage_default(storage_table, "qdrant", qdrant_data);
+        tracing::info!(
+            target: "migration",
+            "[memory.qdrant] promoted to [storage.qdrant.default]"
+        );
+    }
+    if let Some(toml::Value::Table(postgres_vector_data)) = memory_postgres {
+        merge_storage_default(storage_table, "postgres", postgres_vector_data);
+        tracing::info!(
+            target: "migration",
+            "[memory.postgres] vector fields promoted to [storage.postgres.default]"
+        );
+    }
+
+    if let Some(provider_section_value) = storage_provider {
+        // V2 had two layouts: `[storage.provider.config]` (nested) or
+        // `storage.provider = { provider = "...", db_url = "..." }` (inline).
+        // Both produce the same parsed structure: a Table with a `config`
+        // sub-table. Flatten that here.
+        let config_table = match provider_section_value {
+            toml::Value::Table(mut section) => {
+                if let Some(toml::Value::Table(inner)) = section.remove("config") {
+                    inner
+                } else {
+                    section
+                }
+            }
+            _ => return,
+        };
+        if config_table.is_empty() {
+            return;
+        }
+
+        let (provider_type, mut adapted_fields) = adapt_storage_provider_config(config_table);
+        if !adapted_fields.is_empty() {
+            // sqlite_open_timeout_secs from [memory] (already removed above)
+            // wasn't re-injected, but we previously moved memory.qdrant /
+            // memory.postgres in here, so fields stay separate per backend.
+            merge_storage_default(
+                storage_table,
+                &provider_type,
+                std::mem::take(&mut adapted_fields),
+            );
+            tracing::info!(
+                target: "migration",
+                "[storage.provider.config provider={provider_type}] promoted to [storage.{provider_type}.default]"
+            );
+        }
+    }
+}
+
+/// Adapt a V2 `StorageProviderConfig` (flat `{provider, db_url, schema,
+/// table, connect_timeout_secs}`) to the V3 backend-specific shape. Returns
+/// the chosen backend type and the adapted field table.
+fn adapt_storage_provider_config(mut config: toml::Table) -> (String, toml::Table) {
+    let provider_type = config
+        .remove("provider")
+        .and_then(|v| match v {
+            toml::Value::String(s) if !s.is_empty() => Some(s),
+            _ => None,
+        })
+        .unwrap_or_else(|| "sqlite".to_string());
+
+    match provider_type.as_str() {
+        "sqlite" => {
+            let mut out = toml::Table::new();
+            // V2 db_url for sqlite was typically "sqlite:///path" — extract path.
+            if let Some(toml::Value::String(db_url)) = config.remove("db_url") {
+                let path = db_url
+                    .strip_prefix("sqlite://")
+                    .or_else(|| db_url.strip_prefix("sqlite:"))
+                    .map(ToString::to_string)
+                    .unwrap_or(db_url);
+                if !path.is_empty() {
+                    out.insert("path".to_string(), toml::Value::String(path));
+                }
+            }
+            // V2 connect_timeout_secs maps to V3 SqliteStorageConfig.open_timeout_secs.
+            if let Some(v) = config.remove("connect_timeout_secs") {
+                out.insert("open_timeout_secs".to_string(), v);
+            }
+            // schema/table not applicable to sqlite — drop.
+            (provider_type, out)
+        }
+        "postgres" => {
+            // db_url, schema, table, connect_timeout_secs all map directly.
+            (provider_type, config)
+        }
+        "qdrant" => {
+            let mut out = toml::Table::new();
+            if let Some(v) = config.remove("db_url") {
+                out.insert("url".to_string(), v);
+            }
+            // schema/table not applicable to qdrant — drop.
+            (provider_type, out)
+        }
+        _ => {
+            tracing::info!(
+                target: "migration",
+                "[storage.provider.config] unknown provider type {provider_type:?}; passthrough as-is"
+            );
+            (provider_type, config)
+        }
+    }
+}
+
+/// Merge `fields` into `storage_table.<backend>.default`, creating the
+/// nested tables if missing. Existing keys win — `fields` only fills gaps.
+fn merge_storage_default(storage_table: &mut toml::Table, backend_type: &str, fields: toml::Table) {
+    let backend_entry = storage_table
+        .entry(backend_type.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let Some(backend_table) = backend_entry.as_table_mut() {
+        let default_entry = backend_table
+            .entry("default".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let Some(default_table) = default_entry.as_table_mut() {
+            for (k, v) in fields {
+                default_table.entry(k).or_insert(v);
+            }
+        }
+    }
+}
+
+/// **T13**: Fold V2 `[security.sandbox]` and `[security.resources]` blocks
+/// into the `risk_profiles.default` entry under V3 field names.
+///
+/// V3 `RiskProfileConfig` absorbed sandbox and resource limits — they used
+/// to live at `[security.sandbox]` and `[security.resources]`, but V3 places
+/// them on each risk profile so per-agent overrides are possible.
+///
+/// Field renames during the fold:
+/// - `security.sandbox.enabled` → `risk_profiles.default.sandbox_enabled`
+/// - `security.sandbox.backend` → `risk_profiles.default.sandbox_backend`
+/// - `security.sandbox.firejail_args` → `risk_profiles.default.firejail_args`
+/// - `security.resources.max_memory_mb` → `risk_profiles.default.max_memory_mb`
+/// - `security.resources.max_cpu_time_seconds` → `risk_profiles.default.max_cpu_time_seconds`
+/// - `security.resources.max_subprocesses` → `risk_profiles.default.max_subprocesses`
+/// - `security.resources.memory_monitoring` → `risk_profiles.default.memory_monitoring`
+///
+/// Both V2 source blocks are removed. Existing values on the V3 profile take
+/// precedence — globals only fill in missing slots.
+fn fold_security_into_risk_profile(passthrough: &mut toml::Table) {
+    let (sandbox, resources) = {
+        let security_table = match passthrough
+            .get_mut("security")
+            .and_then(toml::Value::as_table_mut)
+        {
+            Some(t) => t,
+            None => return,
+        };
+        (
+            security_table.remove("sandbox"),
+            security_table.remove("resources"),
+        )
+    };
+    if sandbox.is_none() && resources.is_none() {
+        return;
+    }
+
+    let risk_profiles = passthrough
+        .entry("risk_profiles".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let Some(risk_profiles_table) = risk_profiles.as_table_mut() else {
+        return;
+    };
+    let default_entry = risk_profiles_table
+        .entry("default".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let Some(default_profile) = default_entry.as_table_mut() else {
+        return;
+    };
+
+    if let Some(toml::Value::Table(sandbox_table)) = sandbox {
+        for (k, v) in sandbox_table {
+            let target_key = match k.as_str() {
+                "enabled" => "sandbox_enabled",
+                "backend" => "sandbox_backend",
+                "firejail_args" => "firejail_args",
+                _ => continue,
+            };
+            default_profile.entry(target_key.to_string()).or_insert(v);
+        }
+        tracing::info!(
+            target: "migration",
+            "[security.sandbox] folded into [risk_profiles.default]"
+        );
+    }
+    if let Some(toml::Value::Table(resources_table)) = resources {
+        for (k, v) in resources_table {
+            let target_key = match k.as_str() {
+                "max_memory_mb" => "max_memory_mb",
+                "max_cpu_time_seconds" => "max_cpu_time_seconds",
+                "max_subprocesses" => "max_subprocesses",
+                "memory_monitoring" => "memory_monitoring",
+                _ => continue,
+            };
+            default_profile.entry(target_key.to_string()).or_insert(v);
+        }
+        tracing::info!(
+            target: "migration",
+            "[security.resources] folded into [risk_profiles.default]"
+        );
+    }
 }
 
 /// Rename top-level keys inside a `toml::Value::Table` according to a list of

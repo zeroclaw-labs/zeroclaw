@@ -5,9 +5,9 @@
 //! shape is asserted via typed deserialization (`Config`) and `toml::Value`
 //! navigation on the migration output.
 //!
-//! Each test asserts a specific transformation and fails if that
-//! transformation breaks. Per the plan: no bullshit tests; every test must
-//! fail when its target logic is broken.
+//! One test per transform listed in the plan's Step 0 ground truth. Each
+//! test asserts the destination value present in V3 output; if the migration
+//! step that performs the transform is broken, the test fails.
 
 use zeroclaw_config::migration::{
     CURRENT_SCHEMA_VERSION, MigrateReport, V1_LEGACY_KEYS, detect_version,
@@ -17,17 +17,27 @@ use zeroclaw_config::schema::Config;
 
 const V1_FIXTURE: &str = include_str!("fixtures/v1.toml");
 
+fn v3_config() -> Config {
+    migrate_to_current(V1_FIXTURE).expect("V1 fixture migrates to current schema")
+}
+
+fn v3_value() -> toml::Value {
+    let migrated = migrate_file(V1_FIXTURE)
+        .expect("migrate_file succeeds")
+        .expect("migration ran (V1 → V3)");
+    toml::from_str(&migrated).expect("migrate_file output parses as TOML")
+}
+
 // ─────────────────────────────────────────────────────────────
 // chain validity + schema_version detection
 // ─────────────────────────────────────────────────────────────
 
 #[test]
 fn chain_produces_valid_v3() {
-    let config: Config =
-        migrate_to_current(V1_FIXTURE).expect("V1 fixture migrates to current schema");
+    let cfg = v3_config();
     assert_eq!(
-        config.schema_version, CURRENT_SCHEMA_VERSION,
-        "migrated config must have current schema_version"
+        cfg.schema_version, CURRENT_SCHEMA_VERSION,
+        "migrated config must carry current schema_version"
     );
 }
 
@@ -58,7 +68,6 @@ fn detect_version_table() {
 
 #[test]
 fn v1_legacy_keys_match_v1_fixture_top_level() {
-    // Spot-check: V1_LEGACY_KEYS must include the V1 globals our fixture exercises.
     for required in [
         "api_key",
         "api_url",
@@ -76,12 +85,12 @@ fn v1_legacy_keys_match_v1_fixture_top_level() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// V1 → V2 → V3 specific transforms
+// V1 globals → V2 [providers] → V3 providers.models.<type>.default
 // ─────────────────────────────────────────────────────────────
 
 #[test]
 fn v1_default_provider_target_holds_globals() {
-    let cfg = migrate_to_current(V1_FIXTURE).unwrap();
+    let cfg = v3_config();
     let entry = cfg
         .providers
         .models
@@ -92,7 +101,7 @@ fn v1_default_provider_target_holds_globals() {
     assert_eq!(
         entry.base_url.as_deref(),
         Some("https://api.example.com/v1"),
-        "V1 api_url renamed to base_url"
+        "V1 api_url renamed to base_url on the per-provider entry"
     );
     assert_eq!(entry.model.as_deref(), Some("gpt-4o-mini"));
     assert_eq!(entry.temperature, Some(0.5));
@@ -106,31 +115,27 @@ fn v1_default_provider_target_holds_globals() {
 
 #[test]
 fn v1_model_providers_alias_wrapped() {
-    let cfg = migrate_to_current(V1_FIXTURE).unwrap();
-    let anthropic_default = cfg
+    let cfg = v3_config();
+    let anth = cfg
         .providers
         .models
         .get("anthropic")
         .and_then(|m| m.get("default"))
         .expect("anthropic.default present");
-    assert_eq!(anthropic_default.api_key.as_deref(), Some("sk-ant-v1-test"));
-    assert_eq!(
-        anthropic_default.model.as_deref(),
-        Some("claude-sonnet-4-5")
-    );
+    assert_eq!(anth.api_key.as_deref(), Some("sk-ant-v1-test"));
+    assert_eq!(anth.model.as_deref(), Some("claude-sonnet-4-5"));
 }
 
 #[test]
 fn claude_code_folded_under_anthropic() {
-    let cfg = migrate_to_current(V1_FIXTURE).unwrap();
-    let claude_code = cfg
+    let cfg = v3_config();
+    let cc = cfg
         .providers
         .models
         .get("anthropic")
         .and_then(|m| m.get("claude-code"))
         .expect("claude-code folded under anthropic.claude-code");
-    assert_eq!(claude_code.api_key.as_deref(), Some("sk-cc-v1-test"));
-    // Confirm the standalone top-level "claude-code" provider key did NOT survive.
+    assert_eq!(cc.api_key.as_deref(), Some("sk-cc-v1-test"));
     assert!(
         !cfg.providers.models.contains_key("claude-code"),
         "standalone claude-code provider must not appear in V3"
@@ -139,56 +144,508 @@ fn claude_code_folded_under_anthropic() {
 
 #[test]
 fn v1_model_routes_preserved_at_providers_level() {
-    let cfg = migrate_to_current(V1_FIXTURE).unwrap();
+    let cfg = v3_config();
     assert!(
         !cfg.providers.model_routes.is_empty(),
         "model_routes survive into providers.model_routes"
     );
 }
 
+// ─────────────────────────────────────────────────────────────
+// T1, T2 — V1→V2 channel singular→plural folds
+// ─────────────────────────────────────────────────────────────
+
 #[test]
-fn channels_config_renamed_and_alias_wrapped() {
-    let cfg = migrate_to_current(V1_FIXTURE).unwrap();
-    let discord_default = cfg
+fn t1_matrix_room_id_folds_into_allowed_rooms() {
+    let cfg = v3_config();
+    let matrix = cfg
         .channels
-        .discord
+        .matrix
         .get("default")
-        .expect("channels.discord.default exists after alias wrap");
-    assert_eq!(discord_default.bot_token, "discord-bot-token-v1");
-    // V1 had channels_config.discord.guild_id; V3 schema uses guild_ids
-    // (singular folded into plural during the V3 schema cut). Existing
-    // schema.rs handles guild_ids as plural by default; the V1 singular
-    // is in passthrough on the discord block, so the test asserts the
-    // bot_token round-trip rather than the field rename (which is V3
-    // schema-internal, not a migration concern).
+        .expect("channels.matrix.default exists after enabled-keep");
+    assert!(
+        matrix
+            .allowed_rooms
+            .iter()
+            .any(|r| r == "!important-room:matrix.org"),
+        "V1 matrix.room_id was not folded into V3 channels.matrix.default.allowed_rooms[]; \
+         got {:?}",
+        matrix.allowed_rooms
+    );
 }
 
 #[test]
-fn discord_history_folded_with_archive_flag() {
-    let cfg = migrate_to_current(V1_FIXTURE).unwrap();
-    let discord_default = cfg
+fn t2_slack_channel_id_folds_into_channel_ids() {
+    let cfg = v3_config();
+    let slack = cfg
+        .channels
+        .slack
+        .get("default")
+        .expect("channels.slack.default exists");
+    assert!(
+        slack.channel_ids.iter().any(|c| c == "C01ABCD0001"),
+        "V1 slack.channel_id was not folded into V3 channels.slack.default.channel_ids[]; \
+         got {:?}",
+        slack.channel_ids
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+// T3-T6 — V2→V3 channel singular→plural folds
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn t3_discord_guild_id_folds_into_guild_ids() {
+    let cfg = v3_config();
+    let discord = cfg
         .channels
         .discord
         .get("default")
         .expect("channels.discord.default exists");
     assert!(
-        discord_default.archive,
-        "channels.discord_history fold sets archive=true on channels.discord.default"
+        discord.guild_ids.iter().any(|g| g == "11111"),
+        "V2 discord.guild_id was not folded into V3 guild_ids[]; got {:?}",
+        discord.guild_ids
     );
 }
 
 #[test]
+fn t4_mattermost_channel_id_folds_into_channel_ids() {
+    let cfg = v3_config();
+    let mm = cfg
+        .channels
+        .mattermost
+        .get("default")
+        .expect("channels.mattermost.default exists");
+    assert!(
+        mm.channel_ids.iter().any(|c| c == "mm-channel-001"),
+        "V2 mattermost.channel_id was not folded into V3 channel_ids[]; got {:?}",
+        mm.channel_ids
+    );
+}
+
+#[test]
+fn t5_reddit_subreddit_folds_into_subreddits() {
+    let cfg = v3_config();
+    let reddit = cfg
+        .channels
+        .reddit
+        .get("default")
+        .expect("channels.reddit.default exists");
+    assert!(
+        reddit.subreddits.iter().any(|s| s == "rust"),
+        "V2 reddit.subreddit was not folded into V3 subreddits[]; got {:?}",
+        reddit.subreddits
+    );
+}
+
+#[test]
+fn t6_signal_group_id_folds_into_group_ids() {
+    let cfg = v3_config();
+    let signal = cfg
+        .channels
+        .signal
+        .get("default")
+        .expect("channels.signal.default exists");
+    assert!(
+        signal.group_ids.iter().any(|g| g == "group-abc-001"),
+        "V2 signal.group_id was not folded into V3 group_ids[]; got {:?}",
+        signal.group_ids
+    );
+    // The fixture's signal.group_id is NOT "dm", so dm_only should remain false.
+    assert!(
+        !signal.dm_only,
+        "non-\"dm\" group_id must not set dm_only=true"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+// T7 — channel `enabled` semantics
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn t7_enabled_false_channel_dropped() {
+    let cfg = v3_config();
+    assert!(
+        cfg.channels.webhook.is_empty(),
+        "V2 webhook with enabled=false must be dropped from V3 channels.webhook \
+         (V3 has no off-switch other than absence); got {:?}",
+        cfg.channels.webhook.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn t7_enabled_unset_channel_dropped() {
+    let cfg = v3_config();
+    assert!(
+        cfg.channels.imessage.is_empty(),
+        "V2 imessage without explicit enabled must be dropped (defaulted to false); \
+         got {:?}",
+        cfg.channels.imessage.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn t7_enabled_field_stripped_from_surviving_instance() {
+    // V3 channel configs have no `enabled` field; the migration must strip it
+    // before alias-wrapping. We assert by checking the raw migrated TOML.
+    let value = v3_value();
+    let matrix_default = value
+        .get("channels")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("matrix"))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("default"))
+        .and_then(toml::Value::as_table)
+        .expect("channels.matrix.default in migrated TOML");
+    assert!(
+        !matrix_default.contains_key("enabled"),
+        "V2 enabled field must be stripped from surviving V3 channel instances"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+// discord_history fold (covered already in V2→V3 step) + T7 interaction
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn discord_history_folded_with_archive_flag() {
+    let cfg = v3_config();
+    let discord = cfg
+        .channels
+        .discord
+        .get("default")
+        .expect("channels.discord.default present");
+    assert!(
+        discord.archive,
+        "channels.discord_history fold sets archive=true on channels.discord.default"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+// T8 — TTS subsystem promotion
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn t8_tts_subsystem_promoted_to_providers() {
+    let value = v3_value();
+    // [tts.openai] should be GONE from [tts] (moved to providers.tts.openai.default)
+    let tts_table = value
+        .get("tts")
+        .and_then(toml::Value::as_table)
+        .expect("[tts] retained for top-level scalars");
+    assert!(
+        !tts_table.contains_key("openai"),
+        "V2 [tts.openai] sub-block must be moved out of [tts]"
+    );
+
+    // And it should appear at providers.tts.openai.default with the api_key.
+    let api_key = value
+        .get("providers")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("tts"))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("openai"))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("default"))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("api_key"))
+        .and_then(toml::Value::as_str);
+    assert_eq!(
+        api_key,
+        Some("sk-tts-openai"),
+        "V2 [tts.openai].api_key did not land at providers.tts.openai.default.api_key"
+    );
+
+    // ElevenLabs model_id should also be carried over.
+    let eleven_model = value
+        .get("providers")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("tts"))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("elevenlabs"))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("default"))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("model_id"))
+        .and_then(toml::Value::as_str);
+    assert_eq!(eleven_model, Some("eleven_monolingual_v1"));
+}
+
+#[test]
+fn t8_tts_default_provider_rewritten_as_dotted_alias() {
+    let value = v3_value();
+    let dp = value
+        .get("tts")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("default_provider"))
+        .and_then(toml::Value::as_str);
+    assert_eq!(
+        dp,
+        Some("openai.default"),
+        "V2 tts.default_provider=\"openai\" must be rewritten as dotted V3 alias \"openai.default\""
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+// T9 + T10 — storage subsystem promotion
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn t9_memory_qdrant_promoted_to_storage() {
+    let cfg = v3_config();
+    let qdrant = cfg
+        .storage
+        .qdrant
+        .get("default")
+        .expect("[memory.qdrant] promoted to [storage.qdrant.default]");
+    assert_eq!(qdrant.url.as_deref(), Some("http://localhost:6333"));
+    assert_eq!(qdrant.collection, "zc_memories");
+    assert_eq!(qdrant.api_key.as_deref(), Some("qdrant-api-key"));
+}
+
+#[test]
+fn t9_memory_postgres_vector_fields_promoted() {
+    let cfg = v3_config();
+    let pg = cfg
+        .storage
+        .postgres
+        .get("default")
+        .expect("[memory.postgres] vector fields promoted to [storage.postgres.default]");
+    assert!(
+        pg.vector_enabled,
+        "V2 [memory.postgres] vector_enabled must land at V3 storage.postgres.default.vector_enabled"
+    );
+    assert_eq!(pg.vector_dimensions, 1536);
+}
+
+#[test]
+fn t10_storage_provider_postgres_promoted() {
+    let cfg = v3_config();
+    let pg = cfg
+        .storage
+        .postgres
+        .get("default")
+        .expect("[storage.postgres.default] exists");
+    // Connection fields from [storage.provider.config] (provider=postgres)
+    // merge with vector fields from [memory.postgres] on the same entry.
+    assert_eq!(
+        pg.db_url.as_deref(),
+        Some("postgres://user:pass@localhost/zc"),
+        "V2 [storage.provider.config].db_url must land at V3 storage.postgres.default.db_url"
+    );
+    assert_eq!(pg.schema, "zeroclaw");
+    assert_eq!(pg.table, "memories");
+    assert_eq!(pg.connect_timeout_secs, Some(30));
+}
+
+// ─────────────────────────────────────────────────────────────
+// T11 — cron job id drop + alias-keyed cron
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn t11_cron_job_id_dropped_and_alias_keyed() {
+    let cfg = v3_config();
+    let job = cfg
+        .cron
+        .get("morning_digest")
+        .expect("cron job alias derived from name slug");
+    // V2 had `id: String` on CronJobDecl; V3 removed it. The migrated job
+    // table must not carry an `id` field — assert via raw value navigation
+    // since V3 CronJobDecl doesn't even have a slot for it.
+    let value = v3_value();
+    let raw_job = value
+        .get("cron")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("morning_digest"))
+        .and_then(toml::Value::as_table)
+        .expect("cron.morning_digest in raw migrated TOML");
+    assert!(
+        !raw_job.contains_key("id"),
+        "V2 CronJobDecl.id must be dropped during V2→V3 cron restructure"
+    );
+    // Job content survives.
+    assert_eq!(job.name.as_deref(), Some("Morning Digest"));
+    assert_eq!(job.prompt.as_deref(), Some("Summarize unread messages"));
+}
+
+#[test]
+fn t11_cron_subsystem_knobs_moved_to_scheduler() {
+    let cfg = v3_config();
+    assert_eq!(
+        cfg.scheduler.max_run_history, 50,
+        "V2 cron.max_run_history must move to scheduler.max_run_history"
+    );
+    assert!(
+        cfg.scheduler.catch_up_on_startup,
+        "V2 cron.catch_up_on_startup must move to scheduler.catch_up_on_startup"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+// T12 — reliability fallback fields dropped
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn t12_reliability_fallback_fields_dropped() {
+    let value = v3_value();
+    let reliability = value
+        .get("reliability")
+        .and_then(toml::Value::as_table)
+        .expect("[reliability] block survives with non-fallback fields");
+    assert!(
+        !reliability.contains_key("fallback_providers"),
+        "V2 reliability.fallback_providers must be dropped (provider fallback eradicated)"
+    );
+    assert!(
+        !reliability.contains_key("model_fallbacks"),
+        "V2 reliability.model_fallbacks must be dropped"
+    );
+    // Unrelated fields stay (provider_retries was set in the fixture).
+    assert!(
+        reliability.contains_key("provider_retries"),
+        "non-fallback reliability fields must survive"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+// T13 — security.sandbox + .resources fold into risk_profiles.default
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn t13_security_sandbox_folded_into_risk_profile() {
+    let cfg = v3_config();
+    let profile = cfg
+        .risk_profiles
+        .get("default")
+        .expect("risk_profiles.default present");
+    assert_eq!(
+        profile.sandbox_enabled,
+        Some(true),
+        "V2 [security.sandbox].enabled must fold into risk_profiles.default.sandbox_enabled"
+    );
+    assert_eq!(
+        profile.sandbox_backend.as_deref(),
+        Some("firejail"),
+        "V2 [security.sandbox].backend must fold into risk_profiles.default.sandbox_backend"
+    );
+    assert_eq!(
+        profile.firejail_args,
+        vec!["--noroot"],
+        "V2 [security.sandbox].firejail_args must carry over"
+    );
+}
+
+#[test]
+fn t13_security_resources_folded_into_risk_profile() {
+    let cfg = v3_config();
+    let profile = cfg
+        .risk_profiles
+        .get("default")
+        .expect("risk_profiles.default present");
+    assert_eq!(profile.max_memory_mb, 512);
+    assert_eq!(profile.max_cpu_time_seconds, 600);
+    assert_eq!(profile.max_subprocesses, 10);
+    assert!(profile.memory_monitoring);
+}
+
+// ─────────────────────────────────────────────────────────────
+// T14 — per-agent V2→V3 transforms
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn t14a_max_iterations_renamed_to_max_tool_iterations() {
+    let cfg = v3_config();
+    let agent = cfg
+        .agents
+        .get("complex_agent")
+        .expect("agents.complex_agent present");
+    assert_eq!(
+        agent.max_tool_iterations, 25,
+        "V2 max_iterations=25 must land at V3 max_tool_iterations on the agent"
+    );
+}
+
+#[test]
+fn t14b_runtime_overrides_synthesize_per_agent_runtime_profile() {
+    let cfg = v3_config();
+    let agent = cfg
+        .agents
+        .get("complex_agent")
+        .expect("agents.complex_agent present");
+    assert_eq!(
+        agent.runtime_profile, "agent_complex_agent",
+        "V2 runtime overrides must point agent at synthesized per-agent runtime profile"
+    );
+    let profile = cfg
+        .runtime_profiles
+        .get("agent_complex_agent")
+        .expect("synthesized runtime_profiles.agent_complex_agent");
+    assert!(profile.agentic);
+    assert_eq!(profile.allowed_tools, vec!["shell", "memory"]);
+    assert_eq!(profile.timeout_secs, Some(180));
+    assert_eq!(profile.agentic_timeout_secs, Some(600));
+}
+
+#[test]
+fn t14c_max_depth_synthesizes_per_agent_risk_profile() {
+    let cfg = v3_config();
+    let agent = cfg
+        .agents
+        .get("complex_agent")
+        .expect("agents.complex_agent present");
+    assert_eq!(
+        agent.risk_profile, "agent_complex_agent",
+        "V2 max_depth must point agent at synthesized per-agent risk profile"
+    );
+    let profile = cfg
+        .risk_profiles
+        .get("agent_complex_agent")
+        .expect("synthesized risk_profiles.agent_complex_agent");
+    assert_eq!(profile.max_delegation_depth, 4);
+}
+
+#[test]
+fn t14d_skills_directory_dropped() {
+    let value = v3_value();
+    let agent = value
+        .get("agents")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("complex_agent"))
+        .and_then(toml::Value::as_table)
+        .expect("agents.complex_agent in raw migrated TOML");
+    assert!(
+        !agent.contains_key("skills_directory"),
+        "V2 agents.<id>.skills_directory must be dropped (V3 uses skill_bundles aliases)"
+    );
+}
+
+#[test]
+fn t14e_memory_namespace_widening() {
+    let cfg = v3_config();
+    let agent = cfg
+        .agents
+        .get("complex_agent")
+        .expect("agents.complex_agent present");
+    assert_eq!(
+        agent.memory_namespace, "complex",
+        "V2 Option<String> memory_namespace must widen to V3 String unchanged"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+// V3 fields synthesized from V1/V2 input
+// ─────────────────────────────────────────────────────────────
+
+#[test]
 fn autonomy_synthesized_into_risk_profiles_default() {
-    let cfg = migrate_to_current(V1_FIXTURE).unwrap();
+    let cfg = v3_config();
     let profile = cfg
         .risk_profiles
         .get("default")
         .expect("risk_profiles.default synthesized from [autonomy]");
     assert_eq!(profile.allowed_commands, vec!["ls", "git", "cat"]);
-    assert!(
-        profile.workspace_only,
-        "V2 autonomy.workspace_only carried into V3 risk_profile.workspace_only"
-    );
+    assert!(profile.workspace_only);
     assert_eq!(
         profile.excluded_tools,
         vec!["browser"],
@@ -199,7 +656,7 @@ fn autonomy_synthesized_into_risk_profiles_default() {
 
 #[test]
 fn agent_synthesized_into_runtime_profiles_default() {
-    let cfg = migrate_to_current(V1_FIXTURE).unwrap();
+    let cfg = v3_config();
     let profile = cfg
         .runtime_profiles
         .get("default")
@@ -210,28 +667,25 @@ fn agent_synthesized_into_runtime_profiles_default() {
     assert_eq!(profile.tool_dispatcher.as_deref(), Some("auto"));
 }
 
+// ─────────────────────────────────────────────────────────────
+// cost.prices fold (covered already)
+// ─────────────────────────────────────────────────────────────
+
 #[test]
 fn cost_prices_folded_into_provider_pricing() {
-    let cfg = migrate_to_current(V1_FIXTURE).unwrap();
-    let anthropic_default = cfg
+    let cfg = v3_config();
+    let anth = cfg
         .providers
         .models
         .get("anthropic")
         .and_then(|m| m.get("default"))
         .expect("anthropic.default exists");
     assert_eq!(
-        anthropic_default
-            .pricing
-            .get("claude-sonnet-4-5.input")
-            .copied(),
-        Some(3.0),
-        "V1 [cost.prices.anthropic.claude-sonnet-4-5.input] folded onto provider pricing"
+        anth.pricing.get("claude-sonnet-4-5.input").copied(),
+        Some(3.0)
     );
     assert_eq!(
-        anthropic_default
-            .pricing
-            .get("claude-sonnet-4-5.output")
-            .copied(),
+        anth.pricing.get("claude-sonnet-4-5.output").copied(),
         Some(15.0)
     );
 }
@@ -242,10 +696,7 @@ fn cost_prices_folded_into_provider_pricing() {
 
 #[test]
 fn passthrough_propagates_unknown_section() {
-    let migrated = migrate_file(V1_FIXTURE)
-        .expect("migrate_file succeeds")
-        .expect("migration ran (V1 → V3)");
-    let value: toml::Value = toml::from_str(&migrated).unwrap();
+    let value = v3_value();
     let custom = value
         .get("my_custom_section")
         .and_then(toml::Value::as_table)
@@ -266,8 +717,7 @@ fn comment_preserved_on_surviving_key() {
         .expect("migrate_file succeeds")
         .expect("migration ran");
     // [cost] survives V1 → V3 (with prices stripped). Its leading comment
-    // "# Cost tracking limits and per-model pricing." should round-trip
-    // through the toml_edit::DocumentMut reconciliation.
+    // should round-trip through the toml_edit::DocumentMut reconciliation.
     assert!(
         migrated.contains("Cost tracking limits"),
         "[cost] section comment was not preserved across migration"
@@ -280,7 +730,6 @@ fn comment_preserved_on_surviving_key() {
 
 #[test]
 fn migrate_file_is_none_when_already_current() {
-    // Synthesize a minimal V3 input by running the chain once and serializing.
     let v3_string = migrate_file(V1_FIXTURE)
         .expect("first migrate succeeds")
         .expect("first migrate ran");
@@ -337,7 +786,6 @@ fn file_api_writes_backup_first() {
 fn file_api_no_op_when_already_current() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("config.toml");
-    // Migrate V1 fixture to V3, then write V3 to disk and call migrate again.
     let v3 = migrate_file(V1_FIXTURE).unwrap().unwrap();
     std::fs::write(&path, &v3).expect("seed V3");
     let report = migrate_file_in_place(&path).expect("migrate_file_in_place succeeds");
@@ -419,97 +867,35 @@ fn malformed_schema_version_returns_clean_error() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// inventory check — every transform documented in V1Config /
-// V2Config has at least one test asserting its outcome.
+// signal "dm" sentinel — separate test because the V1 fixture above
+// uses a non-"dm" value to exercise the array fold path. This test
+// inlines a minimal V1 input to exercise the sentinel branch.
 // ─────────────────────────────────────────────────────────────
 
 #[test]
-fn inventory_check_v1_to_v2() {
-    // Each entry corresponds to a V1Config explicit field. If a transform is
-    // added (new explicit field on V1Config), this list must grow and a
-    // corresponding test must exist. The `assert!(...)` chains below verify
-    // that the V1 fixture exercises each one and the migration produces the
-    // expected outcome.
-    let cfg = migrate_to_current(V1_FIXTURE).unwrap();
-    let openai_default = cfg
-        .providers
-        .models
-        .get("openai")
-        .and_then(|m| m.get("default"))
-        .expect("openai default entry");
-    assert!(openai_default.api_key.is_some(), "api_key folded");
-    assert!(
-        openai_default.base_url.is_some(),
-        "api_url → base_url folded"
-    );
-    assert!(
-        openai_default.model.is_some(),
-        "default_model → model folded"
-    );
-    assert!(
-        openai_default.temperature.is_some(),
-        "default_temperature → temperature folded"
-    );
-    assert!(
-        openai_default.timeout_secs.is_some(),
-        "provider_timeout_secs → timeout_secs folded"
-    );
-    assert!(
-        openai_default.max_tokens.is_some(),
-        "provider_max_tokens → max_tokens folded"
-    );
-    assert!(
-        !openai_default.extra_headers.is_empty(),
-        "extra_headers folded"
-    );
-    assert!(
-        cfg.providers.models.contains_key("anthropic"),
-        "model_providers entries alias-wrapped"
-    );
-    assert!(
-        !cfg.providers.model_routes.is_empty(),
-        "model_routes preserved"
-    );
-    assert!(
-        cfg.channels.discord.contains_key("default"),
-        "channels_config → channels alias-wrapped"
-    );
-}
+fn t6_signal_dm_sentinel_sets_dm_only() {
+    let raw = r#"
+default_provider = "openai"
+default_model = "gpt-4o-mini"
 
-#[test]
-fn inventory_check_v2_to_v3() {
-    // Each entry corresponds to a V2Config explicit field's transform.
-    let cfg = migrate_to_current(V1_FIXTURE).unwrap();
+[channels_config.signal]
+enabled = true
+http_url = "http://127.0.0.1:8686"
+account = "+15555550100"
+group_id = "dm"
+"#;
+    let cfg = migrate_to_current(raw).expect("dm-sentinel V1 migrates");
+    let signal = cfg
+        .channels
+        .signal
+        .get("default")
+        .expect("channels.signal.default present");
     assert!(
-        cfg.risk_profiles.contains_key("default"),
-        "autonomy → risk_profiles.default synthesized"
+        signal.dm_only,
+        "V2 signal.group_id=\"dm\" must set V3 signal.dm_only=true"
     );
     assert!(
-        cfg.runtime_profiles.contains_key("default"),
-        "agent → runtime_profiles.default synthesized"
-    );
-    // swarms drop is implicit (no swarms in V3 Config struct at all post-RFC).
-    let discord_default = cfg.channels.discord.get("default").unwrap();
-    assert!(
-        discord_default.archive,
-        "channels.discord_history → archive=true folded"
-    );
-    let anthropic_default = cfg
-        .providers
-        .models
-        .get("anthropic")
-        .and_then(|m| m.get("default"))
-        .unwrap();
-    assert!(
-        !anthropic_default.pricing.is_empty(),
-        "cost.prices folded into provider pricing"
-    );
-    assert!(
-        cfg.providers
-            .models
-            .get("anthropic")
-            .and_then(|m| m.get("claude-code"))
-            .is_some(),
-        "standalone claude-code provider folded under anthropic.claude-code"
+        signal.group_ids.is_empty(),
+        "the \"dm\" sentinel must NOT also land in group_ids[]"
     );
 }

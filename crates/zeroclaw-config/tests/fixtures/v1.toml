@@ -1,23 +1,16 @@
 # V1 migration fixture (pre-versioned schema).
 #
-# Hand-authored to exercise every transformation the V1→V2→V3 chain knows
-# about. Loaded via `include_str!` from `tests/migration.rs` (test-only;
-# never compiled into release binaries).
+# Every transformation rule listed in the plan's Step 0 / drill-down ground
+# truth has at least one populated source field here. Tests in
+# `tests/migration.rs` assert the destination after V1 → V2 → V3.
 #
-# When adding a new V1→V2 or V2→V3 transformation rule, extend this fixture
-# to populate the source field and add a test that asserts the destination
-# in V3 output.
-#
-# Keys present here are exercised by `tests/migration.rs`. Anything else
-# is a "passthrough" example proving that unmodeled keys propagate
-# unchanged through the chain.
+# Loaded via `include_str!` (test build only — never compiled into release
+# binaries).
 
-# ── V1 globals — fold into V2 [providers] then per-provider model entries ──
-
-# Comment-preservation test target: this comment lives on a top-level
-# section that survives V1 → V3 (the [cost] block, below). When the
-# comment-preservation pass runs, the "Cost tracking …" comment should
-# still be attached to [cost] in the migrated V3 output.
+# ──────────────────────────────────────────────────────────────────────
+# V1 globals (top-level) — fold into V2 [providers], then V3
+# providers.models.<type>.default during V2→V3.
+# ──────────────────────────────────────────────────────────────────────
 
 api_key       = "sk-v1-test-global"
 api_url       = "https://api.example.com/v1"
@@ -28,45 +21,104 @@ default_temperature = 0.5
 provider_timeout_secs = 90
 provider_max_tokens   = 4096
 
-# Top-level [extra_headers] — folds into providers.models.<type>.default.extra_headers
+# Top-level [extra_headers] — folds into the synthesized provider entry's
+# extra_headers map.
 [extra_headers]
 User-Agent   = "ZeroClaw-V1-Test/1.0"
 "X-Title"    = "zeroclaw"
 
-# ── V1 [model_providers.<id>] flat → V2 providers.models flat → V3 aliased ──
-
+# V1 [model_providers.<id>] flat → V2 providers.models flat → V3 aliased.
 [model_providers.anthropic]
 api_key = "sk-ant-v1-test"
 model   = "claude-sonnet-4-5"
 base_url = "https://api.anthropic.com"
 
-# Standalone claude-code provider should land at providers.models.anthropic.claude-code in V3.
+# Standalone claude-code provider should land at providers.models.anthropic.claude-code.
 [model_providers.claude-code]
 api_key = "sk-cc-v1-test"
-
-# ── V1 model_routes / embedding_routes — preserved at providers level in V3 ──
 
 [[model_routes]]
 hint     = "fast"
 provider = "openai"
 model    = "gpt-4o-mini"
 
-# ── V1 channels_config → V2 channels → V3 channels.<type>.<alias> ──
+# ──────────────────────────────────────────────────────────────────────
+# Channels — exercises T1, T2 (V1→V2) and T3, T4, T5, T6, T7 (V2→V3)
+# plus the discord_history fold and the channels_config → channels rename.
+# ──────────────────────────────────────────────────────────────────────
 
 [channels_config]
 cli = true
 
+# T1: V1 matrix.room_id → matrix.allowed_rooms[].
+[channels_config.matrix]
+enabled = true
+homeserver = "https://matrix.org"
+access_token = "matrix-bot-token"
+room_id = "!important-room:matrix.org"
+allowed_users = ["@admin:matrix.org"]
+
+# T2: V1 slack.channel_id → slack.channel_ids[].
+# Also keeps the V2-era enabled=true so T7 lets it through.
+[channels_config.slack]
+enabled = true
+bot_token = "xoxb-slack-token"
+app_token = "xapp-slack-token"
+channel_id = "C01ABCD0001"
+
+# T3: discord.guild_id → guild_ids[]. Also a baseline enabled=true channel.
 [channels_config.discord]
+enabled = true
 bot_token = "discord-bot-token-v1"
 guild_id  = "11111"
 allowed_users = ["111", "222"]
 
-# Legacy discord_history sidecar — folds into channels.discord.<alias>.archive=true
+# discord_history fold: archive=true on merged discord block. Effective
+# enabled = discord.enabled OR discord_history.enabled.
 [channels_config.discord_history]
+enabled = true
 bot_token = "discord-bot-token-v1"
 channel_ids = ["aaaa", "bbbb"]
 
-# ── V1 [autonomy] → V3 [risk_profiles.default] (synthesize) ──
+# T4: mattermost.channel_id → channel_ids[].
+[channels_config.mattermost]
+enabled = true
+url = "https://mattermost.example.com"
+bot_token = "mm-bot-token"
+channel_id = "mm-channel-001"
+
+# T5: reddit.subreddit → subreddits[].
+[channels_config.reddit]
+enabled = true
+client_id = "reddit-client-id"
+client_secret = "reddit-client-secret"
+refresh_token = "reddit-refresh-token"
+username = "test-bot"
+subreddit = "rust"
+
+# T6: signal.group_id → group_ids[] (non-"dm" value).
+[channels_config.signal]
+enabled = true
+http_url = "http://127.0.0.1:8686"
+account = "+15551234567"
+group_id = "group-abc-001"
+
+# T7 negative case: a configured but explicitly-disabled channel must be
+# DROPPED from the V3 alias map. Tests assert this is gone.
+[channels_config.webhook]
+enabled = false
+port = 8080
+send_url = "https://disabled.example.com/hook"
+
+# T7 negative case: a channel with no `enabled` field defaults to false in
+# V2 and must also be dropped (V3 has no off-switch other than absence).
+[channels_config.imessage]
+allowed_contacts = ["+15555550100"]
+
+# ──────────────────────────────────────────────────────────────────────
+# Autonomy/agent → V3 risk_profiles.default + runtime_profiles.default.
+# ──────────────────────────────────────────────────────────────────────
+
 [autonomy]
 level = "supervised"
 workspace_only = true
@@ -83,7 +135,6 @@ allowed_roots = ["~/workspace"]
 non_cli_excluded_tools = ["browser"]   # renamed to `excluded_tools` in V3
 shell_timeout_secs = 60
 
-# ── V1 [agent] → V3 [runtime_profiles.default] (synthesize) ──
 [agent]
 parallel_tools = true
 max_history_messages = 50
@@ -91,8 +142,134 @@ max_context_tokens = 32000
 tool_dispatcher = "auto"
 max_tool_iterations = 10
 
-# ── V1 [cost] — pricing folds into providers.models[*].pricing in V3 ──
+# ──────────────────────────────────────────────────────────────────────
+# T13: V2 [security.sandbox] and [security.resources] fold into
+# risk_profiles.default sandbox_*/max_*/firejail_args/memory_monitoring.
+# ──────────────────────────────────────────────────────────────────────
+
+[security.sandbox]
+enabled = true
+backend = "firejail"
+firejail_args = ["--noroot"]
+
+[security.resources]
+max_memory_mb = 512
+max_cpu_time_seconds = 600
+max_subprocesses = 10
+memory_monitoring = true
+
+# ──────────────────────────────────────────────────────────────────────
+# T11: cron.jobs Vec<CronJobDecl> + id field → V3 cron HashMap keyed by
+# alias; the `id` field is dropped (V3 keys via the HashMap key).
+# ──────────────────────────────────────────────────────────────────────
+
+[cron]
+enabled = true
+catch_up_on_startup = true
+max_run_history = 50
+
+[[cron.jobs]]
+id = "morning-digest-id"
+name = "Morning Digest"
+job_type = "agent"
+schedule = { kind = "cron", expr = "0 8 * * *" }
+prompt = "Summarize unread messages"
+enabled = true
+uses_memory = true
+
+# ──────────────────────────────────────────────────────────────────────
+# T12: V2 [reliability] fallback fields removed in V3 (provider fallback
+# eradicated, f8c66f1dd).
+# ──────────────────────────────────────────────────────────────────────
+
+[reliability]
+provider_retries = 3
+fallback_providers = ["anthropic", "openai"]
+
+[reliability.model_fallbacks]
+"gpt-4o" = ["claude-sonnet-4-5", "gpt-4o-mini"]
+
+# ──────────────────────────────────────────────────────────────────────
+# T8: V2 [tts] subsystem → V3 [providers.tts.<type>.default].
+# ──────────────────────────────────────────────────────────────────────
+
+[tts]
+enabled = true
+default_provider = "openai"
+default_voice = "alloy"
+default_format = "mp3"
+max_text_length = 4096
+
+[tts.openai]
+api_key = "sk-tts-openai"
+model = "tts-1-hd"
+speed = 1.0
+
+[tts.elevenlabs]
+api_key = "sk-tts-eleven"
+model_id = "eleven_monolingual_v1"
+stability = 0.5
+similarity_boost = 0.5
+
+# ──────────────────────────────────────────────────────────────────────
+# T9: V2 [memory.qdrant] + [memory.postgres] → V3 [storage.qdrant.default]
+# and [storage.postgres.default] (vector fields).
+# ──────────────────────────────────────────────────────────────────────
+
+[memory]
+backend = "qdrant"
+sqlite_open_timeout_secs = 60   # V3-removed; should be dropped silently
+
+[memory.qdrant]
+url = "http://localhost:6333"
+collection = "zc_memories"
+api_key = "qdrant-api-key"
+
+[memory.postgres]
+vector_enabled = true
+vector_dimensions = 1536
+
+# ──────────────────────────────────────────────────────────────────────
+# T10: V2 [storage.provider.config] → V3 [storage.<provider>.<alias>].
+# ──────────────────────────────────────────────────────────────────────
+
+[storage.provider.config]
+provider = "postgres"
+db_url = "postgres://user:pass@localhost/zc"
+schema = "zeroclaw"
+table = "memories"
+connect_timeout_secs = 30
+
+# ──────────────────────────────────────────────────────────────────────
+# T14: per-agent V2→V3 transforms. `complex_agent` exercises every
+# field-level move (max_iterations rename, agentic/allowed_tools/
+# timeout_secs/agentic_timeout_secs runtime override synthesis,
+# max_depth → risk profile, skills_directory drop, memory_namespace
+# widening). `simple_agent` exercises only the brain fold.
+# ──────────────────────────────────────────────────────────────────────
+
+[agents.simple_agent]
+provider = "openai"
+model = "gpt-4o-mini"
+
+[agents.complex_agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+api_key = "sk-ant-complex"
+temperature = 0.3
+max_iterations = 25                # → max_tool_iterations on V3 agent
+max_depth = 4                      # → risk_profiles.agent_complex_agent.max_delegation_depth
+agentic = true                     # → runtime_profiles.agent_complex_agent.agentic
+allowed_tools = ["shell", "memory"] # → runtime_profiles.agent_complex_agent.allowed_tools
+timeout_secs = 180                 # → runtime_profiles.agent_complex_agent.timeout_secs
+agentic_timeout_secs = 600         # → runtime_profiles.agent_complex_agent.agentic_timeout_secs
+skills_directory = "/opt/zeroclaw/skills"  # dropped (V3 wants skill_bundles aliases)
+memory_namespace = "complex"
+
+# ──────────────────────────────────────────────────────────────────────
 # Cost tracking limits and per-model pricing.
+# ──────────────────────────────────────────────────────────────────────
+
 [cost]
 enabled = true
 daily_limit_usd = 25.0
@@ -103,7 +280,10 @@ warn_at_percent = 80
 "claude-sonnet-4-5.input"  = 3.0
 "claude-sonnet-4-5.output" = 15.0
 
-# ── Unknown top-level section — must propagate to V3 unchanged (passthrough) ──
+# ──────────────────────────────────────────────────────────────────────
+# Unknown top-level section — must propagate to V3 unchanged (passthrough).
+# ──────────────────────────────────────────────────────────────────────
+
 [my_custom_section]
 custom_field = "preserved-through-chain"
 nested_value = 42
