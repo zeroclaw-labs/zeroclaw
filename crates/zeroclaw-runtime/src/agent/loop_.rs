@@ -2481,7 +2481,7 @@ pub async fn run(
     let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
         crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.workspace_dir)
             .map(|tracker| {
-                ToolLoopCostTrackingContext::new(tracker, Arc::new(config.cost.prices.clone()))
+                ToolLoopCostTrackingContext::new(tracker, Arc::new(config.combined_pricing()))
             });
 
     // ── Execute ──────────────────────────────────────────────────

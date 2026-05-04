@@ -603,6 +603,14 @@ pub struct ModelProviderConfig {
     /// Example: `provider_extra = { provider = { only = ["Anthropic"] } }`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_extra: Option<serde_json::Value>,
+    /// Per-provider input/output token pricing (USD per 1M tokens). When set,
+    /// merged into the cost-tracking lookup at `<provider_id>/<model>` so the
+    /// budget surface attributes spend correctly even when the same model is
+    /// served by different providers at different rates. Top-level
+    /// `[cost.prices.<key>]` entries continue to take precedence on conflict;
+    /// this field is purely additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -9951,6 +9959,28 @@ async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
 }
 
 impl Config {
+    /// Combine top-level `[cost.prices.<key>]` entries with any per-provider
+    /// `pricing` entries declared on `[providers.models.<id>]`. Per-provider
+    /// pricing is keyed as `<provider_id>/<model>` to align with the lookup
+    /// pattern in `record_tool_loop_cost_usage` (direct → `provider/model`
+    /// → suffix-after-last-slash). Top-level entries win on conflict so
+    /// existing operator overrides are never silently shadowed.
+    pub fn combined_pricing(&self) -> std::collections::HashMap<String, ModelPricing> {
+        let mut combined = self.cost.prices.clone();
+        for (provider_id, provider) in &self.providers.models {
+            let (Some(pricing), Some(model)) = (&provider.pricing, &provider.model) else {
+                continue;
+            };
+            if model.is_empty() {
+                continue;
+            }
+            combined
+                .entry(format!("{provider_id}/{model}"))
+                .or_insert_with(|| pricing.clone());
+        }
+        combined
+    }
+
     /// Return top-level TOML keys in `raw_toml` that Config does not recognise.
     ///
     /// Keys present in `Config::default()` serialization pass immediately.
@@ -11769,6 +11799,15 @@ impl_enum_prop_kind!(
     SandboxBackend,
     AutonomyLevel,
 );
+
+impl HasPropKind for ModelPricing {
+    // ModelPricing is a 2-field struct (`input`, `output`). The dashboard form
+    // renders it as a string field where the operator pastes a TOML inline
+    // table; round-trip via `set_prop` stays correct because serde
+    // deserializes the TOML back into a typed ModelPricing. Power users still
+    // hand-edit `config.toml` directly when convenient.
+    const PROP_KIND: PropKind = PropKind::String;
+}
 
 impl HasPropKind for serde_json::Value {
     // `serde_json::Value` is an arbitrary JSON document, not an enum.

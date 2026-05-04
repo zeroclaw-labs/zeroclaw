@@ -5770,7 +5770,7 @@ pub async fn start_channels(
         )
         .map(|tracker| ChannelCostTrackingState {
             tracker,
-            prices: Arc::new(config.cost.prices.clone()),
+            prices: Arc::new(config.combined_pricing()),
         }),
         pacing: config.pacing.clone(),
         max_tool_result_chars: config.agent.max_tool_result_chars,
