@@ -27,6 +27,12 @@ pub enum PropKind {
     /// Schema v3 / #5947 will migrate the load-bearing ones (mcp.servers etc.)
     /// to `HashMap<String, T>` keyed tables; until then this kind covers them.
     ObjectArray,
+    /// A struct-shaped scalar field (e.g. `Option<ModelPricing>`). Round-tripped
+    /// on the wire as a JSON object; the dashboard renders a sub-form for the
+    /// inner fields using the JSON Schema from `OPTIONS /api/config`. Distinct
+    /// from `String`, which inserts the raw value as a TOML string and breaks
+    /// the serde round-trip for typed structs (#6357 review).
+    Object,
 }
 
 /// Maps Rust types to PropKind at compile time.

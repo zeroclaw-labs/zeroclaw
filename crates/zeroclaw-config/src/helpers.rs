@@ -207,6 +207,20 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
                 anyhow::anyhow!("JSON value contained only nulls — nothing to write")
             })
         }
+        // Struct-shaped scalar: parse the JSON object into a TOML table so
+        // the parent serde round-trip deserializes into the typed struct
+        // (e.g. `Option<ModelPricing>`). Inserting a raw String here would
+        // fail serde because the field is typed, not free-form text.
+        PropKind::Object => {
+            let v: serde_json::Value = serde_json::from_str(value_str)
+                .map_err(|e| anyhow::anyhow!("invalid JSON object: {e}"))?;
+            if !matches!(v, serde_json::Value::Object(_)) {
+                anyhow::bail!("Object field requires a JSON object; got {v}");
+            }
+            json_to_toml(v).ok_or_else(|| {
+                anyhow::anyhow!("JSON object contained only nulls — nothing to write")
+            })
+        }
     }
 }
 

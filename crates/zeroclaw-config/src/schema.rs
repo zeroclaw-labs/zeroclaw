@@ -11801,12 +11801,14 @@ impl_enum_prop_kind!(
 );
 
 impl HasPropKind for ModelPricing {
-    // ModelPricing is a 2-field struct (`input`, `output`). The dashboard form
-    // renders it as a string field where the operator pastes a TOML inline
-    // table; round-trip via `set_prop` stays correct because serde
-    // deserializes the TOML back into a typed ModelPricing. Power users still
-    // hand-edit `config.toml` directly when convenient.
-    const PROP_KIND: PropKind = PropKind::String;
+    // ModelPricing is a 2-field struct (`input`, `output`). Wire form is a
+    // JSON object (e.g. `{"input": 1.0, "output": 2.5}`); the dashboard
+    // renders a sub-form for the inner fields. `PropKind::Object` (vs
+    // `String`) is what makes the round-trip through `Config::set_prop`
+    // succeed — `parse_prop_value` parses the JSON into a TOML table so
+    // serde deserializes it back into the typed `ModelPricing` instead
+    // of failing on a TOML string (#6357 review).
+    const PROP_KIND: PropKind = PropKind::Object;
 }
 
 impl HasPropKind for serde_json::Value {
@@ -18678,6 +18680,118 @@ allowed_users = ["@u:m"]
         assert!(
             combined.is_empty(),
             "empty model string must be treated the same as missing, got {combined:?}"
+        );
+    }
+
+    // ── set_prop round-trip for `pricing` (#6357 review) ──────────────
+    //
+    // Dashboard / JSON-patch callers send `pricing` as a JSON object
+    // (`{"input": 1.0, "output": 2.5}`). Before #6357 review, `pricing` was
+    // classified as `PropKind::String`, which meant `parse_prop_value`
+    // inserted the JSON text as a TOML string and serde failed to
+    // deserialize it back into `Option<ModelPricing>`. The fix classifies
+    // `ModelPricing` as `PropKind::Object` and routes through `json_to_toml`
+    // so the value lands as a typed inline table. These tests pin that
+    // contract end-to-end through `Config::set_prop` and the wire-form
+    // coercion at `coerce_for_set_prop`.
+
+    #[test]
+    async fn set_prop_round_trips_per_provider_pricing_object() {
+        let mut config = config_with_provider("openai", Some("gpt-4o"), None);
+
+        // Caller hits `Config::set_prop` directly with the JSON-stringified
+        // object that the dashboard / CLI hand off after type coercion.
+        config
+            .set_prop(
+                "providers.models.openai.pricing",
+                r#"{"input": 1.5, "output": 6.0}"#,
+            )
+            .expect("set_prop must accept a JSON object for pricing");
+
+        // Round-trip 1: typed access on the struct must reflect the write.
+        let pricing = config
+            .providers
+            .models
+            .get("openai")
+            .and_then(|m| m.pricing.clone())
+            .expect("pricing must round-trip back into a typed ModelPricing, not a string");
+        assert_eq!(pricing.input, 1.5);
+        assert_eq!(pricing.output, 6.0);
+
+        // Round-trip 2: the merged pricing map (the runtime/channel cost
+        // contexts consume this) must show the new values keyed under
+        // `<provider_id>/<model>`.
+        let combined = config.combined_pricing();
+        let entry = combined
+            .get("openai/gpt-4o")
+            .expect("set_prop write must surface in combined_pricing");
+        assert_eq!(entry.input, 1.5);
+        assert_eq!(entry.output, 6.0);
+    }
+
+    #[test]
+    async fn set_prop_pricing_rejects_non_object_string_payload() {
+        // Sanity: a quoted JSON string (which is what the buggy
+        // `PropKind::String` path would have silently accepted by writing
+        // the raw text into a TOML string field) must NOT round-trip into
+        // a typed `ModelPricing`. The fix is `PropKind::Object`, which
+        // requires a JSON object; anything else fails set_prop and leaves
+        // the field unchanged. We assert the failure is observable AND
+        // that no garbage state was written.
+        let mut config = config_with_provider("openai", Some("gpt-4o"), None);
+
+        let result = config.set_prop(
+            "providers.models.openai.pricing",
+            "\"{\\\"input\\\":1.5,\\\"output\\\":6.0}\"",
+        );
+        assert!(
+            result.is_err(),
+            "a JSON string in place of an object must be rejected by set_prop"
+        );
+        // Pricing must still be `None` — no partial / garbage write.
+        let pricing_after = config
+            .providers
+            .models
+            .get("openai")
+            .and_then(|m| m.pricing.clone());
+        assert!(
+            pricing_after.is_none(),
+            "rejected set_prop must not mutate pricing, got {pricing_after:?}"
+        );
+    }
+
+    #[test]
+    async fn coerce_for_set_prop_object_round_trips_pricing_payload() {
+        use crate::traits::PropKind;
+        use crate::typed_value::coerce_for_set_prop;
+
+        // Dashboard / CLI sends a real JSON object; the coercion layer
+        // must hand it back as a JSON-stringified object (the wire form
+        // that `parse_prop_value`'s `Object` arm consumes).
+        let coerced = coerce_for_set_prop(
+            &serde_json::json!({"input": 1.5, "output": 6.0}),
+            Some(PropKind::Object),
+        )
+        .expect("JSON object payload must coerce successfully for an Object field");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&coerced).expect("coerced output must remain valid JSON");
+        assert_eq!(parsed, serde_json::json!({"input": 1.5, "output": 6.0}));
+    }
+
+    #[test]
+    async fn coerce_for_set_prop_object_rejects_non_object() {
+        use crate::traits::PropKind;
+        use crate::typed_value::coerce_for_set_prop;
+
+        let err = coerce_for_set_prop(
+            &serde_json::json!("{\"input\":1.5}"),
+            Some(PropKind::Object),
+        )
+        .expect_err("a JSON string is not a JSON object — must be rejected");
+        assert!(
+            err.message.contains("object"),
+            "rejection message must name the object requirement, got: {}",
+            err.message
         );
     }
 }
