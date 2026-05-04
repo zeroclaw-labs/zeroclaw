@@ -36,6 +36,11 @@ pub struct SlackChannel {
     workspace_dir: Option<PathBuf>,
     /// Maps channel_id -> thread_ts for active assistant threads (used for status indicators).
     active_assistant_thread: Mutex<HashMap<String, String>>,
+    /// Threads (`thread_ts`) for which we have already prepended a
+    /// `[Thread context]` backfill block on the first inbound message.
+    /// Reset on process restart; one re-backfill per thread after restart
+    /// is acceptable. Bounded by `SLACK_THREAD_BACKFILL_SEEN_MAX`.
+    seen_threads: Mutex<HashSet<String>>,
     /// Use the newer `markdown` block type (richer formatting, 12k char limit).
     use_markdown_blocks: bool,
     /// Per-channel proxy URL override.
@@ -84,6 +89,10 @@ const SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE: usize = 8;
 const SLACK_PERMALINK_MAX_LINKS_PER_MESSAGE: usize = 3;
 const SLACK_PERMALINK_THREAD_MAX_REPLIES: usize = 20;
 const SLACK_PERMALINK_TEXT_MAX_CHARS: usize = 8_000;
+/// Soft cap on entries in `SlackChannel::seen_threads`. When this is
+/// exceeded the set is cleared, so any active thread sees one re-backfill
+/// next time a message arrives in it. Per-process only (lost on restart).
+const SLACK_THREAD_BACKFILL_SEEN_MAX: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SlackPermalinkRef {
@@ -179,6 +188,7 @@ impl SlackChannel {
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
             active_assistant_thread: Mutex::new(HashMap::new()),
+            seen_threads: Mutex::new(HashSet::new()),
             use_markdown_blocks: false,
             proxy_url: None,
             transcription: None,
@@ -833,6 +843,7 @@ impl SlackChannel {
     async fn build_incoming_content(
         &self,
         message: &serde_json::Value,
+        channel_id: &str,
         require_mention: bool,
         bot_user_id: &str,
     ) -> Option<String> {
@@ -843,9 +854,67 @@ impl SlackChannel {
         let normalized_text = Self::normalize_incoming_text(text, require_mention, bot_user_id)?;
         let attachment_blocks = self.render_file_attachments(message).await;
         let permalink_blocks = self.resolve_permalink_blocks(&normalized_text).await;
-        let mut blocks = attachment_blocks;
+
+        // Thread context backfill: when this message is a reply in a thread
+        // (thread_ts present and != ts) and the bot has not yet seen this
+        // thread in the current process, fetch the thread and prepend a
+        // `[Thread context]` block.
+        let backfill_block = self
+            .maybe_render_thread_backfill(message, channel_id, bot_user_id)
+            .await;
+
+        let mut blocks = Vec::new();
+        if let Some(block) = backfill_block {
+            blocks.push(block);
+        }
+        blocks.extend(attachment_blocks);
         blocks.extend(permalink_blocks);
         Self::compose_incoming_content(normalized_text, blocks)
+    }
+
+    /// First-encounter thread-context gate. Returns a rendered
+    /// `[Thread context]` block when this is the first message we forward
+    /// for the given thread; returns `None` for top-level messages, thread
+    /// parents, threads we have already backfilled, or fetch failures.
+    ///
+    /// Marks the thread as seen on success, leaves `seen_threads` untouched
+    /// on fetch failure so the next message in the same thread can retry.
+    async fn maybe_render_thread_backfill(
+        &self,
+        message: &serde_json::Value,
+        channel_id: &str,
+        bot_user_id: &str,
+    ) -> Option<String> {
+        let ts = message
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let thread_ts = message.get("thread_ts").and_then(|v| v.as_str())?;
+        if thread_ts.is_empty() || thread_ts == ts {
+            return None;
+        }
+
+        // Already seen → skip backfill.
+        {
+            let seen = self.seen_threads.lock().ok()?;
+            if seen.contains(thread_ts) {
+                return None;
+            }
+        }
+
+        let block = self
+            .render_thread_backfill_block(channel_id, thread_ts, bot_user_id)
+            .await?;
+
+        // Fetch succeeded — record the thread as seen.
+        if let Ok(mut seen) = self.seen_threads.lock() {
+            if seen.len() >= SLACK_THREAD_BACKFILL_SEEN_MAX {
+                seen.clear();
+            }
+            seen.insert(thread_ts.to_string());
+        }
+
+        Some(block)
     }
 
     async fn resolve_permalink_blocks(&self, text: &str) -> Vec<String> {
@@ -1143,6 +1212,91 @@ impl SlackChannel {
             let rendered = self.render_permalink_message_line(&message, true).await?;
             lines.push("Message:".to_string());
             lines.push(rendered);
+        }
+
+        Self::truncate_text(&lines.join("\n"), SLACK_PERMALINK_TEXT_MAX_CHARS)
+    }
+
+    /// Build a `[Thread context]` block summarising the parent and prior
+    /// replies of `thread_ts`, suitable for prepending to the agent payload
+    /// on the bot's first encounter with a thread.
+    ///
+    /// Behaviour:
+    /// - Fail-open: if the underlying Slack fetch fails, returns `None`.
+    /// - Allow-list filtering: messages from users not on the channel's
+    ///   allow-list are dropped; the count is surfaced as a visible gap
+    ///   marker so the agent knows context is missing for policy reasons.
+    ///   Messages with no `user` field (webhooks / other bots) and the
+    ///   bot's own past replies are NOT subject to the allow-list filter
+    ///   and pass through — the bot's prior turns are useful self-context,
+    ///   and webhook content is already trusted at ingest.
+    /// - Reply cap: only the most recent `SLACK_PERMALINK_THREAD_MAX_REPLIES`
+    ///   allow-listed messages are rendered, with a `… N earlier thread
+    ///   messages omitted …` prefix marker when the cap activates.
+    /// - Char cap: the joined block is clipped to
+    ///   `SLACK_PERMALINK_TEXT_MAX_CHARS` via `truncate_text`, which
+    ///   appends a `…[truncated]` suffix on overflow.
+    /// - Bot self-mentions (`<@bot_user_id>`) are stripped from each
+    ///   rendered line so downstream re-trigger heuristics don't fire.
+    async fn render_thread_backfill_block(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        bot_user_id: &str,
+    ) -> Option<String> {
+        let messages = self
+            .fetch_thread_messages_with_retry(channel_id, thread_ts)
+            .await?;
+
+        let mut dropped_by_allow_list = 0usize;
+        let allowed: Vec<&serde_json::Value> = messages
+            .iter()
+            .filter(|message| {
+                let user = message
+                    .get("user")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                // Pass through:
+                //   - messages with no `user` field (bot/webhook) — let the
+                //     renderer decide how to label them
+                //   - the bot's own past replies — useful self-context
+                //   - allow-listed users
+                if user.is_empty() || user == bot_user_id {
+                    return true;
+                }
+                if self.is_user_allowed(user) {
+                    true
+                } else {
+                    dropped_by_allow_list += 1;
+                    false
+                }
+            })
+            .collect();
+
+        let total_allowed = allowed.len();
+        let start = total_allowed.saturating_sub(SLACK_PERMALINK_THREAD_MAX_REPLIES);
+
+        let mut lines = vec!["[Thread context]".to_string()];
+
+        if dropped_by_allow_list > 0 {
+            lines.push(format!(
+                "… {} messages from non-allow-listed users omitted …",
+                dropped_by_allow_list
+            ));
+        }
+        if start > 0 {
+            lines.push(format!("… {} earlier thread messages omitted …", start));
+        }
+
+        for message in &allowed[start..] {
+            if let Some(line) = self.render_permalink_message_line(message, false).await {
+                lines.push(Self::strip_bot_mentions(&line, bot_user_id));
+            }
+        }
+
+        // Header-only block carries no signal. Drop it.
+        if lines.len() == 1 {
+            return None;
         }
 
         Self::truncate_text(&lines.join("\n"), SLACK_PERMALINK_TEXT_MAX_CHARS)
@@ -2868,7 +3022,7 @@ impl SlackChannel {
                     && (!is_thread_reply || self.strict_mention_in_thread);
 
                 let Some(normalized_text) = self
-                    .build_incoming_content(event, require_mention, bot_user_id)
+                    .build_incoming_content(event, &channel_id, require_mention, bot_user_id)
                     .await
                 else {
                     continue;
@@ -3828,6 +3982,7 @@ impl Channel for SlackChannel {
                 if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
                     // Register thread parents discovered in channel history.
                     for (thread_ts, latest_reply) in Self::extract_active_threads(messages) {
+                        let was_present = active_threads.contains_key(&thread_ts);
                         let entry = active_threads.entry(thread_ts.clone()).or_insert_with(|| {
                             (channel_id.clone(), thread_ts.clone(), Instant::now())
                         });
@@ -3835,6 +3990,16 @@ impl Channel for SlackChannel {
                             entry.1 = latest_reply;
                         }
                         entry.2 = Instant::now();
+
+                        // First time this thread enters the polling loop: mark
+                        // it as seen so the subsequent reply-forwarding path
+                        // does not re-trigger thread-context backfill.
+                        if !was_present && let Ok(mut seen) = self.seen_threads.lock() {
+                            if seen.len() >= SLACK_THREAD_BACKFILL_SEEN_MAX {
+                                seen.clear();
+                            }
+                            seen.insert(thread_ts.clone());
+                        }
                     }
 
                     // Messages come newest-first, reverse to process oldest first
@@ -3880,7 +4045,7 @@ impl Channel for SlackChannel {
                             && !allow_sender_without_mention
                             && (!is_thread_reply || self.strict_mention_in_thread);
                         let Some(normalized_text) = self
-                            .build_incoming_content(msg, require_mention, &bot_user_id)
+                            .build_incoming_content(msg, &channel_id, require_mention, &bot_user_id)
                             .await
                         else {
                             continue;
@@ -3971,7 +4136,12 @@ impl Channel for SlackChannel {
                     // inside threads the bot is already participating in.
                     let require_mention = false;
                     let Some(normalized_text) = self
-                        .build_incoming_content(reply, require_mention, &bot_user_id)
+                        .build_incoming_content(
+                            reply,
+                            &thread_channel_id,
+                            require_mention,
+                            &bot_user_id,
+                        )
                         .await
                     else {
                         continue;
