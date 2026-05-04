@@ -74,11 +74,11 @@ pub struct ApprovalManager {
 
 impl ApprovalManager {
     /// Create an interactive (CLI) approval manager from a risk profile.
-    pub fn from_risk_profile(profile: &RiskProfileConfig) -> Self {
+    pub fn from_risk_profile(risk_profile: &RiskProfileConfig) -> Self {
         Self {
-            auto_approve: profile.auto_approve.iter().cloned().collect(),
-            always_ask: profile.always_ask.iter().cloned().collect(),
-            autonomy_level: profile.level,
+            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
+            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            autonomy_level: risk_profile.level,
             non_interactive: false,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
@@ -90,11 +90,11 @@ impl ApprovalManager {
     /// Enforces the same `auto_approve` / `always_ask` / supervised policies
     /// as the CLI manager, but tools that would require interactive approval
     /// are auto-denied instead of prompting (since there is no operator).
-    pub fn for_non_interactive(profile: &RiskProfileConfig) -> Self {
+    pub fn for_non_interactive(risk_profile: &RiskProfileConfig) -> Self {
         Self {
-            auto_approve: profile.auto_approve.iter().cloned().collect(),
-            always_ask: profile.always_ask.iter().cloned().collect(),
-            autonomy_level: profile.level,
+            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
+            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            autonomy_level: risk_profile.level,
             non_interactive: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),

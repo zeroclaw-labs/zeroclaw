@@ -1577,32 +1577,32 @@ impl SecurityPolicy {
     /// [`crate::schema::RiskProfileConfig`] via
     /// [`crate::schema::Config::active_risk_profile`] and passes it here.
     pub fn from_risk_profile(
-        profile: &crate::schema::RiskProfileConfig,
+        risk_profile: &crate::schema::RiskProfileConfig,
         workspace_dir: &Path,
     ) -> Self {
         // When autonomy is Full, disable workspace_only so the agent can
         // access paths outside the workspace. Forbidden-path checks still
         // apply, preventing access to sensitive system directories.
         // See issue #5463.
-        let effective_workspace_only = if profile.level == AutonomyLevel::Full {
+        let effective_workspace_only = if risk_profile.level == AutonomyLevel::Full {
             false
         } else {
-            profile.workspace_only
+            risk_profile.workspace_only
         };
 
-        let shell_timeout_secs = if profile.shell_timeout_secs == 0 {
+        let shell_timeout_secs = if risk_profile.shell_timeout_secs == 0 {
             60
         } else {
-            profile.shell_timeout_secs
+            risk_profile.shell_timeout_secs
         };
 
         Self {
-            autonomy: profile.level,
+            autonomy: risk_profile.level,
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: effective_workspace_only,
-            allowed_commands: profile.allowed_commands.clone(),
-            forbidden_paths: profile.forbidden_paths.clone(),
-            allowed_roots: profile
+            allowed_commands: risk_profile.allowed_commands.clone(),
+            forbidden_paths: risk_profile.forbidden_paths.clone(),
+            allowed_roots: risk_profile
                 .allowed_roots
                 .iter()
                 .map(|root| {
@@ -1614,11 +1614,11 @@ impl SecurityPolicy {
                     }
                 })
                 .collect(),
-            max_actions_per_hour: profile.max_actions_per_hour,
-            max_cost_per_day_cents: profile.max_cost_per_day_cents,
-            require_approval_for_medium_risk: profile.require_approval_for_medium_risk,
-            block_high_risk_commands: profile.block_high_risk_commands,
-            shell_env_passthrough: profile.shell_env_passthrough.clone(),
+            max_actions_per_hour: risk_profile.max_actions_per_hour,
+            max_cost_per_day_cents: risk_profile.max_cost_per_day_cents,
+            require_approval_for_medium_risk: risk_profile.require_approval_for_medium_risk,
+            block_high_risk_commands: risk_profile.block_high_risk_commands,
+            shell_env_passthrough: risk_profile.shell_env_passthrough.clone(),
             shell_timeout_secs,
             tracker: PerSenderTracker::new(),
         }
@@ -1629,12 +1629,12 @@ impl SecurityPolicy {
     /// when its `risk_profile` field doesn't name a configured profile —
     /// V3 has no global fallback, every security context is per-agent.
     pub fn for_agent(config: &crate::schema::Config, agent_alias: &str) -> anyhow::Result<Self> {
-        let profile = config.risk_profile_for_agent(agent_alias).ok_or_else(|| {
+        let risk_profile = config.risk_profile_for_agent(agent_alias).ok_or_else(|| {
             anyhow::anyhow!(
                 "agents.{agent_alias} has no resolvable risk_profile (load-time validation should have caught this)"
             )
         })?;
-        Ok(Self::from_risk_profile(profile, &config.workspace_dir))
+        Ok(Self::from_risk_profile(risk_profile, &config.workspace_dir))
     }
 
     /// Render a human-readable summary of the active security constraints

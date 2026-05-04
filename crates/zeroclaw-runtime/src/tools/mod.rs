@@ -411,13 +411,11 @@ pub fn all_tools_with_runtime(
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
     ];
 
-    // Register discord_search if discord archive is enabled
-    if root_config
-        .channels
-        .discord
-        .get("default")
-        .is_some_and(|d| d.archive)
-    {
+    // Register discord_search if any configured Discord alias has
+    // archive enabled. V3 supports multiple Discord aliases (one per
+    // bot/server set); the search tool reads from a shared archive DB
+    // so it's enabled when at least one alias archives.
+    if root_config.channels.discord.values().any(|d| d.archive) {
         match zeroclaw_memory::SqliteMemory::new_named(workspace_dir, "discord") {
             Ok(discord_mem) => {
                 tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
