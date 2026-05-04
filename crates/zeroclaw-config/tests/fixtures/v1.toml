@@ -268,6 +268,12 @@ memory_namespace = "complex"
 
 # ──────────────────────────────────────────────────────────────────────
 # Cost tracking limits and per-model pricing.
+#
+# V2 [cost.prices.<id>] entries are HashMap<String, ModelPricing> with
+# composite keys like "<provider>/<model>". Per #5947, V3 drops them
+# entirely with INFO log per entry — the V2 key shape can't be remapped
+# to the V3 [providers.models.<type>.<alias>].pricing path without
+# heuristics. Operators paste rates manually under the right block.
 # ──────────────────────────────────────────────────────────────────────
 
 [cost]
@@ -276,9 +282,13 @@ daily_limit_usd = 25.0
 monthly_limit_usd = 100.0
 warn_at_percent = 80
 
-[cost.prices.anthropic]
-"claude-sonnet-4-5.input"  = 3.0
-"claude-sonnet-4-5.output" = 15.0
+[cost.prices."anthropic/claude-sonnet-4-5"]
+input = 3.0
+output = 15.0
+
+[cost.prices."openrouter/gpt-4o-mini"]
+input = 0.15
+output = 0.6
 
 # ──────────────────────────────────────────────────────────────────────
 # Unknown top-level section — must propagate to V3 unchanged (passthrough).

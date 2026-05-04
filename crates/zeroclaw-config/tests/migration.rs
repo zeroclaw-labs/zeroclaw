@@ -611,17 +611,47 @@ fn t14c_max_depth_synthesizes_per_agent_risk_profile() {
 }
 
 #[test]
-fn t14d_skills_directory_dropped() {
+fn t14d_skills_directory_synthesizes_per_agent_skill_bundle() {
+    let cfg = v3_config();
+    let agent = cfg
+        .agents
+        .get("complex_agent")
+        .expect("agents.complex_agent present");
+    // skills_directory is gone from the agent and replaced with a
+    // synthesized skill_bundle alias.
+    assert!(
+        agent
+            .skill_bundles
+            .iter()
+            .any(|alias| alias == "agent_complex_agent"),
+        "agents.complex_agent.skill_bundles must reference the synthesized \
+         per-agent bundle alias; got {:?}",
+        agent.skill_bundles
+    );
+
+    // The bundle entry exists with the V2 directory captured.
+    let bundle = cfg
+        .skill_bundles
+        .get("agent_complex_agent")
+        .expect("skill_bundles.agent_complex_agent synthesized from V2 skills_directory");
+    assert_eq!(
+        bundle.directory.as_deref(),
+        Some("/opt/zeroclaw/skills"),
+        "V2 skills_directory value must land at skill_bundles.agent_<id>.directory"
+    );
+
+    // skills_directory must not survive on the V3 agent (V3 schema has
+    // no slot for it).
     let value = v3_value();
-    let agent = value
+    let raw_agent = value
         .get("agents")
         .and_then(toml::Value::as_table)
         .and_then(|t| t.get("complex_agent"))
         .and_then(toml::Value::as_table)
         .expect("agents.complex_agent in raw migrated TOML");
     assert!(
-        !agent.contains_key("skills_directory"),
-        "V2 agents.<id>.skills_directory must be dropped (V3 uses skill_bundles aliases)"
+        !raw_agent.contains_key("skills_directory"),
+        "V2 skills_directory field must be removed from the V3 agent block"
     );
 }
 
@@ -673,11 +703,13 @@ fn agent_synthesized_into_runtime_profiles_default() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// cost.prices fold (covered already)
+// cost.prices drop (per #5947 — composite V2 keys can't be remapped
+// onto V3 alias-keyed paths without heuristics; operators paste
+// manually under the right block).
 // ─────────────────────────────────────────────────────────────
 
 #[test]
-fn cost_prices_folded_into_provider_pricing() {
+fn cost_prices_dropped_not_folded() {
     let cfg = v3_config();
     let anth = cfg
         .providers
@@ -685,13 +717,22 @@ fn cost_prices_folded_into_provider_pricing() {
         .get("anthropic")
         .and_then(|m| m.get("default"))
         .expect("anthropic.default exists");
-    assert_eq!(
-        anth.pricing.get("claude-sonnet-4-5.input").copied(),
-        Some(3.0)
+    assert!(
+        anth.pricing.is_empty(),
+        "V2 cost.prices entries must be dropped on migration; \
+         got pricing entries on anthropic.default: {:?}",
+        anth.pricing.keys().collect::<Vec<_>>()
     );
-    assert_eq!(
-        anth.pricing.get("claude-sonnet-4-5.output").copied(),
-        Some(15.0)
+
+    // The migrated config also must not carry [cost.prices.*] anywhere.
+    let value = v3_value();
+    let cost_prices = value
+        .get("cost")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("prices"));
+    assert!(
+        cost_prices.is_none(),
+        "V3 [cost] block must not retain prices: {cost_prices:?}"
     );
 }
 
@@ -868,6 +909,48 @@ fn malformed_schema_version_returns_clean_error() {
     assert!(
         msg.contains("schema_version"),
         "error must mention schema_version, got: {msg}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+// discord_history bot_token conflict — per #5947, when the legacy
+// [channels.discord-history].bot_token differs from
+// [channels.discord].bot_token, the migration drops the history
+// token (the discord token wins) and emits a WARN naming the source.
+// Two-bot deployments must reconfigure manually.
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn discord_history_bot_token_conflict_drops_history_token() {
+    // Both blocks present with different bot_tokens; discord wins.
+    let raw = r#"
+default_provider = "openai"
+default_model = "gpt-4o-mini"
+
+[channels_config.discord]
+enabled = true
+bot_token = "discord-token-survives"
+guild_id = "11111"
+
+[channels_config.discord_history]
+enabled = true
+bot_token = "history-token-dropped"
+channel_ids = ["aaaa"]
+"#;
+    let cfg = migrate_to_current(raw).expect("migration succeeds despite bot_token conflict");
+    let discord = cfg
+        .channels
+        .discord
+        .get("default")
+        .expect("merged channels.discord.default present");
+    assert_eq!(
+        discord.bot_token, "discord-token-survives",
+        "the [channels.discord] bot_token must win over the dropped \
+         [channels.discord-history] bot_token"
+    );
+    assert!(
+        discord.archive,
+        "the discord_history fold still flips archive=true on the merged block"
     );
 }
 

@@ -232,12 +232,17 @@ impl V2Config {
         //     section level — they live inline on each `ModelProviderConfig`.
         fold_providers_globals_into_models(&mut new_providers, &mut aliased_models);
 
-        // 6. cost.prices → providers.models[*].pricing inline
+        // 6. cost.prices → dropped (per #5947 V3 spec).
+        //    V2 keys were composite identifiers like "<provider>/<model>"
+        //    that don't carry the V3 alias path, so heuristic remapping is
+        //    fragile and was rejected by the V3 schema design. Drop the
+        //    entries entirely; emit one INFO line per entry naming the model
+        //    and last-known input/output rates so the operator can paste
+        //    them under the correct V3 alias block manually.
         let cost_passthrough = if let Some(cost_value) = cost {
             let (cost_remaining, prices) = strip_cost_prices(cost_value);
             if !prices.is_empty() {
-                fold_pricing_into_models(&mut aliased_models, prices);
-                tracing::info!(target: "migration", "[cost.prices] folded into providers.models[*].pricing");
+                drop_cost_prices_with_logs(&prices);
             }
             cost_remaining
         } else {
@@ -514,63 +519,27 @@ fn strip_cost_prices(cost_value: toml::Value) -> (Option<toml::Value>, toml::Tab
     (cost_passthrough, prices)
 }
 
-/// Merge legacy `cost.prices` entries into per-model `pricing` fields on
-/// the matching aliased model entries. Best-effort: a price keyed by a
-/// model id matches when the model id appears as a `(provider_type, alias)`
-/// — typically `(provider_type, "default")`.
-///
-/// Unmatched entries are logged and dropped, since V3 has no equivalent.
-fn fold_pricing_into_models(aliased_models: &mut toml::Table, prices: toml::Table) {
+/// Per #5947: drop V2 `[cost.prices.*]` entries entirely. V2 keyed pricing
+/// by composite `"<provider>/<model>"` identifiers that don't carry the V3
+/// `<provider_type>.<alias>` path, so any automatic remap is heuristic
+/// and fragile. Operators paste the rates manually under the right V3
+/// `[providers.models.<type>.<alias>].pricing` block; the INFO logs name
+/// the model id and last-known input/output rates to make that easy.
+fn drop_cost_prices_with_logs(prices: &toml::Table) {
     for (model_id, price) in prices {
-        // V2 `cost.prices` was keyed by model id (free-form). V3 `pricing` is
-        // a free-form HashMap<String, f64>. We attach the price as
-        // `pricing.<model_id>` on the closest matching model entry. If
-        // ambiguous, we attach to the first provider whose default alias
-        // matches; otherwise we synthesize an `<id>.default` entry.
-        let pricing_table = match price {
-            toml::Value::Table(t) => t,
-            other => {
-                tracing::info!(
-                    target: "migration",
-                    "[cost.prices.{model_id}] unexpected shape ({other:?}); dropped"
-                );
-                continue;
-            }
+        let (input, output) = match price.as_table() {
+            Some(t) => (
+                t.get("input").and_then(toml::Value::as_float),
+                t.get("output").and_then(toml::Value::as_float),
+            ),
+            None => (None, None),
         };
-        let target_provider = aliased_models
-            .iter_mut()
-            .find_map(|(provider_type, value)| {
-                if provider_type == &model_id {
-                    Some(value)
-                } else {
-                    None
-                }
-            });
-        let provider_value = match target_provider {
-            Some(v) => v,
-            None => aliased_models
-                .entry(model_id.clone())
-                .or_insert_with(|| toml::Value::Table(toml::Table::new())),
-        };
-        let provider_table = match provider_value.as_table_mut() {
-            Some(t) => t,
-            None => continue,
-        };
-        let alias_value = provider_table
-            .entry("default".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let alias_table = match alias_value.as_table_mut() {
-            Some(t) => t,
-            None => continue,
-        };
-        let pricing = alias_table
-            .entry("pricing".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        if let Some(pricing_t) = pricing.as_table_mut() {
-            for (k, v) in pricing_table {
-                pricing_t.insert(k, v);
-            }
-        }
+        tracing::info!(
+            target: "migration",
+            "[cost.prices.{model_id}] dropped (V3 puts pricing on each \
+             [providers.models.<type>.<alias>] block); last-known rates: \
+             input={input:?} output={output:?}"
+        );
     }
 }
 
@@ -655,10 +624,34 @@ fn alias_wrap_channels(channels_value: toml::Value) -> toml::Table {
 /// `discord_history.enabled`. Existing discord keys win over history keys
 /// for non-`enabled` fields (so a user-set discord.bot_token isn't
 /// overwritten by history's bot_token).
+///
+/// Per #5947: when both blocks have a `bot_token` and the values **differ**,
+/// emit one `WARN` line naming the source block whose token was dropped
+/// (`[channels.discord_history].bot_token`) and the surviving block
+/// (`[channels.discord]`). The dropped value itself is **not** logged —
+/// operators recover from the pre-migration `<config>.backup` adjacent to
+/// the migrated file. Two-bot deployments must reconfigure manually.
 fn fold_discord_history(channels: &mut toml::Table) {
     let history_value = match channels.remove("discord_history") {
         Some(v) => v,
         None => return,
+    };
+
+    // Capture the conflict signal BEFORE the merge mutates either side.
+    let discord_bot_token = channels
+        .get("discord")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("bot_token"))
+        .and_then(toml::Value::as_str)
+        .map(ToString::to_string);
+    let history_bot_token = history_value
+        .as_table()
+        .and_then(|t| t.get("bot_token"))
+        .and_then(toml::Value::as_str)
+        .map(ToString::to_string);
+    let bot_token_conflict = match (&discord_bot_token, &history_bot_token) {
+        (Some(d), Some(h)) => d != h,
+        _ => false,
     };
 
     let history_enabled = history_value
@@ -697,6 +690,15 @@ fn fold_discord_history(channels: &mut toml::Table) {
         target: "migration",
         "[channels.discord_history] folded into [channels.discord] (archive=true, effective enabled={effective_enabled})"
     );
+    if bot_token_conflict {
+        tracing::warn!(
+            target: "migration",
+            "[channels.discord_history].bot_token differed from [channels.discord].bot_token; \
+             the discord_history token was dropped and the discord token survives. \
+             Two-bot deployments must reconfigure manually — recover the dropped value \
+             from the pre-migration <config>.backup file adjacent to the migrated config."
+        );
+    }
 }
 
 /// Apply V2→V3 singular→plural folds to a channel-instance table in place.
@@ -926,12 +928,39 @@ fn synthesize_agent_brains(
             );
         }
 
-        // T14d: skills_directory has no V3 alias equivalent. Drop with log.
-        if agent_table.remove("skills_directory").is_some() {
+        // T14d: skills_directory → synthesize a per-agent skill_bundle and
+        //   point agent.skill_bundles at it. Per #5947: "per-agent V2
+        //   DelegateAgentConfig.skills_directory overrides become per-agent
+        //   skill bundles." V3 SkillBundleConfig has a `directory:
+        //   Option<String>` slot that carries the V2 path verbatim.
+        if let Some(toml::Value::String(skills_dir)) = agent_table.remove("skills_directory")
+            && !skills_dir.is_empty()
+        {
+            let bundle_alias = format!("agent_{}", alias);
+            let mut bundle_entry = toml::Table::new();
+            bundle_entry.insert("directory".to_string(), toml::Value::String(skills_dir));
+            install_profile_entry(passthrough, "skill_bundles", &bundle_alias, bundle_entry);
+            // V3 DelegateAgentConfig.skill_bundles is Vec<String> of aliases.
+            // Append our synthesized bundle alias (preserve any user-set list).
+            let existing = agent_table
+                .remove("skill_bundles")
+                .and_then(|v| match v {
+                    toml::Value::Array(a) => Some(a),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let mut new_list = existing;
+            let already = new_list
+                .iter()
+                .any(|v| v.as_str() == Some(bundle_alias.as_str()));
+            if !already {
+                new_list.push(toml::Value::String(bundle_alias.clone()));
+            }
+            agent_table.insert("skill_bundles".to_string(), toml::Value::Array(new_list));
             tracing::info!(
                 target: "migration",
-                "agents.{alias}.skills_directory dropped — V3 uses skill_bundles alias references; \
-                 add a [skill_bundles.<alias>] entry pointing at the directory and reference it here"
+                "agents.{alias}.skills_directory → [skill_bundles.{bundle_alias}] (referenced \
+                 from agents.{alias}.skill_bundles)"
             );
         }
 
