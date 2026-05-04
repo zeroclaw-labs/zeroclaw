@@ -264,6 +264,33 @@ impl WhatsAppWebChannel {
         }
     }
 
+    /// Build the LID-aware diagnostic suffix appended to allowlist-rejection
+    /// logs so the operator sees why a known phone number didn't match.
+    /// Only meaningful inside an actual rejection branch (`normalized.is_none()`
+    /// under `Allowlist` policy); outside that branch the LID resolution
+    /// state is not the operator's concern, since the message is being
+    /// processed normally (#6354 review).
+    #[cfg(feature = "whatsapp-web")]
+    fn lid_rejection_diagnostic(
+        sender: &wa_rs_binary::jid::Jid,
+        mapped_phone: Option<&str>,
+    ) -> String {
+        if !sender.is_lid() {
+            return String::new();
+        }
+        if mapped_phone.is_none() {
+            format!(
+                " (LID→phone resolution returned None for sender {sender}; \
+                 allowlist phone-number entries cannot match. Workaround: \
+                 add the LID-form (+{}) to allowed_numbers, or wait for the \
+                 in-memory LID cache to populate for this contact.)",
+                sender.user
+            )
+        } else {
+            " (sender is LID; resolved phone did not match any allowlist entry)".to_string()
+        }
+    }
+
     /// Build normalized sender candidates from sender JID, optional alt JID, and optional LID->PN mapping.
     #[cfg(feature = "whatsapp-web")]
     fn sender_phone_candidates(
@@ -1140,16 +1167,6 @@ impl Channel for WhatsAppWebChannel {
                                 } else {
                                     None
                                 };
-                                if sender_jid.is_lid() && mapped_phone.is_none() {
-                                    tracing::warn!(
-                                        "WhatsApp Web: LID→phone resolution returned None for sender {} — \
-                                         allowlist entries phrased as the contact's phone number will not match. \
-                                         Workaround: add the LID-form (+{}) to allowed_numbers; long-term, the \
-                                         in-memory LID cache may not yet be populated for this contact.",
-                                        sender_jid,
-                                        sender_jid.user,
-                                    );
-                                }
                                 let sender_candidates = Self::sender_phone_candidates(
                                     &sender_jid,
                                     sender_alt.as_ref(),
@@ -1220,15 +1237,14 @@ impl Channel for WhatsAppWebChannel {
                                             }
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist => {
                                                 if normalized.is_none() {
-                                                    let lid_hint = if sender_jid.is_lid() {
-                                                        " (sender is LID; if your allowlist contains the contact's phone number, ensure LID→phone resolution is succeeding — see preceding warning)"
-                                                    } else {
-                                                        ""
-                                                    };
+                                                    let lid_diag = Self::lid_rejection_diagnostic(
+                                                        &sender_jid,
+                                                        mapped_phone.as_deref(),
+                                                    );
                                                     tracing::warn!(
                                                         "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={}){}",
                                                         sender_candidates.len(),
-                                                        lid_hint,
+                                                        lid_diag,
                                                     );
                                                     return;
                                                 }
@@ -1248,15 +1264,14 @@ impl Channel for WhatsAppWebChannel {
                                             }
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist => {
                                                 if normalized.is_none() {
-                                                    let lid_hint = if sender_jid.is_lid() {
-                                                        " (sender is LID; if your allowlist contains the contact's phone number, ensure LID→phone resolution is succeeding — see preceding warning)"
-                                                    } else {
-                                                        ""
-                                                    };
+                                                    let lid_diag = Self::lid_rejection_diagnostic(
+                                                        &sender_jid,
+                                                        mapped_phone.as_deref(),
+                                                    );
                                                     tracing::warn!(
                                                         "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={}){}",
                                                         sender_candidates.len(),
-                                                        lid_hint,
+                                                        lid_diag,
                                                     );
                                                     return;
                                                 }
@@ -1850,6 +1865,61 @@ mod tests {
         let candidates =
             WhatsAppWebChannel::sender_phone_candidates(&sender, None, Some("15551234567"));
         assert!(candidates.contains(&"+15551234567".to_string()));
+    }
+
+    // ── lid_rejection_diagnostic: scoped LID warning (#6354 review) ────
+    //
+    // The diagnostic fires only inside the `Allowlist::normalized.is_none()`
+    // branch. These tests pin the three shapes the function returns; the
+    // call-site composition (suffix appended to the rejection log) is
+    // covered by reading the surrounding code path.
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn lid_rejection_diagnostic_empty_for_non_lid_sender() {
+        let sender = Jid::pn("15551234567");
+        let diag = WhatsAppWebChannel::lid_rejection_diagnostic(&sender, None);
+        assert!(
+            diag.is_empty(),
+            "non-LID senders must not generate any LID-resolution suffix; got {diag:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn lid_rejection_diagnostic_names_resolution_failure_for_lid_with_no_phone() {
+        let sender = Jid::lid("76188559093817");
+        let diag = WhatsAppWebChannel::lid_rejection_diagnostic(&sender, None);
+        assert!(
+            diag.contains("LID→phone resolution returned None"),
+            "diagnostic must name the resolution failure mode #6350 describes; got {diag:?}"
+        );
+        assert!(
+            diag.contains("76188559093817"),
+            "diagnostic must surface the LID identifier so the operator can add the LID-form workaround; got {diag:?}"
+        );
+        assert!(
+            diag.contains("allowed_numbers"),
+            "diagnostic must point at the config knob to fix this; got {diag:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn lid_rejection_diagnostic_distinguishes_resolved_phone_mismatch() {
+        // LID resolved successfully but the resulting phone wasn't in the
+        // allowlist. Different cause from the resolution failure path; the
+        // operator shouldn't be steered toward the LID workaround.
+        let sender = Jid::lid("76188559093817");
+        let diag = WhatsAppWebChannel::lid_rejection_diagnostic(&sender, Some("15551234567"));
+        assert!(
+            !diag.contains("LID→phone resolution returned None"),
+            "must not suggest resolution failed when mapped_phone is Some; got {diag:?}"
+        );
+        assert!(
+            diag.contains("did not match"),
+            "diagnostic must explain the resolved phone failed the allowlist; got {diag:?}"
+        );
     }
 
     #[tokio::test]
