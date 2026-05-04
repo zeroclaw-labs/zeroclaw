@@ -1140,6 +1140,16 @@ impl Channel for WhatsAppWebChannel {
                                 } else {
                                     None
                                 };
+                                if sender_jid.is_lid() && mapped_phone.is_none() {
+                                    tracing::warn!(
+                                        "WhatsApp Web: LID→phone resolution returned None for sender {} — \
+                                         allowlist entries phrased as the contact's phone number will not match. \
+                                         Workaround: add the LID-form (+{}) to allowed_numbers; long-term, the \
+                                         in-memory LID cache may not yet be populated for this contact.",
+                                        sender_jid,
+                                        sender_jid.user,
+                                    );
+                                }
                                 let sender_candidates = Self::sender_phone_candidates(
                                     &sender_jid,
                                     sender_alt.as_ref(),
@@ -1210,9 +1220,15 @@ impl Channel for WhatsAppWebChannel {
                                             }
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist => {
                                                 if normalized.is_none() {
+                                                    let lid_hint = if sender_jid.is_lid() {
+                                                        " (sender is LID; if your allowlist contains the contact's phone number, ensure LID→phone resolution is succeeding — see preceding warning)"
+                                                    } else {
+                                                        ""
+                                                    };
                                                     tracing::warn!(
-                                                        "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={})",
-                                                        sender_candidates.len()
+                                                        "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={}){}",
+                                                        sender_candidates.len(),
+                                                        lid_hint,
                                                     );
                                                     return;
                                                 }
@@ -1232,9 +1248,15 @@ impl Channel for WhatsAppWebChannel {
                                             }
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist => {
                                                 if normalized.is_none() {
+                                                    let lid_hint = if sender_jid.is_lid() {
+                                                        " (sender is LID; if your allowlist contains the contact's phone number, ensure LID→phone resolution is succeeding — see preceding warning)"
+                                                    } else {
+                                                        ""
+                                                    };
                                                     tracing::warn!(
-                                                        "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={})",
-                                                        sender_candidates.len()
+                                                        "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={}){}",
+                                                        sender_candidates.len(),
+                                                        lid_hint,
                                                     );
                                                     return;
                                                 }
