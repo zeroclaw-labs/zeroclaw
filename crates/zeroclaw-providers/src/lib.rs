@@ -3610,11 +3610,15 @@ mod tests {
             .providers
             .models
             .insert("anthropic".to_string(), anthropic_aliases);
-        let mut work_agent = DelegateAgentConfig::default();
-        work_agent.model_provider = "anthropic.work".to_string();
+        let work_agent = DelegateAgentConfig {
+            model_provider: "anthropic.work".to_string(),
+            ..DelegateAgentConfig::default()
+        };
         config.agents.insert("work_agent".to_string(), work_agent);
-        let mut default_agent = DelegateAgentConfig::default();
-        default_agent.model_provider = "anthropic.default".to_string();
+        let default_agent = DelegateAgentConfig {
+            model_provider: "anthropic.default".to_string(),
+            ..DelegateAgentConfig::default()
+        };
         config
             .agents
             .insert("default_agent".to_string(), default_agent);
