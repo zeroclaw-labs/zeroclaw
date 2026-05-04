@@ -115,6 +115,15 @@ pub struct PersonalityPutResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct PersonalityDeleteResponse {
+    pub filename: String,
+    /// `true` when a file was actually removed; `false` when the file did not
+    /// exist (DELETE is idempotent — the BOOTSTRAP.md "delete after first
+    /// conversation" use case may fire after the file was already removed).
+    pub existed: bool,
+}
+
+#[derive(Debug, Serialize)]
 pub struct PersonalityConflict {
     pub error: &'static str,
     pub filename: String,
@@ -354,6 +363,60 @@ pub async fn handle_put(
     Json(PersonalityPutResponse {
         bytes_written,
         mtime_ms,
+    })
+    .into_response()
+}
+
+/// DELETE /api/personality/{filename} — remove an allowlisted personality file.
+///
+/// Idempotent: deleting a file that does not exist returns 200 with
+/// `existed: false` rather than 404. The primary motivating use case is the
+/// dashboard's "first-run completion" flow for `BOOTSTRAP.md` (the file is
+/// supposed to delete itself once the operator has finished onboarding;
+/// today it persists silently because there's no UI surface to remove it),
+/// but the route accepts any allowlisted filename so operators can reset
+/// other personality files to runtime defaults when needed. The runtime
+/// reload behaviour matches PUT — changes are picked up at the next
+/// session boundary.
+pub async fn handle_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+    Query(q): Query<AgentQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let allowed = match validate_filename(&filename) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
+
+    let workspace_dir = {
+        let cfg = state.config.lock();
+        cfg.workspace_dir.clone()
+    };
+    let path = personality_path(&workspace_dir, q.agent.as_deref(), allowed);
+
+    let existed = path.exists();
+    if existed
+        && let Err(err) = std::fs::remove_file(&path)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "failed to delete personality file",
+                "filename": allowed,
+                "detail": err.to_string(),
+            })),
+        )
+            .into_response();
+    }
+
+    Json(PersonalityDeleteResponse {
+        filename: allowed.to_string(),
+        existed,
     })
     .into_response()
 }

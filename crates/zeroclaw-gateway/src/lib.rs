@@ -1051,7 +1051,9 @@ pub async fn run_gateway(
         )
         .route(
             "/api/personality/{filename}",
-            get(api_personality::handle_get).put(api_personality::handle_put),
+            get(api_personality::handle_get)
+                .put(api_personality::handle_put)
+                .delete(api_personality::handle_delete),
         )
         .route("/api/config/init", post(api_config::handle_init))
         .route("/api/config/migrate", post(api_config::handle_migrate))
