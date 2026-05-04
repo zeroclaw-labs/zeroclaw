@@ -26,14 +26,18 @@ use crate::schema::v2::V2Config;
 /// The schema version this binary writes and expects on disk.
 pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
-/// Top-level TOML keys that existed in V1 but were removed or renamed in V2.
-/// Presence of any of these in a config without `schema_version` is a strong
-/// V1 signal; used by `Config::load_or_init` to detect legacy configs that
-/// need silent in-memory migration.
+/// Top-level TOML keys that legacy schema versions had but V3 either
+/// removed or restructured into a different shape. Used by
+/// `Config::unknown_keys` to suppress false "unknown key" warnings on
+/// V1/V2 configs migrating through `migrate_to_current` — every key here
+/// is consumed by the V1→V2 or V2→V3 migration step, so its presence in
+/// a stale-but-being-migrated config is expected, not a typo.
 ///
-/// Source: `git show 1ec9c14ca:crates/zeroclaw-config/src/schema.rs` —
-/// fields removed in the V1→V2 diff.
+/// Sources:
+/// - V1→V2 removed/renamed (top-level): `git show 1ec9c14ca:crates/zeroclaw-config/src/schema.rs`.
+/// - V2→V3 removed/restructured (top-level): `git show 68a875b5b:crates/zeroclaw-config/src/schema.rs`.
 pub const V1_LEGACY_KEYS: &[&str] = &[
+    // V1 → V2 removed/renamed
     "api_key",
     "api_url",
     "api_path",
@@ -47,6 +51,14 @@ pub const V1_LEGACY_KEYS: &[&str] = &[
     "model_routes",
     "embedding_routes",
     "channels_config",
+    // V2 → V3 removed or shape-changed at top level. V3's `Config::default()`
+    // serialization either omits these (HashMap-typed, `skip_serializing_if`
+    // empty) or doesn't carry the field at all, so without this entry the
+    // unknown-key probe would flag a legitimately-migrating V2 input.
+    "autonomy",
+    "agent",
+    "swarms",
+    "cron",
 ];
 
 /// Detect a config's schema version from its parsed TOML representation.

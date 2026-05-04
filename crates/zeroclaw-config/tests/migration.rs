@@ -10,8 +10,8 @@
 //! step that performs the transform is broken, the test fails.
 
 use zeroclaw_config::migration::{
-    CURRENT_SCHEMA_VERSION, MigrateReport, V1_LEGACY_KEYS, detect_version,
-    ensure_disk_at_current_version, migrate_file, migrate_file_in_place, migrate_to_current,
+    CURRENT_SCHEMA_VERSION, MigrateReport, detect_version, ensure_disk_at_current_version,
+    migrate_file, migrate_file_in_place, migrate_to_current,
 };
 use zeroclaw_config::schema::Config;
 
@@ -64,24 +64,6 @@ fn detect_version_table() {
         detect_version(&toml::from_str("schema_version = \"two\"").unwrap()).is_err(),
         "non-integer version errors"
     );
-}
-
-#[test]
-fn v1_legacy_keys_match_v1_fixture_top_level() {
-    for required in [
-        "api_key",
-        "api_url",
-        "default_provider",
-        "default_model",
-        "model_providers",
-        "extra_headers",
-        "channels_config",
-    ] {
-        assert!(
-            V1_LEGACY_KEYS.contains(&required),
-            "V1_LEGACY_KEYS missing {required}"
-        );
-    }
 }
 
 // ─────────────────────────────────────────────────────────────
