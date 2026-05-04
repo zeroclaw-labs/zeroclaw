@@ -736,14 +736,23 @@ impl Default for ProviderRuntimeOptions {
     }
 }
 
-pub fn provider_runtime_options_from_config(
+/// Build `ProviderRuntimeOptions` from a *specific* `ModelProviderConfig`
+/// entry plus the global config's process-wide settings (zeroclaw_dir,
+/// secrets, runtime). Splits out the per-entry resolution so callers with
+/// agent context can pass in the alias-resolved entry instead of hitting
+/// `first_provider()` (#6266 review).
+///
+/// Pass `None` when no provider entry is resolvable (e.g. tests or fresh
+/// config with no models configured); falls back to safe defaults.
+pub fn provider_runtime_options_from_provider_entry(
     config: &zeroclaw_config::schema::Config,
+    entry: Option<&zeroclaw_config::schema::ModelProviderConfig>,
 ) -> ProviderRuntimeOptions {
-    let primary = config.providers.first_provider();
     // Resolve merge_system_into_user from the active model provider profile
-    // by matching api_url — apply_named_model_provider_profile() has already
-    // run; providers.models retains all profiles.
-    let merge_system_into_user = primary
+    // by matching api_url — providers.models retains all profiles. We keep
+    // this lookup based on URL match rather than identity because the entry
+    // we were given may itself originate from any of those profiles.
+    let merge_system_into_user = entry
         .and_then(|e| e.base_url.as_deref())
         .map(str::trim)
         .filter(|u| !u.is_empty())
@@ -767,18 +776,45 @@ pub fn provider_runtime_options_from_config(
 
     ProviderRuntimeOptions {
         auth_profile_override: None,
-        provider_api_url: primary.and_then(|e| e.base_url.clone()),
+        provider_api_url: entry.and_then(|e| e.base_url.clone()),
         zeroclaw_dir: config.config_path.parent().map(PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
-        provider_timeout_secs: Some(primary.and_then(|e| e.timeout_secs).unwrap_or(120)),
-        extra_headers: primary.map(|e| e.extra_headers.clone()).unwrap_or_default(),
-        api_path: primary.and_then(|e| e.api_path.clone()),
-        provider_max_tokens: primary.and_then(|e| e.max_tokens),
+        provider_timeout_secs: Some(entry.and_then(|e| e.timeout_secs).unwrap_or(120)),
+        extra_headers: entry.map(|e| e.extra_headers.clone()).unwrap_or_default(),
+        api_path: entry.and_then(|e| e.api_path.clone()),
+        provider_max_tokens: entry.and_then(|e| e.max_tokens),
         merge_system_into_user,
-        provider_extra: primary.and_then(|e| e.provider_extra.clone()),
+        provider_extra: entry.and_then(|e| e.provider_extra.clone()),
     }
+}
+
+/// Resolve `ProviderRuntimeOptions` from an agent's `model_provider` alias
+/// (`"<type>.<alias>"`). Falls back to `first_provider()` when the agent
+/// alias doesn't exist, doesn't have a `model_provider` set, or names a
+/// non-existent provider entry — preserving the conservative pre-V3
+/// behavior so misconfigured callsites still get *something* instead of
+/// crashing the channel server. The fallback is logged so multi-alias
+/// users can spot misconfiguration.
+pub fn provider_runtime_options_for_agent(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> ProviderRuntimeOptions {
+    let entry = config.model_provider_for_agent(agent_alias).or_else(|| {
+        tracing::debug!(
+            agent = agent_alias,
+            "model_provider_for_agent returned None; falling back to providers.first_provider()"
+        );
+        config.providers.first_provider()
+    });
+    provider_runtime_options_from_provider_entry(config, entry)
+}
+
+pub fn provider_runtime_options_from_config(
+    config: &zeroclaw_config::schema::Config,
+) -> ProviderRuntimeOptions {
+    provider_runtime_options_from_provider_entry(config, config.providers.first_provider())
 }
 
 fn is_secret_char(c: char) -> bool {
@@ -3543,5 +3579,86 @@ mod tests {
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_PROVIDER_URL") };
+    }
+
+    // ── Per-alias provider_runtime_options resolution (#6266 review) ──
+
+    /// Build a `Config` with two `anthropic` aliases at different base_urls
+    /// so the test can prove `provider_runtime_options_for_agent` selects
+    /// the alias-specific entry rather than `first_provider()`.
+    fn config_with_two_anthropic_aliases() -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{Config, DelegateAgentConfig, ModelProviderConfig};
+        let mut config = Config::default();
+        let default_alias = ModelProviderConfig {
+            model: Some("claude-default".into()),
+            api_key: Some("default-key".into()),
+            base_url: Some("https://api.default.example/v1".into()),
+            api_path: Some("/messages".into()),
+            ..ModelProviderConfig::default()
+        };
+        let work_alias = ModelProviderConfig {
+            model: Some("claude-work".into()),
+            api_key: Some("work-key".into()),
+            base_url: Some("https://work-proxy.example/v1".into()),
+            api_path: Some("/v1/anthropic/messages".into()),
+            ..ModelProviderConfig::default()
+        };
+        let mut anthropic_aliases = std::collections::HashMap::new();
+        anthropic_aliases.insert("default".to_string(), default_alias);
+        anthropic_aliases.insert("work".to_string(), work_alias);
+        config
+            .providers
+            .models
+            .insert("anthropic".to_string(), anthropic_aliases);
+        let mut work_agent = DelegateAgentConfig::default();
+        work_agent.model_provider = "anthropic.work".to_string();
+        config.agents.insert("work_agent".to_string(), work_agent);
+        let mut default_agent = DelegateAgentConfig::default();
+        default_agent.model_provider = "anthropic.default".to_string();
+        config
+            .agents
+            .insert("default_agent".to_string(), default_agent);
+        config
+    }
+
+    #[test]
+    fn provider_runtime_options_for_agent_resolves_alias_specific_base_url() {
+        let config = config_with_two_anthropic_aliases();
+        let work = provider_runtime_options_for_agent(&config, "work_agent");
+        let dflt = provider_runtime_options_for_agent(&config, "default_agent");
+
+        assert_eq!(
+            work.provider_api_url.as_deref(),
+            Some("https://work-proxy.example/v1"),
+            "work agent must resolve to the work alias's base_url, not the first alias's"
+        );
+        assert_eq!(
+            work.api_path.as_deref(),
+            Some("/v1/anthropic/messages"),
+            "work agent must resolve to the work alias's api_path"
+        );
+        assert_eq!(
+            dflt.provider_api_url.as_deref(),
+            Some("https://api.default.example/v1"),
+            "default agent must resolve to the default alias's base_url"
+        );
+        assert_eq!(
+            dflt.api_path.as_deref(),
+            Some("/messages"),
+            "default agent must resolve to the default alias's api_path"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_for_agent_falls_back_to_first_provider_when_unknown_agent() {
+        let config = config_with_two_anthropic_aliases();
+        let opts = provider_runtime_options_for_agent(&config, "nonexistent");
+        // Falls back to first_provider() — order across HashMap is not
+        // guaranteed but the URL must match one of the configured aliases.
+        let url = opts.provider_api_url.as_deref().unwrap_or("");
+        assert!(
+            url == "https://work-proxy.example/v1" || url == "https://api.default.example/v1",
+            "fallback must resolve to one of the configured anthropic aliases; got `{url}`"
+        );
     }
 }

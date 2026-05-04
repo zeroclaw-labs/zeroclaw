@@ -863,6 +863,26 @@ impl Config {
         self.risk_profiles.get(profile_alias)
     }
 
+    /// Resolve an agent's `model_provider` reference (`"<type>.<alias>"`) to
+    /// its concrete `ModelProviderConfig` entry. Returns `None` when the
+    /// agent doesn't exist, the reference is unparseable, or the
+    /// `<type>.<alias>` pair doesn't resolve in `providers.models`.
+    ///
+    /// This is the V3-correct lookup the orchestrator uses to build
+    /// per-agent provider runtime options instead of falling back to
+    /// `first_provider()`, which silently collapses multiple aliases under
+    /// the same provider family to whichever entry happens to be first
+    /// (#6266 review). The matching split logic lives in
+    /// `crates/zeroclaw-runtime/src/tools/delegate.rs::resolve_brain` for
+    /// delegate sub-agents; this helper exposes the same contract for the
+    /// channel-server startup path.
+    #[must_use]
+    pub fn model_provider_for_agent(&self, agent_alias: &str) -> Option<&ModelProviderConfig> {
+        let agent = self.agents.get(agent_alias)?;
+        let (type_key, alias_key) = agent.model_provider.split_once('.')?;
+        self.providers.models.get(type_key)?.get(alias_key)
+    }
+
     /// Reverse-lookup the agent alias that owns a configured channel
     /// (`<type>.<alias>`). Returns the first agent listing the channel in
     /// its `channels` field. `None` when no agent owns the channel —

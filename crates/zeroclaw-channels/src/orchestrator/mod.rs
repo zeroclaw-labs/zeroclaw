@@ -855,23 +855,38 @@ fn resolved_default_model(config: &Config) -> anyhow::Result<String> {
         })
 }
 
-fn runtime_defaults_from_config(config: &Config) -> anyhow::Result<ChannelRuntimeDefaults> {
+/// Resolve runtime defaults from `config` against a specific dotted
+/// `model_provider` reference (`"<type>.<alias>"`) — the per-agent
+/// resolution path (#6266 review). Falls back to `first_provider()` when
+/// the reference is empty or doesn't resolve, preserving the conservative
+/// pre-V3 behavior so misconfigured callsites still get safe defaults.
+fn runtime_defaults_from_config(
+    config: &Config,
+    model_provider: &str,
+) -> anyhow::Result<ChannelRuntimeDefaults> {
+    let dotted = model_provider.split_once('.');
+    let entry = dotted
+        .and_then(|(type_key, alias_key)| config.providers.models.get(type_key)?.get(alias_key))
+        .or_else(|| config.providers.first_provider());
+    let default_provider = dotted
+        .map(|(t, _)| t.to_string())
+        .unwrap_or_else(|| resolved_default_provider(config));
+    let model = entry
+        .and_then(|e| e.model.clone())
+        .or_else(|| resolved_default_model(config).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model configured: model_provider '{model_provider}' does not resolve to a \
+                 ModelProviderConfig with a `model` field, and providers.models has no \
+                 fallback entry."
+            )
+        })?;
     Ok(ChannelRuntimeDefaults {
-        default_provider: resolved_default_provider(config),
-        model: resolved_default_model(config)?,
-        temperature: config
-            .providers
-            .first_provider()
-            .and_then(|e| e.temperature)
-            .unwrap_or(0.7),
-        api_key: config
-            .providers
-            .first_provider()
-            .and_then(|e| e.api_key.clone()),
-        api_url: config
-            .providers
-            .first_provider()
-            .and_then(|e| e.base_url.clone()),
+        default_provider,
+        model,
+        temperature: entry.and_then(|e| e.temperature).unwrap_or(0.7),
+        api_key: entry.and_then(|e| e.api_key.clone()),
+        api_url: entry.and_then(|e| e.base_url.clone()),
         reliability: config.reliability.clone(),
     })
 }
@@ -929,7 +944,10 @@ fn decrypt_optional_secret_for_runtime_reload(
     Ok(())
 }
 
-async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRuntimeDefaults> {
+async fn load_runtime_defaults_from_config_file(
+    path: &Path,
+    model_provider: &str,
+) -> Result<ChannelRuntimeDefaults> {
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -957,7 +975,7 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
         }
     }
 
-    runtime_defaults_from_config(&parsed)
+    runtime_defaults_from_config(&parsed, model_provider)
 }
 
 async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
@@ -980,7 +998,8 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         }
     }
 
-    let next_defaults = load_runtime_defaults_from_config_file(&config_path).await?;
+    let next_defaults =
+        load_runtime_defaults_from_config_file(&config_path, &ctx.agent_cfg.model_provider).await?;
     let next_default_provider = zeroclaw_providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
         next_defaults.api_key.as_deref(),
@@ -5238,20 +5257,28 @@ pub async fn start_channels(
         })?
         .clone();
 
-    let provider_name = resolved_default_provider(&config);
+    // Per-agent provider resolution (#6266 review). Each channel-server
+    // starts under a known `agent_alias`, so the correct provider entry is
+    // the one named by `agents.<alias>.model_provider`, not whatever
+    // happens to come first in `providers.models` iteration order. Falls
+    // back to `first_provider()` when the agent has no model_provider set
+    // or names a missing entry; logged at debug level inside
+    // `provider_runtime_options_for_agent`.
+    let agent_provider_entry = config
+        .model_provider_for_agent(&agent_alias)
+        .or_else(|| config.providers.first_provider());
+    let provider_name = config
+        .agents
+        .get(&agent_alias)
+        .and_then(|a| a.model_provider.split_once('.').map(|(t, _)| t.to_string()))
+        .unwrap_or_else(|| resolved_default_provider(&config));
     let provider_runtime_options =
-        zeroclaw_providers::provider_runtime_options_from_config(&config);
+        zeroclaw_providers::provider_runtime_options_for_agent(&config, &agent_alias);
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
             &provider_name,
-            config
-                .providers
-                .first_provider()
-                .and_then(|e| e.api_key.clone()),
-            config
-                .providers
-                .first_provider()
-                .and_then(|e| e.base_url.clone()),
+            agent_provider_entry.and_then(|e| e.api_key.clone()),
+            agent_provider_entry.and_then(|e| e.base_url.clone()),
             config.reliability.clone(),
             provider_runtime_options.clone(),
         )
@@ -5272,7 +5299,7 @@ pub async fn start_channels(
         store.insert(
             config.config_path.clone(),
             RuntimeConfigState {
-                defaults: runtime_defaults_from_config(&config)?,
+                defaults: runtime_defaults_from_config(&config, &agent.model_provider)?,
                 last_applied_stamp: initial_stamp,
             },
         );
@@ -5283,10 +5310,24 @@ pub async fn start_channels(
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::for_agent(&config, &agent_alias)?);
-    let model = resolved_default_model(&config)?;
-    let temperature = config
-        .providers
-        .first_provider()
+    let model = agent_provider_entry
+        .and_then(|e| e.model.clone())
+        .or_else(|| {
+            tracing::debug!(
+                agent = agent_alias,
+                "model_provider has no `model` set; falling back to resolved_default_model"
+            );
+            resolved_default_model(&config).ok()
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model configured: agents.{agent_alias}.model_provider does not resolve to a \
+                 ModelProviderConfig with a `model` field, and providers.models is empty. \
+                 Configure `[providers.models.<type>.<alias>] model = \"...\"` and reference it \
+                 from `agents.{agent_alias}.model_provider`."
+            )
+        })?;
+    let temperature = agent_provider_entry
         .and_then(|e| e.temperature)
         .unwrap_or(0.7);
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
@@ -5294,10 +5335,7 @@ pub async fn start_channels(
         &config.providers.embedding_routes,
         config.resolve_active_storage(),
         &config.workspace_dir,
-        config
-            .providers
-            .first_provider()
-            .and_then(|e| e.api_key.as_deref()),
+        agent_provider_entry.and_then(|e| e.api_key.as_deref()),
     )?);
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -5330,10 +5368,7 @@ pub async fn start_channels(
         &config.web_fetch,
         &workspace,
         &config.agents,
-        config
-            .providers
-            .first_provider()
-            .and_then(|e| e.api_key.as_deref()),
+        agent_provider_entry.and_then(|e| e.api_key.as_deref()),
         &config,
         // Share the gateway's canvas store so frames pushed from
         // channel-side agents reach the same WebSocket subscribers and
@@ -5704,14 +5739,8 @@ pub async fn start_channels(
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
-        api_key: config
-            .providers
-            .first_provider()
-            .and_then(|e| e.api_key.clone()),
-        api_url: config
-            .providers
-            .first_provider()
-            .and_then(|e| e.base_url.clone()),
+        api_key: agent_provider_entry.and_then(|e| e.api_key.clone()),
+        api_url: agent_provider_entry.and_then(|e| e.base_url.clone()),
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
