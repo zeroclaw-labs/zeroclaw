@@ -1199,11 +1199,11 @@ data: {\"type\":\"message_stop\"}\n\n"
         let usage_pos = states
             .iter()
             .position(|s| *s == "usage")
-            .expect(&format!("expected Usage event in stream, got {states:?}"));
+            .unwrap_or_else(|| panic!("expected Usage event in stream, got {states:?}"));
         let final_pos = states
             .iter()
             .position(|s| *s == "final")
-            .expect(&format!("expected Final event in stream, got {states:?}"));
+            .unwrap_or_else(|| panic!("expected Final event in stream, got {states:?}"));
         assert!(
             usage_pos < final_pos,
             "Usage must come before Final, got {states:?}"
