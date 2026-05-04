@@ -1444,7 +1444,9 @@ async fn run_gateway_chat_with_tools(
                 std::sync::Arc::new(state.config.lock().cost.prices.clone()),
             )
         });
-        let captured_usage = cost_tracking_context.as_ref().map(|ctx| ctx.turn_usage.clone());
+        let captured_usage = cost_tracking_context
+            .as_ref()
+            .map(|ctx| ctx.turn_usage.clone());
         let response = Box::pin(
             zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
@@ -1456,7 +1458,11 @@ async fn run_gateway_chat_with_tools(
             .and_then(|cell| cell.lock().ok().map(|guard| *guard))
             .filter(|u| u.input_tokens > 0 || u.output_tokens > 0);
         let (input_tokens, output_tokens, cost_usd) = match usage {
-            Some(u) => (Some(u.input_tokens), Some(u.output_tokens), Some(u.cost_usd)),
+            Some(u) => (
+                Some(u.input_tokens),
+                Some(u.output_tokens),
+                Some(u.cost_usd),
+            ),
             None => (None, None, None),
         };
         Ok(GatewayChatOutcome {

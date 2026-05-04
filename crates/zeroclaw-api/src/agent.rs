@@ -24,9 +24,13 @@ pub enum TurnEvent {
         name: String,
         output: String,
     },
-    /// Aggregated token usage and cost for the just-completed turn.
-    /// Emitted at most once, after the final LLM call returns. Consumers
-    /// should treat absence as "usage unavailable" rather than zero.
+    /// Per-LLM-call token usage and cost.
+    ///
+    /// Emitted **once per LLM response** the agent loop processes — a single
+    /// turn that hops through tools may emit several `Usage` events, one per
+    /// model call. Consumers (e.g. the gateway WS handler) accumulate these
+    /// into a turn total before reporting back to the client. Absence means
+    /// "usage unavailable for this call" rather than zero.
     Usage {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
