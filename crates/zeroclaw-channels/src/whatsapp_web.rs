@@ -1197,6 +1197,16 @@ impl Channel for WhatsAppWebChannel {
                                                 );
                                             }
                                         }
+                                    } else if info.source.is_from_me {
+                                        // fromMe outside the self-chat thread is a mirror of the
+                                        // operator's own outbound message to a third party (DM or
+                                        // group). Replying would impersonate the operator to the
+                                        // recipient. Drop unconditionally — `self_chat_mode` only
+                                        // gates the dedicated self-chat thread above.
+                                        tracing::debug!(
+                                            "WhatsApp Web: ignoring fromMe message outside self-chat thread (chat={chat}, sender={sender})"
+                                        );
+                                        return;
                                     } else if is_group {
                                         match wa_group_policy {
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Ignore => {
