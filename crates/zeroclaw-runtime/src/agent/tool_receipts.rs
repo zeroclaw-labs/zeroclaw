@@ -120,6 +120,23 @@ impl ReceiptGenerator {
     }
 }
 
+/// Per-turn receipt forwarding scope, used to thread the generator and
+/// the per-turn collector through delegate sub-loops without changing the
+/// `Tool` trait signature. Mirrors the pattern used by
+/// `TOOL_LOOP_COST_TRACKING_CONTEXT`.
+#[derive(Clone)]
+pub struct ReceiptScope {
+    pub generator: ReceiptGenerator,
+    pub collector: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+tokio::task_local! {
+    /// Set by the orchestrator when `[agent.tool_receipts] enabled = true`.
+    /// `DelegateTool` reads this to forward receipts into sub-agent tool loops
+    /// so subagent tool calls land in the same per-turn collector.
+    pub static TOOL_LOOP_RECEIPT_CONTEXT: Option<ReceiptScope>;
+}
+
 /// Parse a receipt string into (timestamp, hash).
 /// Expected format: `zc-receipt-{timestamp}-{base64url_hash}`
 fn parse_receipt(receipt: &str) -> Option<(u64, &str)> {

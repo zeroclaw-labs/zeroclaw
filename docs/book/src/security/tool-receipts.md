@@ -8,13 +8,15 @@ The practical outcome: the model cannot claim to have run a tool it didn't run, 
 
 An LLM is a string generator. By default, nothing prevents it from narrating a tool call it never made ("I ran `git log` and the latest commit is…"), or inventing a result for a tool call ("The weather API says 72°F" — when the call timed out). For an agent with autonomy, this is more than a correctness issue — it's a deniability issue.
 
-Tool receipts close that gap with the cheapest possible construct: a symmetric MAC with an ephemeral per-session key.
+Tool receipts close that gap with the cheapest possible construct: a symmetric MAC with an ephemeral process-lifetime key.
+
+> **What "session" means here.** The HMAC key is generated once when `start_channels` initialises the channel server and lives for the lifetime of that daemon process. Every channel, every conversation, and every delegate sub-agent inside that process verifies against the same key. Restarting the daemon rotates it; there is no per-conversation or per-channel scoping. "Session" is used elsewhere in this document as shorthand for "this daemon process."
 
 Based on: Basu, A. (2026). "Tool Receipts, Not Zero-Knowledge Proofs: Practical Hallucination Detection for AI Agents." [arXiv:2603.10060](https://doi.org/10.48550/arXiv.2603.10060).
 
 ## How it works
 
-1. At agent-loop startup, a 256-bit key is generated. It's ephemeral — never written to disk, never sent to the model, never logged.
+1. At channel-server startup, a 256-bit key is generated and held in `ChannelRuntimeContext` for the lifetime of the daemon process. It's ephemeral — never written to disk, never sent to the model, never logged. A daemon restart rotates the key.
 2. After each tool invocation, the runtime computes:
    ```
    receipt = HMAC-SHA256(key, tool_name || args || result || timestamp)
@@ -49,7 +51,9 @@ The `zc-receipt-` prefix exists so the leak detector doesn't redact them (receip
 
 - **Don't constrain text output.** The model can still say things unrelated to any tool call.
 - **Don't force tool use.** Receipts are only generated when a tool is called; they don't help with "the model answered from prior knowledge when it should have looked something up".
-- **Don't travel across sessions.** Ephemeral keys mean a receipt from session A can't be verified in session B.
+- **Don't travel across daemon restarts.** The ephemeral key is rotated on every daemon process start, so a receipt generated under one process cannot be verified by the next.
+- **Don't isolate channels or conversations from each other within a single daemon.** All channels and all conversations in one daemon process share the key. The threat model targets LLM fabrication inside the process, not cross-channel forgery.
+- **Don't extend to background or detached delegate spawns.** Background and parallel delegate spawns that detach from the user's turn (`background: true`) do not surface receipts in the user-visible block, since the per-turn collector is rendered before those spawns finish. Receipts inside synchronous delegate sub-agents are captured.
 
 ## Viewing receipts
 
@@ -92,7 +96,7 @@ inject_system_prompt = true # instruct the model to echo receipts verbatim
 
 ## Security properties
 
-- **Ephemeral key per session.** Never persisted, never logged, never in the model's context. Compromising long-term storage gains nothing.
+- **Ephemeral key per daemon process.** Generated at `start_channels` time, held only in memory, rotated on every restart. Never persisted, never logged, never in the model's context. Compromising long-term storage gains nothing.
 - **Standard MAC primitives.** `hmac` + `sha2` from the Rust ecosystem.
 - **Negligible overhead.** <1 ms per tool call.
 - **No new external dependencies.**
