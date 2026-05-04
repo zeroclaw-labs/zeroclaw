@@ -15,14 +15,30 @@ Download the latest Windows release zip, extract `zeroclaw.exe`, and put it on y
 From a PowerShell prompt:
 
 ```powershell
+# Idempotent: re-running this block is a no-op when zeroclaw is already
+# installed at the latest release and on the user PATH. After a release
+# bumps, the version check fails and the install side runs again.
 $ver = (Invoke-RestMethod 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name.TrimStart('v')
-$url = "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v$ver/zeroclaw-x86_64-pc-windows-msvc.zip"
 $dst = "$env:USERPROFILE\.zeroclaw\bin"
-New-Item -ItemType Directory -Force -Path $dst | Out-Null
-Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\zeroclaw.zip" -UseBasicParsing
-Expand-Archive -Force -Path "$env:TEMP\zeroclaw.zip" -DestinationPath $dst
-[Environment]::SetEnvironmentVariable('Path', "$dst;$([Environment]::GetEnvironmentVariable('Path','User'))", 'User')
-& "$dst\zeroclaw.exe" onboard
+$exe = "$dst\zeroclaw.exe"
+
+$current = if (Test-Path $exe) {
+    ((& $exe --version 2>$null) | Select-String -Pattern '\d+\.\d+\.\d+').Matches.Value
+} else { '' }
+
+if ($current -ne $ver) {
+    $url = "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v$ver/zeroclaw-x86_64-pc-windows-msvc.zip"
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\zeroclaw.zip" -UseBasicParsing
+    Expand-Archive -Force -Path "$env:TEMP\zeroclaw.zip" -DestinationPath $dst
+}
+
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (($userPath -split ';') -notcontains $dst) {
+    [Environment]::SetEnvironmentVariable('Path', "$dst;$userPath", 'User')
+}
+
+& $exe onboard
 ```
 
 The zip ships a self-contained binary — no Rust toolchain, no Visual Studio Build Tools needed.
