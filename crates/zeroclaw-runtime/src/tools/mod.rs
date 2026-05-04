@@ -567,12 +567,22 @@ pub fn all_tools_with_runtime(
             );
         } else if root_config.jira.base_url.trim().is_empty() {
             tracing::warn!("Jira tool enabled but jira.base_url is empty — skipping registration");
-        } else if root_config.jira.email.trim().is_empty() {
-            tracing::warn!("Jira tool enabled but jira.email is empty — skipping registration");
         } else {
+            let email = root_config
+                .jira
+                .email
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            if email.is_some() {
+                tracing::info!("Jira tool: Cloud mode (API v3, Basic auth)");
+            } else {
+                tracing::info!("Jira tool: Server/DC mode (API v2, Bearer auth)");
+            }
             tool_arcs.push(Arc::new(JiraTool::new(
                 root_config.jira.base_url.trim().to_string(),
-                root_config.jira.email.trim().to_string(),
+                email,
                 api_token,
                 root_config.jira.allowed_actions.clone(),
                 security.clone(),
