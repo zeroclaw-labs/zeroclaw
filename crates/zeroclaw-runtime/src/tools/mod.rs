@@ -448,6 +448,7 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
             root_config.skills.open_skills_enabled,
             root_config.skills.open_skills_dir.clone(),
+            root_config.skills.allow_scripts,
         )));
     }
 
