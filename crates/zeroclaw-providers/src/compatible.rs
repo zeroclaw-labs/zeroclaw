@@ -48,6 +48,9 @@ pub struct OpenAiCompatibleProvider {
     api_path: Option<String>,
     /// Maximum output tokens to include in API requests.
     max_tokens: Option<u32>,
+    /// models.dev catalog key for this provider (e.g. "xai").
+    /// When set, `list_models` fetches from the models.dev catalog.
+    models_dev_key: Option<String>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -119,6 +122,27 @@ fn apply_auth_to_request(
             Err(_) => req.header("Authorization", format!("Bearer {credential}")),
         },
     }
+}
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
+    let mut ids: Vec<String> = body
+        .data
+        .into_iter()
+        .map(|e| e.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort();
+    ids
 }
 
 impl OpenAiCompatibleProvider {
@@ -246,6 +270,7 @@ impl OpenAiCompatibleProvider {
             reasoning_effort: None,
             api_path: None,
             max_tokens: None,
+            models_dev_key: None,
         }
     }
 
@@ -293,6 +318,13 @@ impl OpenAiCompatibleProvider {
     /// Set the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Set the models.dev catalog key for this provider.
+    /// When set, `list_models` returns the catalog's model list for that key.
+    pub fn with_models_dev_key(mut self, key: &str) -> Self {
+        self.models_dev_key = Some(key.to_string());
         self
     }
 
@@ -1752,6 +1784,34 @@ impl Provider for OpenAiCompatibleProvider {
         }
     }
 
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // When a credential is present, hit the provider's native /models endpoint
+        // (OpenAI-compatible: GET {base_url}/models).
+        if let Some(credential) = self.credential.as_deref() {
+            let url = format!("{}/models", self.base_url);
+            let response = self
+                .apply_auth_header(self.http_client().get(&url), Some(credential))
+                .send()
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("{} model list request failed: {url}: {e}", self.name)
+                })?;
+            if !response.status().is_success() {
+                let status = response.status();
+                anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);
+            }
+            let body: ModelsResponse = response.json().await.map_err(|e| {
+                anyhow::anyhow!("{} model list returned invalid JSON: {e}", self.name)
+            })?;
+            return Ok(normalize_model_ids(body));
+        }
+        // No credential — fall back to the models.dev catalog when available.
+        match &self.models_dev_key {
+            Some(key) => crate::models_dev::list_models_for(key).await,
+            None => anyhow::bail!("live model listing is not supported for this provider"),
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -2568,6 +2628,20 @@ mod tests {
             !err_msg.contains("API key not set"),
             "should not get credential error, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn normalize_model_ids_trims_filters_and_sorts() {
+        let body = serde_json::from_value(serde_json::json!({
+            "data": [
+                {"id": " zeta-model "},
+                {"id": ""},
+                {"id": "alpha-model"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(normalize_model_ids(body), vec!["alpha-model", "zeta-model"]);
     }
 
     #[test]
