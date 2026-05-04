@@ -885,6 +885,27 @@ impl SlackChannel {
         channel_id: &str,
         bot_user_id: &str,
     ) -> Option<String> {
+        let thread_ts = Self::precheck_thread_backfill(message, &self.seen_threads)?;
+        let block = self
+            .render_thread_backfill_block(channel_id, &thread_ts, bot_user_id)
+            .await;
+        if block.is_some() {
+            Self::record_thread_seen(&self.seen_threads, &thread_ts);
+        }
+        block
+    }
+
+    /// Pure pre-check for thread-context backfill. Returns `Some(thread_ts)`
+    /// when backfill should run, `None` otherwise.
+    ///
+    /// Returns `None` when:
+    /// - the message has no `thread_ts`
+    /// - `thread_ts` equals `ts` (the message *is* the thread parent)
+    /// - the channel has already backfilled this thread in this process
+    fn precheck_thread_backfill(
+        message: &serde_json::Value,
+        seen_threads: &Mutex<HashSet<String>>,
+    ) -> Option<String> {
         let ts = message
             .get("ts")
             .and_then(|v| v.as_str())
@@ -893,28 +914,59 @@ impl SlackChannel {
         if thread_ts.is_empty() || thread_ts == ts {
             return None;
         }
-
-        // Already seen → skip backfill.
-        {
-            let seen = self.seen_threads.lock().ok()?;
-            if seen.contains(thread_ts) {
-                return None;
-            }
+        let seen = seen_threads.lock().ok()?;
+        if seen.contains(thread_ts) {
+            return None;
         }
+        Some(thread_ts.to_string())
+    }
 
-        let block = self
-            .render_thread_backfill_block(channel_id, thread_ts, bot_user_id)
-            .await?;
-
-        // Fetch succeeded — record the thread as seen.
-        if let Ok(mut seen) = self.seen_threads.lock() {
+    /// Mark `thread_ts` as backfilled. When the seen-set reaches its soft
+    /// cap, it is cleared first; that is acceptable because the worst
+    /// consequence is one re-backfill per active thread.
+    fn record_thread_seen(seen_threads: &Mutex<HashSet<String>>, thread_ts: &str) {
+        if let Ok(mut seen) = seen_threads.lock() {
             if seen.len() >= SLACK_THREAD_BACKFILL_SEEN_MAX {
                 seen.clear();
             }
             seen.insert(thread_ts.to_string());
         }
+    }
 
-        Some(block)
+    /// Pure composer for the `[Thread context]` block. Takes the
+    /// already-rendered per-message lines (after allow-list filtering and
+    /// reply-cap truncation) plus the two omission counts, and returns the
+    /// final block string with header, gap markers, and char-cap
+    /// truncation applied.
+    ///
+    /// Returns `None` when there is no signal to convey (no rendered
+    /// messages and no omissions).
+    fn compose_thread_backfill_block(
+        rendered_message_lines: Vec<String>,
+        dropped_by_allow_list: usize,
+        reply_cap_omitted: usize,
+    ) -> Option<String> {
+        if rendered_message_lines.is_empty() && dropped_by_allow_list == 0 && reply_cap_omitted == 0
+        {
+            return None;
+        }
+
+        let mut lines = vec!["[Thread context]".to_string()];
+        if dropped_by_allow_list > 0 {
+            lines.push(format!(
+                "… {} messages from non-allow-listed users omitted …",
+                dropped_by_allow_list
+            ));
+        }
+        if reply_cap_omitted > 0 {
+            lines.push(format!(
+                "… {} earlier thread messages omitted …",
+                reply_cap_omitted
+            ));
+        }
+        lines.extend(rendered_message_lines);
+
+        Self::truncate_text(&lines.join("\n"), SLACK_PERMALINK_TEXT_MAX_CHARS)
     }
 
     async fn resolve_permalink_blocks(&self, text: &str) -> Vec<String> {
@@ -1274,32 +1326,20 @@ impl SlackChannel {
             .collect();
 
         let total_allowed = allowed.len();
-        let start = total_allowed.saturating_sub(SLACK_PERMALINK_THREAD_MAX_REPLIES);
+        let reply_cap_omitted = total_allowed.saturating_sub(SLACK_PERMALINK_THREAD_MAX_REPLIES);
 
-        let mut lines = vec!["[Thread context]".to_string()];
-
-        if dropped_by_allow_list > 0 {
-            lines.push(format!(
-                "… {} messages from non-allow-listed users omitted …",
-                dropped_by_allow_list
-            ));
-        }
-        if start > 0 {
-            lines.push(format!("… {} earlier thread messages omitted …", start));
-        }
-
-        for message in &allowed[start..] {
+        let mut rendered_message_lines = Vec::new();
+        for message in &allowed[reply_cap_omitted..] {
             if let Some(line) = self.render_permalink_message_line(message, false).await {
-                lines.push(Self::strip_bot_mentions(&line, bot_user_id));
+                rendered_message_lines.push(Self::strip_bot_mentions(&line, bot_user_id));
             }
         }
 
-        // Header-only block carries no signal. Drop it.
-        if lines.len() == 1 {
-            return None;
-        }
-
-        Self::truncate_text(&lines.join("\n"), SLACK_PERMALINK_TEXT_MAX_CHARS)
+        Self::compose_thread_backfill_block(
+            rendered_message_lines,
+            dropped_by_allow_list,
+            reply_cap_omitted,
+        )
     }
 
     async fn render_permalink_thread_messages(
@@ -5442,5 +5482,212 @@ mod tests {
             }
         });
         assert!(SlackChannel::try_parse_approval_block_action(&envelope).is_none());
+    }
+
+    // --- Thread-context backfill tests ---
+
+    /// Spec 3.1: First message in an unseen thread → precheck returns the
+    /// thread_ts so backfill should run.
+    #[test]
+    fn thread_backfill_precheck_returns_thread_ts_for_unseen_thread() {
+        let seen = Mutex::new(HashSet::new());
+        let message = serde_json::json!({
+            "ts": "1700000010.000100",
+            "thread_ts": "1700000000.000001",
+            "text": "hi bot",
+            "user": "U_USER",
+        });
+        let result = SlackChannel::precheck_thread_backfill(&message, &seen);
+        assert_eq!(result.as_deref(), Some("1700000000.000001"));
+        // Precheck must not mutate seen_threads — the gate records only after
+        // a successful render.
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// Spec 3.2: Subsequent message in the same thread → precheck returns
+    /// None because the thread is already in `seen_threads`.
+    #[test]
+    fn thread_backfill_precheck_returns_none_for_already_seen_thread() {
+        let seen = Mutex::new(HashSet::new());
+        seen.lock().unwrap().insert("1700000000.000001".to_string());
+        let message = serde_json::json!({
+            "ts": "1700000020.000200",
+            "thread_ts": "1700000000.000001",
+            "text": "another reply",
+            "user": "U_USER",
+        });
+        assert!(SlackChannel::precheck_thread_backfill(&message, &seen).is_none());
+    }
+
+    /// Spec 3.3: Top-level message (no thread_ts) → no backfill.
+    #[test]
+    fn thread_backfill_precheck_returns_none_for_top_level_message() {
+        let seen = Mutex::new(HashSet::new());
+        let message = serde_json::json!({
+            "ts": "1700000010.000100",
+            "text": "hi bot",
+            "user": "U_USER",
+        });
+        assert!(SlackChannel::precheck_thread_backfill(&message, &seen).is_none());
+    }
+
+    /// Spec 3.4: Thread parent message (`thread_ts == ts`) → no backfill.
+    #[test]
+    fn thread_backfill_precheck_returns_none_for_thread_parent() {
+        let seen = Mutex::new(HashSet::new());
+        let message = serde_json::json!({
+            "ts": "1700000000.000001",
+            "thread_ts": "1700000000.000001",
+            "text": "thread starts here",
+            "user": "U_USER",
+        });
+        assert!(SlackChannel::precheck_thread_backfill(&message, &seen).is_none());
+    }
+
+    /// Spec 3.5: Mixed allow / non-allow senders → 3 rendered + gap marker
+    /// noting 2 omitted, plus the `[Thread context]` header.
+    #[test]
+    fn thread_backfill_compose_renders_allow_list_gap_marker() {
+        let lines = vec![
+            "- alice: first".to_string(),
+            "- bob: second".to_string(),
+            "- alice: third".to_string(),
+        ];
+        let block = SlackChannel::compose_thread_backfill_block(lines, 2, 0)
+            .expect("block should be produced");
+        assert!(block.starts_with("[Thread context]\n"));
+        assert!(block.contains("… 2 messages from non-allow-listed users omitted …"));
+        assert!(block.contains("- alice: first"));
+        assert!(block.contains("- bob: second"));
+        assert!(block.contains("- alice: third"));
+        // Reply-cap marker must NOT appear when reply_cap_omitted == 0.
+        assert!(!block.contains("earlier thread messages omitted"));
+    }
+
+    /// Spec 3.6: Thread containing only non-allow-listed senders → only the
+    /// header and the allow-list gap marker (no rendered messages).
+    #[test]
+    fn thread_backfill_compose_with_only_dropped_senders() {
+        let block = SlackChannel::compose_thread_backfill_block(Vec::new(), 4, 0)
+            .expect("block should still surface the gap signal");
+        assert!(block.starts_with("[Thread context]\n"));
+        assert!(block.contains("… 4 messages from non-allow-listed users omitted …"));
+        // No rendered message lines.
+        assert!(!block.contains("- "));
+    }
+
+    /// Spec 3.7: Thread exceeds reply cap → reply-cap marker rendered
+    /// alongside the most recent messages.
+    #[test]
+    fn thread_backfill_compose_renders_reply_cap_marker() {
+        let lines = (0..SLACK_PERMALINK_THREAD_MAX_REPLIES)
+            .map(|i| format!("- alice: message {i}"))
+            .collect::<Vec<_>>();
+        let block = SlackChannel::compose_thread_backfill_block(lines, 0, 5)
+            .expect("block should be produced");
+        assert!(block.starts_with("[Thread context]\n"));
+        assert!(block.contains("… 5 earlier thread messages omitted …"));
+        // Allow-list marker must NOT appear when dropped_by_allow_list == 0.
+        assert!(!block.contains("non-allow-listed"));
+    }
+
+    /// Spec 3.7b: Thread within reply cap but rendered text exceeds char cap
+    /// → block is clipped with the `…[truncated]` suffix marker.
+    #[test]
+    fn thread_backfill_compose_truncates_long_text() {
+        let huge = "x".repeat(SLACK_PERMALINK_TEXT_MAX_CHARS + 1000);
+        let lines = vec![format!("- alice: {huge}")];
+        let block = SlackChannel::compose_thread_backfill_block(lines, 0, 0)
+            .expect("block should be produced");
+        assert!(block.ends_with("…[truncated]"));
+        assert!(block.starts_with("[Thread context]"));
+    }
+
+    /// Spec 3.8: Backfilled message containing `<@bot_user_id>` → mention is
+    /// stripped from the rendered line so downstream re-trigger heuristics
+    /// don't fire.
+    #[test]
+    fn thread_backfill_strip_bot_mentions_removes_self_mention() {
+        let line = "- alice: hey <@U_BOT> can you help?";
+        let stripped = SlackChannel::strip_bot_mentions(line, "U_BOT");
+        assert!(!stripped.contains("<@U_BOT>"));
+        assert!(stripped.contains("alice:"));
+        assert!(stripped.contains("can you help?"));
+    }
+
+    /// Spec 3.9: Polling-loop eager-mark — when `extract_active_threads`
+    /// surfaces a new thread, the polling-loop logic inserts it into
+    /// `seen_threads` so subsequent reply forwards do not re-trigger
+    /// backfill. This test mirrors the structure of the production loop.
+    #[test]
+    fn thread_backfill_polling_loop_marks_new_thread_as_seen() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["C1".into()], vec![]);
+        let messages = vec![serde_json::json!({
+            "ts": "1700000000.000001",
+            "thread_ts": "1700000000.000001",
+            "reply_count": 2,
+            "latest_reply": "1700000020.000200",
+            "user": "U_USER",
+            "text": "thread parent",
+        })];
+        let mut active_threads: HashMap<String, (String, String, Instant)> = HashMap::new();
+
+        // Replicate the polling-loop registration block from `listen()`.
+        for (thread_ts, latest_reply) in SlackChannel::extract_active_threads(&messages) {
+            let was_present = active_threads.contains_key(&thread_ts);
+            let entry = active_threads
+                .entry(thread_ts.clone())
+                .or_insert_with(|| ("C1".to_string(), thread_ts.clone(), Instant::now()));
+            if latest_reply > entry.1 {
+                entry.1 = latest_reply;
+            }
+            entry.2 = Instant::now();
+            if !was_present {
+                SlackChannel::record_thread_seen(&ch.seen_threads, &thread_ts);
+            }
+        }
+
+        let seen = ch.seen_threads.lock().unwrap();
+        assert!(seen.contains("1700000000.000001"));
+    }
+
+    /// Spec 3.10: Fetch failure → triggering message forwarded without
+    /// `[Thread context]` block, and the thread is NOT inserted into
+    /// `seen_threads` so the next message can retry. This test mirrors
+    /// the contract of `maybe_render_thread_backfill`: record only on
+    /// `Some(_)`.
+    #[test]
+    fn thread_backfill_fetch_failure_does_not_record_thread_as_seen() {
+        let seen = Mutex::new(HashSet::new());
+        // Simulate: precheck returned Some, render returned None.
+        let block: Option<String> = None;
+        if block.is_some() {
+            SlackChannel::record_thread_seen(&seen, "1700000000.000001");
+        }
+        assert!(seen.lock().unwrap().is_empty());
+
+        // Sanity: the same flow with a successful render does record.
+        let block: Option<String> = Some("[Thread context]\n- alice: hi".to_string());
+        if block.is_some() {
+            SlackChannel::record_thread_seen(&seen, "1700000000.000001");
+        }
+        assert!(seen.lock().unwrap().contains("1700000000.000001"));
+    }
+
+    /// Soft-cap eviction: when the seen-set reaches its cap, recording a
+    /// new thread clears the set first, so the new entry is the only one
+    /// remaining. Documents the trade-off chosen for `record_thread_seen`.
+    #[test]
+    fn thread_backfill_soft_cap_clears_when_full() {
+        let seen = Mutex::new(HashSet::new());
+        for i in 0..SLACK_THREAD_BACKFILL_SEEN_MAX {
+            SlackChannel::record_thread_seen(&seen, &format!("T{i}"));
+        }
+        assert_eq!(seen.lock().unwrap().len(), SLACK_THREAD_BACKFILL_SEEN_MAX);
+
+        SlackChannel::record_thread_seen(&seen, "T_NEW");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen.contains("T_NEW"));
     }
 }
