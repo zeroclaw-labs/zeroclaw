@@ -400,9 +400,7 @@ pub async fn handle_delete(
     let path = personality_path(&workspace_dir, q.agent.as_deref(), allowed);
 
     let existed = path.exists();
-    if existed
-        && let Err(err) = std::fs::remove_file(&path)
-    {
+    if existed && let Err(err) = std::fs::remove_file(&path) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
