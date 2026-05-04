@@ -1,3 +1,9 @@
+// Historical schema typed lenses for migration. Each module is frozen after
+// its corresponding version ships; only their `migrate(self) -> ...` methods
+// are referenced at runtime by `crate::migration`.
+pub mod v1;
+pub mod v2;
+
 use crate::autonomy::AutonomyLevel;
 use crate::domain_matcher::DomainMatcher;
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
