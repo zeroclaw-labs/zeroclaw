@@ -1223,7 +1223,7 @@ fn create_provider_with_url_and_options(
             Ok(Box::new(p))
         }
         "anthropic" => {
-            let mut p = anthropic::AnthropicProvider::new(key);
+            let mut p = anthropic::AnthropicProvider::with_base_url(key, api_url);
             if let Some(mt) = options.provider_max_tokens {
                 p = p.with_max_tokens(mt);
             }

@@ -37,6 +37,8 @@ pub struct DiscordChannel {
     /// downloaded, transcribed, and their text inlined into the message.
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+    /// Workspace directory for saving downloaded inbound media attachments.
+    workspace_dir: Option<PathBuf>,
     /// Streaming mode: Off, Partial (draft edits), or MultiMessage (paragraph splits).
     stream_mode: zeroclaw_config::schema::StreamMode,
     /// Minimum interval (ms) between draft message edits (Partial mode only).
@@ -77,6 +79,7 @@ impl DiscordChannel {
             proxy_url: None,
             transcription: None,
             transcription_manager: None,
+            workspace_dir: None,
             stream_mode: zeroclaw_config::schema::StreamMode::Off,
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
@@ -97,6 +100,12 @@ impl DiscordChannel {
 
     pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
         self.approval_timeout_secs = secs;
+        self
+    }
+
+    /// Configure workspace directory for saving downloaded attachments.
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
         self
     }
 
@@ -180,6 +189,7 @@ impl DiscordChannel {
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
+    workspace_dir: Option<&Path>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     for att in attachments {
@@ -209,6 +219,19 @@ async fn process_attachments(
                     tracing::warn!(name, error = %e, "discord attachment fetch error");
                 }
             }
+        } else if ct.starts_with("image/") {
+            let marker = if let Some(workspace) = workspace_dir {
+                match download_discord_attachment_to_workspace(client, workspace, url, name).await {
+                    Ok(local_path) => format!("[IMAGE:{}]", local_path.display()),
+                    Err(e) => {
+                        tracing::warn!(name, error = %e, "discord: image attachment download failed");
+                        format!("[IMAGE:{url}]")
+                    }
+                }
+            } else {
+                format!("[IMAGE:{url}]")
+            };
+            parts.push(marker);
         } else {
             tracing::debug!(
                 name,
@@ -218,6 +241,35 @@ async fn process_attachments(
         }
     }
     parts.join("\n---\n")
+}
+
+async fn download_discord_attachment_to_workspace(
+    client: &reqwest::Client,
+    workspace_dir: &Path,
+    url: &str,
+    filename: &str,
+) -> anyhow::Result<PathBuf> {
+    let save_dir = workspace_dir.join("discord_files");
+    tokio::fs::create_dir_all(&save_dir).await?;
+
+    let bytes = client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+
+    let safe_name = Path::new(filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("attachment");
+    let local_name = format!("{}_{}", Uuid::new_v4(), safe_name);
+    let local_path = save_dir.join(local_name);
+
+    tokio::fs::write(&local_path, &bytes).await?;
+    Ok(local_path)
 }
 
 /// Audio file extensions accepted for voice transcription.
@@ -1248,7 +1300,9 @@ impl Channel for DiscordChannel {
                             .cloned()
                             .unwrap_or_default();
                         let client = self.http_client();
-                        let mut text_parts = process_attachments(&atts, &client).await;
+                        let mut text_parts =
+                            process_attachments(&atts, &client, self.workspace_dir.as_deref())
+                                .await;
 
                         // Transcribe audio attachments when transcription is configured
                         if let Some(ref transcription_manager) = self.transcription_manager {
@@ -2380,7 +2434,7 @@ mod tests {
     #[tokio::test]
     async fn process_attachments_empty_list_returns_empty() {
         let client = reqwest::Client::new();
-        let result = process_attachments(&[], &client).await;
+        let result = process_attachments(&[], &client, None).await;
         assert!(result.is_empty());
     }
 
@@ -2392,8 +2446,23 @@ mod tests {
             "filename": "doc.pdf",
             "content_type": "application/pdf"
         })];
-        let result = process_attachments(&attachments, &client).await;
+        let result = process_attachments(&attachments, &client, None).await;
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_attachments_emits_image_marker_without_workspace() {
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": "https://cdn.discordapp.com/attachments/123/456/photo.jpg",
+            "filename": "photo.jpg",
+            "content_type": "image/jpeg"
+        })];
+        let result = process_attachments(&attachments, &client, None).await;
+        assert_eq!(
+            result,
+            "[IMAGE:https://cdn.discordapp.com/attachments/123/456/photo.jpg]"
+        );
     }
 
     #[test]

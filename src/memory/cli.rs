@@ -1,7 +1,7 @@
 use super::traits::{Memory, MemoryCategory};
 use super::{
     MemoryBackendKind, backend_kind_from_dotted, classify_memory_backend,
-    create_memory_for_migration,
+    create_memory_for_migration, create_memory_with_storage_and_routes,
 };
 use crate::config::Config;
 use anyhow::{Result, bail};
@@ -21,7 +21,54 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
         crate::MemoryCommands::Clear { key, category, yes } => {
             handle_clear(config, key, category, yes).await
         }
+        crate::MemoryCommands::Reindex => handle_reindex(config).await,
     }
+}
+
+/// Create a memory backend with the configured embedder wired in.
+///
+/// Unlike `create_cli_memory`, which skips embedding setup for pure
+/// read/delete operations, this factory is used by commands that must
+/// actually compute embeddings (e.g. `reindex`). Mirrors the gateway's
+/// memory construction so the same model-provider / route resolution
+/// applies. V3 dropped `providers.fallback`; the embedder API key falls
+/// back to the first configured model-provider, matching how the gateway
+/// resolves it (`crates/zeroclaw-gateway/src/lib.rs` `fallback`).
+fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
+    let backend = backend_kind_from_dotted(&config.memory.backend);
+    if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
+        bail!("Memory backend is 'none' (disabled). No entries to manage.");
+    }
+    let fallback_api_key = config
+        .providers
+        .first_provider()
+        .and_then(|e| e.api_key.as_deref());
+    create_memory_with_storage_and_routes(
+        &config.memory,
+        &config.providers.embedding_routes,
+        config.resolve_active_storage(),
+        &config.workspace_dir,
+        fallback_api_key,
+    )
+}
+
+async fn handle_reindex(config: &Config) -> Result<()> {
+    let mem = create_memory_with_embedder(config)?;
+    println!("{} Reindexing memory backend...", style("→").cyan());
+    let count = mem.reindex().await?;
+    if count == 0 {
+        println!(
+            "{} FTS rebuilt. No embeddings to fill in (either everything is already embedded or the backend has no embedder configured).",
+            style("✓").green()
+        );
+    } else {
+        println!(
+            "{} FTS rebuilt. Re-embedded {count} {}.",
+            style("✓").green(),
+            if count == 1 { "entry" } else { "entries" }
+        );
+    }
+    Ok(())
 }
 
 /// Create a lightweight memory backend for CLI management operations.

@@ -69,7 +69,7 @@ tool-discord-search = Search Discord message history stored in discord.db. Use t
 
 tool-memory-forget = Remove a memory by key. Use to delete outdated facts or sensitive data. Returns whether the memory was found and removed.
 
-tool-memory-recall = Search long-term memory for relevant facts, preferences, or context. Returns scored results ranked by relevance.
+tool-memory-recall = Search long-term memory for relevant facts, preferences, or context. Returns scored results ranked by relevance. Omit the query or pass bare * to return recent memories.
 
 tool-memory-store = Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context, or a custom category name.
 
