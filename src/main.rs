@@ -2461,6 +2461,7 @@ async fn main() -> Result<()> {
                 comment,
                 json,
             } => {
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 if no_interactive {
                     let val = value.ok_or_else(|| {
                         anyhow::anyhow!(
@@ -2562,6 +2563,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Init { section, json } => {
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let initialized: Vec<String> = config
                     .init_defaults(section.as_deref())
                     .into_iter()
@@ -2588,26 +2590,18 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Migrate { json } => {
-                let raw = tokio::fs::read_to_string(&config.config_path)
-                    .await
-                    .context("Failed to read config file")?;
-                match crate::config::migration::migrate_file(&raw)? {
-                    Some(migrated) => {
-                        let backup_path = config.config_path.with_extension("toml.bak");
-                        tokio::fs::copy(&config.config_path, &backup_path)
-                            .await
-                            .context("Failed to create config backup")?;
-                        tokio::fs::write(&config.config_path, &migrated).await?;
-                        let to = crate::config::migration::CURRENT_SCHEMA_VERSION;
+                match crate::config::migration::migrate_file_in_place(&config.config_path)? {
+                    Some(report) => {
+                        let to = report.to_version;
                         if json {
                             let envelope = serde_json::json!({
                                 "migrated": true,
-                                "backup_path": backup_path.display().to_string(),
+                                "backup_path": report.backup_path.display().to_string(),
                                 "schema_version": to,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
                         } else {
-                            println!("Backed up to {}", backup_path.display());
+                            println!("Backed up to {}", report.backup_path.display());
                             println!(
                                 "Migrated {} to schema version {to}.",
                                 config.config_path.display()
@@ -2629,6 +2623,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Patch { input, json } => {
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let body = match input.as_deref() {
                     None | Some("-") => {
                         use std::io::Read;

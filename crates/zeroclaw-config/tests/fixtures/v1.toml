@@ -1,0 +1,109 @@
+# V1 migration fixture (pre-versioned schema).
+#
+# Hand-authored to exercise every transformation the V1→V2→V3 chain knows
+# about. Loaded via `include_str!` from `tests/migration.rs` (test-only;
+# never compiled into release binaries).
+#
+# When adding a new V1→V2 or V2→V3 transformation rule, extend this fixture
+# to populate the source field and add a test that asserts the destination
+# in V3 output.
+#
+# Keys present here are exercised by `tests/migration.rs`. Anything else
+# is a "passthrough" example proving that unmodeled keys propagate
+# unchanged through the chain.
+
+# ── V1 globals — fold into V2 [providers] then per-provider model entries ──
+
+# Comment-preservation test target: this comment lives on a top-level
+# section that survives V1 → V3 (the [cost] block, below). When the
+# comment-preservation pass runs, the "Cost tracking …" comment should
+# still be attached to [cost] in the migrated V3 output.
+
+api_key       = "sk-v1-test-global"
+api_url       = "https://api.example.com/v1"
+api_path      = "/chat/completions"
+default_provider = "openai"
+default_model = "gpt-4o-mini"
+default_temperature = 0.5
+provider_timeout_secs = 90
+provider_max_tokens   = 4096
+
+# Top-level [extra_headers] — folds into providers.models.<type>.default.extra_headers
+[extra_headers]
+User-Agent   = "ZeroClaw-V1-Test/1.0"
+"X-Title"    = "zeroclaw"
+
+# ── V1 [model_providers.<id>] flat → V2 providers.models flat → V3 aliased ──
+
+[model_providers.anthropic]
+api_key = "sk-ant-v1-test"
+model   = "claude-sonnet-4-5"
+base_url = "https://api.anthropic.com"
+
+# Standalone claude-code provider should land at providers.models.anthropic.claude-code in V3.
+[model_providers.claude-code]
+api_key = "sk-cc-v1-test"
+
+# ── V1 model_routes / embedding_routes — preserved at providers level in V3 ──
+
+[[model_routes]]
+hint     = "fast"
+provider = "openai"
+model    = "gpt-4o-mini"
+
+# ── V1 channels_config → V2 channels → V3 channels.<type>.<alias> ──
+
+[channels_config]
+cli = true
+
+[channels_config.discord]
+bot_token = "discord-bot-token-v1"
+guild_id  = "11111"
+allowed_users = ["111", "222"]
+
+# Legacy discord_history sidecar — folds into channels.discord.<alias>.archive=true
+[channels_config.discord_history]
+bot_token = "discord-bot-token-v1"
+channel_ids = ["aaaa", "bbbb"]
+
+# ── V1 [autonomy] → V3 [risk_profiles.default] (synthesize) ──
+[autonomy]
+level = "supervised"
+workspace_only = true
+allowed_commands = ["ls", "git", "cat"]
+forbidden_paths = ["/etc"]
+max_actions_per_hour = 100
+max_cost_per_day_cents = 1000
+require_approval_for_medium_risk = true
+block_high_risk_commands = true
+shell_env_passthrough = ["PATH", "HOME"]
+auto_approve = ["weather"]
+always_ask = []
+allowed_roots = ["~/workspace"]
+non_cli_excluded_tools = ["browser"]   # renamed to `excluded_tools` in V3
+shell_timeout_secs = 60
+
+# ── V1 [agent] → V3 [runtime_profiles.default] (synthesize) ──
+[agent]
+parallel_tools = true
+max_history_messages = 50
+max_context_tokens = 32000
+tool_dispatcher = "auto"
+max_tool_iterations = 10
+
+# ── V1 [cost] — pricing folds into providers.models[*].pricing in V3 ──
+# Cost tracking limits and per-model pricing.
+[cost]
+enabled = true
+daily_limit_usd = 25.0
+monthly_limit_usd = 100.0
+warn_at_percent = 80
+
+[cost.prices.anthropic]
+"claude-sonnet-4-5.input"  = 3.0
+"claude-sonnet-4-5.output" = 15.0
+
+# ── Unknown top-level section — must propagate to V3 unchanged (passthrough) ──
+[my_custom_section]
+custom_field = "preserved-through-chain"
+nested_value = 42

@@ -10229,12 +10229,31 @@ impl Config {
             // We now deserialize with `toml::from_str` (which is correct)
             // and run `serde_ignored` separately just for diagnostics.
             //
-            // `migrate_to_current` runs `prepare_table` (V1→V2→V3 TOML
-            // transforms) and deserializes directly into Config — no
-            // V1Compat intermediate is needed since every legacy field
-            // shape is normalized at the TOML level first.
+            // `migrate_to_current` parses the TOML, detects the schema
+            // version, runs the typed V1→V2→V3 chain via `V1Config::migrate`
+            // / `V2Config::migrate`, and deserializes the result into the
+            // current `Config` shape.
+            //
+            // Detect the on-disk version up-front so we can emit one WARN
+            // line (per the v0.8.0 schema rollout plan) when the daemon
+            // auto-migrates an older config in memory: the disk file is left
+            // untouched and the user is advised to lock the migration in
+            // with `zeroclaw config migrate`.
+            let stale_version = toml::from_str::<toml::Value>(&contents)
+                .ok()
+                .as_ref()
+                .and_then(|v| crate::migration::detect_version(v).ok())
+                .filter(|n| *n != crate::migration::CURRENT_SCHEMA_VERSION);
             let mut config: Config = crate::migration::migrate_to_current(&contents)
                 .context("Failed to migrate config")?;
+            if let Some(from_version) = stale_version {
+                tracing::warn!(
+                    "Config at {} is schema_version {from_version}; auto-migrated to {} in memory. \
+                     Run `zeroclaw config migrate` to commit the migration to disk.",
+                    config_path.display(),
+                    crate::migration::CURRENT_SCHEMA_VERSION,
+                );
+            }
 
             // Ensure the built-in default auto_approve entries are always
             // present.  When a user specifies `auto_approve` in their TOML

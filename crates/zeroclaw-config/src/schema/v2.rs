@@ -134,14 +134,21 @@ impl V2Config {
         } = self;
 
         // 1. autonomy → risk_profiles.default
+        // Field renames inside the block: V2 `non_cli_excluded_tools` → V3
+        // `excluded_tools` (V3 broadens the field's meaning beyond the
+        // non-CLI carve-out — same data shape, new name).
         if let Some(autonomy_value) = autonomy {
+            let renamed = rename_table_keys(
+                autonomy_value,
+                &[("non_cli_excluded_tools", "excluded_tools")],
+            );
             let mut risk_profiles = passthrough
                 .remove("risk_profiles")
                 .and_then(|v| v.try_into::<toml::Table>().ok())
                 .unwrap_or_default();
             risk_profiles
                 .entry("default".to_string())
-                .or_insert(autonomy_value);
+                .or_insert(renamed);
             passthrough.insert(
                 "risk_profiles".to_string(),
                 toml::Value::Table(risk_profiles),
@@ -233,9 +240,25 @@ impl V2Config {
             tracing::info!(target: "migration", "[channels] sections alias-wrapped, discord_history folded");
         }
 
-        // 8. agents → strip inline brain, synthesize provider aliases
-        if !agents.is_empty() {
-            let new_agents = synthesize_agent_brains(agents, &mut passthrough);
+        // 8. agents → strip inline brain, synthesize provider aliases.
+        //    If there are no [agents] blocks but the user had brain config
+        //    folded onto a provider entry, synthesize a default agent so V3
+        //    runtime has something concrete to dispatch to (V1/V2 had implicit
+        //    "single global agent" semantics; V3 makes agents explicit, so
+        //    upgrades need at least one). Also ensure the profile entries
+        //    referenced by agents.default exist — V3 validation rejects
+        //    dangling profile references.
+        let new_agents = if !agents.is_empty() {
+            synthesize_agent_brains(agents, &mut passthrough)
+        } else {
+            let synthesized = synthesize_default_agent_if_needed(&passthrough);
+            if !synthesized.is_empty() {
+                ensure_profile_entry(&mut passthrough, "risk_profiles", "default");
+                ensure_profile_entry(&mut passthrough, "runtime_profiles", "default");
+            }
+            synthesized
+        };
+        if !new_agents.is_empty() {
             passthrough.insert("agents".to_string(), toml::Value::Table(new_agents));
         }
 
@@ -660,6 +683,85 @@ fn merge_into_table(top: &mut toml::Table, section: &str, extras: toml::Table) {
             section_table.insert(k, v);
         }
     }
+}
+
+/// Ensure `[<section>.<alias>]` exists in `passthrough` as at least an
+/// empty table. Used when synthesizing the default agent so the agent's
+/// alias references resolve under V3 dangling-reference validation.
+fn ensure_profile_entry(passthrough: &mut toml::Table, section: &str, alias: &str) {
+    let entry = passthrough
+        .entry(section.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let Some(section_table) = entry.as_table_mut() {
+        section_table
+            .entry(alias.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    }
+}
+
+/// If no agents were declared in V2 input but the V2→V3 fold synthesized at
+/// least one provider model entry, emit a single `agents.default` referencing
+/// the first provider-alias. This preserves V1/V2 implicit single-agent
+/// semantics: the V1 user with `default_provider = "openai"` and a brain
+/// configured globally gets a working V3 default agent automatically.
+///
+/// `passthrough` is read (not mutated) — the synthesized agent is returned so
+/// the caller decides whether to install it under `agents`.
+fn synthesize_default_agent_if_needed(passthrough: &toml::Table) -> toml::Table {
+    let providers = match passthrough.get("providers").and_then(toml::Value::as_table) {
+        Some(t) => t,
+        None => return toml::Table::new(),
+    };
+    let models = match providers.get("models").and_then(toml::Value::as_table) {
+        Some(t) => t,
+        None => return toml::Table::new(),
+    };
+    let first_alias = models.iter().find_map(|(provider_type, value)| {
+        let inner = value.as_table()?;
+        let alias = inner.keys().next()?;
+        Some(format!("{provider_type}.{alias}"))
+    });
+    let alias_ref = match first_alias {
+        Some(s) => s,
+        None => return toml::Table::new(),
+    };
+
+    let mut default_agent = toml::Table::new();
+    default_agent.insert("model_provider".to_string(), toml::Value::String(alias_ref));
+    default_agent.insert(
+        "risk_profile".to_string(),
+        toml::Value::String("default".into()),
+    );
+    default_agent.insert(
+        "runtime_profile".to_string(),
+        toml::Value::String("default".into()),
+    );
+
+    let mut agents = toml::Table::new();
+    agents.insert("default".to_string(), toml::Value::Table(default_agent));
+    tracing::info!(
+        target: "migration",
+        "synthesized [agents.default] from V1/V2 implicit single-agent semantics"
+    );
+    agents
+}
+
+/// Rename top-level keys inside a `toml::Value::Table` according to a list of
+/// `(old, new)` pairs. Non-tables are returned unchanged. Existing values at
+/// the new key are not overwritten — the rename is best-effort.
+fn rename_table_keys(value: toml::Value, renames: &[(&str, &str)]) -> toml::Value {
+    let mut table = match value {
+        toml::Value::Table(t) => t,
+        other => return other,
+    };
+    for (old, new) in renames {
+        if let Some(v) = table.remove(*old)
+            && !table.contains_key(*new)
+        {
+            table.insert((*new).to_string(), v);
+        }
+    }
+    toml::Value::Table(table)
 }
 
 /// Lowercase, replace non-alphanumeric runs with underscores, trim underscores.

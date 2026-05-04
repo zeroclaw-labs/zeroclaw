@@ -70,6 +70,12 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
 /// Pure migration from any supported version's TOML string into the current
 /// schema version's TOML string. Returns `Ok(None)` when the input is already
 /// at `CURRENT_SCHEMA_VERSION`.
+///
+/// Comments and decoration on keys whose dotted path survives the migration
+/// are preserved via `toml_edit::DocumentMut` reconciliation (`sync_table`).
+/// Keys that are renamed, removed, or restructured lose their comments — the
+/// `.backup` file written by `migrate_file_in_place` retains the original
+/// for manual recovery.
 pub fn migrate_file(input: &str) -> Result<Option<String>> {
     let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
     let from = detect_version(&value)?;
@@ -82,9 +88,24 @@ pub fn migrate_file(input: &str) -> Result<Option<String>> {
         ));
     }
     let migrated_value = run_chain(value, from)?;
-    let serialized =
-        toml::to_string_pretty(&migrated_value).context("failed to serialize migrated config")?;
-    Ok(Some(serialized))
+    let migrated_table = match migrated_value {
+        toml::Value::Table(t) => t,
+        _ => {
+            anyhow::bail!("migrated config is not a TOML table");
+        }
+    };
+
+    // Try to preserve comments by reconciling into the original DocumentMut.
+    // If the original doesn't parse as toml_edit (rare — toml::from_str
+    // already succeeded on it), fall back to a fresh serialization.
+    if let Ok(mut doc) = input.parse::<toml_edit::DocumentMut>() {
+        sync_table(doc.as_table_mut(), &migrated_table);
+        Ok(Some(doc.to_string()))
+    } else {
+        let serialized = toml::to_string_pretty(&toml::Value::Table(migrated_table))
+            .context("failed to serialize migrated config")?;
+        Ok(Some(serialized))
+    }
 }
 
 /// High-level: arbitrary versioned TOML → fully validated V3 `Config`.
@@ -158,6 +179,46 @@ pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
 pub struct MigrateReport {
     pub backup_path: std::path::PathBuf,
     pub to_version: u32,
+}
+
+/// Refuse to proceed if the on-disk config is at a stale schema version.
+///
+/// Used by CLI write commands (`config set`, `config patch`, `config init`)
+/// to ensure the user explicitly opts into the migration via
+/// `zeroclaw config migrate` before modifying a stale config — the alternative
+/// would be a silent auto-migrate-on-write, which is harder to audit and
+/// surprises users who didn't realize their config schema had changed.
+///
+/// - Missing file → `Ok(())` (fresh install: nothing to migrate yet).
+/// - Current version → `Ok(())`.
+/// - Stale (or future) version → `Err` with a message that names the disk
+///   version and the command the user needs to run.
+pub fn ensure_disk_at_current_version(path: &Path) -> Result<()> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(anyhow::Error::from(e))
+                .with_context(|| format!("failed to read config at {}", path.display()));
+        }
+    };
+    let value: toml::Value =
+        toml::from_str(&raw).context("failed to parse config TOML for version check")?;
+    let from = detect_version(&value)?;
+    if from == CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if from > CURRENT_SCHEMA_VERSION {
+        anyhow::bail!(
+            "config at {} is schema_version {from}, newer than this binary supports ({})",
+            path.display(),
+            CURRENT_SCHEMA_VERSION,
+        );
+    }
+    anyhow::bail!(
+        "config at {} is schema_version {from}; run `zeroclaw config migrate` to update before modifying",
+        path.display(),
+    );
 }
 
 /// Run the typed migration chain from `from` up to `CURRENT_SCHEMA_VERSION`.
