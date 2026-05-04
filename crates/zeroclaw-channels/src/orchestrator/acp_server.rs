@@ -1606,7 +1606,10 @@ mod tests {
         let result = server
             .handle_session_cancel(&serde_json::json!({ "sessionId": "sess_does_not_exist" }))
             .await;
-        assert!(result.is_ok(), "unknown-session cancel must succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "unknown-session cancel must succeed: {result:?}"
+        );
     }
 
     /// After a normal (non-cancelled) turn, the cancel token must be removed from
