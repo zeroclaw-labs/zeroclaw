@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
-import { X, Settings, Sun, Moon, Monitor, Laptop, Check, Type, CaseSensitive, Palette } from 'lucide-react';
+import { X, Settings, Sun, Moon, Monitor, Laptop, Check, Type, CaseSensitive, Palette, Globe } from 'lucide-react';
 import { useTheme } from '@/hooks/useTheme';
-import { t } from '@/lib/i18n';
+import { t, SUPPORTED_LOCALES } from '@/lib/i18n';
 import type { AccentColor, UiFont, MonoFont, ThemeMode } from '@/contexts/ThemeContext';
 import { uiFontStacks, monoFontStacks } from '@/contexts/ThemeContext';
 import { colorThemes } from '@/contexts/colorThemes';
@@ -22,18 +22,18 @@ const accentOptions: { value: AccentColor; color: string }[] = [
   { value: 'blue', color: '#3b82f6' },
 ];
 
-const uiFontOptions: { value: UiFont; label: string; sample: string }[] = [
-  { value: 'system', label: 'System', sample: 'Segoe/UI' },
+const uiFontOptions: { value: UiFont; label: string; labelKey?: string; sample: string }[] = [
+  { value: 'system', label: 'System', labelKey: 'settings.font.system', sample: 'Segoe/UI' },
   { value: 'inter', label: 'Inter', sample: 'Inter' },
   { value: 'segoe', label: 'Segoe UI', sample: 'Segoe' },
   { value: 'sf', label: 'SF Pro', sample: 'SF' },
 ];
 
-const monoFontOptions: { value: MonoFont; label: string; sample: string }[] = [
+const monoFontOptions: { value: MonoFont; label: string; labelKey?: string; sample: string }[] = [
   { value: 'jetbrains', label: 'JetBrains Mono', sample: 'JetBrains' },
   { value: 'fira', label: 'Fira Code', sample: 'Fira' },
   { value: 'cascadia', label: 'Cascadia Code', sample: 'Cascadia' },
-  { value: 'system-mono', label: 'System mono', sample: 'System' },
+  { value: 'system-mono', label: 'System mono', labelKey: 'settings.font.systemMono', sample: 'System' },
 ];
 
 const uiSizes = [14, 15, 16, 17, 18];
@@ -48,6 +48,11 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
       {children}
     </div>
   );
+}
+
+function colorThemeLabel(theme: typeof colorThemes[number]): string {
+  const localized = t(`theme.name.${theme.id}`);
+  return localized === `theme.name.${theme.id}` ? theme.name : localized;
 }
 
 /** Mini terminal preview card for a color theme. */
@@ -108,7 +113,7 @@ function ThemePreviewCard({
           className="text-[10px] font-medium truncate"
           style={{ color: active ? 'var(--pc-accent-light)' : 'var(--pc-text-muted)' }}
         >
-          {theme.name}
+          {colorThemeLabel(theme)}
         </span>
       </div>
     </button>
@@ -118,9 +123,11 @@ function ThemePreviewCard({
 interface Props {
   open: boolean;
   onClose: () => void;
+  locale: string;
+  onLocaleChange: (locale: string) => void;
 }
 
-export function SettingsModal({ open, onClose }: Props) {
+export function SettingsModal({ open, onClose, locale, onLocaleChange }: Props) {
   const {
     theme, accent, colorTheme, uiFont, monoFont, uiFontSize, monoFontSize,
     setTheme, setAccent, setColorTheme, setUiFont, setMonoFont, setUiFontSize, setMonoFontSize,
@@ -129,15 +136,16 @@ export function SettingsModal({ open, onClose }: Props) {
   type TabId = 'appearance' | 'themes' | 'typography';
   const [tab, setTab] = useState<TabId>('appearance');
 
-  const tabs: { id: TabId; label: string; icon: typeof Palette }[] = useMemo(() => [
+  const tabs: { id: TabId; label: string; icon: typeof Palette }[] = [
     { id: 'appearance', label: t('settings.tab.appearance'), icon: Settings },
-    { id: 'themes', label: 'Themes', icon: Palette },
+    { id: 'themes', label: t('settings.tab.themes'), icon: Palette },
     { id: 'typography', label: t('settings.tab.typography'), icon: Type },
-  ], []);
+  ];
 
   // Group themes by scheme for the themes tab
   const darkThemes = useMemo(() => colorThemes.filter(ct => ct.scheme === 'dark'), []);
   const lightThemes = useMemo(() => colorThemes.filter(ct => ct.scheme === 'light'), []);
+  const activeColorTheme = colorThemes.find(ct => ct.id === colorTheme);
 
   useEffect(() => {
     if (!open) return;
@@ -179,7 +187,7 @@ export function SettingsModal({ open, onClose }: Props) {
             style={{ color: 'var(--pc-text-muted)', background: 'transparent', border: 'none', cursor: 'pointer' }}
             onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; e.currentTarget.style.background = 'var(--pc-hover)'; }}
             onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; e.currentTarget.style.background = 'transparent'; }}
-            aria-label="Close"
+            aria-label={t('common.close')}
           >
             <X size={16} />
           </button>
@@ -266,12 +274,39 @@ export function SettingsModal({ open, onClose }: Props) {
                         boxShadow: accent === opt.value ? `0 0 8px ${opt.color}40` : 'none',
                       }}
                       aria-pressed={accent === opt.value}
-                      aria-label={`${opt.value} accent`}
+                      aria-label={`${t(`theme.accent.${opt.value}`)} ${t('theme.accent')}`}
                     >
                       {accent === opt.value && <Check size={14} style={{ color: 'white' }} />}
                     </button>
                   ))}
                 </div>
+              </div>
+
+              {/* Language */}
+              <div className="mb-4">
+                <label
+                  htmlFor="settings-locale"
+                  className="flex items-center gap-2 text-xs mb-2"
+                  style={{ color: 'var(--pc-text-secondary)' }}
+                >
+                  <Globe size={14} />
+                  {t('settings.language')}
+                </label>
+                <select
+                  id="settings-locale"
+                  value={locale}
+                  onChange={(e) => onLocaleChange(e.target.value)}
+                  className="w-full rounded-xl border px-3 py-2 text-xs transition-colors"
+                  style={{
+                    borderColor: 'var(--pc-border)',
+                    background: 'var(--pc-bg-elevated)',
+                    color: 'var(--pc-text-primary)',
+                  }}
+                >
+                  {SUPPORTED_LOCALES.map(({ code, name }) => (
+                    <option key={code} value={code}>{name} · {code.toUpperCase()}</option>
+                  ))}
+                </select>
               </div>
             </>
           )}
@@ -279,7 +314,7 @@ export function SettingsModal({ open, onClose }: Props) {
           {/* Themes Tab */}
           {tab === 'themes' && (
             <>
-              <SectionTitle>Dark Themes</SectionTitle>
+              <SectionTitle>{t('settings.darkThemes')}</SectionTitle>
               <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 mb-4">
                 {darkThemes.map(ct => (
                   <ThemePreviewCard
@@ -291,7 +326,7 @@ export function SettingsModal({ open, onClose }: Props) {
                 ))}
               </div>
 
-              <SectionTitle>Light Themes</SectionTitle>
+              <SectionTitle>{t('settings.lightThemes')}</SectionTitle>
               <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 mb-4">
                 {lightThemes.map(ct => (
                   <ThemePreviewCard
@@ -311,13 +346,13 @@ export function SettingsModal({ open, onClose }: Props) {
                 <div className="flex items-center gap-2">
                   <Palette size={14} style={{ color: 'var(--pc-accent)' }} />
                   <span className="text-xs font-medium" style={{ color: 'var(--pc-text-primary)' }}>
-                    {colorThemes.find(ct => ct.id === colorTheme)?.name ?? 'Default Dark'}
+                    {activeColorTheme ? colorThemeLabel(activeColorTheme) : t('theme.name.default-dark')}
                   </span>
                   <span
                     className="text-[10px] px-1.5 py-0.5 rounded-full"
                     style={{ background: 'var(--pc-accent-glow)', color: 'var(--pc-accent-light)' }}
                   >
-                    Active
+                    {t('settings.active')}
                   </span>
                 </div>
               </div>
@@ -349,7 +384,7 @@ export function SettingsModal({ open, onClose }: Props) {
                       onMouseLeave={(e) => { if (uiFont !== opt.value) e.currentTarget.style.background = 'transparent'; }}
                     >
                       <span style={{ fontSize: '14px', fontFamily: uiFontStacks[opt.value] }}>{opt.sample}</span>
-                      <span style={{ fontSize: '11px', color: 'var(--pc-text-faint)' }}>{opt.label}</span>
+                      <span style={{ fontSize: '11px', color: 'var(--pc-text-faint)' }}>{opt.labelKey ? t(opt.labelKey) : opt.label}</span>
                     </button>
                   ))}
                 </div>
@@ -375,7 +410,7 @@ export function SettingsModal({ open, onClose }: Props) {
                       onMouseLeave={(e) => { if (monoFont !== opt.value) e.currentTarget.style.background = 'transparent'; }}
                     >
                       <span style={{ fontSize: '14px', fontFamily: monoFontStacks[opt.value] }}>{opt.sample}</span>
-                      <span style={{ fontSize: '11px', color: 'var(--pc-text-faint)' }}>{opt.label}</span>
+                      <span style={{ fontSize: '11px', color: 'var(--pc-text-faint)' }}>{opt.labelKey ? t(opt.labelKey) : opt.label}</span>
                     </button>
                   ))}
                 </div>
@@ -446,7 +481,7 @@ export function SettingsModal({ open, onClose }: Props) {
                   className="rounded-xl border p-2 text-[13px]"
                   style={{ fontFamily: 'var(--pc-font-mono)', fontSize: 'var(--pc-font-size-mono)', color: 'var(--pc-text-primary)', borderColor: 'var(--pc-border)', background: 'var(--pc-bg-code)' }}
                 >
-                  const hello = 'ZeroClaw'; // typography preview
+                  {t('settings.previewCode')}
                 </div>
               </div>
             </>

@@ -41,6 +41,38 @@ Generating on demand keeps the runtime `build_spec()` as the single contract sou
 3. Update consumers in `web/src/` to match.
 4. `cargo web build` for the final bundle.
 
+## Dashboard i18n
+
+The dashboard keeps its locale registry in `web/src/lib/i18n/` instead of one
+large translation file:
+
+| Path | Purpose |
+| ---- | ------- |
+| `web/src/lib/i18n.ts` | Runtime locale state and translation helpers |
+| `web/src/lib/i18n/types.ts` | `Locale` and `LocaleMessages` types |
+| `web/src/lib/i18n/supportedLocales.ts` | Language picker metadata |
+| `web/src/lib/i18n/translations.ts` | Per-locale module registry |
+| `web/src/lib/i18n/locales/*.ts` | Locale message maps |
+
+React components should not hardcode visible dashboard copy. Use `t()` for normal
+strings and `tWithFallback()` when a backend-supplied English fallback is still
+valid. Schema-driven config editor copy has dedicated helpers in
+`web/src/lib/i18n.ts`:
+
+- `tConfigLabel(path, fallback)` for field labels.
+- `tConfigDescription(path, fallback)` for schema doc-comment descriptions.
+- `tConfigPlaceholder(path, fallback)` for input placeholders.
+- `tConfigSectionLabel()` / `tConfigGroupLabel()` / picker helpers for Config
+  navigation and picker rows.
+
+Config paths may arrive as kebab-case (`api-key`) or snake_case (`api_key`),
+especially for nested object-array fields derived from JSON Schema. The helper
+layer normalizes both forms, tries wildcard candidates for dynamic map sections
+such as `providers.models.*.<field>` and `channels.*.<field>`, then falls back to
+English and finally to the schema-provided text. Prefer wildcard translation keys
+for user-defined map keys so contributors do not need one translation per local
+provider or channel name.
+
 ## CI and release builds
 
 CI does not run `cargo web build` — the lint/build/test jobs use a `web/dist/.gitkeep` placeholder so the gateway crate compiles without the bundle. Producing a release artifact that includes the dashboard is a separate step:

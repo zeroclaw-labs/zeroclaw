@@ -1,13 +1,14 @@
 # Docs & Translations
 
-ZeroClaw has two independent translation layers:
+ZeroClaw has three independent translation layers:
 
 | Layer | Format | What it covers |
 |---|---|---|
-| **App strings** | Mozilla Fluent (`.ftl`) | CLI help text, command descriptions, runtime messages |
+| **Runtime app strings** | Mozilla Fluent (`.ftl`) | CLI help text, command descriptions, runtime messages |
+| **Web dashboard strings** | TypeScript locale modules (`web/src/lib/i18n/locales/*.ts`) | React dashboard navigation, settings, config editor labels, helper text, and placeholders |
 | **Docs** | gettext (`.po`) | Everything in this mdBook |
 
-They are filled separately and stored separately. Both use a provider-agnostic fill pipeline: configure any OpenAI-compatible endpoint in `~/.zeroclaw/config.toml` under `[providers.models.<name>]` and pass `--provider <name>` to the fill commands.
+They are filled separately and stored separately. Fluent and docs translations use a provider-agnostic fill pipeline: configure any OpenAI-compatible endpoint in `~/.zeroclaw/config.toml` under `[providers.models.<name>]` and pass `--provider <name>` to the fill commands. Web dashboard strings are curated directly in TypeScript locale modules so UI-specific keys can stay close to the React code that consumes them.
 
 Local models via [Ollama](https://ollama.com) are a first-class option — no API keys required, no per-call cost. A hosted provider is also fine for release-grade quality. Translation is a local operation — run `cargo mdbook sync` before you PR.
 
@@ -47,6 +48,44 @@ After filling, copy the updated `.ftl` file to your workspace and rebuild to pic
 mkdir -p ~/.zeroclaw/workspace/locales/ja
 cp crates/zeroclaw-runtime/locales/ja/cli.ftl ~/.zeroclaw/workspace/locales/ja/cli.ftl
 ```
+
+## Updating web dashboard strings (TypeScript)
+
+Dashboard locale data lives under `web/src/lib/i18n/`:
+
+| Path | Purpose |
+|---|---|
+| `web/src/lib/i18n.ts` | Runtime locale state plus helpers such as `t()`, `tWithFallback()`, and config-specific fallback helpers |
+| `web/src/lib/i18n/types.ts` | Supported `Locale` union and message-map type |
+| `web/src/lib/i18n/supportedLocales.ts` | Language picker metadata |
+| `web/src/lib/i18n/translations.ts` | Locale module registry |
+| `web/src/lib/i18n/locales/<locale>.ts` | Per-locale dashboard messages |
+
+When adding or changing dashboard copy:
+
+1. Add English source strings in `web/src/lib/i18n/locales/en.ts`.
+2. Add the requested target locale strings in `web/src/lib/i18n/locales/<locale>.ts`.
+3. Import and call `t()` / `tWithFallback()` from React components instead of hardcoding visible UI text.
+4. For schema-driven config editor fields, prefer stable keys:
+
+   | Key family | Used for |
+   |---|---|
+   | `config.label.<path>` / `config.label.leaf.<leaf>` | Field labels and common leaf-name fallbacks |
+   | `config.description.<path>` | Schema-derived field descriptions and picker descriptions |
+   | `config.placeholder.<path>` | Field-specific placeholders |
+
+   Dynamic map entries should use wildcard keys such as
+   `config.description.providers.models.*.model` instead of per-user map keys.
+   The helper layer normalizes snake_case and kebab-case paths, tries wildcard
+   candidates for map-shaped sections, then falls back to English and finally to
+   the schema-provided text.
+
+5. Validate dashboard changes with:
+
+   ```bash
+   npm run build --prefix web
+   git diff --check
+   ```
 
 ## Filling doc translations (gettext)
 

@@ -18,6 +18,12 @@ import {
   getSectionPicker,
   type PickerItem,
 } from '../../lib/api';
+import {
+  t,
+  tConfigPickerItemDescription,
+  tConfigPickerItemLabel,
+  tWithFallback,
+} from '../../lib/i18n';
 
 interface SectionPickerProps {
   /** Section key, e.g. 'providers'. */
@@ -78,9 +84,20 @@ export default function SectionPicker({
     filterRef.current?.focus();
   }, [sectionKey]);
 
+  const localizedItems = useMemo(
+    () => items.map((item) => ({
+      ...item,
+      label: tConfigPickerItemLabel(sectionKey, item.key, item.label),
+      description: tConfigPickerItemDescription(sectionKey, item.key, item.description) ?? undefined,
+      badge: item.badge ? tWithFallback(`config.badge.${item.badge}`, item.badge) : undefined,
+      rawBadge: item.badge,
+    })),
+    [items, sectionKey],
+  );
+
   const filtered = useMemo(
-    () => fuzzyFilter(items, filter, (i) => `${i.key} ${i.label}`),
-    [items, filter],
+    () => fuzzyFilter(localizedItems, filter, (i) => `${i.key} ${i.label} ${i.description ?? ''}`),
+    [localizedItems, filter],
   );
 
   const handleKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -144,7 +161,7 @@ export default function SectionPicker({
             setHighlightIdx(0);
           }}
           onKeyDown={handleKey}
-          placeholder="Filter — fuzzy match. Enter to pick, Esc to skip."
+          placeholder={t('config.picker.filter_placeholder')}
           className="input-electric w-full px-3 py-2.5 text-sm"
         />
       </div>
@@ -158,7 +175,7 @@ export default function SectionPicker({
             className="px-4 py-6 text-sm text-center"
             style={{ color: 'var(--pc-text-muted)' }}
           >
-            No matches. Try a different filter.
+            {t('config.picker.no_matches')}
           </div>
         ) : (
           filtered.map((item, idx) => (
@@ -202,16 +219,16 @@ export default function SectionPicker({
                   className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full"
                   style={{
                     background:
-                      item.badge === 'configured' || item.badge === 'active'
+                      item.rawBadge === 'configured' || item.rawBadge === 'active'
                         ? 'rgba(0, 230, 138, 0.12)'
                         : 'var(--pc-bg-elevated)',
                     color:
-                      item.badge === 'configured' || item.badge === 'active'
+                      item.rawBadge === 'configured' || item.rawBadge === 'active'
                         ? 'var(--color-status-success)'
                         : 'var(--pc-text-secondary)',
                   }}
                 >
-                  {(item.badge === 'configured' || item.badge === 'active') && (
+                  {(item.rawBadge === 'configured' || item.rawBadge === 'active') && (
                     <Check className="h-3 w-3" />
                   )}
                   {item.badge}
@@ -230,7 +247,7 @@ export default function SectionPicker({
             className="btn-secondary flex items-center gap-2 text-sm px-3 py-2"
           >
             <ArrowLeft className="h-4 w-4" />
-            Back
+            {t('common.back')}
           </button>
         </div>
       )}

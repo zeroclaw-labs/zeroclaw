@@ -195,7 +195,7 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
         </div>
       </header>
 
-      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} locale={locale} onLocaleChange={setAppLocale} />
     </>
   );
 }
