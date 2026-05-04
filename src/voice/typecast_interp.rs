@@ -100,32 +100,107 @@ pub struct TypecastInterpConfig {
 // ── Voice matching ────────────────────────────────────────────────
 
 /// Map LanguageCode to Typecast ISO 639-3 code.
+///
+/// Typecast does not actually support 75 languages today — its ssfm-v30
+/// catalog covers ~37 (per `handle_api_voices_list` in `gateway/api.rs`).
+/// For language codes outside Typecast's catalog we still return a
+/// best-effort ISO 639-3 string; the Typecast TTS call will fail
+/// gracefully and the gateway will surface a `NO_TYPECAST_VOICE` error
+/// (see `select_fallback_voice_id`). That is preferable to refusing to
+/// build the request at all — it lets the rest of the voice pipeline
+/// compile against the full enum, and the only user-visible
+/// consequence is a clear error instead of a silent fallback.
 pub fn lang_to_typecast_iso3(lang: LanguageCode) -> &'static str {
     match lang {
+        // East Asia
         LanguageCode::Ko => "kor",
-        LanguageCode::En => "eng",
         LanguageCode::Ja => "jpn",
         LanguageCode::Zh | LanguageCode::ZhTw => "cmn",
-        LanguageCode::Es => "spa",
-        LanguageCode::Fr => "fra",
-        LanguageCode::De => "deu",
-        LanguageCode::Pt => "por",
-        LanguageCode::It => "ita",
+        LanguageCode::Mn => "mon",
+        // Southeast Asia
         LanguageCode::Vi => "vie",
         LanguageCode::Th => "tha",
         LanguageCode::Id => "ind",
-        LanguageCode::Hi => "hin",
-        LanguageCode::Ar => "ara",
-        LanguageCode::Tr => "tur",
-        LanguageCode::Ru => "rus",
-        LanguageCode::Pl => "pol",
-        LanguageCode::Nl => "nld",
-        LanguageCode::Sv => "swe",
-        LanguageCode::Da => "dan",
-        LanguageCode::Cs => "ces",
-        LanguageCode::Uk => "ukr",
         LanguageCode::Ms => "msa",
         LanguageCode::Tl => "fil",
+        LanguageCode::My => "mya",
+        LanguageCode::Km => "khm",
+        LanguageCode::Lo => "lao",
+        // South Asia
+        LanguageCode::Hi => "hin",
+        LanguageCode::Bn => "ben",
+        LanguageCode::Ta => "tam",
+        LanguageCode::Te => "tel",
+        LanguageCode::Mr => "mar",
+        LanguageCode::Gu => "guj",
+        LanguageCode::Kn => "kan",
+        LanguageCode::Ml => "mal",
+        LanguageCode::Pa => "pan",
+        LanguageCode::Or => "ori",
+        LanguageCode::Si => "sin",
+        LanguageCode::Ur => "urd",
+        LanguageCode::Ne => "nep",
+        LanguageCode::Sd => "snd",
+        // Europe — Western Latin
+        LanguageCode::En => "eng",
+        LanguageCode::Es => "spa",
+        LanguageCode::Fr => "fra",
+        LanguageCode::De => "deu",
+        LanguageCode::It => "ita",
+        LanguageCode::Pt => "por",
+        LanguageCode::Nl => "nld",
+        LanguageCode::Pl => "pol",
+        LanguageCode::Cs => "ces",
+        LanguageCode::Sv => "swe",
+        LanguageCode::Da => "dan",
+        LanguageCode::No => "nor",
+        LanguageCode::Fi => "fin",
+        LanguageCode::Is => "isl",
+        LanguageCode::Ga => "gle",
+        LanguageCode::Cy => "cym",
+        LanguageCode::Mt => "mlt",
+        LanguageCode::Eu => "eus",
+        LanguageCode::Ca => "cat",
+        LanguageCode::Gl => "glg",
+        // Europe — Central / Southeastern Latin
+        LanguageCode::Hu => "hun",
+        LanguageCode::Ro => "ron",
+        LanguageCode::Sk => "slk",
+        LanguageCode::Sl => "slv",
+        LanguageCode::Hr => "hrv",
+        LanguageCode::Sr => "srp",
+        LanguageCode::Bs => "bos",
+        LanguageCode::Sq => "sqi",
+        LanguageCode::Et => "est",
+        LanguageCode::Lv => "lav",
+        LanguageCode::Lt => "lit",
+        // Europe — East Slavic Cyrillic
+        LanguageCode::Ru => "rus",
+        LanguageCode::Uk => "ukr",
+        LanguageCode::Be => "bel",
+        LanguageCode::Bg => "bul",
+        LanguageCode::Mk => "mkd",
+        // Europe — other scripts
+        LanguageCode::El => "ell",
+        LanguageCode::Hy => "hye",
+        LanguageCode::Ka => "kat",
+        LanguageCode::Tr => "tur",
+        // Middle East
+        LanguageCode::Ar => "ara",
+        LanguageCode::He => "heb",
+        LanguageCode::Fa => "fas",
+        // Central Asia
+        LanguageCode::Kk => "kaz",
+        LanguageCode::Uz => "uzb",
+        LanguageCode::Az => "aze",
+        // Africa
+        LanguageCode::Sw => "swa",
+        LanguageCode::Am => "amh",
+        LanguageCode::Yo => "yor",
+        LanguageCode::Ha => "hau",
+        LanguageCode::Zu => "zul",
+        LanguageCode::Af => "afr",
+        LanguageCode::So => "som",
     }
 }
 
