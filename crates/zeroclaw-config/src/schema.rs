@@ -18576,4 +18576,108 @@ allowed_users = ["@u:m"]
             serde_json::from_str(r#"{"enabled":true,"approval_timeout_secs":180}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 180);
     }
+
+    // ── combined_pricing: per-provider + top-level merge (#6251) ──────
+
+    fn pricing(input: f64, output: f64) -> ModelPricing {
+        ModelPricing { input, output }
+    }
+
+    fn config_with_provider(
+        provider_id: &str,
+        model: Option<&str>,
+        per_provider_pricing: Option<ModelPricing>,
+    ) -> Config {
+        let mut config = Config::default();
+        // Start clean: Config::default() seeds CostConfig::default() which calls
+        // get_default_pricing(); for these tests we want a deterministic baseline.
+        config.cost.prices.clear();
+        config.providers.models.insert(
+            provider_id.to_string(),
+            ModelProviderConfig {
+                model: model.map(ToString::to_string),
+                pricing: per_provider_pricing,
+                ..ModelProviderConfig::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    async fn combined_pricing_passes_through_when_no_per_provider_pricing() {
+        let mut config = config_with_provider("openai", Some("gpt-4o"), None);
+        config
+            .cost
+            .prices
+            .insert("openai/gpt-4o".into(), pricing(2.5, 10.0));
+
+        let combined = config.combined_pricing();
+        assert_eq!(combined.len(), 1);
+        let entry = combined.get("openai/gpt-4o").expect("top-level entry");
+        assert_eq!(entry.input, 2.5);
+        assert_eq!(entry.output, 10.0);
+    }
+
+    #[test]
+    async fn combined_pricing_merges_per_provider_into_provider_slash_model_key() {
+        let config = config_with_provider(
+            "anthropic",
+            Some("claude-sonnet-4-5"),
+            Some(pricing(3.0, 15.0)),
+        );
+
+        let combined = config.combined_pricing();
+        let entry = combined
+            .get("anthropic/claude-sonnet-4-5")
+            .expect("per-provider pricing keyed as <provider_id>/<model>");
+        assert_eq!(entry.input, 3.0);
+        assert_eq!(entry.output, 15.0);
+    }
+
+    #[test]
+    async fn combined_pricing_top_level_wins_on_conflict() {
+        let mut config = config_with_provider(
+            "anthropic",
+            Some("claude-sonnet-4-5"),
+            Some(pricing(3.0, 15.0)),
+        );
+        // Operator pinned a different rate at the top level — must survive.
+        config.cost.prices.insert(
+            "anthropic/claude-sonnet-4-5".into(),
+            pricing(2.0, 8.0),
+        );
+
+        let combined = config.combined_pricing();
+        let entry = combined.get("anthropic/claude-sonnet-4-5").unwrap();
+        assert_eq!(
+            entry.input, 2.0,
+            "top-level [cost.prices] override must not be silently shadowed by per-provider pricing"
+        );
+        assert_eq!(entry.output, 8.0);
+    }
+
+    #[test]
+    async fn combined_pricing_skips_provider_with_no_model() {
+        // Provider has pricing but no `model` set — we cannot synthesize the
+        // <provider_id>/<model> key, so the entry must be skipped (not crash,
+        // not produce a malformed key).
+        let config = config_with_provider("openrouter", None, Some(pricing(1.0, 2.0)));
+
+        let combined = config.combined_pricing();
+        assert!(
+            combined.is_empty(),
+            "per-provider pricing without `model` is silently skipped, got {combined:?}"
+        );
+    }
+
+    #[test]
+    async fn combined_pricing_skips_provider_with_empty_model() {
+        let config = config_with_provider("openrouter", Some(""), Some(pricing(1.0, 2.0)));
+
+        let combined = config.combined_pricing();
+        assert!(
+            combined.is_empty(),
+            "empty model string must be treated the same as missing, got {combined:?}"
+        );
+    }
 }
