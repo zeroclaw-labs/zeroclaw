@@ -79,6 +79,19 @@ pub fn record_tool_loop_cost_usage(
     Some((cost_usage.total_tokens, cost_usage.cost_usd))
 }
 
+/// Insert `(provider, model)` into `seen`. Returns `true` on first sighting,
+/// `false` thereafter. Split out from `warn_once_missing_pricing` so the
+/// dedup contract can be unit-tested with a caller-owned set instead of the
+/// process-static one.
+fn missing_pricing_first_sighting(
+    seen: &Mutex<HashSet<(String, String)>>,
+    provider: &str,
+    model: &str,
+) -> bool {
+    seen.lock()
+        .insert((provider.to_string(), model.to_string()))
+}
+
 /// First-time WARN, subsequent DEBUG, per `(provider, model)` pair.
 ///
 /// The default pricing catalog has no entries for most non-OpenAI/Anthropic/
@@ -91,9 +104,7 @@ pub fn record_tool_loop_cost_usage(
 fn warn_once_missing_pricing(provider: &str, model: &str) {
     static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    let key = (provider.to_string(), model.to_string());
-    let first_sighting = seen.lock().insert(key);
-    if first_sighting {
+    if missing_pricing_first_sighting(seen, provider, model) {
         tracing::warn!(
             provider,
             model,
@@ -125,4 +136,76 @@ pub fn check_tool_loop_budget() -> Option<BudgetCheck> {
                 .check_budget(0.0)
                 .unwrap_or(BudgetCheck::Allowed)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_seen() -> Mutex<HashSet<(String, String)>> {
+        Mutex::new(HashSet::new())
+    }
+
+    #[test]
+    fn first_sighting_returns_true() {
+        let seen = fresh_seen();
+        assert!(
+            missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
+            "first observation of a (provider, model) pair must report first-sighting"
+        );
+    }
+
+    #[test]
+    fn second_sighting_same_pair_returns_false() {
+        let seen = fresh_seen();
+        assert!(missing_pricing_first_sighting(
+            &seen, "minimax", "MiniMax-M2.7"
+        ));
+        assert!(
+            !missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
+            "second sighting of the same pair must NOT re-fire WARN"
+        );
+    }
+
+    #[test]
+    fn different_models_under_same_provider_are_independent() {
+        let seen = fresh_seen();
+        assert!(missing_pricing_first_sighting(
+            &seen, "minimax", "MiniMax-M2.7"
+        ));
+        assert!(
+            missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M3.0"),
+            "different model under same provider is a distinct pair"
+        );
+    }
+
+    #[test]
+    fn different_providers_for_same_model_are_independent() {
+        // Same model name served by two different providers — operator may
+        // configure them at different rates, so the warn must fire for each.
+        let seen = fresh_seen();
+        assert!(missing_pricing_first_sighting(
+            &seen,
+            "openrouter",
+            "anthropic/claude-sonnet-4-5"
+        ));
+        assert!(
+            missing_pricing_first_sighting(
+                &seen,
+                "anthropic",
+                "anthropic/claude-sonnet-4-5"
+            ),
+            "different provider for the same model is a distinct pair"
+        );
+    }
+
+    #[test]
+    fn empty_strings_dedup_independently() {
+        // Defensive: empty provider or model shouldn't collide with each other.
+        let seen = fresh_seen();
+        assert!(missing_pricing_first_sighting(&seen, "", "model"));
+        assert!(missing_pricing_first_sighting(&seen, "provider", ""));
+        assert!(missing_pricing_first_sighting(&seen, "", ""));
+        assert!(!missing_pricing_first_sighting(&seen, "", ""));
+    }
 }
