@@ -159,7 +159,9 @@ mod tests {
     fn second_sighting_same_pair_returns_false() {
         let seen = fresh_seen();
         assert!(missing_pricing_first_sighting(
-            &seen, "minimax", "MiniMax-M2.7"
+            &seen,
+            "minimax",
+            "MiniMax-M2.7"
         ));
         assert!(
             !missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
@@ -171,7 +173,9 @@ mod tests {
     fn different_models_under_same_provider_are_independent() {
         let seen = fresh_seen();
         assert!(missing_pricing_first_sighting(
-            &seen, "minimax", "MiniMax-M2.7"
+            &seen,
+            "minimax",
+            "MiniMax-M2.7"
         ));
         assert!(
             missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M3.0"),
@@ -190,11 +194,7 @@ mod tests {
             "anthropic/claude-sonnet-4-5"
         ));
         assert!(
-            missing_pricing_first_sighting(
-                &seen,
-                "anthropic",
-                "anthropic/claude-sonnet-4-5"
-            ),
+            missing_pricing_first_sighting(&seen, "anthropic", "anthropic/claude-sonnet-4-5"),
             "different provider for the same model is a distinct pair"
         );
     }
