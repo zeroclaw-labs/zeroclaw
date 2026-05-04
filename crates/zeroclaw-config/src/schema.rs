@@ -1064,6 +1064,23 @@ where
         .transpose()
 }
 
+/// Deserialize an `Option<String>` that maps an empty literal `""` to
+/// `None`. Used by `JiraConfig::email` so a V2 config that round-tripped
+/// `email = ""` to disk (V2's `email: String` had no
+/// `skip_serializing_if`) doesn't migrate into V3 as `Some("")` and
+/// silently break Basic auth — V3 dropped the email-required validation
+/// when adding Server/DC Bearer-token support (#6116), so this is the
+/// last line of defense (#6266 review).
+fn deserialize_optional_email_skip_empty<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    Ok(value.filter(|s| !s.trim().is_empty()))
+}
+
 // ── Hardware Config (wizard-driven) ─────────────────────────────
 
 /// Hardware transport mode.
@@ -9354,7 +9371,15 @@ pub struct JiraConfig {
     pub base_url: String,
     /// Jira account email used for Basic auth (Cloud).
     /// Omit for Server/DC deployments using Bearer token auth.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// An empty string (`email = ""`) deserializes as `None`; V2 configs
+    /// with the empty default would otherwise silently regress to Basic
+    /// auth with empty username under V3, which dropped the email-required
+    /// validation (#6266 review).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_email_skip_empty"
+    )]
     pub email: Option<String>,
     /// Jira API token. Encrypted at rest. Falls back to `JIRA_API_TOKEN` env var.
     #[serde(default)]
@@ -14987,6 +15012,81 @@ default_model = "persisted-profile"
                 },
             );
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn validate_rejects_unpublished_jira_actions() {
+        // Restored from upstream's #6116 (Jira API v2 server mode). The
+        // validation logic at `Config::validate -> jira.allowed_actions`
+        // exists in V3 unchanged; this test was dropped during the
+        // upstream/master merge resolution alongside the env_override
+        // tests that were intentionally deleted with `apply_env_overrides()`.
+        // It's V3-compatible — restoring (#6266 review).
+        for action in ["list_projects", "myself"] {
+            let mut config = Config::default();
+            config.jira.enabled = true;
+            config.jira.base_url = "https://jira.example.test".into();
+            config.jira.api_token = "token".into();
+            config.jira.allowed_actions = vec![action.into()];
+
+            let err = config
+                .validate()
+                .expect_err("unpublished Jira action should be rejected")
+                .to_string();
+            assert!(
+                err.contains("jira.allowed_actions contains unknown action"),
+                "expected Jira allowed action error for {action}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    async fn jira_email_empty_string_deserializes_as_none() {
+        // V2 configs round-tripped `email = ""` to disk because V2's
+        // `email: String` lacked `skip_serializing_if`. After migration,
+        // V3 would otherwise deserialize `email = ""` as `Some("")`, and
+        // JiraTool would attempt Basic auth with empty username (the
+        // dropped email-required validation no longer catches this).
+        // Defense-in-depth: empty strings deserialize as None (#6266 review).
+        let toml_input = r#"
+enabled = true
+base_url = "https://jira.example.test"
+email = ""
+api_token = "tok"
+"#;
+        let cfg: JiraConfig = toml::from_str(toml_input).expect("parses with empty email");
+        assert!(
+            cfg.email.is_none(),
+            "empty `email = \"\"` must deserialize as None, got {:?}",
+            cfg.email
+        );
+        // Whitespace-only is also normalized to None.
+        let toml_input_ws = r#"
+enabled = true
+base_url = "https://jira.example.test"
+email = "   "
+api_token = "tok"
+"#;
+        let cfg_ws: JiraConfig =
+            toml::from_str(toml_input_ws).expect("parses with whitespace email");
+        assert!(
+            cfg_ws.email.is_none(),
+            "whitespace-only email must deserialize as None, got {:?}",
+            cfg_ws.email
+        );
+        // A real email still survives.
+        let toml_input_real = r#"
+enabled = true
+base_url = "https://jira.example.test"
+email = "ops@example.com"
+api_token = "tok"
+"#;
+        let cfg_real: JiraConfig = toml::from_str(toml_input_real).expect("parses with real email");
+        assert_eq!(
+            cfg_real.email.as_deref(),
+            Some("ops@example.com"),
+            "non-empty email must round-trip unchanged"
+        );
     }
 
     #[test]
