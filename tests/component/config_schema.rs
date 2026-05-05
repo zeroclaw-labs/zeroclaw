@@ -33,7 +33,7 @@ fn config_unknown_keys_parse_without_error() {
     let config = migrate(
         r#"
 default_temperature = 0.7
-default_provider = "test"
+default_provider = "openai"
 totally_unknown_key = "should be ignored"
 another_fake = 42
 "#,
@@ -80,7 +80,7 @@ default_temperature = "hot"
 fn config_out_of_range_temperature_fails() {
     // Temperature validation now happens at the provider level.
     let toml_str = r#"
-[providers.models.test.default]
+[providers.models.openai.default]
 temperature = 99.0
 "#;
     let config: Config = toml::from_str(toml_str).expect("parses");
@@ -89,7 +89,7 @@ temperature = 99.0
         config
             .providers
             .models
-            .find("test", "default")
+            .find("openai", "default")
             .expect("entry exists")
             .temperature
             == Some(99.0)
@@ -99,7 +99,7 @@ temperature = 99.0
 #[test]
 fn config_negative_temperature_fails() {
     let toml_str = r#"
-[providers.models.test.default]
+[providers.models.openai.default]
 temperature = -0.5
 "#;
     let config: Config = toml::from_str(toml_str).expect("parses");
@@ -107,7 +107,7 @@ temperature = -0.5
         config
             .providers
             .models
-            .find("test", "default")
+            .find("openai", "default")
             .expect("entry exists")
             .temperature
             == Some(-0.5)
@@ -410,7 +410,7 @@ fn config_empty_toml_uses_default_temperature() {
 
 #[test]
 fn config_minimal_toml_with_temperature_uses_defaults() {
-    let config = migrate("default_temperature = 0.7\ndefault_provider = \"test\"\n");
+    let config = migrate("default_temperature = 0.7\ndefault_provider = \"openai\"\n");
     // Migration synthesizes [agents.default] from the V2 shape; assert
     // its tunables match DelegateAgentConfig defaults.
     let agent = config
@@ -422,7 +422,7 @@ fn config_minimal_toml_with_temperature_uses_defaults() {
 
 #[test]
 fn config_only_temperature_parses() {
-    let config = migrate("default_temperature = 1.2\ndefault_provider = \"test\"\n");
+    let config = migrate("default_temperature = 1.2\ndefault_provider = \"openai\"\n");
     assert!(
         (config
             .providers
@@ -444,7 +444,7 @@ fn config_extra_unknown_keys_ignored() {
     let config = migrate(
         r#"
 default_temperature = 0.5
-default_provider = "test"
+default_provider = "openai"
 future_feature = true
 [some_future_section]
 value = 123

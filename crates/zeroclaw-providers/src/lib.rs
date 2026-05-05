@@ -1155,21 +1155,6 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
     create_provider_with_options(name, api_key, &ProviderRuntimeOptions::default())
 }
 
-/// Build a `ModelProviderConfig` populated with the named provider's
-/// effective default values from its `Provider` trait methods (the same
-/// `default_temperature` / `default_max_tokens` / `default_timeout_secs` /
-/// `default_wire_api` / `default_base_url` the runtime already calls at
-/// every chat request).
-// `default_provider_config` was the pre-#6273 shim that bridged the runtime
-// provider's trait-level defaults (default_base_url / default_temperature /
-// etc.) into a flat `ModelProviderConfig` for onboarding pre-fill. The
-// typed-family split obsoletes it: each `*ModelProviderConfig` carries
-// its own typed default via `derive(Default)`, and endpoint URIs come
-// from the family's `ModelEndpoint::uri()` impl at runtime construction
-// time. Callers that previously consumed this helper now use
-// `<Family>ModelProviderConfig::default()` and let the runtime resolve
-// the URI from the typed endpoint.
-
 /// Factory: create provider with runtime options (auth profile override, state dir).
 pub fn create_provider_with_options(
     name: &str,

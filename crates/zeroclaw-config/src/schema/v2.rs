@@ -395,12 +395,6 @@ fn restructure_cron(cron_value: toml::Value) -> (toml::Table, toml::Table) {
     (new_cron, scheduler_extras)
 }
 
-/// Convert a V2 `providers.models` flat map (`{id => ModelProviderConfig}`)
-/// into a V3 aliased map (`{provider_type => {alias => ModelProviderConfig}}`).
-///
-/// Rules:
-/// - `claude-code` standalone → `anthropic.claude-code` (per PR body).
-/// - Any other entry `<id>` → `<id>.default` (single alias).
 /// Normalize a V2 provider type string to its V3 canonical name plus the
 /// extras that the typed family config requires (region endpoint, auth_mode,
 /// alias rename, family-specific fields).

@@ -1304,7 +1304,6 @@ mod tests {
                     model: Some("llama3.2".to_string()),
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
         let server = AcpServer::new(config, AcpServerConfig::default());

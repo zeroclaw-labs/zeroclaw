@@ -2467,7 +2467,6 @@ mod tests {
                     model: Some("claude-opus-4-7".into()),
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
 
@@ -2587,7 +2586,7 @@ mod tests {
             "dot in double-nested alias must be rejected"
         );
         assert!(
-            !cfg.providers.models.find("anthropic", "my.alias").is_some(),
+            cfg.providers.models.find("anthropic", "my.alias").is_none(),
             "no entry should be inserted into the inner map"
         );
     }

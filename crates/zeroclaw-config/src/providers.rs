@@ -140,45 +140,44 @@ impl ModelProviders {
     /// Iterate every entry across every typed slot, yielding
     /// `(provider_type, alias, &base)` triples. Use this when consumer code
     /// needs to walk every model provider entry without caring about family.
-    pub fn iter_entries(
-        &self,
-    ) -> Box<dyn Iterator<Item = (&'static str, &str, &ModelProviderConfig)> + '_> {
+    ///
+    /// Materializes through a `Vec` rather than chaining iterators directly:
+    /// with ~60 typed slots the deeply-nested `Chain<Chain<...>>` type blows
+    /// up rustc's `Freeze` trait-resolution recursion limit. The collection
+    /// cost is negligible (entries are sparse — most slots are empty in any
+    /// real config). Returned as `impl Iterator` so call sites can chain
+    /// `.next()`, `.filter_map()`, etc. without changes.
+    pub fn iter_entries(&self) -> impl Iterator<Item = (&'static str, &str, &ModelProviderConfig)> {
+        let mut out: Vec<(&'static str, &str, &ModelProviderConfig)> = Vec::new();
         macro_rules! emit_iter {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
-                Box::new(
-                    std::iter::empty()
-                    $(
-                        .chain(
-                            self.$field.iter().map(|(alias, cfg)| {
-                                ($type_str, alias.as_str(), &cfg.base)
-                            })
-                        )
-                    )+
-                )
+                $(
+                    for (alias, cfg) in &self.$field {
+                        out.push(($type_str, alias.as_str(), &cfg.base));
+                    }
+                )+
             };
         }
-        for_each_model_provider_slot!(emit_iter)
+        for_each_model_provider_slot!(emit_iter);
+        out.into_iter()
     }
 
     /// Iterate every entry mutably across every typed slot.
     pub fn iter_entries_mut(
         &mut self,
-    ) -> Box<dyn Iterator<Item = (&'static str, &str, &mut ModelProviderConfig)> + '_> {
+    ) -> impl Iterator<Item = (&'static str, &str, &mut ModelProviderConfig)> {
+        let mut out: Vec<(&'static str, &str, &mut ModelProviderConfig)> = Vec::new();
         macro_rules! emit_iter_mut {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
-                Box::new(
-                    std::iter::empty()
-                    $(
-                        .chain(
-                            self.$field.iter_mut().map(|(alias, cfg)| {
-                                ($type_str, alias.as_str(), &mut cfg.base)
-                            })
-                        )
-                    )+
-                )
+                $(
+                    for (alias, cfg) in self.$field.iter_mut() {
+                        out.push(($type_str, alias.as_str(), &mut cfg.base));
+                    }
+                )+
             };
         }
-        for_each_model_provider_slot!(emit_iter_mut)
+        for_each_model_provider_slot!(emit_iter_mut);
+        out.into_iter()
     }
 
     /// Look up the shared base config for a given `<provider_type>.<alias>`

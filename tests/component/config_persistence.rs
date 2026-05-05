@@ -142,7 +142,6 @@ fn config_toml_roundtrip_preserves_provider() {
                 temperature: Some(0.5),
                 ..Default::default()
             },
-            ..Default::default()
         },
     );
 
@@ -225,7 +224,6 @@ fn config_file_write_read_roundtrip() {
                 model: Some("mistral-large".into()),
                 ..Default::default()
             },
-            ..Default::default()
         },
     );
     config

@@ -14703,7 +14703,6 @@ default_temperature = 0.7
                     timeout_secs: Some(120),
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
         let config = Config {
@@ -14836,7 +14835,6 @@ default_temperature = 0.7
                     api_key: Some("root-credential".into()),
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
         // Provider fields are now resolved directly — no cache needed.
@@ -15008,7 +15006,6 @@ default_temperature = 0.7
                     model: Some("model-a".into()),
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
         config.save().await.unwrap();
@@ -16148,7 +16145,6 @@ requires_openai_auth = true
                     max_tokens: None,
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
 
@@ -16179,7 +16175,6 @@ requires_openai_auth = true
                     max_tokens: None,
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
 
@@ -16255,7 +16250,6 @@ model = "primary-model"
                     model: Some("tertiary-model".to_string()),
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
         assert_eq!(
@@ -16271,7 +16265,6 @@ model = "primary-model"
                     model: Some("primary-model".to_string()),
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
         // resolve_default_model returns the first non-empty model across all providers.
@@ -16304,7 +16297,6 @@ model = "primary-model"
                     temperature: Some(0.5),
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
         // Provider fields are now resolved directly — no cache needed.
@@ -16352,7 +16344,6 @@ model = "primary-model"
                     api_key: Some("ollama-key".to_string()),
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
 
@@ -16375,7 +16366,6 @@ model = "primary-model"
                     api_key: None,
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
 
@@ -16403,7 +16393,6 @@ model = "primary-model"
                     max_tokens: None,
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
 
@@ -16895,7 +16884,6 @@ default_model = "persisted-profile"
                     temperature: Some(99.0),
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
         let err = config.validate().unwrap_err();
@@ -16916,7 +16904,6 @@ default_model = "persisted-profile"
                     temperature: Some(-0.5),
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
         let err = config.validate().unwrap_err();
@@ -16937,7 +16924,6 @@ default_model = "persisted-profile"
                     temperature: Some(0.7),
                     ..Default::default()
                 },
-                ..Default::default()
             },
         );
         assert!(config.validate().is_ok());
