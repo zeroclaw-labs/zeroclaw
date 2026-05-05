@@ -599,6 +599,17 @@ impl OpenAiCodexProvider {
         instructions: String,
         model: &str,
     ) -> anyhow::Result<String> {
+        self.send_responses_request_with_effort(input, instructions, model, None)
+            .await
+    }
+
+    async fn send_responses_request_with_effort(
+        &self,
+        input: Vec<ResponsesInput>,
+        instructions: String,
+        model: &str,
+        effort_override: Option<&str>,
+    ) -> anyhow::Result<String> {
         let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
         let profile = match self
             .auth
@@ -668,7 +679,7 @@ impl OpenAiCodexProvider {
             reasoning: ResponsesReasoningOptions {
                 effort: resolve_reasoning_effort(
                     normalized_model,
-                    self.reasoning_effort.as_deref(),
+                    effort_override.or(self.reasoning_effort.as_deref()),
                 ),
                 summary: "auto".to_string(),
             },
@@ -769,6 +780,27 @@ impl Provider for OpenAiCodexProvider {
 
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, model)
+            .await
+    }
+
+    async fn chat_fast(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        let mut messages = Vec::new();
+        if let Some(sys) = system_prompt {
+            messages.push(ChatMessage::system(sys));
+        }
+        messages.push(ChatMessage::user(message));
+
+        let config = zeroclaw_config::schema::MultimodalConfig::default();
+        let prepared = crate::multimodal::prepare_messages_for_provider(&messages, &config).await?;
+
+        let (instructions, input) = build_responses_input(&prepared.messages);
+        self.send_responses_request_with_effort(input, instructions, model, Some("low"))
             .await
     }
 }

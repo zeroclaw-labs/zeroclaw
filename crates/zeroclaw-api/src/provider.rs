@@ -395,6 +395,20 @@ pub trait Provider: Send + Sync {
         temperature: Option<f64>,
     ) -> anyhow::Result<String>;
 
+    /// One-shot chat optimized for quick classifier/router-style calls where
+    /// deep reasoning is unnecessary. Providers may lower reasoning effort or
+    /// take a simpler code path. Default delegates to chat_with_system.
+    async fn chat_fast(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        self.chat_with_system(system_prompt, message, model, Some(temperature))
+            .await
+    }
+
     /// Fetch the list of available model IDs for this provider.
     ///
     /// Used by onboard to present a live model picker. Default bails with
