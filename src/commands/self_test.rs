@@ -202,25 +202,50 @@ fn check_version() -> CheckResult {
     CheckResult::pass("version", format!("v{version}"))
 }
 
+/// Resolve a wildcard bind address (`0.0.0.0`, `[::]`) to a concrete
+/// loopback target so the probe can actually connect — and report the
+/// configured value alongside so the user isn't confused about why the
+/// output says `127.0.0.1` when their `config.toml` says `0.0.0.0`
+/// (#6051). Returns `(probe_host, display_host)` where `display_host`
+/// is `Some(_)` only when a rewrite happened.
+fn resolve_probe_host(configured: &str) -> (&str, Option<&str>) {
+    match configured {
+        "0.0.0.0" => ("127.0.0.1", Some("0.0.0.0")),
+        // Normalise both shapes to bracketed form for the display URL so the
+        // unbracketed `::` doesn't yield `http://:::42617` (three colons,
+        // invalid URL). The probe target stays `[::1]`.
+        "[::]" | "::" => ("[::1]", Some("[::]")),
+        other => (other, None),
+    }
+}
+
+fn format_probe_url(scheme: &str, configured_host: &str, port: u16, path: &str) -> String {
+    let (probe_host, display_host) = resolve_probe_host(configured_host);
+    let probed = format!("{scheme}://{probe_host}:{port}{path}");
+    match display_host {
+        Some(cfg) => {
+            format!("{scheme}://{cfg}:{port}{path} (probed via {scheme}://{probe_host}:{port})")
+        }
+        None => probed,
+    }
+}
+
 async fn check_gateway_health(config: &crate::config::Config) -> CheckResult {
     let port = config.gateway.port;
-    let host = if config.gateway.host == "[::]" || config.gateway.host == "0.0.0.0" {
-        "127.0.0.1"
-    } else {
-        &config.gateway.host
-    };
-    let url = format!("http://{host}:{port}/health");
+    let (probe_host, _) = resolve_probe_host(&config.gateway.host);
+    let probe_url = format!("http://{probe_host}:{port}/health");
+    let display_url = format_probe_url("http", &config.gateway.host, port, "/health");
     match reqwest::Client::new()
-        .get(&url)
+        .get(&probe_url)
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            CheckResult::pass("gateway", format!("health OK at {url}"))
+            CheckResult::pass("gateway", format!("health OK at {display_url}"))
         }
         Ok(resp) => CheckResult::fail("gateway", format!("health returned {}", resp.status())),
-        Err(e) => CheckResult::fail("gateway", format!("not reachable at {url}: {e}")),
+        Err(e) => CheckResult::fail("gateway", format!("not reachable at {display_url}: {e}")),
     }
 }
 
@@ -270,15 +295,82 @@ async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
 
 async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResult {
     let port = config.gateway.port;
-    let host = if config.gateway.host == "[::]" || config.gateway.host == "0.0.0.0" {
-        "127.0.0.1"
-    } else {
-        &config.gateway.host
-    };
-    let url = format!("ws://{host}:{port}/ws/chat");
+    let (probe_host, _) = resolve_probe_host(&config.gateway.host);
+    let probe_url = format!("ws://{probe_host}:{port}/ws/chat");
+    let display_url = format_probe_url("ws", &config.gateway.host, port, "/ws/chat");
 
-    match tokio_tungstenite::connect_async(&url).await {
-        Ok((_, _)) => CheckResult::pass("websocket", format!("handshake OK at {url}")),
-        Err(e) => CheckResult::fail("websocket", format!("handshake failed at {url}: {e}")),
+    match tokio_tungstenite::connect_async(&probe_url).await {
+        Ok((_, _)) => CheckResult::pass("websocket", format!("handshake OK at {display_url}")),
+        Err(e) => CheckResult::fail(
+            "websocket",
+            format!("handshake failed at {display_url}: {e}"),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_probe_url, resolve_probe_host};
+
+    #[test]
+    fn resolve_probe_host_ipv4_wildcard() {
+        assert_eq!(
+            resolve_probe_host("0.0.0.0"),
+            ("127.0.0.1", Some("0.0.0.0"))
+        );
+    }
+
+    #[test]
+    fn resolve_probe_host_ipv6_wildcard_bracketed() {
+        assert_eq!(resolve_probe_host("[::]"), ("[::1]", Some("[::]")));
+    }
+
+    #[test]
+    fn resolve_probe_host_ipv6_wildcard_unbracketed_normalises_to_brackets() {
+        // Regression: previously returned `Some("::")`, which `format_probe_url`
+        // would render as `http://:::42617/...` (three colons, invalid URL).
+        assert_eq!(resolve_probe_host("::"), ("[::1]", Some("[::]")));
+    }
+
+    #[test]
+    fn resolve_probe_host_concrete_host_passthrough() {
+        assert_eq!(resolve_probe_host("127.0.0.1"), ("127.0.0.1", None));
+        assert_eq!(
+            resolve_probe_host("example.internal"),
+            ("example.internal", None)
+        );
+    }
+
+    #[test]
+    fn format_probe_url_ipv4_wildcard_shows_both() {
+        assert_eq!(
+            format_probe_url("http", "0.0.0.0", 42617, "/health"),
+            "http://0.0.0.0:42617/health (probed via http://127.0.0.1:42617)"
+        );
+    }
+
+    #[test]
+    fn format_probe_url_ipv6_wildcard_unbracketed_shows_valid_url() {
+        // Regression: was `http://:::42617/health`, now `http://[::]:42617/health`.
+        assert_eq!(
+            format_probe_url("http", "::", 42617, "/health"),
+            "http://[::]:42617/health (probed via http://[::1]:42617)"
+        );
+    }
+
+    #[test]
+    fn format_probe_url_ipv6_wildcard_bracketed_shows_valid_url() {
+        assert_eq!(
+            format_probe_url("http", "[::]", 42617, "/health"),
+            "http://[::]:42617/health (probed via http://[::1]:42617)"
+        );
+    }
+
+    #[test]
+    fn format_probe_url_concrete_host_no_probe_suffix() {
+        assert_eq!(
+            format_probe_url("ws", "127.0.0.1", 42617, "/ws/chat"),
+            "ws://127.0.0.1:42617/ws/chat"
+        );
     }
 }
