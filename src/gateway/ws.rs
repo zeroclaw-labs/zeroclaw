@@ -1811,6 +1811,71 @@ async fn resolve_gemma_asr_endpoint() -> (String, String) {
     (base_url, model)
 }
 
+/// Construct an optional `VoiceChatPipeline` for the interpretation
+/// loop's self-validation step.
+///
+/// Returns `None` (rather than `Err`) on any provider construction
+/// failure: voice validation is a UX nicety, and a configuration
+/// hiccup must NEVER block the user from starting an interpretation
+/// session. Translation still works without the validator; the only
+/// loss is the "재차 말씀해 주세요" / "이 말씀이 맞으십니까?" UX
+/// for noisy or ambiguous input.
+///
+/// Both providers are constructed with the user's already-verified
+/// keys + endpoints — no extra config or env-var lookups happen here.
+fn build_voice_chat_validator(
+    gemma_base_url: &str,
+    gemma_model: &str,
+    gemini_api_key: &str,
+) -> Option<std::sync::Arc<crate::voice::voice_chat_pipeline::VoiceChatPipeline>> {
+    use crate::providers::create_provider_with_url;
+    use crate::voice::voice_chat_pipeline::VoiceChatPipeline;
+
+    let gemma_provider = match create_provider_with_url("ollama", None, Some(gemma_base_url)) {
+        Ok(p) => std::sync::Arc::from(p),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                gemma_base_url,
+                "voice-validation: failed to construct Ollama provider; \
+                 interpretation will run without re-ask staircase"
+            );
+            return None;
+        }
+    };
+
+    let gemini_provider = match create_provider_with_url("gemini", Some(gemini_api_key), None) {
+        Ok(p) => std::sync::Arc::from(p),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "voice-validation: failed to construct Gemini provider; \
+                 interpretation will run without re-ask staircase"
+            );
+            return None;
+        }
+    };
+
+    // The validator only ever calls `validate_only` from the
+    // interpretation context (see `typecast_interp::validate_then_translate`),
+    // which uses the Gemma provider for the JSON self-check. The
+    // `llm` provider is required by `VoiceChatPipeline::new` because
+    // the full `validate_and_answer` path uses it for the ComplexLlm
+    // branch — interpretation never takes that branch, so the value
+    // is unused in practice. We still wire the verified Gemini
+    // provider through so any future use of `validate_and_answer`
+    // here works without surprises.
+    let llm_model = std::env::var("VOICE_VALIDATION_LLM_MODEL")
+        .unwrap_or_else(|_| "gemini-3.1-flash-lite-preview".to_string());
+
+    Some(std::sync::Arc::new(VoiceChatPipeline::new(
+        gemma_provider,
+        gemma_model,
+        gemini_provider,
+        llm_model,
+    )))
+}
+
 async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
     use crate::voice::{
         events::{ClientMessage, ServerMessage},
@@ -2043,6 +2108,23 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                                 "https://generativelanguage.googleapis.com".to_string()
                             });
 
+                        // Build the optional voice-chat self-validation
+                        // pipeline so the interpretation loop can ask
+                        // the speaker to repeat / confirm in their own
+                        // language when Gemma is uncertain. Uses the
+                        // SAME Gemma endpoint resolved above for STT
+                        // (so we don't re-probe the device tier) and
+                        // the SAME Gemini key already verified for the
+                        // translation step. Wrapped in `try` so a
+                        // construction failure (missing provider, etc.)
+                        // never blocks session start — interpretation
+                        // still works with translation only.
+                        let voice_validation = build_voice_chat_validator(
+                            &gemma_base_url,
+                            &gemma_model,
+                            &gemini_api_key,
+                        );
+
                         let tc_config = TypecastInterpConfig {
                             session_id: session_id.clone(),
                             gemma_base_url,
@@ -2060,6 +2142,7 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                             segmentation,
                             bidirectional: mode
                                 == crate::voice::events::InterpretationMode::Bidirectional,
+                            voice_validation,
                         };
                         TypecastInterpSession::start(tc_config)
                             .await

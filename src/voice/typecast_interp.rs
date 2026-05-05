@@ -39,6 +39,7 @@
 //!    via [`select_fallback_voice_id`] before session start.
 
 use base64::Engine;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -47,6 +48,10 @@ use super::events::ServerMessage;
 use super::gemma_asr::{GemmaAsrConfig, GemmaAsrSession, DEFAULT_OLLAMA_URL};
 use super::pipeline::{LanguageCode, VoiceAge, VoiceGender};
 use super::simul::{SegmentationConfig, SegmentationEngine};
+use super::voice_chat_pipeline::{QueryRoute, SttResult, VoiceChatPipeline};
+use super::voice_messages::{
+    ask_user_to_repeat, confirm_interpretation_fallback, confirm_interpretation_prefix,
+};
 
 // ── Configuration ─────────────────────────────────────────────────
 
@@ -95,6 +100,23 @@ pub struct TypecastInterpConfig {
     pub segmentation: SegmentationConfig,
     /// Bidirectional mode.
     pub bidirectional: bool,
+    /// Optional voice-chat self-validation pipeline. When present,
+    /// each committed Gemma transcript runs through Gemma 4's
+    /// JSON-only self-check before being sent to LLM translation.
+    /// On `AskUserToRepeat` / `ConfirmInterpretation` routes the
+    /// pipeline emits a re-ask in the speaker's own language and
+    /// SKIPS translation for that segment — saving the cloud LLM
+    /// call entirely when Gemma was unsure of the input. On
+    /// `SimpleGemma` and `ComplexLlm` routes the pipeline proceeds
+    /// to translation as before. When `None`, behavior is identical
+    /// to pre-PR-C: every committed segment is translated.
+    ///
+    /// The session uses this only for `validate_only(...)`; the
+    /// pipeline's `validate_and_answer` path (which would call its
+    /// own LLM for direct answers) is not used in interpretation
+    /// because the interpretation context wants translation, not a
+    /// conversational answer.
+    pub voice_validation: Option<Arc<VoiceChatPipeline>>,
 }
 
 // ── Voice matching ────────────────────────────────────────────────
@@ -664,6 +686,225 @@ impl TypecastInterpSession {
         asr.close().await;
     }
 
+    // ── Internal: self-validation gate ─────────────────────────────
+
+    /// Validate a committed source segment via the optional
+    /// `voice_chat_pipeline` self-check, then either:
+    ///   * translate it normally (SimpleGemma / ComplexLlm route, or
+    ///     when no validator is configured), or
+    ///   * emit a re-ask in the speaker's own language and SKIP
+    ///     translation (AskUserToRepeat / ConfirmInterpretation route).
+    ///
+    /// `voice_retry_counts` is the per-speaker counter the
+    /// `event_processor` keeps for the staircase.
+    async fn validate_then_translate(
+        config: &TypecastInterpConfig,
+        commit_id: u64,
+        source_text: &str,
+        session_id: &str,
+        event_tx: &mpsc::Sender<ServerMessage>,
+        voice_retry_counts: &mut HashMap<LanguageCode, u8>,
+    ) {
+        // No validator configured → preserve pre-PR-C behavior:
+        // translate every committed segment unconditionally.
+        let Some(validator) = config.voice_validation.as_ref() else {
+            Self::translate_and_speak(config, commit_id, source_text, session_id, event_tx).await;
+            return;
+        };
+
+        // Run the JSON-only Gemma self-check. Compose the StttResult
+        // with the gateway's source language as the detection
+        // default — see `SttResult::default_language` doc comment.
+        // We don't have a real STT confidence here (Gemma ASR
+        // doesn't surface one to typecast_interp); pass 1.0 as a
+        // neutral high-confidence value so the validation prompt's
+        // own confidence call drives the decision instead of the
+        // STT confidence threshold.
+        //
+        // For retry_count we look up by the language we *expect* the
+        // speaker to be using. We don't yet know the detected
+        // language — that comes from validation itself. So we
+        // pessimistically use the source-lang default; if validation
+        // detects a different language we'll bump that bucket on
+        // re-ask routes. This is a small inaccuracy on the very
+        // first turn but self-corrects within one round trip.
+        let default_lang = config.source_lang;
+        let pre_retry_count = voice_retry_counts
+            .get(&default_lang)
+            .copied()
+            .unwrap_or(0);
+        let stt = SttResult {
+            text: source_text.to_string(),
+            confidence: 1.0,
+            processing_time_ms: 0,
+            voice_retry_count: pre_retry_count,
+            default_language: Some(default_lang),
+        };
+
+        let validation = match validator.validate_only(&stt).await {
+            Ok(v) => v,
+            Err(e) => {
+                // Validation failure must NEVER block the
+                // interpretation flow — the user is having a real
+                // conversation. Log and translate as if validation
+                // never happened.
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "voice-validation failed; proceeding with unvalidated translation"
+                );
+                Self::translate_and_speak(config, commit_id, source_text, session_id, event_tx)
+                    .await;
+                return;
+            }
+        };
+
+        match validation.route {
+            QueryRoute::SimpleGemma | QueryRoute::ComplexLlm => {
+                // Gemma is sure it understood. Reset this speaker's
+                // retry counter (the conversation has progressed)
+                // and translate normally.
+                voice_retry_counts.insert(validation.detected_language, 0);
+                Self::translate_and_speak(config, commit_id, source_text, session_id, event_tx)
+                    .await;
+            }
+            QueryRoute::AskUserToRepeat => {
+                // Bump the speaker's retry counter so the next
+                // utterance from the same language advances to
+                // ConfirmInterpretation.
+                let entry = voice_retry_counts
+                    .entry(validation.detected_language)
+                    .or_insert(0);
+                *entry = entry.saturating_add(1);
+
+                let phrase = ask_user_to_repeat(validation.detected_language).to_string();
+                tracing::debug!(
+                    session_id = %session_id,
+                    lang = validation.detected_language.as_str(),
+                    "voice-validation: AskUserToRepeat (translation skipped)"
+                );
+                // Send as CommitTgt so the existing client UI surfaces
+                // it on the translated-text rail. We pair it with a
+                // TTS synthesis in the speaker's own language so the
+                // user actually hears the re-ask out loud.
+                let _ = event_tx
+                    .send(ServerMessage::CommitTgt {
+                        session_id: session_id.to_string(),
+                        commit_id,
+                        text: phrase.clone(),
+                    })
+                    .await;
+                Self::synthesize_phrase(
+                    config,
+                    commit_id,
+                    &phrase,
+                    validation.detected_language,
+                    session_id,
+                    event_tx,
+                )
+                .await;
+            }
+            QueryRoute::ConfirmInterpretation => {
+                let entry = voice_retry_counts
+                    .entry(validation.detected_language)
+                    .or_insert(0);
+                *entry = entry.saturating_add(1);
+
+                let paraphrase = validation.interpreted_meaning.trim();
+                let phrase = if paraphrase.is_empty() {
+                    confirm_interpretation_fallback(validation.detected_language).to_string()
+                } else {
+                    format!(
+                        "{prefix} '{paraphrase}'",
+                        prefix = confirm_interpretation_prefix(validation.detected_language)
+                    )
+                };
+                tracing::debug!(
+                    session_id = %session_id,
+                    lang = validation.detected_language.as_str(),
+                    "voice-validation: ConfirmInterpretation (translation skipped)"
+                );
+                let _ = event_tx
+                    .send(ServerMessage::CommitTgt {
+                        session_id: session_id.to_string(),
+                        commit_id,
+                        text: phrase.clone(),
+                    })
+                    .await;
+                Self::synthesize_phrase(
+                    config,
+                    commit_id,
+                    &phrase,
+                    validation.detected_language,
+                    session_id,
+                    event_tx,
+                )
+                .await;
+            }
+        }
+    }
+
+    /// TTS-synthesize a fixed phrase (re-ask / confirm message) in
+    /// the speaker's own language. Used by `validate_then_translate`
+    /// on the re-ask routes — separate from `translate_and_speak`
+    /// which couples translation + TTS, so the re-ask path can skip
+    /// the LLM call entirely while still producing audible output.
+    async fn synthesize_phrase(
+        config: &TypecastInterpConfig,
+        _commit_id: u64,
+        phrase: &str,
+        lang: LanguageCode,
+        session_id: &str,
+        event_tx: &mpsc::Sender<ServerMessage>,
+    ) {
+        let voice_id = match config
+            .voice_clone_id
+            .as_deref()
+            .or(config.fallback_voice_id.as_deref())
+        {
+            Some(id) if !id.is_empty() => id,
+            _ => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "no voice id available for re-ask TTS; phrase delivered as text only"
+                );
+                return;
+            }
+        };
+
+        let lang_iso3 = lang_to_typecast_iso3(lang);
+        match typecast_tts_synthesize(
+            &config.typecast_api_key,
+            voice_id,
+            phrase,
+            lang_iso3,
+            config.voice_clone_id.as_deref(),
+        )
+        .await
+        {
+            Ok(pcm_data) => {
+                let chunk_size = 8820;
+                for (seq, chunk) in (0u64..).zip(pcm_data.chunks(chunk_size)) {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(chunk);
+                    let _ = event_tx
+                        .send(ServerMessage::AudioOut {
+                            session_id: session_id.to_string(),
+                            seq,
+                            pcm16le: b64,
+                        })
+                        .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "re-ask TTS synthesis failed; phrase delivered as text only"
+                );
+            }
+        }
+    }
+
     // ── Internal: translate + synthesize a committed segment ──────
 
     async fn translate_and_speak(
@@ -783,6 +1024,20 @@ impl TypecastInterpSession {
         session_id: String,
         config: Arc<TypecastInterpConfig>,
     ) {
+        // Per-speaker voice-retry counter for the self-validation
+        // staircase. Bidirectional interpretation flips speakers
+        // turn-by-turn (Korean speaker → English speaker → …), so a
+        // single global counter would mis-attribute "this is your
+        // second voice retry" across the language boundary. Keying
+        // by detected `LanguageCode` keeps each speaker's staircase
+        // independent.
+        //
+        // The counter is pure local state — no need for an Arc or
+        // Mutex because the entire `event_processor` runs in one
+        // tokio task. It resets to 0 for a given language as soon
+        // as a successful translation happens for that language.
+        let mut voice_retry_counts: HashMap<LanguageCode, u8> = HashMap::new();
+
         let mut rx = asr.event_rx.lock().await;
         loop {
             let event = match rx.recv().await {
@@ -850,14 +1105,16 @@ impl TypecastInterpSession {
                     // Release lock before async translation calls
                     drop(seg);
 
-                    // Translate + TTS each committed segment
+                    // Validate (when configured) then translate + TTS
+                    // each committed segment.
                     for committed in commits {
-                        Self::translate_and_speak(
+                        Self::validate_then_translate(
                             &config,
                             committed.commit_id,
                             &committed.text,
                             &session_id,
                             &event_tx,
+                            &mut voice_retry_counts,
                         )
                         .await;
                     }
@@ -1072,5 +1329,77 @@ mod tests {
         assert_eq!(lang_to_typecast_iso3(LanguageCode::Ja), "jpn");
         assert_eq!(lang_to_typecast_iso3(LanguageCode::Zh), "cmn");
         assert_eq!(lang_to_typecast_iso3(LanguageCode::ZhTw), "cmn");
+    }
+
+    // ── PR-C: per-speaker retry counter behavior ──────────────────
+    //
+    // The full `validate_then_translate` integration touches an
+    // mpsc::Sender, an async Provider trait object, and a Typecast
+    // HTTP call — none of which a unit test can exercise. So we
+    // pin the *retry-counter accounting* itself with a small
+    // simulation that mirrors the relevant arms of the function.
+
+    /// Mirror of the retry-bookkeeping in `validate_then_translate`.
+    /// Kept in tests because it has no callers in production code —
+    /// production calls the inline statements. If `validate_then_translate`'s
+    /// counter logic changes, this helper must change in lockstep.
+    fn simulate_route(
+        counts: &mut HashMap<LanguageCode, u8>,
+        route: QueryRoute,
+        lang: LanguageCode,
+    ) {
+        match route {
+            QueryRoute::SimpleGemma | QueryRoute::ComplexLlm => {
+                counts.insert(lang, 0);
+            }
+            QueryRoute::AskUserToRepeat | QueryRoute::ConfirmInterpretation => {
+                let entry = counts.entry(lang).or_insert(0);
+                *entry = entry.saturating_add(1);
+            }
+        }
+    }
+
+    #[test]
+    fn retry_counter_increments_on_uncertain_then_resets_on_success() {
+        let mut counts: HashMap<LanguageCode, u8> = HashMap::new();
+        // First Korean utterance: uncertain → AskUserToRepeat
+        simulate_route(&mut counts, QueryRoute::AskUserToRepeat, LanguageCode::Ko);
+        assert_eq!(counts.get(&LanguageCode::Ko).copied(), Some(1));
+        // User re-speaks Korean: still uncertain → ConfirmInterpretation
+        simulate_route(
+            &mut counts,
+            QueryRoute::ConfirmInterpretation,
+            LanguageCode::Ko,
+        );
+        assert_eq!(counts.get(&LanguageCode::Ko).copied(), Some(2));
+        // User confirms; pipeline routes to ComplexLlm → counter resets
+        simulate_route(&mut counts, QueryRoute::ComplexLlm, LanguageCode::Ko);
+        assert_eq!(counts.get(&LanguageCode::Ko).copied(), Some(0));
+    }
+
+    #[test]
+    fn retry_counter_is_independent_per_speaker_language() {
+        // Bidirectional case: Korean speaker has trouble; English
+        // speaker on the next turn comes through clean. The Korean
+        // counter must NOT bleed into English.
+        let mut counts: HashMap<LanguageCode, u8> = HashMap::new();
+        simulate_route(&mut counts, QueryRoute::AskUserToRepeat, LanguageCode::Ko);
+        simulate_route(&mut counts, QueryRoute::ComplexLlm, LanguageCode::En);
+        assert_eq!(counts.get(&LanguageCode::Ko).copied(), Some(1));
+        assert_eq!(counts.get(&LanguageCode::En).copied(), Some(0));
+        // Now the English speaker has a noisy turn — independently
+        // bumps the English counter, leaves Korean untouched.
+        simulate_route(&mut counts, QueryRoute::AskUserToRepeat, LanguageCode::En);
+        assert_eq!(counts.get(&LanguageCode::Ko).copied(), Some(1));
+        assert_eq!(counts.get(&LanguageCode::En).copied(), Some(1));
+    }
+
+    #[test]
+    fn retry_counter_saturates_does_not_overflow() {
+        let mut counts: HashMap<LanguageCode, u8> = HashMap::new();
+        counts.insert(LanguageCode::Ko, u8::MAX);
+        // Should saturate at u8::MAX, not panic.
+        simulate_route(&mut counts, QueryRoute::AskUserToRepeat, LanguageCode::Ko);
+        assert_eq!(counts.get(&LanguageCode::Ko).copied(), Some(u8::MAX));
     }
 }
