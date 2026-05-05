@@ -1084,6 +1084,276 @@ pub struct GroqModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Mistral ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MistralEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for MistralEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.mistral.ai/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.mistral"]
+pub struct MistralModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── DeepSeek ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DeepseekEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for DeepseekEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.deepseek.com/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.deepseek"]
+pub struct DeepseekModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Cohere ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CohereEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for CohereEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.cohere.ai/compatibility/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.cohere"]
+pub struct CohereModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Perplexity ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PerplexityEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for PerplexityEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.perplexity.ai",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.perplexity"]
+pub struct PerplexityModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── xAI (Grok) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum XaiEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for XaiEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.x.ai/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.xai"]
+pub struct XaiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Cerebras ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CerebrasEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for CerebrasEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.cerebras.ai/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.cerebras"]
+pub struct CerebrasModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── SambaNova ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SambanovaEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for SambanovaEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.sambanova.ai/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.sambanova"]
+pub struct SambanovaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Hyperbolic ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum HyperbolicEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for HyperbolicEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.hyperbolic.xyz/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.hyperbolic"]
+pub struct HyperbolicModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── DeepInfra ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DeepinfraEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for DeepinfraEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.deepinfra.com/v1/openai",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.deepinfra"]
+pub struct DeepinfraModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Hugging Face ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum HuggingfaceEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for HuggingfaceEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://router.huggingface.co/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.huggingface"]
+pub struct HuggingfaceModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── Bedrock (computed-endpoint exemplar, AWS region template) ──
 
 /// AWS Bedrock endpoint template. Single variant; the URL is computed at
@@ -12070,6 +12340,16 @@ impl_enum_prop_kind!(
     TogetherEndpoint,
     FireworksEndpoint,
     GroqEndpoint,
+    MistralEndpoint,
+    DeepseekEndpoint,
+    CohereEndpoint,
+    PerplexityEndpoint,
+    XaiEndpoint,
+    CerebrasEndpoint,
+    SambanovaEndpoint,
+    HyperbolicEndpoint,
+    DeepinfraEndpoint,
+    HuggingfaceEndpoint,
 );
 
 impl HasPropKind for serde_json::Value {
