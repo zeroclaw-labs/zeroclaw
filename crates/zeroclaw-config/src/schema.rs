@@ -1365,7 +1365,9 @@ pub enum Ai21Endpoint {
 }
 impl ModelEndpoint for Ai21Endpoint {
     fn uri(&self) -> &'static str {
-        "https://api.ai21.com/studio/v1"
+        match self {
+            Self::Default => "https://api.ai21.com/studio/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1388,7 +1390,9 @@ pub enum RekaEndpoint {
 }
 impl ModelEndpoint for RekaEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.reka.ai/v1"
+        match self {
+            Self::Default => "https://api.reka.ai/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1411,7 +1415,9 @@ pub enum BasetenEndpoint {
 }
 impl ModelEndpoint for BasetenEndpoint {
     fn uri(&self) -> &'static str {
-        "https://inference.baseten.co/v1"
+        match self {
+            Self::Default => "https://inference.baseten.co/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1434,7 +1440,9 @@ pub enum NscaleEndpoint {
 }
 impl ModelEndpoint for NscaleEndpoint {
     fn uri(&self) -> &'static str {
-        "https://inference.api.nscale.com/v1"
+        match self {
+            Self::Default => "https://inference.api.nscale.com/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1457,7 +1465,9 @@ pub enum AnyscaleEndpoint {
 }
 impl ModelEndpoint for AnyscaleEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.endpoints.anyscale.com/v1"
+        match self {
+            Self::Default => "https://api.endpoints.anyscale.com/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1480,7 +1490,9 @@ pub enum NebiusEndpoint {
 }
 impl ModelEndpoint for NebiusEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.studio.nebius.ai/v1"
+        match self {
+            Self::Default => "https://api.studio.nebius.ai/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1503,7 +1515,9 @@ pub enum FriendliEndpoint {
 }
 impl ModelEndpoint for FriendliEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.friendli.ai/serverless/v1"
+        match self {
+            Self::Default => "https://api.friendli.ai/serverless/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1526,7 +1540,9 @@ pub enum StepfunEndpoint {
 }
 impl ModelEndpoint for StepfunEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.stepfun.com/v1"
+        match self {
+            Self::Default => "https://api.stepfun.com/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1549,7 +1565,9 @@ pub enum AihubmixEndpoint {
 }
 impl ModelEndpoint for AihubmixEndpoint {
     fn uri(&self) -> &'static str {
-        "https://aihubmix.com/v1"
+        match self {
+            Self::Default => "https://aihubmix.com/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1572,7 +1590,9 @@ pub enum SiliconflowEndpoint {
 }
 impl ModelEndpoint for SiliconflowEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.siliconflow.cn/v1"
+        match self {
+            Self::Default => "https://api.siliconflow.cn/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1595,7 +1615,9 @@ pub enum AstraiEndpoint {
 }
 impl ModelEndpoint for AstraiEndpoint {
     fn uri(&self) -> &'static str {
-        "https://as-trai.com/v1"
+        match self {
+            Self::Default => "https://as-trai.com/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1618,7 +1640,9 @@ pub enum AvianEndpoint {
 }
 impl ModelEndpoint for AvianEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.avian.io/v1"
+        match self {
+            Self::Default => "https://api.avian.io/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1641,7 +1665,9 @@ pub enum DeepmystEndpoint {
 }
 impl ModelEndpoint for DeepmystEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.deepmyst.com/v1"
+        match self {
+            Self::Default => "https://api.deepmyst.com/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1664,7 +1690,9 @@ pub enum VeniceEndpoint {
 }
 impl ModelEndpoint for VeniceEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.venice.ai"
+        match self {
+            Self::Default => "https://api.venice.ai",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1687,7 +1715,9 @@ pub enum NovitaEndpoint {
 }
 impl ModelEndpoint for NovitaEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.novita.ai/openai"
+        match self {
+            Self::Default => "https://api.novita.ai/openai",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1710,7 +1740,9 @@ pub enum NvidiaEndpoint {
 }
 impl ModelEndpoint for NvidiaEndpoint {
     fn uri(&self) -> &'static str {
-        "https://integrate.api.nvidia.com/v1"
+        match self {
+            Self::Default => "https://integrate.api.nvidia.com/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1733,7 +1765,9 @@ pub enum TelnyxEndpoint {
 }
 impl ModelEndpoint for TelnyxEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.telnyx.com/v2"
+        match self {
+            Self::Default => "https://api.telnyx.com/v2",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1756,7 +1790,9 @@ pub enum VercelEndpoint {
 }
 impl ModelEndpoint for VercelEndpoint {
     fn uri(&self) -> &'static str {
-        "https://ai-gateway.vercel.sh/v1"
+        match self {
+            Self::Default => "https://ai-gateway.vercel.sh/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1779,7 +1815,9 @@ pub enum CloudflareEndpoint {
 }
 impl ModelEndpoint for CloudflareEndpoint {
     fn uri(&self) -> &'static str {
-        "https://gateway.ai.cloudflare.com/v1"
+        match self {
+            Self::Default => "https://gateway.ai.cloudflare.com/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1802,7 +1840,9 @@ pub enum OvhEndpoint {
 }
 impl ModelEndpoint for OvhEndpoint {
     fn uri(&self) -> &'static str {
-        "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
+        match self {
+            Self::Default => "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1825,7 +1865,9 @@ pub enum CopilotEndpoint {
 }
 impl ModelEndpoint for CopilotEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.githubcopilot.com"
+        match self {
+            Self::Default => "https://api.githubcopilot.com",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1956,7 +1998,9 @@ pub enum DoubaoEndpoint {
 }
 impl ModelEndpoint for DoubaoEndpoint {
     fn uri(&self) -> &'static str {
-        "https://ark.cn-beijing.volces.com/api/v3"
+        match self {
+            Self::Default => "https://ark.cn-beijing.volces.com/api/v3",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -1979,7 +2023,9 @@ pub enum YiEndpoint {
 }
 impl ModelEndpoint for YiEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.lingyiwanwu.com/v1"
+        match self {
+            Self::Default => "https://api.lingyiwanwu.com/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2002,7 +2048,9 @@ pub enum HunyuanEndpoint {
 }
 impl ModelEndpoint for HunyuanEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.hunyuan.cloud.tencent.com/v1"
+        match self {
+            Self::Default => "https://api.hunyuan.cloud.tencent.com/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2025,7 +2073,9 @@ pub enum QianfanEndpoint {
 }
 impl ModelEndpoint for QianfanEndpoint {
     fn uri(&self) -> &'static str {
-        "https://qianfan.baidubce.com/v2"
+        match self {
+            Self::Default => "https://qianfan.baidubce.com/v2",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2048,7 +2098,9 @@ pub enum BaichuanEndpoint {
 }
 impl ModelEndpoint for BaichuanEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.baichuan-ai.com/v1"
+        match self {
+            Self::Default => "https://api.baichuan-ai.com/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2071,7 +2123,9 @@ pub enum GeminiEndpoint {
 }
 impl ModelEndpoint for GeminiEndpoint {
     fn uri(&self) -> &'static str {
-        "https://generativelanguage.googleapis.com/v1beta"
+        match self {
+            Self::Default => "https://generativelanguage.googleapis.com/v1beta",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2122,7 +2176,9 @@ pub enum LmstudioEndpoint {
 }
 impl ModelEndpoint for LmstudioEndpoint {
     fn uri(&self) -> &'static str {
-        "http://localhost:1234/v1"
+        match self {
+            Self::LocalDefault => "http://localhost:1234/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2145,7 +2201,9 @@ pub enum LlamacppEndpoint {
 }
 impl ModelEndpoint for LlamacppEndpoint {
     fn uri(&self) -> &'static str {
-        "http://localhost:8080/v1"
+        match self {
+            Self::LocalDefault => "http://localhost:8080/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2168,7 +2226,9 @@ pub enum SglangEndpoint {
 }
 impl ModelEndpoint for SglangEndpoint {
     fn uri(&self) -> &'static str {
-        "http://localhost:30000/v1"
+        match self {
+            Self::LocalDefault => "http://localhost:30000/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2191,7 +2251,9 @@ pub enum VllmEndpoint {
 }
 impl ModelEndpoint for VllmEndpoint {
     fn uri(&self) -> &'static str {
-        "http://localhost:8000/v1"
+        match self {
+            Self::LocalDefault => "http://localhost:8000/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2214,7 +2276,9 @@ pub enum OsaurusEndpoint {
 }
 impl ModelEndpoint for OsaurusEndpoint {
     fn uri(&self) -> &'static str {
-        "http://localhost:1337/v1"
+        match self {
+            Self::LocalDefault => "http://localhost:1337/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2237,7 +2301,9 @@ pub enum LitellmEndpoint {
 }
 impl ModelEndpoint for LitellmEndpoint {
     fn uri(&self) -> &'static str {
-        "http://localhost:4000/v1"
+        match self {
+            Self::LocalDefault => "http://localhost:4000/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2260,7 +2326,9 @@ pub enum LeptonEndpoint {
 }
 impl ModelEndpoint for LeptonEndpoint {
     fn uri(&self) -> &'static str {
-        "https://llama3-1-405b.lepton.run/api/v1"
+        match self {
+            Self::Default => "https://llama3-1-405b.lepton.run/api/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2283,7 +2351,9 @@ pub enum SyntheticEndpoint {
 }
 impl ModelEndpoint for SyntheticEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.synthetic.new/openai/v1"
+        match self {
+            Self::Default => "https://api.synthetic.new/openai/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2306,7 +2376,9 @@ pub enum OpencodeEndpoint {
 }
 impl ModelEndpoint for OpencodeEndpoint {
     fn uri(&self) -> &'static str {
-        "https://opencode.ai/zen/v1"
+        match self {
+            Self::Default => "https://opencode.ai/zen/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2329,7 +2401,9 @@ pub enum OpencodeGoEndpoint {
 }
 impl ModelEndpoint for OpencodeGoEndpoint {
     fn uri(&self) -> &'static str {
-        "https://opencode.ai/zen/go/v1"
+        match self {
+            Self::Default => "https://opencode.ai/zen/go/v1",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2352,7 +2426,9 @@ pub enum KiloCliEndpoint {
 }
 impl ModelEndpoint for KiloCliEndpoint {
     fn uri(&self) -> &'static str {
-        "subprocess://kilocli"
+        match self {
+            Self::LocalSubprocess => "subprocess://kilocli",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2379,7 +2455,9 @@ pub enum CustomEndpoint {
 }
 impl ModelEndpoint for CustomEndpoint {
     fn uri(&self) -> &'static str {
-        "operator-supplied:set-cfg-uri"
+        match self {
+            Self::OperatorSupplied => "operator-supplied:set-cfg-uri",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -2402,7 +2480,9 @@ pub enum ClaudeCodeEndpoint {
 }
 impl ModelEndpoint for ClaudeCodeEndpoint {
     fn uri(&self) -> &'static str {
-        "https://api.anthropic.com"
+        match self {
+            Self::Default => "https://api.anthropic.com",
+        }
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
