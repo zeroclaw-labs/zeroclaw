@@ -725,6 +725,11 @@ pub struct ProviderRuntimeOptions {
     /// `ModelProviderConfig::native_tools`. Currently consulted only by the
     /// Groq factory branch (#5932).
     pub native_tools: Option<bool>,
+    /// Wire protocol to use for this provider.
+    /// `Some("responses")` routes the provider through the OpenResponses
+    /// `/v1/responses` API instead of chat_completions.  `None` uses the
+    /// provider's built-in default (chat_completions for most providers).
+    pub wire_api: Option<String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -743,6 +748,7 @@ impl Default for ProviderRuntimeOptions {
             merge_system_into_user: false,
             provider_extra: None,
             native_tools: None,
+            wire_api: None,
         }
     }
 }
@@ -787,6 +793,7 @@ pub fn provider_runtime_options_from_config(
         merge_system_into_user,
         provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
         native_tools: fallback.and_then(|e| e.native_tools),
+        wire_api: fallback.and_then(|e| e.wire_api.clone()),
     }
 }
 
@@ -1158,6 +1165,7 @@ fn create_provider_with_url_and_options(
         let extra_headers = options.extra_headers.clone();
         let api_path = options.api_path.clone();
         let max_tokens = options.provider_max_tokens;
+        let wire_api = options.wire_api.clone();
         move |p: OpenAiCompatibleProvider| -> Box<dyn Provider> {
             let mut p = p;
             if let Some(t) = timeout {
@@ -1174,6 +1182,9 @@ fn create_provider_with_url_and_options(
             }
             if let Some(mt) = max_tokens {
                 p = p.with_max_tokens(Some(mt));
+            }
+            if wire_api.as_deref() == Some("responses") {
+                p = p.with_responses_primary();
             }
             Box::new(p)
         }

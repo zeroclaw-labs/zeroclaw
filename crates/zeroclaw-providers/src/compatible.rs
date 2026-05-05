@@ -51,6 +51,10 @@ pub struct OpenAiCompatibleProvider {
     /// models.dev catalog key for this provider (e.g. "xai").
     /// When set, `list_models` fetches from the models.dev catalog.
     models_dev_key: Option<String>,
+    /// When true, tool-calling requests go to `/v1/responses` first;
+    /// chat_completions is used as a fallback only for non-tool requests.
+    /// Set via `wire_api = "responses"` in provider config (e.g. llama.cpp).
+    responses_first: bool,
 }
 
 /// How the provider expects the API key to be sent.
@@ -271,12 +275,21 @@ impl OpenAiCompatibleProvider {
             api_path: None,
             max_tokens: None,
             models_dev_key: None,
+            responses_first: false,
         }
     }
 
     /// Disable native tool calling, forcing prompt-guided tool use instead.
     pub fn without_native_tools(mut self) -> Self {
         self.native_tool_calling = false;
+        self
+    }
+
+    /// Route tool-calling requests through `/v1/responses` instead of chat_completions.
+    /// Use for providers (e.g. llama.cpp) whose chat_completions tool streaming is broken
+    /// but whose responses API is functional (wire_api = "responses").
+    pub fn with_responses_primary(mut self) -> Self {
+        self.responses_first = true;
         self
     }
 
@@ -811,6 +824,10 @@ struct ResponsesRequest {
     instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// Tool definitions in OpenResponses flat format
+    /// (`{"type":"function","name":…,"description":…,"parameters":…}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -866,14 +883,25 @@ struct ResponsesResponse {
 
 #[derive(Debug, Deserialize)]
 struct ResponsesOutput {
+    /// "message" or "function_call"
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    /// Content parts for "message" type outputs
     #[serde(default)]
     content: Vec<ResponsesContent>,
+    /// Tool call id — "call_id" (OpenResponses spec) or "id" (some impls)
+    #[serde(default, alias = "id")]
+    call_id: Option<String>,
+    /// Function name for "function_call" outputs
+    #[serde(default)]
+    name: Option<String>,
+    /// JSON-encoded arguments string for "function_call" outputs
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ResponsesContent {
-    #[serde(rename = "type")]
-    kind: Option<String>,
     text: Option<String>,
 }
 
@@ -882,6 +910,7 @@ struct ResponsesContent {
 // ---------------------------------------------------------------
 
 /// Server-Sent Event stream chunk for OpenAI-compatible streaming.
+// Note: ResponsesOutput / ResponsesContent / ResponsesResponse are defined above.
 #[derive(Debug, Deserialize)]
 struct StreamChunkResponse {
     #[serde(default)]
@@ -1410,30 +1439,55 @@ fn build_responses_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<Resp
     (instructions, input)
 }
 
-fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
-    if let Some(text) = first_nonempty(response.output_text.as_deref()) {
-        return Some(text);
+/// Convert a `ResponsesResponse` into a `ProviderChatResponse`.
+///
+/// Scans `output` for `function_call` items (tool calls) and for `message`
+/// items that contain `output_text` content.  Any function calls found are
+/// returned as `tool_calls`; the first text found becomes `text`.
+fn extract_responses_chat_response(response: ResponsesResponse) -> ProviderChatResponse {
+    let mut tool_calls: Vec<ProviderToolCall> = Vec::new();
+    let mut text: Option<String> = None;
+
+    // Top-level output_text shortcut (some providers collapse text here)
+    if text.is_none() {
+        text = first_nonempty(response.output_text.as_deref());
     }
 
-    for item in &response.output {
-        for content in &item.content {
-            if content.kind.as_deref() == Some("output_text")
-                && let Some(text) = first_nonempty(content.text.as_deref())
-            {
-                return Some(text);
+    for item in response.output {
+        match item.kind.as_deref() {
+            Some("function_call") => {
+                if let Some(name) = item.name {
+                    let arguments = item.arguments.unwrap_or_else(|| "{}".to_string());
+                    let id = item
+                        .call_id
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    tool_calls.push(ProviderToolCall {
+                        id,
+                        name,
+                        arguments,
+                        extra_content: None,
+                    });
+                }
+            }
+            _ => {
+                if text.is_none() {
+                    for content in &item.content {
+                        if let Some(t) = first_nonempty(content.text.as_deref()) {
+                            text = Some(t);
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
 
-    for item in &response.output {
-        for content in &item.content {
-            if let Some(text) = first_nonempty(content.text.as_deref()) {
-                return Some(text);
-            }
-        }
+    ProviderChatResponse {
+        text,
+        tool_calls,
+        usage: None,
+        reasoning_content: None,
     }
-
-    None
 }
 
 fn compact_sanitized_body_snippet(body: &str) -> String {
@@ -1478,11 +1532,12 @@ impl OpenAiCompatibleProvider {
         credential: Option<&str>,
         messages: &[ChatMessage],
         model: &str,
-    ) -> anyhow::Result<String> {
+        tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
+    ) -> anyhow::Result<ProviderChatResponse> {
         let (instructions, input) = build_responses_prompt(messages);
         if input.is_empty() {
             anyhow::bail!(
-                "{} Responses API fallback requires at least one non-system message",
+                "{} Responses API requires at least one non-system message",
                 self.name
             );
         }
@@ -1492,6 +1547,7 @@ impl OpenAiCompatibleProvider {
             input,
             instructions,
             stream: Some(false),
+            tools: Self::convert_tool_specs_for_responses(tools),
         };
 
         let url = self.responses_url();
@@ -1507,10 +1563,33 @@ impl OpenAiCompatibleProvider {
         }
 
         let body = response.text().await?;
-        let responses = parse_responses_response_body(&self.name, &body)?;
+        let responses_resp = parse_responses_response_body(&self.name, &body)?;
 
-        extract_responses_text(responses)
-            .ok_or_else(|| anyhow::anyhow!("No response from {} Responses API", self.name))
+        Ok(extract_responses_chat_response(responses_resp))
+    }
+
+    /// Convert tool specs to the flat OpenResponses format used by `/v1/responses`.
+    /// Unlike chat_completions (which nests under `"function": {...}`), the
+    /// responses API puts name/description/parameters at the top level.
+    fn convert_tool_specs_for_responses(
+        tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
+    ) -> Option<Vec<serde_json::Value>> {
+        tools.map(|items| {
+            items
+                .iter()
+                .map(|tool| {
+                    let params = zeroclaw_api::schema::SchemaCleanr::clean_for_openai(
+                        tool.parameters.clone(),
+                    );
+                    serde_json::json!({
+                        "type": "function",
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": params,
+                    })
+                })
+                .collect()
+        })
     }
 
     fn convert_tool_specs(
@@ -1912,8 +1991,9 @@ impl Provider for OpenAiCompatibleProvider {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
                     return self
-                        .chat_via_responses(credential, &fallback_messages, model)
+                        .chat_via_responses(credential, &fallback_messages, model, None)
                         .await
+                        .map(|r| r.text.unwrap_or_default())
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
                                 "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
@@ -1933,8 +2013,9 @@ impl Provider for OpenAiCompatibleProvider {
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses(credential, &fallback_messages, model)
+                    .chat_via_responses(credential, &fallback_messages, model, None)
                     .await
+                    .map(|r| r.text.unwrap_or_default())
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
                             "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
@@ -2014,8 +2095,9 @@ impl Provider for OpenAiCompatibleProvider {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
                     return self
-                        .chat_via_responses(credential, &effective_messages, model)
+                        .chat_via_responses(credential, &effective_messages, model, None)
                         .await
+                        .map(|r| r.text.unwrap_or_default())
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
                                 "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
@@ -2034,8 +2116,9 @@ impl Provider for OpenAiCompatibleProvider {
             // Mirror chat_with_system: 404 may mean this provider uses the Responses API
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses(credential, &effective_messages, model)
+                    .chat_via_responses(credential, &effective_messages, model, None)
                     .await
+                    .map(|r| r.text.unwrap_or_default())
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
                             "{} API error (chat completions unavailable; responses fallback failed: {responses_err})",
@@ -2191,9 +2274,28 @@ impl Provider for OpenAiCompatibleProvider {
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
-        let tools = Self::convert_tool_specs(request.tools);
         let effective_messages = Self::flatten_system_messages(request.messages, merge);
         let effective_messages = self.strip_native_tool_messages(&effective_messages);
+
+        let has_tools = request.tools.is_some_and(|t| !t.is_empty());
+
+        // When wire_api = "responses", route tool-calling turns through the
+        // responses API first.  The agent loop sets should_consume_provider_stream
+        // = false for these turns (supports_streaming_tool_events returns false),
+        // so this path is reached directly without a prior streaming attempt.
+        if self.responses_first && has_tools {
+            return self
+                .chat_via_responses(credential, &effective_messages, model, request.tools)
+                .await
+                .map_err(|responses_err| {
+                    anyhow::anyhow!(
+                        "{} responses API failed: {responses_err}",
+                        self.name
+                    )
+                });
+        }
+
+        let tools = Self::convert_tool_specs(request.tools);
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages_for_native(&effective_messages, !merge),
@@ -2224,14 +2326,8 @@ impl Provider for OpenAiCompatibleProvider {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
                     return self
-                        .chat_via_responses(credential, &effective_messages, model)
+                        .chat_via_responses(credential, &effective_messages, model, request.tools)
                         .await
-                        .map(|text| ProviderChatResponse {
-                            text: Some(text),
-                            tool_calls: vec![],
-                            usage: None,
-                            reasoning_content: None,
-                        })
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
                                 "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
@@ -2265,14 +2361,8 @@ impl Provider for OpenAiCompatibleProvider {
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses(credential, &effective_messages, model)
+                    .chat_via_responses(credential, &effective_messages, model, request.tools)
                     .await
-                    .map(|text| ProviderChatResponse {
-                        text: Some(text),
-                        tool_calls: vec![],
-                        usage: None,
-                        reasoning_content: None,
-                    })
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
                             "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
@@ -2311,7 +2401,10 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
-        self.native_tool_calling
+        // When responses_first is true, tool calls go through the non-streaming
+        // responses API; the agent loop will call chat() instead of stream_chat()
+        // for tool-enabled turns, bypassing the broken chat_completions streaming.
+        self.native_tool_calling && !self.responses_first
     }
 
     fn stream_chat(
@@ -2339,7 +2432,7 @@ impl Provider for OpenAiCompatibleProvider {
                 model: model.to_string(),
                 messages: Self::convert_messages_for_native(&effective_messages, !merge),
                 temperature,
-                reasoning_effort: self.reasoning_effort.clone(),
+                reasoning_effort: self.reasoning_effort_for_model(model),
                 tool_stream: if options.enabled {
                     self.tool_stream_for_tools(true)
                 } else {
@@ -2369,7 +2462,7 @@ impl Provider for OpenAiCompatibleProvider {
                 model: model.to_string(),
                 messages,
                 temperature,
-                reasoning_effort: self.reasoning_effort.clone(),
+                reasoning_effort: self.reasoning_effort_for_model(model),
                 tool_stream: if options.enabled {
                     self.tool_stream_for_tools(false)
                 } else {
@@ -2958,7 +3051,7 @@ mod tests {
         let json = r#"{"output_text":"Hello from top-level","output":[]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_chat_response(response).text.as_deref(),
             Some("Hello from top-level")
         );
     }
@@ -2969,7 +3062,7 @@ mod tests {
             r#"{"output":[{"content":[{"type":"output_text","text":"Hello from nested"}]}]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_chat_response(response).text.as_deref(),
             Some("Hello from nested")
         );
     }
@@ -2979,7 +3072,7 @@ mod tests {
         let json = r#"{"output":[{"content":[{"type":"message","text":"Fallback text"}]}]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_chat_response(response).text.as_deref(),
             Some("Fallback text")
         );
     }
@@ -3049,6 +3142,7 @@ mod tests {
                 Some("test-key"),
                 &[ChatMessage::system("policy")],
                 "gpt-test",
+                None,
             )
             .await
             .expect_err("system-only fallback payload should fail");
