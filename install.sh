@@ -721,9 +721,8 @@ fi
 
 if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
   if [ -t 0 ]; then
-    # Per #6292: present a 3-way choice rather than launching CLI onboard
-    # unconditionally. Bare Enter accepts the [1] CLI default; option [2]
-    # foregrounds the daemon so the operator can finish onboarding in the
+    # 3-way onboarding choice. Bare Enter accepts the [1] CLI default;
+    # option [2] foregrounds the daemon so the operator can finish in the
     # browser and Ctrl+C to return; [3] skips and prints a follow-up hint.
     # Non-TTY runs fall through to the silent skip in the else branch.
     echo
