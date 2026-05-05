@@ -568,6 +568,35 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// One trait per family-endpoint enum. Returns the URI template for the chosen
+/// variant — a literal URL for fixed endpoints (`https://api.openai.com/v1`),
+/// or a substitution template for computed endpoints (Azure's
+/// `https://{resource}.openai.azure.com/...`). Substitution happens family-side
+/// in the runtime constructor; for non-templated families the return value is
+/// the final URL.
+///
+/// Resolution order at runtime is uniform across every model provider family:
+/// operator's `cfg.uri` first; family endpoint enum's `uri()` second; loud
+/// failure when neither is set.
+pub trait ModelEndpoint {
+    fn uri(&self) -> &'static str;
+}
+
+/// Authentication mode for model provider families that support more than one
+/// (e.g. Qwen, Minimax can use API key OR OAuth). Families that only support a
+/// single auth flow simply omit this field from their config struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// Standard API key authentication via the `api_key` field.
+    #[default]
+    ApiKey,
+    /// OAuth flow — credential resolution defers to the family runtime impl
+    /// (typically reading a vendor-specific token cache or env var).
+    OAuth,
+}
+
 /// Named provider profile definition.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -11568,6 +11597,7 @@ impl_enum_prop_kind!(
     OtpMethod,
     SandboxBackend,
     AutonomyLevel,
+    AuthMode,
 );
 
 impl HasPropKind for serde_json::Value {
