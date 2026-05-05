@@ -271,7 +271,7 @@ impl WhatsAppChannel {
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"normalized_from": normalized_from})),
-                            "ignoring message from unauthorized number: . Add to channels.whatsapp.allowed_numbers in config.toml, or run `zeroclaw onboard --channels-only` to configure interactively."
+                            "ignoring message from unauthorized number: . Add to channels.whatsapp.allowed_numbers in config.toml, or run `zeroclaw onboard channels` to configure interactively."
                         );
                         continue;
                     }
