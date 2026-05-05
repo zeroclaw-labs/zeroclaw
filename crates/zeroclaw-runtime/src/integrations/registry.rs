@@ -4,8 +4,35 @@ use zeroclaw_providers::{
     is_zai_alias,
 };
 
-/// Returns the full catalog of integrations
-#[allow(clippy::too_many_lines)]
+/// Generates a `status_fn` for an `Option<ChannelConfig>` field on
+/// `Config::channels`. The closure tests `is_some()` and maps to
+/// `Active` / `Available` per the standard channel-presence convention.
+///
+/// Capture-free, so the result coerces cleanly to the `fn(&Config) ->
+/// IntegrationStatus` field type on `IntegrationEntry`. Removes the
+/// 7-line boilerplate this file previously repeated ~50 times.
+macro_rules! channel_active {
+    ($field:ident) => {
+        |c| {
+            if c.channels.$field.is_some() {
+                IntegrationStatus::Active
+            } else {
+                IntegrationStatus::Available
+            }
+        }
+    };
+}
+
+/// `status_fn` for an integration that isn't wired up yet. Mirrors the
+/// previous `|_| IntegrationStatus::ComingSoon` literal verbatim, just
+/// named for readability.
+macro_rules! coming_soon {
+    () => {
+        |_| IntegrationStatus::ComingSoon
+    };
+}
+
+/// Returns the full catalog of integrations.
 pub fn all_integrations() -> Vec<IntegrationEntry> {
     vec![
         // ── Chat Providers ──────────────────────────────────────
@@ -13,103 +40,55 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Telegram",
             description: "Bot API — long-polling",
             category: IntegrationCategory::Chat,
-            status_fn: |c| {
-                if c.channels.telegram.is_some() {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            status_fn: channel_active!(telegram),
         },
         IntegrationEntry {
             name: "Discord",
             description: "Servers, channels & DMs",
             category: IntegrationCategory::Chat,
-            status_fn: |c| {
-                if c.channels.discord.is_some() {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            status_fn: channel_active!(discord),
         },
         IntegrationEntry {
             name: "Slack",
             description: "Workspace apps via Web API",
             category: IntegrationCategory::Chat,
-            status_fn: |c| {
-                if c.channels.slack.is_some() {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            status_fn: channel_active!(slack),
         },
         IntegrationEntry {
             name: "Webhooks",
             description: "HTTP endpoint for triggers",
             category: IntegrationCategory::Chat,
-            status_fn: |c| {
-                if c.channels.webhook.is_some() {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            status_fn: channel_active!(webhook),
         },
         IntegrationEntry {
             name: "WhatsApp",
             description: "Meta Cloud API via webhook",
             category: IntegrationCategory::Chat,
-            status_fn: |c| {
-                if c.channels.whatsapp.is_some() {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            status_fn: channel_active!(whatsapp),
         },
         IntegrationEntry {
             name: "Signal",
             description: "Privacy-focused via signal-cli",
             category: IntegrationCategory::Chat,
-            status_fn: |c| {
-                if c.channels.signal.is_some() {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            status_fn: channel_active!(signal),
         },
         IntegrationEntry {
             name: "iMessage",
             description: "macOS AppleScript bridge",
             category: IntegrationCategory::Chat,
-            status_fn: |c| {
-                if c.channels.imessage.is_some() {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            status_fn: channel_active!(imessage),
         },
         IntegrationEntry {
             name: "Microsoft Teams",
             description: "Enterprise chat support",
             category: IntegrationCategory::Chat,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: coming_soon!(),
         },
         IntegrationEntry {
             name: "Matrix",
             description: "Matrix protocol (Element)",
             category: IntegrationCategory::Chat,
-            status_fn: |c| {
-                if c.channels.matrix.is_some() {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            status_fn: channel_active!(matrix),
         },
         IntegrationEntry {
             name: "Nostr",
