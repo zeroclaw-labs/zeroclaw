@@ -1508,7 +1508,7 @@ async fn run_gateway_chat_with_tools(
         )
         .await?;
         let usage = captured_usage
-            .and_then(|cell| cell.lock().ok().map(|guard| *guard))
+            .map(|cell| *cell.lock())
             .filter(|u| u.input_tokens > 0 || u.output_tokens > 0);
         let (input_tokens, output_tokens, cost_usd) = match usage {
             Some(u) => (

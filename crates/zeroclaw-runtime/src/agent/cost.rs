@@ -1,6 +1,8 @@
 use crate::cost::CostTracker;
 use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
 use zeroclaw_config::schema::ModelPricing;
 
 // ── Cost tracking via task-local ──
@@ -40,10 +42,7 @@ impl ToolLoopCostTrackingContext {
     /// Snapshot the per-scope usage. Wrapping code calls this after the
     /// scoped future completes to populate observer-event annotations.
     pub fn snapshot_turn_usage(&self) -> TurnUsage {
-        self.turn_usage
-            .lock()
-            .map(|guard| *guard)
-            .unwrap_or_default()
+        *self.turn_usage.lock()
     }
 }
 
@@ -88,11 +87,7 @@ pub fn record_tool_loop_cost_usage(
     );
 
     if pricing.is_none() {
-        tracing::debug!(
-            provider = provider_name,
-            model,
-            "Cost tracking recorded token usage with zero pricing (no pricing entry found)"
-        );
+        warn_once_missing_pricing(provider_name, model);
     }
 
     if let Err(error) = ctx.tracker.record_usage(cost_usage.clone()) {
@@ -103,13 +98,59 @@ pub fn record_tool_loop_cost_usage(
         );
     }
 
-    if let Ok(mut usage) = ctx.turn_usage.lock() {
+    {
+        let mut usage = ctx.turn_usage.lock();
         usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
         usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
         usage.cost_usd += cost_usage.cost_usd;
     }
 
     Some((cost_usage.total_tokens, cost_usage.cost_usd))
+}
+
+/// Insert `(provider, model)` into `seen`. Returns `true` on first sighting,
+/// `false` thereafter. Split out from `warn_once_missing_pricing` so the
+/// dedup contract can be unit-tested with a caller-owned set instead of the
+/// process-static one.
+fn missing_pricing_first_sighting(
+    seen: &Mutex<HashSet<(String, String)>>,
+    provider: &str,
+    model: &str,
+) -> bool {
+    seen.lock()
+        .insert((provider.to_string(), model.to_string()))
+}
+
+/// First-time WARN, subsequent DEBUG, per `(provider, model)` pair.
+///
+/// The default pricing catalog has no entries for most non-OpenAI/Anthropic/
+/// Google models. Operators only realize their cost-tracking surface is
+/// reporting zero when they happen to enable DEBUG logging — a pure-DEBUG
+/// signal is too quiet for "your cost enforcement is silently inert" to
+/// register. Promote the first sighting per-pair to WARN with a config-path
+/// pointer; all subsequent same-pair occurrences stay at DEBUG so the warn
+/// stream doesn't get spammy.
+fn warn_once_missing_pricing(provider: &str, model: &str) {
+    static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if missing_pricing_first_sighting(seen, provider, model) {
+        tracing::warn!(
+            provider,
+            model,
+            "Cost tracking: no pricing entry found for {provider}/{model} — \
+             token usage will be recorded with zero cost and budget enforcement \
+             is inert for this model. Add a pricing entry to config.toml under \
+             `[cost.prices.\"{provider}/{model}\"]` with `input = <USD per 1M tokens>` \
+             and `output = <USD per 1M tokens>` to enable cost tracking. \
+             This warning fires once per (provider, model) pair per process.",
+        );
+    } else {
+        tracing::debug!(
+            provider,
+            model,
+            "Cost tracking recorded token usage with zero pricing (no pricing entry found)",
+        );
+    }
 }
 
 /// Check budget before an LLM call. Returns `None` when no cost tracking
@@ -124,4 +165,76 @@ pub fn check_tool_loop_budget() -> Option<BudgetCheck> {
                 .check_budget(0.0)
                 .unwrap_or(BudgetCheck::Allowed)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_seen() -> Mutex<HashSet<(String, String)>> {
+        Mutex::new(HashSet::new())
+    }
+
+    #[test]
+    fn first_sighting_returns_true() {
+        let seen = fresh_seen();
+        assert!(
+            missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
+            "first observation of a (provider, model) pair must report first-sighting"
+        );
+    }
+
+    #[test]
+    fn second_sighting_same_pair_returns_false() {
+        let seen = fresh_seen();
+        assert!(missing_pricing_first_sighting(
+            &seen,
+            "minimax",
+            "MiniMax-M2.7"
+        ));
+        assert!(
+            !missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
+            "second sighting of the same pair must NOT re-fire WARN"
+        );
+    }
+
+    #[test]
+    fn different_models_under_same_provider_are_independent() {
+        let seen = fresh_seen();
+        assert!(missing_pricing_first_sighting(
+            &seen,
+            "minimax",
+            "MiniMax-M2.7"
+        ));
+        assert!(
+            missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M3.0"),
+            "different model under same provider is a distinct pair"
+        );
+    }
+
+    #[test]
+    fn different_providers_for_same_model_are_independent() {
+        // Same model name served by two different providers — operator may
+        // configure them at different rates, so the warn must fire for each.
+        let seen = fresh_seen();
+        assert!(missing_pricing_first_sighting(
+            &seen,
+            "openrouter",
+            "anthropic/claude-sonnet-4-5"
+        ));
+        assert!(
+            missing_pricing_first_sighting(&seen, "anthropic", "anthropic/claude-sonnet-4-5"),
+            "different provider for the same model is a distinct pair"
+        );
+    }
+
+    #[test]
+    fn empty_strings_dedup_independently() {
+        // Defensive: empty provider or model shouldn't collide with each other.
+        let seen = fresh_seen();
+        assert!(missing_pricing_first_sighting(&seen, "", "model"));
+        assert!(missing_pricing_first_sighting(&seen, "provider", ""));
+        assert!(missing_pricing_first_sighting(&seen, "", ""));
+        assert!(!missing_pricing_first_sighting(&seen, "", ""));
+    }
 }
