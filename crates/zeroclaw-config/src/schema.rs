@@ -7339,6 +7339,18 @@ pub struct WebhookConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub secret: Option<String>,
+    /// Maximum number of retry attempts for outbound sends on transient failures
+    /// (network errors, 429, 5xx). Set to `0` to disable retries. Default: `3`.
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    /// Base delay in milliseconds for exponential backoff between retries. Default: `500`.
+    /// Values below `1` are clamped to `1ms` at runtime to avoid busy-retry loops.
+    #[serde(default)]
+    pub retry_base_delay_ms: Option<u64>,
+    /// Maximum delay cap in milliseconds for any single retry wait. Default: `30000` (30s).
+    /// Values below `1` are clamped to `1ms` at runtime to avoid busy-retry loops.
+    #[serde(default)]
+    pub retry_max_delay_ms: Option<u64>,
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -13712,6 +13724,43 @@ bot_token = "xoxb-tok"
         let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.secret.is_none());
         assert_eq!(parsed.port, 8080);
+    }
+
+    #[test]
+    async fn webhook_config_retry_fields_default_to_none() {
+        let json = r#"{"port":8080}"#;
+        let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.max_retries.is_none());
+        assert!(parsed.retry_base_delay_ms.is_none());
+        assert!(parsed.retry_max_delay_ms.is_none());
+    }
+
+    #[test]
+    async fn webhook_config_retry_fields_roundtrip() {
+        let wc = WebhookConfig {
+            enabled: true,
+            port: 8080,
+            listen_path: None,
+            send_url: Some("https://example.com/cb".into()),
+            send_method: None,
+            auth_header: None,
+            secret: None,
+            max_retries: Some(5),
+            retry_base_delay_ms: Some(250),
+            retry_max_delay_ms: Some(10_000),
+        };
+
+        let json = serde_json::to_string(&wc).unwrap();
+        let parsed: WebhookConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.max_retries, Some(5));
+        assert_eq!(parsed.retry_base_delay_ms, Some(250));
+        assert_eq!(parsed.retry_max_delay_ms, Some(10_000));
+
+        let toml_str = toml::to_string(&wc).unwrap();
+        let parsed: WebhookConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.max_retries, Some(5));
+        assert_eq!(parsed.retry_base_delay_ms, Some(250));
+        assert_eq!(parsed.retry_max_delay_ms, Some(10_000));
     }
 
     // ── WhatsApp config ──────────────────────────────────────
