@@ -26,9 +26,6 @@ pub struct OpenAiCompatibleProvider {
     pub credential: Option<String>,
     pub auth_header: AuthStyle,
     supports_vision: bool,
-    /// When false, do not fall back to /v1/responses on chat completions 404.
-    /// GLM/Zhipu does not support the responses API.
-    supports_responses_fallback: bool,
     user_agent: Option<String>,
     /// When true, collect all `system` messages and prepend their content
     /// to the first `user` message, then drop the system messages.
@@ -51,10 +48,6 @@ pub struct OpenAiCompatibleProvider {
     /// models.dev catalog key for this provider (e.g. "xai").
     /// When set, `list_models` fetches from the models.dev catalog.
     models_dev_key: Option<String>,
-    /// When true, tool-calling requests go to `/v1/responses` first;
-    /// chat_completions is used as a fallback only for non-tool requests.
-    /// Set via `wire_api = "responses"` in provider config (e.g. llama.cpp).
-    responses_first: bool,
 }
 
 /// How the provider expects the API key to be sent.
@@ -156,9 +149,7 @@ impl OpenAiCompatibleProvider {
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
-        Self::new_with_options(
-            name, base_url, credential, auth_style, false, true, None, false,
-        )
+        Self::new_with_options(name, base_url, credential, auth_style, false, None, false)
     }
 
     pub fn new_with_vision(
@@ -174,23 +165,19 @@ impl OpenAiCompatibleProvider {
             credential,
             auth_style,
             supports_vision,
-            true,
             None,
             false,
         )
     }
 
-    /// Same as `new` but skips the /v1/responses fallback on 404.
-    /// Use for providers (e.g. GLM) that only support chat completions.
+    /// Alias for `new`; kept for call-site compatibility.
     pub fn new_no_responses_fallback(
         name: &str,
         base_url: &str,
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
-        Self::new_with_options(
-            name, base_url, credential, auth_style, false, false, None, false,
-        )
+        Self::new(name, base_url, credential, auth_style)
     }
 
     /// Create a provider with a custom User-Agent header.
@@ -210,7 +197,6 @@ impl OpenAiCompatibleProvider {
             credential,
             auth_style,
             false,
-            true,
             Some(user_agent),
             false,
         )
@@ -230,7 +216,6 @@ impl OpenAiCompatibleProvider {
             credential,
             auth_style,
             supports_vision,
-            true,
             Some(user_agent),
             false,
         )
@@ -244,9 +229,7 @@ impl OpenAiCompatibleProvider {
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
-        Self::new_with_options(
-            name, base_url, credential, auth_style, false, false, None, true,
-        )
+        Self::new_with_options(name, base_url, credential, auth_style, false, None, true)
     }
 
     fn new_with_options(
@@ -255,7 +238,6 @@ impl OpenAiCompatibleProvider {
         credential: Option<&str>,
         auth_style: AuthStyle,
         supports_vision: bool,
-        supports_responses_fallback: bool,
         user_agent: Option<&str>,
         merge_system_into_user: bool,
     ) -> Self {
@@ -265,7 +247,6 @@ impl OpenAiCompatibleProvider {
             credential: credential.map(ToString::to_string),
             auth_header: auth_style,
             supports_vision,
-            supports_responses_fallback,
             user_agent: user_agent.map(ToString::to_string),
             merge_system_into_user,
             native_tool_calling: !merge_system_into_user,
@@ -275,21 +256,12 @@ impl OpenAiCompatibleProvider {
             api_path: None,
             max_tokens: None,
             models_dev_key: None,
-            responses_first: false,
         }
     }
 
     /// Disable native tool calling, forcing prompt-guided tool use instead.
     pub fn without_native_tools(mut self) -> Self {
         self.native_tool_calling = false;
-        self
-    }
-
-    /// Route tool-calling requests through `/v1/responses` instead of chat_completions.
-    /// Use for providers (e.g. llama.cpp) whose chat_completions tool streaming is broken
-    /// but whose responses API is functional (wire_api = "responses").
-    pub fn with_responses_primary(mut self) -> Self {
-        self.responses_first = true;
         self
     }
 
@@ -425,6 +397,58 @@ impl OpenAiCompatibleProvider {
         )
     }
 
+    /// HTTP client for streaming SSE connections — connect timeout only, no total timeout.
+    /// reqwest's total timeout kills long-running streams mid-response; streaming paths must
+    /// use this client instead of http_client().
+    fn streaming_http_client(&self) -> Client {
+        let has_user_agent = self.user_agent.is_some();
+        let has_extra_headers = !self.extra_headers.is_empty();
+
+        if has_user_agent || has_extra_headers {
+            let mut headers = HeaderMap::new();
+            if let Some(ua) = self.user_agent.as_deref()
+                && let Ok(value) = HeaderValue::from_str(ua)
+            {
+                headers.insert(USER_AGENT, value);
+            }
+            for (key, value) in &self.extra_headers {
+                match (
+                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                    HeaderValue::from_str(value),
+                ) {
+                    (Ok(name), Ok(val)) => {
+                        headers.insert(name, val);
+                    }
+                    _ => {
+                        tracing::warn!(header = key, "Skipping invalid extra header name or value");
+                    }
+                }
+            }
+
+            let builder = Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .default_headers(headers);
+            let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                builder,
+                "provider.compatible",
+            );
+            return builder.build().unwrap_or_else(|error| {
+                tracing::warn!(
+                    "Failed to build proxied streaming client with custom headers: {error}"
+                );
+                Client::new()
+            });
+        }
+
+        let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        let builder =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
+        builder.build().unwrap_or_else(|error| {
+            tracing::warn!("Failed to build proxied streaming client: {error}");
+            Client::new()
+        })
+    }
+
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
     /// This allows custom providers with non-standard endpoints (e.g., VolcEngine ARK uses
     /// `/api/coding/v3/chat/completions` instead of `/v1/chat/completions`).
@@ -454,23 +478,6 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    fn path_ends_with(&self, suffix: &str) -> bool {
-        if let Ok(url) = reqwest::Url::parse(&self.base_url) {
-            return url.path().trim_end_matches('/').ends_with(suffix);
-        }
-
-        self.base_url.trim_end_matches('/').ends_with(suffix)
-    }
-
-    fn has_explicit_api_path(&self) -> bool {
-        let Ok(url) = reqwest::Url::parse(&self.base_url) else {
-            return false;
-        };
-
-        let path = url.path().trim_end_matches('/');
-        !path.is_empty() && path != "/"
-    }
-
     fn requires_tool_stream(&self) -> bool {
         let host_requires_tool_stream = reqwest::Url::parse(&self.base_url)
             .ok()
@@ -485,28 +492,6 @@ impl OpenAiCompatibleProvider {
             Some(true)
         } else {
             None
-        }
-    }
-
-    /// Build the full URL for responses API, detecting if base_url already includes the path.
-    fn responses_url(&self) -> String {
-        if self.path_ends_with("/responses") {
-            return self.base_url.clone();
-        }
-
-        let normalized_base = self.base_url.trim_end_matches('/');
-
-        // If chat endpoint is explicitly configured, derive sibling responses endpoint.
-        if let Some(prefix) = normalized_base.strip_suffix("/chat/completions") {
-            return format!("{prefix}/responses");
-        }
-
-        // If an explicit API path already exists (e.g. /v1, /openai, /api/coding/v3),
-        // append responses directly to avoid duplicate /v1 segments.
-        if self.has_explicit_api_path() {
-            format!("{normalized_base}/responses")
-        } else {
-            format!("{normalized_base}/v1/responses")
         }
     }
 
@@ -816,101 +801,11 @@ struct NativeMessage {
     reasoning_content: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct ResponsesRequest {
-    model: String,
-    input: Vec<ResponsesInput>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    instructions: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
-    /// Tool definitions in OpenResponses flat format
-    /// (`{"type":"function","name":…,"description":…,"parameters":…}`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<serde_json::Value>>,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesInput {
-    role: String,
-    content: ResponsesInputContent,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    kind: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum ResponsesInputContent {
-    Text(String),
-    Parts(Vec<ResponsesInputPart>),
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesInputPart {
-    #[serde(rename = "type")]
-    kind: String,
-    text: String,
-}
-
-impl ResponsesInput {
-    fn user_text(content: String) -> Self {
-        Self {
-            role: "user".to_string(),
-            content: ResponsesInputContent::Text(content),
-            kind: None,
-        }
-    }
-
-    fn assistant_output_text(content: String) -> Self {
-        Self {
-            role: "assistant".to_string(),
-            content: ResponsesInputContent::Parts(vec![ResponsesInputPart {
-                kind: "output_text".to_string(),
-                text: content,
-            }]),
-            kind: Some("message".to_string()),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponsesResponse {
-    #[serde(default)]
-    output: Vec<ResponsesOutput>,
-    #[serde(default)]
-    output_text: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponsesOutput {
-    /// "message" or "function_call"
-    #[serde(rename = "type", default)]
-    kind: Option<String>,
-    /// Content parts for "message" type outputs
-    #[serde(default)]
-    content: Vec<ResponsesContent>,
-    /// Tool call id — "call_id" (OpenResponses spec) or "id" (some impls)
-    #[serde(default, alias = "id")]
-    call_id: Option<String>,
-    /// Function name for "function_call" outputs
-    #[serde(default)]
-    name: Option<String>,
-    /// JSON-encoded arguments string for "function_call" outputs
-    #[serde(default)]
-    arguments: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponsesContent {
-    text: Option<String>,
-}
-
 // ---------------------------------------------------------------
 // Streaming support (SSE parser)
 // ---------------------------------------------------------------
 
 /// Server-Sent Event stream chunk for OpenAI-compatible streaming.
-// Note: ResponsesOutput / ResponsesContent / ResponsesResponse are defined above.
 #[derive(Debug, Deserialize)]
 struct StreamChunkResponse {
     #[serde(default)]
@@ -1396,124 +1291,11 @@ pub(crate) fn sse_bytes_to_events(
     .boxed()
 }
 
-fn first_nonempty(text: Option<&str>) -> Option<String> {
-    text.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
-fn build_responses_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<ResponsesInput>) {
-    let mut instructions_parts = Vec::new();
-    let mut input = Vec::new();
-
-    for message in messages {
-        if message.content.trim().is_empty() {
-            continue;
-        }
-
-        if message.role == "system" {
-            instructions_parts.push(message.content.clone());
-            continue;
-        }
-
-        let input_item = match message.role.as_str() {
-            // llama.cpp Responses parser expects assistant history items in
-            // "output_message" shape (`type=message`, `output_text` parts).
-            "assistant" | "tool" => ResponsesInput::assistant_output_text(message.content.clone()),
-            _ => ResponsesInput::user_text(message.content.clone()),
-        };
-        input.push(input_item);
-    }
-
-    let instructions = if instructions_parts.is_empty() {
-        None
-    } else {
-        Some(instructions_parts.join("\n\n"))
-    };
-
-    (instructions, input)
-}
-
-/// Convert a `ResponsesResponse` into a `ProviderChatResponse`.
-///
-/// Scans `output` for `function_call` items (tool calls) and for `message`
-/// items that contain `output_text` content.  Any function calls found are
-/// returned as `tool_calls`; the first text found becomes `text`.
-fn extract_responses_chat_response(response: ResponsesResponse) -> ProviderChatResponse {
-    let mut tool_calls: Vec<ProviderToolCall> = Vec::new();
-    let mut text: Option<String> = None;
-
-    // Top-level output_text shortcut (some providers collapse text here)
-    if text.is_none() {
-        text = first_nonempty(response.output_text.as_deref());
-    }
-
-    for item in response.output {
-        match item.kind.as_deref() {
-            Some("function_call") => {
-                if let Some(name) = item.name {
-                    let arguments = item.arguments.unwrap_or_else(|| "{}".to_string());
-                    let id = item
-                        .call_id
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                    tool_calls.push(ProviderToolCall {
-                        id,
-                        name,
-                        arguments,
-                        extra_content: None,
-                    });
-                }
-            }
-            _ => {
-                if text.is_none() {
-                    for content in &item.content {
-                        if let Some(t) = first_nonempty(content.text.as_deref()) {
-                            text = Some(t);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    ProviderChatResponse {
-        text,
-        tool_calls,
-        usage: None,
-        reasoning_content: None,
-    }
-}
-
-fn compact_sanitized_body_snippet(body: &str) -> String {
-    super::sanitize_api_error(body)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn parse_chat_response_body(provider_name: &str, body: &str) -> anyhow::Result<ApiChatResponse> {
-    serde_json::from_str::<ApiChatResponse>(body).map_err(|error| {
-        let snippet = compact_sanitized_body_snippet(body);
+fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatResponse> {
+    serde_json::from_str(body).map_err(|_| {
+        let sanitized = super::sanitize_api_error(body);
         anyhow::anyhow!(
-            "{provider_name} API returned an unexpected chat-completions payload: {error}; body={snippet}"
-        )
-    })
-}
-
-fn parse_responses_response_body(
-    provider_name: &str,
-    body: &str,
-) -> anyhow::Result<ResponsesResponse> {
-    serde_json::from_str::<ResponsesResponse>(body).map_err(|error| {
-        let snippet = compact_sanitized_body_snippet(body);
-        anyhow::anyhow!(
-            "{provider_name} Responses API returned an unexpected payload: {error}; body={snippet}"
+            "{name} API returned an unexpected chat-completions payload; body={sanitized}"
         )
     })
 }
@@ -1525,71 +1307,6 @@ impl OpenAiCompatibleProvider {
         credential: Option<&str>,
     ) -> reqwest::RequestBuilder {
         apply_auth_to_request(req, &self.auth_header, credential)
-    }
-
-    async fn chat_via_responses(
-        &self,
-        credential: Option<&str>,
-        messages: &[ChatMessage],
-        model: &str,
-        tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
-    ) -> anyhow::Result<ProviderChatResponse> {
-        let (instructions, input) = build_responses_prompt(messages);
-        if input.is_empty() {
-            anyhow::bail!(
-                "{} Responses API requires at least one non-system message",
-                self.name
-            );
-        }
-
-        let request = ResponsesRequest {
-            model: model.to_string(),
-            input,
-            instructions,
-            stream: Some(false),
-            tools: Self::convert_tool_specs_for_responses(tools),
-        };
-
-        let url = self.responses_url();
-
-        let response = self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let error = response.text().await?;
-            anyhow::bail!("{} Responses API error: {error}", self.name);
-        }
-
-        let body = response.text().await?;
-        let responses_resp = parse_responses_response_body(&self.name, &body)?;
-
-        Ok(extract_responses_chat_response(responses_resp))
-    }
-
-    /// Convert tool specs to the flat OpenResponses format used by `/v1/responses`.
-    /// Unlike chat_completions (which nests under `"function": {...}`), the
-    /// responses API puts name/description/parameters at the top level.
-    fn convert_tool_specs_for_responses(
-        tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
-    ) -> Option<Vec<serde_json::Value>> {
-        tools.map(|items| {
-            items
-                .iter()
-                .map(|tool| {
-                    let params = zeroclaw_api::schema::SchemaCleanr::clean_for_openai(
-                        tool.parameters.clone(),
-                    );
-                    serde_json::json!({
-                        "type": "function",
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": params,
-                    })
-                })
-                .collect()
-        })
     }
 
     fn convert_tool_specs(
@@ -1974,13 +1691,6 @@ impl Provider for OpenAiCompatibleProvider {
 
         let url = self.chat_completions_url();
 
-        let mut fallback_messages = Vec::new();
-        if let Some(system_prompt) = system_prompt {
-            fallback_messages.push(ChatMessage::system(system_prompt));
-        }
-        fallback_messages.push(ChatMessage::user(message));
-        let fallback_messages = Self::flatten_system_messages(&fallback_messages, merge);
-
         let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
@@ -1988,20 +1698,6 @@ impl Provider for OpenAiCompatibleProvider {
         {
             Ok(response) => response,
             Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &fallback_messages, model, None)
-                        .await
-                        .map(|r| r.text.unwrap_or_default())
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
                 return Err(chat_error.into());
             }
         };
@@ -2010,20 +1706,6 @@ impl Provider for OpenAiCompatibleProvider {
             let status = response.status();
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
-
-            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
-                return self
-                    .chat_via_responses(credential, &fallback_messages, model, None)
-                    .await
-                    .map(|r| r.text.unwrap_or_default())
-                    .map_err(|responses_err| {
-                        anyhow::anyhow!(
-                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
-                            self.name
-                        )
-                    });
-            }
-
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
@@ -2035,15 +1717,15 @@ impl Provider for OpenAiCompatibleProvider {
             .into_iter()
             .next()
             .map(|c| {
-                // If tool_calls are present, serialize the full message as JSON
-                // so parse_tool_calls can handle the OpenAI-style format
                 if c.message.tool_calls.is_some()
-                    && c.message.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
+                    && c.message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|t: &Vec<_>| !t.is_empty())
                 {
                     serde_json::to_string(&c.message)
                         .unwrap_or_else(|_| c.message.effective_content())
                 } else {
-                    // No tool calls, return content (with reasoning_content fallback)
                     c.message.effective_content()
                 }
             })
@@ -2091,42 +1773,10 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model, None)
-                        .await
-                        .map(|r| r.text.unwrap_or_default())
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
-            let status = response.status();
-
-            // Mirror chat_with_system: 404 may mean this provider uses the Responses API
-            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
-                return self
-                    .chat_via_responses(credential, &effective_messages, model, None)
-                    .await
-                    .map(|r| r.text.unwrap_or_default())
-                    .map_err(|responses_err| {
-                        anyhow::anyhow!(
-                            "{} API error (chat completions unavailable; responses fallback failed: {responses_err})",
-                            self.name
-                        )
-                    });
-            }
-
             return Err(super::api_error(&self.name, response).await);
         }
 
@@ -2138,15 +1788,15 @@ impl Provider for OpenAiCompatibleProvider {
             .into_iter()
             .next()
             .map(|c| {
-                // If tool_calls are present, serialize the full message as JSON
-                // so parse_tool_calls can handle the OpenAI-style format
                 if c.message.tool_calls.is_some()
-                    && c.message.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
+                    && c.message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|t: &Vec<_>| !t.is_empty())
                 {
                     serde_json::to_string(&c.message)
                         .unwrap_or_else(|_| c.message.effective_content())
                 } else {
-                    // No tool calls, return content (with reasoning_content fallback)
                     c.message.effective_content()
                 }
             })
@@ -2277,23 +1927,7 @@ impl Provider for OpenAiCompatibleProvider {
         let effective_messages = Self::flatten_system_messages(request.messages, merge);
         let effective_messages = self.strip_native_tool_messages(&effective_messages);
 
-        let has_tools = request.tools.is_some_and(|t| !t.is_empty());
-
-        // When wire_api = "responses", route tool-calling turns through the
-        // responses API first.  The agent loop sets should_consume_provider_stream
-        // = false for these turns (supports_streaming_tool_events returns false),
-        // so this path is reached directly without a prior streaming attempt.
-        if self.responses_first && has_tools {
-            return self
-                .chat_via_responses(credential, &effective_messages, model, request.tools)
-                .await
-                .map_err(|responses_err| {
-                    anyhow::anyhow!(
-                        "{} responses API failed: {responses_err}",
-                        self.name
-                    )
-                });
-        }
+        // When wire_api = "responses", route all turns through the responses API.
 
         let tools = Self::convert_tool_specs(request.tools);
         let native_request = NativeChatRequest {
@@ -2322,22 +1956,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model, request.tools)
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -2357,18 +1976,6 @@ impl Provider for OpenAiCompatibleProvider {
                     usage: None,
                     reasoning_content: None,
                 });
-            }
-
-            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
-                return self
-                    .chat_via_responses(credential, &effective_messages, model, request.tools)
-                    .await
-                    .map_err(|responses_err| {
-                        anyhow::anyhow!(
-                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
-                            self.name
-                        )
-                    });
             }
 
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
@@ -2401,10 +2008,8 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
-        // When responses_first is true, tool calls go through the non-streaming
-        // responses API; the agent loop will call chat() instead of stream_chat()
-        // for tool-enabled turns, bypassing the broken chat_completions streaming.
-        self.native_tool_calling && !self.responses_first
+        // The responses API always supports streaming tool events.
+        self.native_tool_calling
     }
 
     fn stream_chat(
@@ -2486,7 +2091,7 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
-        let client = self.http_client();
+        let client = self.streaming_http_client();
         let auth_header = self.auth_header.clone();
         let count_tokens = options.count_tokens;
 
@@ -2583,7 +2188,7 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
-        let client = self.http_client();
+        let client = self.streaming_http_client();
         let auth_header = self.auth_header.clone();
 
         // Use a channel to bridge the async HTTP response to the stream
@@ -2674,7 +2279,7 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
-        let client = self.http_client();
+        let client = self.streaming_http_client();
         let auth_header = self.auth_header.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
@@ -2719,9 +2324,8 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        // Hit the chat completions URL with a GET to establish the connection pool.
-        // The server will likely return 405 Method Not Allowed, which is fine -
-        // the goal is TLS handshake and HTTP/2 negotiation.
+        // Hit the appropriate URL with a GET to prime the connection pool.
+        // The server will likely return 405 Method Not Allowed, which is fine.
         let url = self.chat_completions_url();
         let _ = self
             .apply_auth_header(self.http_client().get(&url), self.credential.as_deref())
@@ -2915,18 +2519,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_responses_response_body_reports_sanitized_snippet() {
-        let body = r#"{"output_text":123,"api_key":"sk-another-secret"}"#;
-        let err = parse_responses_response_body("custom", body).expect_err("payload should fail");
-        let msg = err.to_string();
-
-        assert!(msg.contains("custom Responses API returned an unexpected payload"));
-        assert!(msg.contains("body="));
-        assert!(msg.contains("[REDACTED]"));
-        assert!(!msg.contains("sk-another-secret"));
-    }
-
-    #[test]
     fn x_api_key_auth_style() {
         let p = OpenAiCompatibleProvider::new(
             "moonshot",
@@ -3047,113 +2639,6 @@ mod tests {
     }
 
     #[test]
-    fn responses_extracts_top_level_output_text() {
-        let json = r#"{"output_text":"Hello from top-level","output":[]}"#;
-        let response: ResponsesResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            extract_responses_chat_response(response).text.as_deref(),
-            Some("Hello from top-level")
-        );
-    }
-
-    #[test]
-    fn responses_extracts_nested_output_text() {
-        let json =
-            r#"{"output":[{"content":[{"type":"output_text","text":"Hello from nested"}]}]}"#;
-        let response: ResponsesResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            extract_responses_chat_response(response).text.as_deref(),
-            Some("Hello from nested")
-        );
-    }
-
-    #[test]
-    fn responses_extracts_any_text_as_fallback() {
-        let json = r#"{"output":[{"content":[{"type":"message","text":"Fallback text"}]}]}"#;
-        let response: ResponsesResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            extract_responses_chat_response(response).text.as_deref(),
-            Some("Fallback text")
-        );
-    }
-
-    #[test]
-    fn build_responses_prompt_preserves_multi_turn_history() {
-        let messages = vec![
-            ChatMessage::system("policy"),
-            ChatMessage::user("step 1"),
-            ChatMessage::assistant("ack 1"),
-            ChatMessage::tool("{\"result\":\"ok\"}"),
-            ChatMessage::user("step 2"),
-        ];
-
-        let (instructions, input) = build_responses_prompt(&messages);
-
-        assert_eq!(instructions.as_deref(), Some("policy"));
-        assert_eq!(input.len(), 4);
-
-        let serialized: Vec<serde_json::Value> = input
-            .iter()
-            .map(|item| serde_json::to_value(item).expect("responses input item serializes"))
-            .collect();
-        assert_eq!(
-            serialized[0],
-            serde_json::json!({
-                "role": "user",
-                "content": "step 1"
-            })
-        );
-        assert_eq!(
-            serialized[1],
-            serde_json::json!({
-                "role": "assistant",
-                "type": "message",
-                "content": [{
-                    "type": "output_text",
-                    "text": "ack 1"
-                }]
-            })
-        );
-        assert_eq!(
-            serialized[2],
-            serde_json::json!({
-                "role": "assistant",
-                "type": "message",
-                "content": [{
-                    "type": "output_text",
-                    "text": "{\"result\":\"ok\"}"
-                }]
-            })
-        );
-        assert_eq!(
-            serialized[3],
-            serde_json::json!({
-                "role": "user",
-                "content": "step 2"
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn chat_via_responses_requires_non_system_message() {
-        let provider = make_provider("custom", "https://api.example.com", Some("test-key"));
-        let err = provider
-            .chat_via_responses(
-                Some("test-key"),
-                &[ChatMessage::system("policy")],
-                "gpt-test",
-                None,
-            )
-            .await
-            .expect_err("system-only fallback payload should fail");
-
-        assert!(
-            err.to_string()
-                .contains("requires at least one non-system message")
-        );
-    }
-
-    #[test]
     fn tool_call_function_name_falls_back_to_top_level_name() {
         let call: ToolCall = serde_json::from_value(serde_json::json!({
             "name": "memory_recall",
@@ -3259,68 +2744,6 @@ mod tests {
         assert_eq!(
             p.chat_completions_url(),
             "https://my-api.example.com/v2/llm/chat/completions-proxy/chat/completions"
-        );
-    }
-
-    #[test]
-    fn responses_url_standard() {
-        // Standard providers get /v1/responses appended
-        let p = make_provider("test", "https://api.example.com", None);
-        assert_eq!(p.responses_url(), "https://api.example.com/v1/responses");
-    }
-
-    #[test]
-    fn responses_url_custom_full_endpoint() {
-        // Custom provider with full responses endpoint
-        let p = make_provider(
-            "custom",
-            "https://my-api.example.com/api/v2/responses",
-            None,
-        );
-        assert_eq!(
-            p.responses_url(),
-            "https://my-api.example.com/api/v2/responses"
-        );
-    }
-
-    #[test]
-    fn responses_url_requires_exact_suffix_match() {
-        let p = make_provider(
-            "custom",
-            "https://my-api.example.com/api/v2/responses-proxy",
-            None,
-        );
-        assert_eq!(
-            p.responses_url(),
-            "https://my-api.example.com/api/v2/responses-proxy/responses"
-        );
-    }
-
-    #[test]
-    fn responses_url_derives_from_chat_endpoint() {
-        let p = make_provider(
-            "custom",
-            "https://my-api.example.com/api/v2/chat/completions",
-            None,
-        );
-        assert_eq!(
-            p.responses_url(),
-            "https://my-api.example.com/api/v2/responses"
-        );
-    }
-
-    #[test]
-    fn responses_url_base_with_v1_no_duplicate() {
-        let p = make_provider("test", "https://api.example.com/v1", None);
-        assert_eq!(p.responses_url(), "https://api.example.com/v1/responses");
-    }
-
-    #[test]
-    fn responses_url_non_v1_api_path_uses_raw_suffix() {
-        let p = make_provider("test", "https://api.example.com/api/coding/v3", None);
-        assert_eq!(
-            p.responses_url(),
-            "https://api.example.com/api/coding/v3/responses"
         );
     }
 

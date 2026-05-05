@@ -27,6 +27,7 @@ pub mod gemini;
 pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
+pub mod llamacpp;
 pub mod models_dev;
 pub mod multimodal;
 pub mod ollama;
@@ -730,6 +731,9 @@ pub struct ProviderRuntimeOptions {
     /// `/v1/responses` API instead of chat_completions.  `None` uses the
     /// provider's built-in default (chat_completions for most providers).
     pub wire_api: Option<String>,
+    /// Enable or disable chain-of-thought thinking. Forwarded as
+    /// `enable_thinking` in the request body. `None` lets the model decide.
+    pub think: Option<bool>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -749,6 +753,7 @@ impl Default for ProviderRuntimeOptions {
             provider_extra: None,
             native_tools: None,
             wire_api: None,
+            think: None,
         }
     }
 }
@@ -794,6 +799,7 @@ pub fn provider_runtime_options_from_config(
         provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
         native_tools: fallback.and_then(|e| e.native_tools),
         wire_api: fallback.and_then(|e| e.wire_api.clone()),
+        think: fallback.and_then(|e| e.think),
     }
 }
 
@@ -1165,7 +1171,6 @@ fn create_provider_with_url_and_options(
         let extra_headers = options.extra_headers.clone();
         let api_path = options.api_path.clone();
         let max_tokens = options.provider_max_tokens;
-        let wire_api = options.wire_api.clone();
         move |p: OpenAiCompatibleProvider| -> Box<dyn Provider> {
             let mut p = p;
             if let Some(t) = timeout {
@@ -1182,9 +1187,6 @@ fn create_provider_with_url_and_options(
             }
             if let Some(mt) = max_tokens {
                 p = p.with_max_tokens(Some(mt));
-            }
-            if wire_api.as_deref() == Some("responses") {
-                p = p.with_responses_primary();
             }
             Box::new(p)
         }
@@ -1529,23 +1531,24 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("http://localhost:8080/v1");
-            let llama_cpp_key = key
+            let credential = key
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("llama.cpp");
-            let provider = OpenAiCompatibleProvider::new_with_vision(
-                "llama.cpp",
-                base_url,
-                Some(llama_cpp_key),
-                AuthStyle::Bearer,
-                true,
-            );
-            let provider = if options.merge_system_into_user {
-                provider.with_merge_system_into_user()
-            } else {
-                provider
-            };
-            Ok(compat(provider))
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let mut provider = llamacpp::LlamaCppProvider::new(base_url, credential.as_deref());
+            if let Some(t) = options.provider_timeout_secs {
+                provider = provider.with_timeout_secs(t);
+            }
+            if !options.extra_headers.is_empty() {
+                provider = provider.with_extra_headers(options.extra_headers.clone());
+            }
+            if let Some(mt) = options.provider_max_tokens {
+                provider = provider.with_max_tokens(Some(mt));
+            }
+            if options.think.is_some() {
+                provider = provider.with_think(options.think);
+            }
+            Ok(Box::new(provider))
         }
         "sglang" => {
             let base_url = api_url

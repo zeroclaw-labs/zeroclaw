@@ -620,6 +620,12 @@ pub struct ModelProviderConfig {
     /// tool calling for Groq models that support it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
+    /// Enable or disable chain-of-thought thinking for models that support it
+    /// (e.g. Qwen3, GLM-4). `true` turns thinking on, `false` turns it off.
+    /// `None` (default) lets the model decide. Forwarded as `enable_thinking`
+    /// in the request body; mirrors the Ollama provider's `think` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────

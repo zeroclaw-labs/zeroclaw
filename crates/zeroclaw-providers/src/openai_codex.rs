@@ -1143,6 +1143,9 @@ data: [DONE]
             provider_extra: None,
             native_tools: None,
             wire_api: None,
+            provider_api_url: None,
+            zeroclaw_dir: None,
+            think: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
