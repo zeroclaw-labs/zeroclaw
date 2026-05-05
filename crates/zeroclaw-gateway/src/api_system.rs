@@ -1,16 +1,17 @@
 //! `/api/system/*` — version check + self-update endpoints.
 //!
-//! Backed by `zeroclaw_runtime::updater`, which is the same pipeline `zeroclaw
+//! Backed by [`zeroclaw_updater`], which is the same pipeline `zeroclaw
 //! update` runs on the CLI. The gateway adds a small bit of state to track
 //! whether an update is currently running (so we can return 409 instead of
 //! kicking off a second one) and an SSE stream for live phase progress.
 
 use super::AppState;
 use super::api::require_auth;
+use anyhow::Result;
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -24,13 +25,19 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
-use zeroclaw_runtime::updater::{self, UpdateEvent, UpdatePhase};
+use zeroclaw_updater::{self as updater, UpdateEvent, UpdatePhase};
 
 /// Capacity of the recent-events ring buffer surfaced by `/status`.
 const RECENT_EVENTS_CAPACITY: usize = 64;
 
 /// Capacity of the broadcast channel for live SSE consumers.
 const SSE_BROADCAST_CAPACITY: usize = 128;
+
+/// How long a `GET /api/system/version` response can be served from cache
+/// before re-querying GitHub. Caps the gateway at 1 GitHub call / 30s
+/// regardless of how many dashboard tabs are polling — important because
+/// the request is unauthenticated against the GitHub API (60/hr/IP limit).
+const VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Tracks an in-progress (or just-completed) update run.
 ///
@@ -39,6 +46,17 @@ const SSE_BROADCAST_CAPACITY: usize = 128;
 pub struct UpdateState {
     inner: Mutex<UpdateStateInner>,
     events_tx: broadcast::Sender<UpdateEvent>,
+    /// Memoised GitHub releases response. The cache is populated on first
+    /// successful `/api/system/version` and re-fetched after `VERSION_CACHE_TTL`.
+    /// Uses `tokio::sync::Mutex` so the GitHub call (held under the lock for
+    /// single-flight) doesn't block other handlers — only concurrent
+    /// version requests serialize on it.
+    version_cache: tokio::sync::Mutex<Option<CachedVersion>>,
+}
+
+struct CachedVersion {
+    info: updater::UpdateInfo,
+    fetched_at: std::time::Instant,
 }
 
 struct UpdateStateInner {
@@ -65,16 +83,44 @@ impl UpdateState {
                 recent: VecDeque::with_capacity(RECENT_EVENTS_CAPACITY),
             }),
             events_tx: tx,
+            version_cache: tokio::sync::Mutex::new(None),
         }
     }
 
-    /// Start tracking a new run. Returns `Err(())` if one is already active.
-    pub(crate) fn try_start(&self, task_id: &str) -> Result<(), ()> {
+    /// Return cached `UpdateInfo` if the cache is still fresh, otherwise
+    /// re-fetch from GitHub through the updater crate and replace the
+    /// cache. Caller-side `target_version` bypasses the cache (the cache
+    /// only ever holds the latest-tag response).
+    async fn cached_version(&self, target_version: Option<&str>) -> Result<updater::UpdateInfo> {
+        if target_version.is_some() {
+            return updater::check(target_version).await;
+        }
+        let mut guard = self.version_cache.lock().await;
+        if let Some(cached) = guard.as_ref()
+            && cached.fetched_at.elapsed() < VERSION_CACHE_TTL
+        {
+            return Ok(cached.info.clone());
+        }
+        let info = updater::check(None).await?;
+        *guard = Some(CachedVersion {
+            info: info.clone(),
+            fetched_at: std::time::Instant::now(),
+        });
+        Ok(info)
+    }
+
+    /// Start tracking a new run. Returns `false` when one is already active.
+    ///
+    /// The previous run's `recent` log buffer is preserved until a new run
+    /// emits its first event — this lets an operator who polls `/status`
+    /// after a completed run still see what happened, even if a fresh run
+    /// started in the meantime.
+    pub(crate) fn try_start(&self, task_id: &str) -> bool {
         let mut g = self.inner.lock();
         if let Some(run) = &g.current
             && run.success.is_none()
         {
-            return Err(());
+            return false;
         }
         g.current = Some(UpdateRun {
             task_id: task_id.to_string(),
@@ -82,8 +128,11 @@ impl UpdateState {
             started_at: chrono::Utc::now(),
             success: None,
         });
-        g.recent.clear();
-        Ok(())
+        // Note: `g.recent` is *not* cleared here. `record_event` truncates
+        // older entries naturally as the new run fills the ring buffer; that
+        // way the prior run's terminal events stay visible until they age
+        // out, instead of disappearing the moment a new run is requested.
+        true
     }
 
     fn record_event(&self, event: &UpdateEvent) {
@@ -126,12 +175,16 @@ struct StatusSnapshot {
 // ── Handlers ─────────────────────────────────────────────────────
 
 /// `GET /api/system/version` — current vs. latest release info.
+///
+/// Cached for `VERSION_CACHE_TTL` so dashboard polling (60s/tab × N tabs ×
+/// many deployments) doesn't burn through GitHub's unauthenticated
+/// 60-call/hr rate limit.
 pub async fn handle_get_version(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    match updater::check(None).await {
+    match state.update_state.cached_version(None).await {
         Ok(info) => Json(serde_json::json!({
             "current": info.current_version,
             "latest": info.latest_version,
@@ -155,9 +208,9 @@ pub struct UpdateRequestBody {
     /// Optional explicit version (e.g. "0.7.5"). Defaults to latest.
     pub version: Option<String>,
     /// If true, run even when the latest version is not newer than current.
-    /// Reserved for future use; currently ignored.
+    /// Used to re-install after a corrupted swap or to pin to a specific
+    /// `version` tag.
     #[serde(default)]
-    #[allow(dead_code)]
     pub force: bool,
 }
 
@@ -174,9 +227,11 @@ pub async fn handle_post_update(
     }
 
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    let task_id = format!("upd_{}", chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ"));
+    // UUID v4 over a millisecond timestamp — collision-free even if
+    // single-flight is later relaxed, and the format stays opaque to clients.
+    let task_id = format!("upd_{}", uuid::Uuid::new_v4());
 
-    if state.update_state.try_start(&task_id).is_err() {
+    if !state.update_state.try_start(&task_id) {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -186,13 +241,18 @@ pub async fn handle_post_update(
             .into_response();
     }
 
-    spawn_update_task(state.update_state.clone(), task_id.clone(), body.version);
+    spawn_update_task(
+        state.update_state.clone(),
+        task_id,
+        body.version,
+        body.force,
+    );
 
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "task_id": task_id })),
-    )
-        .into_response()
+    // Single-flight makes the task id non-load-bearing for the client
+    // (`/status` and `/stream` are global, not per-task), so the response
+    // intentionally has no body — just `202 Accepted` to acknowledge the
+    // run started.
+    StatusCode::ACCEPTED.into_response()
 }
 
 /// `GET /api/system/update/status` — current phase + recent log lines.
@@ -227,19 +287,16 @@ pub async fn handle_get_update_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    if state.pairing.require_pairing() {
-        let token = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|auth| auth.strip_prefix("Bearer "))
-            .unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization: Bearer <token>",
-            )
-                .into_response();
-        }
+    // Plain-text 401 (the SSE shape on success is `text/event-stream`, so
+    // the JSON envelope from `require_auth` would be misleading on error).
+    // Auth predicate itself is the same as the JSON handlers — we just
+    // render the failure differently.
+    if !super::api::is_authenticated_request(&state, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "Unauthorized — provide Authorization: Bearer <token>",
+        )
+            .into_response();
     }
 
     let rx = state.update_state.events_tx.subscribe();
@@ -257,7 +314,12 @@ pub async fn handle_get_update_stream(
 
 // ── Task driver ─────────────────────────────────────────────────
 
-fn spawn_update_task(state: Arc<UpdateState>, task_id: String, target_version: Option<String>) {
+fn spawn_update_task(
+    state: Arc<UpdateState>,
+    task_id: String,
+    target_version: Option<String>,
+    force: bool,
+) {
     tokio::spawn(async move {
         let (tx, mut rx) = mpsc::channel::<UpdateEvent>(64);
 
@@ -270,7 +332,13 @@ fn spawn_update_task(state: Arc<UpdateState>, task_id: String, target_version: O
             }
         });
 
-        let _ = updater::run_with_progress(target_version.as_deref(), &task_id, tx).await;
+        let _ = updater::run_with_progress(
+            target_version.as_deref(),
+            &task_id,
+            tx,
+            updater::RunOptions { force },
+        )
+        .await;
 
         let _ = forwarder.await;
     });
@@ -280,12 +348,22 @@ fn spawn_update_task(state: Arc<UpdateState>, task_id: String, target_version: O
 mod tests {
     use super::*;
 
+    fn make_event(task_id: &str, phase: UpdatePhase) -> UpdateEvent {
+        UpdateEvent {
+            task_id: task_id.into(),
+            phase,
+            level: updater::UpdateLevel::Info,
+            message: format!("{phase:?}"),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
     #[tokio::test]
-    async fn try_start_returns_err_when_run_active() {
+    async fn try_start_returns_false_when_run_active() {
         let state = UpdateState::new();
-        assert!(state.try_start("a").is_ok());
+        assert!(state.try_start("a"));
         assert!(
-            state.try_start("b").is_err(),
+            !state.try_start("b"),
             "second concurrent start should be rejected"
         );
     }
@@ -293,35 +371,95 @@ mod tests {
     #[tokio::test]
     async fn try_start_succeeds_after_terminal_event() {
         let state = UpdateState::new();
-        state.try_start("a").unwrap();
-        state.record_event(&UpdateEvent {
-            task_id: "a".into(),
-            phase: UpdatePhase::Done,
-            level: updater::UpdateLevel::Info,
-            message: "ok".into(),
-            timestamp: chrono::Utc::now(),
-        });
+        assert!(state.try_start("a"));
+        state.record_event(&make_event("a", UpdatePhase::Done));
         assert!(
-            state.try_start("b").is_ok(),
+            state.try_start("b"),
             "new run should be allowed once previous is in a terminal state"
         );
     }
 
     #[tokio::test]
+    async fn try_start_preserves_previous_recent_buffer() {
+        // Reviewer ask: don't drop the prior run's history just because a
+        // new run kicks off. Operators polling /status after a finished run
+        // should still see what happened.
+        let state = UpdateState::new();
+        assert!(state.try_start("a"));
+        state.record_event(&make_event("a", UpdatePhase::Download));
+        state.record_event(&make_event("a", UpdatePhase::Done));
+        assert!(state.try_start("b"));
+        let snap = state.snapshot();
+        // Both prior events are still in the ring buffer at this point;
+        // they age out naturally as run "b" emits its own events.
+        assert_eq!(snap.recent.len(), 2);
+        assert!(snap.recent.iter().all(|e| e.task_id == "a"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_status_succeeded_after_done() {
+        let state = UpdateState::new();
+        state.try_start("a");
+        state.record_event(&make_event("a", UpdatePhase::Done));
+        let snap = state.snapshot();
+        assert_eq!(snap.run.as_ref().and_then(|r| r.success), Some(true));
+    }
+
+    #[tokio::test]
+    async fn snapshot_status_failed_after_rolled_back() {
+        let state = UpdateState::new();
+        state.try_start("a");
+        state.record_event(&make_event("a", UpdatePhase::RolledBack));
+        let snap = state.snapshot();
+        assert_eq!(snap.run.as_ref().and_then(|r| r.success), Some(false));
+    }
+
+    #[tokio::test]
+    async fn snapshot_status_failed_after_failed_phase() {
+        let state = UpdateState::new();
+        state.try_start("a");
+        state.record_event(&make_event("a", UpdatePhase::Failed));
+        let snap = state.snapshot();
+        assert_eq!(snap.run.as_ref().and_then(|r| r.success), Some(false));
+    }
+
+    #[tokio::test]
     async fn snapshot_includes_recent_events() {
         let state = UpdateState::new();
-        state.try_start("a").unwrap();
-        for i in 0..3 {
-            state.record_event(&UpdateEvent {
-                task_id: "a".into(),
-                phase: UpdatePhase::Download,
-                level: updater::UpdateLevel::Info,
-                message: format!("chunk {i}"),
-                timestamp: chrono::Utc::now(),
-            });
+        state.try_start("a");
+        for _ in 0..3 {
+            state.record_event(&make_event("a", UpdatePhase::Download));
         }
         let snap = state.snapshot();
         assert_eq!(snap.recent.len(), 3);
         assert!(snap.run.is_some());
+    }
+
+    #[tokio::test]
+    async fn ring_buffer_caps_at_capacity() {
+        // Push more than RECENT_EVENTS_CAPACITY events; verify we never
+        // exceed the cap and that the oldest events are evicted (the first
+        // event should be gone).
+        let state = UpdateState::new();
+        state.try_start("a");
+        let push_count = RECENT_EVENTS_CAPACITY + 5;
+        for i in 0..push_count {
+            state.record_event(&UpdateEvent {
+                task_id: "a".into(),
+                phase: UpdatePhase::Download,
+                level: updater::UpdateLevel::Info,
+                message: format!("event-{i}"),
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        let snap = state.snapshot();
+        assert_eq!(snap.recent.len(), RECENT_EVENTS_CAPACITY);
+        // First event ("event-0") must have been evicted; oldest remaining
+        // should be "event-5" (push_count - capacity = 5).
+        assert_eq!(snap.recent.first().unwrap().message, "event-5");
+        assert_eq!(
+            snap.recent.last().unwrap().message,
+            format!("event-{}", push_count - 1)
+        );
     }
 }

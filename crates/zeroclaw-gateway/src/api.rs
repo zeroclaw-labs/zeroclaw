@@ -20,17 +20,25 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|auth| auth.strip_prefix("Bearer "))
 }
 
+/// Pure authorisation predicate — returns `true` when the request can proceed.
+///
+/// Useful for handlers (like the SSE stream) whose error response shape
+/// differs from the JSON envelope returned by [`require_auth`]. If pairing is
+/// disabled at the gateway, every request authorises.
+pub(super) fn is_authenticated_request(state: &AppState, headers: &HeaderMap) -> bool {
+    if !state.pairing.require_pairing() {
+        return true;
+    }
+    let token = extract_bearer_token(headers).unwrap_or("");
+    state.pairing.is_authenticated(token)
+}
+
 /// Verify bearer token against PairingGuard. Returns error response if unauthorized.
 pub(super) fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if !state.pairing.require_pairing() {
-        return Ok(());
-    }
-
-    let token = extract_bearer_token(headers).unwrap_or("");
-    if state.pairing.is_authenticated(token) {
+    if is_authenticated_request(state, headers) {
         Ok(())
     } else {
         Err((
@@ -1592,6 +1600,32 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// `GET /api/system/update/stream` with no `Authorization` header must
+    /// return 401 when pairing is required. The SSE handler has its own
+    /// auth path (it returns plain text instead of the JSON envelope), so
+    /// it gets its own test rather than relying on the POST coverage.
+    #[tokio::test]
+    async fn system_update_stream_without_token_returns_401() {
+        use crate::api_system::handle_get_update_stream;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+
+        let mut state = test_state(config);
+        state.pairing = Arc::new(PairingGuard::new(true, &["valid-token".to_string()]));
+
+        let response = handle_get_update_stream(State(state), HeaderMap::new())
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     /// A second `POST /api/system/update` while one is in progress must
     /// return 409 Conflict.
     #[tokio::test]
@@ -1609,10 +1643,10 @@ mod tests {
         let state = test_state(config);
         // Mark an active run directly so the test doesn't depend on a real
         // download succeeding.
-        state
-            .update_state
-            .try_start("preexisting")
-            .expect("first start should succeed");
+        assert!(
+            state.update_state.try_start("preexisting"),
+            "first start should succeed"
+        );
 
         let response = handle_post_update(State(state), HeaderMap::new(), None)
             .await

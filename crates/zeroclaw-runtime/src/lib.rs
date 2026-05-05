@@ -30,5 +30,4 @@ pub mod sop;
 pub mod tools;
 pub mod trust;
 pub mod tunnel;
-pub mod updater;
 pub mod verifiable_intent;

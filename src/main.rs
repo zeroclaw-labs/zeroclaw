@@ -637,7 +637,6 @@ Property path tab completion is included automatically in `zeroclaw completions 
     },
 
     /// Check for and apply updates
-    #[cfg(feature = "agent-runtime")]
     #[command(long_about = "\
 Check for and apply ZeroClaw updates.
 
@@ -2245,10 +2244,9 @@ async fn main() -> Result<()> {
             }
         }
 
-        #[cfg(feature = "agent-runtime")]
         Commands::Update {
             check,
-            force: _force,
+            force,
             version,
         } => {
             if check {
@@ -2263,7 +2261,11 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             } else {
-                commands::update::run(version.as_deref()).await
+                zeroclaw_updater::run_with_options(
+                    version.as_deref(),
+                    zeroclaw_updater::RunOptions { force },
+                )
+                .await
             }
         }
 

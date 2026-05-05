@@ -132,27 +132,66 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
     })
 }
 
-/// Run the full 6-phase update pipeline with stdout-style logging.
+/// Options that influence pipeline behaviour without changing event output.
+///
+/// Kept separate from the streaming params (`task_id`, `tx`) so callers don't
+/// have to construct an `mpsc::Sender` just to set a flag.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunOptions {
+    /// When `true`, run the pipeline even when the latest available release
+    /// is not strictly newer than the current binary. Useful for re-installs
+    /// after a corrupted swap or for pinning to a specific tag via
+    /// `target_version`.
+    pub force: bool,
+}
+
+/// Run the full 6-phase update pipeline with the CLI's stdout ergonomics.
 ///
 /// Used by the CLI. For the gateway, prefer `run_with_progress` so events can
 /// be streamed to the web UI.
 pub async fn run(target_version: Option<&str>) -> Result<()> {
+    run_with_options(target_version, RunOptions::default()).await
+}
+
+/// Like [`run`] but accepts [`RunOptions`].
+pub async fn run_with_options(target_version: Option<&str>, options: RunOptions) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<UpdateEvent>(64);
-    // Drain events to stdout so the CLI experience is unchanged.
+    // Drain events to stdout so the CLI surface stays the same shape it had
+    // on master: the headline events (Phase banners, "Update available",
+    // "Already up to date", "Successfully updated") go to stdout via
+    // `println!`, so they show up regardless of `RUST_LOG`. Everything else
+    // routes through `tracing` so operators who want timestamps/JSON get
+    // them.
     let drain = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            match event.level {
-                UpdateLevel::Info => info!("{}", event.message),
-                UpdateLevel::Warn => warn!("{}", event.message),
-                UpdateLevel::Error => eprintln!("error: {}", event.message),
+            if event_is_user_facing_headline(&event) {
+                match event.level {
+                    UpdateLevel::Error => eprintln!("error: {}", event.message),
+                    _ => println!("{}", event.message),
+                }
+            } else {
+                match event.level {
+                    UpdateLevel::Info => info!("{}", event.message),
+                    UpdateLevel::Warn => warn!("{}", event.message),
+                    UpdateLevel::Error => eprintln!("error: {}", event.message),
+                }
             }
         }
     });
 
     let task_id = "cli".to_string();
-    let result = run_with_progress(target_version, &task_id, tx).await;
+    let result = run_with_progress(target_version, &task_id, tx, options).await;
     let _ = drain.await;
     result.map(|_| ())
+}
+
+/// Headline events the CLI prints to stdout (`println!`) so they survive any
+/// `RUST_LOG` filter. Everything else goes through `tracing`.
+fn event_is_user_facing_headline(event: &UpdateEvent) -> bool {
+    matches!(
+        event.phase,
+        UpdatePhase::Preflight | UpdatePhase::Done | UpdatePhase::Failed | UpdatePhase::RolledBack
+    )
 }
 
 /// Run the full 6-phase update pipeline, streaming events through `tx`.
@@ -166,6 +205,7 @@ pub async fn run_with_progress(
     target_version: Option<&str>,
     task_id: &str,
     tx: mpsc::Sender<UpdateEvent>,
+    options: RunOptions,
 ) -> Result<UpdateInfo> {
     let _ = tx
         .send(UpdateEvent::new(
@@ -191,7 +231,10 @@ pub async fn run_with_progress(
         }
     };
 
-    if !update_info.is_newer {
+    // Skip the install when the latest available release isn't newer than the
+    // current binary, unless `options.force` is set (used for re-installs and
+    // for pinning to a specific tag via `target_version`).
+    if !update_info.is_newer && !options.force {
         let _ = tx
             .send(UpdateEvent::new(
                 task_id,
