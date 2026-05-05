@@ -22,9 +22,13 @@ use super::schema::{
     PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
     RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
     SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, TtsProviderConfig,
-    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    TelnyxModelProviderConfig, TogetherModelProviderConfig, VeniceModelProviderConfig,
+    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig,
+};
+use super::schema::{
+    EdgeTtsProviderConfig, ElevenLabsTtsProviderConfig, GoogleTtsProviderConfig,
+    OpenAITtsProviderConfig, PiperTtsProviderConfig, TtsProviderConfig as TtsBaseConfig,
 };
 
 /// Macro that expands to a single source of truth for the per-provider-type
@@ -280,6 +284,106 @@ impl ModelProviders {
     }
 }
 
+/// Typed TTS-provider container — one slot per TTS family. Mirrors
+/// `ModelProviders` but smaller (TTS has a closed set of 5 families:
+/// openai, elevenlabs, google, edge, piper). No catch-all needed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.tts"]
+pub struct TtsProviders {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub openai: HashMap<String, OpenAITtsProviderConfig>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub elevenlabs: HashMap<String, ElevenLabsTtsProviderConfig>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub google: HashMap<String, GoogleTtsProviderConfig>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub edge: HashMap<String, EdgeTtsProviderConfig>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub piper: HashMap<String, PiperTtsProviderConfig>,
+}
+
+impl TtsProviders {
+    /// Iterate every TTS entry across every typed slot, yielding
+    /// `(family, alias, &base)` triples.
+    pub fn iter_entries(
+        &self,
+    ) -> Box<dyn Iterator<Item = (&'static str, &str, &TtsBaseConfig)> + '_> {
+        Box::new(
+            std::iter::empty()
+                .chain(
+                    self.openai
+                        .iter()
+                        .map(|(a, c)| ("openai", a.as_str(), &c.base)),
+                )
+                .chain(
+                    self.elevenlabs
+                        .iter()
+                        .map(|(a, c)| ("elevenlabs", a.as_str(), &c.base)),
+                )
+                .chain(
+                    self.google
+                        .iter()
+                        .map(|(a, c)| ("google", a.as_str(), &c.base)),
+                )
+                .chain(self.edge.iter().map(|(a, c)| ("edge", a.as_str(), &c.base)))
+                .chain(
+                    self.piper
+                        .iter()
+                        .map(|(a, c)| ("piper", a.as_str(), &c.base)),
+                ),
+        )
+    }
+
+    /// Iterate every TTS entry mutably across every typed slot.
+    pub fn iter_entries_mut(
+        &mut self,
+    ) -> Box<dyn Iterator<Item = (&'static str, &str, &mut TtsBaseConfig)> + '_> {
+        Box::new(
+            std::iter::empty()
+                .chain(
+                    self.openai
+                        .iter_mut()
+                        .map(|(a, c)| ("openai", a.as_str(), &mut c.base)),
+                )
+                .chain(
+                    self.elevenlabs
+                        .iter_mut()
+                        .map(|(a, c)| ("elevenlabs", a.as_str(), &mut c.base)),
+                )
+                .chain(
+                    self.google
+                        .iter_mut()
+                        .map(|(a, c)| ("google", a.as_str(), &mut c.base)),
+                )
+                .chain(
+                    self.edge
+                        .iter_mut()
+                        .map(|(a, c)| ("edge", a.as_str(), &mut c.base)),
+                )
+                .chain(
+                    self.piper
+                        .iter_mut()
+                        .map(|(a, c)| ("piper", a.as_str(), &mut c.base)),
+                ),
+        )
+    }
+
+    /// True when no slot has any entry.
+    pub fn is_empty(&self) -> bool {
+        self.openai.is_empty()
+            && self.elevenlabs.is_empty()
+            && self.google.is_empty()
+            && self.edge.is_empty()
+            && self.piper.is_empty()
+    }
+}
+
 /// Top-level `[providers]` section. Wraps model provider profiles and routing rules.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -295,12 +399,11 @@ pub struct ProvidersConfig {
 
     /// Named TTS provider profiles: outer key = provider type, inner key = user alias.
     /// V3 shape: `[providers.tts.<type>.<alias>]` e.g. `[providers.tts.openai.default]`.
-    /// Mirrors `models` for parallel runtime dispatch through agent `tts_provider`
-    /// alias references. (Typed split for TTS is tracked under #6273 as a parallel
-    /// phase; until it lands, this stays as a flat HashMap.)
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    /// Mirrors `models` with the typed-family split: each TTS family has its
+    /// own slot carrying its `*TtsEndpoint` enum.
+    #[serde(default)]
     #[nested]
-    pub tts: HashMap<String, HashMap<String, TtsProviderConfig>>,
+    pub tts: TtsProviders,
 
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

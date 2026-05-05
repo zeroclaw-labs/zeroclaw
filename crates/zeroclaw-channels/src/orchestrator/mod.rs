@@ -965,13 +965,10 @@ async fn load_runtime_defaults_from_config_file(
                 "config.providers.models.api_key",
             )?;
         }
-        // Decrypt TTS provider API keys for runtime reload (V3: per-instance
-        // entries under [providers.tts.<type>.<alias>]).
-        for (ty, alias_map) in parsed.providers.tts.iter_mut() {
-            for (alias, instance) in alias_map.iter_mut() {
-                let label = format!("config.providers.tts.{ty}.{alias}.api_key");
-                decrypt_optional_secret_for_runtime_reload(&store, &mut instance.api_key, &label)?;
-            }
+        // Decrypt TTS provider API keys for runtime reload (V3 typed slots).
+        for (family, alias, instance) in parsed.providers.tts.iter_entries_mut() {
+            let label = format!("config.providers.tts.{family}.{alias}.api_key");
+            decrypt_optional_secret_for_runtime_reload(&store, &mut instance.api_key, &label)?;
         }
     }
 

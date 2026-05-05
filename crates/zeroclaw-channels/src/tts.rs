@@ -486,7 +486,7 @@ impl PiperTtsProvider {
     /// `http://127.0.0.1:5000/v1/audio/speech` when no `api_url` is supplied.
     pub fn new(config: &TtsProviderConfig) -> Self {
         let api_url = config
-            .api_url
+            .uri
             .clone()
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| "http://127.0.0.1:5000/v1/audio/speech".to_string());
@@ -578,37 +578,33 @@ impl TtsManager {
         let mut providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
         let mut voice_by_alias: HashMap<String, String> = HashMap::new();
 
-        for (type_key, alias_map) in &config.providers.tts {
-            for (alias, instance) in alias_map {
-                let dotted = format!("{type_key}.{alias}");
-                let result: Result<Box<dyn TtsProvider>> = match type_key.as_str() {
-                    "openai" => OpenAiTtsProvider::new(instance).map(|p| Box::new(p) as _),
-                    "elevenlabs" => ElevenLabsTtsProvider::new(instance).map(|p| Box::new(p) as _),
-                    "google" => GoogleTtsProvider::new(instance).map(|p| Box::new(p) as _),
-                    "edge" => EdgeTtsProvider::new(instance).map(|p| Box::new(p) as _),
-                    "piper" => Ok(Box::new(PiperTtsProvider::new(instance)) as _),
-                    other => {
-                        tracing::warn!(
-                            "Skipping unknown TTS backend type '{other}' (alias: {alias})"
-                        );
-                        continue;
+        // Typed dispatch over the TtsProviders container's named slots. The
+        // unknown-type warn-and-skip arm is gone — the typed container can't
+        // hold an unrecognized family.
+        for (family, alias, instance) in config.providers.tts.iter_entries() {
+            let dotted = format!("{family}.{alias}");
+            let result: Result<Box<dyn TtsProvider>> = match family {
+                "openai" => OpenAiTtsProvider::new(instance).map(|p| Box::new(p) as _),
+                "elevenlabs" => ElevenLabsTtsProvider::new(instance).map(|p| Box::new(p) as _),
+                "google" => GoogleTtsProvider::new(instance).map(|p| Box::new(p) as _),
+                "edge" => EdgeTtsProvider::new(instance).map(|p| Box::new(p) as _),
+                "piper" => Ok(Box::new(PiperTtsProvider::new(instance)) as _),
+                _ => unreachable!("TtsProviders typed slots cover all 5 families"),
+            };
+            match result {
+                Ok(p) => {
+                    providers.insert(dotted.clone(), p);
+                    if let Some(voice) = instance
+                        .voice
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                    {
+                        voice_by_alias.insert(dotted, voice.to_string());
                     }
-                };
-                match result {
-                    Ok(p) => {
-                        providers.insert(dotted.clone(), p);
-                        if let Some(voice) = instance
-                            .voice
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|v| !v.is_empty())
-                        {
-                            voice_by_alias.insert(dotted, voice.to_string());
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Skipping TTS provider {dotted}: {e}");
-                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Skipping TTS provider {dotted}: {e}");
                 }
             }
         }
@@ -687,34 +683,30 @@ mod tests {
     fn config_with_edge_alias() -> Config {
         let mut cfg = Config::default();
         cfg.tts.default_provider = "edge.default".to_string();
-        cfg.providers
-            .tts
-            .entry("edge".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                TtsProviderConfig {
+        cfg.providers.tts.edge.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::EdgeTtsProviderConfig {
+                base: TtsProviderConfig {
                     binary_path: Some("edge-tts".to_string()),
                     ..TtsProviderConfig::default()
                 },
-            );
+            },
+        );
         cfg
     }
 
     fn config_with_piper_alias() -> Config {
         let mut cfg = Config::default();
         cfg.tts.default_provider = "piper.default".to_string();
-        cfg.providers
-            .tts
-            .entry("piper".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                TtsProviderConfig {
-                    api_url: Some("http://127.0.0.1:5000/v1/audio/speech".to_string()),
+        cfg.providers.tts.piper.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::PiperTtsProviderConfig {
+                base: TtsProviderConfig {
+                    uri: Some("http://127.0.0.1:5000/v1/audio/speech".to_string()),
                     ..TtsProviderConfig::default()
                 },
-            );
+            },
+        );
         cfg
     }
 

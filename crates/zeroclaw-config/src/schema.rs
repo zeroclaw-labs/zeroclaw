@@ -3272,8 +3272,145 @@ pub struct TtsProviderConfig {
     pub language_code: Option<String>,
     /// Path to backend binary (edge-tts subprocess; piper local server).
     pub binary_path: Option<String>,
-    /// Base URL for HTTP-based backends (piper local server).
-    pub api_url: Option<String>,
+    /// Endpoint URI for HTTP-based backends (piper local server). Renamed
+    /// from `api_url` for parity with `ModelProviderConfig.uri`.
+    #[serde(alias = "api_url")]
+    pub uri: Option<String>,
+}
+
+// ── TTS endpoint trait + per-family typed configs ──────────────────────────
+//
+// Mirrors the model-provider typed-family pattern. Each TTS family carries
+// its own typed config (composing TtsProviderConfig as the shared base via
+// `#[serde(flatten)]`) and a single-variant `*TtsEndpoint` enum impl'ing
+// `TtsEndpoint`. Edge and Piper skip the base — they're subprocess / local
+// runtimes with no shared `api_key` / `voice` defaults.
+
+/// One trait per family-endpoint enum. Returns the URI for the chosen
+/// variant. Mirrors `ModelEndpoint` for parity across model and TTS.
+pub trait TtsEndpoint {
+    fn uri(&self) -> &'static str;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAITtsEndpoint {
+    #[default]
+    Default,
+}
+impl TtsEndpoint for OpenAITtsEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.openai.com/v1/audio/speech",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.tts.openai"]
+pub struct OpenAITtsProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TtsProviderConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ElevenLabsTtsEndpoint {
+    #[default]
+    Default,
+}
+impl TtsEndpoint for ElevenLabsTtsEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.elevenlabs.io/v1/text-to-speech",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.tts.elevenlabs"]
+pub struct ElevenLabsTtsProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TtsProviderConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GoogleTtsEndpoint {
+    #[default]
+    Default,
+}
+impl TtsEndpoint for GoogleTtsEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://texttospeech.googleapis.com/v1/text:synthesize",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.tts.google"]
+pub struct GoogleTtsProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TtsProviderConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeTtsEndpoint {
+    /// Subprocess — no remote endpoint. Sentinel for trait conformity.
+    #[default]
+    LocalSubprocess,
+}
+impl TtsEndpoint for EdgeTtsEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalSubprocess => "subprocess://edge-tts",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.tts.edge"]
+pub struct EdgeTtsProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TtsProviderConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PiperTtsEndpoint {
+    #[default]
+    LocalDefault,
+}
+impl TtsEndpoint for PiperTtsEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => "http://127.0.0.1:5000/v1/audio/speech",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.tts.piper"]
+pub struct PiperTtsProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TtsProviderConfig,
 }
 
 /// Determines when a `ToolFilterGroup` is active.
@@ -13384,6 +13521,11 @@ impl_enum_prop_kind!(
     CloudflareEndpoint,
     OvhEndpoint,
     CopilotEndpoint,
+    OpenAITtsEndpoint,
+    ElevenLabsTtsEndpoint,
+    GoogleTtsEndpoint,
+    EdgeTtsEndpoint,
+    PiperTtsEndpoint,
     GlmEndpoint,
     MinimaxEndpoint,
     ZaiEndpoint,

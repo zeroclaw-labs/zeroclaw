@@ -1143,6 +1143,9 @@ data: [DONE]
             provider_max_tokens: None,
             merge_system_into_user: false,
             provider_extra: None,
+            azure_resource: None,
+            azure_deployment: None,
+            azure_api_version: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
