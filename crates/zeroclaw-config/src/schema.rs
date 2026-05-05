@@ -4009,7 +4009,7 @@ impl Default for ClaudeCodeRunnerConfig {
 
 /// Codex CLI tool configuration (`[codex_cli]` section).
 ///
-/// Delegates coding tasks to the `codex -q` CLI. Authentication uses the
+/// Delegates coding tasks to the `codex exec` CLI. Authentication uses the
 /// binary's own session by default — no API key needed unless
 /// `env_passthrough` includes `OPENAI_API_KEY`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -4028,6 +4028,19 @@ pub struct CodexCliConfig {
     /// Extra env vars passed to the codex subprocess (e.g. OPENAI_API_KEY)
     #[serde(default)]
     pub env_passthrough: Vec<String>,
+    /// Extra CLI arguments appended to `codex exec` before the prompt.
+    ///
+    /// Values come from operator-controlled config (same trust level as
+    /// `env_passthrough`) and are not validated — the operator is responsible
+    /// for understanding the implications of flags passed here.
+    ///
+    /// **Warning:** `--sandbox=danger-full-access` disables Codex's bubblewrap
+    /// isolation; only use in environments where the container itself provides
+    /// isolation (e.g. Kubernetes pods with restricted PSS).
+    ///
+    /// Example: `["--sandbox=danger-full-access", "--skip-git-repo-check"]`
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 fn default_codex_cli_timeout_secs() -> u64 {
@@ -4045,6 +4058,7 @@ impl Default for CodexCliConfig {
             timeout_secs: default_codex_cli_timeout_secs(),
             max_output_bytes: default_codex_cli_max_output_bytes(),
             env_passthrough: Vec::new(),
+            extra_args: Vec::new(),
         }
     }
 }
