@@ -1,5 +1,5 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2 } from 'lucide-react';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, Wrench } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { WsMessage } from '@/types/api';
@@ -52,9 +52,9 @@ export default function AgentChat() {
   });
   // #6348: tool execution is plumbing, not chat. Default off so tool_call /
   // tool_result frames do not surface inline in the conversation transcript.
-  // Power users can flip 'zeroclaw_show_tool_activity' in localStorage; a
-  // proper toggle UI is a follow-up.
-  const [showToolActivity] = useState(() => {
+  // Toggleable from the chat toolbar (Wrench button); the same flag persists
+  // to `localStorage.zeroclaw_show_tool_activity` for cross-session memory.
+  const [showToolActivity, setShowToolActivity] = useState(() => {
     try { return localStorage.getItem('zeroclaw_show_tool_activity') === '1'; } catch { return false; }
   });
   const pendingContentRef = useRef('');
@@ -400,6 +400,14 @@ export default function AgentChat() {
     });
   }, []);
 
+  const toggleToolActivity = useCallback(() => {
+    setShowToolActivity((prev) => {
+      const next = !prev;
+      try { localStorage.setItem('zeroclaw_show_tool_activity', next ? '1' : '0'); } catch { /* noop */ }
+      return next;
+    });
+  }, []);
+
   /**
    * Fallback copy using a temporary textarea for HTTP contexts
    * where navigator.clipboard is unavailable.
@@ -446,6 +454,17 @@ export default function AgentChat() {
           >
             {compact ? <Maximize2 className="h-3 w-3" /> : <Minimize2 className="h-3 w-3" />}
             {t('agent.compact_mode')}
+          </button>
+          <button
+            type="button"
+            onClick={toggleToolActivity}
+            className="btn-secondary flex items-center gap-1.5 text-xs"
+            style={{ padding: '0.3rem 0.75rem', borderRadius: '0.5rem' }}
+            aria-label={showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
+            aria-pressed={showToolActivity}
+          >
+            <Wrench className="h-3 w-3" />
+            {showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
           </button>
           <button
             type="button"
