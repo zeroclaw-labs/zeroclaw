@@ -287,6 +287,9 @@ pub enum SkillCommands {
     Install {
         /// Source URL or local path
         source: String,
+        /// Suppress the install-time tier banner
+        #[arg(long)]
+        quiet: bool,
     },
     /// Remove an installed skill
     Remove {
