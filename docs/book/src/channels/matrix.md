@@ -86,8 +86,9 @@ Response:
 zeroclaw config set channels.matrix.access-token    # paste the access_token (input is masked)
 zeroclaw config set channels.matrix.device-id NEWDEVICE
 zeroclaw config set channels.matrix.user-id @bot:example.com
-zeroclaw service restart
 ```
+
+Restart for the new values to take effect: `zeroclaw service restart`.
 
 The wizard (`zeroclaw onboard channels`) prompts for these same fields if you'd rather work through it interactively.
 
@@ -95,21 +96,12 @@ The wizard (`zeroclaw onboard channels`) prompts for these same fields if you'd 
 
 - **Keep a copy of the token** when you first paste it. Secrets are encrypted at rest and `zeroclaw config get` will print `[masked]` for the token field; you can't retrieve it later. Stash it in a scratch note if you'll need it for the curl validation snippets in §5C.
 - **Reuse the same `device_id` on every restart** — changing it forces a new server-side device registration, which breaks key sharing and verification in encrypted rooms. The auto-recovery path in §8 handles the rare cases where wiping is genuinely the right call.
-- **Rotating the access token later** without re-running the wizard:
-  ```bash
-  zeroclaw config set channels.matrix.access-token    # prompts, masked
-  zeroclaw service restart
-  ```
+- **Rotating the access token later** without re-running the wizard: run `zeroclaw config set channels.matrix.access-token` (prompts, input masked), then `zeroclaw service restart`.
 - **Token shows as expired or invalid** at startup: mint a new one with the same curl, repeat Step 2.
 
 ## 4. Quick validation
 
-```bash
-zeroclaw onboard channels
-zeroclaw service restart        # or `zeroclaw daemon` to run foreground
-```
-
-Send a plain-text message in the configured Matrix room. Confirm:
+Run `zeroclaw onboard channels` if you haven't yet, then restart with `zeroclaw service restart` (background) or `zeroclaw daemon` (foreground). Send a plain-text message in the configured Matrix room. Confirm:
 
 - ZeroClaw logs show the Matrix listener starting with no repeated sync/auth errors.
 - In an encrypted room, the bot can read and reply to encrypted messages from allowed users.
@@ -126,11 +118,7 @@ Work through in order.
 ### B. Sender allowlist
 
 - If `allowed_users = []`, all inbound messages are denied.
-- For diagnosis, temporarily open it:
-  ```bash
-  zeroclaw config set channels.matrix.allowed-users '["*"]'
-  zeroclaw service restart
-  ```
+- For diagnosis, temporarily open it: run `zeroclaw config set channels.matrix.allowed-users '["*"]'`, then `zeroclaw service restart`.
 - Tighten to explicit user IDs once the flow works.
 
 ### C. Token and identity
@@ -156,11 +144,7 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 
 - Returned `user_id` must match the bot account.
 - If `device_id` is missing from the response, set it manually (see §5H).
-- Rotate the access token without re-running onboard:
-  ```bash
-  zeroclaw config set channels.matrix.access-token    # prompts, masked
-  zeroclaw service restart
-  ```
+- Rotate the access token without re-running onboard: `zeroclaw config set channels.matrix.access-token` (prompts, masked), then `zeroclaw service restart`.
 
 ### D. E2EE-specific checks
 
@@ -218,10 +202,9 @@ If `device_id` is missing, the token was created without a device login (e.g. vi
 
 ```bash
 zeroclaw config set channels.matrix.device-id ABCDEF1234
-zeroclaw service restart
 ```
 
-Keep `device-id` stable — changing it forces a new device registration, which breaks existing key sharing and verification.
+Then `zeroclaw service restart`. Keep `device-id` stable — changing it forces a new device registration, which breaks existing key sharing and verification.
 
 ### H (continued). Crypto-store deletion recovery
 
@@ -311,10 +294,9 @@ Input is masked. The key is encrypted at rest.
 
 ```bash
 zeroclaw config set channels.matrix.recovery-key    # input masked
-zeroclaw service restart
 ```
 
-Encrypted at rest immediately.
+Then `zeroclaw service restart`. The recovery key is encrypted at rest immediately.
 
 #### Step 3 — Restart
 
