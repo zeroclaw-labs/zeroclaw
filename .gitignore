@@ -6,6 +6,7 @@
 /docs/book/po-extract/
 /docs/book/src/reference/cli.md
 /docs/book/src/reference/config.md
+/docs/book/theme/lang-switcher.js
 .secrets
 firmware/*/target
 web/dist/*
