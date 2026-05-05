@@ -142,8 +142,12 @@ pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }
 
-/// Replace media markers (`[IMAGE:...]`, `[DOCUMENT:...]`, `[FILE:...]`,
-/// `[VIDEO:...]`, `[VOICE:...]`, `[AUDIO:...]`) with `[media attachment]`.
+/// Replace media markers (`[IMAGE:...]`, `[PHOTO:...]`, `[DOCUMENT:...]`,
+/// `[FILE:...]`, `[VIDEO:...]`, `[VOICE:...]`, `[AUDIO:...]`) with
+/// `[media attachment]`. Match is case-insensitive to align with the channel
+/// attachment parsers, which all uppercase the kind before comparing
+/// (`crates/zeroclaw-channels/src/util.rs::ATTACHMENT_KINDS`,
+/// `telegram.rs`, `discord.rs`, `qq.rs`, `whatsapp_web.rs`).
 ///
 /// Use before passing user-facing text to auxiliary `chat_with_system` calls
 /// (intent classification, summarization, delegation) so that local file
@@ -156,7 +160,8 @@ pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
 /// continues to call `prepare_messages_for_provider` for full normalization.
 pub fn strip_media_markers(text: &str) -> String {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\[(?:IMAGE|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]").unwrap()
+        regex::Regex::new(r"(?i)\[(?:IMAGE|PHOTO|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]")
+            .unwrap()
     });
     RE.replace_all(text, "[media attachment]").into_owned()
 }
@@ -573,8 +578,22 @@ mod tests {
 
     #[test]
     fn strip_media_markers_replaces_all_supported_kinds() {
-        let input = "[IMAGE:/a.jpg] [DOCUMENT:/b.pdf] [FILE:/c.zip] [VIDEO:/d.mp4] [VOICE:/e.ogg] [AUDIO:/f.wav]";
-        let expected = "[media attachment] [media attachment] [media attachment] [media attachment] [media attachment] [media attachment]";
+        // Mirrors `ATTACHMENT_KINDS` in
+        // `crates/zeroclaw-channels/src/util.rs`, which is the source of
+        // truth for which marker spellings inbound channels can produce.
+        let input = "[IMAGE:/a.jpg] [PHOTO:/b.jpg] [DOCUMENT:/c.pdf] [FILE:/d.zip] [VIDEO:/e.mp4] [VOICE:/f.ogg] [AUDIO:/g.wav]";
+        let expected = "[media attachment] [media attachment] [media attachment] [media attachment] [media attachment] [media attachment] [media attachment]";
+        assert_eq!(strip_media_markers(input), expected);
+    }
+
+    #[test]
+    fn strip_media_markers_is_case_insensitive() {
+        // Channel parsers uppercase the kind before comparing, so by the time
+        // a marker reaches conversation history it is normally upper-case —
+        // but accept lower/mixed case too so we don't depend on that
+        // invariant downstream.
+        let input = "[image:/a.jpg] [Photo:/b.jpg] [video:/c.mp4]";
+        let expected = "[media attachment] [media attachment] [media attachment]";
         assert_eq!(strip_media_markers(input), expected);
     }
 
