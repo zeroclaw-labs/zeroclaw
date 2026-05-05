@@ -81,6 +81,7 @@ mod tests {
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
+            reply_min_interval_secs: 0,
         };
 
         let discord = DiscordConfig {

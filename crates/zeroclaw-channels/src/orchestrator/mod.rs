@@ -11810,6 +11810,7 @@ This is an example JSON object for profile settings."#;
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
+            reply_min_interval_secs: 0,
         });
         match build_channel_by_id(&config, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),

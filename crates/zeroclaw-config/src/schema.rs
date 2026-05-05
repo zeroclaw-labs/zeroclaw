@@ -12338,6 +12338,7 @@ auto_save = true
                     ack_reactions: None,
                     proxy_url: None,
                     approval_timeout_secs: default_telegram_approval_timeout_secs(),
+                    reply_min_interval_secs: 0,
                 }),
                 discord: None,
                 discord_history: None,
@@ -13243,6 +13244,7 @@ default_temperature = 0.7
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
+            reply_min_interval_secs: 0,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -16665,6 +16667,7 @@ require_otp_to_resume = true
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: default_telegram_approval_timeout_secs(),
+            reply_min_interval_secs: 0,
         });
 
         // Save (triggers encryption)
