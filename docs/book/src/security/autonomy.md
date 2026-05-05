@@ -95,17 +95,17 @@ shell_env_passthrough = ["PATH", "HOME", "USER", "LANG"]
 
 Secrets (`API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD` patterns) are *never* passed through automatically — list them explicitly or fetch from the secrets store inside the command.
 
-## Per-channel autonomy override
+## Restricting tools on non-CLI channels
 
-A public-facing channel can run at a stricter level than the default:
+Autonomy `level` is global — there is no per-channel override field. To keep dangerous tools off public-facing surfaces (Telegram, Discord, Bluesky, every channel that isn't the local CLI), use `non_cli_excluded_tools`:
 
 ```toml
 [autonomy]
-level = "supervised"             # the default
-
-[channels.bluesky]
-autonomy_level = "read_only"     # public channel at read-only
+level = "supervised"                                     # the default
+non_cli_excluded_tools = ["shell", "file_write"]         # excluded from non-CLI channels
 ```
+
+`non_cli_excluded_tools` is binary (CLI vs non-CLI), not per-channel. Anything listed here is omitted from the tool specs the model sees on every channel except the local CLI.
 
 ## Observability
 
