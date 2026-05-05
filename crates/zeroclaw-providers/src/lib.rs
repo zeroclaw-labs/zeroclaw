@@ -715,6 +715,18 @@ pub struct ProviderRuntimeOptions {
     /// Extra JSON parameters merged into API request bodies at the top level.
     /// Propagated from `ModelProviderConfig::provider_extra`.
     pub provider_extra: Option<serde_json::Value>,
+    /// Azure OpenAI resource name. Populated from
+    /// `AzureModelProviderConfig.resource` when the active provider family is
+    /// `azure`. Required for Azure runtime construction; the factory errors
+    /// loudly if missing instead of falling back to env vars.
+    pub azure_resource: Option<String>,
+    /// Azure OpenAI deployment name. Populated from
+    /// `AzureModelProviderConfig.deployment`. Required.
+    pub azure_deployment: Option<String>,
+    /// Azure OpenAI API version. Populated from
+    /// `AzureModelProviderConfig.api_version`. Optional (provider falls back
+    /// to its own default).
+    pub azure_api_version: Option<String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -732,6 +744,9 @@ impl Default for ProviderRuntimeOptions {
             provider_max_tokens: None,
             merge_system_into_user: false,
             provider_extra: None,
+            azure_resource: None,
+            azure_deployment: None,
+            azure_api_version: None,
         }
     }
 }
@@ -790,6 +805,12 @@ pub fn provider_runtime_options_from_provider_entry(
         provider_max_tokens: entry.and_then(|e| e.max_tokens),
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
+        // Azure-specific fields are populated only by the agent-aware
+        // resolver (`provider_runtime_options_for_agent`), where we have the
+        // typed alias context to look up `AzureModelProviderConfig`.
+        azure_resource: None,
+        azure_deployment: None,
+        azure_api_version: None,
     }
 }
 
@@ -811,7 +832,22 @@ pub fn provider_runtime_options_for_agent(
         );
         config.providers.first_provider()
     });
-    provider_runtime_options_from_provider_entry(config, entry)
+    let mut options = provider_runtime_options_from_provider_entry(config, entry);
+
+    // Family-specific extras: when the agent's resolved provider family is
+    // azure, populate the typed Azure fields onto ProviderRuntimeOptions so
+    // the factory can construct AzureOpenAiProvider without env-var fallback.
+    if let Some(agent) = config.agents.get(agent_alias)
+        && let Some((family, alias)) = agent.model_provider.split_once('.')
+        && family == "azure"
+        && let Some(azure_cfg) = config.providers.models.azure.get(alias)
+    {
+        options.azure_resource = azure_cfg.resource.clone();
+        options.azure_deployment = azure_cfg.deployment.clone();
+        options.azure_api_version = azure_cfg.api_version.clone();
+    }
+
+    options
 }
 
 pub fn provider_runtime_options_from_config(
@@ -1382,16 +1418,31 @@ fn create_provider_with_url_and_options(
             .with_merge_system_into_user(),
         )),
         "azure_openai" | "azure-openai" | "azure" => {
-            let resource = std::env::var("AZURE_OPENAI_RESOURCE")
-                .unwrap_or_else(|_| "my-resource".to_string());
-            let deployment =
-                std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_else(|_| "gpt-4o".to_string());
-            let api_version = std::env::var("AZURE_OPENAI_API_VERSION").ok();
+            // Azure runtime config flows from the typed AzureModelProviderConfig
+            // through ProviderRuntimeOptions. Env-var fallback is GONE — the
+            // operator must set [providers.models.azure.<alias>] resource and
+            // deployment in TOML. Migration normalizes legacy AZURE_OPENAI_*
+            // env-var setups by writing the typed fields into the config.
+            let resource = options.azure_resource.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Azure provider requires `resource` — set \
+                     `[providers.models.azure.<alias>] resource = \"...\"` in config.toml. \
+                     The AZURE_OPENAI_RESOURCE env-var fallback was removed in #6273."
+                )
+            })?;
+            let deployment = options.azure_deployment.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Azure provider requires `deployment` — set \
+                     `[providers.models.azure.<alias>] deployment = \"...\"` in config.toml. \
+                     The AZURE_OPENAI_DEPLOYMENT env-var fallback was removed in #6273."
+                )
+            })?;
+            let api_version = options.azure_api_version.as_deref();
             Ok(Box::new(azure_openai::AzureOpenAiProvider::new(
                 key,
-                &resource,
-                &deployment,
-                api_version.as_deref(),
+                resource,
+                deployment,
+                api_version,
             )))
         }
         "bedrock" | "aws-bedrock" => {
