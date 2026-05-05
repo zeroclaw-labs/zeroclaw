@@ -1018,8 +1018,10 @@ channel_ids = ["aaaa"]
 // ─────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "awaits Phase 8 migration sweep: anthropic-custom synonym kill into canonical anthropic + uri injection"]
-fn anthropic_custom_colon_url_default_provider_splits_into_base_url() {
+fn anthropic_custom_colon_url_default_provider_folds_under_anthropic() {
+    // Phase 8 migration sweep: V2 `anthropic-custom:URL` form folds under
+    // providers.models.anthropic.custom with the URL split out onto the
+    // alias entry's `uri` field.
     let raw = r#"
 default_provider = "anthropic-custom:https://api.z.ai/api/anthropic"
 default_model = "claude-sonnet-4"
@@ -1027,12 +1029,9 @@ api_key = "sk-zai-test"
 "#;
     let cfg =
         migrate_to_current(raw).expect("migration succeeds despite colon-URL default_provider");
-    let entry = cfg
-        .providers
-        .models
-        .find("anthropic-custom", "default")
-        .expect(
-            "V3 outer key must be the dot-free prefix `anthropic-custom`, not the raw colon-URL string",
+    let entry =
+        cfg.providers.models.find("anthropic", "custom").expect(
+            "V2 anthropic-custom synonym must fold under providers.models.anthropic.custom",
         );
     assert_eq!(
         entry.uri.as_deref(),

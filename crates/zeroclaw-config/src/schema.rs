@@ -862,6 +862,8 @@ pub enum QwenEndpoint {
     /// International (alicloud international).
     #[default]
     Intl,
+    /// United States (DashScope US).
+    Us,
     /// Code-specialist endpoint.
     Code,
 }
@@ -871,6 +873,7 @@ impl ModelEndpoint for QwenEndpoint {
         match self {
             Self::Cn => "https://dashscope.aliyuncs.com/compatible-mode/v1",
             Self::Intl => "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            Self::Us => "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
             Self::Code => {
                 "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
             }

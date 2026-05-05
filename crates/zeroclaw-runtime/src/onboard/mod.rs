@@ -925,7 +925,7 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         // Advanced settings (temperature, timeout, base-url override,
         // wire-api, etc.) are gated behind an opt-in. Most users never
         // touch these, and the trait-level defaults are sensible.
-        match offer_advanced_settings(cfg, ui, &picked, &prefix).await? {
+        match offer_advanced_settings(cfg, ui, &prefix).await? {
             Nav::Back => {
                 if flags.provider.is_some() {
                     return Ok(Nav::Back);
@@ -949,7 +949,6 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
 async fn offer_advanced_settings(
     cfg: &mut Config,
     ui: &mut dyn OnboardUi,
-    provider: &str,
     prefix: &str,
 ) -> Result<Nav> {
     ui.heading(2, "Advanced settings");
