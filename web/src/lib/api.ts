@@ -182,6 +182,96 @@ export function getHealth(): Promise<HealthSnapshot> {
 }
 
 // ---------------------------------------------------------------------------
+// Devices — paired ZeroClaw clients (laptops, phones, servers, CLIs)
+// ---------------------------------------------------------------------------
+
+export interface Device {
+  id: string;
+  name: string | null;
+  device_type: string | null;
+  paired_at: string;
+  last_seen: string;
+  ip_address: string | null;
+  hostname?: string | null;
+  os_name?: string | null;
+  os_version?: string | null;
+  agent_version?: string | null;
+}
+
+/// Health-pill thresholds shipped from the backend so the dashboard never
+/// hardcodes them. Sourced from `[nodes].stale_after_secs` /
+/// `[nodes].offline_after_secs` config knobs.
+export interface NodePolicy {
+  stale_after_secs: number;
+  offline_after_secs: number;
+}
+
+export interface DeviceList {
+  devices: Device[];
+  count: number;
+  policy: NodePolicy;
+}
+
+export function getDevices(): Promise<DeviceList> {
+  return apiFetch<DeviceList>('/api/devices');
+}
+
+export function revokeDevice(id: string): Promise<void> {
+  return apiFetch<void>(`/api/devices/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+export function renameDevice(
+  id: string,
+  name: string | null,
+): Promise<{ device_id: string; name: string | null }> {
+  return apiFetch(`/api/devices/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+}
+
+/// Generate a one-time code the user can give the target device to re-pair
+/// after rotating its token. The old token stays valid until the device
+/// re-pairs (no immediate revocation).
+export function rotateDeviceToken(
+  id: string,
+): Promise<{ device_id: string; pairing_code: string }> {
+  return apiFetch(`/api/devices/${encodeURIComponent(id)}/token/rotate`, {
+    method: 'POST',
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Nodes — separate ZeroClaw daemons / external processes registered on /ws/nodes
+// ---------------------------------------------------------------------------
+
+export interface NodeCapability {
+  name: string;
+  description: string;
+  parameters?: unknown;
+}
+
+export interface DaemonNode {
+  node_id: string;
+  capabilities: NodeCapability[];
+  capability_count: number;
+  status: 'online' | 'offline';
+}
+
+export interface NodeList {
+  nodes: DaemonNode[];
+  count: number;
+  policy: NodePolicy;
+}
+
+export function getNodes(): Promise<NodeList> {
+  return apiFetch<NodeList>('/api/nodes');
+}
+
+// ---------------------------------------------------------------------------
 // Config — per-property CRUD (issue #6175). Whole-file getConfig/putConfig
 // removed; the gateway no longer exposes those endpoints.
 // ---------------------------------------------------------------------------

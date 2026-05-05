@@ -14,6 +14,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Metadata about a paired device.
+///
+/// `hostname`, `os_name`, `os_version`, and `agent_version` are best-effort
+/// identifiers captured during pairing (from explicit `X-Hostname` /
+/// `X-OS-Name` / `X-OS-Version` / `X-Agent-Version` headers, with
+/// User-Agent fallback for browsers). They're optional to keep the
+/// pairing flow non-strict — the dashboard renders whatever is present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub id: String,
@@ -22,6 +28,14 @@ pub struct DeviceInfo {
     pub paired_at: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub ip_address: Option<String>,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub os_name: Option<String>,
+    #[serde(default)]
+    pub os_version: Option<String>,
+    #[serde(default)]
+    pub agent_version: Option<String>,
 }
 
 /// Registry of paired devices backed by SQLite.
@@ -48,10 +62,25 @@ impl DeviceRegistry {
         )
         .expect("Failed to create devices table");
 
+        // Additive migration: hostname / os_name / os_version / agent_version.
+        // `IF NOT EXISTS` is not supported on `ALTER TABLE ADD COLUMN` in
+        // older SQLite, so we ignore the "duplicate column" error per column.
+        for column in [
+            "hostname TEXT",
+            "os_name TEXT",
+            "os_version TEXT",
+            "agent_version TEXT",
+        ] {
+            let _ = conn.execute(&format!("ALTER TABLE devices ADD COLUMN {column}"), []);
+        }
+
         // Warm the in-memory cache from DB
         let mut cache = HashMap::new();
         let mut stmt = conn
-            .prepare("SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address FROM devices")
+            .prepare(
+                "SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address, \
+                 hostname, os_name, os_version, agent_version FROM devices",
+            )
             .expect("Failed to prepare device select");
         let rows = stmt
             .query_map([], |row| {
@@ -62,6 +91,10 @@ impl DeviceRegistry {
                 let paired_at_str: String = row.get(4)?;
                 let last_seen_str: String = row.get(5)?;
                 let ip_address: Option<String> = row.get(6)?;
+                let hostname: Option<String> = row.get(7)?;
+                let os_name: Option<String> = row.get(8)?;
+                let os_version: Option<String> = row.get(9)?;
+                let agent_version: Option<String> = row.get(10)?;
                 let paired_at = DateTime::parse_from_rfc3339(&paired_at_str)
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
@@ -77,6 +110,10 @@ impl DeviceRegistry {
                         paired_at,
                         last_seen,
                         ip_address,
+                        hostname,
+                        os_name,
+                        os_version,
+                        agent_version,
                     },
                 ))
             })
@@ -98,7 +135,10 @@ impl DeviceRegistry {
     pub fn register(&self, token_hash: String, info: DeviceInfo) {
         let conn = self.open_db();
         conn.execute(
-            "INSERT OR REPLACE INTO devices (token_hash, id, name, device_type, paired_at, last_seen, ip_address) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO devices (\
+                token_hash, id, name, device_type, paired_at, last_seen, ip_address, \
+                hostname, os_name, os_version, agent_version\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 token_hash,
                 info.id,
@@ -107,6 +147,10 @@ impl DeviceRegistry {
                 info.paired_at.to_rfc3339(),
                 info.last_seen.to_rfc3339(),
                 info.ip_address,
+                info.hostname,
+                info.os_name,
+                info.os_version,
+                info.agent_version,
             ],
         )
         .expect("Failed to insert device");
@@ -116,7 +160,10 @@ impl DeviceRegistry {
     pub fn list(&self) -> Vec<DeviceInfo> {
         let conn = self.open_db();
         let mut stmt = conn
-            .prepare("SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address FROM devices")
+            .prepare(
+                "SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address, \
+                 hostname, os_name, os_version, agent_version FROM devices",
+            )
             .expect("Failed to prepare device select");
         let rows = stmt
             .query_map([], |row| {
@@ -126,6 +173,10 @@ impl DeviceRegistry {
                 let paired_at_str: String = row.get(4)?;
                 let last_seen_str: String = row.get(5)?;
                 let ip_address: Option<String> = row.get(6)?;
+                let hostname: Option<String> = row.get(7)?;
+                let os_name: Option<String> = row.get(8)?;
+                let os_version: Option<String> = row.get(9)?;
+                let agent_version: Option<String> = row.get(10)?;
                 let paired_at = DateTime::parse_from_rfc3339(&paired_at_str)
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
@@ -139,6 +190,10 @@ impl DeviceRegistry {
                     paired_at,
                     last_seen,
                     ip_address,
+                    hostname,
+                    os_name,
+                    os_version,
+                    agent_version,
                 })
             })
             .expect("Failed to query devices");
@@ -161,6 +216,29 @@ impl DeviceRegistry {
                 .map(|(k, _)| k.clone());
             if let Some(key) = key {
                 cache.remove(&key);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Update the human-readable label for a device. Returns `true` if a row
+    /// matched the given device id, `false` otherwise.
+    pub fn rename(&self, device_id: &str, new_name: Option<String>) -> bool {
+        let conn = self.open_db();
+        let updated = conn
+            .execute(
+                "UPDATE devices SET name = ?1 WHERE id = ?2",
+                rusqlite::params![new_name, device_id],
+            )
+            .unwrap_or(0);
+        if updated > 0 {
+            for device in self.cache.lock().values_mut() {
+                if device.id == device_id {
+                    device.name = new_name.clone();
+                    break;
+                }
             }
             true
         } else {
@@ -292,6 +370,10 @@ pub async fn submit_pairing_enhanced(
                         paired_at: Utc::now(),
                         last_seen: Utc::now(),
                         ip_address: Some(client_id),
+                        hostname: body["hostname"].as_str().map(String::from),
+                        os_name: body["os_name"].as_str().map(String::from),
+                        os_version: body["os_version"].as_str().map(String::from),
+                        agent_version: body["agent_version"].as_str().map(String::from),
                     },
                 );
             }
@@ -323,9 +405,14 @@ pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> 
         .unwrap_or_default();
 
     let count = devices.len();
+    let nodes_cfg = state.config.lock().nodes.clone();
     Json(serde_json::json!({
         "devices": devices,
-        "count": count
+        "count": count,
+        "policy": {
+            "stale_after_secs": nodes_cfg.stale_after_secs,
+            "offline_after_secs": nodes_cfg.offline_after_secs,
+        }
     }))
     .into_response()
 }
@@ -350,6 +437,43 @@ pub async fn revoke_device(
         Json(serde_json::json!({
             "message": "Device revoked",
             "device_id": device_id
+        }))
+        .into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "Device not found").into_response()
+    }
+}
+
+/// `PATCH /api/devices/{id}` — update the device's friendly label.
+///
+/// Body: `{"name": "Argenis's Mac"}` (or `{"name": null}` to clear).
+/// Returns 404 if the id is unknown.
+#[derive(Deserialize)]
+pub struct DevicePatchBody {
+    /// Replacement label. Pass `null` to clear back to the inferred default.
+    pub name: Option<String>,
+}
+
+pub async fn patch_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+    Json(body): Json<DevicePatchBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let updated = state
+        .device_registry
+        .as_ref()
+        .map(|r| r.rename(&device_id, body.name.clone()))
+        .unwrap_or(false);
+
+    if updated {
+        Json(serde_json::json!({
+            "device_id": device_id,
+            "name": body.name,
         }))
         .into_response()
     } else {

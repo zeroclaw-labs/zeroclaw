@@ -1131,7 +1131,11 @@ pub async fn run_gateway(
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
         .route("/api/devices", get(api_pairing::list_devices))
-        .route("/api/devices/{id}", delete(api_pairing::revoke_device))
+        .route("/api/nodes", get(nodes::list_nodes))
+        .route(
+            "/api/devices/{id}",
+            delete(api_pairing::revoke_device).patch(api_pairing::patch_device),
+        )
         .route(
             "/api/devices/{id}/token/rotate",
             post(api_pairing::rotate_token),
@@ -1419,6 +1423,48 @@ async fn handle_pair(
     match state.pairing.try_pair(code, &rate_key).await {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
+
+            // Register the new device in the persistent DeviceRegistry so it
+            // shows up in /api/devices (and the dashboard's Nodes page).
+            // Pulls best-effort identification from request headers — the
+            // dashboard can pass `X-Device-Name` / `X-Device-Type` for
+            // explicit values; otherwise we infer from User-Agent.
+            if let Some(ref registry) = state.device_registry {
+                let token_hash = {
+                    use sha2::{Digest, Sha256};
+                    hex::encode(Sha256::digest(token.as_bytes()))
+                };
+                let user_agent = headers
+                    .get(header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let read_header = |name: &str| {
+                    headers
+                        .get(name)
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from)
+                };
+                let device_name = read_header("X-Device-Name");
+                let device_type = read_header("X-Device-Type")
+                    .or_else(|| infer_device_type_from_ua(user_agent));
+                let (ua_os_name, ua_os_version) = infer_os_from_ua(user_agent);
+                registry.register(
+                    token_hash,
+                    api_pairing::DeviceInfo {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: device_name,
+                        device_type,
+                        paired_at: chrono::Utc::now(),
+                        last_seen: chrono::Utc::now(),
+                        ip_address: Some(peer_addr.ip().to_string()),
+                        hostname: read_header("X-Hostname"),
+                        os_name: read_header("X-OS-Name").or(ua_os_name),
+                        os_version: read_header("X-OS-Version").or(ua_os_version),
+                        agent_version: read_header("X-Agent-Version"),
+                    },
+                );
+            }
+
             if let Err(err) =
                 Box::pin(persist_pairing_tokens(state.config.clone(), &state.pairing)).await
             {
@@ -1456,6 +1502,77 @@ async fn handle_pair(
             });
             (StatusCode::TOO_MANY_REQUESTS, Json(err))
         }
+    }
+}
+
+/// Best-effort `(os_name, os_version)` inference from a User-Agent header.
+/// Browsers reliably include OS info in the UA; CLIs typically don't, in
+/// which case both components return `None` and the caller should rely on
+/// explicit `X-OS-Name` / `X-OS-Version` headers.
+fn infer_os_from_ua(ua: &str) -> (Option<String>, Option<String>) {
+    if ua.is_empty() {
+        return (None, None);
+    }
+
+    // macOS: "Macintosh; Intel Mac OS X 10_15_7" → name="macOS", version="10.15.7"
+    if let Some(start) = ua.find("Mac OS X ") {
+        let rest = &ua[start + 9..];
+        let end = rest.find([')', ';']).unwrap_or(rest.len());
+        let version = rest[..end].replace('_', ".");
+        return (Some("macOS".into()), Some(version));
+    }
+    // iOS: "iPhone; CPU iPhone OS 17_5_1 like Mac OS X"
+    if let Some(start) = ua.find("iPhone OS ").or_else(|| ua.find("iPad OS ")) {
+        let rest = &ua[start..];
+        let after_space = rest.find(' ').map(|i| &rest[i + 1..]).unwrap_or(rest);
+        let end = after_space
+            .find(|c: char| !(c.is_ascii_digit() || c == '_'))
+            .unwrap_or(after_space.len());
+        let version = after_space[..end].replace('_', ".");
+        return (Some("iOS".into()), Some(version));
+    }
+    // Android: "Android 14;"
+    if let Some(start) = ua.find("Android ") {
+        let rest = &ua[start + 8..];
+        let end = rest.find([';', ')']).unwrap_or(rest.len());
+        return (Some("Android".into()), Some(rest[..end].trim().into()));
+    }
+    // Windows: "Windows NT 10.0" — map NT 10 → 10/11, NT 6.3 → 8.1, etc.
+    if let Some(start) = ua.find("Windows NT ") {
+        let rest = &ua[start + 11..];
+        let end = rest.find([';', ')']).unwrap_or(rest.len());
+        return (Some("Windows".into()), Some(rest[..end].trim().into()));
+    }
+    // Linux distributions: "Linux x86_64" / "X11; Linux"
+    if ua.contains("Linux") {
+        return (Some("Linux".into()), None);
+    }
+
+    (None, None)
+}
+
+/// Best-effort device type inference from a User-Agent header. Returns
+/// `None` if the UA is empty or unrecognised, which lets callers fall back
+/// to whatever metadata they already have.
+fn infer_device_type_from_ua(ua: &str) -> Option<String> {
+    let ua = ua.to_lowercase();
+    if ua.is_empty() {
+        return None;
+    }
+    if ua.contains("iphone") || ua.contains("ipad") {
+        Some("ios".into())
+    } else if ua.contains("android") {
+        Some("android".into())
+    } else if ua.contains("macintosh") || ua.contains("mac os x") {
+        Some("macos".into())
+    } else if ua.contains("windows") {
+        Some("windows".into())
+    } else if ua.contains("linux") {
+        Some("linux".into())
+    } else if ua.starts_with("zeroclaw/") || ua.starts_with("curl/") {
+        Some("cli".into())
+    } else {
+        Some("browser".into())
     }
 }
 

@@ -1125,10 +1125,26 @@ pub struct NodesConfig {
     /// Optional bearer token for node authentication.
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Seconds without a heartbeat before a node is rendered as `Stale`
+    /// in the dashboard. Default: 300 (5 minutes).
+    #[serde(default = "default_stale_after_secs")]
+    pub stale_after_secs: u64,
+    /// Seconds without a heartbeat before a node is rendered as `Offline`
+    /// in the dashboard. Default: 1800 (30 minutes).
+    #[serde(default = "default_offline_after_secs")]
+    pub offline_after_secs: u64,
 }
 
 fn default_max_nodes() -> usize {
     16
+}
+
+fn default_stale_after_secs() -> u64 {
+    300
+}
+
+fn default_offline_after_secs() -> u64 {
+    1800
 }
 
 impl Default for NodesConfig {
@@ -1137,6 +1153,8 @@ impl Default for NodesConfig {
             enabled: false,
             max_nodes: default_max_nodes(),
             auth_token: None,
+            stale_after_secs: default_stale_after_secs(),
+            offline_after_secs: default_offline_after_secs(),
         }
     }
 }
