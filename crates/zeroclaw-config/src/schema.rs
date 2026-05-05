@@ -1354,6 +1354,489 @@ pub struct HuggingfaceModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── AI21 ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Ai21Endpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for Ai21Endpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.ai21.com/studio/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.ai21"]
+pub struct Ai21ModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Reka ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RekaEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for RekaEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.reka.ai/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.reka"]
+pub struct RekaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── BaseTen ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum BasetenEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for BasetenEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://inference.baseten.co/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.baseten"]
+pub struct BasetenModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── NScale ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NscaleEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for NscaleEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://inference.api.nscale.com/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.nscale"]
+pub struct NscaleModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── AnyScale ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AnyscaleEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for AnyscaleEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.endpoints.anyscale.com/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.anyscale"]
+pub struct AnyscaleModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Nebius ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NebiusEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for NebiusEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.studio.nebius.ai/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.nebius"]
+pub struct NebiusModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Friendli ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FriendliEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for FriendliEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.friendli.ai/serverless/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.friendli"]
+pub struct FriendliModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Stepfun ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum StepfunEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for StepfunEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.stepfun.com/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.stepfun"]
+pub struct StepfunModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── AIHubMix ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AihubmixEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for AihubmixEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://aihubmix.com/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.aihubmix"]
+pub struct AihubmixModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── SiliconFlow ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SiliconflowEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for SiliconflowEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.siliconflow.cn/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.siliconflow"]
+pub struct SiliconflowModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Astrai ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AstraiEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for AstraiEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://as-trai.com/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.astrai"]
+pub struct AstraiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Avian ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AvianEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for AvianEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.avian.io/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.avian"]
+pub struct AvianModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── DeepMyst ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DeepmystEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for DeepmystEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.deepmyst.com/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.deepmyst"]
+pub struct DeepmystModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Venice ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum VeniceEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for VeniceEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.venice.ai"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.venice"]
+pub struct VeniceModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Novita ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NovitaEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for NovitaEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.novita.ai/openai"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.novita"]
+pub struct NovitaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── NVIDIA ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NvidiaEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for NvidiaEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://integrate.api.nvidia.com/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.nvidia"]
+pub struct NvidiaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Telnyx ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TelnyxEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for TelnyxEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.telnyx.com/v2"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.telnyx"]
+pub struct TelnyxModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Vercel AI Gateway ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum VercelEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for VercelEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://ai-gateway.vercel.sh/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.vercel"]
+pub struct VercelModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Cloudflare AI Gateway ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CloudflareEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for CloudflareEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://gateway.ai.cloudflare.com/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.cloudflare"]
+pub struct CloudflareModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── OVH ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OvhEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for OvhEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.ovh"]
+pub struct OvhModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── GitHub Copilot ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CopilotEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for CopilotEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.githubcopilot.com"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.copilot"]
+pub struct CopilotModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── Bedrock (computed-endpoint exemplar, AWS region template) ──
 
 /// AWS Bedrock endpoint template. Single variant; the URL is computed at
@@ -12350,6 +12833,27 @@ impl_enum_prop_kind!(
     HyperbolicEndpoint,
     DeepinfraEndpoint,
     HuggingfaceEndpoint,
+    Ai21Endpoint,
+    RekaEndpoint,
+    BasetenEndpoint,
+    NscaleEndpoint,
+    AnyscaleEndpoint,
+    NebiusEndpoint,
+    FriendliEndpoint,
+    StepfunEndpoint,
+    AihubmixEndpoint,
+    SiliconflowEndpoint,
+    AstraiEndpoint,
+    AvianEndpoint,
+    DeepmystEndpoint,
+    VeniceEndpoint,
+    NovitaEndpoint,
+    NvidiaEndpoint,
+    TelnyxEndpoint,
+    VercelEndpoint,
+    CloudflareEndpoint,
+    OvhEndpoint,
+    CopilotEndpoint,
 );
 
 impl HasPropKind for serde_json::Value {
