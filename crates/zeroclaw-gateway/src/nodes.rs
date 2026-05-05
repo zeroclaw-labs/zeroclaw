@@ -152,10 +152,7 @@ impl NodeRegistry {
 /// Distinct from `/api/devices` (paired clients of *this* daemon). A node is
 /// a separate process — typically another ZeroClaw daemon, or a peripheral
 /// device that opted in to advertise tools.
-pub async fn list_nodes(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn list_nodes(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = super::api::require_auth(&state, &headers) {
         return e.into_response();
     }

@@ -1445,8 +1445,8 @@ async fn handle_pair(
                         .map(String::from)
                 };
                 let device_name = read_header("X-Device-Name");
-                let device_type = read_header("X-Device-Type")
-                    .or_else(|| infer_device_type_from_ua(user_agent));
+                let device_type =
+                    read_header("X-Device-Type").or_else(|| infer_device_type_from_ua(user_agent));
                 let (ua_os_name, ua_os_version) = infer_os_from_ua(user_agent);
                 registry.register(
                     token_hash,
