@@ -9,8 +9,8 @@
 (function () {
   const LOCALES = [
     { code: "en", label: "English" },
-    { code: "fr", label: "Français" },
     { code: "ja", label: "日本語" },
+    { code: "fr", label: "Français" },
     { code: "es", label: "Español" },
     { code: "zh-CN", label: "中文" },
   ];
