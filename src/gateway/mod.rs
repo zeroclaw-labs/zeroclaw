@@ -23,6 +23,7 @@ pub mod remote;
 pub mod sse;
 pub mod static_files;
 pub mod timesync;
+pub mod voice_api;
 pub mod ws;
 
 use crate::billing::PaymentManager;
@@ -1708,6 +1709,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             Router::new()
                 .route("/proxy", post(llm_proxy::handle_llm_proxy))
                 .layer(RequestBodyLimitLayer::new(CHAT_MAX_BODY_SIZE)),
+        )
+        // ── Voice chat HTTP endpoints (Rust-native replacements for
+        //    pieces of the LiveKit-based voice path; not yet wired
+        //    to a UI, see `gateway/voice_api.rs` for context) ──
+        // Voice transcribe accepts base64 PCM16 audio inline; needs
+        // the chat-size body limit so a 30-second utterance fits.
+        .nest(
+            "/api/voice",
+            Router::new()
+                .route("/transcribe", post(voice_api::handle_voice_transcribe))
+                .layer(RequestBodyLimitLayer::new(CHAT_MAX_BODY_SIZE)),
+        )
+        .route(
+            "/api/billing/voice-usage",
+            post(voice_api::handle_voice_usage),
         )
         // ── Document processing ──
         .route(
