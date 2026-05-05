@@ -7067,14 +7067,13 @@ pub struct TelegramConfig {
     pub approval_timeout_secs: u64,
     /// Minimum wall-clock interval (seconds) between consecutive outbound
     /// agent replies on this channel. `0` (default) preserves the current
-    /// behaviour where replies fire as soon as the LLM completes.
-    /// See #6345 for the threat model (paired-identity channels under
-    /// personal accounts where instant replies are an AI tell and a
-    /// platform-anomaly signal). The intended range is `0..=3600`.
+    /// behaviour where replies fire as soon as the LLM completes. The
+    /// intended range is `0..=3600`.
     ///
-    /// This commit only adds the schema field; load-time validation
-    /// and the runtime scheduler that honors the interval land in
-    /// follow-up commits on the same branch / issue.
+    /// On paired-identity channels under personal accounts, sub-second
+    /// replies are a strong AI-tell and a platform-side anomaly signal;
+    /// raising this value paces the agent so its cadence resembles a
+    /// human operator's.
     #[serde(default)]
     pub reply_min_interval_secs: u64,
 }
