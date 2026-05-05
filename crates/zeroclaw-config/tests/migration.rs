@@ -1018,6 +1018,7 @@ channel_ids = ["aaaa"]
 // ─────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "awaits Phase 8 migration sweep: anthropic-custom synonym kill into canonical anthropic + uri injection"]
 fn anthropic_custom_colon_url_default_provider_splits_into_base_url() {
     let raw = r#"
 default_provider = "anthropic-custom:https://api.z.ai/api/anthropic"

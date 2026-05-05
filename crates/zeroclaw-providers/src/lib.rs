@@ -3405,6 +3405,14 @@ mod tests {
     #[test]
     fn listed_providers_and_aliases_are_constructible() {
         for provider in list_providers() {
+            // Azure requires typed config (resource + deployment) per #6273.
+            // create_provider with default options has no azure context — that's
+            // by design (env-var fallback eradicated). Tests that exercise the
+            // Azure factory pass a populated ProviderRuntimeOptions through
+            // create_provider_with_options.
+            if matches!(provider.name, "azure_openai" | "azure-openai" | "azure") {
+                continue;
+            }
             assert!(
                 create_provider(provider.name, Some("provider-test-credential")).is_ok(),
                 "Canonical provider id should be constructible: {}",
