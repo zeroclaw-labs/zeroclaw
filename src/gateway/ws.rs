@@ -2561,6 +2561,302 @@ async fn handle_stt_socket(mut socket: WebSocket, state: AppState) {
     dg_session.close().await;
 }
 
+// ── Voice chat WebSocket (Rust-native, replaces LiveKit) ─────────
+
+/// `GET /ws/voice_chat` — WebSocket upgrade for the Rust-native
+/// voice-chat path. This is the new transport for the voice-chat
+/// feature that previously ran through LiveKit + Python agents.
+///
+/// Protocol: see `voice/events_chat.rs::ChatClientMessage` /
+/// `ChatServerMessage`. Both directions are JSON text frames.
+pub async fn handle_ws_voice_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let query_params = parse_ws_query_params(query.as_deref());
+
+    // Auth via Authorization header or websocket protocol token —
+    // same pattern as /ws/voice (interpretation).
+    if state.pairing.require_pairing() {
+        let token =
+            extract_ws_bearer_token(&headers, query_params.token.as_deref()).unwrap_or_default();
+        if !state.pairing.is_authenticated(&token) {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Unauthorized — provide Authorization: Bearer <token>",
+            )
+                .into_response();
+        }
+    }
+
+    ws.on_upgrade(move |socket| handle_voice_chat_socket(socket, state))
+        .into_response()
+}
+
+async fn handle_voice_chat_socket(mut socket: WebSocket, state: AppState) {
+    use crate::voice::events_chat::{ChatClientMessage, ChatServerMessage};
+    use crate::voice::voice_chat_session::{
+        TypecastTtsConfig, VoiceChatSession, VoiceChatSessionConfig,
+    };
+
+    // Wait for the SessionStart message before doing anything
+    // expensive. The client must speak first to declare intent
+    // (matches the interpretation handler's flow).
+    let active_session: Option<VoiceChatSession> = None;
+    let mut active_session = active_session;
+    let mut relay_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+    while let Some(msg) = socket.recv().await {
+        let text = match msg {
+            Ok(Message::Text(t)) => t,
+            Ok(Message::Close(_)) | Err(_) => break,
+            _ => continue,
+        };
+
+        let client_msg: ChatClientMessage = match serde_json::from_str(&text) {
+            Ok(m) => m,
+            Err(e) => {
+                let err = ChatServerMessage::Error {
+                    session_id: String::new(),
+                    code: "INVALID_MESSAGE".into(),
+                    message: format!("Invalid message: {e}"),
+                };
+                let _ = socket
+                    .send(Message::Text(
+                        serde_json::to_string(&err).unwrap_or_default().into(),
+                    ))
+                    .await;
+                continue;
+            }
+        };
+
+        match &client_msg {
+            ChatClientMessage::SessionStart {
+                session_id,
+                source_lang,
+                provider: _,
+                model: _,
+                voice_clone_id,
+                ..
+            } => {
+                // Stop any pre-existing session on this socket.
+                if let Some(s) = active_session.take() {
+                    s.stop().await;
+                }
+                if let Some(h) = relay_handle.take() {
+                    h.abort();
+                }
+
+                // Resolve the LLM provider per the operator-key
+                // fallback contract (mirrors text chat / interpretation).
+                // For Rust-native voice chat the LLM step uses the
+                // same provider stack the agent loop already uses.
+                let voice_config = {
+                    let cfg = state.config.lock();
+                    cfg.voice.clone()
+                };
+                let gemini_api_key = voice_config
+                    .gemini_api_key
+                    .clone()
+                    .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+                    .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
+                    .unwrap_or_default();
+                if gemini_api_key.is_empty() {
+                    let err = ChatServerMessage::Error {
+                        session_id: session_id.clone(),
+                        code: "NO_API_KEY".into(),
+                        message: "Voice chat requires a Gemini API key. \
+                                  Please set it in Settings."
+                            .into(),
+                    };
+                    let _ = socket
+                        .send(Message::Text(
+                            serde_json::to_string(&err).unwrap_or_default().into(),
+                        ))
+                        .await;
+                    continue;
+                }
+                let llm_provider = match crate::providers::create_provider_with_url(
+                    "gemini",
+                    Some(&gemini_api_key),
+                    None,
+                ) {
+                    Ok(p) => std::sync::Arc::from(p),
+                    Err(e) => {
+                        let err = ChatServerMessage::Error {
+                            session_id: session_id.clone(),
+                            code: "PROVIDER_INIT_FAILED".into(),
+                            message: format!("Failed to construct LLM provider: {e}"),
+                        };
+                        let _ = socket
+                            .send(Message::Text(
+                                serde_json::to_string(&err).unwrap_or_default().into(),
+                            ))
+                            .await;
+                        continue;
+                    }
+                };
+
+                // Optional Typecast TTS — when no key configured we
+                // fall through to the local TTS router.
+                let typecast_api_key = std::env::var("TYPECAST_API_KEY").unwrap_or_default();
+                let typecast = if typecast_api_key.is_empty() {
+                    None
+                } else {
+                    Some(TypecastTtsConfig {
+                        api_key: typecast_api_key,
+                        voice_clone_id: voice_clone_id.clone(),
+                        // The fallback voice is Phase 1 / interp-only
+                        // logic; for voice chat we leave it unset and
+                        // let the local TTS router cover the no-clone
+                        // case — preserves the offline guarantee.
+                        fallback_voice_id: None,
+                    })
+                };
+
+                // Resolve Gemma endpoint + model for ASR.
+                let (gemma_base_url, gemma_model) = resolve_gemma_asr_endpoint().await;
+
+                // Self-validation pipeline (graceful degradation).
+                let validator = build_voice_chat_validator(
+                    &gemma_base_url,
+                    &gemma_model,
+                    &gemini_api_key,
+                );
+
+                // Source language hint — falls back to None (English).
+                let lang = source_lang
+                    .as_deref()
+                    .and_then(crate::voice::pipeline::LanguageCode::from_str_code);
+
+                // Local TTS router from app state — None for now,
+                // PR-F will populate this from the Kokoro/CosyVoice
+                // setup the rest of the gateway already wires.
+                let local_tts: Option<std::sync::Arc<crate::voice::tts_router::TtsRouter>> = None;
+
+                let cfg = VoiceChatSessionConfig {
+                    session_id: session_id.clone(),
+                    gemma_base_url,
+                    gemma_model,
+                    source_lang: lang,
+                    llm: llm_provider,
+                    llm_model: "gemini-3.1-flash-lite-preview".to_string(),
+                    typecast,
+                    local_tts,
+                };
+
+                let session = match VoiceChatSession::start(cfg, validator).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let err = ChatServerMessage::Error {
+                            session_id: session_id.clone(),
+                            code: "SESSION_START_FAILED".into(),
+                            message: format!("Failed to start voice-chat session: {e}"),
+                        };
+                        let _ = socket
+                            .send(Message::Text(
+                                serde_json::to_string(&err).unwrap_or_default().into(),
+                            ))
+                            .await;
+                        continue;
+                    }
+                };
+
+                let event_rx = session.event_rx.clone();
+                let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel::<String>(256);
+                let relay = tokio::spawn(async move {
+                    let mut rx = event_rx.lock().await;
+                    while let Some(event) = rx.recv().await {
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            if ws_tx.send(json).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+                relay_handle = Some(relay);
+                active_session = Some(session);
+
+                voice_chat_session_loop(&mut socket, active_session.as_ref().unwrap(), &mut ws_rx)
+                    .await;
+
+                if let Some(s) = active_session.take() {
+                    s.stop().await;
+                }
+                if let Some(h) = relay_handle.take() {
+                    h.abort();
+                }
+                return;
+            }
+            _ => {
+                // Any other message before SessionStart is a
+                // protocol error — return a clear message and keep
+                // the socket open in case the client recovers.
+                let err = ChatServerMessage::Error {
+                    session_id: String::new(),
+                    code: "EXPECTED_SESSION_START".into(),
+                    message: "First message must be `chat_session_start`.".into(),
+                };
+                let _ = socket
+                    .send(Message::Text(
+                        serde_json::to_string(&err).unwrap_or_default().into(),
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    if let Some(s) = active_session.take() {
+        s.stop().await;
+    }
+    if let Some(h) = relay_handle.take() {
+        h.abort();
+    }
+}
+
+/// Voice-chat session main loop: forwards client messages into the
+/// session and pumps server messages back to the WebSocket. Mirrors
+/// the interpretation handler's `voice_session_loop_unified`.
+async fn voice_chat_session_loop(
+    socket: &mut WebSocket,
+    session: &crate::voice::voice_chat_session::VoiceChatSession,
+    ws_rx: &mut tokio::sync::mpsc::Receiver<String>,
+) {
+    use crate::voice::events_chat::ChatClientMessage;
+
+    loop {
+        tokio::select! {
+            // Server-side events → WebSocket
+            json = ws_rx.recv() => {
+                let Some(json) = json else { break };
+                if socket.send(Message::Text(json.into())).await.is_err() {
+                    break;
+                }
+            }
+            // Client messages → session
+            msg = socket.recv() => {
+                let Some(msg) = msg else { break };
+                let text = match msg {
+                    Ok(Message::Text(t)) => t,
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => continue,
+                };
+                let parsed: ChatClientMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if matches!(parsed, ChatClientMessage::SessionStop { .. }) {
+                    let _ = session.send_client_message(parsed).await;
+                    break;
+                }
+                let _ = session.send_client_message(parsed).await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

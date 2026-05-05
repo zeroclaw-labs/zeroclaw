@@ -402,6 +402,20 @@ pub async fn select_fallback_voice_id(
 
 // ── TTS call ──────────────────────────────────────────────────────
 
+/// Public wrapper around `typecast_tts_synthesize` so the new
+/// Rust-native voice-chat session (`voice/voice_chat_session.rs`)
+/// can call Typecast through the same code path without
+/// duplicating the request shape.
+pub async fn call_typecast_tts_synthesize(
+    api_key: &str,
+    voice_id: &str,
+    text: &str,
+    language: &str,
+    voice_clone_id: Option<&str>,
+) -> anyhow::Result<Vec<u8>> {
+    typecast_tts_synthesize(api_key, voice_id, text, language, voice_clone_id).await
+}
+
 /// Call Typecast TTS API and return raw PCM16 audio bytes (44.1kHz mono).
 /// Strips the 44-byte WAV header.
 async fn typecast_tts_synthesize(

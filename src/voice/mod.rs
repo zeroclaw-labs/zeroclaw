@@ -24,6 +24,7 @@ pub mod conference;
 pub mod cosyvoice2;
 pub mod deepgram_stt;
 pub mod events;
+pub mod events_chat;
 pub mod gemini_live;
 pub mod gemma_asr;
 pub mod kokoro_tts;
@@ -36,6 +37,7 @@ pub mod tts_engine;
 pub mod tts_router;
 pub mod typecast_interp;
 pub mod voice_chat_pipeline;
+pub mod voice_chat_session;
 pub mod voice_messages;
 
 // ── Shared voice event type ──────────────────────────────────────

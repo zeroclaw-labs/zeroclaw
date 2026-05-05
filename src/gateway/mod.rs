@@ -1126,8 +1126,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  GET  /api/*     — REST API (bearer token required)");
     println!("  GET  /ws/chat   — WebSocket agent chat");
     if config.voice.enabled {
-        println!("  GET  /ws/voice  — WebSocket simultaneous interpretation (Gemini/Deepgram)");
-        println!("  GET  /ws/stt    — WebSocket Deepgram STT (chat voice input)");
+        println!("  GET  /ws/voice       — WebSocket simultaneous interpretation (Gemini/Typecast)");
+        println!("  GET  /ws/stt         — WebSocket Deepgram STT (chat voice input — legacy)");
+        println!("  GET  /ws/voice_chat  — WebSocket voice chat (Rust-native, Gemma + LLM + TTS)");
     }
     if config.auth.enabled {
         println!(
@@ -1754,8 +1755,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── WebSocket voice interpretation ──
         .route("/ws/voice", get(ws::handle_ws_voice))
-        // ── WebSocket Deepgram STT (chat voice input) ──
+        // ── WebSocket Deepgram STT (chat voice input — legacy) ──
         .route("/ws/stt", get(ws::handle_ws_stt))
+        // ── WebSocket voice chat (Rust-native; replaces LiveKit) ──
+        .route("/ws/voice_chat", get(ws::handle_ws_voice_chat))
         // ── User auth API (Tauri/web client) ──
         .route("/api/auth/register", post(auth_api::handle_auth_register))
         .route("/api/auth/login", post(auth_api::handle_auth_login))

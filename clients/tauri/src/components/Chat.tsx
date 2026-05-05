@@ -14,7 +14,10 @@ import {
 } from "../lib/chat-attachments";
 import { apiClient } from "../lib/api";
 import VoicePicker, { loadSelectedVoice } from "./VoicePicker";
-import { LiveKitVoiceChat } from "./LiveKitVoiceChat";
+// LiveKit-based voice chat replaced by the Rust-native WebSocket
+// path in 2026-05 (PR-E). The new component reuses the same DOM
+// class names so existing CSS continues to apply.
+import { VoiceChat } from "./VoiceChat";
 import { isTauri } from "../lib/tauri-bridge";
 
 // ---------------------------------------------------------------------------
@@ -976,7 +979,7 @@ export function Chat({
             zIndex: 1000,
             overflow: "auto",
           }}>
-            <LiveKitVoiceChat
+            <VoiceChat
               locale={locale}
               onClose={() => setShowLiveKitChat(false)}
               initialMode={voiceChatMode}
