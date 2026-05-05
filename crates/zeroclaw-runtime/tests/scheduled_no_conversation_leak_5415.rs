@@ -136,8 +136,7 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     //   )
     // `interactive=false` + `session_state_file=None` is exactly the heartbeat
     // shape that bypasses session scoping inside `build_context`.
-    let prompt =
-        "Any reminders to surface today? Pull anything relevant from memory.".to_string();
+    let prompt = "Any reminders to surface today? Pull anything relevant from memory.".to_string();
     let run_result = zeroclaw_runtime::agent::run(
         config,
         Some(prompt),

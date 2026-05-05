@@ -370,9 +370,7 @@ async fn build_context(
                 // own autosaves but miss Conversation entries written by
                 // channel handlers (Discord, gateway, WhatsApp, …) under
                 // their own keys. See #5415 / #5456.
-                if exclude_conversation
-                    && matches!(entry.category, MemoryCategory::Conversation)
-                {
+                if exclude_conversation && matches!(entry.category, MemoryCategory::Conversation) {
                     continue;
                 }
                 if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
