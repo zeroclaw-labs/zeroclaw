@@ -7065,6 +7065,17 @@ pub struct TelegramConfig {
     /// button on a tool approval prompt before auto-denying. Default: 120.
     #[serde(default = "default_telegram_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// Minimum wall-clock interval (seconds) between consecutive outbound
+    /// agent replies on this channel. `0` (default) preserves the current
+    /// behaviour where replies fire as soon as the LLM completes.
+    /// Range: `0..=3600`. See #6345 for the threat model (paired-identity
+    /// channels under personal accounts where instant replies are an AI
+    /// tell and a platform-anomaly signal). Validation is enforced at
+    /// load time; the runtime scheduler is keyed per
+    /// `(channel, peer-jid)` to serialise multiple in-flight replies to
+    /// the same peer.
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
 }
 
 impl ChannelConfig for TelegramConfig {
