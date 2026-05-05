@@ -46,19 +46,65 @@ fn has_serde_skip(field: &syn::Field) -> bool {
 ///
 /// # Generated methods
 ///
-/// ## Secret methods (unchanged)
+/// ## Secret methods
 /// - `secret_fields(&self) -> Vec<SecretFieldInfo>`
 /// - `set_secret(&mut self, name: &str, value: String) -> Result<()>`
 /// - `encrypt_secrets(&mut self, store: &SecretStore) -> Result<()>`
 /// - `decrypt_secrets(&mut self, store: &SecretStore) -> Result<()>`
 ///
-/// ## Property methods (new)
+/// ## Property methods
 /// - `prop_fields(&self) -> Vec<PropFieldInfo>` — enumerate all fields
 /// - `get_prop(&self, name: &str) -> Result<String>` — get current value as string
 /// - `set_prop(&mut self, name: &str, value_str: &str) -> Result<()>` — parse string and set
 /// - `prop_is_secret(name: &str) -> bool` — static check
 /// - `init_defaults(&mut self, prefix: Option<&str>) -> Vec<&'static str>` — instantiate None nested sections
-#[proc_macro_derive(Configurable, attributes(secret, nested, prefix, serde))]
+///
+/// # Adding a new config struct
+///
+/// 1. Derive `Configurable` and `Default`, set `#[prefix]`, add `enabled` if the
+///    section is opt-in:
+///
+/// ```ignore
+/// use zeroclaw_macros::Configurable;
+///
+/// #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+/// #[prefix = "channels.your-channel"]
+/// pub struct YourChannelConfig {
+///     #[serde(default)]
+///     pub enabled: bool,
+///     #[secret]
+///     pub bot_token: String,
+///     #[secret]
+///     pub webhook_secret: Option<String>,
+///     pub room_id: String,
+/// }
+/// ```
+///
+/// 2. If the struct nests inside a parent (e.g. `ChannelsConfig`), add `#[nested]`
+///    on the parent's field so the tree traversal finds it.
+///
+/// 3. Field names convert from `snake_case` to `kebab-case` for CLI use.
+///    `bot_token` on a struct with `#[prefix = "channels.your-channel"]`
+///    becomes `channels.your-channel.bot-token`.
+///
+/// ## Enum fields
+///
+/// Enum types used as fields must implement `HasPropKind`. Add the type to the
+/// `impl_enum_prop_kind!` block in `crates/zeroclaw-config/src/schema.rs`, or
+/// implement `HasPropKind` at the enum's definition site:
+///
+/// ```ignore
+/// impl crate::config::HasPropKind for YourEnum {
+///     const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
+/// }
+/// ```
+///
+/// Live examples: see `ChannelsConfig`, `ProvidersConfig`, and `MemoryConfig`
+/// in `crates/zeroclaw-config/src/schema.rs`.
+#[proc_macro_derive(
+    Configurable,
+    attributes(secret, nested, prefix, serde, derived_from_secret)
+)]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_name = &input.ident;
@@ -107,11 +153,23 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let mut nested_prop_is_secret = Vec::new();
     let mut init_defaults_ops = Vec::new();
 
+    // ── Map-key (HashMap<String, T>) and List (Vec<T:Configurable>) section
+    //    accumulators. Both surface a "+ Add entry" affordance in the
+    //    dashboard / CLI; both are auto-discovered from #[nested] fields
+    //    whose type is a container. The dispatch table at the gateway
+    //    `handle_map_key` walks `Config::map_key_sections()` and matches
+    //    on the path string — no hand-maintained list anywhere.
+    let mut map_key_section_entries: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut create_map_key_arms: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut create_map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+
     for field in fields {
         let field_ident = field.ident.as_ref().expect("Named field must have ident");
         let is_secret = has_attr(field, "secret");
         let is_nested = has_attr(field, "nested");
         let serde_skip = has_serde_skip(field);
+        let derived_from_secret = has_attr(field, "derived_from_secret");
 
         // ── Secret handling ──
         if is_secret {
@@ -240,8 +298,134 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         inner.decrypt_secrets(store)?;
                     }
                 });
+                // Path routing through HashMap<String, T>: the one parser
+                // lives in `crate::config::route_hashmap_path` so get/set
+                // don't duplicate it. Paths look like
+                // `<my_prefix>.<field>.<key>.<inner_suffix>`; keys may contain
+                // dots/URLs, so the shared parser preserves the runtime key and
+                // splits on the final field separator. On a hit the dispatch is
+                // forwarded to the value type's own get_prop / set_prop via its
+                // `configurable_prefix()`.
+                let field_name_lit = snake_to_kebab(&field_ident.to_string());
                 nested_prop_is_secret.push(quote! {
-                    if <#value_ty>::prop_is_secret(name) { return true; }
+                    if let Some((_hm_key, inner_name)) = crate::config::route_hashmap_path(
+                        name,
+                        Self::configurable_prefix(),
+                        #field_name_lit,
+                        <#value_ty>::configurable_prefix(),
+                    ) && <#value_ty>::prop_is_secret(&inner_name)
+                    {
+                        return true;
+                    }
+                });
+                nested_get_prop.push(quote! {
+                    if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
+                        name,
+                        Self::configurable_prefix(),
+                        #field_name_lit,
+                        <#value_ty>::configurable_prefix(),
+                    ) && let Some(inner) = self.#field_ident.get(hm_key)
+                        && let Ok(val) = inner.get_prop(&inner_name)
+                    {
+                        return Ok(val);
+                    }
+                });
+                nested_set_prop.push(quote! {
+                    if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
+                        name,
+                        Self::configurable_prefix(),
+                        #field_name_lit,
+                        <#value_ty>::configurable_prefix(),
+                    ) && let Some(inner) = self.#field_ident.get_mut(hm_key)
+                        && let Ok(()) = inner.set_prop(&inner_name, value_str)
+                    {
+                        return Ok(());
+                    }
+                });
+
+                // Enumerate every HashMap entry and inject its runtime key
+                // into the child's static field paths: a child field named
+                // `<inner_prefix>.api-key` becomes
+                // `<my_prefix>.<field>.<hm_key>.api-key`. Without this, prop_fields()
+                // never surfaces e.g. `providers.models.anthropic.api-key`,
+                // so onboard has no way to prompt for it.
+                nested_prop_fields.push(quote! {
+                    {
+                        let inner_prefix = <#value_ty>::configurable_prefix();
+                        let outer_prefix = if Self::configurable_prefix().is_empty() {
+                            #field_name_lit.to_string()
+                        } else {
+                            format!("{}.{}", Self::configurable_prefix(), #field_name_lit)
+                        };
+                        for (hm_key, inner) in &self.#field_ident {
+                            let base = format!("{outer_prefix}.{hm_key}");
+                            for mut field in inner.prop_fields() {
+                                let leaf = field
+                                    .name
+                                    .strip_prefix(inner_prefix)
+                                    .and_then(|s| s.strip_prefix('.'))
+                                    .unwrap_or(field.name.as_str())
+                                    .to_string();
+                                field.name = if leaf.is_empty() {
+                                    base.clone()
+                                } else {
+                                    format!("{base}.{leaf}")
+                                };
+                                fields.push(field);
+                            }
+                        }
+                    }
+                });
+
+                // ── Map-key section emission (HashMap<String, T>) ──
+                // The dashboard / CLI consume `Self::map_key_sections()` to
+                // surface "+ Add" affordances; `create_map_key()` is the
+                // typed insertion. Both auto-derived — no hand-table.
+                let value_ty_name = value_ty.to_token_stream().to_string();
+                let field_doc = extract_doc(&field.attrs);
+                map_key_section_entries.push(quote! {
+                    out.push(crate::config::MapKeySection {
+                        // Path is computed at static-init time via the
+                        // configurable_prefix const + field name literal.
+                        path: {
+                            // SAFETY: leak-once for static lifetime; runs
+                            // exactly per (Type, field) pair, bounded by the
+                            // schema's field count.
+                            let prefix = Self::configurable_prefix();
+                            let s = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            Box::leak(s.into_boxed_str())
+                        },
+                        kind: crate::config::MapKeyKind::Map,
+                        value_type: #value_ty_name,
+                        description: #field_doc,
+                    });
+                });
+                create_map_key_arms.push(quote! {
+                    {
+                        let prefix = Self::configurable_prefix();
+                        let expected = if prefix.is_empty() {
+                            #field_name_lit.to_string()
+                        } else {
+                            format!("{prefix}.{}", #field_name_lit)
+                        };
+                        if section_path == expected {
+                            if self.#field_ident.contains_key(map_key) {
+                                return Ok(false);
+                            }
+                            let value: #value_ty = serde_json::from_value(
+                                serde_json::json!({}),
+                            ).map_err(|e| format!(
+                                "default-construct {} failed: {e}",
+                                stringify!(#value_ty)
+                            ))?;
+                            self.#field_ident.insert(map_key.to_string(), value);
+                            return Ok(true);
+                        }
+                    }
                 });
 
                 continue;
@@ -322,7 +506,82 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             return true;
                         }
                     });
+
+                    // Recurse: pull the inner type's map_key_sections + create_map_key.
+                    map_key_recurse.push(quote! {
+                        out.extend(<#inner_ty_tokens>::map_key_sections());
+                    });
+                    create_map_key_recurse.push(quote! {
+                        if let Some(inner) = &mut self.#field_ident {
+                            match inner.create_map_key(section_path, map_key) {
+                                Ok(created) => return Ok(created),
+                                Err(_) => {} // not handled by this branch; try next
+                            }
+                        }
+                    });
                 }
+            } else if let Some(vec_inner_ty) = extract_vec_inner(&field.ty) {
+                // ── Nested Vec<T> ──
+                // Vec doesn't implement Configurable, so we cannot delegate
+                // get_prop / set_prop / secret_fields / prop_fields /
+                // init_defaults to the field directly. The list-section
+                // emission below handles `+ Add` and per-entry creation;
+                // per-prop access to elements happens through the schema's
+                // natural-key routing once entries are inserted.
+                //
+                // Intentionally NO push to nested_collect / nested_set /
+                // nested_encrypt / nested_decrypt / nested_prop_fields /
+                // nested_get_prop / nested_set_prop / nested_prop_is_secret
+                // / init_defaults_ops / map_key_recurse / create_map_key_recurse
+                // for Vec<T> + #[nested] — all those call methods Vec doesn't
+                // have.
+                let vec_inner_name = vec_inner_ty.to_token_stream().to_string();
+                let field_doc = extract_doc(&field.attrs);
+                let vec_field_name_lit = snake_to_kebab(&field_ident.to_string());
+                map_key_section_entries.push(quote! {
+                    out.push(crate::config::MapKeySection {
+                        path: {
+                            let prefix = Self::configurable_prefix();
+                            let s = if prefix.is_empty() {
+                                #vec_field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #vec_field_name_lit)
+                            };
+                            Box::leak(s.into_boxed_str())
+                        },
+                        kind: crate::config::MapKeyKind::List,
+                        value_type: #vec_inner_name,
+                        description: #field_doc,
+                    });
+                });
+                create_map_key_arms.push(quote! {
+                    {
+                        let prefix = Self::configurable_prefix();
+                        let expected = if prefix.is_empty() {
+                            #vec_field_name_lit.to_string()
+                        } else {
+                            format!("{prefix}.{}", #vec_field_name_lit)
+                        };
+                        if section_path == expected {
+                            let value: #vec_inner_ty = serde_json::from_value(
+                                serde_json::json!({}),
+                            ).map_err(|e| format!(
+                                "default-construct {} failed: {e}",
+                                stringify!(#vec_inner_ty)
+                            ))?;
+                            self.#field_ident.push(value);
+                            let new_idx = self.#field_ident.len() - 1;
+                            let inner_prefix = <#vec_inner_ty>::configurable_prefix();
+                            let _ = self.#field_ident[new_idx].set_prop(
+                                &format!("{inner_prefix}.name"), map_key,
+                            );
+                            let _ = self.#field_ident[new_idx].set_prop(
+                                &format!("{inner_prefix}.hint"), map_key,
+                            );
+                            return Ok(true);
+                        }
+                    }
+                });
             } else {
                 nested_collect.push(quote! {
                     fields.extend(self.#field_ident.secret_fields());
@@ -366,6 +625,25 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 init_defaults_ops.push(quote! {
                     initialized.extend(self.#field_ident.init_defaults(prefix));
                 });
+
+                // Recurse into the nested type's map_key_sections AND
+                // create_map_key for non-Option nested fields. This is how
+                // the root Config picks up `providers.models` (declared on
+                // ProvidersConfig, not on Config).
+                let field_ty = &field.ty;
+                map_key_recurse.push(quote! {
+                    out.extend(<#field_ty>::map_key_sections());
+                });
+                create_map_key_recurse.push(quote! {
+                    if let Ok(created) = self.#field_ident.create_map_key(section_path, map_key) {
+                        return Ok(created);
+                    }
+                });
+
+                // Vec<T> handling moved to its own `else if extract_vec_inner`
+                // branch above so the per-prop method dispatch (set_prop,
+                // get_prop, secret_fields, …) is skipped — Vec<T> doesn't
+                // implement those methods.
             }
 
             continue; // nested fields handled above
@@ -380,11 +658,18 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let is_option = is_option_type(&field.ty);
         let inner_ty = extract_option_inner(&field.ty).unwrap_or(&field.ty);
 
-        // Skip compound types (Vec, HashMap, PathBuf), but expose Vec<String> as StringArray.
-        let is_vec_string = extract_vec_inner(inner_ty)
+        // Skip HashMap and PathBuf compound types (handled by other paths
+        // or omitted from the prop surface). `Vec<T>` is surfaced as a
+        // single prop field — `Vec<String>` becomes PropKind::StringArray
+        // (chip editor on the dashboard), any other `Vec<T>` becomes
+        // PropKind::ObjectArray (per-row sub-form on the dashboard,
+        // JSON-array round-tripped on the wire).
+        let vec_inner = extract_vec_inner(inner_ty);
+        let is_vec_string = vec_inner
             .map(|t| t.to_token_stream().to_string() == "String")
             .unwrap_or(false);
-        if is_compound_type(inner_ty) && !is_vec_string {
+        let is_vec_object = vec_inner.is_some() && !is_vec_string;
+        if is_compound_type(inner_ty) && !is_vec_string && !is_vec_object {
             continue;
         }
 
@@ -400,29 +685,55 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let category_lit = &category;
         let type_str = field.ty.to_token_stream().to_string().replace(' ', "");
         let type_hint_lit = &type_str;
+        let description = extract_doc(&field.attrs);
+        let description_lit = description.as_str();
 
         // PropKind resolved at compile time via HasPropKind trait.
         // All field types must implement HasPropKind — scalars in traits.rs,
         // config enums in schema.rs via impl_enum_prop_kind!.
-        let kind_token = quote! { <#inner_ty as crate::config::HasPropKind>::PROP_KIND };
-        let enum_variants_expr = quote! {
-            {
-                #[cfg(feature = "schema-export")]
+        // Exception: `Vec<T>` of structs (anything that's not `Vec<String>`)
+        // is hardcoded to ObjectArray here because a blanket
+        // `impl<T> HasPropKind for Vec<T>` would conflict with the existing
+        // `Vec<String> -> StringArray` impl, and per-type impls would
+        // be tedious to maintain. The macro already knows the field is a
+        // Vec via `extract_vec_inner`.
+        let kind_token = if is_vec_object {
+            quote! { crate::config::PropKind::ObjectArray }
+        } else {
+            quote! { <#inner_ty as crate::config::HasPropKind>::PROP_KIND }
+        };
+        // Vec<T> object-array fields are never enums; short-circuit the
+        // `HasPropKind::PROP_KIND` probe so the compile doesn't demand
+        // a HasPropKind impl on `Vec<T>` for arbitrary T.
+        let enum_variants_expr = if is_vec_object {
+            quote! { None::<fn() -> Vec<String>> }
+        } else {
+            quote! {
                 {
-                    if <#inner_ty as crate::config::HasPropKind>::PROP_KIND == crate::config::PropKind::Enum {
-                        Some(|| {
-                            crate::config::enum_variants::<#inner_ty>()
-                                .split(", ")
-                                .map(|s| s.to_string())
-                                .collect()
-                        })
-                    } else {
-                        None
+                    #[cfg(feature = "schema-export")]
+                    {
+                        if <#inner_ty as crate::config::HasPropKind>::PROP_KIND == crate::config::PropKind::Enum {
+                            Some(|| {
+                                crate::config::enum_variants::<#inner_ty>()
+                                    .split(", ")
+                                    .map(str::to_string)
+                                    // Defensive: the helper returns a placeholder
+                                    // string ("(unknown variants)") when schemars
+                                    // can't enumerate variants for the type. Drop
+                                    // empties and the placeholder so the dashboard
+                                    // form falls back to a text input instead of
+                                    // rendering a one-option dropdown of garbage.
+                                    .filter(|v| !v.is_empty() && v != "(unknown variants)")
+                                    .collect()
+                            })
+                        } else {
+                            None
+                        }
                     }
-                }
-                #[cfg(not(feature = "schema-export"))]
-                {
-                    None::<fn() -> Vec<String>>
+                    #[cfg(not(feature = "schema-export"))]
+                    {
+                        None::<fn() -> Vec<String>>
+                    }
                 }
             }
         };
@@ -435,18 +746,53 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         prop_kind_tokens.push(kind_token.clone());
         prop_is_option_flags.push(is_option);
 
-        prop_field_entries.push(quote! {
-            crate::config::make_prop_field(
-                __table.as_ref(),
-                #full_name_lit,
-                #serde_name_lit,
-                #category_lit,
-                #type_hint_lit,
-                #kind_token,
-                #is_secret,
-                #enum_variants_expr,
-            )
-        });
+        if is_vec_object {
+            // For `Vec<T>` of structs we bypass make_prop_field's TOML-table
+            // lookup and JSON-serialize the field directly, so the dashboard
+            // gets `value: [{"name":"fs",...}]` instead of `value: "[{name=...}]"`
+            // (TOML inline syntax) that the per-row editor would have to parse.
+            //
+            // Empty Vec is rendered as `<unset>` to match how Option<T> empty
+            // values are surfaced — empty object-arrays carry no user signal
+            // and round-trip back to `<unset>` after a save anyway because
+            // `#[serde(skip_serializing_if = "Vec::is_empty")]` strips them
+            // from the on-disk TOML. Without this, the
+            // `every_prop_is_gettable_and_settable` round-trip test sees
+            // `set '[]' / get '<unset>'` and fails.
+            prop_field_entries.push(quote! {
+                crate::config::PropFieldInfo {
+                    name: #full_name_lit.to_string(),
+                    category: #category_lit,
+                    display_value: if self.#field_ident.is_empty() {
+                        "<unset>".to_string()
+                    } else {
+                        serde_json::to_string(&self.#field_ident)
+                            .unwrap_or_else(|_| "[]".to_string())
+                    },
+                    type_hint: #type_hint_lit,
+                    kind: #kind_token,
+                    is_secret: #is_secret,
+                    enum_variants: #enum_variants_expr,
+                    description: #description_lit,
+                    derived_from_secret: #derived_from_secret,
+                }
+            });
+        } else {
+            prop_field_entries.push(quote! {
+                crate::config::make_prop_field(
+                    __table.as_ref(),
+                    #full_name_lit,
+                    #serde_name_lit,
+                    #category_lit,
+                    #type_hint_lit,
+                    #kind_token,
+                    #is_secret,
+                    #enum_variants_expr,
+                    #description_lit,
+                    #derived_from_secret,
+                )
+            });
+        }
     }
 
     let prefix_lit = &prefix;
@@ -543,6 +889,39 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 #(#init_defaults_ops)*
                 initialized
             }
+
+            /// Enumerate every map-keyed (`HashMap<String, T>`) and list-shaped
+            /// (`Vec<T>`) section discoverable from this Configurable's tree.
+            /// The dashboard / CLI consume this to surface "+ Add" affordances
+            /// without hardcoding the section list.
+            pub fn map_key_sections() -> Vec<crate::config::MapKeySection> {
+                let mut out: Vec<crate::config::MapKeySection> = Vec::new();
+                #(#map_key_section_entries)*
+                #(#map_key_recurse)*
+                out
+            }
+
+            /// Insert a default-valued entry under a map-keyed section, or
+            /// append to a list-shaped one, with `map_key` as the new entry's
+            /// natural identifier (HashMap key for Map sections; identifier
+            /// field for List sections).
+            ///
+            /// Returns `Ok(true)` if a new entry was created, `Ok(false)` if
+            /// the entry already existed (idempotent), or `Err(reason)` if
+            /// the section path doesn't resolve to a Map/List in this tree.
+            pub fn create_map_key(
+                &mut self,
+                section_path: &str,
+                map_key: &str,
+            ) -> Result<bool, String> {
+                #(#create_map_key_arms)*
+                #(#create_map_key_recurse)*
+                Err(format!(
+                    "no map-keyed/list section at `{}` in `{}`",
+                    section_path,
+                    Self::configurable_prefix(),
+                ))
+            }
         }
     };
 
@@ -593,6 +972,32 @@ fn has_attr(field: &syn::Field, name: &str) -> bool {
 
 fn snake_to_kebab(s: &str) -> String {
     s.replace('_', "-")
+}
+
+/// Flatten a field's `///` doc comment into a single space-separated line.
+/// Empty string when the field has no doc comment.
+fn extract_doc(attrs: &[syn::Attribute]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for attr in attrs {
+        if !attr.path().is_ident("doc") {
+            continue;
+        }
+        let Meta::NameValue(nv) = &attr.meta else {
+            continue;
+        };
+        let syn::Expr::Lit(expr_lit) = &nv.value else {
+            continue;
+        };
+        let Lit::Str(lit_str) = &expr_lit.lit else {
+            continue;
+        };
+        let line = lit_str.value();
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+    parts.join(" ")
 }
 
 fn is_option_type(ty: &syn::Type) -> bool {

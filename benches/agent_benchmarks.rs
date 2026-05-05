@@ -7,7 +7,7 @@
 //!
 //! Run: `cargo bench`
 //!
-//! Ref: https://github.com/zeroclaw-labs/zeroclaw/issues/618 (item 7)
+//! Ref: <https://github.com/zeroclaw-labs/zeroclaw/issues/618> (item 7)
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -54,6 +54,7 @@ impl BenchProvider {
                         id: "tc1".into(),
                         name: "noop".into(),
                         arguments: "{}".into(),
+                        extra_content: None,
                     }],
                     usage: None,
                     reasoning_content: None,
@@ -76,7 +77,7 @@ impl Provider for BenchProvider {
         _system_prompt: Option<&str>,
         _message: &str,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<String> {
         Ok("fallback".into())
     }
@@ -85,7 +86,7 @@ impl Provider for BenchProvider {
         &self,
         _request: ChatRequest<'_>,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
@@ -204,11 +205,13 @@ fn bench_native_parsing(c: &mut Criterion) {
                 id: "tc1".into(),
                 name: "search".into(),
                 arguments: r#"{"query": "zeroclaw"}"#.into(),
+                extra_content: None,
             },
             ToolCall {
                 id: "tc2".into(),
                 name: "read_file".into(),
                 arguments: r#"{"path": "src/main.rs"}"#.into(),
+                extra_content: None,
             },
         ],
         usage: None,

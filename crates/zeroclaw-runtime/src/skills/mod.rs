@@ -86,6 +86,8 @@ struct SkillMeta {
     author: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    prompts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -169,12 +171,18 @@ pub fn load_skills_with_config(
     workspace_dir: &Path,
     config: &zeroclaw_config::schema::Config,
 ) -> Vec<Skill> {
-    load_skills_with_open_skills_config(
+    #[allow(unused_mut)]
+    let mut skills = load_skills_with_open_skills_config(
         workspace_dir,
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
         Some(config.skills.allow_scripts),
-    )
+    );
+
+    #[cfg(feature = "plugins-wasm")]
+    skills.extend(load_plugin_skills_from_config(config));
+
+    skills
 }
 
 /// Load skills using explicit open-skills settings.
@@ -182,12 +190,13 @@ pub fn load_skills_with_open_skills_settings(
     workspace_dir: &Path,
     open_skills_enabled: bool,
     open_skills_dir: Option<&str>,
+    allow_scripts: bool,
 ) -> Vec<Skill> {
     load_skills_with_open_skills_config(
         workspace_dir,
         Some(open_skills_enabled),
         open_skills_dir,
-        None,
+        Some(allow_scripts),
     )
 }
 
@@ -596,6 +605,13 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
     let manifest: SkillManifest = toml::from_str(&content)?;
 
+    // Merge prompts from both locations: inside the [skill] table (natural
+    // location for per-skill prompts) and at the manifest root (historical
+    // location). Previously, prompts placed inside [skill] were silently
+    // dropped because SkillMeta had no `prompts` field. Fixes #5721.
+    let mut prompts = manifest.skill.prompts;
+    prompts.extend(manifest.prompts);
+
     Ok(Skill {
         name: manifest.skill.name,
         description: manifest.skill.description,
@@ -603,7 +619,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         author: manifest.skill.author,
         tags: manifest.skill.tags,
         tools: manifest.tools,
-        prompts: manifest.prompts,
+        prompts,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1605,6 +1621,74 @@ pub fn install_registry_skill_source(
     )
 }
 
+// ─── Plugin-shipped skills (plugins-wasm only) ───────────────────────────────
+
+/// Load skills from skill-capable plugins discovered by the plugin host.
+///
+/// Each plugin's `skills/` directory is fed to the existing skill loader, and
+/// every loaded skill is renamed to `plugin:<plugin>/<skill>` to avoid
+/// collisions with user-authored skills and between bundles. The `plugin:<name>`
+/// tag is also added so prompts can distinguish plugin skills.
+#[cfg(feature = "plugins-wasm")]
+pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) -> Vec<Skill> {
+    if !config.plugins.enabled {
+        return Vec::new();
+    }
+
+    let plugins_dir = expand_plugins_dir(&config.plugins.plugins_dir);
+    let parent = match plugins_dir.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return Vec::new(),
+    };
+
+    let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
+        &config.plugins.security.signature_mode,
+    );
+    let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();
+
+    let host = match zeroclaw_plugins::host::PluginHost::with_security(
+        &parent,
+        signature_mode,
+        trusted_keys,
+    ) {
+        Ok(host) => host,
+        Err(err) => {
+            tracing::warn!("failed to discover plugin skills: {err}");
+            return Vec::new();
+        }
+    };
+
+    let allow_scripts = config.skills.allow_scripts;
+    let mut skills = Vec::new();
+    for (manifest, skills_dir) in host.skill_plugin_details() {
+        for raw in load_skills_from_directory(&skills_dir, allow_scripts) {
+            skills.push(namespace_plugin_skill(&manifest.name, raw));
+        }
+    }
+    skills
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn expand_plugins_dir(plugins_dir: &str) -> PathBuf {
+    if let Some(rest) = plugins_dir.strip_prefix("~/")
+        && let Some(dirs) = UserDirs::new()
+    {
+        return dirs.home_dir().join(rest);
+    }
+    PathBuf::from(plugins_dir)
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
+    let qualified = format!("plugin:{}/{}", plugin_name, skill.name);
+    skill.name = qualified;
+    let plugin_tag = format!("plugin:{plugin_name}");
+    if !skill.tags.iter().any(|t| t == &plugin_tag) {
+        skill.tags.push(plugin_tag);
+    }
+    skill
+}
+
 #[cfg(test)]
 mod registry_tests {
     use super::*;
@@ -1658,5 +1742,80 @@ mod registry_tests {
     fn test_is_registry_source_rejects_special_chars() {
         assert!(!is_registry_source(".hidden"));
         assert!(!is_registry_source("~tilde"));
+    }
+}
+
+#[cfg(test)]
+mod prompts_section_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_manifest(dir: &Path, toml: &str) -> std::path::PathBuf {
+        let p = dir.join("SKILL.toml");
+        std::fs::write(&p, toml).unwrap();
+        p
+    }
+
+    #[test]
+    fn prompts_inside_skill_section_are_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+prompts = ["If asked about XYZZY, respond YES"]
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(
+            skill.prompts,
+            vec!["If asked about XYZZY, respond YES".to_string()]
+        );
+    }
+
+    #[test]
+    fn prompts_at_root_level_still_work() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+
+prompts = ["legacy root-level prompt"]
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(skill.prompts, vec!["legacy root-level prompt".to_string()]);
+    }
+
+    #[test]
+    fn prompts_in_both_locations_are_merged_skill_first() {
+        // Root-level prompts must precede the [skill] header in TOML.
+        // Per the fix, [skill]-section prompts appear first in the merged
+        // list, with root-level prompts appended after.
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+prompts = ["from-root"]
+
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+prompts = ["from-skill-section"]
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(
+            skill.prompts,
+            vec!["from-skill-section".to_string(), "from-root".to_string(),]
+        );
     }
 }

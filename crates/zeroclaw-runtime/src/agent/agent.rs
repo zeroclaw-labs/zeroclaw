@@ -4,15 +4,16 @@ use crate::agent::dispatcher::{
 use crate::agent::eval::AutoClassifyExt;
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
-use crate::i18n::ToolDescriptions;
+use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
 use anyhow::Result;
 use chrono::{Datelike, Timelike};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write as IoWrite;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use zeroclaw_config::schema::Config;
@@ -47,7 +48,6 @@ pub struct Agent {
     #[allow(dead_code)] // WIP: stored for future runtime tool filtering
     allowed_tools: Option<Vec<String>>,
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
-    tool_descriptions: Option<ToolDescriptions>,
     /// Pre-rendered security policy summary injected into the system prompt
     /// so the LLM knows the concrete constraints before making tool calls.
     security_summary: Option<String>,
@@ -60,6 +60,66 @@ pub struct Agent {
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    /// Approval manager for direct Agent execution paths such as ACP.
+    approval_manager: Option<Arc<ApprovalManager>>,
+    /// Late-bound channel maps for the four channel-driven tools
+    /// (`ask_user`, `reaction`, `escalate_to_human`, `poll`). Held so that
+    /// per-session callers (e.g. the ACP server) can register a back-channel
+    /// after agent construction. Production paths populate via
+    /// `start_channels`; this is the alternate path for environments that
+    /// build an Agent directly without `start_channels`.
+    channel_handles: AgentChannelHandles,
+}
+
+/// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
+/// cheap (Arc clones); the underlying maps are shared with the live tools.
+#[derive(Clone, Default)]
+pub struct AgentChannelHandles {
+    pub ask_user: Option<tools::ChannelMapHandle>,
+    pub reaction: Option<tools::ChannelMapHandle>,
+    pub escalate: Option<tools::ChannelMapHandle>,
+    pub poll: Option<tools::ChannelMapHandle>,
+}
+
+impl AgentChannelHandles {
+    /// Register a channel into every populated handle so all four
+    /// channel-driven tools can resolve it by name.
+    pub fn register_channel(
+        &self,
+        name: impl Into<String>,
+        channel: Arc<dyn zeroclaw_api::channel::Channel>,
+    ) {
+        let name = name.into();
+        for handle in [&self.ask_user, &self.reaction, &self.escalate, &self.poll]
+            .into_iter()
+            .flatten()
+        {
+            handle.write().insert(name.clone(), Arc::clone(&channel));
+        }
+    }
+
+    /// Remove a channel from every populated handle (used on session/stop).
+    pub fn unregister_channel(&self, name: &str) {
+        for handle in [&self.ask_user, &self.reaction, &self.escalate, &self.poll]
+            .into_iter()
+            .flatten()
+        {
+            handle.write().remove(name);
+        }
+    }
+
+    /// Look up a registered channel by name from any populated channel map.
+    pub fn get_channel(&self, name: &str) -> Option<Arc<dyn zeroclaw_api::channel::Channel>> {
+        for handle in [&self.ask_user, &self.reaction, &self.escalate, &self.poll]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(channel) = handle.read().get(name) {
+                return Some(Arc::clone(channel));
+            }
+        }
+        None
+    }
 }
 
 pub struct AgentBuilder {
@@ -84,11 +144,11 @@ pub struct AgentBuilder {
     route_model_by_hint: Option<HashMap<String, String>>,
     allowed_tools: Option<Vec<String>>,
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
-    tool_descriptions: Option<ToolDescriptions>,
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    approval_manager: Option<Arc<ApprovalManager>>,
 }
 
 impl Default for AgentBuilder {
@@ -121,11 +181,11 @@ impl AgentBuilder {
             route_model_by_hint: None,
             allowed_tools: None,
             response_cache: None,
-            tool_descriptions: None,
             security_summary: None,
             autonomy_level: None,
             activated_tools: None,
             hook_runner: None,
+            approval_manager: None,
         }
     }
 
@@ -246,11 +306,6 @@ impl AgentBuilder {
         self
     }
 
-    pub fn tool_descriptions(mut self, tool_descriptions: Option<ToolDescriptions>) -> Self {
-        self.tool_descriptions = tool_descriptions;
-        self
-    }
-
     pub fn security_summary(mut self, summary: Option<String>) -> Self {
         self.security_summary = summary;
         self
@@ -271,6 +326,11 @@ impl AgentBuilder {
 
     pub fn hook_runner(mut self, runner: Option<Arc<crate::hooks::HookRunner>>) -> Self {
         self.hook_runner = runner;
+        self
+    }
+
+    pub fn approval_manager(mut self, manager: Option<Arc<ApprovalManager>>) -> Self {
+        self.approval_manager = manager;
         self
     }
 
@@ -306,9 +366,12 @@ impl AgentBuilder {
                 .memory_loader
                 .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
             config: self.config.unwrap_or_default(),
-            model_name: self
-                .model_name
-                .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
+            // No silent vendor-default model. Callers that construct `Agent` via the
+            // builder must set `model_name` explicitly (via `.model_name(...)` or via
+            // `Agent::from_config`, which resolves from `[providers]`). The sentinel
+            // keeps the field non-empty so accidental dispatch surfaces a clear 4xx
+            // rather than misrouting to a real vendor model.
+            model_name: self.model_name.unwrap_or_else(|| "<unconfigured>".into()),
             temperature: self.temperature.unwrap_or(0.7),
             workspace_dir: self
                 .workspace_dir
@@ -324,13 +387,14 @@ impl AgentBuilder {
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
             allowed_tools: allowed,
             response_cache: self.response_cache,
-            tool_descriptions: self.tool_descriptions,
             security_summary: self.security_summary,
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
             hook_runner: self.hook_runner,
+            approval_manager: self.approval_manager,
+            channel_handles: AgentChannelHandles::default(),
         })
     }
 }
@@ -338,6 +402,15 @@ impl AgentBuilder {
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
+    }
+
+    /// Late-bound channel-map handles for the four channel-driven tools.
+    /// Populated by `from_config_with_session_cwd`; empty when an Agent is
+    /// constructed via the builder directly. Callers (e.g. the ACP server)
+    /// use `channel_handles().register_channel(...)` to wire a back-channel
+    /// into all four tool maps in one shot.
+    pub fn channel_handles(&self) -> &AgentChannelHandles {
+        &self.channel_handles
     }
 
     pub fn history(&self) -> &[ConversationMessage] {
@@ -372,13 +445,43 @@ impl Agent {
     }
 
     pub async fn from_config(config: &Config) -> Result<Self> {
+        Self::from_config_with_session_cwd(config, None).await
+    }
+
+    /// Build an Agent with an optional per-session working directory override.
+    ///
+    /// `session_cwd`, when supplied, becomes [`SecurityPolicy::workspace_dir`]
+    /// for this agent — i.e. the boundary used by file_read/write/edit and the
+    /// cwd used by the shell tool. Memory storage, identity files, scheduled
+    /// task DBs, and other on-disk state continue to live under
+    /// `config.workspace_dir`.
+    ///
+    /// This is what ACP sessions use to pin tool path resolution to the
+    /// IDE-provided `cwd` without relocating the agent's data directory.
+    pub async fn from_config_with_session_cwd(
+        config: &Config,
+        session_cwd: Option<&Path>,
+    ) -> Result<Self> {
+        Self::from_config_with_session_cwd_and_mcp(config, session_cwd, true).await
+    }
+
+    /// Build an Agent while optionally skipping eager MCP initialization.
+    ///
+    /// ACP clients expect `session/new` to return promptly. User-configured
+    /// MCP servers are external processes/services and can block startup while
+    /// they time out, so ACP uses this with `initialize_mcp = false`.
+    pub async fn from_config_with_session_cwd_and_mcp(
+        config: &Config,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+    ) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
-            &config.workspace_dir,
+            session_cwd.unwrap_or(&config.workspace_dir),
         ));
 
         let fallback_provider_ag = config.providers.fallback_provider();
@@ -405,10 +508,10 @@ impl Agent {
         let (
             mut tools,
             delegate_handle,
-            _reaction_handle,
-            _channel_map_handle,
-            _ask_user_handle,
-            _escalate_handle,
+            reaction_handle,
+            poll_handle,
+            ask_user_handle,
+            escalate_handle,
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -419,7 +522,7 @@ impl Agent {
             &config.browser,
             &config.http_request,
             &config.web_fetch,
-            &config.workspace_dir,
+            &security.workspace_dir,
             &config.agents,
             fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
             config,
@@ -431,7 +534,7 @@ impl Agent {
         // and webhook paths (loop_.rs) so that the WebSocket/daemon UI
         // path also has access to MCP tools.
         let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
-        if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        if initialize_mcp && config.mcp.enabled && !config.mcp.servers.is_empty() {
             tracing::info!(
                 "Initializing MCP client — {} server(s) configured",
                 config.mcp.servers.len()
@@ -489,10 +592,34 @@ impl Agent {
 
         let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
 
-        let model_name = fallback_provider_ag
+        let model_name = match fallback_provider_ag
             .and_then(|e| e.model.as_deref())
-            .unwrap_or("anthropic/claude-sonnet-4-20250514")
-            .to_string();
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            Some(m) => m.to_string(),
+            None => match config.providers.resolve_default_model() {
+                Some(m) => {
+                    tracing::warn!(
+                        provider = provider_name,
+                        model = %m,
+                        "fallback provider has no `model` set; using first configured \
+                         providers.models entry as default. Set [providers.models.{provider_name}] \
+                         model = \"...\" to silence this warning.",
+                    );
+                    m
+                }
+                None => {
+                    anyhow::bail!(
+                        "no model configured: providers.fallback = {:?} resolves with no model, \
+                         and no [[providers.models.*]] entry has a `model` field set. \
+                         Configure at least one [providers.models.<name>] model = \"...\" \
+                         or define a [[model_routes]] hint.",
+                        config.providers.fallback,
+                    )
+                }
+            },
+        };
 
         let provider_runtime_options =
             zeroclaw_providers::provider_runtime_options_from_config(config);
@@ -549,7 +676,7 @@ impl Agent {
         let skills = crate::skills::load_skills_with_config(&config.workspace_dir, config);
         tools::register_skill_tools(&mut tools, &skills, security.clone());
 
-        Agent::builder()
+        let mut agent = Agent::builder()
             .provider(provider)
             .tools(tools)
             .memory(memory)
@@ -568,7 +695,7 @@ impl Agent {
                     .and_then(|e| e.temperature)
                     .unwrap_or(0.7),
             )
-            .workspace_dir(config.workspace_dir.clone())
+            .workspace_dir(security.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)
@@ -593,7 +720,19 @@ impl Agent {
             } else {
                 None
             })
-            .build()
+            .approval_manager(Some(Arc::new(ApprovalManager::for_non_interactive(
+                &config.autonomy,
+            ))))
+            .build()?;
+
+        agent.channel_handles = AgentChannelHandles {
+            ask_user: ask_user_handle,
+            reaction: reaction_handle,
+            escalate: escalate_handle,
+            poll: Some(poll_handle),
+        };
+
+        Ok(agent)
     }
 
     fn trim_history(&mut self) {
@@ -650,7 +789,6 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
-            tool_descriptions: self.tool_descriptions.as_ref(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
         };
@@ -686,6 +824,98 @@ impl Agent {
                         tool_call_id: call.tool_call_id.clone(),
                     };
                 }
+            }
+        }
+
+        // ── Approval hook ──────────────────────────────────────
+        // The ACP/WebSocket Agent path executes tools directly instead of
+        // going through run_tool_call_loop. Keep its policy behavior aligned
+        // with the shared loop by honoring auto_approve / always_ask here too.
+        if let Some(mgr) = self.approval_manager.as_deref()
+            && mgr.needs_approval(&tool_name)
+        {
+            let request = ApprovalRequest {
+                tool_name: tool_name.clone(),
+                arguments: tool_args.clone(),
+            };
+
+            let (decision, decision_channel) = if mgr.is_non_interactive() {
+                // Iterate every registered channel looking for one that can
+                // handle the approval request. The first Ok(Some(_)) wins.
+                // This avoids hard-coding a channel name (e.g. "acp") and
+                // naturally supports WS sessions or any future back-channel.
+                let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
+                    tool_name: request.tool_name.clone(),
+                    arguments_summary: crate::approval::summarize_args(&request.arguments),
+                };
+                let mut channel_decision: Option<zeroclaw_api::channel::ChannelApprovalResponse> =
+                    None;
+                let mut decision_channel_name = String::new();
+                // Collect channels while holding the lock briefly, then drop
+                // the lock before any await points so the guard is not Send.
+                let channels: Vec<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = self
+                    .channel_handles
+                    .ask_user
+                    .as_ref()
+                    .map(|h| {
+                        h.read()
+                            .iter()
+                            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (ch_name, ch) in &channels {
+                    match ch.request_approval("", &ch_request).await {
+                        Ok(Some(r)) => {
+                            decision_channel_name = ch_name.clone();
+                            channel_decision = Some(r);
+                            break;
+                        }
+                        Ok(None) => continue,
+                        Err(e) => {
+                            tracing::warn!(
+                                tool = %tool_name,
+                                channel = %ch_name,
+                                error = %e,
+                                "channel approval request failed"
+                            );
+                        }
+                    }
+                }
+                let approval = match channel_decision {
+                    Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve) => {
+                        ApprovalResponse::Yes
+                    }
+                    Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove) => {
+                        ApprovalResponse::Always
+                    }
+                    Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny) => {
+                        ApprovalResponse::No
+                    }
+                    None => {
+                        tracing::warn!(
+                            tool = %tool_name,
+                            "no approval channel handled this request — denying. \
+                             Configure a back-channel (ACP or WS) that implements \
+                             request_approval to enable interactive approval."
+                        );
+                        ApprovalResponse::No
+                    }
+                };
+                (approval, decision_channel_name)
+            } else {
+                (mgr.prompt_cli(&request), String::new())
+            };
+
+            mgr.record_decision(&tool_name, &tool_args, decision, &decision_channel);
+
+            if decision == ApprovalResponse::No {
+                return ToolExecutionResult {
+                    name: tool_name,
+                    output: "Denied by user.".to_string(),
+                    success: false,
+                    tool_call_id: call.tool_call_id.clone(),
+                };
             }
         }
 
@@ -769,7 +999,12 @@ impl Agent {
     }
 
     async fn execute_tools(&self, calls: &[ParsedToolCall]) -> Vec<ToolExecutionResult> {
-        if !self.config.parallel_tools {
+        let approval_required = self.approval_manager.as_deref().is_some_and(|mgr| {
+            calls
+                .iter()
+                .any(|call| mgr.needs_approval(call.name.as_str()))
+        });
+        if !self.config.parallel_tools || approval_required {
             let mut results = Vec::with_capacity(calls.len());
             for call in calls {
                 results.push(self.execute_tool_call(call).await);
@@ -929,7 +1164,7 @@ impl Agent {
                         },
                     },
                     &effective_model,
-                    self.temperature,
+                    Some(self.temperature),
                 )
                 .await
             {
@@ -966,10 +1201,6 @@ impl Agent {
             }
 
             if !text.is_empty() {
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        text.clone(),
-                    )));
                 print!("{text}");
                 let _ = std::io::stdout().flush();
             }
@@ -1004,6 +1235,7 @@ impl Agent {
         &mut self,
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<String> {
         // ── Preamble (identical to turn) ───────────────────────────────
         if self.history.is_empty() {
@@ -1050,6 +1282,14 @@ impl Agent {
 
         // ── Turn loop ──────────────────────────────────────────────────
         for _ in 0..self.config.max_tool_iterations {
+            // Early exit if the caller cancelled this turn (e.g. user abort)
+            if cancel_token
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                return Err(crate::agent::loop_::ToolLoopCancelled.into());
+            }
+
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
             // Response cache check (same as turn)
@@ -1108,15 +1348,37 @@ impl Agent {
                     },
                 },
                 &effective_model,
-                self.temperature,
+                Some(self.temperature),
                 stream_opts,
             );
 
             let mut streamed_text = String::new();
             let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
             let mut got_stream = false;
+            let mut pre_executed_call_ids: HashMap<String, VecDeque<String>> = HashMap::new();
+            let mut was_cancelled = false;
 
-            while let Some(item) = stream.next().await {
+            // Consume the stream, checking for cancellation between chunks.
+            // We use a manual loop with `tokio::select!` so that a cancel
+            // signal interrupts even while waiting for the next SSE event
+            // from the provider.
+            loop {
+                let next_item = stream.next();
+
+                let item = if let Some(ref token) = cancel_token {
+                    tokio::select! {
+                        biased;
+                        () = token.cancelled() => {
+                            was_cancelled = true;
+                            break;
+                        }
+                        item = next_item => item,
+                    }
+                } else {
+                    next_item.await
+                };
+
+                let Some(item) = item else { break };
                 match item {
                     Ok(event) => match event {
                         zeroclaw_providers::traits::StreamEvent::TextDelta(chunk) => {
@@ -1144,8 +1406,14 @@ impl Agent {
                             name,
                             args,
                         } => {
+                            let call_id = uuid::Uuid::new_v4().to_string();
+                            pre_executed_call_ids
+                                .entry(name.clone())
+                                .or_default()
+                                .push_back(call_id.clone());
                             let _ = event_tx
                                 .send(TurnEvent::ToolCall {
+                                    id: call_id,
                                     name,
                                     args: serde_json::from_str(&args).unwrap_or_default(),
                                 })
@@ -1156,7 +1424,17 @@ impl Agent {
                             name,
                             output,
                         } => {
-                            let _ = event_tx.send(TurnEvent::ToolResult { name, output }).await;
+                            let result_id = pre_executed_call_ids
+                                .get_mut(&name)
+                                .and_then(|ids| ids.pop_front())
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                            let _ = event_tx
+                                .send(TurnEvent::ToolResult {
+                                    id: result_id,
+                                    name,
+                                    output,
+                                })
+                                .await;
                         }
                         zeroclaw_providers::traits::StreamEvent::Final => break,
                     },
@@ -1165,6 +1443,22 @@ impl Agent {
             }
             // Drop the stream so we release the borrow on provider.
             drop(stream);
+
+            // If cancelled during streaming, return partial content with
+            // the interruption marker appended. The caller (ws.rs) will
+            // persist this truncated message and send an abort frame.
+            if was_cancelled {
+                let partial = if streamed_text.is_empty() {
+                    "[interrupted by user]".to_string()
+                } else {
+                    format!("{streamed_text}\n\n[interrupted by user]")
+                };
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(
+                        partial.clone(),
+                    )));
+                return Err(crate::agent::loop_::ToolLoopCancelled.into());
+            }
 
             // If streaming produced text, use it as the response and
             // check for tool calls via the dispatcher.
@@ -1177,29 +1471,37 @@ impl Agent {
                     reasoning_content: None,
                 }
             } else {
-                // Fall back to non-streaming chat
-                match self
-                    .provider
-                    .chat(
-                        ChatRequest {
-                            messages: &messages,
-                            tools: if self.tool_dispatcher.should_send_tool_specs() {
-                                Some(&self.tool_specs)
-                            } else {
-                                None
-                            },
+                // Fall back to non-streaming chat, with cancellation guard
+                let chat_fut = self.provider.chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: if self.tool_dispatcher.should_send_tool_specs() {
+                            Some(&self.tool_specs)
+                        } else {
+                            None
                         },
-                        &effective_model,
-                        self.temperature,
-                    )
-                    .await
-                {
+                    },
+                    &effective_model,
+                    Some(self.temperature),
+                );
+                let chat_result = if let Some(ref token) = cancel_token {
+                    tokio::select! {
+                        biased;
+                        () = token.cancelled() => {
+                            return Err(crate::agent::loop_::ToolLoopCancelled.into());
+                        }
+                        result = chat_fut => result,
+                    }
+                } else {
+                    chat_fut.await
+                };
+                match chat_result {
                     Ok(resp) => resp,
                     Err(err) => return Err(err),
                 }
             };
 
-            let (text, calls) = self.tool_dispatcher.parse_response(&response);
+            let (text, mut calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {
                 let final_text = if text.is_empty() {
                     response.text.unwrap_or_default()
@@ -1236,14 +1538,14 @@ impl Agent {
                 return Ok(final_text);
             }
 
-            // ── Tool calls ─────────────────────────────────────────────
-            if !text.is_empty() {
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        text.clone(),
-                    )));
+            // Pre-assign stable IDs to tool calls that don't have one
+            for call in &mut calls {
+                if call.tool_call_id.is_none() {
+                    call.tool_call_id = Some(uuid::Uuid::new_v4().to_string());
+                }
             }
 
+            // ── Tool calls ─────────────────────────────────────────────
             self.history.push(ConversationMessage::AssistantToolCalls {
                 text: response.text.clone(),
                 tool_calls: response.tool_calls.clone(),
@@ -1252,8 +1554,10 @@ impl Agent {
 
             // Notify about each tool call
             for call in &calls {
+                let call_id = call.tool_call_id.as_ref().unwrap().clone();
                 let _ = event_tx
                     .send(TurnEvent::ToolCall {
+                        id: call_id,
                         name: call.name.clone(),
                         args: call.arguments.clone(),
                     })
@@ -1264,8 +1568,10 @@ impl Agent {
 
             // Notify about each tool result
             for result in &results {
+                let result_id = result.tool_call_id.as_ref().unwrap().clone();
                 let _ = event_tx
                     .send(TurnEvent::ToolResult {
+                        id: result_id,
                         name: result.name.clone(),
                         output: result.output.clone(),
                     })
@@ -1343,12 +1649,19 @@ pub async fn run(
         .as_deref()
         .unwrap_or("openrouter")
         .to_string();
+    // `Agent::from_config` above has already errored if no model could be resolved,
+    // so this telemetry line should always find one. We keep `resolve_default_model`
+    // as a cheap secondary lookup and emit "<unresolved>" only if nothing matches —
+    // never silently substitute a hardcoded vendor model.
     let model_name = effective_config
         .providers
         .fallback_provider()
         .and_then(|e| e.model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4-20250514")
-        .to_string();
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| effective_config.providers.resolve_default_model())
+        .unwrap_or_else(|| "<unresolved>".to_string());
 
     agent.observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.clone(),
@@ -1379,6 +1692,7 @@ mod tests {
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockProvider {
         responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
@@ -1391,7 +1705,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<String> {
             Ok("ok".into())
         }
@@ -1400,7 +1714,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             let mut guard = self.responses.lock();
             if guard.is_empty() {
@@ -1427,7 +1741,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<String> {
             Ok("ok".into())
         }
@@ -1436,7 +1750,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             self.seen_models.lock().push(model.to_string());
             let mut guard = self.responses.lock();
@@ -1477,6 +1791,66 @@ mod tests {
         }
     }
 
+    struct CountingTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn description(&self) -> &str {
+            "echo"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "tool-out".into(),
+                error: None,
+            })
+        }
+    }
+
+    struct ApprovalChannel {
+        response: zeroclaw_api::channel::ChannelApprovalResponse,
+        requests: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::channel::Channel for ApprovalChannel {
+        fn name(&self) -> &str {
+            "acp"
+        }
+
+        async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            _recipient: &str,
+            _request: &zeroclaw_api::channel::ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(self.response))
+        }
+    }
+
     #[tokio::test]
     async fn turn_without_tools_returns_text() {
         let provider = Box::new(MockProvider {
@@ -1513,6 +1887,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_agent_tool_execution_requests_acp_approval() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let approval_cfg = zeroclaw_config::schema::AutonomyConfig {
+            always_ask: vec!["echo".into()],
+            ..zeroclaw_config::schema::AutonomyConfig::default()
+        };
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(CountingTool {
+                calls: Arc::clone(&tool_calls),
+            })])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .approval_manager(Some(Arc::new(ApprovalManager::for_non_interactive(
+                &approval_cfg,
+            ))))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
+        let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
+            response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
+            requests: Arc::clone(&approval_requests),
+        });
+        handle.write().insert("acp".to_string(), channel);
+
+        let result = agent
+            .execute_tool_call(&ParsedToolCall {
+                name: "echo".into(),
+                arguments: serde_json::json!({"message": "hi"}),
+                tool_call_id: Some("tc1".into()),
+            })
+            .await;
+
+        assert!(result.success);
+        assert_eq!(result.output, "tool-out");
+        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_agent_tool_execution_denies_when_acp_rejects() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let approval_cfg = zeroclaw_config::schema::AutonomyConfig {
+            always_ask: vec!["echo".into()],
+            ..zeroclaw_config::schema::AutonomyConfig::default()
+        };
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(CountingTool {
+                calls: Arc::clone(&tool_calls),
+            })])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .approval_manager(Some(Arc::new(ApprovalManager::for_non_interactive(
+                &approval_cfg,
+            ))))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
+        let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
+            response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+            requests: Arc::clone(&approval_requests),
+        });
+        handle.write().insert("acp".to_string(), channel);
+
+        let result = agent
+            .execute_tool_call(&ParsedToolCall {
+                name: "echo".into(),
+                arguments: serde_json::json!({"message": "hi"}),
+                tool_call_id: Some("tc1".into()),
+            })
+            .await;
+
+        assert!(!result.success);
+        assert_eq!(result.output, "Denied by user.");
+        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn turn_with_native_dispatcher_handles_tool_results_variant() {
         let provider = Box::new(MockProvider {
             responses: Mutex::new(vec![
@@ -1522,6 +2010,7 @@ mod tests {
                         id: "tc1".into(),
                         name: "echo".into(),
                         arguments: "{}".into(),
+                        extra_content: None,
                     }],
                     usage: None,
                     reasoning_content: None,
@@ -1836,7 +2325,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<String> {
             Ok("ok".into())
         }
@@ -1845,7 +2334,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             self.tools_received.lock().push(request.tools.is_some());
             let mut count = self.call_count.lock();
@@ -1854,9 +2343,10 @@ mod tests {
                 Ok(zeroclaw_providers::ChatResponse {
                     text: Some(String::new()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
-                        id: "tc_stream_1".into(),
+                        id: "00000000-0000-0000-0000-000000000001".into(),
                         name: "echo".into(),
                         arguments: "{}".into(),
+                        extra_content: None,
                     }],
                     usage: None,
                     reasoning_content: None,
@@ -1879,7 +2369,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             _options: zeroclaw_providers::traits::StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -1892,9 +2382,10 @@ mod tests {
             if *count == 1 {
                 let tc = zeroclaw_providers::traits::StreamEvent::ToolCall(
                     zeroclaw_providers::ToolCall {
-                        id: "tc_stream_1".into(),
+                        id: "00000000-0000-0000-0000-000000000001".into(),
                         name: "echo".into(),
                         arguments: "{}".into(),
+                        extra_content: None,
                     },
                 );
                 stream::iter(vec![
@@ -1950,7 +2441,7 @@ mod tests {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
         let response = agent
-            .turn_streamed("use the echo tool", event_tx)
+            .turn_streamed("use the echo tool", event_tx, None)
             .await
             .unwrap();
         assert_eq!(response, "stream-done");
@@ -1990,6 +2481,166 @@ mod tests {
             has_tool_result,
             "Should have emitted a ToolResult event for 'echo'"
         );
+
+        // Verify ID correlation
+        let call_id = events
+            .iter()
+            .find_map(|e| {
+                if let TurnEvent::ToolCall { id, .. } = e {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("ToolCall should have an ID");
+
+        let result_id = events
+            .iter()
+            .find_map(|e| {
+                if let TurnEvent::ToolResult { id, .. } = e {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("ToolResult should have an ID");
+
+        assert_eq!(
+            call_id, result_id,
+            "ToolCall and ToolResult should share the same ID for correlation"
+        );
+
+        // Verify it's a valid UUID
+        assert!(
+            uuid::Uuid::parse_str(&call_id).is_ok(),
+            "Generated ID should be a valid UUID: got '{}'",
+            call_id
+        );
+    }
+
+    struct PreExecutedToolProvider;
+
+    #[async_trait]
+    impl Provider for PreExecutedToolProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+
+            stream::iter(vec![
+                Ok(
+                    zeroclaw_providers::traits::StreamEvent::PreExecutedToolCall {
+                        name: "file_read".into(),
+                        args: "{\"path\":\"a.txt\"}".into(),
+                    },
+                ),
+                Ok(
+                    zeroclaw_providers::traits::StreamEvent::PreExecutedToolCall {
+                        name: "shell".into(),
+                        args: "{\"command\":\"pwd\"}".into(),
+                    },
+                ),
+                Ok(
+                    zeroclaw_providers::traits::StreamEvent::PreExecutedToolResult {
+                        name: "file_read".into(),
+                        output: "a".into(),
+                    },
+                ),
+                Ok(
+                    zeroclaw_providers::traits::StreamEvent::PreExecutedToolResult {
+                        name: "shell".into(),
+                        output: "b".into(),
+                    },
+                ),
+                Ok(zeroclaw_providers::traits::StreamEvent::Final),
+            ])
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_executed_tool_results_keep_ids_when_calls_overlap() {
+        let provider = Box::new(PreExecutedToolProvider);
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _ = agent
+            .turn_streamed("use pre-executed tools", event_tx, None)
+            .await
+            .unwrap();
+
+        let mut call_ids = HashMap::new();
+        let mut result_ids = HashMap::new();
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                TurnEvent::ToolCall { id, name, .. } => {
+                    call_ids.insert(name, id);
+                }
+                TurnEvent::ToolResult { id, name, .. } => {
+                    result_ids.insert(name, id);
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(call_ids.len(), 2, "expected two pre-executed tool calls");
+        assert_eq!(
+            result_ids.len(),
+            2,
+            "expected two pre-executed tool results"
+        );
+        assert_eq!(call_ids.get("file_read"), result_ids.get("file_read"));
+        assert_eq!(call_ids.get("shell"), result_ids.get("shell"));
     }
 
     /// Reproduction test for the orphan-tool_results trim bug.
@@ -2050,6 +2701,7 @@ mod tests {
                     id: format!("tc{i}"),
                     name: format!("tool{i}"),
                     arguments: "{}".into(),
+                    extra_content: None,
                 }],
                 reasoning_content: None,
             });
@@ -2092,6 +2744,200 @@ mod tests {
                      entry — pair was split during trim"
                 );
             }
+        }
+    }
+
+    // ── Duplicate narration guard ────────────────────────────────────
+
+    /// When the model returns narration text alongside tool calls, the agent
+    /// must store exactly ONE assistant history entry (AssistantToolCalls) —
+    /// not a plain Chat(assistant) followed by AssistantToolCalls. The latter
+    /// pattern causes providers that enforce role-alternation to reject the
+    /// next request with a consecutive-assistant-role error.
+    #[tokio::test]
+    async fn narration_with_tool_calls_produces_no_consecutive_assistant_entries() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some("I will echo the message.".into()),
+                tool_calls: vec![zeroclaw_providers::ToolCall {
+                    id: "tc1".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        });
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        agent.turn("hi").await.unwrap();
+
+        let history = agent.history();
+        for window in history.windows(2) {
+            let prev_is_assistant_chat = matches!(
+                &window[0],
+                ConversationMessage::Chat(m) if m.role == "assistant"
+            );
+            let next_is_tool_calls =
+                matches!(&window[1], ConversationMessage::AssistantToolCalls { .. });
+            assert!(
+                !(prev_is_assistant_chat && next_is_tool_calls),
+                "history contains Chat(assistant) immediately before AssistantToolCalls — \
+                 duplicate narration push was not removed"
+            );
+        }
+    }
+
+    /// Streaming mock that emits narration text + tool call on the first turn,
+    /// then a plain text response on the second. Used to verify the streaming
+    /// path has the same duplicate-narration guard as the blocking path.
+    struct NarrationStreamProvider {
+        call_count: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl Provider for NarrationStreamProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                        zeroclaw_providers::traits::StreamChunk {
+                            delta: "I will echo the message.".into(),
+                            is_final: false,
+                            reasoning: None,
+                            token_count: 0,
+                        },
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::ToolCall(
+                        zeroclaw_providers::ToolCall {
+                            id: "tc1".into(),
+                            name: "echo".into(),
+                            arguments: "{}".into(),
+                            extra_content: None,
+                        },
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            } else {
+                stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                        zeroclaw_providers::traits::StreamChunk {
+                            delta: "done".into(),
+                            is_final: false,
+                            reasoning: None,
+                            token_count: 0,
+                        },
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_narration_with_tool_calls_produces_no_consecutive_assistant_entries() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let provider = Box::new(NarrationStreamProvider {
+            call_count: Arc::new(Mutex::new(0)),
+        });
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent.turn_streamed("hi", event_tx, None).await.unwrap();
+
+        let history = agent.history();
+        for window in history.windows(2) {
+            let prev_is_assistant_chat = matches!(
+                &window[0],
+                ConversationMessage::Chat(m) if m.role == "assistant"
+            );
+            let next_is_tool_calls =
+                matches!(&window[1], ConversationMessage::AssistantToolCalls { .. });
+            assert!(
+                !(prev_is_assistant_chat && next_is_tool_calls),
+                "streaming path: history contains Chat(assistant) immediately before \
+                 AssistantToolCalls — duplicate narration push was not removed"
+            );
         }
     }
 

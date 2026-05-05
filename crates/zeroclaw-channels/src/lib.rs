@@ -4,6 +4,8 @@ pub mod orchestrator;
 pub mod util;
 
 // Always-compiled channels and utilities (no feature gate)
+#[cfg(feature = "channel-acp-server")]
+pub mod acp_channel;
 pub mod cli;
 pub mod link_enricher;
 pub mod transcription;
@@ -66,6 +68,8 @@ pub mod voice_wake;
 pub mod wati;
 #[cfg(feature = "channel-webhook")]
 pub mod webhook;
+#[cfg(feature = "channel-wechat")]
+pub mod wechat;
 #[cfg(feature = "channel-wecom")]
 pub mod wecom;
 #[cfg(feature = "channel-whatsapp-cloud")]

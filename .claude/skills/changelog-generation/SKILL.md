@@ -15,7 +15,7 @@ checked out and up to date.
 
 Read the protocol reference before doing anything else:
 
-- `docs/contributing/changelog-generation.md` — **the full procedure**; follow it
+- `docs/book/src/maintainers/changelog-generation.md` — **the full procedure**; follow it
   exactly for every run. It defines the commit range logic, categorisation rules,
   GraphQL contributor resolution, filter lists, output format, and release workflow
   integration.
@@ -130,7 +130,7 @@ to `master` directly.
 
 ## Execution rules
 
-1. **Always read `docs/contributing/changelog-generation.md` first.** The protocol
+1. **Always read `docs/book/src/maintainers/changelog-generation.md` first.** The protocol
    file is authoritative. If anything in this skill conflicts with it, the protocol
    wins.
 2. **Always report the resolved range before doing any work.** The user should
@@ -147,5 +147,6 @@ to `master` directly.
 7. **Always confirm before committing.** Show the user the exact commit message
    and ask for an explicit yes. Do not infer consent from prior steps.
 8. **Never push to `master` directly.** Always push to the open release PR branch.
-9. **Never delete `CHANGELOG-next.md` manually.** The release workflow deletes it
-   automatically after a successful stable release.
+9. **Do not delete `CHANGELOG-next.md` manually.** The file is intentionally left on
+   `master` between releases and is overwritten at the start of the next release cycle.
+   No cleanup is needed after a release ships.

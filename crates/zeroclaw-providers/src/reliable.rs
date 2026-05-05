@@ -450,7 +450,7 @@ impl Provider for ReliableProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
@@ -601,7 +601,7 @@ impl Provider for ReliableProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
@@ -772,7 +772,7 @@ impl Provider for ReliableProvider {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
@@ -929,7 +929,7 @@ impl Provider for ReliableProvider {
         &self,
         request: ChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
@@ -1105,7 +1105,7 @@ impl Provider for ReliableProvider {
         &self,
         request: ChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
@@ -1170,7 +1170,7 @@ impl Provider for ReliableProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         // Try each provider/model combination for streaming
@@ -1238,7 +1238,7 @@ impl Provider for ReliableProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         // Try each provider/model combination for streaming with history.
@@ -1314,7 +1314,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if attempt <= self.fail_until_attempt {
@@ -1327,7 +1327,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if attempt <= self.fail_until_attempt {
@@ -1352,7 +1352,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.models_seen.lock().push(model.to_string());
@@ -1382,7 +1382,10 @@ mod tests {
             1,
         );
 
-        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        let result = provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .unwrap();
         assert_eq!(result, "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -1404,7 +1407,10 @@ mod tests {
             1,
         );
 
-        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        let result = provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .unwrap();
         assert_eq!(result, "recovered");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
@@ -1439,7 +1445,10 @@ mod tests {
             1,
         );
 
-        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        let result = provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .unwrap();
         assert_eq!(result, "from fallback");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
@@ -1473,7 +1482,7 @@ mod tests {
         );
 
         let err = provider
-            .simple_chat("hello", "test", 0.0)
+            .simple_chat("hello", "test", Some(0.0))
             .await
             .expect_err("all providers should fail");
         let msg = err.to_string();
@@ -1556,7 +1565,7 @@ mod tests {
         .with_model_fallbacks(model_fallbacks);
 
         let err = provider
-            .simple_chat("hello", "gpt-5.3-codex", 0.0)
+            .simple_chat("hello", "gpt-5.3-codex", Some(0.0))
             .await
             .expect_err("context window overflow should fail fast");
         let msg = err.to_string();
@@ -1584,7 +1593,7 @@ mod tests {
         );
 
         let err = provider
-            .simple_chat("hello", "glm-4.7", 0.0)
+            .simple_chat("hello", "glm-4.7", Some(0.0))
             .await
             .expect_err("provider should fail");
         let msg = err.to_string();
@@ -1625,7 +1634,10 @@ mod tests {
             1,
         );
 
-        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        let result = provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .unwrap();
         assert_eq!(result, "from fallback");
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
@@ -1651,7 +1663,7 @@ mod tests {
 
         let messages = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
         let result = provider
-            .chat_with_history(&messages, "test", 0.0)
+            .chat_with_history(&messages, "test", Some(0.0))
             .await
             .unwrap();
         assert_eq!(result, "history ok");
@@ -1690,7 +1702,7 @@ mod tests {
 
         let messages = vec![ChatMessage::user("hello")];
         let result = provider
-            .chat_with_history(&messages, "test", 0.0)
+            .chat_with_history(&messages, "test", Some(0.0))
             .await
             .unwrap();
         assert_eq!(result, "fallback ok");
@@ -1724,7 +1736,7 @@ mod tests {
         .with_model_fallbacks(fallbacks);
 
         let result = provider
-            .simple_chat("hello", "claude-opus", 0.0)
+            .simple_chat("hello", "claude-opus", Some(0.0))
             .await
             .unwrap();
         assert_eq!(result, "ok from sonnet");
@@ -1759,7 +1771,7 @@ mod tests {
         .with_model_fallbacks(fallbacks);
 
         let err = provider
-            .simple_chat("hello", "model-a", 0.0)
+            .simple_chat("hello", "model-a", Some(0.0))
             .await
             .expect_err("all models should fail");
         assert!(err.to_string().contains("All providers/models failed"));
@@ -1785,7 +1797,10 @@ mod tests {
             1,
         );
         // No model_fallbacks set — should work exactly as before
-        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        let result = provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .unwrap();
         assert_eq!(result, "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -2031,7 +2046,7 @@ mod tests {
             1,
         );
 
-        let result = provider.simple_chat("hello", "test", 0.0).await;
+        let result = provider.simple_chat("hello", "test", Some(0.0)).await;
         assert!(result.is_err(), "401 should fail without retries");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -2057,7 +2072,7 @@ mod tests {
             1,
         );
 
-        let result = provider.simple_chat("hello", "test", 0.0).await;
+        let result = provider.simple_chat("hello", "test", Some(0.0)).await;
         assert!(
             result.is_err(),
             "plan-restricted 429 should fail quickly without retrying"
@@ -2087,7 +2102,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(self.response_text.to_string())
         }
@@ -2100,7 +2115,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if attempt <= self.fail_until_attempt {
@@ -2122,6 +2137,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "shell".to_string(),
             arguments: r#"{"command":"date"}"#.to_string(),
+            extra_content: None,
         };
         let provider = ReliableProvider::new(
             vec![(
@@ -2143,7 +2159,10 @@ mod tests {
             messages: &messages,
             tools: None,
         };
-        let result = provider.chat(request, "test-model", 0.0).await.unwrap();
+        let result = provider
+            .chat(request, "test-model", Some(0.0))
+            .await
+            .unwrap();
 
         assert_eq!(result.text.as_deref(), Some("ok"));
         assert_eq!(result.tool_calls.len(), 1);
@@ -2158,6 +2177,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "shell".to_string(),
             arguments: r#"{"command":"date"}"#.to_string(),
+            extra_content: None,
         };
         let provider = ReliableProvider::new(
             vec![(
@@ -2179,7 +2199,10 @@ mod tests {
             messages: &messages,
             tools: None,
         };
-        let result = provider.chat(request, "test-model", 0.0).await.unwrap();
+        let result = provider
+            .chat(request, "test-model", Some(0.0))
+            .await
+            .unwrap();
 
         assert_eq!(result.text.as_deref(), Some("recovered"));
         assert!(
@@ -2251,7 +2274,7 @@ mod tests {
             tools: None,
         };
         let err = provider
-            .chat(request, "test", 0.0)
+            .chat(request, "test", Some(0.0))
             .await
             .expect_err("all providers should fail");
         let msg = err.to_string();
@@ -2279,7 +2302,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(self.response_text.to_string())
         }
@@ -2292,7 +2315,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.models_seen.lock().push(model.to_string());
@@ -2340,7 +2363,10 @@ mod tests {
             messages: &messages,
             tools: None,
         };
-        let result = provider.chat(request, "claude-opus", 0.0).await.unwrap();
+        let result = provider
+            .chat(request, "claude-opus", Some(0.0))
+            .await
+            .unwrap();
         assert_eq!(result.text.as_deref(), Some("ok from sonnet"));
 
         let seen = mock.models_seen.lock();
@@ -2388,7 +2414,7 @@ mod tests {
             messages: &messages,
             tools: None,
         };
-        let result = provider.chat(request, "test", 0.0).await.unwrap();
+        let result = provider.chat(request, "test", Some(0.0)).await.unwrap();
         assert_eq!(result.text.as_deref(), Some("from fallback"));
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
@@ -2472,7 +2498,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
@@ -2481,7 +2507,7 @@ mod tests {
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             self.message_counts.lock().push(messages.len());
@@ -2519,7 +2545,7 @@ mod tests {
         ];
 
         let result = provider
-            .chat_with_history(&messages, "local-model", 0.0)
+            .chat_with_history(&messages, "local-model", Some(0.0))
             .await
             .unwrap();
         assert_eq!(result, "recovered after truncation");
@@ -2549,7 +2575,7 @@ mod tests {
         ];
 
         let result = provider
-            .chat_with_history(&messages, "local-model", 0.0)
+            .chat_with_history(&messages, "local-model", Some(0.0))
             .await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -2637,7 +2663,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
@@ -2654,7 +2680,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
@@ -2663,6 +2689,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "shell".to_string(),
                     arguments: r#"{"command":"date"}"#.to_string(),
+                    extra_content: None,
                 })),
                 Ok(StreamEvent::Final),
             ])
@@ -2708,7 +2735,7 @@ mod tests {
                 tools: Some(&tools),
             },
             "model",
-            0.0,
+            Some(0.0),
             StreamOptions::new(true),
         );
 
@@ -2749,7 +2776,7 @@ mod tests {
                 tools: Some(&tools),
             },
             "model",
-            0.0,
+            Some(0.0),
             StreamOptions::new(true),
         );
 
@@ -2779,7 +2806,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
@@ -2792,7 +2819,7 @@ mod tests {
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
@@ -2827,8 +2854,12 @@ mod tests {
             ChatMessage::assistant("resp1"),
             ChatMessage::user("msg2"),
         ];
-        let mut stream =
-            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+        let mut stream = provider.stream_chat_with_history(
+            &messages,
+            "model",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
 
         let first = stream.next().await.unwrap().unwrap();
         assert_eq!(first.delta, "4", "should pass all 4 messages to provider");
@@ -2865,8 +2896,12 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("hello")];
-        let mut stream =
-            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+        let mut stream = provider.stream_chat_with_history(
+            &messages,
+            "model",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
 
         let first = stream.next().await.unwrap().unwrap();
         assert_eq!(first.delta, "1");
@@ -2897,8 +2932,12 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("hello")];
-        let mut stream =
-            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+        let mut stream = provider.stream_chat_with_history(
+            &messages,
+            "model",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
 
         let first = stream.next().await.unwrap();
         let err = first.expect_err("should fail when no provider supports streaming");
@@ -2937,7 +2976,10 @@ mod tests {
                 1,
             );
 
-            let resp = provider.simple_chat("hi", "test-model", 0.0).await.unwrap();
+            let resp = provider
+                .simple_chat("hi", "test-model", Some(0.0))
+                .await
+                .unwrap();
             assert_eq!(resp, "hello from working");
 
             let fb = take_last_provider_fallback();
