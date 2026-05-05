@@ -50,6 +50,13 @@ export default function AgentChat() {
   const [compact, setCompact] = useState(() => {
     try { return localStorage.getItem('zeroclaw_chat_compact') === '1'; } catch { return false; }
   });
+  // #6348: tool execution is plumbing, not chat. Default off so tool_call /
+  // tool_result frames do not surface inline in the conversation transcript.
+  // Power users can flip 'zeroclaw_show_tool_activity' in localStorage; a
+  // proper toggle UI is a follow-up.
+  const [showToolActivity] = useState(() => {
+    try { return localStorage.getItem('zeroclaw_show_tool_activity') === '1'; } catch { return false; }
+  });
   const pendingContentRef = useRef('');
   const pendingThinkingRef = useRef('');
   // Snapshot of thinking captured at chunk_reset, so it survives the reset.
@@ -180,6 +187,14 @@ export default function AgentChat() {
         }
 
         case 'tool_call': {
+          // #6348: tool execution is plumbing, not chat content. Skip
+          // inline rendering unless the operator explicitly opts in via
+          // localStorage 'zeroclaw_show_tool_activity'. A future commit
+          // will route tool activity into the existing collapsed
+          // Thinking strip so it has a discoverable home.
+          if (!showToolActivity) {
+            break;
+          }
           const toolName = msg.name ?? 'unknown';
           const toolArgs = msg.args;
           setMessages((prev) => {
@@ -209,6 +224,11 @@ export default function AgentChat() {
         }
 
         case 'tool_result': {
+          // #6348: tool errors and results should not surface as chat
+          // content. Same gate as tool_call above.
+          if (!showToolActivity) {
+            break;
+          }
           setMessages((prev) => {
             // Forward scan: find the FIRST unresolved toolCall (order-guaranteed by backend)
             const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
