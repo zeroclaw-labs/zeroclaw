@@ -376,7 +376,7 @@ struct ChannelRuntimeContext {
     query_classification: zeroclaw_config::schema::QueryClassificationConfig,
     ack_reactions: bool,
     show_tool_calls: bool,
-    session_store: Option<Arc<zeroclaw_infra::session_store::SessionStore>>,
+    session_store: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
     /// `[autonomy]` config; auto-denies tools that would need interactive
@@ -5769,10 +5769,16 @@ pub async fn start_channels(
         ack_reactions: config.channels.ack_reactions,
         show_tool_calls: config.channels.show_tool_calls,
         session_store: if config.channels.session_persistence {
-            match zeroclaw_infra::session_store::SessionStore::new(&config.workspace_dir) {
-                Ok(store) => {
-                    tracing::info!("📂 Session persistence enabled");
-                    Some(Arc::new(store))
+            match zeroclaw_infra::make_session_backend(
+                &config.workspace_dir,
+                &config.channels.session_backend,
+            ) {
+                Ok(backend) => {
+                    tracing::info!(
+                        "📂 Session persistence enabled (backend: {})",
+                        config.channels.session_backend
+                    );
+                    Some(backend)
                 }
                 Err(e) => {
                     tracing::warn!("Session persistence disabled: {e}");
@@ -5808,22 +5814,15 @@ pub async fn start_channels(
     if let Some(ref store) = runtime_ctx.session_store {
         let mut hydrated = 0usize;
         let mut orphans_closed = 0usize;
-        let session_keys = store.list_sessions();
 
-        // Sort by file mtime (most recently modified first) for predictable hydration.
-        // Collect mtimes up front to avoid repeated FS reads inside the comparator.
-        let mut keyed: Vec<_> = session_keys
-            .into_iter()
-            .map(|k| {
-                let mt = store
-                    .session_mtime(&k)
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                (k, mt)
-            })
-            .collect();
-        keyed.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-        keyed.truncate(MAX_CONVERSATION_SENDERS);
-        let session_keys: Vec<String> = keyed.into_iter().map(|(k, _)| k).collect();
+        // Sort by last activity (most recent first) for predictable hydration.
+        // The SessionBackend trait carries last_activity in metadata, so any
+        // backend (JSONL, SQLite) can answer this question without a side
+        // call to a backend-specific mtime method.
+        let mut metadata = store.list_sessions_with_metadata();
+        metadata.sort_by_key(|m| std::cmp::Reverse(m.last_activity));
+        metadata.truncate(MAX_CONVERSATION_SENDERS);
+        let session_keys: Vec<String> = metadata.into_iter().map(|m| m.key).collect();
 
         let mut histories = runtime_ctx
             .conversation_histories
@@ -6603,7 +6602,8 @@ mod tests {
     #[test]
     fn rollback_orphan_user_turn_also_removes_from_session_store() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let store: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
+            Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
 
         let sender = "telegram_u4".to_string();
 
