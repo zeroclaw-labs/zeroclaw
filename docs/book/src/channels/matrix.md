@@ -22,9 +22,7 @@ Before testing message flow:
 
 1. The bot account is joined to the target room.
 2. The access token belongs to the same bot account.
-3. `room_id` is correct:
-   - preferred: canonical room ID (`!room:server`)
-   - supported: room alias (`#alias:server`) — ZeroClaw resolves it
+3. `allowed_rooms` includes the target room (or is empty to allow all rooms the bot has joined). Each entry is either a canonical room ID (`!room:server`) or an alias (`#alias:server`); ZeroClaw resolves aliases.
 4. `allowed_users` allows the sender (`["*"]` for open testing).
 5. For E2EE rooms, the bot device has received encryption keys for the room.
 
@@ -42,16 +40,16 @@ Or set individual fields after onboarding:
 
 ```bash
 zeroclaw config set channels.matrix.homeserver https://matrix.example.com
-zeroclaw config set channels.matrix.room-id '!room:matrix.example.com'
 zeroclaw config set channels.matrix.access-token           # prompts, input masked
 zeroclaw config set channels.matrix.user-id @bot:matrix.example.com
 zeroclaw config set channels.matrix.device-id ABCDEF1234
 zeroclaw config set channels.matrix.allowed-users '["*"]'   # open for testing
+zeroclaw config set channels.matrix.allowed-rooms '["!room:matrix.example.com"]'  # empty list = allow all joined rooms
 zeroclaw config set channels.matrix.ack-reactions true       # default: true (👀 → ✅)
 zeroclaw config set channels.matrix.reply-in-thread true     # default: true
 ```
 
-Required: `homeserver`, `access-token`, `room-id`. Strongly recommended for E2EE: `user-id` and `device-id`. For the full field index, see the [Config reference](../reference/config.md).
+Required: `homeserver`, `access-token`, `allowed-users`. Strongly recommended for E2EE: `user-id` and `device-id`. `allowed-rooms` is optional — leave empty to allow every room the bot has joined, or list explicit IDs/aliases to restrict. For the full field index, see the [Config reference](../reference/config.md).
 
 > **Don't have an `access-token` yet?** See §3 below — it walks through the Matrix password-login API call that mints a token plus a stable `device_id` in one shot. If you only need to look up `device_id` for a token you already have, see §5H.
 

@@ -11,7 +11,8 @@ Nextcloud Talk integration via the Talk Bot webhook protocol. Self-hosted, feder
 ## Prerequisites
 
 - **Nextcloud server** with the Talk app enabled (v17 or later recommended)
-- **Bot account** in Talk settings — give it a display name (e.g. `zeroclaw-bot`) and generate a bot webhook URL
+- **Bot account** in Talk settings — give it a display name (e.g. `zeroclaw-bot`)
+- **Bot app token** from the Talk admin UI for OCS API bearer auth (used for outbound replies)
 - **Webhook secret** from the Talk admin UI if you want signature verification (strongly recommended)
 - **Publicly-reachable gateway** — see [Setup → Container](../setup/container.md) for tunnel options if self-hosted
 
@@ -20,13 +21,12 @@ Nextcloud Talk integration via the Talk Bot webhook protocol. Self-hosted, feder
 ```toml
 [channels.nextcloud_talk]
 enabled = true
-server_url = "https://cloud.example.com"
-bot_name = "zeroclaw-bot"                      # the display name of the bot in Talk
-webhook_secret = "..."                         # shared secret from Talk admin UI
-username = "..."                               # bot's Nextcloud login for outbound API
-password = "..."                               # app password (not the account password)
-allowed_rooms = ["ROOM-TOKEN-1"]               # tokens from webhook payloads
+base_url = "https://cloud.example.com"
+app_token = "..."                              # OCS API bearer token (bot app token)
+webhook_secret = "..."                         # shared secret for HMAC-SHA256 webhook verification
+bot_name = "zeroclaw-bot"                      # display name; filters out the bot's own posts
 allowed_users = ["*"]                          # actor IDs; "*" = allow all (use for first-time test only)
+proxy_url = ""                                 # optional per-channel proxy override
 ```
 
 Environment override: `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` takes precedence over the config value. Useful for rotating secrets without editing the config.
@@ -93,8 +93,9 @@ Nextcloud Talk does not support message edits via the Bot API, so streaming draf
 ## Self-hosting notes
 
 - TLS: terminate at your reverse proxy; webhook signature verification works over HTTP-to-container loopback
-- The OCS API is authenticated via HTTP Basic — use an app password, not the account password
+- The OCS API is authenticated via Bearer token — use the bot app token from the Talk admin UI
 - Rate limits are Nextcloud-server dependent; the default bot doesn't run into them in normal conversation cadences
+- Per-channel proxy: set `proxy_url` to override the global `[proxy]` setting for Nextcloud Talk only (`http://`, `https://`, `socks5://`, `socks5h://`)
 
 ## See also
 
