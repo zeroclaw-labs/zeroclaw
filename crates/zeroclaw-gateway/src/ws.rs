@@ -12,6 +12,37 @@
 //! Server -> Client: {"type":"done","full_response":"..."}
 //! ```
 //!
+//! ## Tool approvals (in progress, see #6207)
+//!
+//! When supervised-mode tool calls hit the `ApprovalManager`, the server
+//! emits an `approval_request` and pauses the tool loop until the client
+//! responds. Mirrors the Telegram inline-keyboard / CLI Y/N/A pattern,
+//! but over the WS frame transport.
+//!
+//! ```text
+//! Server -> Client: {
+//!     "type": "approval_request",
+//!     "request_id": "<uuid>",
+//!     "tool": "shell",
+//!     "arguments_summary": "command: git status",
+//!     "risk_tier": "medium",
+//!     "timeout_secs": 120
+//! }
+//! Client -> Server: {
+//!     "type": "approval_response",
+//!     "request_id": "<uuid>",
+//!     "decision": "approve" | "deny" | "always"
+//! }
+//! ```
+//!
+//! Semantics target parity with `process_channel_message` + `ApprovalManager`:
+//! `approve` runs the tool once, `always` adds the tool to the session
+//! allowlist for the rest of the conversation, `deny` returns a structured
+//! error to the model that mirrors Telegram's "Denied by user" response.
+//! When no client is connected (or the client disconnects mid-prompt) the
+//! tool call is auto-denied with the same structured error after the
+//! `timeout_secs` window expires.
+//!
 //! Query params:
 //! - `session_id` — resume or create a session (default: new UUID)
 //! - `name` — optional human-readable label for the session
@@ -576,6 +607,19 @@ async fn process_chat_message(
                 TurnEvent::ToolResult { id, name, output } => {
                     serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
                 }
+                // TODO(#6207): Add TurnEvent::ApprovalRequest variant in
+                // zeroclaw-runtime so the runtime can pause the tool loop
+                // and emit:
+                //   { "type": "approval_request", "request_id": <uuid>,
+                //     "tool": ..., "arguments_summary": ..., "risk_tier": ...,
+                //     "timeout_secs": ... }
+                // Inbound `approval_response` frames need to round-trip
+                // back to the same ApprovalManager waiter the CLI/channel
+                // path uses (see the gate at
+                // crates/zeroclaw-runtime/src/agent/loop_.rs:1572-1619).
+                // Today this branch is unreachable because Agent::turn_streamed
+                // never constructs an ApprovalManager — that's the actual
+                // bug this PR is structured around fixing.
             };
             let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
         }
