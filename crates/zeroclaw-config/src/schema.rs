@@ -770,9 +770,7 @@ impl ModelEndpoint for AzureEndpoint {
             // Azure's URI is a template — substitution happens in the
             // AzureModelProvider runtime constructor against the typed
             // config's resource / deployment fields.
-            Self::Default => {
-                "https://{resource}.openai.azure.com/openai/deployments/{deployment}"
-            }
+            Self::Default => "https://{resource}.openai.azure.com/openai/deployments/{deployment}",
         }
     }
 }
@@ -791,15 +789,27 @@ pub struct AzureModelProviderConfig {
     /// Azure resource name (the `<resource>` part of `<resource>.openai.azure.com`).
     /// Accepts the legacy `azure_openai_resource` key on deserialize for V2
     /// compatibility.
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "azure_openai_resource")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "azure_openai_resource"
+    )]
     pub resource: Option<String>,
     /// Azure deployment name — the deployment created in Azure AI Studio that
     /// wraps a specific model.
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "azure_openai_deployment")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "azure_openai_deployment"
+    )]
     pub deployment: Option<String>,
     /// Azure API version string (e.g. `2024-10-21`). Must match a version the
     /// resource supports.
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "azure_openai_api_version")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "azure_openai_api_version"
+    )]
     pub api_version: Option<String>,
 }
 
@@ -906,7 +916,9 @@ impl ModelEndpoint for QwenEndpoint {
         match self {
             Self::Cn => "https://dashscope.aliyuncs.com/compatible-mode/v1",
             Self::Intl => "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-            Self::Code => "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
+            Self::Code => {
+                "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
+            }
         }
     }
 }
@@ -11022,9 +11034,7 @@ impl Config {
                         format!("model_providers.{profile_name}.uri is not a valid URL")
                     })?;
                     if !matches!(parsed.scheme(), "http" | "https") {
-                        anyhow::bail!(
-                            "model_providers.{profile_name}.uri must use http/https"
-                        );
+                        anyhow::bail!("model_providers.{profile_name}.uri must use http/https");
                     }
                 }
 

@@ -34,14 +34,14 @@ fn has_serde_flatten(field: &syn::Field) -> bool {
 
 fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
     for attr in &field.attrs {
-        if attr.path().is_ident("serde") {
-            if let Ok(nested) = attr.parse_args_with(
+        if attr.path().is_ident("serde")
+            && let Ok(nested) = attr.parse_args_with(
                 syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
-            ) {
-                for meta in &nested {
-                    if meta.path().is_ident(ident) {
-                        return true;
-                    }
+            )
+        {
+            for meta in &nested {
+                if meta.path().is_ident(ident) {
+                    return true;
                 }
             }
         }
