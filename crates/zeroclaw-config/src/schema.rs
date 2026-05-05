@@ -886,6 +886,95 @@ impl Default for MoonshotModelProviderConfig {
     }
 }
 
+// ── Qwen (multi-region + auth_mode exemplar) ──
+
+/// Qwen endpoint variants. Operators pick the region matching their account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QwenEndpoint {
+    /// Mainland China (DashScope).
+    Cn,
+    /// International (alicloud international).
+    Intl,
+    /// Code-specialist endpoint.
+    Code,
+}
+
+impl ModelEndpoint for QwenEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Cn => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            Self::Intl => "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            Self::Code => "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
+        }
+    }
+}
+
+/// Qwen model provider config. Multi-region (`endpoint` required) and
+/// supports both API key and OAuth flows (`auth_mode` chooses which).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.qwen"]
+pub struct QwenModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    pub endpoint: QwenEndpoint,
+    /// Auth flow. Defaults to `api_key`; set to `oauth` to use the vendor's
+    /// OAuth-cache integration instead of the `api_key` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<AuthMode>,
+}
+
+impl Default for QwenModelProviderConfig {
+    fn default() -> Self {
+        Self {
+            base: ModelProviderConfig::default(),
+            endpoint: QwenEndpoint::Intl,
+            auth_mode: None,
+        }
+    }
+}
+
+// ── Bedrock (computed-endpoint exemplar, AWS region template) ──
+
+/// AWS Bedrock endpoint template. Single variant; the URL is computed at
+/// runtime by substituting `{region}` from the typed config field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum BedrockEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for BedrockEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            // Bedrock URI is a template — substitution happens in the
+            // BedrockModelProvider runtime constructor against cfg.region.
+            Self::Default => "https://bedrock-runtime.{region}.amazonaws.com",
+        }
+    }
+}
+
+/// AWS Bedrock model provider config. Carries the AWS region (the URI
+/// template substitutes `{region}` from this field). Bedrock auth is
+/// SigV4 — credentials come from the standard AWS credential chain
+/// (env vars, instance metadata, profile), not from `api_key`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.bedrock"]
+pub struct BedrockModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// AWS region for the Bedrock endpoint (e.g. `us-east-1`, `eu-west-1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+}
+
 // ── Delegate Tool Configuration ─────────────────────────────────
 
 /// Global delegate tool configuration for default timeout values.
@@ -11829,6 +11918,8 @@ impl_enum_prop_kind!(
     AzureEndpoint,
     AnthropicEndpoint,
     MoonshotEndpoint,
+    QwenEndpoint,
+    BedrockEndpoint,
 );
 
 impl HasPropKind for serde_json::Value {
