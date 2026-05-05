@@ -423,8 +423,11 @@ fi
 
 # ── Decide: pre-built or source ───────────────────────────────────
 
-# --minimal or --features imply source
-if [ "$MINIMAL" = true ] || [ -n "$USER_FEATURES" ]; then
+# --minimal, --features, --without-gateway, or --preset full imply source.
+# Prebuilt binaries always ship with default features, so any flag that
+# changes the feature set must force a source build.
+if [ "$MINIMAL" = true ] || [ -n "$USER_FEATURES" ] \
+   || [ "$WITH_GATEWAY" = "false" ] || [ "$PRESET" = "full" ]; then
   INSTALL_MODE="source"
 fi
 
@@ -556,14 +559,10 @@ esac
 
 # ── Build feature flags ──────────────────────────────────────────
 #
-# Default features come from Cargo.toml (`agent-runtime`, `acp-bridge`,
-# `gateway`, `tui-onboarding`, `observability-prometheus`,
-# `schema-export`). Cargo cannot remove individual entries from
-# `default`, so toggling `gateway` off requires `--no-default-features`
-# plus an explicit list of the others. Keep the list below in sync with
-# Cargo.toml's `default = [...]`.
-
-DEFAULT_FEATURES_NO_GATEWAY="agent-runtime,acp-bridge,tui-onboarding,observability-prometheus,schema-export"
+# Cargo cannot remove individual entries from `default`, so toggling
+# `gateway` off requires `--no-default-features` plus an explicit list
+# of the rest. Derive that list from $DEFAULT_FEATURES (parsed from
+# Cargo.toml above) so it stays in sync automatically.
 
 CARGO_FLAGS=""
 
@@ -572,10 +571,11 @@ if [ "$MINIMAL" = true ]; then
 fi
 
 # `--without-gateway` overrides the default-features set: switch to
-# --no-default-features and re-add everything except `gateway`.
+# --no-default-features and re-add everything in `default` except gateway.
 if [ "$WITH_GATEWAY" = "false" ] && [ "$MINIMAL" != true ]; then
   CARGO_FLAGS="--no-default-features"
-  USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$DEFAULT_FEATURES_NO_GATEWAY"
+  defaults_no_gateway=$(printf '%s' "$DEFAULT_FEATURES" | tr ',' '\n' | grep -vx gateway | paste -sd, -)
+  USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$defaults_no_gateway"
 fi
 
 # `--with-gateway` is a no-op when default features are on (gateway is
