@@ -1,788 +1,394 @@
+//! Integration catalog.
+//!
+//! Every entry corresponds to either:
+//! - a schema field (chat channels via `ChannelsConfig::nested_option_entries`,
+//!   AI providers via `providers.fallback`), or
+//! - a runtime built-in (`Shell`, `File System`, `Weather`, `Browser`, `Cron`,
+//!   `Google Workspace`), or
+//! - a compile-time platform fact (`cfg!(target_os = ...)`).
+//!
+//! There is no hand-maintained channel list. Adding a
+//! `pub foo: Option<FooConfig>` field with `#[nested]` to `ChannelsConfig`
+//! surfaces a `Foo` integration entry automatically; no edit here required.
+//! There is also no "coming soon" status — if it is not in the schema or
+//! a real built-in, it does not get listed.
+
 use super::{IntegrationCategory, IntegrationEntry, IntegrationStatus};
+use zeroclaw_config::schema::Config;
 use zeroclaw_providers::{
     is_glm_alias, is_minimax_alias, is_moonshot_alias, is_qianfan_alias, is_qwen_alias,
     is_zai_alias,
 };
 
-/// Generates a `status_fn` for an `Option<ChannelConfig>` field on
-/// `Config::channels`. The closure tests `is_some()` and maps to
-/// `Active` / `Available` per the standard channel-presence convention.
-///
-/// Capture-free, so the result coerces cleanly to the `fn(&Config) ->
-/// IntegrationStatus` field type on `IntegrationEntry`. Removes the
-/// 7-line boilerplate this file previously repeated ~50 times.
-macro_rules! channel_active {
-    ($field:ident) => {
-        |c| {
-            if c.channels.$field.is_some() {
-                IntegrationStatus::Active
-            } else {
-                IntegrationStatus::Available
+/// Map snake_case schema field names to display names. Anything not in
+/// this table title-cases the snake_case name (e.g. `discord_history`
+/// becomes "Discord History"). Override here when title-case looks
+/// wrong (acronyms, brand casing).
+fn channel_display_name(field: &str) -> String {
+    match field {
+        "imessage" => "iMessage".into(),
+        "qq" => "QQ Official".into(),
+        "irc" => "IRC".into(),
+        "mqtt" => "MQTT".into(),
+        "wati" => "WATI".into(),
+        "wecom" => "WeCom".into(),
+        "wechat" => "WeChat".into(),
+        "dingtalk" => "DingTalk".into(),
+        "whatsapp" => "WhatsApp".into(),
+        "twitter" => "X / Twitter".into(),
+        "bluesky" => "Bluesky".into(),
+        "clawdtalk" => "ClawdTalk".into(),
+        "voice_call" => "Voice Call".into(),
+        "voice_wake" => "Voice Wake".into(),
+        "voice_duplex" => "Voice Duplex".into(),
+        "gmail_push" => "Gmail Push".into(),
+        "nextcloud_talk" => "Nextcloud Talk".into(),
+        "discord_history" => "Discord History".into(),
+        other => snake_to_title(other),
+    }
+}
+
+fn snake_to_title(s: &str) -> String {
+    s.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
             }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `status_fn` for an AI-model integration keyed off
+/// `providers.fallback`. Accepts one or more literal provider keys
+/// (e.g. `provider_active!("huggingface", "hf")`).
+macro_rules! provider_active {
+    ($c:expr, $($name:expr),+ $(,)?) => {
+        match $c.providers.fallback.as_deref() {
+            $(Some($name))|+ => IntegrationStatus::Active,
+            _ => IntegrationStatus::Available,
         }
     };
 }
 
-/// `status_fn` for an integration that isn't wired up yet. Mirrors the
-/// previous `|_| IntegrationStatus::ComingSoon` literal verbatim, just
-/// named for readability.
-macro_rules! coming_soon {
-    () => {
-        |_| IntegrationStatus::ComingSoon
+/// `status_fn` for an AI-model integration whose provider key is
+/// recognised by an alias predicate (e.g. `is_moonshot_alias`).
+macro_rules! provider_alias_active {
+    ($c:expr, $alias_fn:path) => {
+        if $c.providers.fallback.as_deref().is_some_and($alias_fn) {
+            IntegrationStatus::Active
+        } else {
+            IntegrationStatus::Available
+        }
     };
 }
 
-/// Returns the full catalog of integrations.
-pub fn all_integrations() -> Vec<IntegrationEntry> {
-    vec![
-        // ── Chat Providers ──────────────────────────────────────
-        IntegrationEntry {
-            name: "Telegram",
-            description: "Bot API — long-polling",
-            category: IntegrationCategory::Chat,
-            status_fn: channel_active!(telegram),
-        },
-        IntegrationEntry {
-            name: "Discord",
-            description: "Servers, channels & DMs",
-            category: IntegrationCategory::Chat,
-            status_fn: channel_active!(discord),
-        },
-        IntegrationEntry {
-            name: "Slack",
-            description: "Workspace apps via Web API",
-            category: IntegrationCategory::Chat,
-            status_fn: channel_active!(slack),
-        },
-        IntegrationEntry {
-            name: "Webhooks",
-            description: "HTTP endpoint for triggers",
-            category: IntegrationCategory::Chat,
-            status_fn: channel_active!(webhook),
-        },
-        IntegrationEntry {
-            name: "WhatsApp",
-            description: "Meta Cloud API via webhook",
-            category: IntegrationCategory::Chat,
-            status_fn: channel_active!(whatsapp),
-        },
-        IntegrationEntry {
-            name: "Signal",
-            description: "Privacy-focused via signal-cli",
-            category: IntegrationCategory::Chat,
-            status_fn: channel_active!(signal),
-        },
-        IntegrationEntry {
-            name: "iMessage",
-            description: "macOS AppleScript bridge",
-            category: IntegrationCategory::Chat,
-            status_fn: channel_active!(imessage),
-        },
-        IntegrationEntry {
-            name: "Microsoft Teams",
-            description: "Enterprise chat support",
-            category: IntegrationCategory::Chat,
-            status_fn: coming_soon!(),
-        },
-        IntegrationEntry {
-            name: "Matrix",
-            description: "Matrix protocol (Element)",
-            category: IntegrationCategory::Chat,
-            status_fn: channel_active!(matrix),
-        },
-        IntegrationEntry {
-            name: "Nostr",
-            description: "Decentralized DMs (NIP-04)",
-            category: IntegrationCategory::Chat,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "WebChat",
-            description: "Browser-based chat UI",
-            category: IntegrationCategory::Chat,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Nextcloud Talk",
-            description: "Self-hosted Nextcloud chat",
-            category: IntegrationCategory::Chat,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Zalo",
-            description: "Zalo Bot API",
-            category: IntegrationCategory::Chat,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "DingTalk",
-            description: "DingTalk Stream Mode",
-            category: IntegrationCategory::Chat,
-            status_fn: |c| {
-                if c.channels.dingtalk.is_some() {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "QQ Official",
-            description: "Tencent QQ Bot SDK",
-            category: IntegrationCategory::Chat,
-            status_fn: |c| {
-                if c.channels.qq.is_some() {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        // ── AI Models ───────────────────────────────────────────
-        IntegrationEntry {
-            name: "OpenRouter",
-            description: "200+ models, 1 API key",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("openrouter")
-                    && c.providers
-                        .fallback_provider()
-                        .and_then(|e| e.api_key.as_ref())
-                        .is_some()
-                {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Anthropic",
-            description: "Claude 3.5/4 Sonnet & Opus",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("anthropic") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "OpenAI",
-            description: "GPT-4o, GPT-5, o1",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("openai") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Google",
-            description: "Gemini 2.5 Pro/Flash",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers
-                    .fallback_provider()
-                    .and_then(|e| e.model.as_deref())
-                    .is_some_and(|m| m.starts_with("google/"))
-                {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "DeepSeek",
-            description: "DeepSeek V3 & R1",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers
-                    .fallback_provider()
-                    .and_then(|e| e.model.as_deref())
-                    .is_some_and(|m| m.starts_with("deepseek/"))
-                {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "xAI",
-            description: "Grok 3 & 4",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers
-                    .fallback_provider()
-                    .and_then(|e| e.model.as_deref())
-                    .is_some_and(|m| m.starts_with("x-ai/"))
-                {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Mistral",
-            description: "Mistral Large & Codestral",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers
-                    .fallback_provider()
-                    .and_then(|e| e.model.as_deref())
-                    .is_some_and(|m| m.starts_with("mistral"))
-                {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Ollama",
-            description: "Local models (Llama, etc.)",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("ollama") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Perplexity",
-            description: "Search-augmented AI",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("perplexity") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Hugging Face",
-            description: "Open-source models",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if matches!(c.providers.fallback.as_deref(), Some("huggingface" | "hf")) {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "LM Studio",
-            description: "Local model server",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if matches!(
-                    c.providers.fallback.as_deref(),
-                    Some("lmstudio" | "lm-studio")
-                ) {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Venice",
-            description: "Privacy-first inference (Llama, Opus)",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("venice") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Vercel AI",
-            description: "Vercel AI Gateway",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("vercel") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Cloudflare AI",
-            description: "Cloudflare AI Gateway",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("cloudflare") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Moonshot",
-            description: "Kimi & Kimi Coding",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers
-                    .fallback
-                    .as_deref()
-                    .is_some_and(is_moonshot_alias)
-                {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Synthetic",
-            description: "Synthetic AI models",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("synthetic") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "OpenCode Zen",
-            description: "Code-focused AI models",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("opencode") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "OpenCode Go",
-            description: "Subsidized Code-focused AI models",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("opencode-go") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Z.AI",
-            description: "Z.AI inference",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref().is_some_and(is_zai_alias) {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "GLM",
-            description: "ChatGLM / Zhipu models",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref().is_some_and(is_glm_alias) {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "MiniMax",
-            description: "MiniMax AI models",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers
-                    .fallback
-                    .as_deref()
-                    .is_some_and(is_minimax_alias)
-                {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Qwen",
-            description: "Alibaba DashScope Qwen models",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref().is_some_and(is_qwen_alias) {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Amazon Bedrock",
-            description: "AWS managed model access",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("bedrock") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Qianfan",
-            description: "Baidu AI models",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers
-                    .fallback
-                    .as_deref()
-                    .is_some_and(is_qianfan_alias)
-                {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Groq",
-            description: "Ultra-fast LPU inference",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("groq") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Together AI",
-            description: "Open-source model hosting",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("together") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Fireworks AI",
-            description: "Fast open-source inference",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("fireworks") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Novita AI",
-            description: "Affordable open-source inference",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("novita") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Cohere",
-            description: "Command R+ & embeddings",
-            category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.fallback.as_deref() == Some("cohere") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        // ── Productivity ────────────────────────────────────────
-        IntegrationEntry {
-            name: "Google Workspace",
-            description: "Drive, Gmail, Calendar, Sheets, Docs via gws CLI",
-            category: IntegrationCategory::Productivity,
-            status_fn: |c| {
-                if c.google_workspace.enabled {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "GitHub",
-            description: "Code, issues, PRs",
-            category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Notion",
-            description: "Workspace & databases",
-            category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Apple Notes",
-            description: "Native macOS/iOS notes",
-            category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Apple Reminders",
-            description: "Task management",
-            category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Obsidian",
-            description: "Knowledge graph notes",
-            category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Things 3",
-            description: "GTD task manager",
-            category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Bear Notes",
-            description: "Markdown notes",
-            category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Trello",
-            description: "Kanban boards",
-            category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Linear",
-            description: "Issue tracking",
-            category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        // ── Music & Audio ───────────────────────────────────────
-        IntegrationEntry {
-            name: "Spotify",
-            description: "Music playback control",
-            category: IntegrationCategory::MusicAudio,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Sonos",
-            description: "Multi-room audio",
-            category: IntegrationCategory::MusicAudio,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Shazam",
-            description: "Song recognition",
-            category: IntegrationCategory::MusicAudio,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        // ── Smart Home ──────────────────────────────────────────
-        IntegrationEntry {
-            name: "Home Assistant",
-            description: "Home automation hub",
-            category: IntegrationCategory::SmartHome,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Philips Hue",
-            description: "Smart lighting",
-            category: IntegrationCategory::SmartHome,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "8Sleep",
-            description: "Smart mattress",
-            category: IntegrationCategory::SmartHome,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        // ── Tools & Automation ──────────────────────────────────
-        IntegrationEntry {
-            name: "Browser",
-            description: "Chrome/Chromium control",
-            category: IntegrationCategory::ToolsAutomation,
-            status_fn: |c| {
-                if c.browser.enabled {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Shell",
-            description: "Terminal command execution",
-            category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::Active,
-        },
-        IntegrationEntry {
-            name: "File System",
-            description: "Read/write files",
-            category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::Active,
-        },
-        IntegrationEntry {
-            name: "Cron",
-            description: "Scheduled tasks",
-            category: IntegrationCategory::ToolsAutomation,
-            status_fn: |c| {
-                if c.cron.enabled {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Voice",
-            description: "Voice wake + talk mode",
-            category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Gmail",
-            description: "Email triggers & send",
-            category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "1Password",
-            description: "Secure credentials",
-            category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Weather",
-            description: "Forecasts & conditions",
-            category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::Active,
-        },
-        IntegrationEntry {
-            name: "Canvas",
-            description: "Visual workspace + A2UI",
-            category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        // ── Media & Creative ────────────────────────────────────
-        IntegrationEntry {
-            name: "Image Gen",
-            description: "AI image generation",
-            category: IntegrationCategory::MediaCreative,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "GIF Search",
-            description: "Find the perfect GIF",
-            category: IntegrationCategory::MediaCreative,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Screen Capture",
-            description: "Screenshot & screen control",
-            category: IntegrationCategory::MediaCreative,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Camera",
-            description: "Photo/video capture",
-            category: IntegrationCategory::MediaCreative,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        // ── Social ──────────────────────────────────────────────
-        IntegrationEntry {
-            name: "Twitter/X",
-            description: "Tweet, reply, search",
-            category: IntegrationCategory::Social,
-            status_fn: |_| IntegrationStatus::ComingSoon,
-        },
-        IntegrationEntry {
-            name: "Email",
-            description: "IMAP/SMTP email channel",
-            category: IntegrationCategory::Social,
-            status_fn: |c| {
-                if c.channels.email.is_some() {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        // ── Platforms ───────────────────────────────────────────
-        IntegrationEntry {
-            name: "macOS",
-            description: "Native support + AppleScript",
-            category: IntegrationCategory::Platform,
-            status_fn: |_| {
-                if cfg!(target_os = "macos") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Linux",
-            description: "Native support",
-            category: IntegrationCategory::Platform,
-            status_fn: |_| {
-                if cfg!(target_os = "linux") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
-        },
-        IntegrationEntry {
-            name: "Windows",
-            description: "WSL2 recommended",
-            category: IntegrationCategory::Platform,
-            status_fn: |_| IntegrationStatus::Available,
-        },
-        IntegrationEntry {
-            name: "iOS",
-            description: "Chat via Telegram/Discord",
-            category: IntegrationCategory::Platform,
-            status_fn: |_| IntegrationStatus::Available,
-        },
-        IntegrationEntry {
-            name: "Android",
-            description: "Chat via Telegram/Discord",
-            category: IntegrationCategory::Platform,
-            status_fn: |_| IntegrationStatus::Available,
-        },
-    ]
+/// `status_fn` for an AI-model integration recognised by a model-id
+/// prefix on the resolved fallback provider (e.g. `"google/"`).
+macro_rules! provider_model_prefix_active {
+    ($c:expr, $prefix:expr) => {
+        if $c
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.model.as_deref())
+            .is_some_and(|m| m.starts_with($prefix))
+        {
+            IntegrationStatus::Active
+        } else {
+            IntegrationStatus::Available
+        }
+    };
+}
+
+fn bool_to_status(active: bool) -> IntegrationStatus {
+    if active {
+        IntegrationStatus::Active
+    } else {
+        IntegrationStatus::Available
+    }
+}
+
+fn entry(
+    name: impl Into<String>,
+    description: impl Into<String>,
+    category: IntegrationCategory,
+    status: IntegrationStatus,
+) -> IntegrationEntry {
+    IntegrationEntry {
+        name: name.into(),
+        description: description.into(),
+        category,
+        status,
+    }
+}
+
+/// Returns the integration catalog computed against `config`.
+pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
+    let mut out: Vec<IntegrationEntry> = Vec::new();
+
+    // ── Chat channels (schema-derived) ──
+    // Every `#[nested] Option<XConfig>` field on `ChannelsConfig`
+    // surfaces here. No hand-list, no ComingSoon stand-ins.
+    out.push(entry(
+        "CLI",
+        "In-process interactive shell",
+        IntegrationCategory::Chat,
+        bool_to_status(config.channels.cli),
+    ));
+    for (field, is_set) in config.channels.nested_option_entries() {
+        out.push(entry(
+            channel_display_name(field),
+            "Chat channel",
+            IntegrationCategory::Chat,
+            bool_to_status(is_set),
+        ));
+    }
+
+    // ── AI Models ──
+    // Provider keys live in the schema (`providers.fallback`); the lookup
+    // macros derive status from there.
+    let openrouter_active = config.providers.fallback.as_deref() == Some("openrouter")
+        && config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.api_key.as_ref())
+            .is_some();
+    out.push(entry(
+        "OpenRouter",
+        "200+ models, 1 API key",
+        IntegrationCategory::AiModel,
+        bool_to_status(openrouter_active),
+    ));
+    out.push(entry(
+        "Anthropic",
+        "Claude 3.5/4 Sonnet & Opus",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "anthropic"),
+    ));
+    out.push(entry(
+        "OpenAI",
+        "GPT-4o, GPT-5, o1",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "openai"),
+    ));
+    out.push(entry(
+        "Google",
+        "Gemini 2.5 Pro/Flash",
+        IntegrationCategory::AiModel,
+        provider_model_prefix_active!(config, "google/"),
+    ));
+    out.push(entry(
+        "DeepSeek",
+        "DeepSeek V3 & R1",
+        IntegrationCategory::AiModel,
+        provider_model_prefix_active!(config, "deepseek/"),
+    ));
+    out.push(entry(
+        "xAI",
+        "Grok 3 & 4",
+        IntegrationCategory::AiModel,
+        provider_model_prefix_active!(config, "x-ai/"),
+    ));
+    out.push(entry(
+        "Mistral",
+        "Mistral Large & Codestral",
+        IntegrationCategory::AiModel,
+        provider_model_prefix_active!(config, "mistral"),
+    ));
+    out.push(entry(
+        "Ollama",
+        "Local models (Llama, etc.)",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "ollama"),
+    ));
+    out.push(entry(
+        "Perplexity",
+        "Search-augmented AI",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "perplexity"),
+    ));
+    out.push(entry(
+        "Hugging Face",
+        "Open-source models",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "huggingface", "hf"),
+    ));
+    out.push(entry(
+        "LM Studio",
+        "Local model server",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "lmstudio", "lm-studio"),
+    ));
+    out.push(entry(
+        "Venice",
+        "Privacy-first inference (Llama, Opus)",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "venice"),
+    ));
+    out.push(entry(
+        "Vercel AI",
+        "Vercel AI Gateway",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "vercel"),
+    ));
+    out.push(entry(
+        "Cloudflare AI",
+        "Cloudflare AI Gateway",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "cloudflare"),
+    ));
+    out.push(entry(
+        "Moonshot",
+        "Kimi & Kimi Coding",
+        IntegrationCategory::AiModel,
+        provider_alias_active!(config, is_moonshot_alias),
+    ));
+    out.push(entry(
+        "Synthetic",
+        "Synthetic AI models",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "synthetic"),
+    ));
+    out.push(entry(
+        "OpenCode Zen",
+        "Code-focused AI models",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "opencode"),
+    ));
+    out.push(entry(
+        "OpenCode Go",
+        "Subsidized code-focused AI models",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "opencode-go"),
+    ));
+    out.push(entry(
+        "Z.AI",
+        "Z.AI inference",
+        IntegrationCategory::AiModel,
+        provider_alias_active!(config, is_zai_alias),
+    ));
+    out.push(entry(
+        "GLM",
+        "ChatGLM / Zhipu models",
+        IntegrationCategory::AiModel,
+        provider_alias_active!(config, is_glm_alias),
+    ));
+    out.push(entry(
+        "MiniMax",
+        "MiniMax AI models",
+        IntegrationCategory::AiModel,
+        provider_alias_active!(config, is_minimax_alias),
+    ));
+    out.push(entry(
+        "Qwen",
+        "Alibaba DashScope Qwen models",
+        IntegrationCategory::AiModel,
+        provider_alias_active!(config, is_qwen_alias),
+    ));
+    out.push(entry(
+        "Amazon Bedrock",
+        "AWS managed model access",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "bedrock"),
+    ));
+    out.push(entry(
+        "Qianfan",
+        "Baidu AI models",
+        IntegrationCategory::AiModel,
+        provider_alias_active!(config, is_qianfan_alias),
+    ));
+    out.push(entry(
+        "Groq",
+        "Ultra-fast LPU inference",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "groq"),
+    ));
+    out.push(entry(
+        "Together AI",
+        "Open-source model hosting",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "together"),
+    ));
+    out.push(entry(
+        "Fireworks AI",
+        "Fast open-source inference",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "fireworks"),
+    ));
+    out.push(entry(
+        "Novita AI",
+        "Affordable open-source inference",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "novita"),
+    ));
+    out.push(entry(
+        "Cohere",
+        "Command R+ & embeddings",
+        IntegrationCategory::AiModel,
+        provider_active!(config, "cohere"),
+    ));
+
+    // ── Tools & Automation (runtime built-ins + a few schema bools) ──
+    out.push(entry(
+        "Browser",
+        "Chrome/Chromium control",
+        IntegrationCategory::ToolsAutomation,
+        bool_to_status(config.browser.enabled),
+    ));
+    out.push(entry(
+        "Cron",
+        "Scheduled tasks",
+        IntegrationCategory::ToolsAutomation,
+        bool_to_status(config.cron.enabled),
+    ));
+    out.push(entry(
+        "Google Workspace",
+        "Drive, Gmail, Calendar, Sheets, Docs via gws CLI",
+        IntegrationCategory::ToolsAutomation,
+        bool_to_status(config.google_workspace.enabled),
+    ));
+    out.push(entry(
+        "Shell",
+        "Terminal command execution",
+        IntegrationCategory::ToolsAutomation,
+        IntegrationStatus::Active,
+    ));
+    out.push(entry(
+        "File System",
+        "Read/write files",
+        IntegrationCategory::ToolsAutomation,
+        IntegrationStatus::Active,
+    ));
+    out.push(entry(
+        "Weather",
+        "Forecasts & conditions (wttr.in)",
+        IntegrationCategory::ToolsAutomation,
+        IntegrationStatus::Active,
+    ));
+
+    // ── Platforms (compile-time facts) ──
+    out.push(entry(
+        "macOS",
+        "Native support + AppleScript",
+        IntegrationCategory::Platform,
+        bool_to_status(cfg!(target_os = "macos")),
+    ));
+    out.push(entry(
+        "Linux",
+        "Native support",
+        IntegrationCategory::Platform,
+        bool_to_status(cfg!(target_os = "linux")),
+    ));
+    out.push(entry(
+        "Windows",
+        "Native support (WSL2 recommended)",
+        IntegrationCategory::Platform,
+        bool_to_status(cfg!(target_os = "windows")),
+    ));
+
+    out
 }
 
 #[cfg(test)]
@@ -793,17 +399,19 @@ mod tests {
 
     #[test]
     fn registry_has_entries() {
-        let entries = all_integrations();
+        let config = Config::default();
+        let entries = all_integrations(&config);
         assert!(
-            entries.len() >= 50,
-            "Expected 50+ integrations, got {}",
+            entries.len() >= 30,
+            "Expected 30+ integrations, got {}",
             entries.len()
         );
     }
 
     #[test]
     fn all_categories_represented() {
-        let entries = all_integrations();
+        let config = Config::default();
+        let entries = all_integrations(&config);
         for cat in IntegrationCategory::all() {
             let count = entries.iter().filter(|e| e.category == *cat).count();
             assert!(count > 0, "Category {cat:?} has no entries");
@@ -811,21 +419,13 @@ mod tests {
     }
 
     #[test]
-    fn status_functions_dont_panic() {
-        let config = Config::default();
-        let entries = all_integrations();
-        for entry in &entries {
-            let _ = (entry.status_fn)(&config);
-        }
-    }
-
-    #[test]
     fn no_duplicate_names() {
-        let entries = all_integrations();
+        let config = Config::default();
+        let entries = all_integrations(&config);
         let mut seen = std::collections::HashSet::new();
         for entry in &entries {
             assert!(
-                seen.insert(entry.name),
+                seen.insert(entry.name.clone()),
                 "Duplicate integration name: {}",
                 entry.name
             );
@@ -834,7 +434,8 @@ mod tests {
 
     #[test]
     fn no_empty_names_or_descriptions() {
-        let entries = all_integrations();
+        let config = Config::default();
+        let entries = all_integrations(&config);
         for entry in &entries {
             assert!(!entry.name.is_empty(), "Found integration with empty name");
             assert!(
@@ -860,43 +461,29 @@ mod tests {
             proxy_url: None,
             approval_timeout_secs: 120,
         });
-        let entries = all_integrations();
+        let entries = all_integrations(&config);
         let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();
-        assert!(matches!((tg.status_fn)(&config), IntegrationStatus::Active));
+        assert!(matches!(tg.status, IntegrationStatus::Active));
     }
 
     #[test]
     fn telegram_available_when_not_configured() {
         let config = Config::default();
-        let entries = all_integrations();
+        let entries = all_integrations(&config);
         let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();
-        assert!(matches!(
-            (tg.status_fn)(&config),
-            IntegrationStatus::Available
-        ));
+        assert!(matches!(tg.status, IntegrationStatus::Available));
     }
 
     #[test]
-    fn imessage_active_when_configured() {
+    fn imessage_active_when_configured_and_displays_brand_casing() {
         let mut config = Config::default();
         config.channels.imessage = Some(IMessageConfig {
             enabled: true,
             allowed_contacts: vec!["*".into()],
         });
-        let entries = all_integrations();
+        let entries = all_integrations(&config);
         let im = entries.iter().find(|e| e.name == "iMessage").unwrap();
-        assert!(matches!((im.status_fn)(&config), IntegrationStatus::Active));
-    }
-
-    #[test]
-    fn imessage_available_when_not_configured() {
-        let config = Config::default();
-        let entries = all_integrations();
-        let im = entries.iter().find(|e| e.name == "iMessage").unwrap();
-        assert!(matches!(
-            (im.status_fn)(&config),
-            IntegrationStatus::Available
-        ));
+        assert!(matches!(im.status, IntegrationStatus::Active));
     }
 
     #[test]
@@ -921,113 +508,37 @@ mod tests {
             reply_in_thread: true,
             ack_reactions: true,
         });
-        let entries = all_integrations();
+        let entries = all_integrations(&config);
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();
-        assert!(matches!((mx.status_fn)(&config), IntegrationStatus::Active));
-    }
-
-    #[test]
-    fn matrix_available_when_not_configured() {
-        let config = Config::default();
-        let entries = all_integrations();
-        let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();
-        assert!(matches!(
-            (mx.status_fn)(&config),
-            IntegrationStatus::Available
-        ));
-    }
-
-    #[test]
-    fn coming_soon_integrations_stay_coming_soon() {
-        let config = Config::default();
-        let entries = all_integrations();
-        for name in ["Nostr", "Spotify", "Home Assistant"] {
-            let entry = entries.iter().find(|e| e.name == name).unwrap();
-            assert!(
-                matches!((entry.status_fn)(&config), IntegrationStatus::ComingSoon),
-                "{name} should be ComingSoon"
-            );
-        }
-    }
-
-    #[test]
-    fn whatsapp_available_when_not_configured() {
-        let config = Config::default();
-        let entries = all_integrations();
-        let wa = entries.iter().find(|e| e.name == "WhatsApp").unwrap();
-        assert!(matches!(
-            (wa.status_fn)(&config),
-            IntegrationStatus::Available
-        ));
-    }
-
-    #[test]
-    fn email_available_when_not_configured() {
-        let config = Config::default();
-        let entries = all_integrations();
-        let email = entries.iter().find(|e| e.name == "Email").unwrap();
-        assert!(matches!(
-            (email.status_fn)(&config),
-            IntegrationStatus::Available
-        ));
+        assert!(matches!(mx.status, IntegrationStatus::Active));
     }
 
     #[test]
     fn cron_active_when_enabled() {
         let mut config = Config::default();
         config.cron.enabled = true;
-        let entries = all_integrations();
+        let entries = all_integrations(&config);
         let cron = entries.iter().find(|e| e.name == "Cron").unwrap();
-        assert!(matches!(
-            (cron.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
-    }
-
-    #[test]
-    fn cron_available_when_disabled() {
-        let mut config = Config::default();
-        config.cron.enabled = false;
-        let entries = all_integrations();
-        let cron = entries.iter().find(|e| e.name == "Cron").unwrap();
-        assert!(matches!(
-            (cron.status_fn)(&config),
-            IntegrationStatus::Available
-        ));
+        assert!(matches!(cron.status, IntegrationStatus::Active));
     }
 
     #[test]
     fn browser_active_when_enabled() {
         let mut config = Config::default();
         config.browser.enabled = true;
-        let entries = all_integrations();
+        let entries = all_integrations(&config);
         let browser = entries.iter().find(|e| e.name == "Browser").unwrap();
-        assert!(matches!(
-            (browser.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!(browser.status, IntegrationStatus::Active));
     }
 
     #[test]
-    fn browser_available_when_disabled() {
-        let mut config = Config::default();
-        config.browser.enabled = false;
-        let entries = all_integrations();
-        let browser = entries.iter().find(|e| e.name == "Browser").unwrap();
-        assert!(matches!(
-            (browser.status_fn)(&config),
-            IntegrationStatus::Available
-        ));
-    }
-
-    #[test]
-    fn shell_and_filesystem_always_active() {
+    fn shell_filesystem_weather_always_active() {
         let config = Config::default();
-        let entries = all_integrations();
+        let entries = all_integrations(&config);
         for name in ["Shell", "File System", "Weather"] {
             let entry = entries.iter().find(|e| e.name == name).unwrap();
             assert!(
-                matches!((entry.status_fn)(&config), IntegrationStatus::Active),
+                matches!(entry.status, IntegrationStatus::Active),
                 "{name} should always be Active"
             );
         }
@@ -1036,82 +547,86 @@ mod tests {
     #[test]
     fn macos_active_on_macos() {
         let config = Config::default();
-        let entries = all_integrations();
+        let entries = all_integrations(&config);
         let macos = entries.iter().find(|e| e.name == "macOS").unwrap();
-        let status = (macos.status_fn)(&config);
         if cfg!(target_os = "macos") {
-            assert!(matches!(status, IntegrationStatus::Active));
+            assert!(matches!(macos.status, IntegrationStatus::Active));
         } else {
-            assert!(matches!(status, IntegrationStatus::Available));
+            assert!(matches!(macos.status, IntegrationStatus::Available));
         }
     }
 
     #[test]
-    fn category_counts_reasonable() {
-        let entries = all_integrations();
-        let chat_count = entries
+    fn channel_list_derives_from_schema_includes_previously_missing_channels() {
+        // The hand-maintained list in master only surfaced ~11 channels;
+        // ChannelsConfig actually declares ~25+. This test pins the
+        // schema-derived path so adding a new channel surfaces here.
+        let config = Config::default();
+        let entries = all_integrations(&config);
+        let chat_names: std::collections::HashSet<&str> = entries
             .iter()
             .filter(|e| e.category == IntegrationCategory::Chat)
-            .count();
-        let ai_count = entries
-            .iter()
-            .filter(|e| e.category == IntegrationCategory::AiModel)
-            .count();
-        assert!(
-            chat_count >= 5,
-            "Expected 5+ chat integrations, got {chat_count}"
-        );
-        assert!(
-            ai_count >= 5,
-            "Expected 5+ AI model integrations, got {ai_count}"
-        );
+            .map(|e| e.name.as_str())
+            .collect();
+        for must in [
+            "Telegram",
+            "Discord",
+            "Slack",
+            "Matrix",
+            "iMessage",
+            "WhatsApp",
+            // Previously missing from the hand-list:
+            "Mattermost",
+            "IRC",
+            "Lark",
+            "Line",
+            "Feishu",
+            "WeCom",
+            "WeChat",
+            "Reddit",
+            "Bluesky",
+            "MQTT",
+            "Discord History",
+        ] {
+            assert!(
+                chat_names.contains(must),
+                "Chat category should include {must} (derived from schema)"
+            );
+        }
     }
 
     #[test]
     fn regional_provider_aliases_activate_expected_ai_integrations() {
-        let entries = all_integrations();
         let mut config = Config::default();
-        config.providers.fallback = Some("minimax-cn".to_string());
 
+        config.providers.fallback = Some("minimax-cn".to_string());
+        let entries = all_integrations(&config);
         let minimax = entries.iter().find(|e| e.name == "MiniMax").unwrap();
-        assert!(matches!(
-            (minimax.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!(minimax.status, IntegrationStatus::Active));
 
         config.providers.fallback = Some("glm-cn".to_string());
+        let entries = all_integrations(&config);
         let glm = entries.iter().find(|e| e.name == "GLM").unwrap();
-        assert!(matches!(
-            (glm.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!(glm.status, IntegrationStatus::Active));
 
         config.providers.fallback = Some("moonshot-intl".to_string());
+        let entries = all_integrations(&config);
         let moonshot = entries.iter().find(|e| e.name == "Moonshot").unwrap();
-        assert!(matches!(
-            (moonshot.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!(moonshot.status, IntegrationStatus::Active));
 
         config.providers.fallback = Some("qwen-intl".to_string());
+        let entries = all_integrations(&config);
         let qwen = entries.iter().find(|e| e.name == "Qwen").unwrap();
-        assert!(matches!(
-            (qwen.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!(qwen.status, IntegrationStatus::Active));
 
         config.providers.fallback = Some("zai-cn".to_string());
+        let entries = all_integrations(&config);
         let zai = entries.iter().find(|e| e.name == "Z.AI").unwrap();
-        assert!(matches!(
-            (zai.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!(zai.status, IntegrationStatus::Active));
 
         config.providers.fallback = Some("baidu".to_string());
+        let entries = all_integrations(&config);
         let qianfan = entries.iter().find(|e| e.name == "Qianfan").unwrap();
-        assert!(matches!(
-            (qianfan.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+        assert!(matches!(qianfan.status, IntegrationStatus::Active));
     }
 }

@@ -574,17 +574,16 @@ pub async fn handle_api_integrations(
     }
 
     let config = state.config.lock().clone();
-    let entries = zeroclaw_runtime::integrations::registry::all_integrations();
+    let entries = zeroclaw_runtime::integrations::registry::all_integrations(&config);
 
     let integrations: Vec<serde_json::Value> = entries
         .iter()
         .map(|entry| {
-            let status = (entry.status_fn)(&config);
             serde_json::json!({
                 "name": entry.name,
                 "description": entry.description,
                 "category": entry.category,
-                "status": status,
+                "status": entry.status,
             })
         })
         .collect();
@@ -602,21 +601,20 @@ pub async fn handle_api_integrations_settings(
     }
 
     let config = state.config.lock().clone();
-    let entries = zeroclaw_runtime::integrations::registry::all_integrations();
+    let entries = zeroclaw_runtime::integrations::registry::all_integrations(&config);
 
     let mut settings = serde_json::Map::new();
     for entry in &entries {
-        let status = (entry.status_fn)(&config);
         let enabled = matches!(
-            status,
+            entry.status,
             zeroclaw_runtime::integrations::IntegrationStatus::Active
         );
         settings.insert(
-            entry.name.to_string(),
+            entry.name.clone(),
             serde_json::json!({
                 "enabled": enabled,
                 "category": entry.category,
-                "status": status,
+                "status": entry.status,
             }),
         );
     }

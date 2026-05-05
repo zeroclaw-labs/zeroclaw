@@ -141,7 +141,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': '集成',
     'integrations.available': '可用',
     'integrations.active': '活跃',
-    'integrations.coming_soon': '即将推出',
     'integrations.category': '类别',
     'integrations.status': '状态',
     'integrations.search': '搜索集成...',
@@ -151,7 +150,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': '加载集成失败',
     'integrations.status_active': '活跃',
     'integrations.status_available': '可用',
-    'integrations.status_coming_soon': '即将推出',
 
     // Memory
     'memory.title': '记忆存储',
@@ -518,7 +516,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integrations',
     'integrations.available': 'Available',
     'integrations.active': 'Active',
-    'integrations.coming_soon': 'Coming Soon',
     'integrations.category': 'Category',
     'integrations.status': 'Status',
     'integrations.search': 'Search integrations...',
@@ -528,7 +525,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Failed to load integrations',
     'integrations.status_active': 'Active',
     'integrations.status_available': 'Available',
-    'integrations.status_coming_soon': 'Coming Soon',
 
     // Memory
     'memory.title': 'Memory Store',
@@ -934,7 +930,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Entegrasyonlar',
     'integrations.available': 'Mevcut',
     'integrations.active': 'Aktif',
-    'integrations.coming_soon': 'Yakında',
     'integrations.category': 'Kategori',
     'integrations.status': 'Durum',
     'integrations.search': 'Entegrasyon ara...',
@@ -944,7 +939,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Entegrasyonlar yüklenemedi',
     'integrations.status_active': 'Aktif',
     'integrations.status_available': 'Mevcut',
-    'integrations.status_coming_soon': 'Yakında',
 
     // Memory
     'memory.title': 'Hafıza Deposu',
@@ -1258,7 +1252,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'التكاملات',
     'integrations.available': 'متاح',
     'integrations.active': 'نشط',
-    'integrations.coming_soon': 'قريبًا',
     'integrations.category': 'الفئة',
     'integrations.status': 'الحالة',
     'integrations.search': 'البحث في التكاملات...',
@@ -1268,7 +1261,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'فشل تحميل التكاملات',
     'integrations.status_active': 'نشط',
     'integrations.status_available': 'متاح',
-    'integrations.status_coming_soon': 'قريبًا',
 
     // Memory
     'memory.title': 'مخزن الذاكرة',
@@ -1615,7 +1607,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'ইন্টিগ্রেশন',
     'integrations.available': 'উপলব্ধ',
     'integrations.active': 'সক্রিয়',
-    'integrations.coming_soon': 'শীঘ্রই আসছে',
     'integrations.category': 'বিভাগ',
     'integrations.status': 'স্থিতি',
     'integrations.search': 'ইন্টিগ্রেশন খুঁজুন...',
@@ -1625,7 +1616,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'ইন্টিগ্রেশন লোড করতে ব্যর্থ',
     'integrations.status_active': 'সক্রিয়',
     'integrations.status_available': 'উপলব্ধ',
-    'integrations.status_coming_soon': 'শীঘ্রই আসছে',
 
     // Memory
     'memory.title': 'মেমরি স্টোর',
@@ -1972,7 +1962,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integrace',
     'integrations.available': 'Dostupné',
     'integrations.active': 'Aktivní',
-    'integrations.coming_soon': 'Již brzy',
     'integrations.category': 'Kategorie',
     'integrations.status': 'Stav',
     'integrations.search': 'Hledat integrace...',
@@ -1982,7 +1971,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Nepodařilo se načíst integrace',
     'integrations.status_active': 'Aktivní',
     'integrations.status_available': 'Dostupné',
-    'integrations.status_coming_soon': 'Již brzy',
 
     // Memory
     'memory.title': 'Úložiště paměti',
@@ -2329,7 +2317,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integrationer',
     'integrations.available': 'Tilgængelig',
     'integrations.active': 'Aktiv',
-    'integrations.coming_soon': 'Kommer snart',
     'integrations.category': 'Kategori',
     'integrations.status': 'Status',
     'integrations.search': 'Søg i integrationer...',
@@ -2339,7 +2326,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Kunne ikke indlæse integrationer',
     'integrations.status_active': 'Aktiv',
     'integrations.status_available': 'Tilgængelig',
-    'integrations.status_coming_soon': 'Kommer snart',
 
     // Memory
     'memory.title': 'Hukommelseslager',
@@ -2686,7 +2672,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integrationen',
     'integrations.available': 'Verfügbar',
     'integrations.active': 'Aktiv',
-    'integrations.coming_soon': 'Demnächst',
     'integrations.category': 'Kategorie',
     'integrations.status': 'Status',
     'integrations.search': 'Integrationen suchen...',
@@ -2696,7 +2681,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Integrationen konnten nicht geladen werden',
     'integrations.status_active': 'Aktiv',
     'integrations.status_available': 'Verfügbar',
-    'integrations.status_coming_soon': 'Demnächst',
 
     // Memory
     'memory.title': 'Speicherverwaltung',
@@ -3043,7 +3027,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Ενσωματώσεις',
     'integrations.available': 'Διαθέσιμο',
     'integrations.active': 'Ενεργό',
-    'integrations.coming_soon': 'Σύντομα',
     'integrations.category': 'Κατηγορία',
     'integrations.status': 'Κατάσταση',
     'integrations.search': 'Αναζήτηση ενσωματώσεων...',
@@ -3053,7 +3036,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Αποτυχία φόρτωσης ενσωματώσεων',
     'integrations.status_active': 'Ενεργό',
     'integrations.status_available': 'Διαθέσιμο',
-    'integrations.status_coming_soon': 'Σύντομα',
 
     // Memory
     'memory.title': 'Αποθήκη μνήμης',
@@ -3400,7 +3382,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integraciones',
     'integrations.available': 'Disponible',
     'integrations.active': 'Activo',
-    'integrations.coming_soon': 'Próximamente',
     'integrations.category': 'Categoría',
     'integrations.status': 'Estado',
     'integrations.search': 'Buscar integraciones...',
@@ -3410,7 +3391,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'No se pudieron cargar las integraciones',
     'integrations.status_active': 'Activo',
     'integrations.status_available': 'Disponible',
-    'integrations.status_coming_soon': 'Próximamente',
 
     // Memory
     'memory.title': 'Almacén de memoria',
@@ -3757,7 +3737,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integraatiot',
     'integrations.available': 'Saatavilla',
     'integrations.active': 'Aktiivinen',
-    'integrations.coming_soon': 'Tulossa pian',
     'integrations.category': 'Kategoria',
     'integrations.status': 'Tila',
     'integrations.search': 'Hae integraatioita...',
@@ -3767,7 +3746,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Integraatioiden lataus epäonnistui',
     'integrations.status_active': 'Aktiivinen',
     'integrations.status_available': 'Saatavilla',
-    'integrations.status_coming_soon': 'Tulossa pian',
 
     // Memory
     'memory.title': 'Muistivarasto',
@@ -4114,7 +4092,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Intégrations',
     'integrations.available': 'Disponible',
     'integrations.active': 'Actif',
-    'integrations.coming_soon': 'Bientôt disponible',
     'integrations.category': 'Catégorie',
     'integrations.status': 'Statut',
     'integrations.search': 'Rechercher des intégrations...',
@@ -4124,7 +4101,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Échec du chargement des intégrations',
     'integrations.status_active': 'Actif',
     'integrations.status_available': 'Disponible',
-    'integrations.status_coming_soon': 'Bientôt disponible',
 
     // Memory
     'memory.title': 'Stockage mémoire',
@@ -4485,7 +4461,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'אינטגרציות',
     'integrations.available': 'זמין',
     'integrations.active': 'פעיל',
-    'integrations.coming_soon': 'בקרוב',
     'integrations.category': 'קטגוריה',
     'integrations.status': 'סטטוס',
     'integrations.search': 'חפש אינטגרציות...',
@@ -4495,7 +4470,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'טעינת האינטגרציות נכשלה',
     'integrations.status_active': 'פעיל',
     'integrations.status_available': 'זמין',
-    'integrations.status_coming_soon': 'בקרוב',
 
     // Memory
     'memory.title': 'מאגר זיכרון',
@@ -4842,7 +4816,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'इंटीग्रेशन',
     'integrations.available': 'उपलब्ध',
     'integrations.active': 'सक्रिय',
-    'integrations.coming_soon': 'जल्द आ रहा है',
     'integrations.category': 'श्रेणी',
     'integrations.status': 'स्थिति',
     'integrations.search': 'इंटीग्रेशन खोजें...',
@@ -4852,7 +4825,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'इंटीग्रेशन लोड करने में विफल',
     'integrations.status_active': 'सक्रिय',
     'integrations.status_available': 'उपलब्ध',
-    'integrations.status_coming_soon': 'जल्द आ रहा है',
 
     // Memory
     'memory.title': 'मेमोरी स्टोर',
@@ -5199,7 +5171,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integrációk',
     'integrations.available': 'Elérhető',
     'integrations.active': 'Aktív',
-    'integrations.coming_soon': 'Hamarosan',
     'integrations.category': 'Kategória',
     'integrations.status': 'Státusz',
     'integrations.search': 'Integrációk keresése...',
@@ -5209,7 +5180,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Integrációk betöltése sikertelen',
     'integrations.status_active': 'Aktív',
     'integrations.status_available': 'Elérhető',
-    'integrations.status_coming_soon': 'Hamarosan',
 
     // Memory
     'memory.title': 'Memóriatár',
@@ -5556,7 +5526,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integrasi',
     'integrations.available': 'Tersedia',
     'integrations.active': 'Aktif',
-    'integrations.coming_soon': 'Segera Hadir',
     'integrations.category': 'Kategori',
     'integrations.status': 'Status',
     'integrations.search': 'Cari integrasi...',
@@ -5566,7 +5535,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Gagal memuat integrasi',
     'integrations.status_active': 'Aktif',
     'integrations.status_available': 'Tersedia',
-    'integrations.status_coming_soon': 'Segera Hadir',
 
     // Memory
     'memory.title': 'Penyimpanan Memori',
@@ -5913,7 +5881,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integrazioni',
     'integrations.available': 'Disponibile',
     'integrations.active': 'Attivo',
-    'integrations.coming_soon': 'In arrivo',
     'integrations.category': 'Categoria',
     'integrations.status': 'Stato',
     'integrations.search': 'Cerca integrazioni...',
@@ -5923,7 +5890,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Caricamento integrazioni non riuscito',
     'integrations.status_active': 'Attivo',
     'integrations.status_available': 'Disponibile',
-    'integrations.status_coming_soon': 'In arrivo',
 
     // Memory
     'memory.title': 'Archivio memoria',
@@ -6270,7 +6236,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'インテグレーション',
     'integrations.available': '利用可能',
     'integrations.active': 'アクティブ',
-    'integrations.coming_soon': '近日公開',
     'integrations.category': 'カテゴリ',
     'integrations.status': 'ステータス',
     'integrations.search': 'インテグレーションを検索...',
@@ -6280,7 +6245,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'インテグレーションの読み込みに失敗しました',
     'integrations.status_active': 'アクティブ',
     'integrations.status_available': '利用可能',
-    'integrations.status_coming_soon': '近日公開',
 
     // Memory
     'memory.title': 'メモリストア',
@@ -6641,7 +6605,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': '통합',
     'integrations.available': '사용 가능',
     'integrations.active': '활성',
-    'integrations.coming_soon': '곧 출시',
     'integrations.category': '카테고리',
     'integrations.status': '상태',
     'integrations.search': '통합 검색...',
@@ -6651,7 +6614,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': '통합을 불러오지 못했습니다',
     'integrations.status_active': '활성',
     'integrations.status_available': '사용 가능',
-    'integrations.status_coming_soon': '곧 출시',
 
     // Memory
     'memory.title': '메모리 저장소',
@@ -6998,7 +6960,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integrasjoner',
     'integrations.available': 'Tilgjengelig',
     'integrations.active': 'Aktiv',
-    'integrations.coming_soon': 'Kommer snart',
     'integrations.category': 'Kategori',
     'integrations.status': 'Status',
     'integrations.search': 'Søk etter integrasjoner...',
@@ -7008,7 +6969,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Kunne ikke laste integrasjoner',
     'integrations.status_active': 'Aktiv',
     'integrations.status_available': 'Tilgjengelig',
-    'integrations.status_coming_soon': 'Kommer snart',
 
     // Memory
     'memory.title': 'Minnelager',
@@ -7355,7 +7315,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integraties',
     'integrations.available': 'Beschikbaar',
     'integrations.active': 'Actief',
-    'integrations.coming_soon': 'Binnenkort beschikbaar',
     'integrations.category': 'Categorie',
     'integrations.status': 'Status',
     'integrations.search': 'Integraties zoeken...',
@@ -7365,7 +7324,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Kan integraties niet laden',
     'integrations.status_active': 'Actief',
     'integrations.status_available': 'Beschikbaar',
-    'integrations.status_coming_soon': 'Binnenkort beschikbaar',
 
     // Memory
     'memory.title': 'Geheugenopslag',
@@ -7712,7 +7670,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integracje',
     'integrations.available': 'Dostępne',
     'integrations.active': 'Aktywne',
-    'integrations.coming_soon': 'Wkrótce',
     'integrations.category': 'Kategoria',
     'integrations.status': 'Status',
     'integrations.search': 'Szukaj integracji...',
@@ -7722,7 +7679,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Nie udało się załadować integracji',
     'integrations.status_active': 'Aktywna',
     'integrations.status_available': 'Dostępna',
-    'integrations.status_coming_soon': 'Wkrótce',
 
     // Memory
     'memory.title': 'Magazyn pamięci',
@@ -8069,7 +8025,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integrações',
     'integrations.available': 'Disponível',
     'integrations.active': 'Ativa',
-    'integrations.coming_soon': 'Em breve',
     'integrations.category': 'Categoria',
     'integrations.status': 'Status',
     'integrations.search': 'Pesquisar integrações...',
@@ -8079,7 +8034,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Falha ao carregar integrações',
     'integrations.status_active': 'Ativa',
     'integrations.status_available': 'Disponível',
-    'integrations.status_coming_soon': 'Em breve',
 
     // Memory
     'memory.title': 'Armazenamento de Memória',
@@ -8426,7 +8380,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integrări',
     'integrations.available': 'Disponibil',
     'integrations.active': 'Activ',
-    'integrations.coming_soon': 'În curând',
     'integrations.category': 'Categorie',
     'integrations.status': 'Stare',
     'integrations.search': 'Caută integrări...',
@@ -8436,7 +8389,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Nu s-au putut încărca integrările',
     'integrations.status_active': 'Activ',
     'integrations.status_available': 'Disponibil',
-    'integrations.status_coming_soon': 'În curând',
 
     // Memory
     'memory.title': 'Depozit de memorie',
@@ -8783,7 +8735,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Интеграции',
     'integrations.available': 'Доступно',
     'integrations.active': 'Активно',
-    'integrations.coming_soon': 'Скоро',
     'integrations.category': 'Категория',
     'integrations.status': 'Статус',
     'integrations.search': 'Поиск интеграций...',
@@ -8793,7 +8744,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Не удалось загрузить интеграции',
     'integrations.status_active': 'Активно',
     'integrations.status_available': 'Доступно',
-    'integrations.status_coming_soon': 'Скоро',
 
     // Memory
     'memory.title': 'Хранилище памяти',
@@ -9154,7 +9104,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Integrationer',
     'integrations.available': 'Tillgänglig',
     'integrations.active': 'Aktiv',
-    'integrations.coming_soon': 'Kommer snart',
     'integrations.category': 'Kategori',
     'integrations.status': 'Status',
     'integrations.search': 'Sök integrationer...',
@@ -9164,7 +9113,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Kunde inte ladda integrationer',
     'integrations.status_active': 'Aktiv',
     'integrations.status_available': 'Tillgänglig',
-    'integrations.status_coming_soon': 'Kommer snart',
 
     // Memory
     'memory.title': 'Minneslagring',
@@ -9511,7 +9459,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'การเชื่อมต่อ',
     'integrations.available': 'พร้อมใช้งาน',
     'integrations.active': 'ใช้งานอยู่',
-    'integrations.coming_soon': 'เร็ว ๆ นี้',
     'integrations.category': 'หมวดหมู่',
     'integrations.status': 'สถานะ',
     'integrations.search': 'ค้นหาการเชื่อมต่อ...',
@@ -9521,7 +9468,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'ไม่สามารถโหลดการเชื่อมต่อได้',
     'integrations.status_active': 'ใช้งานอยู่',
     'integrations.status_available': 'พร้อมใช้งาน',
-    'integrations.status_coming_soon': 'เร็ว ๆ นี้',
 
     // Memory
     'memory.title': 'คลังหน่วยความจำ',
@@ -9868,7 +9814,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Mga Integrasyon',
     'integrations.available': 'Magagamit',
     'integrations.active': 'Aktibo',
-    'integrations.coming_soon': 'Malapit Na',
     'integrations.category': 'Kategorya',
     'integrations.status': 'Katayuan',
     'integrations.search': 'Maghanap ng mga integrasyon...',
@@ -9878,7 +9823,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Hindi ma-load ang mga integrasyon',
     'integrations.status_active': 'Aktibo',
     'integrations.status_available': 'Magagamit',
-    'integrations.status_coming_soon': 'Malapit Na',
 
     // Memory
     'memory.title': 'Imbakan ng Memorya',
@@ -10225,7 +10169,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Інтеграції',
     'integrations.available': 'Доступно',
     'integrations.active': 'Активно',
-    'integrations.coming_soon': 'Незабаром',
     'integrations.category': 'Категорія',
     'integrations.status': 'Статус',
     'integrations.search': 'Пошук інтеграцій...',
@@ -10235,7 +10178,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Не вдалося завантажити інтеграції',
     'integrations.status_active': 'Активно',
     'integrations.status_available': 'Доступно',
-    'integrations.status_coming_soon': 'Незабаром',
 
     // Memory
     'memory.title': 'Сховище пам\'яті',
@@ -10582,7 +10524,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'انٹیگریشنز',
     'integrations.available': 'دستیاب',
     'integrations.active': 'فعال',
-    'integrations.coming_soon': 'جلد آ رہا ہے',
     'integrations.category': 'زمرہ',
     'integrations.status': 'حالت',
     'integrations.search': 'انٹیگریشنز تلاش کریں...',
@@ -10592,7 +10533,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'انٹیگریشنز لوڈ کرنے میں ناکامی',
     'integrations.status_active': 'فعال',
     'integrations.status_available': 'دستیاب',
-    'integrations.status_coming_soon': 'جلد آ رہا ہے',
 
     // Memory
     'memory.title': 'میموری اسٹور',
@@ -10939,7 +10879,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.title': 'Tích hợp',
     'integrations.available': 'Khả dụng',
     'integrations.active': 'Đang hoạt động',
-    'integrations.coming_soon': 'Sắp ra mắt',
     'integrations.category': 'Danh mục',
     'integrations.status': 'Trạng thái',
     'integrations.search': 'Tìm kiếm tích hợp...',
@@ -10949,7 +10888,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.load_error': 'Không thể tải tích hợp',
     'integrations.status_active': 'Đang hoạt động',
     'integrations.status_available': 'Khả dụng',
-    'integrations.status_coming_soon': 'Sắp ra mắt',
 
     // Memory
     'memory.title': 'Kho bộ nhớ',

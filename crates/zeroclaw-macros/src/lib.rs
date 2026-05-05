@@ -164,6 +164,14 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let mut map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut create_map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
 
+    // ── Nested-Option enumeration ──
+    // One entry per `#[nested] Option<T>` field, surfacing the schema's
+    // own field name plus an `is_some()` snapshot. Consumers (e.g. the
+    // integrations registry) iterate this list so adding a new
+    // `pub foo: Option<FooConfig>` to a Configurable struct surfaces
+    // automatically — no hand-maintained mirror list anywhere.
+    let mut nested_option_entry_pushes: Vec<proc_macro2::TokenStream> = Vec::new();
+
     for field in fields {
         let field_ident = field.ident.as_ref().expect("Named field must have ident");
         let is_secret = has_attr(field, "secret");
@@ -430,6 +438,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
                 continue;
             } else if is_option {
+                let field_name_str = field_ident.to_string();
+                nested_option_entry_pushes.push(quote! {
+                    out.push((#field_name_str, self.#field_ident.is_some()));
+                });
+
                 nested_collect.push(quote! {
                     if let Some(inner) = &self.#field_ident {
                         fields.extend(inner.secret_fields());
@@ -898,6 +911,20 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 let mut out: Vec<crate::config::MapKeySection> = Vec::new();
                 #(#map_key_section_entries)*
                 #(#map_key_recurse)*
+                out
+            }
+
+            /// Snapshot of every `#[nested] Option<T>` field on this struct
+            /// as `(field_name, is_some)` tuples, in declaration order.
+            ///
+            /// `field_name` is the raw Rust ident (snake_case) — consumers
+            /// can map to display names via their own table. The schema
+            /// is the single source of truth: adding a new
+            /// `pub foo: Option<FooConfig>` field with `#[nested]` surfaces
+            /// here without touching any caller.
+            pub fn nested_option_entries(&self) -> Vec<(&'static str, bool)> {
+                let mut out: Vec<(&'static str, bool)> = Vec::new();
+                #(#nested_option_entry_pushes)*
                 out
             }
 
