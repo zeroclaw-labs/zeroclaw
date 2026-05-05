@@ -86,6 +86,8 @@ struct SkillMeta {
     author: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    prompts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -188,12 +190,13 @@ pub fn load_skills_with_open_skills_settings(
     workspace_dir: &Path,
     open_skills_enabled: bool,
     open_skills_dir: Option<&str>,
+    allow_scripts: bool,
 ) -> Vec<Skill> {
     load_skills_with_open_skills_config(
         workspace_dir,
         Some(open_skills_enabled),
         open_skills_dir,
-        None,
+        Some(allow_scripts),
     )
 }
 
@@ -602,6 +605,13 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
     let manifest: SkillManifest = toml::from_str(&content)?;
 
+    // Merge prompts from both locations: inside the [skill] table (natural
+    // location for per-skill prompts) and at the manifest root (historical
+    // location). Previously, prompts placed inside [skill] were silently
+    // dropped because SkillMeta had no `prompts` field. Fixes #5721.
+    let mut prompts = manifest.skill.prompts;
+    prompts.extend(manifest.prompts);
+
     Ok(Skill {
         name: manifest.skill.name,
         description: manifest.skill.description,
@@ -609,7 +619,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         author: manifest.skill.author,
         tags: manifest.skill.tags,
         tools: manifest.tools,
-        prompts: manifest.prompts,
+        prompts,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1732,5 +1742,80 @@ mod registry_tests {
     fn test_is_registry_source_rejects_special_chars() {
         assert!(!is_registry_source(".hidden"));
         assert!(!is_registry_source("~tilde"));
+    }
+}
+
+#[cfg(test)]
+mod prompts_section_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_manifest(dir: &Path, toml: &str) -> std::path::PathBuf {
+        let p = dir.join("SKILL.toml");
+        std::fs::write(&p, toml).unwrap();
+        p
+    }
+
+    #[test]
+    fn prompts_inside_skill_section_are_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+prompts = ["If asked about XYZZY, respond YES"]
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(
+            skill.prompts,
+            vec!["If asked about XYZZY, respond YES".to_string()]
+        );
+    }
+
+    #[test]
+    fn prompts_at_root_level_still_work() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+
+prompts = ["legacy root-level prompt"]
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(skill.prompts, vec!["legacy root-level prompt".to_string()]);
+    }
+
+    #[test]
+    fn prompts_in_both_locations_are_merged_skill_first() {
+        // Root-level prompts must precede the [skill] header in TOML.
+        // Per the fix, [skill]-section prompts appear first in the merged
+        // list, with root-level prompts appended after.
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+prompts = ["from-root"]
+
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+prompts = ["from-skill-section"]
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(
+            skill.prompts,
+            vec!["from-skill-section".to_string(), "from-root".to_string(),]
+        );
     }
 }
