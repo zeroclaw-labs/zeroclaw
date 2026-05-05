@@ -1837,6 +1837,583 @@ pub struct CopilotModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── GLM (multi-region) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GlmEndpoint {
+    Cn,
+    Global,
+}
+impl ModelEndpoint for GlmEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Cn => "https://open.bigmodel.cn/api/paas/v4",
+            Self::Global => "https://api.z.ai/api/paas/v4",
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.glm"]
+pub struct GlmModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    pub endpoint: GlmEndpoint,
+}
+impl Default for GlmModelProviderConfig {
+    fn default() -> Self {
+        Self {
+            base: ModelProviderConfig::default(),
+            endpoint: GlmEndpoint::Global,
+        }
+    }
+}
+
+// ── Minimax (multi-region + auth_mode) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MinimaxEndpoint {
+    Cn,
+    Intl,
+}
+impl ModelEndpoint for MinimaxEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Cn => "https://api.minimaxi.com/v1",
+            Self::Intl => "https://api.minimax.io/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.minimax"]
+pub struct MinimaxModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    pub endpoint: MinimaxEndpoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<AuthMode>,
+}
+impl Default for MinimaxModelProviderConfig {
+    fn default() -> Self {
+        Self {
+            base: ModelProviderConfig::default(),
+            endpoint: MinimaxEndpoint::Intl,
+            auth_mode: None,
+        }
+    }
+}
+
+// ── Z.AI (multi-region) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ZaiEndpoint {
+    Cn,
+    Global,
+}
+impl ModelEndpoint for ZaiEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Cn => "https://open.bigmodel.cn/api/coding/paas/v4",
+            Self::Global => "https://api.z.ai/api/coding/paas/v4",
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.zai"]
+pub struct ZaiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    pub endpoint: ZaiEndpoint,
+}
+impl Default for ZaiModelProviderConfig {
+    fn default() -> Self {
+        Self {
+            base: ModelProviderConfig::default(),
+            endpoint: ZaiEndpoint::Global,
+        }
+    }
+}
+
+// ── Doubao (Volcengine; single canonical endpoint) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DoubaoEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for DoubaoEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://ark.cn-beijing.volces.com/api/v3"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.doubao"]
+pub struct DoubaoModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Yi (Lingyiwanwu; single endpoint) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum YiEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for YiEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.lingyiwanwu.com/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.yi"]
+pub struct YiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Hunyuan (Tencent; single endpoint) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum HunyuanEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for HunyuanEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.hunyuan.cloud.tencent.com/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.hunyuan"]
+pub struct HunyuanModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Qianfan (Baidu) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QianfanEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for QianfanEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://qianfan.baidubce.com/v2"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.qianfan"]
+pub struct QianfanModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Baichuan ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum BaichuanEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for BaichuanEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.baichuan-ai.com/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.baichuan"]
+pub struct BaichuanModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Gemini (OAuth-capable) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GeminiEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for GeminiEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://generativelanguage.googleapis.com/v1beta"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.gemini"]
+pub struct GeminiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Auth flow. Defaults to `api_key`; `oauth` uses GeminiProvider's
+    /// OAuth-cache integration instead of the `api_key` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<AuthMode>,
+}
+
+// ── Gemini CLI (subprocess wrapper) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GeminiCliEndpoint {
+    #[default]
+    LocalSubprocess,
+}
+impl ModelEndpoint for GeminiCliEndpoint {
+    fn uri(&self) -> &'static str {
+        // Subprocess — no remote endpoint. Sentinel for trait conformity.
+        "subprocess://gemini-cli"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.gemini_cli"]
+pub struct GeminiCliModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── LMStudio (local default) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LmstudioEndpoint {
+    #[default]
+    LocalDefault,
+}
+impl ModelEndpoint for LmstudioEndpoint {
+    fn uri(&self) -> &'static str {
+        "http://localhost:1234/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.lmstudio"]
+pub struct LmstudioModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── llama.cpp (local default) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LlamacppEndpoint {
+    #[default]
+    LocalDefault,
+}
+impl ModelEndpoint for LlamacppEndpoint {
+    fn uri(&self) -> &'static str {
+        "http://localhost:8080/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.llamacpp"]
+pub struct LlamacppModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── SGLang (local default) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SglangEndpoint {
+    #[default]
+    LocalDefault,
+}
+impl ModelEndpoint for SglangEndpoint {
+    fn uri(&self) -> &'static str {
+        "http://localhost:30000/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.sglang"]
+pub struct SglangModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── vLLM (local default) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum VllmEndpoint {
+    #[default]
+    LocalDefault,
+}
+impl ModelEndpoint for VllmEndpoint {
+    fn uri(&self) -> &'static str {
+        "http://localhost:8000/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.vllm"]
+pub struct VllmModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Osaurus (local default) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OsaurusEndpoint {
+    #[default]
+    LocalDefault,
+}
+impl ModelEndpoint for OsaurusEndpoint {
+    fn uri(&self) -> &'static str {
+        "http://localhost:1337/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.osaurus"]
+pub struct OsaurusModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── LiteLLM (operator-self-hosted gateway) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LitellmEndpoint {
+    #[default]
+    LocalDefault,
+}
+impl ModelEndpoint for LitellmEndpoint {
+    fn uri(&self) -> &'static str {
+        "http://localhost:4000/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.litellm"]
+pub struct LitellmModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Lepton ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LeptonEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for LeptonEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://llama3-1-405b.lepton.run/api/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.lepton"]
+pub struct LeptonModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Synthetic ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SyntheticEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for SyntheticEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.synthetic.new/openai/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.synthetic"]
+pub struct SyntheticModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── OpenCode (Zen) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpencodeEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for OpencodeEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://opencode.ai/zen/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.opencode"]
+pub struct OpencodeModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── OpenCode Go ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpencodeGoEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for OpencodeGoEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://opencode.ai/zen/go/v1"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.opencode_go"]
+pub struct OpencodeGoModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── KiloCli (subprocess wrapper) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum KiloCliEndpoint {
+    #[default]
+    LocalSubprocess,
+}
+impl ModelEndpoint for KiloCliEndpoint {
+    fn uri(&self) -> &'static str {
+        "subprocess://kilocli"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.kilocli"]
+pub struct KiloCliModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Custom (user-supplied URL, no canonical default) ──
+
+/// Custom catch-all for operator-defined endpoints. The endpoint variant has
+/// no canonical URL — operators must always set `base.uri`. The trait return
+/// is a sentinel string; the runtime constructor must verify `base.uri` is
+/// set for `custom` entries and fail with a clear error if not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CustomEndpoint {
+    #[default]
+    OperatorSupplied,
+}
+impl ModelEndpoint for CustomEndpoint {
+    fn uri(&self) -> &'static str {
+        "operator-supplied:set-cfg-uri"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.custom"]
+pub struct CustomModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── ClaudeCode (Anthropic flavor) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeCodeEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for ClaudeCodeEndpoint {
+    fn uri(&self) -> &'static str {
+        "https://api.anthropic.com"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.claude_code"]
+pub struct ClaudeCodeModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── Bedrock (computed-endpoint exemplar, AWS region template) ──
 
 /// AWS Bedrock endpoint template. Single variant; the URL is computed at
@@ -12854,6 +13431,29 @@ impl_enum_prop_kind!(
     CloudflareEndpoint,
     OvhEndpoint,
     CopilotEndpoint,
+    GlmEndpoint,
+    MinimaxEndpoint,
+    ZaiEndpoint,
+    DoubaoEndpoint,
+    YiEndpoint,
+    HunyuanEndpoint,
+    QianfanEndpoint,
+    BaichuanEndpoint,
+    GeminiEndpoint,
+    GeminiCliEndpoint,
+    LmstudioEndpoint,
+    LlamacppEndpoint,
+    SglangEndpoint,
+    VllmEndpoint,
+    OsaurusEndpoint,
+    LitellmEndpoint,
+    LeptonEndpoint,
+    SyntheticEndpoint,
+    OpencodeEndpoint,
+    OpencodeGoEndpoint,
+    KiloCliEndpoint,
+    CustomEndpoint,
+    ClaudeCodeEndpoint,
 );
 
 impl HasPropKind for serde_json::Value {
