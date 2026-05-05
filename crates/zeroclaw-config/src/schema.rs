@@ -949,6 +949,141 @@ impl Default for QwenModelProviderConfig {
     }
 }
 
+// ── OpenRouter ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenRouterEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for OpenRouterEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://openrouter.ai/api/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.openrouter"]
+pub struct OpenRouterModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Ollama (local-default endpoint) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OllamaEndpoint {
+    #[default]
+    LocalDefault,
+}
+
+impl ModelEndpoint for OllamaEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => "http://localhost:11434",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.ollama"]
+pub struct OllamaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Together ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TogetherEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for TogetherEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.together.xyz/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.together"]
+pub struct TogetherModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Fireworks ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FireworksEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for FireworksEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.fireworks.ai/inference/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.fireworks"]
+pub struct FireworksModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Groq ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GroqEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for GroqEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.groq.com/openai/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.groq"]
+pub struct GroqModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── Bedrock (computed-endpoint exemplar, AWS region template) ──
 
 /// AWS Bedrock endpoint template. Single variant; the URL is computed at
@@ -11930,6 +12065,11 @@ impl_enum_prop_kind!(
     MoonshotEndpoint,
     QwenEndpoint,
     BedrockEndpoint,
+    OpenRouterEndpoint,
+    OllamaEndpoint,
+    TogetherEndpoint,
+    FireworksEndpoint,
+    GroqEndpoint,
 );
 
 impl HasPropKind for serde_json::Value {
