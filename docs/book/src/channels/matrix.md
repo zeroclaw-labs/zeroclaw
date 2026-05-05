@@ -33,7 +33,7 @@ All config management goes through `zeroclaw config` or `zeroclaw onboard`. Do n
 Easiest: run the wizard and let it prompt for every Matrix field:
 
 ```bash
-zeroclaw onboard --channels-only
+zeroclaw onboard channels
 ```
 
 Or set individual fields after onboarding:
@@ -89,7 +89,7 @@ zeroclaw config set channels.matrix.user-id @bot:example.com
 zeroclaw service restart
 ```
 
-The wizard (`zeroclaw onboard --channels-only`) prompts for these same fields if you'd rather work through it interactively.
+The wizard (`zeroclaw onboard channels`) prompts for these same fields if you'd rather work through it interactively.
 
 ### Notes
 
@@ -105,7 +105,7 @@ The wizard (`zeroclaw onboard --channels-only`) prompts for these same fields if
 ## 4. Quick validation
 
 ```bash
-zeroclaw onboard --channels-only
+zeroclaw onboard channels
 zeroclaw service restart        # or `zeroclaw daemon` to run foreground
 ```
 
@@ -296,7 +296,7 @@ Either path works. The onboarding wizard is easier for fresh installs; `zeroclaw
 **Option A — during onboarding:**
 
 ```bash
-zeroclaw onboard --channels-only
+zeroclaw onboard channels
 ```
 
 When prompted:

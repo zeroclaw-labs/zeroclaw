@@ -87,8 +87,8 @@ impl WhatsAppChannel {
     }
 
     /// Access the process-wide pending-approvals map shared across every
-    /// `WhatsAppChannel` instance. See [`PENDING_APPROVALS`] for why this
-    /// must be a static rather than per-instance.
+    /// `WhatsAppChannel` instance. The map is a process-wide static rather
+    /// than per-instance so approvals survive instance churn.
     pub fn pending_approvals(&self) -> &Arc<PendingApprovalsMap> {
         &PENDING_APPROVALS
     }
@@ -256,7 +256,7 @@ impl WhatsAppChannel {
                         tracing::warn!(
                             "WhatsApp: ignoring message from unauthorized number: {normalized_from}. \
                             Add to channels.whatsapp.allowed_numbers in config.toml, \
-                            or run `zeroclaw onboard --channels-only` to configure interactively."
+                            or run `zeroclaw onboard channels` to configure interactively."
                         );
                         continue;
                     }

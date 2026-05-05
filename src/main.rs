@@ -2737,7 +2737,7 @@ async fn main() -> Result<()> {
                 if !daemon_running {
                     eprintln!(
                         "Note: gateway does not appear to be running at {host}:{port}. \
-                         Start it with `zeroclaw daemon start` to load the explorer."
+                         Start it with `zeroclaw service start` (background) or `zeroclaw daemon` (foreground) to load the explorer."
                     );
                 }
                 Ok(())

@@ -3891,7 +3891,7 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<(
     let mut updated = config.clone();
     let Some(telegram) = updated.channels.telegram.as_mut() else {
         anyhow::bail!(
-            "Telegram channel is not configured. Run `zeroclaw onboard --channels-only` first"
+            "Telegram channel is not configured. Run `zeroclaw onboard channels` first"
         );
     };
 

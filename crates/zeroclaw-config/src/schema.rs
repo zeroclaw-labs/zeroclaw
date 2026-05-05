@@ -489,6 +489,7 @@ pub struct OnboardStateConfig {
     pub completed_sections: Vec<String>,
 }
 
+/// Multi-client workspace isolation (`[workspace]`). Each named profile gets its own memory, secrets, and audit directories.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "workspace"]
@@ -5646,6 +5647,7 @@ fn default_runtime_trace_max_entries() -> usize {
 
 // ── Hooks ────────────────────────────────────────────────────────
 
+/// Lifecycle hooks: built-in audit/logging hooks that run alongside tool calls (`[hooks]`).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "hooks"]
@@ -5669,6 +5671,7 @@ impl Default for HooksConfig {
     }
 }
 
+/// Built-in hooks shipped with ZeroClaw (`[hooks.builtin]`). Toggle individual hooks on/off here.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "hooks.builtin"]
@@ -6495,6 +6498,7 @@ impl Default for TunnelConfig {
     }
 }
 
+/// Cloudflare Tunnel configuration (`[tunnel.cloudflare]`). Active when `tunnel.provider = "cloudflare"`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel.cloudflare"]
@@ -6506,6 +6510,7 @@ pub struct CloudflareTunnelConfig {
     pub token: String,
 }
 
+/// Tailscale Funnel/Serve configuration (`[tunnel.tailscale]`). Active when `tunnel.provider = "tailscale"`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel.tailscale"]
@@ -6518,6 +6523,7 @@ pub struct TailscaleTunnelConfig {
     pub hostname: Option<String>,
 }
 
+/// ngrok tunnel configuration (`[tunnel.ngrok]`). Active when `tunnel.provider = "ngrok"`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel.ngrok"]
@@ -6576,6 +6582,7 @@ impl Default for OpenVpnTunnelConfig {
     }
 }
 
+/// Pinggy tunnel configuration (`[tunnel.pinggy]`). Active when `tunnel.provider = "pinggy"`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel.pinggy"]
@@ -6590,6 +6597,7 @@ pub struct PinggyTunnelConfig {
     pub region: Option<String>,
 }
 
+/// Custom tunnel command configuration (`[tunnel.custom]`). Active when `tunnel.provider = "custom"`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel.custom"]
@@ -7439,6 +7447,7 @@ impl ChannelConfig for MatrixConfig {
     }
 }
 
+/// Signal channel via the signal-cli HTTP daemon (`[channels.signal]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.signal"]
@@ -7614,6 +7623,7 @@ impl ChannelConfig for WhatsAppConfig {
     }
 }
 
+/// Linq partner API channel for iMessage / RCS / SMS bridging (`[channels.linq]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.linq"]
@@ -9045,24 +9055,33 @@ pub fn default_nostr_relays() -> Vec<String> {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "notion"]
 pub struct NotionConfig {
+    /// Enable the Notion integration. Default: `false`.
     #[serde(default)]
     pub enabled: bool,
+    /// Notion API integration token. Falls back to the `NOTION_API_KEY` env var when empty.
     #[serde(default)]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: String,
+    /// Notion database ID the agent polls for pending tasks.
     #[serde(default)]
     pub database_id: String,
+    /// Polling interval in seconds. Default: `5`.
     #[serde(default = "default_notion_poll_interval")]
     pub poll_interval_secs: u64,
+    /// Database property name holding the row's status. Default: `"Status"`.
     #[serde(default = "default_notion_status_prop")]
     pub status_property: String,
+    /// Database property name holding the agent's input. Default: `"Input"`.
     #[serde(default = "default_notion_input_prop")]
     pub input_property: String,
+    /// Database property name where the agent writes its result. Default: `"Result"`.
     #[serde(default = "default_notion_result_prop")]
     pub result_property: String,
+    /// Maximum concurrent in-flight tasks. Default: `4`.
     #[serde(default = "default_notion_max_concurrent")]
     pub max_concurrent: usize,
+    /// Pick up rows left mid-run on startup. Default: `true`.
     #[serde(default = "default_notion_recover_stale")]
     pub recover_stale: bool,
 }
