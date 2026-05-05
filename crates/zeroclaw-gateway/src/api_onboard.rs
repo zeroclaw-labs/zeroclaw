@@ -536,7 +536,7 @@ fn providers_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
     zeroclaw_providers::list_providers()
         .into_iter()
         .map(|p| {
-            let configured = cfg.providers.models.contains_key(p.name);
+            let configured = cfg.providers.models.contains_provider_type(p.name);
             PickerItem {
                 key: p.name.to_string(),
                 label: p.display_name.to_string(),

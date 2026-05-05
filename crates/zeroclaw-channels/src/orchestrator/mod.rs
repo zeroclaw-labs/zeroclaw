@@ -866,7 +866,12 @@ fn runtime_defaults_from_config(
 ) -> anyhow::Result<ChannelRuntimeDefaults> {
     let dotted = model_provider.split_once('.');
     let entry = dotted
-        .and_then(|(type_key, alias_key)| config.providers.models.get(type_key)?.get(alias_key))
+        .and_then(|(type_key, alias_key)| {
+            config
+                .providers
+                .models
+                .get_base_for_alias(type_key, alias_key)
+        })
         .or_else(|| config.providers.first_provider());
     let default_provider = dotted
         .map(|(t, _)| t.to_string())
@@ -5804,11 +5809,9 @@ pub async fn start_channels(
             let pricing: zeroclaw_runtime::agent::cost::ModelProviderPricing = config
                 .providers
                 .models
-                .iter()
-                .flat_map(|(type_k, alias_map)| {
-                    alias_map.iter().map(move |(alias_k, profile)| {
-                        (format!("{type_k}.{alias_k}"), profile.pricing.clone())
-                    })
+                .iter_entries()
+                .map(|(type_k, alias_k, profile)| {
+                    (format!("{type_k}.{alias_k}"), profile.pricing.clone())
                 })
                 .filter(|(_, p)| !p.is_empty())
                 .collect();

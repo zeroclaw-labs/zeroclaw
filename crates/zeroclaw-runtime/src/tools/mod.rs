@@ -919,7 +919,25 @@ pub fn all_tools_with_runtime(
         .with_delegate_config(root_config.delegate.clone())
         .with_workspace_dir(workspace_dir.to_path_buf())
         .with_memory(memory.clone())
-        .with_providers_models(root_config.providers.models.clone())
+        .with_providers_models({
+            // DelegateTool's signature still expects the V3 flat HashMap shape;
+            // collapse the typed ModelProviders container down to base-config
+            // entries here. Family-specific extras (wire_api / requires_openai_auth /
+            // resource / etc.) aren't needed by DelegateTool — it only resolves
+            // baseline fields (model, api_key, uri) for sub-agent dispatch.
+            // Phase 7 will switch DelegateTool to consume Arc<ModelProviders>
+            // directly and drop this collapse.
+            let mut m: std::collections::HashMap<
+                String,
+                std::collections::HashMap<String, zeroclaw_config::schema::ModelProviderConfig>,
+            > = std::collections::HashMap::new();
+            for (t, a, base) in root_config.providers.models.iter_entries() {
+                m.entry(t.to_string())
+                    .or_default()
+                    .insert(a.to_string(), base.clone());
+            }
+            m
+        })
         .with_risk_profiles(root_config.risk_profiles.clone())
         .with_runtime_profiles(root_config.runtime_profiles.clone())
         .with_skill_bundles(root_config.skill_bundles.clone())

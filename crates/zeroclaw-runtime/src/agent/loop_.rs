@@ -2526,11 +2526,9 @@ pub async fn run(
                 let pricing: crate::agent::cost::ModelProviderPricing = config
                     .providers
                     .models
-                    .iter()
-                    .flat_map(|(type_k, alias_map)| {
-                        alias_map.iter().map(move |(alias_k, profile)| {
-                            (format!("{type_k}.{alias_k}"), profile.pricing.clone())
-                        })
+                    .iter_entries()
+                    .map(|(type_k, alias_k, profile)| {
+                        (format!("{type_k}.{alias_k}"), profile.pricing.clone())
                     })
                     .filter(|(_, p)| !p.is_empty())
                     .collect();

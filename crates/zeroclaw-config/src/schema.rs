@@ -849,13 +849,14 @@ pub struct AnthropicModelProviderConfig {
 /// Moonshot endpoint variants. Operators pick the region that matches their
 /// account; the runtime resolves the URI from the chosen variant unless
 /// overridden by `base.uri`. Code variant is intl-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MoonshotEndpoint {
     /// Mainland China endpoint.
     Cn,
     /// International endpoint.
+    #[default]
     Intl,
     /// Code-specialist endpoint (intl).
     Code,
@@ -874,38 +875,31 @@ impl ModelEndpoint for MoonshotEndpoint {
 /// Moonshot model provider config. The `endpoint` field is required (no
 /// implicit default) — operators must pick a region explicitly. Migration
 /// fills it in from collapsed `moonshot-cn` / `moonshot-intl` outer keys.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.moonshot"]
 pub struct MoonshotModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
-    /// Required: pick `cn`, `intl`, or `code`.
+    /// Required: pick `cn`, `intl`, or `code`. Defaults to `intl` when omitted
+    /// to ease V3 transition; operators on the China endpoint should set
+    /// `endpoint = "cn"` explicitly.
+    #[serde(default)]
     pub endpoint: MoonshotEndpoint,
-}
-
-impl Default for MoonshotModelProviderConfig {
-    fn default() -> Self {
-        Self {
-            base: ModelProviderConfig::default(),
-            // Default chosen so onboarding / `Config::default()` constructs
-            // a usable shape; operators can override after picking a region.
-            endpoint: MoonshotEndpoint::Intl,
-        }
-    }
 }
 
 // ── Qwen (multi-region + auth_mode exemplar) ──
 
 /// Qwen endpoint variants. Operators pick the region matching their account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum QwenEndpoint {
     /// Mainland China (DashScope).
     Cn,
     /// International (alicloud international).
+    #[default]
     Intl,
     /// Code-specialist endpoint.
     Code,
@@ -925,28 +919,19 @@ impl ModelEndpoint for QwenEndpoint {
 
 /// Qwen model provider config. Multi-region (`endpoint` required) and
 /// supports both API key and OAuth flows (`auth_mode` chooses which).
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.qwen"]
 pub struct QwenModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    #[serde(default)]
     pub endpoint: QwenEndpoint,
     /// Auth flow. Defaults to `api_key`; set to `oauth` to use the vendor's
     /// OAuth-cache integration instead of the `api_key` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AuthMode>,
-}
-
-impl Default for QwenModelProviderConfig {
-    fn default() -> Self {
-        Self {
-            base: ModelProviderConfig::default(),
-            endpoint: QwenEndpoint::Intl,
-            auth_mode: None,
-        }
-    }
 }
 
 // ── OpenRouter ──
@@ -1881,11 +1866,12 @@ pub struct CopilotModelProviderConfig {
 
 // ── GLM (multi-region) ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum GlmEndpoint {
     Cn,
+    #[default]
     Global,
 }
 impl ModelEndpoint for GlmEndpoint {
@@ -1896,31 +1882,25 @@ impl ModelEndpoint for GlmEndpoint {
         }
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.glm"]
 pub struct GlmModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    #[serde(default)]
     pub endpoint: GlmEndpoint,
-}
-impl Default for GlmModelProviderConfig {
-    fn default() -> Self {
-        Self {
-            base: ModelProviderConfig::default(),
-            endpoint: GlmEndpoint::Global,
-        }
-    }
 }
 
 // ── Minimax (multi-region + auth_mode) ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MinimaxEndpoint {
     Cn,
+    #[default]
     Intl,
 }
 impl ModelEndpoint for MinimaxEndpoint {
@@ -1931,34 +1911,27 @@ impl ModelEndpoint for MinimaxEndpoint {
         }
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.minimax"]
 pub struct MinimaxModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    #[serde(default)]
     pub endpoint: MinimaxEndpoint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AuthMode>,
 }
-impl Default for MinimaxModelProviderConfig {
-    fn default() -> Self {
-        Self {
-            base: ModelProviderConfig::default(),
-            endpoint: MinimaxEndpoint::Intl,
-            auth_mode: None,
-        }
-    }
-}
 
 // ── Z.AI (multi-region) ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ZaiEndpoint {
     Cn,
+    #[default]
     Global,
 }
 impl ModelEndpoint for ZaiEndpoint {
@@ -1969,22 +1942,15 @@ impl ModelEndpoint for ZaiEndpoint {
         }
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.zai"]
 pub struct ZaiModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    #[serde(default)]
     pub endpoint: ZaiEndpoint,
-}
-impl Default for ZaiModelProviderConfig {
-    fn default() -> Self {
-        Self {
-            base: ModelProviderConfig::default(),
-            endpoint: ZaiEndpoint::Global,
-        }
-    }
 }
 
 // ── Doubao (Volcengine; single canonical endpoint) ──
@@ -2769,7 +2735,9 @@ impl Config {
     pub fn model_provider_for_agent(&self, agent_alias: &str) -> Option<&ModelProviderConfig> {
         let agent = self.agents.get(agent_alias)?;
         let (type_key, alias_key) = agent.model_provider.split_once('.')?;
-        self.providers.models.get(type_key)?.get(alias_key)
+        self.providers
+            .models
+            .get_base_for_alias(type_key, alias_key)
     }
 
     /// Reverse-lookup the agent alias that owns a configured channel
@@ -12527,88 +12495,83 @@ impl Config {
             }
         }
 
-        for (type_key, alias_map) in &self.providers.models {
-            if type_key.trim().is_empty() {
-                anyhow::bail!("model_providers contains an empty provider type name");
+        for (type_key, alias_key, profile) in self.providers.models.iter_entries() {
+            let profile_name = format!("{type_key}.{alias_key}");
+
+            let has_name = profile
+                .name
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            let has_uri = profile
+                .uri
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+
+            // Entries created by migration from top-level fields use the provider
+            // name as the map key and may not have explicit `name` or `uri`
+            // (the provider factory resolves the family's default endpoint via
+            // `ModelEndpoint`). An entry with no identifying information at
+            // all is almost always an in-progress onboarding state — the user
+            // picked the provider but hasn't filled anything in yet. Warn but
+            // don't bail; the runtime falls back to family-default endpoint at
+            // use time, and a chat against the unconfigured provider fails
+            // with a clear error then.
+            let has_api_key = profile
+                .api_key
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+            let has_model = profile
+                .model
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+            if !has_name && !has_uri && !has_api_key && !has_model {
+                tracing::warn!(
+                    provider = %profile_name,
+                    "providers.models.{profile_name} is empty (no name / uri / api_key / model). \
+                     Skipping at runtime; finish onboarding via the dashboard or `zeroclaw onboard` \
+                     to make this provider usable.",
+                );
+                continue;
             }
-            for (alias_key, profile) in alias_map {
-                let profile_name = format!("{type_key}.{alias_key}");
 
-                let has_name = profile
-                    .name
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|value| !value.is_empty());
-                let has_uri = profile
-                    .uri
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|value| !value.is_empty());
-
-                // Entries created by migration from top-level fields use the provider
-                // name as the map key and may not have explicit `name` or `uri`
-                // (the provider factory resolves the family's default endpoint via
-                // `ModelEndpoint`). An entry with no identifying information at
-                // all is almost always an in-progress onboarding state — the user
-                // picked the provider but hasn't filled anything in yet. Warn but
-                // don't bail; the runtime falls back to family-default endpoint at
-                // use time, and a chat against the unconfigured provider fails
-                // with a clear error then.
-                let has_api_key = profile
-                    .api_key
-                    .as_deref()
-                    .is_some_and(|v| !v.trim().is_empty());
-                let has_model = profile
-                    .model
-                    .as_deref()
-                    .is_some_and(|v| !v.trim().is_empty());
-                if !has_name && !has_uri && !has_api_key && !has_model {
-                    tracing::warn!(
-                        provider = %profile_name,
-                        "providers.models.{profile_name} is empty (no name / uri / api_key / model). \
-                         Skipping at runtime; finish onboarding via the dashboard or `zeroclaw onboard` \
-                         to make this provider usable.",
-                    );
-                    continue;
+            if let Some(uri) = profile.uri.as_deref().map(str::trim)
+                && !uri.is_empty()
+            {
+                let parsed = reqwest::Url::parse(uri).with_context(|| {
+                    format!("model_providers.{profile_name}.uri is not a valid URL")
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("model_providers.{profile_name}.uri must use http/https");
                 }
+            }
 
-                if let Some(uri) = profile.uri.as_deref().map(str::trim)
-                    && !uri.is_empty()
-                {
-                    let parsed = reqwest::Url::parse(uri).with_context(|| {
-                        format!("model_providers.{profile_name}.uri is not a valid URL")
-                    })?;
-                    if !matches!(parsed.scheme(), "http" | "https") {
-                        anyhow::bail!("model_providers.{profile_name}.uri must use http/https");
-                    }
-                }
+            if let Some(wire_api) = profile.wire_api.as_deref().map(str::trim)
+                && !wire_api.is_empty()
+                && normalize_wire_api(wire_api).is_none()
+            {
+                anyhow::bail!(
+                    "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions"
+                );
+            }
 
-                if let Some(wire_api) = profile.wire_api.as_deref().map(str::trim)
-                    && !wire_api.is_empty()
-                    && normalize_wire_api(wire_api).is_none()
-                {
+            if let Some(temp) = profile.temperature {
+                validate_temperature(temp).map_err(|e| {
+                    anyhow::anyhow!("providers.models.{profile_name}.temperature: {e}")
+                })?;
+            }
+
+            for (key, value) in &profile.pricing {
+                if value.is_nan() {
                     anyhow::bail!(
-                        "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions"
+                        "providers.models.{profile_name}.pricing.{key}: value must not be NaN"
                     );
                 }
-
-                if let Some(temp) = profile.temperature {
-                    validate_temperature(temp).map_err(|e| {
-                        anyhow::anyhow!("providers.models.{profile_name}.temperature: {e}")
-                    })?;
-                }
-
-                for (key, value) in &profile.pricing {
-                    if value.is_nan() {
-                        anyhow::bail!(
-                            "providers.models.{profile_name}.pricing.{key}: value must not be NaN"
-                        );
-                    }
-                    if *value < 0.0 {
-                        anyhow::bail!(
-                            "providers.models.{profile_name}.pricing.{key}: value must be >= 0.0 (got {value})"
-                        );
-                    }
+                if *value < 0.0 {
+                    anyhow::bail!(
+                        "providers.models.{profile_name}.pricing.{key}: value must be >= 0.0 (got {value})"
+                    );
                 }
             }
         }
@@ -12626,8 +12589,10 @@ impl Config {
         if let Some(entry) = self
             .providers
             .models
-            .get("ollama")
-            .and_then(|m| m.values().next())
+            .ollama
+            .values()
+            .next()
+            .map(|cfg| &cfg.base)
             .filter(|e| {
                 e.model
                     .as_deref()
@@ -14008,19 +13973,19 @@ auto_save = true
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::ProvidersConfig {
                 models: {
-                    let mut m = HashMap::new();
-                    m.entry("openrouter".to_string())
-                        .or_insert_with(HashMap::new)
-                        .insert(
-                            "default".to_string(),
-                            ModelProviderConfig {
+                    let mut m = crate::providers::ModelProviders::default();
+                    m.openrouter.insert(
+                        "default".to_string(),
+                        OpenRouterModelProviderConfig {
+                            base: ModelProviderConfig {
                                 api_key: Some("sk-test-key".into()),
                                 model: Some("gpt-4o".into()),
                                 temperature: Some(0.5),
                                 timeout_secs: Some(120),
                                 ..Default::default()
                             },
-                        );
+                        },
+                    );
                     m
                 },
                 ..Default::default()

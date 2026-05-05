@@ -85,8 +85,7 @@ fn v1_default_provider_target_holds_globals() {
     let entry = cfg
         .providers
         .models
-        .get("openai")
-        .and_then(|m| m.get("default"))
+        .get_base_for_alias("openai", "default")
         .expect("openai.default entry synthesized from V1 default_provider");
     assert_eq!(entry.api_key.as_deref(), Some("sk-v1-test-global"));
     assert_eq!(
@@ -768,8 +767,7 @@ fn cost_prices_dropped_not_folded() {
     let anth = cfg
         .providers
         .models
-        .get("anthropic")
-        .and_then(|m| m.get("default"))
+        .get_base_for_alias("anthropic", "default")
         .expect("anthropic.default exists");
     assert!(
         anth.pricing.is_empty(),
@@ -1031,8 +1029,7 @@ api_key = "sk-zai-test"
     let entry = cfg
         .providers
         .models
-        .get("anthropic-custom")
-        .and_then(|m| m.get("default"))
+        .get_base_for_alias("anthropic-custom", "default")
         .expect(
             "V3 outer key must be the dot-free prefix `anthropic-custom`, not the raw colon-URL string",
         );
@@ -1056,8 +1053,7 @@ default_model = "local-model"
     let entry = cfg
         .providers
         .models
-        .get("custom")
-        .and_then(|m| m.get("default"))
+        .get_base_for_alias("custom", "default")
         .expect("V3 outer key must be `custom`, not the raw colon-URL");
     assert_eq!(
         entry.uri.as_deref(),

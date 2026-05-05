@@ -1653,18 +1653,12 @@ pub async fn run(
             effective_config
                 .providers
                 .models
-                .entry(type_key.to_string())
-                .or_default()
-                .entry(alias_key.to_string())
-                .or_default();
+                .ensure_alias_base_mut(type_key, alias_key);
         } else {
             effective_config
                 .providers
                 .models
-                .entry(p.clone())
-                .or_default()
-                .entry("default".to_string())
-                .or_default();
+                .ensure_alias_base_mut(&p, "default");
         }
     }
     if let Some(entry) = effective_config.providers.first_provider_mut() {
@@ -2200,16 +2194,17 @@ mod tests {
             // `extra_headers` onto outgoing requests. (The native
             // `openai` factory ignores extra_headers; OpenRouter
             // hardcodes the upstream URL.)
-            let provider_type = format!("custom:http://{mock_addr}");
+            // Custom-URL provider: type is the canonical `custom` slot,
+            // operator URL goes in the `uri` field (post-Phase 6 — V3
+            // operators no longer put URLs in the outer type key).
             let entry = config
                 .providers
                 .models
-                .entry(provider_type)
-                .or_default()
-                .entry("default".to_string())
-                .or_default();
+                .ensure_alias_base_mut("custom", "default")
+                .expect("custom provider type slot");
             entry.api_key = Some("test-key".to_string());
             entry.model = Some("test-model".to_string());
+            entry.uri = Some(format!("http://{mock_addr}"));
             entry.extra_headers.insert(
                 "User-Agent".to_string(),
                 "zeroclaw-web-test/1.0".to_string(),
@@ -2230,11 +2225,9 @@ mod tests {
         );
         let provider_alias = config
             .providers
-            .models
-            .keys()
-            .next()
+            .first_provider_type()
             .expect("provider configured above")
-            .clone();
+            .to_string();
         let agent_cfg = zeroclaw_config::schema::DelegateAgentConfig {
             model_provider: format!("{provider_alias}.default"),
             risk_profile: "test-profile".to_string(),

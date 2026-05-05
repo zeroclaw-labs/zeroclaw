@@ -760,8 +760,8 @@ pub fn provider_runtime_options_from_provider_entry(
             config
                 .providers
                 .models
-                .values()
-                .flat_map(|alias_map| alias_map.values())
+                .iter_entries()
+                .map(|(_, _, base)| base)
                 .find(|p| {
                     p.uri
                         .as_deref()
@@ -3590,27 +3590,36 @@ mod tests {
     /// so the test can prove `provider_runtime_options_for_agent` selects
     /// the alias-specific entry rather than `first_provider()`.
     fn config_with_two_anthropic_aliases() -> zeroclaw_config::schema::Config {
-        use zeroclaw_config::schema::{Config, DelegateAgentConfig, ModelProviderConfig};
+        use zeroclaw_config::schema::{
+            AnthropicModelProviderConfig, Config, DelegateAgentConfig, ModelProviderConfig,
+        };
         let mut config = Config::default();
-        let default_alias = ModelProviderConfig {
-            model: Some("claude-default".into()),
-            api_key: Some("default-key".into()),
-            uri: Some("https://api.default.example/v1/messages".into()),
-            ..ModelProviderConfig::default()
+        let default_alias = AnthropicModelProviderConfig {
+            base: ModelProviderConfig {
+                model: Some("claude-default".into()),
+                api_key: Some("default-key".into()),
+                uri: Some("https://api.default.example/v1/messages".into()),
+                ..ModelProviderConfig::default()
+            },
         };
-        let work_alias = ModelProviderConfig {
-            model: Some("claude-work".into()),
-            api_key: Some("work-key".into()),
-            uri: Some("https://work-proxy.example/v1/v1/anthropic/messages".into()),
-            ..ModelProviderConfig::default()
+        let work_alias = AnthropicModelProviderConfig {
+            base: ModelProviderConfig {
+                model: Some("claude-work".into()),
+                api_key: Some("work-key".into()),
+                uri: Some("https://work-proxy.example/v1/v1/anthropic/messages".into()),
+                ..ModelProviderConfig::default()
+            },
         };
-        let mut anthropic_aliases = std::collections::HashMap::new();
-        anthropic_aliases.insert("default".to_string(), default_alias);
-        anthropic_aliases.insert("work".to_string(), work_alias);
         config
             .providers
             .models
-            .insert("anthropic".to_string(), anthropic_aliases);
+            .anthropic
+            .insert("default".to_string(), default_alias);
+        config
+            .providers
+            .models
+            .anthropic
+            .insert("work".to_string(), work_alias);
         let work_agent = DelegateAgentConfig {
             model_provider: "anthropic.work".to_string(),
             ..DelegateAgentConfig::default()

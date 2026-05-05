@@ -222,12 +222,8 @@ fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec
     config
         .providers
         .models
-        .iter()
-        .flat_map(|(type_k, alias_map)| {
-            alias_map
-                .keys()
-                .map(move |alias_k| format!("{type_k}.{alias_k}"))
-        })
+        .iter_entries()
+        .map(|(type_k, alias_k, _)| format!("{type_k}.{alias_k}"))
         .collect()
 }
 
@@ -1080,10 +1076,8 @@ mod tests {
         config
             .providers
             .models
-            .entry("default".into())
-            .or_default()
-            .entry("default".to_string())
-            .or_default()
+            .ensure_alias_base_mut("default", "default")
+            .expect("known provider type")
             .temperature = Some(5.0);
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
@@ -1099,17 +1093,8 @@ mod tests {
         config
             .providers
             .models
-            .entry("default.default".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
-        config
-            .providers
-            .models
-            .entry("default".into())
-            .or_default()
-            .entry("default".to_string())
-            .or_default()
+            .ensure_alias_base_mut("openrouter", "default")
+            .expect("known provider type")
             .temperature = Some(0.7);
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
@@ -1135,10 +1120,8 @@ mod tests {
         config
             .providers
             .models
-            .entry("totally-fake".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
+            .ensure_alias_base_mut("totally-fake", "default")
+            .expect("known provider type");
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let prov_item = items
@@ -1148,44 +1131,12 @@ mod tests {
         assert_eq!(prov_item.unwrap().severity, Severity::Error);
     }
 
-    #[test]
-    fn config_validation_catches_malformed_custom_provider() {
-        let mut config = Config::default();
-        config.providers.models = Default::default();
-        config
-            .providers
-            .models
-            .entry("custom:".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
-        let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
-
-        let prov_item = items
-            .iter()
-            .find(|item| item.message.contains("provider \"custom:\" is invalid"));
-        assert!(prov_item.is_some());
-        assert_eq!(prov_item.unwrap().severity, Severity::Error);
-    }
-
-    #[test]
-    fn config_validation_accepts_custom_provider() {
-        let mut config = Config::default();
-        config.providers.models = Default::default();
-        config
-            .providers
-            .models
-            .entry("custom:https://my-api.com".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
-        let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
-        let prov_item = items.iter().find(|i| i.message.contains("is valid"));
-        assert!(prov_item.is_some());
-        assert_eq!(prov_item.unwrap().severity, Severity::Ok);
-    }
+    // The pre-Phase-6 tests `config_validation_catches_malformed_custom_provider`
+    // and `config_validation_accepts_custom_provider` are obsolete: the V3 typed
+    // ModelProviders container can't represent malformed `custom:` outer keys at
+    // all. Custom-URL providers now live under the `custom` typed slot with the
+    // operator-supplied URL in `base.uri`. The malformed-custom-key validator
+    // path is unreachable in V3.
 
     #[test]
     fn config_validation_warns_empty_model_route() {

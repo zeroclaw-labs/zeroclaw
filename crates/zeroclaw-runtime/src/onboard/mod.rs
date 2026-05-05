@@ -765,7 +765,7 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                 let mut options: Vec<SelectItem> = entries
                     .iter()
                     .map(|p| {
-                        let configured = cfg.providers.models.contains_key(p.name);
+                        let configured = cfg.providers.models.contains_provider_type(p.name);
                         let is_active = p.name == current_type;
                         let badge = match (is_active, configured) {
                             (true, _) => Some("[active]".into()),
@@ -845,17 +845,12 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         // `persist()` for a real value (api_key, model, …) carries it to
         // disk. If the user backs out before any value is set, the back
         // paths drop the entry so it never reaches the file.
-        let is_new_entry = !cfg
+        let is_new_entry = cfg
             .providers
             .models
-            .get(&picked)
-            .is_some_and(|m| m.contains_key(&alias));
-        cfg.providers
-            .models
-            .entry(picked.clone())
-            .or_default()
-            .entry(alias.clone())
-            .or_default();
+            .get_base_for_alias(&picked, &alias)
+            .is_none();
+        cfg.providers.models.ensure_alias_base_mut(&picked, &alias);
 
         // For fresh entries, pre-populate the provider's trait-level defaults
         // into the in-memory entry. Skipped when reconfiguring so existing
@@ -866,10 +861,7 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
             field_visibility::apply_provider_trait_defaults(cfg, &picked, &prefix)?;
         }
         if let Some(base_url) = selected_base_url.as_deref() {
-            cfg.set_prop(
-                &format!("providers.models.{picked}.{alias}.base-url"),
-                base_url,
-            )?;
+            cfg.set_prop(&format!("providers.models.{picked}.{alias}.uri"), base_url)?;
         }
 
         let display_name = entries
@@ -908,11 +900,8 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                     if flags.provider.is_some() {
                         return Ok(Nav::Back);
                     }
-                    if is_new_entry && let Some(aliases) = cfg.providers.models.get_mut(&picked) {
-                        aliases.remove(&alias);
-                        if aliases.is_empty() {
-                            cfg.providers.models.remove(&picked);
-                        }
+                    if is_new_entry {
+                        cfg.providers.models.remove_alias(&picked, &alias);
                     }
                     continue;
                 }
@@ -928,11 +917,8 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                     if flags.provider.is_some() {
                         return Ok(Nav::Back);
                     }
-                    if is_new_entry && let Some(aliases) = cfg.providers.models.get_mut(&picked) {
-                        aliases.remove(&alias);
-                        if aliases.is_empty() {
-                            cfg.providers.models.remove(&picked);
-                        }
+                    if is_new_entry {
+                        cfg.providers.models.remove_alias(&picked, &alias);
                     }
                     continue;
                 }
@@ -1034,11 +1020,7 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, prefix: &str) ->
     let (provider, profile) = match prefix.strip_prefix("providers.models.") {
         Some(rest) => {
             if let Some((type_k, alias_k)) = rest.split_once('.') {
-                let profile = cfg
-                    .providers
-                    .models
-                    .get(type_k)
-                    .and_then(|m| m.get(alias_k));
+                let profile = cfg.providers.models.get_base_for_alias(type_k, alias_k);
                 (type_k.to_string(), profile)
             } else {
                 (rest.to_string(), None)
@@ -1881,9 +1863,8 @@ mod tests {
         assert!(!section_has_signal(&cfg, "providers"));
         cfg.providers
             .models
-            .entry("anthropic".into())
-            .or_default()
-            .insert("default".to_string(), ModelProviderConfig::default());
+            .ensure_alias_base_mut("anthropic", "default")
+            .expect("anthropic typed slot");
         assert!(section_has_signal(&cfg, "providers"));
     }
 
@@ -2135,8 +2116,7 @@ mod tests {
         let model_cfg = cfg
             .providers
             .models
-            .get(&provider)
-            .and_then(|m| m.get("default"))
+            .get_base_for_alias(&provider, "default")
             .expect("custom provider entry should be seeded");
         assert_eq!(model_cfg.api_key.as_deref(), Some("sk-custom-test"));
         assert_eq!(model_cfg.model.as_deref(), Some("qwen-local"));
@@ -2152,29 +2132,23 @@ mod tests {
             None,
         )
         .await;
-        cfg.providers
+        let entry = cfg
+            .providers
             .models
-            .entry("my-gateway".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
-                    api_key: Some("sk-gateway-test".into()),
-                    uri: Some(base_url),
-                    ..Default::default()
-                },
-            );
+            .ensure_alias_base_mut("custom", "default")
+            .expect("custom typed slot");
+        entry.api_key = Some("sk-gateway-test".into());
+        entry.uri = Some(base_url);
         let mut ui = QuickUi::new().with("Model", "gateway-large");
 
-        prompt_model(&mut cfg, &mut ui, "providers.models.my-gateway.default")
+        prompt_model(&mut cfg, &mut ui, "providers.models.custom.default")
             .await
             .unwrap();
 
         let model_cfg = cfg
             .providers
             .models
-            .get("my-gateway")
-            .and_then(|m| m.get("default"))
+            .get_base_for_alias("my-gateway", "default")
             .expect("unknown provider entry should remain configured");
         assert_eq!(model_cfg.model.as_deref(), Some("gateway-large"));
     }
@@ -2204,8 +2178,7 @@ mod tests {
         let model_cfg = cfg
             .providers
             .models
-            .get("anthropic")
-            .and_then(|m| m.get("default"))
+            .get_base_for_alias("anthropic", "default")
             .expect("anthropic.default entry should be seeded");
         assert_eq!(model_cfg.model.as_deref(), Some("claude-opus-4-7"));
         assert_eq!(model_cfg.api_key.as_deref(), Some("sk-ant-test"));
@@ -2491,8 +2464,7 @@ mod tests {
         let work_model = cfg
             .providers
             .models
-            .get("anthropic")
-            .and_then(|m| m.get("work"))
+            .get_base_for_alias("anthropic", "work")
             .and_then(|c| c.model.as_deref());
         assert_eq!(
             work_model,
@@ -2503,8 +2475,7 @@ mod tests {
         let default_model = cfg
             .providers
             .models
-            .get("anthropic")
-            .and_then(|m| m.get("default"))
+            .get_base_for_alias("anthropic", "default")
             .and_then(|c| c.model.as_deref());
         assert!(
             default_model.is_none(),
@@ -2549,8 +2520,7 @@ mod tests {
         let alias_cfg = cfg
             .providers
             .models
-            .get("anthropic")
-            .and_then(|m| m.get("my-alias"))
+            .get_base_for_alias("anthropic", "my-alias")
             .expect("my-alias must survive ESC on an existing entry");
         assert_eq!(
             alias_cfg.api_key.as_deref(),
@@ -2583,8 +2553,7 @@ mod tests {
         let entry = cfg
             .providers
             .models
-            .get("anthropic")
-            .and_then(|m| m.get("fresh"));
+            .get_base_for_alias("anthropic", "fresh");
         assert!(
             entry.is_none(),
             "in-progress 'fresh' alias must be removed after ESC (never persisted)"

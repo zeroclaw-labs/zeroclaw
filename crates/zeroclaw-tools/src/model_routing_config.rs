@@ -405,19 +405,21 @@ impl ModelRoutingConfigTool {
                 // Update whichever entry is already first, or create a placeholder.
                 cfg.providers
                     .models
-                    .iter()
+                    .iter_entries()
                     .next()
-                    .and_then(|(t, aliases)| aliases.keys().next().map(|a| (t.clone(), a.clone())))
-                    .unwrap_or_else(|| ("default".to_string(), "default".to_string()))
+                    .map(|(t, a, _)| (t.to_string(), a.to_string()))
+                    .unwrap_or_else(|| ("custom".to_string(), "default".to_string()))
             }
         };
         let entry = cfg
             .providers
             .models
-            .entry(type_k.clone())
-            .or_default()
-            .entry(alias_k.clone())
-            .or_default();
+            .ensure_alias_base_mut(&type_k, &alias_k)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown provider type `{type_k}` — no typed slot in ModelProviders"
+                )
+            })?;
 
         match model_update {
             MaybeSet::Set(model) => entry.model = Some(model),
@@ -454,13 +456,18 @@ impl ModelRoutingConfigTool {
                     .unwrap_or("(none)")
                     .to_string();
 
-                // Rollback: restore the previous entry for this type.alias slot.
-                if let Some(prev_entry) = previous_first_provider {
-                    cfg.providers
+                // Rollback: restore the previous entry's baseline fields for
+                // this type.alias slot. Family-specific extras on the typed
+                // family config are NOT touched — they survive the modify+
+                // restore cycle because we only ever mutated baseline fields
+                // (model, temperature, api_key) above.
+                if let Some(prev_entry) = previous_first_provider
+                    && let Some(slot) = cfg
+                        .providers
                         .models
-                        .entry(type_k)
-                        .or_default()
-                        .insert(alias_k, prev_entry);
+                        .ensure_alias_base_mut(&type_k, &alias_k)
+                {
+                    *slot = prev_entry;
                 }
                 cfg.save().await?;
 
@@ -741,10 +748,12 @@ impl ModelRoutingConfigTool {
             let provider_entry = cfg
                 .providers
                 .models
-                .entry(provider.clone())
-                .or_default()
-                .entry(name.clone())
-                .or_default();
+                .ensure_alias_base_mut(&provider, &name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown provider type `{provider}` — no typed slot in ModelProviders"
+                    )
+                })?;
             provider_entry.model = Some(model.clone());
             match api_key_update {
                 MaybeSet::Set(ref v) => provider_entry.api_key = Some(v.clone()),

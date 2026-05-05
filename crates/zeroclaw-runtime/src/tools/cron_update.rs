@@ -274,12 +274,9 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
-        config.providers.models.insert(
-            "openrouter".to_string(),
-            std::collections::HashMap::from([(
-                "default".to_string(),
-                zeroclaw_config::schema::ModelProviderConfig::default(),
-            )]),
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::OpenRouterModelProviderConfig::default(),
         );
         config.agents.insert(
             "test-agent".to_string(),
