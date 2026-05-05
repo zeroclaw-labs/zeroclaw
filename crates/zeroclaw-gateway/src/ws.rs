@@ -606,20 +606,19 @@ async fn process_chat_message(
                 }
                 TurnEvent::ToolResult { id, name, output } => {
                     serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
-                }
-                // TODO(#6207): Add TurnEvent::ApprovalRequest variant in
-                // zeroclaw-runtime so the runtime can pause the tool loop
-                // and emit:
-                //   { "type": "approval_request", "request_id": <uuid>,
-                //     "tool": ..., "arguments_summary": ..., "risk_tier": ...,
-                //     "timeout_secs": ... }
-                // Inbound `approval_response` frames need to round-trip
-                // back to the same ApprovalManager waiter the CLI/channel
-                // path uses (see the gate at
-                // crates/zeroclaw-runtime/src/agent/loop_.rs:1572-1619).
-                // Today this branch is unreachable because Agent::turn_streamed
-                // never constructs an ApprovalManager — that's the actual
-                // bug this PR is structured around fixing.
+                } // TODO(#6207): Add TurnEvent::ApprovalRequest variant in
+                  // zeroclaw-runtime so the runtime can pause the tool loop
+                  // and emit:
+                  //   { "type": "approval_request", "request_id": <uuid>,
+                  //     "tool": ..., "arguments_summary": ..., "risk_tier": ...,
+                  //     "timeout_secs": ... }
+                  // Inbound `approval_response` frames need to round-trip
+                  // back to the same ApprovalManager waiter the CLI/channel
+                  // path uses (see the gate at
+                  // crates/zeroclaw-runtime/src/agent/loop_.rs:1572-1619).
+                  // Today this branch is unreachable because Agent::turn_streamed
+                  // never constructs an ApprovalManager — that's the actual
+                  // bug this PR is structured around fixing.
             };
             let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
         }
