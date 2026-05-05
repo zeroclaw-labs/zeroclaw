@@ -308,7 +308,7 @@ do_uninstall() {
   if [ -d "$config_dir" ]; then
     if [ -t 0 ]; then
       printf "  Remove config and data (%s)? [y/N] " "$config_dir"
-      read confirm
+      read -r confirm
       case "$confirm" in
         [Yy]*) rm -rf "$config_dir"; info "Removed $config_dir" ;;
         *)     info "Config preserved at $config_dir" ;;
@@ -437,7 +437,7 @@ if [ "$INSTALL_MODE" = "" ]; then
       printf "  [P] Pre-built binary  — fast, no Rust required  %s\n" "$(bold "(default)")"
       printf "  [s] Build from source — custom features, latest code\n"
       printf "\n  Choice [P/s]: "
-      read install_choice
+      read -r install_choice
       case "$install_choice" in
         [Ss]*) INSTALL_MODE="source" ;;
         *)     INSTALL_MODE="prebuilt" ;;
@@ -555,11 +555,35 @@ See all available features:
 esac
 
 # ── Build feature flags ──────────────────────────────────────────
+#
+# Default features come from Cargo.toml (`agent-runtime`, `acp-bridge`,
+# `gateway`, `tui-onboarding`, `observability-prometheus`,
+# `schema-export`). Cargo cannot remove individual entries from
+# `default`, so toggling `gateway` off requires `--no-default-features`
+# plus an explicit list of the others. Keep the list below in sync with
+# Cargo.toml's `default = [...]`.
+
+DEFAULT_FEATURES_NO_GATEWAY="agent-runtime,acp-bridge,tui-onboarding,observability-prometheus,schema-export"
 
 CARGO_FLAGS=""
 
 if [ "$MINIMAL" = true ]; then
   CARGO_FLAGS="--no-default-features"
+fi
+
+# `--without-gateway` overrides the default-features set: switch to
+# --no-default-features and re-add everything except `gateway`.
+if [ "$WITH_GATEWAY" = "false" ] && [ "$MINIMAL" != true ]; then
+  CARGO_FLAGS="--no-default-features"
+  USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$DEFAULT_FEATURES_NO_GATEWAY"
+fi
+
+# `--with-gateway` is a no-op when default features are on (gateway is
+# already there), and additive when --no-default-features is in play.
+if [ "$WITH_GATEWAY" = "true" ]; then
+  case "$CARGO_FLAGS" in
+    *--no-default-features*) USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}gateway" ;;
+  esac
 fi
 
 if [ -n "$USER_FEATURES" ]; then
@@ -594,7 +618,7 @@ if [ -n "$PATH_BIN" ]; then
   if [ "$MINIMAL" = true ] && [ "$DRY_RUN" != true ]; then
     if [ -t 0 ]; then
       printf "  --minimal will produce a reduced binary (no agent runtime by default). Continue? [Y/n] "
-      read confirm
+      read -r confirm
       case "$confirm" in
         [Nn]*) echo "Aborted."; exit 0 ;;
       esac
@@ -698,16 +722,17 @@ fi
 if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
   if [ -t 0 ]; then
     # Per #6292: present a 3-way choice rather than launching CLI onboard
-    # unconditionally. Skip the prompt and auto-launch CLI onboard if
-    # onboarding is not needed (status check would say "already onboarded"),
-    # or fall through to non-interactive skip when stdin is not a TTY.
+    # unconditionally. Bare Enter accepts the [1] CLI default; option [2]
+    # foregrounds the daemon so the operator can finish onboarding in the
+    # browser and Ctrl+C to return; [3] skips and prints a follow-up hint.
+    # Non-TTY runs fall through to the silent skip in the else branch.
     echo
     printf "%s\n" "$(bold "ZeroClaw installed. How would you like to complete onboarding?")"
     printf "  [1] CLI/TUI  (zeroclaw onboard)\n"
     printf "  [2] Open gateway in browser (zeroclaw daemon + dashboard)\n"
     printf "  [3] Skip for now\n"
     printf "  Choice [1-3, default 1]: "
-    read onboard_choice
+    read -r onboard_choice
     case "${onboard_choice:-1}" in
       1|"")
         echo
