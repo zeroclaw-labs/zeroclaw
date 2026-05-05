@@ -254,13 +254,17 @@ Usage: $0 [options]
 Options:
   --prebuilt           Download and install a pre-built binary (default when asked)
   --source             Build from source (skips the pre-built prompt)
-  --minimal            Build kernel only — source only (config + providers + memory, ~6.6MB)
+  --preset NAME        Named feature preset: 'minimal' (kernel only, ~6.6MB) or
+                       'full' (default features). Source builds only.
+  --minimal            Alias for --preset minimal
   --features X,Y       Select specific features — source only (comma-separated)
+  --with-gateway       Force the gateway feature on (overrides preset/feature default)
+  --without-gateway    Force the gateway feature off (overrides preset/feature default)
   --list-features      Print all available features and exit
   --prefix PATH        Install everything under PATH (default: \$HOME)
                        Sets CARGO_HOME, RUSTUP_HOME, source checkout, config
   --dry-run            Show what would happen without building or installing
-  --skip-onboard       Skip the setup wizard after install
+  --skip-onboard       Skip the post-install onboarding prompt
   --uninstall          Remove ZeroClaw binary and optionally config/data
   -h, --help           Show this help
   -V, --version        Show version from Cargo.toml
@@ -340,6 +344,8 @@ UNINSTALL=false
 DRY_RUN=false
 PREFIX="$HOME"
 INSTALL_MODE=""   # ""=ask, "prebuilt"=force prebuilt, "source"=force source
+PRESET=""         # ""=unset, "minimal"=alias for --minimal, "full"=default-features
+WITH_GATEWAY=""   # ""=unset (preset/feature default applies), "true"/"false"=explicit toggle
 
 # Support legacy env var
 if [ -n "${ZEROCLAW_CARGO_FEATURES:-}" ]; then
@@ -349,11 +355,23 @@ fi
 while [ $# -gt 0 ]; do
   case "$1" in
     --minimal)        MINIMAL=true ;;
+    --preset)
+      if [ $# -lt 2 ]; then
+        die "Missing value for --preset. Expected: --preset minimal|full"
+      fi
+      shift
+      case "$1" in
+        minimal) PRESET="minimal"; MINIMAL=true ;;
+        full)    PRESET="full" ;;
+        *)       die "Unknown preset '$1'. Expected: minimal or full" ;;
+      esac ;;
     --features)
       if [ $# -lt 2 ]; then
         die "Missing value for --features. Expected: --features X,Y"
       fi
       shift; USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$1" ;;
+    --with-gateway)    WITH_GATEWAY="true" ;;
+    --without-gateway) WITH_GATEWAY="false" ;;
     --list-features)  LIST_FEATURES=true ;;
     --prefix)
       if [ $# -lt 2 ]; then
@@ -679,12 +697,38 @@ fi
 
 if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
   if [ -t 0 ]; then
+    # Per #6292: present a 3-way choice rather than launching CLI onboard
+    # unconditionally. Skip the prompt and auto-launch CLI onboard if
+    # onboarding is not needed (status check would say "already onboarded"),
+    # or fall through to non-interactive skip when stdin is not a TTY.
     echo
-    printf "%s\n" "$(bold "Running setup wizard...")"
-    echo
-    "$BIN" onboard || warn "Onboard wizard exited with an error — run 'zeroclaw onboard' manually"
+    printf "%s\n" "$(bold "ZeroClaw installed. How would you like to complete onboarding?")"
+    printf "  [1] CLI/TUI  (zeroclaw onboard)\n"
+    printf "  [2] Open gateway in browser (zeroclaw daemon + dashboard)\n"
+    printf "  [3] Skip for now\n"
+    printf "  Choice [1-3, default 1]: "
+    read onboard_choice
+    case "${onboard_choice:-1}" in
+      1|"")
+        echo
+        "$BIN" onboard || warn "Onboard wizard exited with an error — run 'zeroclaw onboard' manually"
+        ;;
+      2)
+        echo
+        info "Starting gateway daemon for browser-based onboarding..."
+        info "Open the dashboard in your browser; pair with the code shown in logs."
+        info "Stop the daemon with Ctrl+C when done; then run 'zeroclaw service install' for always-on."
+        "$BIN" daemon || warn "Daemon exited with an error — run 'zeroclaw daemon' manually"
+        ;;
+      3)
+        info "Skipped onboarding. Run 'zeroclaw onboard' (CLI) or 'zeroclaw daemon' (browser) when ready."
+        ;;
+      *)
+        warn "Unknown choice '$onboard_choice' — skipping. Run 'zeroclaw onboard' to configure."
+        ;;
+    esac
   else
-    info "Non-interactive — skipping onboard wizard. Run 'zeroclaw onboard' to configure."
+    info "Non-interactive — skipping onboard prompt. Run 'zeroclaw onboard' to configure."
   fi
 fi
 
