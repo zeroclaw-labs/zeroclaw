@@ -1473,12 +1473,12 @@ async fn run_gateway_chat_with_tools(
             .provider
             .chat_with_system(None, message, &state.model, Some(state.temperature))
             .await?;
-        return Ok(GatewayChatOutcome {
+        Ok(GatewayChatOutcome {
             response,
             input_tokens: None,
             output_tokens: None,
             cost_usd: None,
-        });
+        })
     }
 
     #[cfg(not(test))]
