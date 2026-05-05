@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use zeroclaw_config::schema::Config;
+use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
@@ -576,7 +577,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         if ctx.is_empty() {
                             None
                         } else {
-                            Some(format!("[Memory context]\n{ctx}\n[/Memory context]\n\n"))
+                            Some(format!(
+                                "{MEMORY_CONTEXT_OPEN}\n{ctx}\n{MEMORY_CONTEXT_CLOSE}\n\n"
+                            ))
                         }
                     }
                     _ => None,

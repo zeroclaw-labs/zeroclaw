@@ -89,7 +89,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
-use zeroclaw_memory::{self, Memory};
+use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, Provider};
 use zeroclaw_runtime::agent::loop_::{
@@ -1947,7 +1947,8 @@ async fn build_memory_context(
             }
 
             if included == 0 {
-                context.push_str("[Memory context]\n");
+                context.push_str(MEMORY_CONTEXT_OPEN);
+                context.push('\n');
             }
 
             context.push_str(&line);
@@ -1956,7 +1957,8 @@ async fn build_memory_context(
         }
 
         if included > 0 {
-            context.push_str("[/Memory context]\n\n");
+            context.push_str(MEMORY_CONTEXT_CLOSE);
+            context.push_str("\n\n");
         }
     }
 
@@ -9786,7 +9788,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
 
         let context = build_memory_context(&mem, "age", 0.0, None).await;
-        assert!(context.contains("[Memory context]"));
+        assert!(context.contains(MEMORY_CONTEXT_OPEN));
         assert!(context.contains("Age is 45"));
     }
 
@@ -10257,7 +10259,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(calls[0].len(), 2);
         // Memory context is injected into the system prompt, not the user message.
         assert_eq!(calls[0][0].0, "system");
-        assert!(calls[0][0].1.contains("[Memory context]"));
+        assert!(calls[0][0].1.contains(MEMORY_CONTEXT_OPEN));
         assert!(calls[0][0].1.contains("Age is 45"));
         assert_eq!(calls[0][1].0, "user");
         assert_eq!(calls[0][1].1, "hello");
@@ -10271,7 +10273,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "hello");
-        assert!(!turns[0].content.contains("[Memory context]"));
+        assert!(!turns[0].content.contains(MEMORY_CONTEXT_OPEN));
     }
 
     #[tokio::test]
