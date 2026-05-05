@@ -295,12 +295,12 @@ mod tests {
         )
         .expect("apply defaults");
 
-        let base_url = cfg
-            .get_prop("providers.models.ollama.my-ollama-alias.base-url")
-            .expect("base-url");
+        let uri = cfg
+            .get_prop("providers.models.ollama.my-ollama-alias.uri")
+            .expect("uri");
         assert!(
-            base_url.contains("11434"),
-            "expected ollama default base_url with port 11434, got: {base_url}"
+            uri.contains("11434"),
+            "expected ollama default uri with port 11434, got: {uri}"
         );
 
         // Temperature should also be populated (Ollama overrides to 0.0).
@@ -323,10 +323,10 @@ mod tests {
         cfg.create_map_key("providers.models.ollama", "my-ollama-alias")
             .expect("create alias");
         cfg.set_prop(
-            "providers.models.ollama.my-ollama-alias.base-url",
+            "providers.models.ollama.my-ollama-alias.uri",
             "http://example:9999",
         )
-        .expect("set base-url");
+        .expect("set uri");
 
         apply_provider_trait_defaults(
             &mut cfg,
@@ -335,12 +335,12 @@ mod tests {
         )
         .expect("apply defaults");
 
-        let base_url = cfg
-            .get_prop("providers.models.ollama.my-ollama-alias.base-url")
-            .expect("base-url");
+        let uri = cfg
+            .get_prop("providers.models.ollama.my-ollama-alias.uri")
+            .expect("uri");
         assert_eq!(
-            base_url, "http://example:9999",
-            "user-set base_url must survive a defaults pass"
+            uri, "http://example:9999",
+            "user-set uri must survive a defaults pass"
         );
     }
 

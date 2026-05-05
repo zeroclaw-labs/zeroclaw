@@ -660,6 +660,232 @@ pub struct ModelProviderConfig {
     pub pricing: HashMap<String, f64>,
 }
 
+// ── Per-family model provider configs ────────────────────────────
+//
+// Each family carries its own typed config (composing `ModelProviderConfig`
+// via `#[serde(flatten)]`) plus a per-family `*Endpoint` enum that names the
+// known endpoints and resolves them via the `ModelEndpoint` trait. Families
+// that support multiple auth flows additionally carry an `auth_mode` field.
+//
+// Pattern reference for adding a new family:
+// - Single-endpoint family with no extras: see `AnthropicModelProviderConfig`
+// - Family with extras: see `OpenAIModelProviderConfig`
+// - Family with computed-endpoint template: see `AzureModelProviderConfig`
+// - Multi-region family with a required `endpoint` field: see `MoonshotModelProviderConfig`
+//
+// The `ModelProviders` container in `crates/zeroclaw-config/src/providers.rs`
+// holds a typed slot per family; the runtime impls in zeroclaw-providers
+// consume the typed configs directly.
+
+// ── OpenAI ──
+
+/// OpenAI canonical endpoint. Single variant — OpenAI publishes one base URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAIEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for OpenAIEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.openai.com/v1",
+        }
+    }
+}
+
+/// OpenAI model provider config. Adds the OpenAI-family extras
+/// (`wire_api`, `requires_openai_auth`) on top of the shared base.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.openai"]
+pub struct OpenAIModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Wire protocol flavor: `"responses"` for OpenAI's Responses API,
+    /// `"chat_completions"` for the chat completions endpoint. Auto-selected
+    /// per provider — only override if you're forcing an unusual combination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_api: Option<String>,
+}
+
+// ── OpenAI Codex ──
+
+/// OpenAI Codex / Responses API endpoint. Currently single-variant; future
+/// regional or beta endpoints would be additional variants here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAICodexEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for OpenAICodexEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.openai.com/v1",
+        }
+    }
+}
+
+/// OpenAI Codex model provider config. Same extras as OpenAI proper plus
+/// `requires_openai_auth` (Codex-specific OAuth-cache integration).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.openai_codex"]
+pub struct OpenAICodexModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Wire protocol flavor (typically `"responses"` for Codex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_api: Option<String>,
+    /// When true, the client pulls credentials from `OPENAI_API_KEY` or
+    /// `~/.codex/auth.json` instead of the `api_key` field. Codex-specific
+    /// auth-cache integration; off by default.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_openai_auth: bool,
+}
+
+// ── Azure OpenAI ──
+
+/// Azure OpenAI endpoint template. Single variant; the URL is computed at
+/// runtime by substituting `{resource}` and `{deployment}` from the typed
+/// config fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AzureEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for AzureEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            // Azure's URI is a template — substitution happens in the
+            // AzureModelProvider runtime constructor against the typed
+            // config's resource / deployment fields.
+            Self::Default => {
+                "https://{resource}.openai.azure.com/openai/deployments/{deployment}"
+            }
+        }
+    }
+}
+
+/// Azure OpenAI model provider config. Carries the Azure-specific connection
+/// fields (`resource`, `deployment`, `api_version`) — the URI template
+/// substitutes `{resource}` and `{deployment}` at runtime. Operators can
+/// still override the entire endpoint via `base.uri`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.azure_openai"]
+pub struct AzureModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Azure resource name (the `<resource>` part of `<resource>.openai.azure.com`).
+    /// Accepts the legacy `azure_openai_resource` key on deserialize for V2
+    /// compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "azure_openai_resource")]
+    pub resource: Option<String>,
+    /// Azure deployment name — the deployment created in Azure AI Studio that
+    /// wraps a specific model.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "azure_openai_deployment")]
+    pub deployment: Option<String>,
+    /// Azure API version string (e.g. `2024-10-21`). Must match a version the
+    /// resource supports.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "azure_openai_api_version")]
+    pub api_version: Option<String>,
+}
+
+// ── Anthropic ──
+
+/// Anthropic canonical endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for AnthropicEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.anthropic.com",
+        }
+    }
+}
+
+/// Anthropic model provider config. No family-specific extras yet — typed
+/// slot reserved for future Anthropic-only knobs (cache_control, beta
+/// headers) so they land cleanly without another schema rework.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.anthropic"]
+pub struct AnthropicModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Moonshot (multi-region exemplar) ──
+
+/// Moonshot endpoint variants. Operators pick the region that matches their
+/// account; the runtime resolves the URI from the chosen variant unless
+/// overridden by `base.uri`. Code variant is intl-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MoonshotEndpoint {
+    /// Mainland China endpoint.
+    Cn,
+    /// International endpoint.
+    Intl,
+    /// Code-specialist endpoint (intl).
+    Code,
+}
+
+impl ModelEndpoint for MoonshotEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Cn => "https://api.moonshot.cn/v1",
+            Self::Intl => "https://api.moonshot.ai/v1",
+            Self::Code => "https://api.moonshot.cn/coder/v1",
+        }
+    }
+}
+
+/// Moonshot model provider config. The `endpoint` field is required (no
+/// implicit default) — operators must pick a region explicitly. Migration
+/// fills it in from collapsed `moonshot-cn` / `moonshot-intl` outer keys.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.moonshot"]
+pub struct MoonshotModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Required: pick `cn`, `intl`, or `code`.
+    pub endpoint: MoonshotEndpoint,
+}
+
+impl Default for MoonshotModelProviderConfig {
+    fn default() -> Self {
+        Self {
+            base: ModelProviderConfig::default(),
+            // Default chosen so onboarding / `Config::default()` constructs
+            // a usable shape; operators can override after picking a region.
+            endpoint: MoonshotEndpoint::Intl,
+        }
+    }
+}
+
 // ── Delegate Tool Configuration ─────────────────────────────────
 
 /// Global delegate tool configuration for default timeout values.
@@ -11598,6 +11824,11 @@ impl_enum_prop_kind!(
     SandboxBackend,
     AutonomyLevel,
     AuthMode,
+    OpenAIEndpoint,
+    OpenAICodexEndpoint,
+    AzureEndpoint,
+    AnthropicEndpoint,
+    MoonshotEndpoint,
 );
 
 impl HasPropKind for serde_json::Value {
