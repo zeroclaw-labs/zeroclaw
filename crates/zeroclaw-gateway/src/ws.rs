@@ -12,12 +12,12 @@
 //! Server -> Client: {"type":"done","full_response":"..."}
 //! ```
 //!
-//! ## Tool approvals (in progress, see #6207)
+//! ## Tool approvals
 //!
 //! When supervised-mode tool calls hit the `ApprovalManager`, the server
 //! emits an `approval_request` and pauses the tool loop until the client
 //! responds. Mirrors the Telegram inline-keyboard / CLI Y/N/A pattern,
-//! but over the WS frame transport.
+//! over the WS frame transport.
 //!
 //! ```text
 //! Server -> Client: {
@@ -25,7 +25,6 @@
 //!     "request_id": "<uuid>",
 //!     "tool": "shell",
 //!     "arguments_summary": "command: git status",
-//!     "risk_tier": "medium",
 //!     "timeout_secs": 120
 //! }
 //! Client -> Server: {
@@ -35,13 +34,21 @@
 //! }
 //! ```
 //!
-//! Semantics target parity with `process_channel_message` + `ApprovalManager`:
 //! `approve` runs the tool once, `always` adds the tool to the session
 //! allowlist for the rest of the conversation, `deny` returns a structured
-//! error to the model that mirrors Telegram's "Denied by user" response.
-//! When no client is connected (or the client disconnects mid-prompt) the
-//! tool call is auto-denied with the same structured error after the
-//! `timeout_secs` window expires.
+//! error to the model. When no client is connected, or the client
+//! disconnects mid-prompt, the tool call is auto-denied after `timeout_secs`.
+//!
+//! ### `arguments_summary` security boundary
+//!
+//! `arguments_summary` is a human-readable string the runtime synthesises
+//! for the operator (e.g. `"command: git status"`, `"path: /etc/hosts"`).
+//! It is render-only; the operator's approve/deny choice attaches to the
+//! `request_id`, never to the summary string. The runtime must not echo
+//! any `#[secret]` or `#[derived_from_secret]` field (auth tokens, API
+//! keys, OAuth secrets) into the summary. The agent's tool loop runs
+//! tool args through `zeroclaw_runtime::approval::summarize_args` before
+//! the request reaches this transport; do not stringify raw args here.
 //!
 //! Query params:
 //! - `session_id` — resume or create a session (default: new UUID)
@@ -49,6 +56,7 @@
 //! - `token` — bearer auth token (alternative to Authorization header)
 
 use super::AppState;
+use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
 use axum::{
     extract::{
         Query, State, WebSocketUpgrade,
@@ -60,7 +68,15 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::debug;
+use zeroclaw_api::channel::ChannelApprovalResponse;
+
+/// Default wall-clock budget for the operator to answer an
+/// `approval_request` frame before the channel auto-denies. Mirrors the
+/// channel-side default on `TelegramConfig::approval_timeout_secs`.
+const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 
 /// Optional connection parameters sent as the first WebSocket message.
 ///
@@ -343,6 +359,26 @@ async fn handle_socket(
         agent.seed_history(&stored_messages);
     }
 
+    // ── Tool-approval back-channel ─────────────────────────────────
+    // Connection-level event channel that the WsApprovalChannel shares
+    // with the per-turn forward task: it pushes ApprovalRequest frames
+    // here when the agent's tool loop pauses for consent, and the
+    // forward task drains them out the same WebSocket as the regular
+    // streaming events. The pending map is shared with the receive loop
+    // so inbound `approval_response` frames can resolve the matching
+    // oneshot waiter.
+    let (approval_event_tx, mut approval_event_rx) =
+        tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(8);
+    let pending_approvals: PendingApprovals = new_pending_approvals();
+    let approval_channel = Arc::new(WsApprovalChannel::new(
+        approval_event_tx.clone(),
+        pending_approvals.clone(),
+        Duration::from_secs(WS_APPROVAL_TIMEOUT_SECS),
+    ));
+    agent
+        .channel_handles()
+        .register_channel("ws", approval_channel.clone());
+
     // Process the first message if it was not a connect frame
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
@@ -427,6 +463,33 @@ async fn handle_socket(
                     }
                 }
 
+                // ── approval_response (operator answered a tool prompt) ──
+                if msg_type == "approval_response" {
+                    let request_id = parsed["request_id"].as_str().unwrap_or("");
+                    let decision_str = parsed["decision"].as_str().unwrap_or("");
+                    let decision = match decision_str {
+                        "approve" => Some(ChannelApprovalResponse::Approve),
+                        "always" => Some(ChannelApprovalResponse::AlwaysApprove),
+                        "deny" => Some(ChannelApprovalResponse::Deny),
+                        _ => None,
+                    };
+                    if request_id.is_empty() || decision.is_none() {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": "approval_response requires request_id and decision in {approve,deny,always}",
+                            "code": "INVALID_APPROVAL_RESPONSE"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        continue;
+                    }
+                    if let Some(tx) = pending_approvals.lock().remove(request_id) {
+                        let _ = tx.send(decision.expect("checked above"));
+                    } else {
+                        debug!(%request_id, "approval_response with no matching pending request");
+                    }
+                    continue;
+                }
+
                 if msg_type != "message" {
                     let err = serde_json::json!({
                         "type": "error",
@@ -478,6 +541,38 @@ async fn handle_socket(
                 if let Ok(event) = event {
                     let _ = sender.send(Message::Text(event.to_string().into())).await;
                 }
+            }
+
+            // ── Approval request from the agent's tool loop ────────────
+            // The WsApprovalChannel emits these whenever a supervised tool
+            // call needs operator consent. Forwarded out the same socket
+            // as the regular streaming events; the matching response
+            // arrives via the `approval_response` arm above and resolves
+            // the channel's pending oneshot.
+            approval_event = approval_event_rx.recv() => {
+                let Some(event) = approval_event else { break };
+                let frame = match event {
+                    zeroclaw_api::agent::TurnEvent::ApprovalRequest {
+                        request_id,
+                        tool_name,
+                        arguments_summary,
+                        timeout_secs,
+                    } => serde_json::json!({
+                        "type": "approval_request",
+                        "request_id": request_id,
+                        "tool": tool_name,
+                        "arguments_summary": arguments_summary,
+                        "timeout_secs": timeout_secs,
+                    }),
+                    other => {
+                        tracing::warn!(
+                            kind = ?other,
+                            "non-ApprovalRequest event leaked into approval channel"
+                        );
+                        continue;
+                    }
+                };
+                let _ = sender.send(Message::Text(frame.to_string().into())).await;
             }
         }
     }
@@ -606,19 +701,21 @@ async fn process_chat_message(
                 }
                 TurnEvent::ToolResult { id, name, output } => {
                     serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
-                } // TODO(#6207): Add TurnEvent::ApprovalRequest variant in
-                  // zeroclaw-runtime so the runtime can pause the tool loop
-                  // and emit:
-                  //   { "type": "approval_request", "request_id": <uuid>,
-                  //     "tool": ..., "arguments_summary": ..., "risk_tier": ...,
-                  //     "timeout_secs": ... }
-                  // Inbound `approval_response` frames need to round-trip
-                  // back to the same ApprovalManager waiter the CLI/channel
-                  // path uses (see the gate at
-                  // crates/zeroclaw-runtime/src/agent/loop_.rs:1572-1619).
-                  // Today this branch is unreachable because Agent::turn_streamed
-                  // never constructs an ApprovalManager — that's the actual
-                  // bug this PR is structured around fixing.
+                }
+                TurnEvent::ApprovalRequest {
+                    request_id,
+                    tool_name,
+                    arguments_summary,
+                    timeout_secs,
+                } => {
+                    serde_json::json!({
+                        "type": "approval_request",
+                        "request_id": request_id,
+                        "tool": tool_name,
+                        "arguments_summary": arguments_summary,
+                        "timeout_secs": timeout_secs,
+                    })
+                }
             };
             let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
         }

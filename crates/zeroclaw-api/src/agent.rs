@@ -24,4 +24,20 @@ pub enum TurnEvent {
         name: String,
         output: String,
     },
+    /// The agent is waiting for the operator to approve, deny, or always-allow
+    /// a tool call. The transport (e.g. gateway WebSocket) is expected to
+    /// surface this to the operator and route the response back through the
+    /// same correlation `request_id`. The runtime tool loop pauses until that
+    /// answer arrives or the channel times out.
+    ApprovalRequest {
+        /// Correlation ID. The matching response frame must echo it.
+        request_id: String,
+        tool_name: String,
+        /// Human-readable, secret-redacted summary of the tool arguments.
+        /// Synthesised by `crate::approval::summarize_args`; never the raw
+        /// `args` value.
+        arguments_summary: String,
+        /// How long the channel will wait before auto-denying.
+        timeout_secs: u64,
+    },
 }
