@@ -50,7 +50,7 @@ export default function AgentChat() {
   const [compact, setCompact] = useState(() => {
     try { return localStorage.getItem('zeroclaw_chat_compact') === '1'; } catch { return false; }
   });
-  // #6348: tool execution is plumbing, not chat. Default off so tool_call /
+  // Tool execution is plumbing, not chat. Default off so tool_call /
   // tool_result frames do not surface inline in the conversation transcript.
   // Toggleable from the chat toolbar (Wrench button); the same flag persists
   // to `localStorage.zeroclaw_show_tool_activity` for cross-session memory.
@@ -187,11 +187,6 @@ export default function AgentChat() {
         }
 
         case 'tool_call': {
-          // #6348: tool execution is plumbing, not chat content. Skip
-          // inline rendering unless the operator explicitly opts in via
-          // localStorage 'zeroclaw_show_tool_activity'. A future commit
-          // will route tool activity into the existing collapsed
-          // Thinking strip so it has a discoverable home.
           if (!showToolActivity) {
             break;
           }
@@ -224,8 +219,6 @@ export default function AgentChat() {
         }
 
         case 'tool_result': {
-          // #6348: tool errors and results should not surface as chat
-          // content. Same gate as tool_call above.
           if (!showToolActivity) {
             break;
           }
