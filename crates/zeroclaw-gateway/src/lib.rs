@@ -1521,14 +1521,23 @@ fn infer_os_from_ua(ua: &str) -> (Option<String>, Option<String>) {
         let version = rest[..end].replace('_', ".");
         return (Some("macOS".into()), Some(version));
     }
-    // iOS: "iPhone; CPU iPhone OS 17_5_1 like Mac OS X"
-    if let Some(start) = ua.find("iPhone OS ").or_else(|| ua.find("iPad OS ")) {
-        let rest = &ua[start..];
-        let after_space = rest.find(' ').map(|i| &rest[i + 1..]).unwrap_or(rest);
-        let end = after_space
+    // iOS: "iPhone; CPU iPhone OS 17_5_1 like Mac OS X" or "iPad OS 17_5_1"
+    //
+    // Skip the literal prefix length per match (the two prefixes have
+    // different lengths: "iPhone OS " is 10, "iPad OS " is 8). Earlier code
+    // tried to share a single skip via `find(' ')` and landed on the space
+    // between "iPhone" and "OS" instead of the one before the version, which
+    // produced empty version strings on every iOS UA.
+    let ios_match = ua
+        .find("iPhone OS ")
+        .map(|i| i + "iPhone OS ".len())
+        .or_else(|| ua.find("iPad OS ").map(|i| i + "iPad OS ".len()));
+    if let Some(version_start) = ios_match {
+        let rest = &ua[version_start..];
+        let end = rest
             .find(|c: char| !(c.is_ascii_digit() || c == '_'))
-            .unwrap_or(after_space.len());
-        let version = after_space[..end].replace('_', ".");
+            .unwrap_or(rest.len());
+        let version = rest[..end].replace('_', ".");
         return (Some("iOS".into()), Some(version));
     }
     // Android: "Android 14;"
@@ -2637,6 +2646,110 @@ mod tests {
     fn generate_test_secret() -> String {
         let bytes: [u8; 32] = rand::random();
         hex::encode(bytes)
+    }
+
+    // ── User-Agent parsers ──────────────────────────────────────────
+    //
+    // One test per branch of `infer_os_from_ua` and `infer_device_type_from_ua`.
+    // The iOS case in particular caught a bug where the previous parser walked
+    // off the wrong space and produced `Some("iOS")` / `Some("")`.
+
+    #[test]
+    fn infer_os_from_ua_macos() {
+        let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15";
+        assert_eq!(
+            infer_os_from_ua(ua),
+            (Some("macOS".into()), Some("10.15.7".into()))
+        );
+    }
+
+    #[test]
+    fn infer_os_from_ua_iphone_returns_version() {
+        let ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15";
+        // Regression: previously this returned `Some("")` because the parser
+        // walked the space between "iPhone" and "OS" instead of the one
+        // before the version.
+        assert_eq!(
+            infer_os_from_ua(ua),
+            (Some("iOS".into()), Some("17.5.1".into()))
+        );
+    }
+
+    #[test]
+    fn infer_os_from_ua_ipad_returns_version() {
+        let ua = "Mozilla/5.0 (iPad; CPU iPad OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15";
+        // Same bug class as iPhone but with a 2-char-shorter prefix; verifies
+        // the per-prefix length skip handles both correctly.
+        assert_eq!(
+            infer_os_from_ua(ua),
+            (Some("iOS".into()), Some("17.5.1".into()))
+        );
+    }
+
+    #[test]
+    fn infer_os_from_ua_android() {
+        let ua = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36";
+        // The "Android " prefix appears before the bare "Linux" word, so the
+        // Android branch should win. Without that ordering the result would
+        // be Linux/None.
+        assert_eq!(
+            infer_os_from_ua(ua),
+            (Some("Android".into()), Some("14".into()))
+        );
+    }
+
+    #[test]
+    fn infer_os_from_ua_windows() {
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+        assert_eq!(
+            infer_os_from_ua(ua),
+            (Some("Windows".into()), Some("10.0".into()))
+        );
+    }
+
+    #[test]
+    fn infer_os_from_ua_linux_no_version() {
+        let ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36";
+        assert_eq!(infer_os_from_ua(ua), (Some("Linux".into()), None));
+    }
+
+    #[test]
+    fn infer_os_from_ua_empty_returns_none() {
+        assert_eq!(infer_os_from_ua(""), (None, None));
+    }
+
+    #[test]
+    fn infer_os_from_ua_unrecognised_returns_none() {
+        assert_eq!(
+            infer_os_from_ua("zeroclaw/0.7.4 some-weird-runtime"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn infer_device_type_from_ua_branches() {
+        assert_eq!(
+            infer_device_type_from_ua("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X)"),
+            Some("ios".into())
+        );
+        assert_eq!(
+            infer_device_type_from_ua("Mozilla/5.0 (Linux; Android 14)"),
+            Some("android".into())
+        );
+        assert_eq!(
+            infer_device_type_from_ua("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"),
+            Some("macos".into())
+        );
+        assert_eq!(
+            infer_device_type_from_ua("Mozilla/5.0 (Windows NT 10.0)"),
+            Some("windows".into())
+        );
+        assert_eq!(
+            infer_device_type_from_ua("zeroclaw/0.7.4"),
+            Some("cli".into())
+        );
+        assert_eq!(infer_device_type_from_ua("curl/8.4.0"), Some("cli".into()));
+        assert_eq!(infer_device_type_from_ua(""), None);
     }
 
     #[test]

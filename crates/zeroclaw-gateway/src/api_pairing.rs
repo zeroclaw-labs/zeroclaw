@@ -64,14 +64,33 @@ impl DeviceRegistry {
 
         // Additive migration: hostname / os_name / os_version / agent_version.
         // `IF NOT EXISTS` is not supported on `ALTER TABLE ADD COLUMN` in
-        // older SQLite, so we ignore the "duplicate column" error per column.
-        for column in [
-            "hostname TEXT",
-            "os_name TEXT",
-            "os_version TEXT",
-            "agent_version TEXT",
+        // SQLite, so we list the existing columns up front and only attempt
+        // ADD on the ones that are actually missing. This is idempotent
+        // across restarts and surfaces *real* errors (DB locked, permission
+        // denied, disk full) instead of swallowing them under the previous
+        // `let _ = conn.execute(...)` shape.
+        let existing_columns: std::collections::HashSet<String> = conn
+            .prepare("PRAGMA table_info(devices)")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(1))
+                    .map(|rows| rows.filter_map(Result::ok).collect())
+            })
+            .unwrap_or_default();
+        for (name, decl) in [
+            ("hostname", "hostname TEXT"),
+            ("os_name", "os_name TEXT"),
+            ("os_version", "os_version TEXT"),
+            ("agent_version", "agent_version TEXT"),
         ] {
-            let _ = conn.execute(&format!("ALTER TABLE devices ADD COLUMN {column}"), []);
+            if existing_columns.contains(name) {
+                continue;
+            }
+            if let Err(e) = conn.execute(&format!("ALTER TABLE devices ADD COLUMN {decl}"), []) {
+                tracing::warn!(
+                    target: "zeroclaw_gateway::devices",
+                    "failed to add column {name} to devices table: {e}"
+                );
+            }
         }
 
         // Warm the in-memory cache from DB
@@ -504,5 +523,136 @@ pub async fn rotate_token(
             "Cannot generate new pairing code",
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn fresh_registry() -> (TempDir, DeviceRegistry) {
+        let tmp = TempDir::new().unwrap();
+        let registry = DeviceRegistry::new(tmp.path());
+        (tmp, registry)
+    }
+
+    fn sample_device(id: &str, name: Option<&str>) -> DeviceInfo {
+        DeviceInfo {
+            id: id.into(),
+            name: name.map(String::from),
+            device_type: Some("macos".into()),
+            paired_at: Utc::now(),
+            last_seen: Utc::now(),
+            ip_address: Some("127.0.0.1".into()),
+            hostname: Some("argenis-Mac.local".into()),
+            os_name: Some("macOS".into()),
+            os_version: Some("10.15.7".into()),
+            agent_version: Some("0.7.4".into()),
+        }
+    }
+
+    #[test]
+    fn rename_persists_new_name() {
+        let (_tmp, registry) = fresh_registry();
+        registry.register("hash-1".into(), sample_device("dev-1", Some("Old Name")));
+
+        assert!(registry.rename("dev-1", Some("New Name".into())));
+        let listed = registry.list();
+        let updated = listed.iter().find(|d| d.id == "dev-1").unwrap();
+        assert_eq!(updated.name.as_deref(), Some("New Name"));
+    }
+
+    #[test]
+    fn rename_returns_false_for_unknown_id() {
+        let (_tmp, registry) = fresh_registry();
+        // No device registered yet; rename should be a no-op.
+        assert!(!registry.rename("does-not-exist", Some("X".into())));
+    }
+
+    #[test]
+    fn rename_to_none_clears_label() {
+        let (_tmp, registry) = fresh_registry();
+        registry.register("hash-1".into(), sample_device("dev-1", Some("Set")));
+
+        assert!(registry.rename("dev-1", None));
+        let listed = registry.list();
+        let cleared = listed.iter().find(|d| d.id == "dev-1").unwrap();
+        assert!(cleared.name.is_none());
+    }
+
+    /// Pre-create a `devices.db` with the v1 schema (no hostname / os_name /
+    /// os_version / agent_version columns) and a sample row, then open a
+    /// fresh `DeviceRegistry` against the same dir. The additive migration
+    /// must add the columns and preserve the pre-existing row.
+    #[test]
+    fn migration_adds_columns_to_pre_existing_db() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("devices.db");
+
+        // Simulate the v1 schema (the shape master had before this PR).
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE devices (
+                    token_hash TEXT PRIMARY KEY,
+                    id TEXT NOT NULL,
+                    name TEXT,
+                    device_type TEXT,
+                    paired_at TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    ip_address TEXT
+                )",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO devices (token_hash, id, name, device_type, paired_at, last_seen, ip_address) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "legacy-hash",
+                    "legacy-dev",
+                    "Pre-migration Mac",
+                    "macos",
+                    Utc::now().to_rfc3339(),
+                    Utc::now().to_rfc3339(),
+                    "127.0.0.1",
+                ],
+            )
+            .unwrap();
+        }
+
+        // Opening the registry runs the migration.
+        let registry = DeviceRegistry::new(tmp.path());
+
+        // Pre-existing row is still there with its old fields intact and the
+        // new fields populated as `None`.
+        let listed = registry.list();
+        let legacy = listed.iter().find(|d| d.id == "legacy-dev").unwrap();
+        assert_eq!(legacy.name.as_deref(), Some("Pre-migration Mac"));
+        assert_eq!(legacy.device_type.as_deref(), Some("macos"));
+        assert!(legacy.hostname.is_none());
+        assert!(legacy.os_name.is_none());
+        assert!(legacy.os_version.is_none());
+        assert!(legacy.agent_version.is_none());
+
+        // And new registers can populate the new fields end-to-end.
+        registry.register("new-hash".into(), sample_device("new-dev", Some("Fresh")));
+        let listed = registry.list();
+        let fresh = listed.iter().find(|d| d.id == "new-dev").unwrap();
+        assert_eq!(fresh.hostname.as_deref(), Some("argenis-Mac.local"));
+        assert_eq!(fresh.os_version.as_deref(), Some("10.15.7"));
+    }
+
+    /// Re-opening an already-migrated db must be a no-op (no errors
+    /// surfaced, columns unchanged). Catches the case where the idempotent
+    /// existence check regresses.
+    #[test]
+    fn migration_is_idempotent_on_already_migrated_db() {
+        let tmp = TempDir::new().unwrap();
+        let _first = DeviceRegistry::new(tmp.path());
+        // Second open should not panic and should preserve schema.
+        let second = DeviceRegistry::new(tmp.path());
+        // Round-trip a row to confirm the table is still usable.
+        second.register("h".into(), sample_device("d", None));
+        assert_eq!(second.list().len(), 1);
     }
 }
