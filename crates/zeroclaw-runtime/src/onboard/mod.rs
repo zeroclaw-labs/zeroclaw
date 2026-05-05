@@ -848,14 +848,13 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         let is_new_entry = cfg.providers.models.find(&picked, &alias).is_none();
         cfg.providers.models.ensure(&picked, &alias);
 
-        // For fresh entries, pre-populate the provider's trait-level defaults
-        // into the in-memory entry. Skipped when reconfiguring so existing
-        // user overrides aren't clobbered. Lives in memory until the first
-        // `persist()` carries the entry — defaults included — to disk.
-        if is_new_entry {
-            let prefix = format!("providers.models.{picked}.{alias}");
-            field_visibility::apply_provider_trait_defaults(cfg, &picked, &prefix)?;
-        }
+        // Per-family typed configs now derive their own default endpoint
+        // URI via the `ModelEndpoint` trait at runtime construction time.
+        // The pre-Phase-6 `apply_provider_trait_defaults` walk that copied
+        // `default_provider_config` field values into the new entry is gone
+        // — operator-set fields ride the typed config's `Default` impl, and
+        // family endpoint resolution happens family-side rather than via
+        // pre-populated entry fields.
         if let Some(base_url) = selected_base_url.as_deref() {
             cfg.set_prop(&format!("providers.models.{picked}.{alias}.uri"), base_url)?;
         }
@@ -965,41 +964,14 @@ async fn offer_advanced_settings(
         Answer::Value(true) => {}
     }
 
-    let defaults = provider_trait_defaults_for_prompts(provider, prefix);
-
-    // Skipped: `model` (already via prompt_model), `api-key` (explicit auth
-    // phase), and fields that only apply to a different provider family
-    // (e.g. azure-openai-* when the user picked Anthropic).
-    let mut excludes: Vec<&str> = vec!["model", "api-key"];
-    excludes.extend(field_visibility::provider_family_excludes(provider));
+    // Per-family typed configs only carry their own family-applicable fields,
+    // so no per-family exclude list is needed (vs. pre-#6273 when one flat
+    // ModelProviderConfig had every family's fields jumbled together).
+    // Excluded: `model` (already prompted via prompt_model) and `api-key`
+    // (explicit auth phase).
+    let excludes: Vec<&str> = vec!["model", "api-key"];
+    let defaults: Vec<FieldDefault> = Vec::new();
     prompt_fields_under(cfg, ui, prefix, &excludes, &defaults).await
-}
-
-/// Build the `FieldDefault` list for the prompt walker by walking the
-/// schema fields of `zeroclaw_providers::default_provider_config(provider)`
-/// and rebasing each leaf onto `prefix`. Same source of truth the gateway's
-/// `apply_provider_trait_defaults` uses — schema-driven, no per-field
-/// names to keep in sync.
-fn provider_trait_defaults_for_prompts(provider: &str, prefix: &str) -> Vec<FieldDefault> {
-    let defaults = zeroclaw_providers::default_provider_config(provider);
-    let source_dot = format!(
-        "{}.",
-        zeroclaw_config::schema::ModelProviderConfig::configurable_prefix()
-    );
-    defaults
-        .prop_fields()
-        .into_iter()
-        .filter_map(|field| {
-            let leaf = field.name.strip_prefix(&source_dot)?;
-            if leaf.contains('.') || field.display_value == "<unset>" {
-                return None;
-            }
-            Some(FieldDefault {
-                path: format!("{prefix}.{leaf}"),
-                display: field.display_value,
-            })
-        })
-        .collect()
 }
 
 /// Prompt for the model field using the provider's live model catalog.

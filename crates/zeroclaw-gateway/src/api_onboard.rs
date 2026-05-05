@@ -757,22 +757,12 @@ pub async fn handle_section_select(
                 Ok(c) => c,
                 Err(resp) => return resp,
             };
-            // Pre-populate the provider's trait-level defaults (base_url for
-            // Ollama, default temperature / max_tokens / etc.) so the form
-            // opens with sensible values instead of a sea of empty inputs.
-            // Idempotent — only fills paths that are still unset, so a user
-            // who's already overridden a field doesn't get clobbered on re-select.
-            let prefix = format!("providers.models.{key}.{alias}");
-            if let Err(e) =
-                zeroclaw_runtime::onboard::field_visibility::apply_provider_trait_defaults(
-                    &mut working,
-                    &key,
-                    &prefix,
-                )
-            {
-                tracing::warn!(provider = %key, alias = %alias, error = ?e, "failed to apply trait defaults; form will start blank");
-            }
-            (prefix, created)
+            // Per-family typed configs derive their own default endpoint
+            // URI via the `ModelEndpoint` trait at runtime construction time
+            // (#6273). The pre-Phase-6 trait-defaults pre-population walk is
+            // gone — operators get the typed config's `Default::default()`
+            // shape and override individual fields through the form.
+            (format!("providers.models.{key}.{alias}"), created)
         }
         "channels" => {
             let created = working
