@@ -717,6 +717,12 @@ pub struct ProviderRuntimeOptions {
     /// Extra JSON parameters merged into API request bodies at the top level.
     /// Propagated from `ModelProviderConfig::provider_extra`.
     pub provider_extra: Option<serde_json::Value>,
+    /// Override the provider's default for native tool calling. `None` honors
+    /// the per-provider built-in choice. `Some(true)` forces native tool
+    /// calls on; `Some(false)` forces text-fallback. Propagated from
+    /// `ModelProviderConfig::native_tools`. Currently consulted only by the
+    /// Groq factory branch (#5932).
+    pub native_tools: Option<bool>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -734,6 +740,7 @@ impl Default for ProviderRuntimeOptions {
             provider_max_tokens: None,
             merge_system_into_user: false,
             provider_extra: None,
+            native_tools: None,
         }
     }
 }
@@ -777,6 +784,7 @@ pub fn provider_runtime_options_from_config(
         provider_max_tokens: fallback.and_then(|e| e.max_tokens),
         merge_system_into_user,
         provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
+        native_tools: fallback.and_then(|e| e.native_tools),
     }
 }
 
@@ -1425,15 +1433,22 @@ fn create_provider_with_url_and_options(
         }
 
         // ── Extended ecosystem (community favorites) ─────────
-        "groq" => Ok(compat(
-            OpenAiCompatibleProvider::new(
+        "groq" => {
+            let mut p = OpenAiCompatibleProvider::new(
                 "Groq",
                 "https://api.groq.com/openai/v1",
                 key,
                 AuthStyle::Bearer,
-            )
-            .without_native_tools(),
-        )),
+            );
+            // Default to text-fallback because Groq's llama-family models
+            // reject native tool calls with HTTP 400 (#5848). Operators can
+            // override per-profile via `[providers.models.<alias>] native_tools = true`
+            // to enable native tool calling for Groq models that support it.
+            if options.native_tools != Some(true) {
+                p = p.without_native_tools();
+            }
+            Ok(compat(p))
+        }
         "mistral" => Ok(compat(OpenAiCompatibleProvider::new(
             "Mistral",
             "https://api.mistral.ai/v1",
@@ -3041,6 +3056,75 @@ mod tests {
     #[test]
     fn factory_groq() {
         assert!(create_provider("groq", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_groq_disables_native_tools_by_default() {
+        // Default behavior preserves the #5848 blanket disable: llama-family
+        // Groq models reject native tool calls with HTTP 400.
+        let provider =
+            create_provider_with_options("groq", Some("key"), &ProviderRuntimeOptions::default())
+                .expect("groq factory must succeed");
+        assert!(
+            !provider.supports_native_tools(),
+            "Groq must default to text-fallback for llama-family compatibility (#5848)"
+        );
+    }
+
+    #[test]
+    fn factory_groq_honors_native_tools_override_true() {
+        // Operator opt-in via `[providers.models.<alias>] native_tools = true`
+        // skips the default disable so non-llama Groq models can use native
+        // tool calling (#5932).
+        let options = ProviderRuntimeOptions {
+            native_tools: Some(true),
+            ..Default::default()
+        };
+        let provider = create_provider_with_options("groq", Some("key"), &options)
+            .expect("groq factory must succeed");
+        assert!(
+            provider.supports_native_tools(),
+            "Groq with `native_tools = true` must enable native tool calling (#5932)"
+        );
+    }
+
+    #[test]
+    fn factory_groq_native_tools_override_false_keeps_disable() {
+        // Explicit `native_tools = false` matches the default behavior; this
+        // documents that the option is tri-state and `Some(false)` is not a
+        // no-op surprise.
+        let options = ProviderRuntimeOptions {
+            native_tools: Some(false),
+            ..Default::default()
+        };
+        let provider = create_provider_with_options("groq", Some("key"), &options)
+            .expect("groq factory must succeed");
+        assert!(
+            !provider.supports_native_tools(),
+            "Groq with explicit `native_tools = false` must remain text-fallback"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_from_config_propagates_native_tools() {
+        // The end-to-end path the operator uses: setting `native_tools` on
+        // the active provider profile must reach `ProviderRuntimeOptions`
+        // so the Groq factory branch sees it (#5932).
+        let mut config = zeroclaw_config::schema::Config::default();
+        let mut groq = zeroclaw_config::schema::ModelProviderConfig {
+            native_tools: Some(true),
+            ..Default::default()
+        };
+        groq.base_url = Some("https://api.groq.com/openai/v1".to_string());
+        config.providers.models.insert("groq".to_string(), groq);
+        config.providers.fallback = Some("groq".to_string());
+
+        let options = provider_runtime_options_from_config(&config);
+        assert_eq!(
+            options.native_tools,
+            Some(true),
+            "native_tools must propagate from the active provider profile to runtime options"
+        );
     }
 
     #[test]
