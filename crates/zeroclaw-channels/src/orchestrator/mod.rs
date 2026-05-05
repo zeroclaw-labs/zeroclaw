@@ -838,20 +838,38 @@ fn resolved_default_provider(config: &Config) -> String {
         .unwrap_or_else(|| "openrouter".to_string())
 }
 
+/// Three-step model resolution mirroring `agent::Agent::from_config` (#6099):
+/// (1) the fallback provider's `model`, (2) the first configured
+/// `[providers.models.*]` model with a WARN naming what to set,
+/// (3) hard fail with an actionable error. No silent vendor-default.
 fn resolved_default_model(config: &Config) -> anyhow::Result<String> {
-    config
+    let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
+    if let Some(m) = config
         .providers
         .fallback_provider()
-        .and_then(|e| e.model.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model configured: providers.fallback = {:?} resolves with no model, \
-                 and no [[providers.models.*]] entry has a `model` field set. \
-                 Configure at least one [providers.models.<name>] model = \"...\" \
-                 or define a [[model_routes]] hint.",
-                config.providers.fallback
-            )
-        })
+        .and_then(|e| e.model.as_deref())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        return Ok(m.to_string());
+    }
+    if let Some(m) = config.providers.resolve_default_model() {
+        tracing::warn!(
+            provider = provider_name,
+            model = %m,
+            "fallback provider has no `model` set; using first configured \
+             providers.models entry as default. Set [providers.models.{provider_name}] \
+             model = \"...\" to silence this warning.",
+        );
+        return Ok(m);
+    }
+    anyhow::bail!(
+        "no model configured: providers.fallback = {:?} resolves with no model, \
+         and no [providers.models.*] entry has a `model` field set. \
+         Configure at least one [providers.models.<name>] model = \"...\", \
+         or define a [[model_routes]] hint, before starting channels.",
+        config.providers.fallback,
+    )
 }
 
 fn runtime_defaults_from_config(config: &Config) -> anyhow::Result<ChannelRuntimeDefaults> {
