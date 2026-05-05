@@ -607,15 +607,6 @@ pub struct ModelProviderConfig {
     /// When true, the client pulls credentials from `OPENAI_API_KEY` or `~/.codex/auth.json` instead of the `api_key` field above. Turn on only for the OpenAI Codex provider; leave off for standard API-key providers.
     #[serde(default, skip_serializing_if = "is_false")]
     pub requires_openai_auth: bool,
-    /// Azure OpenAI resource name (the `<resource>` part of `<resource>.openai.azure.com`). Azure-only; ignore for OpenAI, Anthropic, and everything else.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub azure_openai_resource: Option<String>,
-    /// Azure OpenAI deployment name — the deployment you created in Azure AI Studio that wraps a specific model. Azure-only; ignore for other providers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub azure_openai_deployment: Option<String>,
-    /// Azure OpenAI API version string (e.g. `2024-10-21`). Azure-only; must match a version your resource supports. Ignore for other providers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub azure_openai_api_version: Option<String>,
     /// Hard cap on response length in tokens. Most models enforce sensible built-in limits already — leave unset unless you specifically need to clip long outputs for cost or latency reasons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
@@ -14183,9 +14174,6 @@ requires_openai_auth = true
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
                     wire_api: None,
                     requires_openai_auth: false,
-                    azure_openai_resource: None,
-                    azure_openai_deployment: None,
-                    azure_openai_api_version: None,
                     api_path: None,
                     max_tokens: None,
                     ..Default::default()
@@ -14220,9 +14208,6 @@ requires_openai_auth = true
                     base_url: Some("https://api.tonsof.blue".to_string()),
                     wire_api: Some("responses".to_string()),
                     requires_openai_auth: true,
-                    azure_openai_resource: None,
-                    azure_openai_deployment: None,
-                    azure_openai_api_version: None,
                     api_path: None,
                     max_tokens: None,
                     ..Default::default()
@@ -14463,9 +14448,6 @@ model = "primary-model"
                     base_url: Some("https://api.tonsof.blue/v1".to_string()),
                     wire_api: Some("ws".to_string()),
                     requires_openai_auth: false,
-                    azure_openai_resource: None,
-                    azure_openai_deployment: None,
-                    azure_openai_api_version: None,
                     api_path: None,
                     max_tokens: None,
                     ..Default::default()

@@ -23,11 +23,6 @@ use zeroclaw_config::schema::Config;
 /// from this list is shown for every provider.
 pub fn provider_family_excludes(provider: &str) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if provider != "azure_openai" {
-        out.push("azure-openai-resource");
-        out.push("azure-openai-deployment");
-        out.push("azure-openai-api-version");
-    }
     if !matches!(provider, "openai" | "openai_codex") {
         out.push("wire-api");
         out.push("requires-openai-auth");
@@ -205,22 +200,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn azure_excludes_hide_for_non_azure() {
-        let excludes = provider_family_excludes("ollama");
-        assert!(excludes.contains(&"azure-openai-resource"));
-        assert!(excludes.contains(&"azure-openai-deployment"));
-        assert!(excludes.contains(&"azure-openai-api-version"));
-    }
-
-    #[test]
-    fn azure_excludes_keep_for_azure() {
-        let excludes = provider_family_excludes("azure_openai");
-        assert!(!excludes.contains(&"azure-openai-resource"));
-        assert!(!excludes.contains(&"azure-openai-deployment"));
-        assert!(!excludes.contains(&"azure-openai-api-version"));
-    }
-
-    #[test]
     fn openai_specific_excludes_for_non_openai() {
         let excludes = provider_family_excludes("anthropic");
         assert!(excludes.contains(&"wire-api"));
@@ -267,12 +246,6 @@ mod tests {
         // The alias is whatever the user named it — "my-ollama-alias" here to make
         // clear that the string is an alias, not a type or hardcoded keyword.
         let paths = excluded_paths(&cfg, "providers.models.ollama.my-ollama-alias");
-        assert!(
-            paths
-                .iter()
-                .any(|p| p == "providers.models.ollama.my-ollama-alias.azure-openai-resource"),
-            "expected azure-openai-resource excluded, got: {paths:?}"
-        );
         assert!(
             paths
                 .iter()
