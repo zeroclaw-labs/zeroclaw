@@ -30,6 +30,33 @@ pub fn route_hashmap_path<'a>(
     Some((hm_key, inner_name))
 }
 
+/// For a `#[nested] HashMap<String, HashMap<String, T>>` field, parse a path
+/// `<my_prefix>.<field_name>.<outer_key>.<inner_key>.<inner_suffix>` and
+/// return (outer_key, inner_key, fully-qualified inner name for T::get_prop).
+///
+/// Returns `None` when the path doesn't match (wrong prefix or too few segments).
+pub fn route_double_hashmap_path<'a>(
+    name: &'a str,
+    my_prefix: &str,
+    field_name: &str,
+    inner_prefix: &str,
+) -> Option<(&'a str, &'a str, String)> {
+    let key_prefix = if my_prefix.is_empty() {
+        field_name.to_string()
+    } else {
+        format!("{my_prefix}.{field_name}")
+    };
+    let rest = name.strip_prefix(&key_prefix)?.strip_prefix('.')?;
+    let (outer_key, rest2) = rest.split_once('.')?;
+    let (inner_key, inner_suffix) = rest2.split_once('.')?;
+    let inner_name = if inner_prefix.is_empty() {
+        inner_suffix.to_string()
+    } else {
+        format!("{inner_prefix}.{inner_suffix}")
+    };
+    Some((outer_key, inner_key, inner_name))
+}
+
 /// Return a comma-separated string of valid enum variant names for display in error messages.
 #[cfg(feature = "schema-export")]
 pub fn enum_variants<T: schemars::JsonSchema>() -> String {
@@ -242,6 +269,43 @@ fn json_to_toml(v: serde_json::Value) -> Option<toml::Value> {
     }
 }
 
+/// Validate that an alias key is safe for use in TOML dotted paths, URLs, and
+/// filesystem paths on Windows, macOS, and Linux.
+///
+/// Allowed: `[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}` — alphanumeric start, then
+/// alphanumeric, underscore, or hyphen. Maximum 63 characters.
+///
+/// Dots are forbidden because they are TOML key separators. Spaces and all
+/// other punctuation are forbidden to stay safe across OS path APIs and URL
+/// path segments.
+pub fn validate_alias_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("alias must not be empty".to_string());
+    }
+    if key.len() > 63 {
+        return Err(format!(
+            "alias '{}' is too long ({} chars); maximum is 63",
+            key,
+            key.len()
+        ));
+    }
+    let mut chars = key.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphanumeric() {
+        return Err(format!("alias '{}' must start with a letter or digit", key));
+    }
+    for ch in chars {
+        if !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_') {
+            return Err(format!(
+                "alias '{}' contains invalid character {:?}; \
+                 only letters, digits, hyphens, and underscores are allowed",
+                key, ch
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +341,78 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0].as_str(), Some("tok1"));
         assert_eq!(arr[1].as_str(), Some(r#"p@ss"word"#));
+    }
+
+    // ── validate_alias_key ────────────────────────────────────────────────
+
+    #[test]
+    fn validate_alias_key_accepts_simple_names() {
+        assert!(validate_alias_key("default").is_ok());
+        assert!(validate_alias_key("work").is_ok());
+        assert!(validate_alias_key("my-alias").is_ok());
+        assert!(validate_alias_key("my_alias").is_ok());
+        assert!(validate_alias_key("alias123").is_ok());
+        assert!(validate_alias_key("A").is_ok());
+        assert!(validate_alias_key("z9-Z").is_ok());
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_empty() {
+        assert!(validate_alias_key("").is_err());
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_dot() {
+        // dots break TOML dotted-key path parsing
+        let err = validate_alias_key("my.alias").unwrap_err();
+        assert!(err.contains("invalid character"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_slash() {
+        let err = validate_alias_key("my/alias").unwrap_err();
+        assert!(err.contains("invalid character"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_space() {
+        let err = validate_alias_key("my alias").unwrap_err();
+        assert!(err.contains("invalid character"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_leading_hyphen() {
+        let err = validate_alias_key("-bad").unwrap_err();
+        assert!(err.contains("must start with"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_leading_underscore() {
+        let err = validate_alias_key("_bad").unwrap_err();
+        assert!(err.contains("must start with"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_over_63_chars() {
+        let long = "a".repeat(64);
+        let err = validate_alias_key(&long).unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_accepts_exactly_63_chars() {
+        let at_limit = "a".repeat(63);
+        assert!(validate_alias_key(&at_limit).is_ok());
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_windows_reserved_chars() {
+        for ch in [':', '*', '?', '"', '<', '>', '|', '\\'] {
+            let key = format!("alias{ch}name");
+            assert!(
+                validate_alias_key(&key).is_err(),
+                "expected rejection of char {ch:?} in alias key"
+            );
+        }
     }
 }

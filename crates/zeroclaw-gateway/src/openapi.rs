@@ -101,7 +101,7 @@ pub fn build_spec() -> serde_json::Value {
         "in": "query",
         "required": true,
         "schema": { "type": "string" },
-        "description": "Dotted property path, e.g. `providers.fallback`."
+        "description": "Dotted property path, e.g. `agents.researcher.model_provider`."
     });
 
     let prefix_param = serde_json::json!({

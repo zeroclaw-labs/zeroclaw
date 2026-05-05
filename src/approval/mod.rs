@@ -4,22 +4,22 @@ pub use zeroclaw_runtime::approval::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AutonomyConfig;
+    use crate::config::RiskProfileConfig;
     use crate::security::AutonomyLevel;
 
-    fn supervised_config() -> AutonomyConfig {
-        AutonomyConfig {
+    fn supervised_config() -> RiskProfileConfig {
+        RiskProfileConfig {
             level: AutonomyLevel::Supervised,
             auto_approve: vec!["file_read".into(), "memory_recall".into()],
             always_ask: vec!["shell".into()],
-            ..AutonomyConfig::default()
+            ..RiskProfileConfig::default()
         }
     }
 
-    fn full_config() -> AutonomyConfig {
-        AutonomyConfig {
+    fn full_config() -> RiskProfileConfig {
+        RiskProfileConfig {
             level: AutonomyLevel::Full,
-            ..AutonomyConfig::default()
+            ..RiskProfileConfig::default()
         }
     }
 
@@ -27,27 +27,27 @@ mod tests {
 
     #[test]
     fn auto_approve_tools_skip_prompt() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         assert!(!mgr.needs_approval("file_read"));
         assert!(!mgr.needs_approval("memory_recall"));
     }
 
     #[test]
     fn always_ask_tools_always_prompt() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         assert!(mgr.needs_approval("shell"));
     }
 
     #[test]
     fn unknown_tool_needs_approval_in_supervised() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         assert!(mgr.needs_approval("file_write"));
         assert!(mgr.needs_approval("http_request"));
     }
 
     #[test]
     fn full_autonomy_never_prompts() {
-        let mgr = ApprovalManager::from_config(&full_config());
+        let mgr = ApprovalManager::from_risk_profile(&full_config());
         assert!(!mgr.needs_approval("shell"));
         assert!(!mgr.needs_approval("file_write"));
         assert!(!mgr.needs_approval("anything"));
@@ -55,11 +55,11 @@ mod tests {
 
     #[test]
     fn readonly_never_prompts() {
-        let config = AutonomyConfig {
+        let config = RiskProfileConfig {
             level: AutonomyLevel::ReadOnly,
-            ..AutonomyConfig::default()
+            ..RiskProfileConfig::default()
         };
-        let mgr = ApprovalManager::from_config(&config);
+        let mgr = ApprovalManager::from_risk_profile(&config);
         assert!(!mgr.needs_approval("shell"));
     }
 
@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn always_response_adds_to_session_allowlist() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         assert!(mgr.needs_approval("file_write"));
 
         mgr.record_decision(
@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn always_ask_overrides_session_allowlist() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
 
         // Even after "Always" for shell, it should still prompt.
         mgr.record_decision(
@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn yes_response_does_not_add_to_allowlist() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         mgr.record_decision(
             "file_write",
             &serde_json::json!({}),
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn audit_log_records_decisions() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
 
         mgr.record_decision(
             "shell",
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn audit_log_contains_timestamp_and_channel() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "ls"}),
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn interactive_manager_reports_interactive() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         assert!(!mgr.is_non_interactive());
     }
 
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn non_interactive_shell_skips_outer_approval_by_default() {
-        let mgr = ApprovalManager::for_non_interactive(&AutonomyConfig::default());
+        let mgr = ApprovalManager::for_non_interactive(&RiskProfileConfig::default());
         assert!(!mgr.needs_approval("shell"));
     }
 
@@ -243,9 +243,9 @@ mod tests {
 
     #[test]
     fn non_interactive_readonly_never_needs_approval() {
-        let config = AutonomyConfig {
+        let config = RiskProfileConfig {
             level: AutonomyLevel::ReadOnly,
-            ..AutonomyConfig::default()
+            ..RiskProfileConfig::default()
         };
         let mgr = ApprovalManager::for_non_interactive(&config);
         // ReadOnly blocks execution elsewhere; approval manager does not prompt.
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn non_interactive_allows_default_auto_approve_tools() {
-        let config = AutonomyConfig::default();
+        let config = RiskProfileConfig::default();
         let mgr = ApprovalManager::for_non_interactive(&config);
 
         for tool in &config.auto_approve {
@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn non_interactive_denies_unknown_tools() {
-        let config = AutonomyConfig::default();
+        let config = RiskProfileConfig::default();
         let mgr = ApprovalManager::for_non_interactive(&config);
         assert!(
             mgr.needs_approval("some_unknown_tool"),
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn non_interactive_weather_is_auto_approved() {
-        let config = AutonomyConfig::default();
+        let config = RiskProfileConfig::default();
         let mgr = ApprovalManager::for_non_interactive(&config);
         assert!(
             !mgr.needs_approval("weather"),
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn always_ask_overrides_auto_approve() {
-        let mut config = AutonomyConfig::default();
+        let mut config = RiskProfileConfig::default();
         config.always_ask = vec!["weather".into()];
         let mgr = ApprovalManager::for_non_interactive(&config);
         assert!(

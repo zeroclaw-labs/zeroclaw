@@ -1014,7 +1014,6 @@ mod tests {
     #[test]
     fn config_default_values() {
         let config = GmailPushConfig::default();
-        assert!(!config.enabled);
         assert!(config.topic.is_empty());
         assert_eq!(config.label_filter, vec!["INBOX"]);
         assert!(config.oauth_token.is_empty());
@@ -1026,7 +1025,6 @@ mod tests {
     fn config_deserialize_with_defaults() {
         let json = r#"{"topic": "projects/my-proj/topics/gmail"}"#;
         let config: GmailPushConfig = serde_json::from_str(json).unwrap();
-        assert!(!config.enabled);
         assert_eq!(config.topic, "projects/my-proj/topics/gmail");
         assert_eq!(config.label_filter, vec!["INBOX"]);
     }
@@ -1034,13 +1032,13 @@ mod tests {
     #[test]
     fn config_serialize_roundtrip() {
         let config = GmailPushConfig {
-            enabled: true,
             topic: "projects/test/topics/gmail".into(),
             label_filter: vec!["INBOX".into(), "IMPORTANT".into()],
             oauth_token: "test-token".into(),
             allowed_senders: vec!["@example.com".into()],
             webhook_url: "https://example.com/webhook/gmail".into(),
             webhook_secret: "my-secret".into(),
+            excluded_tools: vec![],
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: GmailPushConfig = serde_json::from_str(&json).unwrap();

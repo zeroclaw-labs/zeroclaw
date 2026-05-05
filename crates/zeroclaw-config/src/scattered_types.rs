@@ -348,8 +348,6 @@ fn default_max_attachment_bytes() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.email"]
 pub struct EmailConfig {
-    #[serde(default)]
-    pub enabled: bool,
     pub imap_host: String,
     #[serde(default = "default_imap_port")]
     pub imap_port: u16,
@@ -376,6 +374,11 @@ pub struct EmailConfig {
     pub default_subject: String,
     #[serde(default = "default_max_attachment_bytes")]
     pub max_attachment_bytes: usize,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 impl ChannelConfig for EmailConfig {
@@ -390,7 +393,6 @@ impl ChannelConfig for EmailConfig {
 impl Default for EmailConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             imap_host: String::new(),
             imap_port: default_imap_port(),
             imap_folder: default_imap_folder(),
@@ -405,6 +407,7 @@ impl Default for EmailConfig {
             allowed_senders: Vec::new(),
             default_subject: default_subject(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: Vec::new(),
         }
     }
 }
@@ -417,8 +420,6 @@ fn default_label_filter() -> Vec<String> {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.gmail"]
 pub struct GmailPushConfig {
-    #[serde(default)]
-    pub enabled: bool,
     pub topic: String,
     #[serde(default = "default_label_filter")]
     pub label_filter: Vec<String>,
@@ -431,6 +432,11 @@ pub struct GmailPushConfig {
     pub webhook_url: String,
     #[serde(default)]
     pub webhook_secret: String,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 impl ChannelConfig for GmailPushConfig {
@@ -445,13 +451,13 @@ impl ChannelConfig for GmailPushConfig {
 impl Default for GmailPushConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             topic: String::new(),
             label_filter: default_label_filter(),
             oauth_token: String::new(),
             allowed_senders: Vec::new(),
             webhook_url: String::new(),
             webhook_secret: String::new(),
+            excluded_tools: Vec::new(),
         }
     }
 }
@@ -460,8 +466,6 @@ impl Default for GmailPushConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.clawdtalk"]
 pub struct ClawdTalkConfig {
-    #[serde(default)]
-    pub enabled: bool,
     #[secret]
     pub api_key: String,
     pub connection_id: String,
@@ -471,6 +475,11 @@ pub struct ClawdTalkConfig {
     #[serde(default)]
     #[secret]
     pub webhook_secret: Option<String>,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 impl ChannelConfig for ClawdTalkConfig {
@@ -519,8 +528,6 @@ fn default_max_call_duration() -> u64 {
 #[prefix = "channels.voice-call"]
 pub struct VoiceCallConfig {
     #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
     pub provider: VoiceProvider,
     pub account_id: String,
     pub auth_token: String,
@@ -537,12 +544,16 @@ pub struct VoiceCallConfig {
     pub max_call_duration_secs: u64,
     #[serde(default)]
     pub webhook_base_url: Option<String>,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 impl Default for VoiceCallConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             provider: VoiceProvider::default(),
             account_id: String::new(),
             auth_token: String::new(),
@@ -553,6 +564,7 @@ impl Default for VoiceCallConfig {
             tts_voice: None,
             max_call_duration_secs: default_max_call_duration(),
             webhook_base_url: None,
+            excluded_tools: Vec::new(),
         }
     }
 }

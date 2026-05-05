@@ -88,7 +88,7 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
         'require_pairing = false' \
         'web_dist_dir = "/zeroclaw-data/web/dist"' \
         '' \
-        '[autonomy]' \
+        '[risk_profiles.default]' \
         'level = "supervised"' \
         'auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]' \
         > /zeroclaw-data/.zeroclaw/config.toml && \
@@ -117,13 +117,13 @@ ENV LANG=C.UTF-8
 # Use consistent workspace path
 ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
 ENV HOME=/zeroclaw-data
-# Defaults for local dev (Ollama) - matches config.template.toml
-ENV PROVIDER="ollama"
-ENV ZEROCLAW_MODEL="llama3.2"
+# Provider/model selection lives in the config file (defaults to
+# `~/.zeroclaw/config.toml`; custom workspaces override the path) under
+# `[providers.models.<type>.<alias>]`. The V1/V2 `PROVIDER` and
+# `ZEROCLAW_MODEL` env-var overrides were removed in V3.
 ENV ZEROCLAW_GATEWAY_PORT=42617
 
-# Note: API_KEY is intentionally NOT set here to avoid confusion.
-# It is set in config.toml as the Ollama URL.
+# Note: credentials live in the config file, not in env.
 
 WORKDIR /zeroclaw-data
 USER 65534:65534

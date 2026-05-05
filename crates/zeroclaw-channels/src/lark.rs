@@ -2975,7 +2975,6 @@ mod tests {
     fn lark_config_serde() {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
         let lc = LarkConfig {
-            enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -2986,6 +2985,7 @@ mod tests {
             receive_mode: LarkReceiveMode::default(),
             port: None,
             proxy_url: None,
+            excluded_tools: vec![],
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -2999,7 +2999,6 @@ mod tests {
     fn lark_config_toml_roundtrip() {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
         let lc = LarkConfig {
-            enabled: true,
             app_id: "app".into(),
             app_secret: "secret".into(),
             encrypt_key: None,
@@ -3010,6 +3009,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            excluded_tools: vec![],
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -3035,7 +3035,6 @@ mod tests {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
 
         let cfg = LarkConfig {
-            enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -3046,6 +3045,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            excluded_tools: vec![],
         };
 
         let ch = LarkChannel::from_config(&cfg);
@@ -3061,7 +3061,6 @@ mod tests {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
 
         let cfg = LarkConfig {
-            enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -3072,6 +3071,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            excluded_tools: vec![],
         };
 
         let ch = LarkChannel::from_lark_config(&cfg);
@@ -3086,7 +3086,6 @@ mod tests {
         use zeroclaw_config::schema::{FeishuConfig, LarkReceiveMode};
 
         let cfg = FeishuConfig {
-            enabled: true,
             app_id: "cli_feishu_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -3096,6 +3095,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            excluded_tools: vec![],
         };
 
         let ch = LarkChannel::from_feishu_config(&cfg);
@@ -3110,7 +3110,6 @@ mod tests {
         use zeroclaw_config::schema::{FeishuConfig, LarkReceiveMode};
 
         let cfg_true = FeishuConfig {
-            enabled: true,
             app_id: "cli_feishu_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -3120,6 +3119,7 @@ mod tests {
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
+            excluded_tools: vec![],
         };
 
         let cfg_false = FeishuConfig {
@@ -3322,7 +3322,6 @@ mod tests {
         );
 
         let feishu_cfg = zeroclaw_config::schema::FeishuConfig {
-            enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -3332,6 +3331,7 @@ mod tests {
             receive_mode: zeroclaw_config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
+            excluded_tools: vec![],
         };
         let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
         assert_eq!(

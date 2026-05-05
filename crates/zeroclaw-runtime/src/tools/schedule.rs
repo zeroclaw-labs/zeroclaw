@@ -12,11 +12,21 @@ use zeroclaw_config::schema::Config;
 pub struct ScheduleTool {
     security: Arc<SecurityPolicy>,
     config: Config,
+    /// Owning agent — risk profile gate for shell command validation.
+    agent_alias: String,
 }
 
 impl ScheduleTool {
-    pub fn new(security: Arc<SecurityPolicy>, config: Config) -> Self {
-        Self { security, config }
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        config: Config,
+        agent_alias: impl Into<String>,
+    ) -> Self {
+        Self {
+            security,
+            config,
+            agent_alias: agent_alias.into(),
+        }
     }
 }
 
@@ -137,12 +147,12 @@ impl Tool for ScheduleTool {
 
 impl ScheduleTool {
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
-        if !self.config.cron.enabled {
+        if !self.config.scheduler.enabled {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "cron is disabled by config (cron.enabled=false); cannot perform '{action}'"
+                    "cron is disabled by config (scheduler.enabled=false); cannot perform '{action}'"
                 )),
             });
         }
@@ -309,6 +319,7 @@ impl ScheduleTool {
         if let Some(value) = expression {
             let job = match cron::add_shell_job_with_approval(
                 &self.config,
+                &self.agent_alias,
                 None,
                 cron::Schedule::Cron {
                     expr: value.to_string(),
@@ -341,7 +352,13 @@ impl ScheduleTool {
         }
 
         if let Some(value) = delay {
-            let job = match cron::add_once_validated(&self.config, value, command, approved) {
+            let job = match cron::add_once_validated(
+                &self.config,
+                &self.agent_alias,
+                value,
+                command,
+                approved,
+            ) {
                 Ok(job) => job,
                 Err(error) => {
                     return Ok(ToolResult {
@@ -368,8 +385,13 @@ impl ScheduleTool {
             .map_err(|error| anyhow::anyhow!("Invalid run_at timestamp: {error}"))?
             .with_timezone(&Utc);
 
-        let job = match cron::add_once_at_validated(&self.config, run_at_parsed, command, approved)
-        {
+        let job = match cron::add_once_at_validated(
+            &self.config,
+            &self.agent_alias,
+            run_at_parsed,
+            command,
+            approved,
+        ) {
             Ok(job) => job,
             Err(error) => {
                 return Ok(ToolResult {
@@ -440,16 +462,21 @@ mod tests {
 
     async fn test_setup() -> (TempDir, Config, Arc<SecurityPolicy>) {
         let tmp = TempDir::new().unwrap();
-        let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..Config::default()
-        };
+        // Seed test-agent so ScheduleTool's add_shell_job_with_approval
+        // (which validates against the agent's risk profile) succeeds.
+        let config = config_with_default_risk_profile(
+            tmp.path().join("workspace"),
+            tmp.path().join("config.toml"),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
             &config.workspace_dir,
         ));
         (tmp, config, security)
@@ -458,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn tool_name_and_schema() {
         let (_tmp, config, security) = test_setup().await;
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, config, "test-agent");
         assert_eq!(tool.name(), "schedule");
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["action"].is_object());
@@ -467,7 +494,7 @@ mod tests {
     #[tokio::test]
     async fn list_empty() {
         let (_tmp, config, security) = test_setup().await;
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, config, "test-agent");
 
         let result = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(result.success);
@@ -477,7 +504,7 @@ mod tests {
     #[tokio::test]
     async fn create_get_and_cancel_roundtrip() {
         let (_tmp, config, security) = test_setup().await;
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, config, "test-agent");
 
         let create = tool
             .execute(json!({
@@ -513,7 +540,7 @@ mod tests {
     #[tokio::test]
     async fn once_and_pause_resume_aliases_work() {
         let (_tmp, config, security) = test_setup().await;
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, config, "test-agent");
 
         let once = tool
             .execute(json!({
@@ -549,27 +576,62 @@ mod tests {
         assert!(resume.success);
     }
 
+    fn config_with_default_risk_profile(
+        workspace: std::path::PathBuf,
+        config_path: std::path::PathBuf,
+        profile: zeroclaw_config::schema::RiskProfileConfig,
+    ) -> Config {
+        let mut config = Config {
+            workspace_dir: workspace,
+            config_path,
+            ..Config::default()
+        };
+        config.risk_profiles.insert("default".into(), profile);
+        // ScheduleTool callsites pass "test-agent" as agent_alias; the
+        // tool's add_shell_job_with_approval routes through validation
+        // that resolves SecurityPolicy::for_agent("test-agent"). Seed
+        // a configured agent that points at the supplied risk profile.
+        config.providers.models.insert(
+            "openrouter".to_string(),
+            std::collections::HashMap::from([(
+                "default".to_string(),
+                zeroclaw_config::schema::ModelProviderConfig::default(),
+            )]),
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "openrouter.default".to_string(),
+                risk_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
     #[tokio::test]
     async fn readonly_blocks_mutating_actions() {
         let tmp = TempDir::new().unwrap();
-        let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            autonomy: zeroclaw_config::schema::AutonomyConfig {
+        let config = config_with_default_risk_profile(
+            tmp.path().join("workspace"),
+            tmp.path().join("config.toml"),
+            zeroclaw_config::schema::RiskProfileConfig {
                 level: AutonomyLevel::ReadOnly,
                 ..Default::default()
             },
-            ..Config::default()
-        };
+        );
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
             &config.workspace_dir,
         ));
 
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, config, "test-agent");
 
         let blocked = tool
             .execute(json!({
@@ -589,24 +651,26 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_blocks_create_action() {
         let tmp = TempDir::new().unwrap();
-        let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            autonomy: zeroclaw_config::schema::AutonomyConfig {
+        let config = config_with_default_risk_profile(
+            tmp.path().join("workspace"),
+            tmp.path().join("config.toml"),
+            zeroclaw_config::schema::RiskProfileConfig {
                 level: AutonomyLevel::Full,
                 max_actions_per_hour: 0,
                 ..Default::default()
             },
-            ..Config::default()
-        };
+        );
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
             &config.workspace_dir,
         ));
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, config, "test-agent");
 
         let blocked = tool
             .execute(json!({
@@ -633,24 +697,26 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_blocks_cancel_and_keeps_job() {
         let tmp = TempDir::new().unwrap();
-        let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            autonomy: zeroclaw_config::schema::AutonomyConfig {
+        let config = config_with_default_risk_profile(
+            tmp.path().join("workspace"),
+            tmp.path().join("config.toml"),
+            zeroclaw_config::schema::RiskProfileConfig {
                 level: AutonomyLevel::Full,
                 max_actions_per_hour: 1,
                 ..Default::default()
             },
-            ..Config::default()
-        };
+        );
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
             &config.workspace_dir,
         ));
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, config, "test-agent");
 
         let create = tool
             .execute(json!({
@@ -687,7 +753,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_action_returns_failure() {
         let (_tmp, config, security) = test_setup().await;
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, config, "test-agent");
 
         let result = tool.execute(json!({"action": "explode"})).await.unwrap();
         assert!(!result.success);
@@ -702,13 +768,31 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.cron.enabled = false;
+        config.scheduler.enabled = false;
+        config.providers.models.insert(
+            "openrouter".to_string(),
+            std::collections::HashMap::from([(
+                "default".to_string(),
+                zeroclaw_config::schema::ModelProviderConfig::default(),
+            )]),
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "openrouter.default".to_string(),
+                risk_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
             &config.workspace_dir,
         ));
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, config, "test-agent");
 
         let create = tool
             .execute(json!({
@@ -737,14 +821,40 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.level = AutonomyLevel::Supervised;
-        config.autonomy.allowed_commands = vec!["echo".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = AutonomyLevel::Supervised;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config.providers.models.insert(
+            "openrouter".to_string(),
+            std::collections::HashMap::from([(
+                "default".to_string(),
+                zeroclaw_config::schema::ModelProviderConfig::default(),
+            )]),
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "openrouter.default".to_string(),
+                risk_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
             &config.workspace_dir,
         ));
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, config, "test-agent");
 
         let result = tool
             .execute(json!({
@@ -773,14 +883,40 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.level = AutonomyLevel::Supervised;
-        config.autonomy.allowed_commands = vec!["touch".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = AutonomyLevel::Supervised;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["touch".into()];
+        config.providers.models.insert(
+            "openrouter".to_string(),
+            std::collections::HashMap::from([(
+                "default".to_string(),
+                zeroclaw_config::schema::ModelProviderConfig::default(),
+            )]),
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "openrouter.default".to_string(),
+                risk_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            config
+                .risk_profiles
+                .get("default")
+                .unwrap_or(&zeroclaw_config::schema::RiskProfileConfig::default()),
             &config.workspace_dir,
         ));
-        let tool = ScheduleTool::new(security, config);
+        let tool = ScheduleTool::new(security, config, "test-agent");
 
         let denied = tool
             .execute(json!({

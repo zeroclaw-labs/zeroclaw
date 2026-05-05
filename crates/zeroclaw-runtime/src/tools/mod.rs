@@ -102,7 +102,6 @@ pub use zeroclaw_tools::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
 };
-pub use zeroclaw_tools::swarm::SwarmTool;
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
 pub use zeroclaw_tools::weather_tool::WeatherTool;
@@ -273,6 +272,8 @@ pub fn register_skill_tools(
 pub fn all_tools(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
     composio_entity_id: Option<&str>,
@@ -295,6 +296,8 @@ pub fn all_tools(
     all_tools_with_runtime(
         config,
         security,
+        risk_profile,
+        agent_alias,
         Arc::new(NativeRuntime::new()),
         memory,
         composio_key,
@@ -319,6 +322,8 @@ pub fn all_tools(
 pub fn all_tools_with_runtime(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
     runtime: Arc<dyn RuntimeAdapter>,
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
@@ -341,11 +346,8 @@ pub fn all_tools_with_runtime(
 ) {
     let has_shell_access = runtime.has_shell_access();
     let runtime_kind = root_config.runtime.kind.as_str();
-    let sandbox = create_sandbox(
-        &root_config.security,
-        runtime_kind,
-        Some(&security.workspace_dir),
-    );
+    let sandbox_cfg = risk_profile.sandbox_config();
+    let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
@@ -366,10 +368,18 @@ pub fn all_tools_with_runtime(
             PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
             security.clone(),
         )),
-        Arc::new(CronAddTool::new(config.clone(), security.clone())),
+        Arc::new(CronAddTool::new(
+            config.clone(),
+            security.clone(),
+            agent_alias,
+        )),
         Arc::new(CronListTool::new(config.clone())),
         Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
-        Arc::new(CronUpdateTool::new(config.clone(), security.clone())),
+        Arc::new(CronUpdateTool::new(
+            config.clone(),
+            security.clone(),
+            agent_alias,
+        )),
         Arc::new(CronRunTool::new(config.clone(), security.clone())),
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
@@ -377,7 +387,11 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryExportTool::new(memory.clone())),
         Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
-        Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
+        Arc::new(ScheduleTool::new(
+            security.clone(),
+            root_config.clone(),
+            agent_alias,
+        )),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
@@ -397,8 +411,11 @@ pub fn all_tools_with_runtime(
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
     ];
 
-    // Register discord_search if discord_history channel is configured
-    if root_config.channels.discord_history.is_some() {
+    // Register discord_search if any configured Discord alias has
+    // archive enabled. V3 supports multiple Discord aliases (one per
+    // bot/server set); the search tool reads from a shared archive DB
+    // so it's enabled when at least one alias archives.
+    if root_config.channels.discord.values().any(|d| d.archive) {
         match zeroclaw_memory::SqliteMemory::new_named(workspace_dir, "discord") {
             Ok(discord_mem) => {
                 tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
@@ -413,12 +430,12 @@ pub fn all_tools_with_runtime(
     {
         let llm_task_provider = root_config
             .providers
-            .fallback
-            .clone()
-            .unwrap_or_else(|| "openrouter".to_string());
+            .first_provider_type()
+            .unwrap_or("openrouter")
+            .to_string();
         let llm_task_model = root_config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.model.clone())
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
         let llm_task_runtime_options =
@@ -429,12 +446,12 @@ pub fn all_tools_with_runtime(
             llm_task_model,
             root_config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7),
             root_config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.api_key.clone()),
             llm_task_runtime_options,
         )));
@@ -876,7 +893,7 @@ pub fn all_tools_with_runtime(
     }
 
     // Add delegation tool when agents are configured
-    let delegate_fallback_credential = fallback_api_key.and_then(|value| {
+    let delegate_global_credential = fallback_api_key.and_then(|value| {
         let trimmed_value = value.trim();
         (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
     });
@@ -893,7 +910,7 @@ pub fn all_tools_with_runtime(
         let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
         let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
-            delegate_fallback_credential.clone(),
+            delegate_global_credential.clone(),
             security.clone(),
             provider_runtime_options.clone(),
         )
@@ -901,25 +918,15 @@ pub fn all_tools_with_runtime(
         .with_multimodal_config(root_config.multimodal.clone())
         .with_delegate_config(root_config.delegate.clone())
         .with_workspace_dir(workspace_dir.to_path_buf())
-        .with_memory(memory.clone());
+        .with_memory(memory.clone())
+        .with_providers_models(root_config.providers.models.clone())
+        .with_risk_profiles(root_config.risk_profiles.clone())
+        .with_runtime_profiles(root_config.runtime_profiles.clone())
+        .with_skill_bundles(root_config.skill_bundles.clone())
+        .with_memory_namespaces(root_config.memory_namespaces.clone());
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
-
-    // Add swarm tool when swarms are configured
-    if !root_config.swarms.is_empty() {
-        let swarm_agents: HashMap<String, DelegateAgentConfig> = agents
-            .iter()
-            .map(|(name, cfg)| (name.clone(), cfg.clone()))
-            .collect();
-        tool_arcs.push(Arc::new(SwarmTool::new(
-            root_config.swarms.clone(),
-            swarm_agents,
-            delegate_fallback_credential,
-            security.clone(),
-            provider_runtime_options,
-        )));
-    }
 
     // Workspace management tool (conditionally registered when workspace isolation is enabled)
     if root_config.workspace.enabled {
@@ -1050,6 +1057,8 @@ mod tests {
         let (tools, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
             mem,
             None,
             None,
@@ -1093,6 +1102,8 @@ mod tests {
         let (tools, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
             mem,
             None,
             None,
@@ -1229,25 +1240,16 @@ mod tests {
         agents.insert(
             "researcher".to_string(),
             DelegateAgentConfig {
-                provider: "ollama".to_string(),
-                model: "llama3".to_string(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
+                model_provider: "ollama.researcher".to_string(),
+                ..Default::default()
             },
         );
 
         let (tools, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
             mem,
             None,
             None,
@@ -1282,6 +1284,8 @@ mod tests {
         let (tools, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
             mem,
             None,
             None,
@@ -1318,6 +1322,8 @@ mod tests {
         let (tools, _, _, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
             mem,
             None,
             None,
@@ -1353,6 +1359,8 @@ mod tests {
         let (tools, _, _, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
             mem,
             None,
             None,

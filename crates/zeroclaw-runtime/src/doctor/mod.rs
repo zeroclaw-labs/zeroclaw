@@ -219,7 +219,16 @@ fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec
         return vec![provider.to_string()];
     }
 
-    config.providers.models.keys().cloned().collect()
+    config
+        .providers
+        .models
+        .iter()
+        .flat_map(|(type_k, alias_map)| {
+            alias_map
+                .keys()
+                .map(move |alias_k| format!("{type_k}.{alias_k}"))
+        })
+        .collect()
 }
 
 pub async fn run_models(
@@ -448,14 +457,14 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
-    // Provider validity
-    let fallback_provider = config.providers.fallback.as_deref();
-    let fallback_provider_doc = config.providers.fallback_provider();
-    if let Some(provider) = fallback_provider {
+    // Provider validity (first configured model provider)
+    let primary_provider_doc = config.providers.first_provider();
+    let primary_provider = config.providers.first_provider_type();
+    if let Some(provider) = primary_provider {
         if let Some(reason) = provider_validation_error(provider) {
             items.push(DiagItem::error(
                 cat,
-                format!("default provider \"{provider}\" is invalid: {reason}"),
+                format!("provider \"{provider}\" is invalid: {reason}"),
             ));
         } else {
             items.push(DiagItem::ok(
@@ -464,12 +473,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     } else {
-        items.push(DiagItem::error(cat, "no default_provider configured"));
+        items.push(DiagItem::error(cat, "no model provider configured"));
     }
 
     // API key presence
-    if fallback_provider != Some("ollama") {
-        if fallback_provider_doc
+    if primary_provider != Some("ollama") {
+        if primary_provider_doc
             .and_then(|e| e.api_key.as_deref())
             .is_some()
         {
@@ -483,26 +492,29 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Model configured
-    let default_model = fallback_provider_doc.and_then(|e| e.model.as_deref());
-    if default_model.is_some() {
+    let primary_model = primary_provider_doc.and_then(|e| e.model.as_deref());
+    if primary_model.is_some() {
         items.push(DiagItem::ok(
             cat,
-            format!("default model: {}", default_model.unwrap_or("?")),
+            format!("model: {}", primary_model.unwrap_or("?")),
         ));
     } else {
-        items.push(DiagItem::warn(cat, "no default_model configured"));
+        items.push(DiagItem::warn(
+            cat,
+            "no model configured on primary provider",
+        ));
     }
 
     // Temperature range
-    let default_temperature = fallback_provider_doc
+    let primary_temperature = primary_provider_doc
         .and_then(|e| e.temperature)
         .unwrap_or(0.7);
-    if (0.0..=2.0).contains(&default_temperature) {
+    if (0.0..=2.0).contains(&primary_temperature) {
         items.push(DiagItem::ok(
             cat,
             format!(
                 "temperature {:.1} (valid range 0.0–2.0)",
-                default_temperature
+                primary_temperature
             ),
         ));
     } else {
@@ -510,7 +522,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             cat,
             format!(
                 "temperature {:.1} is out of range (expected 0.0–2.0)",
-                default_temperature
+                primary_temperature
             ),
         ));
     }
@@ -521,16 +533,6 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         items.push(DiagItem::ok(cat, format!("gateway port: {port}")));
     } else {
         items.push(DiagItem::error(cat, "gateway port is 0 (invalid)"));
-    }
-
-    // Reliability: fallback providers
-    for fb in &config.reliability.fallback_providers {
-        if let Some(reason) = provider_validation_error(fb) {
-            items.push(DiagItem::warn(
-                cat,
-                format!("fallback provider \"{fb}\" is invalid: {reason}"),
-            ));
-        }
     }
 
     // Model routes validation
@@ -619,18 +621,22 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
-    // Delegate agents: provider validity
+    // Delegate agents: provider validity (resolved from model_provider alias)
     let mut agent_names: Vec<_> = config.agents.keys().collect();
     agent_names.sort();
     for name in agent_names {
         let agent = config.agents.get(name).unwrap();
-        if let Some(reason) = provider_validation_error(&agent.provider) {
+        let provider_type = agent
+            .model_provider
+            .split_once('.')
+            .map_or(agent.model_provider.as_str(), |(t, _)| t);
+        if provider_type.is_empty() {
+            continue;
+        }
+        if let Some(reason) = provider_validation_error(provider_type) {
             items.push(DiagItem::warn(
                 cat,
-                format!(
-                    "agent \"{name}\" uses invalid provider \"{}\": {}",
-                    agent.provider, reason
-                ),
+                format!("agent \"{name}\" uses invalid provider \"{provider_type}\": {reason}",),
             ));
         }
     }
@@ -1065,12 +1071,18 @@ mod tests {
 
     #[test]
     fn config_validation_catches_bad_temperature() {
+        // Single provider entry with an out-of-range temperature so the
+        // doctor's `first_provider()` lookup deterministically picks it
+        // (HashMap iteration order is unspecified — multiple entries
+        // produce a coin-flip first pick).
         let mut config = Config::default();
-        config.providers.fallback = Some("default".into());
+        config.providers.models = Default::default();
         config
             .providers
             .models
             .entry("default".into())
+            .or_default()
+            .entry("default".to_string())
             .or_default()
             .temperature = Some(5.0);
         let mut items = Vec::new();
@@ -1083,11 +1095,20 @@ mod tests {
     #[test]
     fn config_validation_accepts_valid_temperature() {
         let mut config = Config::default();
-        config.providers.fallback = Some("default".into());
+        config.providers.models = Default::default();
+        config
+            .providers
+            .models
+            .entry("default.default".to_string())
+            .or_default()
+            .entry("default".to_string())
+            .or_default();
         config
             .providers
             .models
             .entry("default".into())
+            .or_default()
+            .entry("default".to_string())
             .or_default()
             .temperature = Some(0.7);
         let mut items = Vec::new();
@@ -1110,12 +1131,19 @@ mod tests {
     #[test]
     fn config_validation_catches_unknown_provider() {
         let mut config = Config::default();
-        config.providers.fallback = Some("totally-fake".into());
+        config.providers.models = Default::default();
+        config
+            .providers
+            .models
+            .entry("totally-fake".to_string())
+            .or_default()
+            .entry("default".to_string())
+            .or_default();
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let prov_item = items
             .iter()
-            .find(|i| i.message.contains("default provider"));
+            .find(|i| i.message.contains("provider \"totally-fake\" is invalid"));
         assert!(prov_item.is_some());
         assert_eq!(prov_item.unwrap().severity, Severity::Error);
     }
@@ -1123,14 +1151,20 @@ mod tests {
     #[test]
     fn config_validation_catches_malformed_custom_provider() {
         let mut config = Config::default();
-        config.providers.fallback = Some("custom:".into());
+        config.providers.models = Default::default();
+        config
+            .providers
+            .models
+            .entry("custom:".to_string())
+            .or_default()
+            .entry("default".to_string())
+            .or_default();
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
 
-        let prov_item = items.iter().find(|item| {
-            item.message
-                .contains("default provider \"custom:\" is invalid")
-        });
+        let prov_item = items
+            .iter()
+            .find(|item| item.message.contains("provider \"custom:\" is invalid"));
         assert!(prov_item.is_some());
         assert_eq!(prov_item.unwrap().severity, Severity::Error);
     }
@@ -1138,40 +1172,19 @@ mod tests {
     #[test]
     fn config_validation_accepts_custom_provider() {
         let mut config = Config::default();
-        config.providers.fallback = Some("custom:https://my-api.com".into());
+        config.providers.models = Default::default();
+        config
+            .providers
+            .models
+            .entry("custom:https://my-api.com".to_string())
+            .or_default()
+            .entry("default".to_string())
+            .or_default();
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let prov_item = items.iter().find(|i| i.message.contains("is valid"));
         assert!(prov_item.is_some());
         assert_eq!(prov_item.unwrap().severity, Severity::Ok);
-    }
-
-    #[test]
-    fn config_validation_warns_bad_fallback() {
-        let mut config = Config::default();
-        config.reliability.fallback_providers = vec!["fake-provider".into()];
-        let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
-        let fb_item = items
-            .iter()
-            .find(|i| i.message.contains("fallback provider"));
-        assert!(fb_item.is_some());
-        assert_eq!(fb_item.unwrap().severity, Severity::Warn);
-    }
-
-    #[test]
-    fn config_validation_warns_bad_custom_fallback() {
-        let mut config = Config::default();
-        config.reliability.fallback_providers = vec!["custom:".into()];
-        let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
-
-        let fb_item = items.iter().find(|item| {
-            item.message
-                .contains("fallback provider \"custom:\" is invalid")
-        });
-        assert!(fb_item.is_some());
-        assert_eq!(fb_item.unwrap().severity, Severity::Warn);
     }
 
     #[test]
@@ -1290,37 +1303,15 @@ mod tests {
         config.agents.insert(
             "zeta".into(),
             zeroclaw_config::schema::DelegateAgentConfig {
-                provider: "totally-fake".into(),
-                model: "model-z".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
+                model_provider: "totally-fake.default".into(),
+                ..Default::default()
             },
         );
         config.agents.insert(
             "alpha".into(),
             zeroclaw_config::schema::DelegateAgentConfig {
-                provider: "totally-fake".into(),
-                model: "model-a".into(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: 3,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: 10,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
+                model_provider: "totally-fake.default".into(),
+                ..Default::default()
             },
         );
 

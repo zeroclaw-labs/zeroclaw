@@ -355,16 +355,19 @@ fn push_failure(
 }
 
 // ── Resilient Provider Wrapper ────────────────────────────────────────────
-// Three-level failover strategy: model chain → provider chain → retry loop.
-//   Outer loop:  iterate model fallback chain (original model first, then
-//                configured alternatives).
-//   Middle loop: iterate registered providers in priority order.
-//   Inner loop:  retry the same (provider, model) pair with exponential
-//                backoff, rotating API keys on rate-limit errors.
+// Two-level strategy: provider chain → retry loop.
+//   Outer loop: iterate registered providers in priority order. The production
+//               caller always wires a single primary; tests construct multi-
+//               element chains directly to exercise failover semantics.
+//   Inner loop: retry the same (provider, model) pair with exponential backoff,
+//               rotating API keys on rate-limit errors.
 // Loop invariant: `failures` accumulates every failed attempt so the final
 // error message gives operators a complete diagnostic trail.
 
-/// Provider wrapper with retry, fallback, auth rotation, and model failover.
+/// Provider wrapper with retry + auth-key rotation. The provider Vec exists
+/// for tests to exercise multi-provider failover; production wiring always
+/// passes a single primary. Per-model failover chains are also test-only —
+/// the schema no longer surfaces them.
 pub struct ReliableProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
     max_retries: u32,
@@ -372,7 +375,7 @@ pub struct ReliableProvider {
     /// Extra API keys for rotation (index tracks round-robin position).
     api_keys: Vec<String>,
     key_index: AtomicUsize,
-    /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
+    /// Per-model failover chains. Test-only: model_name → [alt1, alt2, ...].
     model_fallbacks: HashMap<String, Vec<String>>,
 }
 
@@ -398,13 +401,15 @@ impl ReliableProvider {
         self
     }
 
-    /// Set per-model fallback chains.
+    /// Test-only hook: install per-model failover chains. Production builds
+    /// never call this — the schema has no surface for it.
+    #[cfg(test)]
     pub fn with_model_fallbacks(mut self, fallbacks: HashMap<String, Vec<String>>) -> Self {
         self.model_fallbacks = fallbacks;
         self
     }
 
-    /// Build the list of models to try: [original, fallback1, fallback2, ...]
+    /// Build the list of models to try: [original, alt1, alt2, ...]
     fn model_chain<'a>(&'a self, model: &'a str) -> Vec<&'a str> {
         let mut chain = vec![model];
         if let Some(fallbacks) = self.model_fallbacks.get(model) {

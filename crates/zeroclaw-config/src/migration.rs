@@ -1,369 +1,540 @@
-//! Forward-only config schema migration.
+//! Forward-only schema migration: V1 → V2 → V3.
 //!
-//! Old config layouts are typed structs. Migration deserializes into the legacy
-//! struct, moves field values into the new layout, and returns a clean `Config`.
+//! User TOML on disk is the source of truth. Each historical version (V1, V2)
+//! is a partial typed lens (`schema/v{1,2}.rs`) — explicit Rust fields only for
+//! what transforms between adjacent versions; everything else rides through
+//! `passthrough: toml::Table`. V3 is the live `Config` in `schema.rs`.
 //!
-//! The on-disk file is never rewritten by migration.
-//!
-//! ## When to bump the schema version
-//!
-//! Only when props are **renamed, moved, or removed**. New props with `#[serde(default)]`
-//! don't need a bump.
-//!
-//! ## How to add a new migration step
-//!
-//! 1. Bump [`CURRENT_SCHEMA_VERSION`].
-//! 2. If the legacy field was on `V1Compat`, update `migrate_providers()` (or the
-//!    relevant `V1Compat` method) to move the value into the new location.
-//! 3. For changes between V2+ layouts, add a `fn vN_to_vM(&mut Config)` and call
-//!    it from `into_config()` after the schema-version check.
-//! 4. Add a test in `tests/component/config_migration.rs`:
-//!    - Deserialize a TOML string with the old layout.
-//!    - Assert the migrated `Config` has values in the new locations.
-//!    - Assert the old locations are empty/cleared.
-//! 5. Verify with `cargo test --test component -- config_migration`.
-//!
-//! ## User-facing migration command
-//!
-//! `zeroclaw config migrate` rewrites the on-disk `config.toml` to the current
-//! schema version using `toml_edit` to preserve comments and formatting.
+//! Public API (preserved from the previous implementation so existing callers
+//! in `schema.rs`, `src/main.rs`, gateway, tools, and tests keep compiling
+//! without changes):
+//! - `CURRENT_SCHEMA_VERSION` — current schema version constant
+//! - `V1_LEGACY_KEYS` — top-level keys whose presence implies V1 input
+//! - `migrate_to_current(&str) -> Result<Config>` — high-level: TOML → V3 Config
+//! - `migrate_file(&str) -> Result<Option<String>>` — pure transform; returns
+//!   `Some(migrated)` if migration ran, `None` if input was already current
+//! - `sync_table(toml_edit::Table, &toml::Table)` — comment-preserving
+//!   reconciliation helper used by `Config::save()`
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
-use std::collections::HashMap;
-use toml_edit::DocumentMut;
+use std::path::Path;
 
-use super::schema::ModelProviderConfig;
+use crate::schema::Config;
+use crate::schema::v1::V1Config;
+use crate::schema::v2::V2Config;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+/// The schema version this binary writes and expects on disk.
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
-/// Top-level keys from V1 that are consumed by V1Compat during migration.
-/// Used by the unknown-key detector to suppress false "unknown key" warnings.
+/// Top-level TOML keys that legacy schema versions had but V3 either
+/// removed or restructured into a different shape. Used by
+/// `Config::unknown_keys` to suppress false "unknown key" warnings on
+/// V1/V2 configs migrating through `migrate_to_current` — every key here
+/// is consumed by the V1→V2 or V2→V3 migration step, so its presence in
+/// a stale-but-being-migrated config is expected, not a typo.
+///
+/// Sources:
+/// - V1→V2 removed/renamed (top-level): `git show 1ec9c14ca:crates/zeroclaw-config/src/schema.rs`.
+/// - V2→V3 removed/restructured (top-level): `git show 68a875b5b:crates/zeroclaw-config/src/schema.rs`.
 pub const V1_LEGACY_KEYS: &[&str] = &[
+    // V1 → V2 removed/renamed
     "api_key",
     "api_url",
     "api_path",
     "default_provider",
-    "model_provider",
     "default_model",
-    "model",
+    "model_providers",
     "default_temperature",
     "provider_timeout_secs",
     "provider_max_tokens",
     "extra_headers",
-    "model_providers",
     "model_routes",
     "embedding_routes",
     "channels_config",
+    // V2 → V3 removed or shape-changed at top level. V3's `Config::default()`
+    // serialization either omits these (HashMap-typed, `skip_serializing_if`
+    // empty) or doesn't carry the field at all, so without this entry the
+    // unknown-key probe would flag a legitimately-migrating V2 input.
+    "autonomy",
+    "agent",
+    "swarms",
+    "cron",
 ];
 
-/// Wraps the current Config with extra fields from V1 that no longer exist on Config.
-/// `#[serde(flatten)]` lets Config consume its known fields; the old fields are
-/// captured here.
-#[derive(Deserialize)]
-pub struct V1Compat {
-    #[serde(flatten)]
-    pub config: super::schema::Config,
-
-    // ── Old top-level provider fields (removed in V2) ──
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    api_url: Option<String>,
-    #[serde(default)]
-    api_path: Option<String>,
-    #[serde(default, alias = "model_provider")]
-    default_provider: Option<String>,
-    #[serde(default, alias = "model")]
-    default_model: Option<String>,
-    #[serde(default)]
-    model_providers: HashMap<String, ModelProviderConfig>,
-    #[serde(default)]
-    default_temperature: Option<f64>,
-    #[serde(default)]
-    provider_timeout_secs: Option<u64>,
-    #[serde(default)]
-    provider_max_tokens: Option<u32>,
-    #[serde(default)]
-    extra_headers: Option<HashMap<String, String>>,
-    #[serde(default)]
-    model_routes: Vec<super::schema::ModelRouteConfig>,
-    #[serde(default)]
-    embedding_routes: Vec<super::schema::EmbeddingRouteConfig>,
-}
-
-impl V1Compat {
-    /// Consume self, migrating old fields into the current Config layout.
-    pub fn into_config(mut self) -> super::schema::Config {
-        let from = self.config.schema_version;
-        let needs_migration = from < CURRENT_SCHEMA_VERSION || self.has_legacy_fields();
-
-        if !needs_migration {
-            return self.config;
-        }
-
-        self.migrate_providers();
-        self.config.schema_version = CURRENT_SCHEMA_VERSION;
-
-        tracing::info!(
-            from = from,
-            to = CURRENT_SCHEMA_VERSION,
-            "Config schema migrated in-memory from version {from} to {CURRENT_SCHEMA_VERSION}. \
-             Run `zeroclaw config migrate` to update the file on disk.",
-        );
-
-        self.config
-    }
-
-    fn has_legacy_fields(&self) -> bool {
-        self.api_key.is_some()
-            || self.api_url.is_some()
-            || self.api_path.is_some()
-            || self.default_provider.is_some()
-            || self.default_model.is_some()
-            || !self.model_providers.is_empty()
-            || self.default_temperature.is_some()
-            || self.provider_timeout_secs.is_some()
-            || self.provider_max_tokens.is_some()
-            || self.extra_headers.as_ref().is_some_and(|h| !h.is_empty())
-            || !self.model_routes.is_empty()
-            || !self.embedding_routes.is_empty()
-    }
-
-    fn migrate_providers(&mut self) {
-        let fallback = self
-            .default_provider
-            .take()
-            .unwrap_or_else(|| "default".into());
-
-        // First, move old model_providers entries into providers.models.
-        // These take precedence over top-level fields (more specific).
-        for (key, profile) in std::mem::take(&mut self.model_providers) {
-            self.config.providers.models.entry(key).or_insert(profile);
-        }
-
-        // Then fill gaps in the fallback entry from top-level fields.
-        let entry = self
-            .config
-            .providers
-            .models
-            .entry(fallback.clone())
-            .or_default();
-
-        if entry.api_key.is_none() {
-            entry.api_key = self.api_key.take();
-        }
-        if entry.base_url.is_none() {
-            entry.base_url = self.api_url.take();
-        }
-        if entry.api_path.is_none() {
-            entry.api_path = self.api_path.take();
-        }
-        if entry.model.is_none() {
-            entry.model = self.default_model.take();
-        }
-        if entry.temperature.is_none() {
-            entry.temperature = self.default_temperature.take();
-        }
-        if entry.timeout_secs.is_none() {
-            entry.timeout_secs = self.provider_timeout_secs.take();
-        }
-        if entry.max_tokens.is_none() {
-            entry.max_tokens = self.provider_max_tokens.take();
-        }
-        if entry.extra_headers.is_empty()
-            && let Some(headers) = self.extra_headers.take()
-        {
-            entry.extra_headers = headers;
-        }
-
-        if self.config.providers.fallback.is_none() {
-            self.config.providers.fallback = Some(fallback);
-        }
-
-        // Move routing rules into providers.
-        if self.config.providers.model_routes.is_empty() && !self.model_routes.is_empty() {
-            self.config.providers.model_routes = std::mem::take(&mut self.model_routes);
-        }
-        if self.config.providers.embedding_routes.is_empty() && !self.embedding_routes.is_empty() {
-            self.config.providers.embedding_routes = std::mem::take(&mut self.embedding_routes);
-        }
-    }
-}
-
-/// Pre-deserialization table migration for nested field changes that
-/// `#[serde(flatten)]` cannot capture (e.g. removing a field from a nested
-/// struct and moving its value elsewhere).
+/// Detect a config's schema version from its parsed TOML representation.
 ///
-/// Called on the raw `toml::Table` before it is deserialized into `V1Compat`.
-pub fn prepare_table(table: &mut toml::Table) {
-    // Migrate channels_config.matrix.room_id → channels_config.matrix.allowed_rooms
-    for key in &["channels_config", "channels"] {
-        if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
-            && let Some(toml::Value::Table(matrix)) = channels.get_mut("matrix")
-            && let Some(toml::Value::String(room_id)) = matrix.remove("room_id")
-            && !room_id.is_empty()
-        {
-            let rooms = matrix
-                .entry("allowed_rooms")
-                .or_insert_with(|| toml::Value::Array(Vec::new()));
-            if let toml::Value::Array(arr) = rooms {
-                let already_present = arr.iter().any(|v| v.as_str() == Some(room_id.as_str()));
-                if !already_present {
-                    arr.push(toml::Value::String(room_id));
-                }
-            }
-        }
-    }
-
-    // Migrate channels.slack.channel_id → channels.slack.channel_ids
-    for key in &["channels_config", "channels"] {
-        if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
-            && let Some(toml::Value::Table(slack)) = channels.get_mut("slack")
-            && let Some(toml::Value::String(channel_id)) = slack.remove("channel_id")
-            && !channel_id.is_empty()
-            && channel_id != "*"
-        {
-            let ids = slack
-                .entry("channel_ids")
-                .or_insert_with(|| toml::Value::Array(Vec::new()));
-            if let toml::Value::Array(arr) = ids {
-                let already_present = arr.iter().any(|v| v.as_str() == Some(channel_id.as_str()));
-                if !already_present {
-                    arr.push(toml::Value::String(channel_id));
-                }
-            }
-        }
-    }
-
-    // Rename legacy `channels_config` key to `channels`
-    if table.contains_key("channels_config")
-        && !table.contains_key("channels")
-        && let Some(val) = table.remove("channels_config")
-    {
-        table.insert("channels".to_string(), val);
+/// - Missing top-level `schema_version` key → V1 (pre-versioned).
+/// - Integer ≥ 1 → that integer.
+/// - Anything else → error.
+pub fn detect_version(value: &toml::Value) -> Result<u32> {
+    let table = value
+        .as_table()
+        .context("config root must be a TOML table")?;
+    match table.get("schema_version") {
+        None => Ok(1),
+        Some(toml::Value::Integer(n)) if *n >= 1 => Ok(*n as u32),
+        Some(other) => Err(anyhow::anyhow!(
+            "schema_version must be a positive integer, got {other}"
+        )),
     }
 }
 
-// ── File-level migration (comment-preserving) ───────────────────────────────
-//
-// Uses V1Compat (the single source of migration logic) to compute the migrated
-// Config, then syncs the original toml_edit document to match. The sync function
-// is generic — it doesn't know field names, it just diffs two table structures.
-
-/// Migrate a raw TOML config file, preserving comments and formatting.
-/// Returns `None` if already at current version.
-pub fn migrate_file(raw: &str) -> Result<Option<String>> {
-    let mut table: toml::Table = toml::from_str(raw).context("Failed to parse config table")?;
-    prepare_table(&mut table);
-    let prepared = toml::to_string(&table).context("Failed to re-serialize prepared table")?;
-    let compat: V1Compat = toml::from_str(&prepared).context("Failed to deserialize config")?;
-    if compat.config.schema_version >= CURRENT_SCHEMA_VERSION && !compat.has_legacy_fields() {
+/// Pure migration from any supported version's TOML string into the current
+/// schema version's TOML string. Returns `Ok(None)` when the input is already
+/// at `CURRENT_SCHEMA_VERSION`.
+///
+/// Comments and decoration on keys whose dotted path survives the migration
+/// are preserved via `toml_edit::DocumentMut` reconciliation (`sync_table`).
+/// Keys that are renamed, removed, or restructured lose their comments — the
+/// `.backup` file written by `migrate_file_in_place` retains the original
+/// for manual recovery.
+pub fn migrate_file(input: &str) -> Result<Option<String>> {
+    let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
+    let from = detect_version(&value)?;
+    if from == CURRENT_SCHEMA_VERSION {
         return Ok(None);
     }
-    let config = compat.into_config();
-
-    // Serialize the migrated config to get the target table structure.
-    let target: toml::Table = toml::from_str(&toml::to_string(&config)?)
-        .context("Failed to round-trip migrated config")?;
-
-    // Sync the original document (with comments) to match the target.
-    let mut doc: DocumentMut = raw.parse().context("Failed to parse config.toml")?;
-
-    // Rename channels_config → channels in the document to preserve comments.
-    if doc.contains_key("channels_config")
-        && !doc.contains_key("channels")
-        && let Some(val) = doc.remove("channels_config")
-    {
-        doc.insert("channels", val);
+    if from > CURRENT_SCHEMA_VERSION {
+        return Err(anyhow::anyhow!(
+            "config schema_version {from} is newer than this binary supports ({CURRENT_SCHEMA_VERSION})"
+        ));
     }
+    let migrated_value = run_chain(value, from)?;
+    let migrated_table = match migrated_value {
+        toml::Value::Table(t) => t,
+        _ => {
+            anyhow::bail!("migrated config is not a TOML table");
+        }
+    };
 
-    sync_table(doc.as_table_mut(), &target);
-
-    Ok(Some(doc.to_string()))
+    // Try to preserve comments by reconciling into the original DocumentMut.
+    // If the original doesn't parse as toml_edit (rare — toml::from_str
+    // already succeeded on it), fall back to a fresh serialization.
+    if let Ok(mut doc) = input.parse::<toml_edit::DocumentMut>() {
+        sync_table(doc.as_table_mut(), &migrated_table);
+        Ok(Some(doc.to_string()))
+    } else {
+        let serialized = toml::to_string_pretty(&toml::Value::Table(migrated_table))
+            .context("failed to serialize migrated config")?;
+        Ok(Some(serialized))
+    }
 }
 
-/// Recursively sync a `toml_edit` table to match a target `toml::Table`.
-/// - Keys absent from target are removed.
-/// - Keys present in target but not in doc are inserted.
-/// - Sub-tables are recursed. Leaf values are updated only if changed.
-/// - Unchanged entries retain their original formatting and comments.
-pub fn sync_table(doc: &mut toml_edit::Table, target: &toml::Table) {
-    // Remove keys not in target.
+/// High-level: arbitrary versioned TOML → fully validated V3 `Config`.
+/// Runs migration if needed, then deserializes into the current `Config` type.
+pub fn migrate_to_current(input: &str) -> Result<Config> {
+    let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
+    let from = detect_version(&value)?;
+    let final_value = if from == CURRENT_SCHEMA_VERSION {
+        value
+    } else if from > CURRENT_SCHEMA_VERSION {
+        return Err(anyhow::anyhow!(
+            "config schema_version {from} is newer than this binary supports ({CURRENT_SCHEMA_VERSION})"
+        ));
+    } else {
+        run_chain(value, from)?
+    };
+    final_value
+        .try_into()
+        .context("migrated config failed to deserialize as current schema")
+}
+
+/// File-API wrapper: read disk config, migrate, write `<file>.backup`
+/// adjacent to the original, then atomically replace the original. Returns
+/// `Ok(None)` when already current.
+///
+/// Backup file is `<config_filename>.backup` (joined cross-platform via
+/// `Path` ops). The write path mirrors `Config::save()` so the documented
+/// durability guarantee holds end-to-end (#6266 review):
+///
+/// 1. Write the migrated content to `<path>.tmp-<uuid>` and fsync it.
+/// 2. Copy the original to `<path>.backup` (existing behavior; recovery
+///    rope if anything later goes wrong).
+/// 3. `rename(<path>.tmp, <path>)` — atomic on Unix and on modern Windows.
+/// 4. Fsync the parent directory so the rename is durable.
+///
+/// On rename failure the temp file is removed and the backup is restored
+/// over the original so the operator never observes a partial write.
+pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config at {}", path.display()))?;
+    let migrated = match migrate_file(&raw)? {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let parent = path
+        .parent()
+        .with_context(|| format!("config path {} has no parent directory", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .with_context(|| format!("config path {} has no file name", path.display()))?;
+    let backup_path = parent.join(format!("{file_name}.backup"));
+    let temp_path = parent.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
+
+    // 1. Write migrated content to temp + fsync.
+    {
+        let mut temp = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary migrated config at {}",
+                    temp_path.display()
+                )
+            })?;
+        std::io::Write::write_all(&mut temp, migrated.as_bytes()).with_context(|| {
+            format!("failed to write migrated config to {}", temp_path.display())
+        })?;
+        temp.sync_all().with_context(|| {
+            format!(
+                "failed to fsync temporary migrated config at {}",
+                temp_path.display()
+            )
+        })?;
+    }
+
+    // 2. Backup original BEFORE touching the destination. Copy gets a fresh inode.
+    std::fs::copy(path, &backup_path).with_context(|| {
+        format!(
+            "failed to write backup {} before migration (temp file intact at {})",
+            backup_path.display(),
+            temp_path.display(),
+        )
+    })?;
+
+    // 3. Atomic rename. On failure, restore from backup so the operator
+    //    never observes a partial write.
+    if let Err(rename_err) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        if backup_path.exists() {
+            let _ = std::fs::copy(&backup_path, path);
+        }
+        return Err(anyhow::anyhow!(
+            "failed to atomically replace {} with migrated config: {rename_err} \
+             (backup retained at {})",
+            path.display(),
+            backup_path.display(),
+        ));
+    }
+
+    // 4. Fsync the parent directory so the rename is durable across crashes.
+    sync_directory(parent).with_context(|| {
+        format!(
+            "failed to fsync parent directory after migration: {}",
+            parent.display()
+        )
+    })?;
+
+    Ok(Some(MigrateReport {
+        backup_path,
+        to_version: CURRENT_SCHEMA_VERSION,
+    }))
+}
+
+/// Fsync the directory entry so a subsequent rename inside it is durable.
+/// No-op on platforms where directory fsync isn't a meaningful primitive.
+#[allow(clippy::unused_async)] // kept sync to mirror Config::save()'s helper
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = std::fs::File::open(path)
+            .with_context(|| format!("failed to open directory for fsync: {}", path.display()))?;
+        dir.sync_all()
+            .with_context(|| format!("failed to fsync directory: {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Best-effort: open + drop. Windows doesn't provide a portable
+        // directory-fsync primitive in std; the rename itself is durable
+        // on NTFS.
+        let _ = std::fs::File::open(path);
+    }
+    Ok(())
+}
+
+/// Result of an on-disk migration. Returned by `migrate_file_in_place` when
+/// migration ran (vs. `Ok(None)` when input was already current).
+#[derive(Debug, Clone)]
+pub struct MigrateReport {
+    pub backup_path: std::path::PathBuf,
+    pub to_version: u32,
+}
+
+/// Refuse to proceed if the on-disk config is at a stale schema version.
+///
+/// Used by CLI write commands (`config set`, `config patch`, `config init`)
+/// to ensure the user explicitly opts into the migration via
+/// `zeroclaw config migrate` before modifying a stale config — the alternative
+/// would be a silent auto-migrate-on-write, which is harder to audit and
+/// surprises users who didn't realize their config schema had changed.
+///
+/// - Missing file → `Ok(())` (fresh install: nothing to migrate yet).
+/// - Current version → `Ok(())`.
+/// - Stale (or future) version → `Err` with a message that names the disk
+///   version and the command the user needs to run.
+pub fn ensure_disk_at_current_version(path: &Path) -> Result<()> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(anyhow::Error::from(e))
+                .with_context(|| format!("failed to read config at {}", path.display()));
+        }
+    };
+    let value: toml::Value =
+        toml::from_str(&raw).context("failed to parse config TOML for version check")?;
+    let from = detect_version(&value)?;
+    if from == CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if from > CURRENT_SCHEMA_VERSION {
+        anyhow::bail!(
+            "config at {} is schema_version {from}, newer than this binary supports ({})",
+            path.display(),
+            CURRENT_SCHEMA_VERSION,
+        );
+    }
+    anyhow::bail!(
+        "config at {} is schema_version {from}; run `zeroclaw config migrate` to update before modifying",
+        path.display(),
+    );
+}
+
+/// Fold a `from_key: String` value into a `to_key: Vec<String>` array on the
+/// same table. Used for the singular→plural channel transforms (V1→V2:
+/// `matrix.room_id` → `allowed_rooms`, `slack.channel_id` → `channel_ids`;
+/// V2→V3: `discord.guild_id` → `guild_ids`, etc.).
+///
+/// - Removes `from_key` from the table.
+/// - If the value was a non-empty string, appends it to `to_key`'s array
+///   (creating the array if missing). Existing entries are preserved; the new
+///   value is deduplicated against current contents.
+/// - Empty strings, non-string types, and missing `from_key` are no-ops.
+///
+/// Returns `true` if a value was actually folded (caller may emit a log line).
+pub(crate) fn fold_string_into_array(
+    table: &mut toml::Table,
+    from_key: &str,
+    to_key: &str,
+) -> bool {
+    let value = match table.remove(from_key) {
+        Some(toml::Value::String(s)) if !s.is_empty() => s,
+        Some(other) => {
+            // Non-string: re-insert under from_key untouched (caller may handle).
+            table.insert(from_key.to_string(), other);
+            return false;
+        }
+        None => return false,
+    };
+    let entry = table
+        .entry(to_key.to_string())
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    if let Some(arr) = entry.as_array_mut() {
+        let already_present = arr.iter().any(|v| v.as_str() == Some(value.as_str()));
+        if !already_present {
+            arr.push(toml::Value::String(value));
+        }
+        true
+    } else {
+        // Existing to_key wasn't an array (unusual). Reinsert from_key as-is.
+        table.insert(from_key.to_string(), toml::Value::String(value));
+        false
+    }
+}
+
+/// Run the typed migration chain from `from` up to `CURRENT_SCHEMA_VERSION`.
+/// `from` must be < `CURRENT_SCHEMA_VERSION` (caller checks).
+fn run_chain(value: toml::Value, from: u32) -> Result<toml::Value> {
+    // Step 1 → 2
+    let after_v1 = if from < 2 {
+        let v1: V1Config = value
+            .try_into()
+            .context("failed to deserialize input as V1 schema")?;
+        let v2 = v1.migrate();
+        toml::Value::try_from(v2).context("failed to serialize V2 intermediate")?
+    } else {
+        value
+    };
+
+    // Step 2 → 3
+    if from < 3 {
+        let v2: V2Config = after_v1
+            .try_into()
+            .context("failed to deserialize as V2 schema")?;
+        v2.migrate().context("failed to migrate V2 → V3")
+    } else {
+        Ok(after_v1)
+    }
+}
+
+/// Reconcile new typed values into an existing `toml_edit::DocumentMut` so
+/// comments and decoration on surviving keys are preserved across save.
+///
+/// Walks `new` recursively. For each key:
+/// - If the key exists in `doc` AND both sides are tables, recurse.
+/// - If the key exists in `doc` and at least one side is not a table, replace
+///   the value while preserving the key's prefix decor (i.e. the comment lines
+///   that lead the key).
+/// - If the key does not exist in `doc`, insert it.
+///
+/// Removed keys (present in `doc` but absent from `new`) are dropped from `doc`.
+/// This matches the prior crate behavior: the typed schema is authoritative,
+/// and any TOML key not represented in `new` is not part of the current schema.
+pub(crate) fn sync_table(doc: &mut toml_edit::Table, new: &toml::Table) {
+    // Drop keys not present in new
     let to_remove: Vec<String> = doc
         .iter()
         .map(|(k, _)| k.to_string())
-        .filter(|k| !target.contains_key(k))
+        .filter(|k| !new.contains_key(k))
         .collect();
-    for key in &to_remove {
-        doc.remove(key);
+    for k in to_remove {
+        doc.remove(&k);
     }
 
-    // Add or update keys from target.
-    for (key, target_value) in target {
-        match target_value {
-            toml::Value::Table(sub_target) => {
-                let entry = doc
-                    .entry(key)
-                    .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
-                if let Some(sub_doc) = entry.as_table_mut() {
-                    sync_table(sub_doc, sub_target);
-                }
+    for (key, new_value) in new.iter() {
+        if let (Some(doc_item), toml::Value::Table(new_sub)) =
+            (doc.get_mut(key.as_str()), new_value)
+            && let Some(doc_sub) = doc_item.as_table_mut()
+        {
+            // Both tables — recurse to preserve nested comments.
+            sync_table(doc_sub, new_sub);
+            continue;
+        }
+        // Otherwise, replace the value while preserving the key's leading decor.
+        let new_item = toml_value_to_edit_item(new_value);
+        match doc.get_mut(key.as_str()) {
+            Some(existing) => {
+                // Preserve the key's leading decor (comments) by mutating in place.
+                *existing = new_item;
             }
-            _ => {
-                if let Some(existing) = doc.get(key).and_then(|i| i.as_value()) {
-                    // Compare raw values, ignoring formatting/comments.
-                    if values_equal(existing, target_value) {
-                        continue;
-                    }
-                }
-                doc.insert(key, toml_edit::value(toml_to_edit_value(target_value)));
+            None => {
+                doc.insert(key.as_str(), new_item);
             }
         }
-    }
-}
-
-/// Compare a `toml_edit::Value` and a `toml::Value` for semantic equality,
-/// ignoring formatting, whitespace, and comments.
-fn values_equal(edit: &toml_edit::Value, toml: &toml::Value) -> bool {
-    match (edit, toml) {
-        (toml_edit::Value::String(a), toml::Value::String(b)) => a.value() == b,
-        (toml_edit::Value::Integer(a), toml::Value::Integer(b)) => a.value() == b,
-        (toml_edit::Value::Float(a), toml::Value::Float(b)) => (a.value() - b).abs() < f64::EPSILON,
-        (toml_edit::Value::Boolean(a), toml::Value::Boolean(b)) => a.value() == b,
-        (toml_edit::Value::Array(a), toml::Value::Array(b)) => {
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(ae, be)| values_equal(ae, be))
-        }
-        _ => false,
     }
 }
 
-/// Convert a `toml::Value` to a `toml_edit::Value`.
-fn toml_to_edit_value(v: &toml::Value) -> toml_edit::Value {
-    match v {
-        toml::Value::String(s) => toml_edit::Value::from(s.as_str()),
-        toml::Value::Integer(i) => toml_edit::Value::from(*i),
-        toml::Value::Float(f) => toml_edit::Value::from(*f),
-        toml::Value::Boolean(b) => toml_edit::Value::from(*b),
-        toml::Value::Array(arr) => {
-            let mut a = toml_edit::Array::new();
-            for item in arr {
-                a.push(toml_to_edit_value(item));
-            }
-            toml_edit::Value::Array(a)
+/// Convert a `toml::Value` into a `toml_edit::Item` for insertion into
+/// a `DocumentMut`. Tables become inline tables when small, real tables
+/// otherwise — matches `toml_edit`'s default round-trip behavior.
+fn toml_value_to_edit_item(value: &toml::Value) -> toml_edit::Item {
+    // Easiest path: serialize to string, parse as toml_edit. Lossy on numeric
+    // formatting nuance but correct for migration round-trip where we're
+    // emitting freshly-serialized values.
+    let serialized = match value {
+        toml::Value::Table(t) => {
+            let mut wrapper = toml::Table::new();
+            wrapper.insert("__v".into(), toml::Value::Table(t.clone()));
+            toml::to_string(&wrapper).unwrap_or_default()
         }
-        toml::Value::Datetime(dt) => dt
-            .to_string()
-            .parse()
-            .unwrap_or_else(|_| toml_edit::Value::from(dt.to_string())),
-        toml::Value::Table(tbl) => {
-            // Tables inside arrays (e.g. `[[providers.model_routes]]`) need to be
-            // converted to inline tables so they can be pushed into a toml_edit Array.
-            let mut inline = toml_edit::InlineTable::new();
-            for (k, v) in tbl {
-                inline.insert(k, toml_to_edit_value(v));
-            }
-            toml_edit::Value::InlineTable(inline)
+        other => {
+            let mut wrapper = toml::Table::new();
+            wrapper.insert("__v".into(), other.clone());
+            toml::to_string(&wrapper).unwrap_or_default()
         }
+    };
+    let doc: toml_edit::DocumentMut = serialized.parse().unwrap_or_default();
+    doc.get("__v").cloned().unwrap_or(toml_edit::Item::None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_version_missing_is_v1() {
+        let v: toml::Value = toml::from_str("foo = 1").unwrap();
+        assert_eq!(detect_version(&v).unwrap(), 1);
+    }
+
+    #[test]
+    fn detect_version_explicit() {
+        let v: toml::Value = toml::from_str("schema_version = 2\n").unwrap();
+        assert_eq!(detect_version(&v).unwrap(), 2);
+    }
+
+    #[test]
+    fn detect_version_negative_errors() {
+        let v: toml::Value = toml::from_str("schema_version = -1\n").unwrap();
+        assert!(detect_version(&v).is_err());
+    }
+
+    #[test]
+    fn detect_version_string_errors() {
+        let v: toml::Value = toml::from_str("schema_version = \"two\"\n").unwrap();
+        assert!(detect_version(&v).is_err());
+    }
+
+    // ── migrate_file_in_place atomic-write semantics (#6266 review) ──
+
+    fn setup_temp_config_dir() -> tempfile::TempDir {
+        tempfile::TempDir::new().expect("temp dir")
+    }
+
+    #[test]
+    fn migrate_file_in_place_writes_backup_and_replaces_atomically() {
+        let dir = setup_temp_config_dir();
+        let path = dir.path().join("config.toml");
+        // Minimal V1 input (no schema_version) so migration runs.
+        std::fs::write(&path, "default_provider = \"openai\"\nfoo = 1\n").unwrap();
+
+        let report = migrate_file_in_place(&path)
+            .expect("migration succeeds")
+            .expect("migration ran (V1 input)");
+
+        // Backup retains the original content verbatim.
+        let backup = std::fs::read_to_string(&report.backup_path).unwrap();
+        assert!(
+            backup.contains("default_provider = \"openai\"") && backup.contains("foo = 1"),
+            "backup must contain the original V1 content; got: {backup}"
+        );
+
+        // Original is replaced with migrated content.
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            migrated.contains("schema_version"),
+            "migrated config must carry a schema_version line; got: {migrated}"
+        );
+
+        // No `<file>.tmp-*` files left behind in the parent.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".config.toml.tmp-")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp files must remain after a successful migration; got {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn migrate_file_in_place_noop_when_already_current() {
+        let dir = setup_temp_config_dir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!("schema_version = {CURRENT_SCHEMA_VERSION}\n"),
+        )
+        .unwrap();
+
+        let report = migrate_file_in_place(&path).expect("idempotent on current schema");
+        assert!(
+            report.is_none(),
+            "no migration should run when the file is already at CURRENT_SCHEMA_VERSION"
+        );
+        // No backup file should exist when the migration didn't run.
+        let backup = path.with_file_name("config.toml.backup");
+        assert!(
+            !backup.exists(),
+            "no `.backup` should be created on the no-op path; got {}",
+            backup.display()
+        );
     }
 }

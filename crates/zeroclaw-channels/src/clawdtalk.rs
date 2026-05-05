@@ -342,12 +342,12 @@ mod tests {
 
     fn test_config() -> ClawdTalkConfig {
         ClawdTalkConfig {
-            enabled: true,
             api_key: "test-key".to_string(),
             connection_id: "test-connection".to_string(),
             from_number: "+15551234567".to_string(),
             allowed_destinations: vec!["+1555".to_string()],
             webhook_secret: None,
+            excluded_tools: vec![],
         }
     }
 

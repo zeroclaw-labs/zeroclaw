@@ -74,8 +74,9 @@ rewriting is not part of this surface. `test` against a `#[secret]` path is
 rejected with `secret_test_forbidden` — a differential outcome would be the
 only signal a client could read, and that would leak the value.
 
-Path syntax: JSON Pointer (`/providers/fallback`) or the dotted form
-(`providers.fallback`). Both are accepted; the server normalises.
+Path syntax: JSON Pointer (`/agents/researcher/model_provider`) or the
+dotted form (`agents.researcher.model_provider`). Both are accepted; the
+server normalises.
 
 The CLI counterpart is `zeroclaw config patch <file-or-stdin>`, which applies
 the same op set against the local Config and returns the same structured
@@ -102,7 +103,7 @@ Frontends and scripts match against the code; UI matches against the path.
 |---|---|---|
 | `path_not_found` | 404 | The requested property does not exist in the schema. |
 | `validation_failed` | 400 | The whole-config validator rejected the proposed state. |
-| `provider_fallback_dangling` | 400 | `providers.fallback` references a key that is not configured. |
+| `dangling_reference` | 400 | A configured alias reference (e.g. `agents.<x>.model_provider`) names a missing target (e.g. `providers.models.<type>.<alias>`). |
 | `value_type_mismatch` | 400 | The submitted JSON value cannot coerce into the target type. |
 | `op_not_supported` | 400 | JSON Patch op is `move` / `copy` / unknown. |
 | `secret_test_forbidden` | 400 | JSON Patch `test` op targeted a secret path. |

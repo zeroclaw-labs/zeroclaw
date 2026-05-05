@@ -811,7 +811,11 @@ mod client {
         if let Some(pw) = config.password.as_deref().filter(|s| !s.is_empty()) {
             return password_login(client, config, pw).await;
         }
-        if !config.access_token.is_empty() {
+        if config
+            .access_token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty())
+        {
             return access_token_login(client, config).await;
         }
         bail!("matrix login requires either access_token or user_id+password")
@@ -849,7 +853,10 @@ mod client {
                 device_id: device_id.into(),
             },
             tokens: SessionTokens {
-                access_token: config.access_token.clone(),
+                access_token: config
+                    .access_token
+                    .clone()
+                    .ok_or_else(|| anyhow!("matrix.access_token is required for token login"))?,
                 refresh_token: None,
             },
         };
@@ -916,13 +923,17 @@ mod client {
     }
 
     async fn fetch_access_token_whoami(config: &MatrixConfig) -> Result<WhoamiResponse> {
+        let access_token = config
+            .access_token
+            .as_deref()
+            .context("matrix: whoami requires access_token")?;
         let url = matrix_client_api_url(&config.homeserver, WHOAMI_ENDPOINT)?;
         let response = reqwest::Client::builder()
             .timeout(WHOAMI_TIMEOUT)
             .build()
             .context("matrix: build whoami HTTP client")?
             .get(url)
-            .bearer_auth(&config.access_token)
+            .bearer_auth(access_token)
             .send()
             .await
             .context("matrix: whoami request failed")?;
@@ -2573,7 +2584,15 @@ impl MatrixChannel {
         if config.homeserver.trim().is_empty() {
             bail!("matrix: `homeserver` is required");
         }
-        if config.access_token.trim().is_empty() && config.password.is_none() {
+        let has_token = config
+            .access_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty());
+        let has_password = config
+            .password
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        if !has_token && !has_password {
             bail!("matrix: configure either `access_token` or `password`");
         }
         Ok(Self {
@@ -3543,9 +3562,8 @@ mod tests {
 
         fn cfg(password: Option<&str>, user_id: Option<&str>) -> MatrixConfig {
             MatrixConfig {
-                enabled: true,
                 homeserver: "https://m.org".into(),
-                access_token: String::new(),
+                access_token: None,
                 user_id: user_id.map(String::from),
                 device_id: None,
                 allowed_users: vec![],
@@ -3560,13 +3578,14 @@ mod tests {
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
                 ack_reactions: true,
+                excluded_tools: vec![],
             }
         }
 
         fn access_token_cfg(homeserver: String) -> MatrixConfig {
             MatrixConfig {
                 homeserver,
-                access_token: "secret-token".into(),
+                access_token: Some("secret-token".into()),
                 ..cfg(None, None)
             }
         }

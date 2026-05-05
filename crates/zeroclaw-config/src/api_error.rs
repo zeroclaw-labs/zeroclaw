@@ -25,11 +25,7 @@ pub enum ConfigApiCode {
     /// The supplied property path is not defined in the schema.
     PathNotFound,
     /// Generic schema validation failure (catch-all wrapping `Config::validate()` bails).
-    /// Specific failure modes (`provider_fallback_dangling`, etc.) get their own
-    /// codes as the validator is incrementally restructured.
     ValidationFailed,
-    /// `providers.fallback` references a key not present in `providers.models`.
-    ProviderFallbackDangling,
     /// On-disk config differs from in-memory state (an out-of-band file edit
     /// happened despite the daemon-running rule). Caller should reload.
     ConfigChangedExternally,
@@ -59,9 +55,7 @@ pub enum ConfigApiCode {
     /// set (e.g. `tunnel.provider` with an unknown name).
     InvalidEnumVariant,
     /// A reference to another config entry pointed at something that
-    /// doesn't exist (e.g. `agents.<x>.delegate_to` naming a missing
-    /// agent). Distinct from `ProviderFallbackDangling` — that's the
-    /// specific case the dashboard surfaces for the providers section.
+    /// doesn't exist (e.g. `agents.<x>.delegate_to` naming a missing agent).
     DanglingReference,
     /// Catch-all server failure not classified above. Avoid in code; log the
     /// original error and convert to a more specific code where possible.
@@ -73,7 +67,6 @@ impl ConfigApiCode {
         match self {
             Self::PathNotFound => "path_not_found",
             Self::ValidationFailed => "validation_failed",
-            Self::ProviderFallbackDangling => "provider_fallback_dangling",
             Self::ConfigChangedExternally => "config_changed_externally",
             Self::ReloadFailed => "reload_failed",
             Self::OpNotSupported => "op_not_supported",
@@ -93,7 +86,6 @@ impl ConfigApiCode {
         match self {
             Self::PathNotFound => 404,
             Self::ValidationFailed
-            | Self::ProviderFallbackDangling
             | Self::OpNotSupported
             | Self::SecretTestForbidden
             | Self::ValueTypeMismatch
@@ -175,13 +167,6 @@ impl ConfigApiError {
 /// structured errors per bail site.
 pub fn classify_validation_message(msg: &str) -> ConfigApiCode {
     let lower = msg.to_lowercase();
-    if lower.contains("providers.fallback")
-        && (lower.contains("not configured")
-            || lower.contains("not found")
-            || lower.contains("references"))
-    {
-        return ConfigApiCode::ProviderFallbackDangling;
-    }
     if lower.contains("type mismatch") || lower.contains("invalid value") {
         return ConfigApiCode::ValueTypeMismatch;
     }
@@ -275,7 +260,6 @@ mod tests {
         for code in [
             ConfigApiCode::PathNotFound,
             ConfigApiCode::ValidationFailed,
-            ConfigApiCode::ProviderFallbackDangling,
             ConfigApiCode::ConfigChangedExternally,
             ConfigApiCode::ReloadFailed,
             ConfigApiCode::OpNotSupported,
@@ -298,16 +282,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_provider_fallback_dangling() {
-        assert_eq!(
-            classify_validation_message(
-                "providers.fallback references key 'unknown' which is not configured"
-            ),
-            ConfigApiCode::ProviderFallbackDangling
-        );
-    }
-
-    #[test]
     fn classify_unknown_property() {
         assert_eq!(
             classify_validation_message("Unknown property 'foo.bar'"),
@@ -324,20 +298,11 @@ mod tests {
     }
 
     #[test]
-    fn from_validation_picks_dangling_code_for_matching_message() {
-        let err = anyhow::anyhow!(
-            "providers.fallback references 'openrouter' which is not configured under providers.models"
-        );
-        let api = ConfigApiError::from_validation(err);
-        assert_eq!(api.code, ConfigApiCode::ProviderFallbackDangling);
-    }
-
-    #[test]
     fn path_not_found_carries_path() {
-        let err = ConfigApiError::path_not_found("providers.fallback");
+        let err = ConfigApiError::path_not_found("providers.models");
         assert_eq!(err.code, ConfigApiCode::PathNotFound);
-        assert_eq!(err.path.as_deref(), Some("providers.fallback"));
-        assert!(err.message.contains("providers.fallback"));
+        assert_eq!(err.path.as_deref(), Some("providers.models"));
+        assert!(err.message.contains("providers.models"));
     }
 
     #[test]

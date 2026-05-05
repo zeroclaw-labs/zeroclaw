@@ -63,7 +63,6 @@ pub mod report_template_tool;
 pub mod report_templates;
 pub mod screenshot;
 pub mod sessions;
-pub mod swarm;
 pub mod text_browser;
 pub mod tool_search;
 pub mod weather_tool;

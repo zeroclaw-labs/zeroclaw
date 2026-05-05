@@ -126,7 +126,6 @@ mod tests {
     #[test]
     fn mqtt_config_validation_rejects_bad_qos() {
         let config = MqttConfig {
-            enabled: true,
             broker_url: "mqtt://localhost:1883".into(),
             client_id: "zeroclaw".into(),
             topics: vec!["test".into()],
@@ -135,6 +134,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("qos must be 0, 1, or 2"));
@@ -143,7 +143,6 @@ mod tests {
     #[test]
     fn mqtt_config_validation_rejects_bad_url() {
         let config = MqttConfig {
-            enabled: true,
             broker_url: "http://localhost:1883".into(),
             client_id: "zeroclaw".into(),
             topics: vec!["test".into()],
@@ -152,6 +151,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("mqtt://"));
@@ -160,7 +160,6 @@ mod tests {
     #[test]
     fn mqtt_config_validation_rejects_empty_topics() {
         let config = MqttConfig {
-            enabled: true,
             broker_url: "mqtt://localhost:1883".into(),
             client_id: "zeroclaw".into(),
             topics: vec![],
@@ -169,6 +168,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("at least one topic"));
@@ -177,7 +177,6 @@ mod tests {
     #[test]
     fn mqtt_config_validation_rejects_empty_client_id() {
         let config = MqttConfig {
-            enabled: true,
             broker_url: "mqtt://localhost:1883".into(),
             client_id: String::new(),
             topics: vec!["test".into()],
@@ -186,6 +185,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("client_id must not be empty"));
@@ -194,7 +194,6 @@ mod tests {
     #[test]
     fn mqtt_config_validation_accepts_valid() {
         let config = MqttConfig {
-            enabled: true,
             broker_url: "mqtt://localhost:1883".into(),
             client_id: "zeroclaw".into(),
             topics: vec!["sensors/#".into()],
@@ -203,6 +202,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         assert!(config.validate().is_ok());
     }
@@ -210,7 +210,6 @@ mod tests {
     #[test]
     fn mqtt_tls_flag_rejects_mqtt_scheme_with_use_tls() {
         let config = MqttConfig {
-            enabled: true,
             broker_url: "mqtt://localhost:1883".into(),
             client_id: "zeroclaw".into(),
             topics: vec!["test".into()],
@@ -219,6 +218,7 @@ mod tests {
             password: None,
             use_tls: true,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("use_tls is true"));
@@ -227,7 +227,6 @@ mod tests {
     #[test]
     fn mqtt_tls_flag_rejects_mqtts_scheme_without_use_tls() {
         let config = MqttConfig {
-            enabled: true,
             broker_url: "mqtts://localhost:8883".into(),
             client_id: "zeroclaw".into(),
             topics: vec!["test".into()],
@@ -236,6 +235,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("mqtts://"));
@@ -244,7 +244,6 @@ mod tests {
     #[test]
     fn mqtt_tls_flag_accepts_mqtts_with_use_tls() {
         let config = MqttConfig {
-            enabled: true,
             broker_url: "mqtts://localhost:8883".into(),
             client_id: "zeroclaw".into(),
             topics: vec!["test".into()],
@@ -253,6 +252,7 @@ mod tests {
             password: None,
             use_tls: true,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         assert!(config.validate().is_ok());
     }

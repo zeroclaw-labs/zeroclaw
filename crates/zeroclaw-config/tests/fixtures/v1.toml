@@ -1,0 +1,202 @@
+api_key       = "sk-v1-test-global"
+api_url       = "https://api.example.com/v1"
+api_path      = "/chat/completions"
+default_provider = "openai"
+default_model = "gpt-4o-mini"
+default_temperature = 0.5
+provider_timeout_secs = 90
+provider_max_tokens   = 4096
+
+[extra_headers]
+User-Agent   = "ZeroClaw-V1-Test/1.0"
+"X-Title"    = "zeroclaw"
+
+[model_providers.anthropic]
+base_url = "https://api.anthropic.com"
+
+[model_providers.claude-code]
+
+[[model_routes]]
+hint     = "fast"
+provider = "openai"
+model    = "gpt-4o-mini"
+
+[channels_config]
+cli = true
+
+[channels_config.matrix]
+enabled = true
+homeserver = "https://matrix.org"
+access_token = "matrix-bot-token"
+room_id = "!important-room:matrix.org"
+allowed_users = ["@admin:matrix.org"]
+
+[channels_config.slack]
+enabled = true
+bot_token = "xoxb-slack-token"
+app_token = "xapp-slack-token"
+channel_id = "C01ABCD0001"
+
+[channels_config.discord]
+enabled = true
+bot_token = "discord-bot-token-v1"
+guild_id  = "11111"
+allowed_users = ["111", "222"]
+
+[channels_config.discord_history]
+enabled = true
+bot_token = "discord-bot-token-v1"
+channel_ids = ["aaaa", "bbbb"]
+
+[channels_config.mattermost]
+enabled = true
+url = "https://mattermost.example.com"
+bot_token = "mm-bot-token"
+channel_id = "mm-channel-001"
+
+[channels_config.reddit]
+enabled = true
+client_id = "reddit-client-id"
+client_secret = "reddit-client-secret"
+refresh_token = "reddit-refresh-token"
+username = "test-bot"
+subreddit = "rust"
+
+[channels_config.signal]
+enabled = true
+http_url = "http://127.0.0.1:8686"
+account = "+15551234567"
+group_id = "group-abc-001"
+
+[channels_config.webhook]
+enabled = false
+port = 8080
+send_url = "https://disabled.example.com/hook"
+
+[channels_config.imessage]
+allowed_contacts = ["+15555550100"]
+
+[autonomy]
+level = "supervised"
+workspace_only = true
+allowed_commands = ["ls", "git", "cat"]
+forbidden_paths = ["/etc"]
+max_actions_per_hour = 100
+max_cost_per_day_cents = 1000
+require_approval_for_medium_risk = true
+block_high_risk_commands = true
+shell_env_passthrough = ["PATH", "HOME"]
+auto_approve = ["weather"]
+always_ask = []
+allowed_roots = ["~/workspace"]
+non_cli_excluded_tools = ["browser"]
+shell_timeout_secs = 60
+
+[agent]
+parallel_tools = true
+max_history_messages = 50
+max_context_tokens = 32000
+tool_dispatcher = "auto"
+max_tool_iterations = 10
+
+[security.sandbox]
+enabled = true
+backend = "firejail"
+firejail_args = ["--noroot"]
+
+[security.resources]
+max_memory_mb = 512
+max_cpu_time_seconds = 600
+max_subprocesses = 10
+memory_monitoring = true
+
+[cron]
+enabled = true
+catch_up_on_startup = true
+max_run_history = 50
+
+[[cron.jobs]]
+id = "morning-digest-id"
+name = "Morning Digest"
+job_type = "agent"
+schedule = { kind = "cron", expr = "0 8 * * *" }
+prompt = "Summarize unread messages"
+enabled = true
+
+[reliability]
+provider_retries = 3
+fallback_providers = ["anthropic", "openai"]
+
+[reliability.model_fallbacks]
+"gpt-4o" = ["claude-sonnet-4-5", "gpt-4o-mini"]
+
+[tts]
+enabled = true
+default_provider = "openai"
+default_voice = "alloy"
+default_format = "mp3"
+max_text_length = 4096
+
+[tts.openai]
+api_key = "sk-tts-openai"
+model = "tts-1-hd"
+speed = 1.0
+
+[tts.elevenlabs]
+api_key = "sk-tts-eleven"
+model_id = "eleven_monolingual_v1"
+stability = 0.5
+similarity_boost = 0.5
+
+[memory]
+backend = "qdrant"
+sqlite_open_timeout_secs = 60
+
+[memory.qdrant]
+url = "http://localhost:6333"
+collection = "zc_memories"
+api_key = "qdrant-api-key"
+
+[storage.provider.config]
+provider = "postgres"
+db_url = "postgres://user:pass@localhost/zc"
+schema = "zeroclaw"
+table = "memories"
+connect_timeout_secs = 30
+
+[agents.simple_agent]
+provider = "openai"
+model = "gpt-4o-mini"
+
+[agents.complex_agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+api_key = "sk-ant-complex"
+temperature = 0.3
+max_iterations = 25
+max_depth = 4
+agentic = true
+allowed_tools = ["shell", "memory"]
+timeout_secs = 180
+agentic_timeout_secs = 600
+skills_directory = "/opt/zeroclaw/skills"
+memory_namespace = "complex"
+
+# Cost tracking limits: this comment exists solely to verify that comments on a surviving section round-trip through the V1→V2→V3 migration. Asserted by `comment_preserved_on_surviving_key`.
+[cost]
+enabled = true
+daily_limit_usd = 25.0
+monthly_limit_usd = 100.0
+warn_at_percent = 80
+
+[cost.prices."anthropic/claude-sonnet-4-5"]
+input = 3.0
+output = 15.0
+
+[cost.prices."openrouter/gpt-4o-mini"]
+input = 0.15
+output = 0.6
+
+[my_custom_section]
+custom_field = "preserved-through-chain"
+nested_value = 42

@@ -11,7 +11,8 @@ pub struct RedditChannel {
     client_secret: String,
     refresh_token: String,
     username: String,
-    subreddit: Option<String>,
+    /// Empty = accept items from any subreddit the bot has access to.
+    subreddits: Vec<String>,
     auth: Mutex<RedditAuth>,
 }
 
@@ -70,14 +71,14 @@ impl RedditChannel {
         client_secret: String,
         refresh_token: String,
         username: String,
-        subreddit: Option<String>,
+        subreddits: Vec<String>,
     ) -> Self {
         Self {
             client_id,
             client_secret,
             refresh_token,
             username,
-            subreddit,
+            subreddits,
             auth: Mutex::new(RedditAuth {
                 access_token: String::new(),
                 expires_at: Instant::now(),
@@ -194,10 +195,14 @@ impl RedditChannel {
             return None;
         }
 
-        // If a subreddit filter is set, skip items from other subreddits
-        if let Some(ref sub) = self.subreddit
+        // If a subreddit allowlist is set, skip items from other subreddits.
+        // Items without a subreddit (e.g. DMs) are always accepted.
+        if !self.subreddits.is_empty()
             && let Some(ref item_sub) = item.subreddit
-            && !item_sub.eq_ignore_ascii_case(sub)
+            && !self
+                .subreddits
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(item_sub))
         {
             return None;
         }
@@ -301,13 +306,22 @@ impl Channel for RedditChannel {
         // Initial auth
         self.refresh_access_token().await?;
 
+        let scope = if self.subreddits.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "in {}",
+                self.subreddits
+                    .iter()
+                    .map(|s| format!("r/{s}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         tracing::info!(
             "Reddit channel listening as u/{} {}...",
             self.username,
-            self.subreddit
-                .as_ref()
-                .map(|s| format!("in r/{s}"))
-                .unwrap_or_default()
+            scope
         );
 
         loop {
@@ -354,7 +368,7 @@ mod tests {
             "client_secret".into(),
             "refresh_token".into(),
             "testbot".into(),
-            None,
+            Vec::new(),
         )
     }
 
@@ -364,7 +378,7 @@ mod tests {
             "client_secret".into(),
             "refresh_token".into(),
             "testbot".into(),
-            Some(sub.into()),
+            vec![sub.into()],
         )
     }
 

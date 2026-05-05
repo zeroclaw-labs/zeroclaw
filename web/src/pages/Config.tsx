@@ -3,6 +3,11 @@
 // what's currently configured under it, click an item to edit, click +Add
 // to instantiate a new entry.
 //
+// URL structure:
+//   /config/:section             — section overview (configured items list)
+//   /config/:section/:type       — alias list for a provider/channel type
+//   /config/:section/:type/:alias — field form for a specific alias
+//
 // All section list / picker / field rendering comes from the shared
 // SectionPicker + FieldForm components. NO hardcoded section names, field
 // labels, dropdown options, or provider lists.
@@ -13,9 +18,9 @@ import { ArrowLeft, ChevronRight, Plus, Sparkles } from 'lucide-react';
 import {
   ApiError,
   getDrift,
+  getMapKeys,
   getSections,
   selectSectionItem,
-  type ConfigApiError,
   type DriftEntry,
   type PickerItem,
   type SectionInfo,
@@ -44,14 +49,6 @@ const SYNTHETIC_SECTIONS: SectionInfo[] = [
   },
 ];
 
-type Mode =
-  | { kind: 'section-overview' }
-  // 'picker' shows the catalog so the user can pick a new item to add or
-  // an existing one to edit. We reuse the same picker for both: items
-  // already-configured carry the badge so the user knows what's there.
-  | { kind: 'picker' }
-  | { kind: 'form'; item: PickerItem; fieldsPrefix: string };
-
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
 // from the gateway lands in one of these buckets (anything else falls
 // into "Other"). Schema-attribute-driven grouping replaces this in v3 /
@@ -74,26 +71,41 @@ const GROUP_ORDER = [
   'Other',
 ] as const;
 
+// Within the Foundation group we want a dependency-driven order rather
+// than alphabetical: agents reference everything above them, so they
+// land last. Mirrors the wizard order in
+// `crates/zeroclaw-runtime/src/onboard/mod.rs::run_all` and
+// `web/src/pages/onboard/Onboard.tsx`'s ONBOARD_SECTION_ORDER. Sections
+// not in this list fall back to alphabetical sort.
+const FOUNDATION_ORDER: Record<string, number> = {
+  workspace: 0,
+  providers: 1,
+  channels: 2,
+  memory: 3,
+  hardware: 4,
+  tunnel: 5,
+  personality: 6,
+  agents: 7,
+};
+
 export default function Config() {
-  // `/config/:section` preserves the active section in the URL so a page
-  // refresh lands the user back on whichever section they were editing.
-  // `/setup/:section` is the legacy locked single-section view (no inner
-  // sidebar) used by the promoted top-level routes. Both feed `:section`
-  // into the same `useParams`; we distinguish via the path prefix.
-  const { section: sectionParam } = useParams<{ section?: string }>();
+  // URL params drive the view. No internal mode state for picker/form —
+  // the address bar is the source of truth.
+  //   :section              → section overview
+  //   :section/:type        → alias list (providers/channels) or picker (others)
+  //   :section/:type/:alias → field form
+  const {
+    section: sectionParam,
+    type: typeParam,
+    alias: aliasParam,
+  } = useParams<{ section?: string; type?: string; alias?: string }>();
   const location = useLocation();
   const navigate = useNavigate();
   const lockedSection = location.pathname.startsWith('/setup/') ? sectionParam : undefined;
   const [sections, setSections] = useState<SectionInfo[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
-  const [mode, setMode] = useState<Mode>({ kind: 'section-overview' });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  // Single page-level drift state. Refreshed on every section change,
-  // after a daemon reload (ReloadDaemonButton.onReloaded), and after
-  // any successful save in a rendered FieldForm (onSaved). One source,
-  // four refresh points. FieldForm is drift-agnostic — no in-form
-  // banner or per-field indicator.
   const [drifted, setDrifted] = useState<DriftEntry[]>([]);
   const fetchDrift = () => {
     void getDrift()
@@ -102,13 +114,7 @@ export default function Config() {
   };
   useEffect(fetchDrift, [activeKey]);
 
-  // Bumped after a successful daemon reload — used as `key` on
-  // <FieldForm> so React fully remounts and the new instance refetches
-  // values from the freshly-loaded gateway. Without this, an unchanged
-  // prefix prop leaves FieldForm's `useEffect([prefix])` dormant and
-  // the form keeps displaying values from before the reload.
   const [reloadKey, setReloadKey] = useState(0);
-
 
   useEffect(() => {
     let cancelled = false;
@@ -123,15 +129,10 @@ export default function Config() {
           ),
         ];
         setSections(merged);
-        // URL-supplied section (either locked /setup/<x> or
-        // navigable /config/<x>) wins when it exists in the schema.
-        // Falls back to the first available section.
-        const initialKey = sectionParam
-          && merged.find((s) => s.key === sectionParam)
+        const initialKey = sectionParam && merged.find((s) => s.key === sectionParam)
           ? sectionParam
           : merged[0]?.key ?? null;
         setActiveKey(initialKey);
-        setMode({ kind: 'section-overview' });
       })
       .catch((e) => {
         if (cancelled) return;
@@ -142,24 +143,14 @@ export default function Config() {
         }
       })
       .finally(() => !cancelled && setLoading(false));
-    return () => {
-      cancelled = true;
-    };
-    // Mount-only fetch. URL changes are reconciled in the next effect
-    // without re-flipping `loading`, which would otherwise collapse
-    // the whole page to a spinner and remount the inner sidebar at
-    // scrollTop=0 on every section click.
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Reconcile activeKey with the URL `:section` param without
-  // re-fetching sections. Fires on initial param presence and any
-  // subsequent navigation between `/config/<a>` and `/config/<b>`.
   useEffect(() => {
     if (!sectionParam || sections.length === 0) return;
     if (sections.some((s) => s.key === sectionParam) && sectionParam !== activeKey) {
       setActiveKey(sectionParam);
-      setMode({ kind: 'section-overview' });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sectionParam, sections]);
@@ -171,25 +162,29 @@ export default function Config() {
 
   const goToSection = (key: string) => {
     setActiveKey(key);
-    setMode({ kind: 'section-overview' });
-    // Mirror the active section into the URL so a refresh restores
-    // the user's place. Skip when locked (the /setup/<key> route owns
-    // its URL and the inner sidebar is hidden anyway).
     if (!lockedSection) {
-      navigate(`/config/${encodeURIComponent(key)}`, { replace: true });
+      navigate(`/config/${encodeURIComponent(key)}`);
     }
   };
 
-  const handlePick = async (item: PickerItem) => {
-    if (!activeSection) return;
+  // Navigate to alias list for a provider/channel type.
+  const goToType = (sectionKey: string, typeKey: string) => {
+    navigate(`/config/${encodeURIComponent(sectionKey)}/${encodeURIComponent(typeKey)}`);
+  };
+
+  // Navigate to the form for a specific alias. Calls selectSectionItem
+  // to instantiate the entry if needed, then navigates to the alias URL.
+  const goToAlias = async (sectionKey: string, typeKey: string, alias: string) => {
     try {
-      const resp = await selectSectionItem(activeSection.key, item.key);
-      setMode({ kind: 'form', item, fieldsPrefix: resp.fields_prefix });
+      await selectSectionItem(sectionKey, typeKey, alias);
+      navigate(
+        `/config/${encodeURIComponent(sectionKey)}/${encodeURIComponent(typeKey)}/${encodeURIComponent(alias)}`,
+      );
     } catch (e) {
       if (e instanceof ApiError) {
-        setError(`Couldn't open ${item.label}: [${e.envelope.code}] ${e.envelope.message}`);
+        setError(`[${e.envelope.code}] ${e.envelope.message}`);
       } else {
-        setError(`Couldn't open ${item.label}: ${e instanceof Error ? e.message : String(e)}`);
+        setError(e instanceof Error ? e.message : String(e));
       }
     }
   };
@@ -222,111 +217,292 @@ export default function Config() {
     );
   }
 
+  // Determine what to render in the main pane based on URL params.
+  // Two-tier alias sections route /config/<section>/<type>/<alias>.
+  const needsAliasTier =
+    activeSection?.has_picker &&
+    (activeSection.key === 'providers' || activeSection.key === 'channels');
+  // One-tier alias sections route /config/<section>/<alias> directly.
+  // The list lives at the top of the section (no type selection step).
+  const isOneTierAliasSection = activeSection?.key === 'agents';
+
+  const mainContent = (() => {
+    if (!activeSection) return null;
+
+    if (activeSection.key === 'personality') {
+      return (
+        <Suspense
+          fallback={
+            <div
+              className="flex items-center justify-center rounded-xl border p-12"
+              style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}
+            >
+              <div
+                className="h-6 w-6 border-2 rounded-full animate-spin"
+                style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
+              />
+            </div>
+          }
+        >
+          <PersonalityEditor />
+        </Suspense>
+      );
+    }
+
+    if (!activeSection.has_picker) {
+      return (
+        <FieldForm
+          key={reloadKey}
+          prefix={activeSection.key}
+          title={activeSection.label}
+          onSaved={fetchDrift}
+          drift={drifted}
+        />
+      );
+    }
+
+    // /config/:section/:type/:alias — field form
+    if (typeParam && aliasParam) {
+      const fieldsPrefix = needsAliasTier
+        ? activeSection.key === 'providers'
+          ? `providers.models.${typeParam}.${aliasParam}`
+          : `channels.${typeParam}.${aliasParam}`
+        : typeParam;
+      return (
+        <div className="flex flex-col gap-3">
+          <button
+            type="button"
+            onClick={() => navigate(-1)}
+            className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            Back
+          </button>
+          <FieldForm
+            key={`${reloadKey}-${fieldsPrefix}`}
+            prefix={fieldsPrefix}
+            title={`${typeParam} / ${aliasParam}`}
+            onSaved={fetchDrift}
+            drift={drifted}
+          />
+        </div>
+      );
+    }
+
+    // /config/:section/:alias — one-tier alias section field form
+    // (agents). The URL's :type slot carries the alias directly.
+    if (typeParam && isOneTierAliasSection) {
+      const fieldsPrefix = `${activeSection.key}.${typeParam}`;
+      return (
+        <div className="flex flex-col gap-3">
+          <button
+            type="button"
+            onClick={() => navigate(`/config/${encodeURIComponent(activeSection.key)}`)}
+            className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            Back to {activeSection.label}
+          </button>
+          <FieldForm
+            key={`${reloadKey}-${fieldsPrefix}`}
+            prefix={fieldsPrefix}
+            title={typeParam}
+            onSaved={fetchDrift}
+            drift={drifted}
+          />
+        </div>
+      );
+    }
+
+    // /config/:section/:type — alias list (providers/channels) or direct form
+    if (typeParam && needsAliasTier) {
+      return (
+        <AliasListView
+          sectionKey={activeSection.key}
+          typeKey={typeParam}
+          onSelectAlias={async (alias) => {
+            await selectSectionItem(activeSection.key, typeParam, alias);
+            navigate(
+              `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(typeParam)}/${encodeURIComponent(alias)}`,
+            );
+          }}
+          onBack={() => navigate(`/config/${encodeURIComponent(activeSection.key)}`)}
+        />
+      );
+    }
+
+    // /config/:section — section overview (configured items) + picker
+    if (typeParam) {
+      // Non-alias-tiered section with a type in the URL: treat as form
+      return (
+        <div className="flex flex-col gap-3">
+          <button
+            type="button"
+            onClick={() => navigate(`/config/${encodeURIComponent(activeSection.key)}`)}
+            className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            Back to {activeSection.label}
+          </button>
+          <FieldForm
+            key={`${reloadKey}-${typeParam}`}
+            prefix={typeParam}
+            title={typeParam}
+            onSaved={fetchDrift}
+            drift={drifted}
+          />
+        </div>
+      );
+    }
+
+    // /config/agents (or any one-tier alias section) — direct alias list with
+    // inline + Add affordance. Mirrors the two-tier AliasListView pattern but
+    // skips the type-selection step since the section IS the type.
+    if (isOneTierAliasSection) {
+      return (
+        <AliasListView
+          sectionKey={activeSection.key}
+          onSelectAlias={async (alias) => {
+            await selectSectionItem(activeSection.key, alias);
+            navigate(
+              `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(alias)}`,
+            );
+          }}
+          onBack={() => navigate('/config')}
+        />
+      );
+    }
+
+    // /config/:section — overview + picker
+    return (
+      <SectionOverview
+        section={activeSection}
+        onPickType={(typeKey) => {
+          if (needsAliasTier) {
+            goToType(activeSection.key, typeKey);
+          } else {
+            void (async () => {
+              try {
+                const resp = await selectSectionItem(activeSection.key, typeKey);
+                navigate(
+                  `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(typeKey)}`,
+                  { state: { fieldsPrefix: resp.fields_prefix } },
+                );
+              } catch (e) {
+                setError(e instanceof Error ? e.message : String(e));
+              }
+            })();
+          }
+        }}
+        onPickAlias={(typeKey, alias) => void goToAlias(activeSection.key, typeKey, alias)}
+        sectionUrl={`/config/${encodeURIComponent(activeSection.key)}`}
+        reloadKey={reloadKey}
+        fetchDrift={fetchDrift}
+        drifted={drifted}
+      />
+    );
+  })();
+
+  // Breadcrumb segments
+  const crumbs: Array<{ label: string; url?: string }> = [
+    { label: 'Config', url: '/config' },
+    {
+      label: activeSection?.label ?? '',
+      url: activeSection
+        ? `/config/${encodeURIComponent(activeSection.key)}`
+        : undefined,
+    },
+  ];
+  if (typeParam) crumbs.push({ label: typeParam, url: typeParam && aliasParam ? `/config/${encodeURIComponent(sectionParam ?? '')}/${encodeURIComponent(typeParam)}` : undefined });
+  if (aliasParam) crumbs.push({ label: aliasParam });
+
   return (
     <div className="flex h-full overflow-hidden">
-      {/* Sidebar — hidden for the locked single-section view (the
-          top-level /setup/<section> routes). The main app sidebar
-          handles section selection in that case. */}
       {!lockedSection && (
-      <aside
-        className="w-56 flex-shrink-0 border-r overflow-y-auto"
-        style={{
-          borderColor: 'var(--pc-border)',
-          background: 'var(--pc-bg-surface)',
-        }}
-      >
-        <nav className="flex flex-col">
-          {GROUP_ORDER.map((groupName) => {
-            // Sections whose `group` isn't in GROUP_ORDER bucket into
-            // "Other" so a backend rename never silently drops them
-            // (e.g. "Onboarding" → "Foundation" before the daemon is
-            // restarted on the new binary).
-            const known = new Set(GROUP_ORDER);
-            const items = sections
-              .filter((s) =>
-                groupName === 'Other'
-                  ? s.group === 'Other' || !known.has(s.group as typeof GROUP_ORDER[number])
-                  : s.group === groupName,
-              )
-              .sort((a, b) => a.label.localeCompare(b.label));
-            if (items.length === 0) return null;
-            return (
-              <div key={groupName}>
-                <div
-                  className="px-4 pt-4 pb-1.5 text-xs font-semibold uppercase tracking-wider"
-                  style={{ color: 'var(--pc-text-secondary)' }}
-                >
-                  {groupName}
-                </div>
-                {items.map((s) => (
-                  <button
-                    key={s.key}
-                    type="button"
-                    onClick={() => goToSection(s.key)}
-                    className="flex items-center justify-between gap-2 px-4 py-2 text-sm text-left transition-colors"
-                    style={{
-                      background:
-                        s.key === activeKey ? 'var(--pc-accent-glow)' : 'transparent',
-                      color:
-                        s.key === activeKey
-                          ? 'var(--pc-accent)'
-                          : 'var(--pc-text-primary)',
-                      fontWeight: s.key === activeKey ? 600 : 400,
-                      borderLeft:
-                        s.key === activeKey
+        <aside
+          className="w-56 flex-shrink-0 border-r overflow-y-auto"
+          style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}
+        >
+          <nav className="flex flex-col">
+            {GROUP_ORDER.map((groupName) => {
+              const known = new Set(GROUP_ORDER);
+              const items = sections
+                .filter((s) =>
+                  groupName === 'Other'
+                    ? s.group === 'Other' || !known.has(s.group as typeof GROUP_ORDER[number])
+                    : s.group === groupName,
+                )
+                .sort((a, b) => {
+                  if (groupName === 'Foundation') {
+                    const ai = FOUNDATION_ORDER[a.key] ?? Number.MAX_SAFE_INTEGER;
+                    const bi = FOUNDATION_ORDER[b.key] ?? Number.MAX_SAFE_INTEGER;
+                    if (ai !== bi) return ai - bi;
+                  }
+                  return a.label.localeCompare(b.label);
+                });
+              if (items.length === 0) return null;
+              return (
+                <div key={groupName}>
+                  <div
+                    className="px-4 pt-4 pb-1.5 text-xs font-semibold uppercase tracking-wider"
+                    style={{ color: 'var(--pc-text-secondary)' }}
+                  >
+                    {groupName}
+                  </div>
+                  {items.map((s) => (
+                    <button
+                      key={s.key}
+                      type="button"
+                      onClick={() => goToSection(s.key)}
+                      className="flex items-center justify-between gap-2 px-4 py-2 text-sm text-left transition-colors"
+                      style={{
+                        background: s.key === activeKey ? 'var(--pc-accent-glow)' : 'transparent',
+                        color: s.key === activeKey ? 'var(--pc-accent)' : 'var(--pc-text-primary)',
+                        fontWeight: s.key === activeKey ? 600 : 400,
+                        borderLeft: s.key === activeKey
                           ? '2px solid var(--pc-accent)'
                           : '2px solid transparent',
-                    }}
-                  >
-                    <span>{s.label}</span>
-                    {s.key === activeKey && <ChevronRight className="h-3.5 w-3.5" />}
-                  </button>
-                ))}
-              </div>
-            );
-          })}
-        </nav>
-      </aside>
+                      }}
+                    >
+                      <span>{s.label}</span>
+                      {s.key === activeKey && <ChevronRight className="h-3.5 w-3.5" />}
+                    </button>
+                  ))}
+                </div>
+              );
+            })}
+          </nav>
+        </aside>
       )}
 
-      {/* Main pane */}
       <main className="flex-1 overflow-y-auto p-6">
         {activeSection && (
           <div className="flex flex-col gap-4 max-w-3xl">
-            {/* Breadcrumb + Reload daemon button on the right */}
+            {/* Breadcrumb */}
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div
                 className="text-sm flex items-center gap-1.5 flex-wrap"
                 style={{ color: 'var(--pc-text-muted)' }}
               >
-                <span style={{ color: 'var(--pc-text-secondary)' }}>Config</span>
-                <ChevronRight className="h-3 w-3" />
-                <span
-                  style={{
-                    color: mode.kind === 'section-overview'
-                      ? 'var(--pc-accent)'
-                      : 'var(--pc-text-secondary)',
-                    cursor: mode.kind !== 'section-overview' ? 'pointer' : 'default',
-                    fontWeight: mode.kind === 'section-overview' ? 600 : 400,
-                  }}
-                  onClick={() => setMode({ kind: 'section-overview' })}
-                >
-                  {activeSection.label}
-                </span>
-                {mode.kind === 'form' && (
-                  <>
-                    <ChevronRight className="h-3 w-3" />
-                    <span style={{ color: 'var(--pc-accent)', fontWeight: 600 }}>
-                      {mode.item.label}
-                    </span>
-                  </>
-                )}
+                {crumbs.map((crumb, i) => (
+                  <span key={i} className="flex items-center gap-1.5">
+                    {i > 0 && <ChevronRight className="h-3 w-3" />}
+                    {crumb.url && i < crumbs.length - 1 ? (
+                      <span
+                        style={{ color: 'var(--pc-text-secondary)', cursor: 'pointer' }}
+                        onClick={() => navigate(crumb.url!)}
+                      >
+                        {crumb.label}
+                      </span>
+                    ) : (
+                      <span style={{ color: 'var(--pc-accent)', fontWeight: 600 }}>
+                        {crumb.label}
+                      </span>
+                    )}
+                  </span>
+                ))}
               </div>
               <div className="flex items-center gap-2">
-                {/* Setup wizard isn't in the global navbar (it's a one-shot
-                    first-run flow), so contributors / re-installers reach it
-                    from here. Mirrors the in-progress signal Audacity88 and
-                    iLTeoooD raised on PR #6179. */}
                 <Link
                   to="/onboard"
                   className="btn-secondary inline-flex items-center gap-1.5 text-xs px-3 py-1.5"
@@ -356,83 +532,7 @@ export default function Config() {
               />
             )}
 
-            {/* Section overview / picker / form */}
-            {activeSection.key === 'personality' ? (
-              <Suspense
-                fallback={
-                  <div
-                    className="flex items-center justify-center rounded-xl border p-12"
-                    style={{
-                      borderColor: 'var(--pc-border)',
-                      background: 'var(--pc-bg-surface)',
-                    }}
-                  >
-                    <div
-                      className="h-6 w-6 border-2 rounded-full animate-spin"
-                      style={{
-                        borderColor: 'var(--pc-border)',
-                        borderTopColor: 'var(--pc-accent)',
-                      }}
-                    />
-                  </div>
-                }
-              >
-                <PersonalityEditor />
-              </Suspense>
-            ) : !activeSection.has_picker ? (
-              // Direct-form sections (Workspace, Hardware): no picker, just
-              // show the form rooted at the section's path prefix.
-              <FieldForm
-                key={reloadKey}
-                prefix={activeSection.key}
-                title={activeSection.label}
-                onSaved={fetchDrift}
-                drift={drifted}
-              />
-            ) : mode.kind === 'section-overview' ? (
-              <SectionOverview
-                section={activeSection}
-                onAdd={() => setMode({ kind: 'picker' })}
-                onEdit={(item, prefix) =>
-                  setMode({ kind: 'form', item, fieldsPrefix: prefix })
-                }
-              />
-            ) : mode.kind === 'picker' ? (
-              <div className="flex flex-col gap-3">
-                <button
-                  type="button"
-                  onClick={() => setMode({ kind: 'section-overview' })}
-                  className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
-                >
-                  <ArrowLeft className="h-4 w-4" />
-                  Back to {activeSection.label}
-                </button>
-                <SectionPicker
-                  sectionKey={activeSection.key}
-                  help={activeSection.help}
-                  onPick={(item) => void handlePick(item)}
-                  onSkip={() => setMode({ kind: 'section-overview' })}
-                />
-              </div>
-            ) : (
-              <div className="flex flex-col gap-3">
-                <button
-                  type="button"
-                  onClick={() => setMode({ kind: 'section-overview' })}
-                  className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
-                >
-                  <ArrowLeft className="h-4 w-4" />
-                  Back to {activeSection.label}
-                </button>
-                <FieldForm
-                  key={reloadKey}
-                  prefix={mode.fieldsPrefix}
-                  title={mode.item.label}
-                  onSaved={fetchDrift}
-                  drift={drifted}
-                />
-              </div>
-            )}
+            {mainContent}
           </div>
         )}
       </main>
@@ -440,10 +540,152 @@ export default function Config() {
   );
 }
 
-// Single page-level drift banner. Embeds `<ReloadDaemonButton>`
-// directly so the inline reload action is the same component the
-// top-right toolbar uses — same modal, same /health poll, same
-// onReloaded callback, no parallel reload code.
+// Alias list page: /config/:section/:type
+// Shows existing aliases as clickable rows + an inline "new alias" input.
+function AliasListView({
+  sectionKey,
+  typeKey,
+  onSelectAlias,
+  onBack,
+}: {
+  sectionKey: string;
+  /** Channel/provider type for two-tier sections; omitted for one-tier
+   *  alias sections like agents that have no `<type>` segment. */
+  typeKey?: string;
+  onSelectAlias: (alias: string) => Promise<void>;
+  onBack: () => void;
+}) {
+  const [aliases, setAliases] = useState<string[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [newAlias, setNewAlias] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [aliasError, setAliasError] = useState<string | null>(null);
+
+  // Two-tier sections (providers, channels) put the type in the path;
+  // one-tier sections (agents, risk_profiles, etc.) just use the section
+  // key as-is. The map-keys endpoint then returns the alias names directly.
+  const mapPath = typeKey
+    ? sectionKey === 'providers'
+      ? `providers.models.${typeKey}`
+      : `${sectionKey}.${typeKey}`
+    : sectionKey;
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    getMapKeys(mapPath)
+      .then((r) => { if (!cancelled) setAliases(r.keys); })
+      .catch((e) => {
+        if (!cancelled) {
+          setAliases([]);
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [mapPath]);
+
+  const submit = async () => {
+    const trimmed = newAlias.trim() || (aliases.length === 0 ? 'default' : `${aliases[0]}-2`);
+    setAliasError(null);
+    try {
+      await onSelectAlias(trimmed);
+    } catch (e) {
+      setAliasError(
+        e instanceof ApiError ? e.envelope.message : (e instanceof Error ? e.message : String(e)),
+      );
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-4">
+      <button
+        type="button"
+        onClick={onBack}
+        className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+      >
+        <ArrowLeft className="h-4 w-4" />
+        Back
+      </button>
+
+      {error && (
+        <div
+          className="rounded-xl border p-3 text-sm"
+          style={{ background: 'rgba(239,68,68,0.08)', borderColor: 'rgba(239,68,68,0.2)', color: '#f87171' }}
+        >
+          {error}
+        </div>
+      )}
+
+      {loading ? (
+        <div className="flex items-center justify-center py-12">
+          <div
+            className="h-8 w-8 border-2 rounded-full animate-spin"
+            style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
+          />
+        </div>
+      ) : (
+        <div
+          className="surface-panel divide-y"
+          style={{ borderColor: 'var(--pc-border)' }}
+        >
+          {aliases.map((alias) => (
+            <button
+              key={alias}
+              type="button"
+              onClick={() => {
+                onSelectAlias(alias).catch((e) => {
+                  setError(
+                    e instanceof ApiError
+                      ? `[${e.envelope.code}] ${e.envelope.message}`
+                      : (e instanceof Error ? e.message : String(e)),
+                  );
+                });
+              }}
+              className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left text-sm transition-colors hover:opacity-90"
+            >
+              <div>
+                <span style={{ color: 'var(--pc-text-primary)', fontWeight: 500 }}>{alias}</span>
+                <code
+                  className="block text-xs mt-0.5"
+                  style={{ color: 'var(--pc-text-faint)' }}
+                >
+                  {mapPath}.{alias}
+                </code>
+              </div>
+              <ChevronRight className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-text-muted)' }} />
+            </button>
+          ))}
+
+          {/* Inline new alias row */}
+          <div className="flex flex-col gap-1 px-4 py-3">
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                className="input-electric flex-1 px-3 py-1.5 text-sm"
+                placeholder={aliases.length === 0 ? 'default' : `${aliases[0]}-2`}
+                value={newAlias}
+                onChange={(e) => { setNewAlias(e.target.value); setAliasError(null); }}
+                onKeyDown={(e) => { if (e.key === 'Enter') void submit(); }}
+              />
+              <button
+                type="button"
+                onClick={() => void submit()}
+                className="btn-electric text-sm px-3 py-1.5 flex-shrink-0"
+              >
+                Add
+              </button>
+            </div>
+            {aliasError && (
+              <p className="text-xs" style={{ color: 'var(--color-status-error)' }}>{aliasError}</p>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PageDriftBanner({
   drifted,
   onReloaded,
@@ -493,51 +735,76 @@ function PageDriftBanner({
 
 interface SectionOverviewProps {
   section: SectionInfo;
-  onAdd: () => void;
-  onEdit: (item: PickerItem, fieldsPrefix: string) => void;
+  onPickType: (typeKey: string) => void;
+  onPickAlias: (typeKey: string, alias: string) => void;
+  sectionUrl: string;
+  reloadKey: number;
+  fetchDrift: () => void;
+  drifted: DriftEntry[];
 }
 
-function SectionOverview({ section, onAdd, onEdit }: SectionOverviewProps) {
-  // The overview is just the section picker filtered to configured items.
-  // Reuse SectionPicker by treating its "Done" button as "+ Add new". For
-  // simplicity, embed the picker directly with the picker semantics tuned
-  // for editing — clicking a row opens the form for it.
+function SectionOverview({
+  section,
+  onPickType,
+  onPickAlias,
+  sectionUrl,
+}: SectionOverviewProps) {
+  const [showPicker, setShowPicker] = useState(false);
+
+  if (showPicker) {
+    return (
+      <div className="flex flex-col gap-3">
+        <button
+          type="button"
+          onClick={() => setShowPicker(false)}
+          className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          Back to {section.label}
+        </button>
+        <SectionPicker
+          sectionKey={section.key}
+          help={section.help}
+          onPick={(item) => { setShowPicker(false); onPickType(item.key); }}
+          onSkip={() => setShowPicker(false)}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
-        <p
-          className="text-sm"
-          style={{ color: 'var(--pc-text-secondary)' }}
-        >
+        <p className="text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
           {section.help}
         </p>
         <button
           type="button"
-          onClick={onAdd}
+          onClick={() => setShowPicker(true)}
           className="btn-electric flex items-center gap-2 text-sm px-3 py-2 flex-shrink-0"
         >
           <Plus className="h-4 w-4" />
           Add
         </button>
       </div>
-      {/* The picker handles fetching, filtering, click. Treat onPick as
-          "edit this item" — selectSectionItem returns the existing fields
-          prefix idempotently when the entry already exists. */}
-      <ConfiguredOnlyPicker section={section} onEdit={onEdit} />
+      <ConfiguredOnlyPicker
+        section={section}
+        onPickType={onPickType}
+        onPickAlias={onPickAlias}
+        sectionUrl={sectionUrl}
+      />
     </div>
   );
 }
 
 interface ConfiguredOnlyPickerProps {
   section: SectionInfo;
-  onEdit: (item: PickerItem, fieldsPrefix: string) => void;
+  onPickType: (typeKey: string) => void;
+  onPickAlias: (typeKey: string, alias: string) => void;
+  sectionUrl: string;
 }
 
-/**
- * Strips the picker down to items that are already configured (badge =
- * "configured" or "active"). Empty state guides the user to + Add.
- */
-function ConfiguredOnlyPicker({ section, onEdit }: ConfiguredOnlyPickerProps) {
+function ConfiguredOnlyPicker({ section, onPickType }: ConfiguredOnlyPickerProps) {
   const [items, setItems] = useState<PickerItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -566,9 +833,7 @@ function ConfiguredOnlyPicker({ section, onEdit }: ConfiguredOnlyPickerProps) {
         })
         .finally(() => !cancelled && setLoading(false)),
     );
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [section.key]);
 
   if (loading) {
@@ -618,22 +883,7 @@ function ConfiguredOnlyPicker({ section, onEdit }: ConfiguredOnlyPickerProps) {
         <button
           key={item.key}
           type="button"
-          onClick={async () => {
-            try {
-              const resp = await (
-                await import('../lib/api')
-              ).selectSectionItem(section.key, item.key);
-              onEdit(item, resp.fields_prefix);
-            } catch (e) {
-              const msg =
-                e instanceof ApiError
-                  ? `[${(e.envelope as ConfigApiError).code}] ${e.envelope.message}`
-                  : e instanceof Error
-                  ? e.message
-                  : String(e);
-              alert(`Couldn't open ${item.label}: ${msg}`);
-            }
-          }}
+          onClick={() => onPickType(item.key)}
           className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:opacity-90"
         >
           <div className="flex-1 min-w-0">

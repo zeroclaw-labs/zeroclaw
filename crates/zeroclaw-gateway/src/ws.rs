@@ -67,6 +67,10 @@ pub struct WsQuery {
     pub session_id: Option<String>,
     /// Optional human-readable name for the session.
     pub name: Option<String>,
+    /// Configured agent alias to run as. Required: V3 has no default
+    /// agent — every WebSocket session is bound to an explicit agent.
+    #[serde(default, alias = "agentAlias", alias = "agent")]
+    pub agent_alias: Option<String>,
     /// Project root / working directory for this session.
     #[serde(default)]
     pub cwd: Option<String>,
@@ -149,11 +153,42 @@ pub async fn handle_ws_chat(
         ws
     };
 
+    // Reject the upgrade up-front when the client didn't pick an agent.
+    // V3 has no default — every WS session is bound to an explicit agent.
+    let Some(agent_alias) = params.agent_alias.filter(|s| !s.trim().is_empty()) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "Missing required `agent` query parameter — pass `?agent=<alias>` matching a configured [agents.<alias>] entry.",
+        )
+            .into_response();
+    };
+    {
+        let cfg = state.config.lock();
+        if cfg.agent(&agent_alias).is_none() {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured."
+                ),
+            )
+                .into_response();
+        }
+    }
+
     let session_id = params.session_id;
     let session_name = params.name;
     let session_cwd = params.cwd.or(params.workspace_dir);
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, session_name, session_cwd))
-        .into_response()
+    ws.on_upgrade(move |socket| {
+        handle_socket(
+            socket,
+            state,
+            agent_alias,
+            session_id,
+            session_name,
+            session_cwd,
+        )
+    })
+    .into_response()
 }
 
 /// Gateway session key prefix to avoid collisions with channel sessions.
@@ -162,6 +197,7 @@ const GW_SESSION_PREFIX: &str = "gw_";
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
+    agent_alias: String,
     session_id: Option<String>,
     session_name: Option<String>,
     session_cwd: Option<String>,
@@ -280,9 +316,11 @@ async fn handle_socket(
 
     // Build a persistent Agent for this connection so history is maintained
     // across turns. The session cwd becomes the security sandbox root; config
-    // workspace remains the daemon data directory.
+    // workspace remains the daemon data directory. The agent_alias was
+    // validated up-front in handle_ws_chat against the configured agents.
     let mut agent = match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd(
         &config,
+        &agent_alias,
         Some(&session_cwd),
     )
     .await
@@ -480,9 +518,9 @@ async fn process_chat_message(
         .config
         .lock()
         .providers
-        .fallback
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
+        .first_provider_type()
+        .unwrap_or("unknown")
+        .to_string();
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({

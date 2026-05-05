@@ -6,7 +6,7 @@ use std::fs;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::{ClassificationRule, Config, DelegateAgentConfig, ModelRouteConfig};
+use zeroclaw_config::schema::{ClassificationRule, Config, ModelRouteConfig};
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
@@ -29,14 +29,13 @@ impl ModelRoutingConfigTool {
             )
         })?;
 
-        let compat: zeroclaw_config::migration::V1Compat =
-            toml::from_str(&contents).map_err(|error| {
+        let mut parsed =
+            zeroclaw_config::migration::migrate_to_current(&contents).map_err(|error| {
                 anyhow::anyhow!(
                     "Failed to parse config file {}: {error}",
                     self.config.config_path.display()
                 )
             })?;
-        let mut parsed = compat.into_config();
         parsed.config_path = self.config.config_path.clone();
         parsed.workspace_dir = self.config.workspace_dir.clone();
         Ok(parsed)
@@ -260,30 +259,28 @@ impl ModelRoutingConfigTool {
 
         let mut agents: BTreeMap<String, Value> = BTreeMap::new();
         for (name, agent) in &cfg.agents {
+            let risk = cfg.risk_profiles.get(&agent.risk_profile);
+            let runtime = cfg.runtime_profiles.get(&agent.runtime_profile);
             agents.insert(
                 name.clone(),
                 json!({
-                    "provider": agent.provider,
-                    "model": agent.model,
+                    "model_provider": agent.model_provider,
+                    "risk_profile": agent.risk_profile,
+                    "runtime_profile": agent.runtime_profile,
                     "system_prompt": agent.system_prompt,
-                    "api_key_configured": agent
-                        .api_key
-                        .as_ref()
-                        .is_some_and(|value| !value.trim().is_empty()),
-                    "temperature": agent.temperature,
-                    "max_depth": agent.max_depth,
-                    "agentic": agent.agentic,
-                    "allowed_tools": agent.allowed_tools,
-                    "max_iterations": agent.max_iterations,
+                    "max_delegation_depth": risk.map(|r| r.max_delegation_depth),
+                    "agentic": runtime.map(|r| r.agentic),
+                    "allowed_tools": runtime.map(|r| &r.allowed_tools),
+                    "max_tool_iterations": runtime.map(|r| r.max_tool_iterations),
                 }),
             );
         }
 
         json!({
             "default": {
-                "provider": cfg.providers.fallback,
-                "model": cfg.providers.fallback_provider().and_then(|e| e.model.as_deref()),
-                "temperature": cfg.providers.fallback_provider().and_then(|e| e.temperature).unwrap_or(0.7),
+                "provider": cfg.providers.first_provider_type(),
+                "model": cfg.providers.first_provider().and_then(|e| e.model.as_deref()),
+                "temperature": cfg.providers.first_provider().and_then(|e| e.temperature).unwrap_or(0.7),
             },
             "query_classification": {
                 "enabled": cfg.query_classification.enabled,
@@ -395,32 +392,32 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        // Capture previous values for rollback on probe failure.
-        let previous_provider = cfg.providers.fallback.clone();
-        let previous_fallback_provider = cfg
-            .providers
-            .fallback
-            .as_deref()
-            .and_then(|name| cfg.providers.models.get(name))
-            .cloned();
+        // Capture previous first-provider entry for rollback on probe failure.
+        let previous_first_provider = cfg.providers.first_provider().cloned();
 
-        let fallback_name = match &provider_update {
-            MaybeSet::Set(provider) => {
-                cfg.providers.fallback = Some(provider.clone());
-                provider.clone()
+        // Determine which models entry to update.
+        let (type_k, alias_k) = match &provider_update {
+            MaybeSet::Set(provider) => provider
+                .split_once('.')
+                .map(|(t, a)| (t.to_string(), a.to_string()))
+                .unwrap_or_else(|| (provider.clone(), "default".to_string())),
+            MaybeSet::Null | MaybeSet::Unset => {
+                // Update whichever entry is already first, or create a placeholder.
+                cfg.providers
+                    .models
+                    .iter()
+                    .next()
+                    .and_then(|(t, aliases)| aliases.keys().next().map(|a| (t.clone(), a.clone())))
+                    .unwrap_or_else(|| ("default".to_string(), "default".to_string()))
             }
-            MaybeSet::Null => {
-                cfg.providers.fallback = None;
-                "default".to_string()
-            }
-            MaybeSet::Unset => cfg.providers.fallback.clone().unwrap_or_else(|| {
-                let name = "default".to_string();
-                cfg.providers.fallback = Some(name.clone());
-                name
-            }),
         };
-
-        let entry = cfg.providers.models.entry(fallback_name).or_default();
+        let entry = cfg
+            .providers
+            .models
+            .entry(type_k.clone())
+            .or_default()
+            .entry(alias_k.clone())
+            .or_default();
 
         match model_update {
             MaybeSet::Set(model) => entry.model = Some(model),
@@ -445,27 +442,25 @@ impl ModelRoutingConfigTool {
 
         // Probe the new model with a minimal API call to catch invalid model IDs
         // before the channel hot-reload picks up the change.
-        let current_provider = cfg.providers.fallback.clone();
-        let current_model = cfg
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.model.clone());
-        if let (Some(provider_name), Some(model_name)) = (current_provider, current_model)
+        let current_model = cfg.providers.first_provider().and_then(|e| e.model.clone());
+        let provider_name = format!("{type_k}.{alias_k}");
+        if let Some(model_name) = current_model
             && let Err(probe_err) = self.probe_model(&provider_name, &model_name).await
         {
             if zeroclaw_providers::reliable::is_non_retryable(&probe_err) {
-                let reverted_model = previous_fallback_provider
+                let reverted_model = previous_first_provider
                     .as_ref()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("(none)")
                     .to_string();
 
-                // Rollback to previous config.
-                cfg.providers.fallback = previous_provider;
-                if let Some(prev_entry) = previous_fallback_provider
-                    && let Some(fb) = cfg.providers.fallback.as_deref()
-                {
-                    cfg.providers.models.insert(fb.to_string(), prev_entry);
+                // Rollback: restore the previous entry for this type.alias slot.
+                if let Some(prev_entry) = previous_first_provider {
+                    cfg.providers
+                        .models
+                        .entry(type_k)
+                        .or_default()
+                        .insert(alias_k, prev_entry);
                 }
                 cfg.save().await?;
 
@@ -505,7 +500,7 @@ impl ModelRoutingConfigTool {
         let api_key = self
             .config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.api_key.as_deref());
         if api_key.is_none_or(|k| k.trim().is_empty()) {
             return Ok(());
@@ -516,7 +511,7 @@ impl ModelRoutingConfigTool {
             api_key,
             self.config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.base_url.as_deref()),
         ) {
             Ok(p) => p,
@@ -740,87 +735,80 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        let mut next_agent = cfg
-            .agents
-            .get(&name)
-            .cloned()
-            .unwrap_or(DelegateAgentConfig {
-                provider: provider.clone(),
-                model: model.clone(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: DEFAULT_AGENT_MAX_DEPTH,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-            });
+        // V3: synthesize providers.models[provider][name] from inline brain params.
+        let model_provider = format!("{provider}.{name}");
+        {
+            let provider_entry = cfg
+                .providers
+                .models
+                .entry(provider.clone())
+                .or_default()
+                .entry(name.clone())
+                .or_default();
+            provider_entry.model = Some(model.clone());
+            match api_key_update {
+                MaybeSet::Set(ref v) => provider_entry.api_key = Some(v.clone()),
+                MaybeSet::Null => provider_entry.api_key = None,
+                MaybeSet::Unset => {}
+            }
+            match temperature_update {
+                MaybeSet::Set(value) => {
+                    if !(0.0..=2.0).contains(&value) {
+                        anyhow::bail!("'temperature' must be between 0.0 and 2.0");
+                    }
+                    provider_entry.temperature = Some(value);
+                }
+                MaybeSet::Null => provider_entry.temperature = None,
+                MaybeSet::Unset => {}
+            }
+        }
 
-        next_agent.provider = provider;
-        next_agent.model = model;
+        // V3: synthesize risk_profiles[name] from max_depth.
+        {
+            let risk = cfg.risk_profiles.entry(name.clone()).or_default();
+            if let MaybeSet::Set(depth) = max_depth_update {
+                if depth == 0 {
+                    anyhow::bail!("'max_depth' must be greater than 0");
+                }
+                risk.max_delegation_depth = depth;
+            } else if risk.max_delegation_depth == 0 {
+                risk.max_delegation_depth = DEFAULT_AGENT_MAX_DEPTH;
+            }
+        }
 
+        // V3: synthesize runtime_profiles[name] from agentic/max_iterations/allowed_tools.
+        {
+            let runtime = cfg.runtime_profiles.entry(name.clone()).or_default();
+            if let Some(agentic) = agentic_update {
+                runtime.agentic = agentic;
+            }
+            if let MaybeSet::Set(iters) = max_iterations_update {
+                if iters == 0 {
+                    anyhow::bail!("'max_iterations' must be greater than 0");
+                }
+                runtime.max_tool_iterations = iters;
+            } else if runtime.max_tool_iterations == 0 {
+                runtime.max_tool_iterations = DEFAULT_AGENT_MAX_ITERATIONS;
+            }
+            if let Some(tools) = allowed_tools_update {
+                runtime.allowed_tools = tools;
+            }
+            if runtime.agentic && runtime.allowed_tools.is_empty() {
+                anyhow::bail!("Agent '{name}' has agentic=true but allowed_tools is empty.");
+            }
+        }
+
+        // Get or create the agent and wire up V3 alias references.
+        let next_agent = cfg.agents.entry(name.clone()).or_default();
+        next_agent.model_provider = model_provider;
+        next_agent.risk_profile = name.clone();
+        next_agent.runtime_profile = name.clone();
         match system_prompt_update {
             MaybeSet::Set(value) => next_agent.system_prompt = Some(value),
             MaybeSet::Null => next_agent.system_prompt = None,
             MaybeSet::Unset => {}
         }
 
-        match api_key_update {
-            MaybeSet::Set(value) => next_agent.api_key = Some(value),
-            MaybeSet::Null => next_agent.api_key = None,
-            MaybeSet::Unset => {}
-        }
-
-        match temperature_update {
-            MaybeSet::Set(value) => {
-                if !(0.0..=2.0).contains(&value) {
-                    anyhow::bail!("'temperature' must be between 0.0 and 2.0");
-                }
-                next_agent.temperature = Some(value);
-            }
-            MaybeSet::Null => next_agent.temperature = None,
-            MaybeSet::Unset => {}
-        }
-
-        match max_depth_update {
-            MaybeSet::Set(value) => next_agent.max_depth = value,
-            MaybeSet::Null => next_agent.max_depth = DEFAULT_AGENT_MAX_DEPTH,
-            MaybeSet::Unset => {}
-        }
-
-        match max_iterations_update {
-            MaybeSet::Set(value) => next_agent.max_iterations = value,
-            MaybeSet::Null => next_agent.max_iterations = DEFAULT_AGENT_MAX_ITERATIONS,
-            MaybeSet::Unset => {}
-        }
-
-        if let Some(agentic) = agentic_update {
-            next_agent.agentic = agentic;
-        }
-
-        if let Some(allowed_tools) = allowed_tools_update {
-            next_agent.allowed_tools = allowed_tools;
-        }
-
-        if next_agent.max_depth == 0 {
-            anyhow::bail!("'max_depth' must be greater than 0");
-        }
-
-        if next_agent.max_iterations == 0 {
-            anyhow::bail!("'max_iterations' must be greater than 0");
-        }
-
-        if next_agent.agentic && next_agent.allowed_tools.is_empty() {
-            anyhow::bail!(
-                "Agent '{name}' has agentic=true but allowed_tools is empty. Set allowed_tools or disable agentic mode."
-            );
-        }
-
-        cfg.agents.insert(name.clone(), next_agent);
         cfg.save().await?;
 
         Ok(ToolResult {
@@ -1166,8 +1154,13 @@ mod tests {
 
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         let output: Value = serde_json::from_str(&get_result.output).unwrap();
-        assert_eq!(output["agents"]["coder"]["provider"], json!("openai"));
-        assert_eq!(output["agents"]["coder"]["model"], json!("gpt-5.3-codex"));
+        // V3 surfaces the dotted alias ref on the agent. The actual model
+        // string lives under providers.models.openai.coder (synthesized
+        // from the `model` upsert arg).
+        assert_eq!(
+            output["agents"]["coder"]["model_provider"],
+            json!("openai.coder")
+        );
         assert_eq!(output["agents"]["coder"]["agentic"], json!(true));
 
         let remove = tool
