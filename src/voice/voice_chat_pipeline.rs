@@ -258,6 +258,19 @@ pub struct VoiceChatPipeline {
     llm_model: String,
 }
 
+// `dyn Provider` is not Debug, so we hand-roll a non-secret-leaking
+// impl that surfaces only the model identifiers. Used so that
+// `TypecastInterpConfig` (which holds an Option<Arc<VoiceChatPipeline>>)
+// can keep its blanket `#[derive(Debug)]`.
+impl std::fmt::Debug for VoiceChatPipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VoiceChatPipeline")
+            .field("gemma_model", &self.gemma_model)
+            .field("llm_model", &self.llm_model)
+            .finish_non_exhaustive()
+    }
+}
+
 impl VoiceChatPipeline {
     /// Construct a pipeline.
     ///
@@ -373,6 +386,24 @@ impl VoiceChatPipeline {
                 inference_ms,
             },
         })
+    }
+
+    /// Public wrapper around the internal validation step. Used by
+    /// `validate_and_answer` (the full voice-chat path) and by
+    /// `crate::voice::typecast_interp` (which uses the validation
+    /// result to decide whether to translate or to ask the user to
+    /// repeat — without paying for the direct-answer or LLM-fallback
+    /// stages of `validate_and_answer`).
+    ///
+    /// Returns the same `ValidationResult` that the internal pipeline
+    /// would have used to pick a route. The caller is responsible for
+    /// rendering re-ask copy via `voice_messages::*` helpers and for
+    /// deciding what the `SimpleGemma` / `ComplexLlm` routes mean in
+    /// its own context (in interpretation, both mean "go ahead and
+    /// translate"; in voice-chat, they mean "answer locally" /
+    /// "answer via the cloud LLM" respectively).
+    pub async fn validate_only(&self, stt: &SttResult) -> Result<ValidationResult> {
+        self.validate_and_route(stt).await
     }
 
     /// Stage [2] — Gemma's own self-check. Calls Gemma with the
