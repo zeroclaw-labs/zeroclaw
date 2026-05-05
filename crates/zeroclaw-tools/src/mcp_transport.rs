@@ -150,15 +150,20 @@ impl McpTransportConn for StdioTransport {
 pub struct HttpTransport {
     url: String,
     /// Per-server tool-call SSE read timeout, from `McpServerConfig.tool_timeout_secs`.
-    /// `None` falls back to `RECV_TIMEOUT_SECS` (used for init/list, where a slow
-    /// server should be cut short). Tool calls — which the client layer already
-    /// wraps in `tool_timeout_secs` — need the same budget at the transport
-    /// layer; otherwise the inner 30s fires first on slow SSE responses (e.g.
-    /// Canva's `generate-design`, 45–90s) and the outer timeout is unreachable.
+    /// `None` falls back to `RECV_TIMEOUT_SECS` for init/list operations.
+    /// Also drives the reqwest client-wide timeout via `http_client_timeout_secs`
+    /// so the client never fires before the configured per-call budget.
     tool_timeout_secs: Option<u64>,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
     session_id: Option<String>,
+}
+
+/// Compute the reqwest client-wide timeout so it never undercuts the configured
+/// tool budget. The client timeout must be at least as large as `tool_timeout_secs`
+/// so it does not fire before the per-call SSE read wrapper.
+fn http_client_timeout_secs(tool_timeout_secs: Option<u64>) -> u64 {
+    tool_timeout_secs.unwrap_or(120).max(120)
 }
 
 impl HttpTransport {
@@ -170,7 +175,9 @@ impl HttpTransport {
             .clone();
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(http_client_timeout_secs(
+                config.tool_timeout_secs,
+            )))
             .build()
             .context("failed to build HTTP client")?;
 
@@ -1065,6 +1072,37 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("session-xyz")
         );
+    }
+
+    // ── http_client_timeout_secs tests ───────────────────────────────────────
+
+    #[test]
+    fn http_client_timeout_defaults_to_120_when_tool_timeout_unset() {
+        assert_eq!(http_client_timeout_secs(None), 120);
+    }
+
+    #[test]
+    fn http_client_timeout_uses_tool_timeout_when_above_120() {
+        assert_eq!(http_client_timeout_secs(Some(300)), 300);
+        assert_eq!(http_client_timeout_secs(Some(600)), 600);
+    }
+
+    #[test]
+    fn http_client_timeout_keeps_120_floor_when_tool_timeout_below_120() {
+        assert_eq!(http_client_timeout_secs(Some(30)), 120);
+        assert_eq!(http_client_timeout_secs(Some(1)), 120);
+    }
+
+    #[test]
+    fn http_transport_builds_successfully_with_high_tool_timeout() {
+        let config = McpServerConfig {
+            name: "test-http-slow".into(),
+            transport: McpTransport::Http,
+            url: Some("http://localhost/mcp".into()),
+            tool_timeout_secs: Some(300),
+            ..Default::default()
+        };
+        assert!(HttpTransport::new(&config).is_ok());
     }
 
     // ── derive_message_url tests ──────────────────────────────────────────────
