@@ -10,6 +10,59 @@ use crate::skills::Skill;
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
+/// Scan `<workspace>/sops/*/SOP.toml` and append a list of SOP names + descriptions
+/// to the prompt so the model sees them alongside tool descriptions. Silent on errors.
+fn inject_available_sops(prompt: &mut String, workspace_dir: &std::path::Path) {
+    let sops_root = workspace_dir.join("sops");
+    let Ok(entries) = std::fs::read_dir(&sops_root) else {
+        return;
+    };
+
+    let mut sops: Vec<(String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let toml_path = entry.path().join("SOP.toml");
+        let Ok(text) = std::fs::read_to_string(&toml_path) else {
+            continue;
+        };
+        let Ok(value) = text.parse::<toml::Value>() else {
+            continue;
+        };
+        let sop_section = match value.get("sop").and_then(|v| v.as_table()) {
+            Some(t) => t,
+            None => continue,
+        };
+        let name = sop_section
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let desc = sop_section
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !name.is_empty() {
+            sops.push((name, desc));
+        }
+    }
+
+    if sops.is_empty() {
+        return;
+    }
+    sops.sort_by(|a, b| a.0.cmp(&b.0));
+
+    use std::fmt::Write as _;
+    prompt.push_str("## Available SOPs\n\n");
+    prompt.push_str(
+        "These are pre-defined workflows. When the user's intent matches one, call \
+         `sop_execute` with the SOP name directly — do NOT call `sop_list` first.\n\n",
+    );
+    for (name, desc) in &sops {
+        let _ = writeln!(prompt, "- **{name}**: {desc}");
+    }
+    prompt.push('\n');
+}
+
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
     workspace_dir: &std::path::Path,
@@ -155,6 +208,9 @@ pub fn build_system_prompt_with_mode_and_autonomy(
             prompt.push('\n');
         }
     }
+
+    // ── 1a. Available SOPs (right after tools so they share affordance space) ───
+    inject_available_sops(&mut prompt, workspace_dir);
 
     // ── 1b. Hardware (when gpio/arduino tools present) ───────────
     let has_hardware = tools.iter().any(|(name, _)| {

@@ -35,7 +35,7 @@ impl Tool for SopExecuteTool {
     }
 
     fn description(&self) -> &str {
-        "Manually trigger a Standard Operating Procedure (SOP) by name. Returns the run ID and first step instruction. Use sop_list to see available SOPs."
+        "Run a workspace SOP (Standard Operating Procedure) by name. SOPs are pre-defined, anti-loop multi-step workflows for common tasks (e.g. product/shopping searches). Available SOPs are listed at the top of the system prompt under '## Available SOPs' — pass the SOP `name` directly. Do NOT call sop_list first. `payload` is a JSON string with the SOP's expected inputs."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
