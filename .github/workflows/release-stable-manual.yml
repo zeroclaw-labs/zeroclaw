@@ -198,12 +198,22 @@ jobs:
             artifact: zeroclaw
             ext: tar.gz
           - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            artifact: zeroclaw
+            ext: tar.gz
+            use_cross: true
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             artifact: zeroclaw
             ext: tar.gz
             cross_compiler: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             linker: aarch64-linux-gnu-gcc
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-musl
+            artifact: zeroclaw
+            ext: tar.gz
+            use_cross: true
           - os: ubuntu-22.04
             target: armv7-unknown-linux-gnueabihf
             artifact: zeroclaw
@@ -259,6 +269,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
 
+      - name: Install cross (MUSL targets)
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
       - name: Setup Android NDK
         if: matrix.ndk
         run: echo "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
@@ -278,10 +292,17 @@ jobs:
           fi
           # Use matrix-level feature override if set, otherwise use global RELEASE_CARGO_FEATURES
           FEATURES="${{ matrix.cargo_features || env.RELEASE_CARGO_FEATURES }}"
-          if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
-            cargo build --release --locked --no-default-features --features "agent-runtime,schema-export,${FEATURES}" --target ${{ matrix.target }}
+          # MUSL targets build via cross-rs (cross-compiled in a container);
+          # all other targets use the host cargo toolchain directly.
+          if [ "${{ matrix.use_cross || 'false' }}" = "true" ]; then
+            BUILD_CMD="cross build"
           else
-            cargo build --release --locked --features "${FEATURES}" --target ${{ matrix.target }}
+            BUILD_CMD="cargo build"
+          fi
+          if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
+            $BUILD_CMD --release --locked --no-default-features --features "agent-runtime,schema-export,${FEATURES}" --target ${{ matrix.target }}
+          else
+            $BUILD_CMD --release --locked --features "${FEATURES}" --target ${{ matrix.target }}
           fi
 
       - name: Check binary size
@@ -397,7 +418,9 @@ jobs:
         run: |
           required_assets=(
             "zeroclaw-x86_64-unknown-linux-gnu.tar.gz"
+            "zeroclaw-x86_64-unknown-linux-musl.tar.gz"
             "zeroclaw-aarch64-unknown-linux-gnu.tar.gz"
+            "zeroclaw-aarch64-unknown-linux-musl.tar.gz"
             "zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz"
             "zeroclaw-arm-unknown-linux-gnueabihf.tar.gz"
             "zeroclaw-aarch64-apple-darwin.tar.gz"
