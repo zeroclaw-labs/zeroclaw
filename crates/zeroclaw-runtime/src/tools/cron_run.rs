@@ -211,10 +211,8 @@ mod tests {
         config
             .providers
             .models
-            .entry("openrouter".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
+            .ensure("openrouter", "default")
+            .expect("known family");
         config.agents.entry("test-agent".to_string()).or_insert(
             zeroclaw_config::schema::DelegateAgentConfig {
                 model_provider: "openrouter.default".to_string(),

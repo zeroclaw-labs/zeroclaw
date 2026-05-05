@@ -1152,18 +1152,18 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = Config {
             workspace_dir: cwd.path().to_path_buf(),
-            providers: zeroclaw_config::providers::ProvidersConfig {
-                models: HashMap::from([(
-                    "openrouter".to_string(),
-                    HashMap::from([(
-                        "default".to_string(),
-                        zeroclaw_config::schema::ModelProviderConfig {
+            providers: {
+                let mut p = zeroclaw_config::providers::ProvidersConfig::default();
+                p.models.openrouter.insert(
+                    "default".to_string(),
+                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
+                        base: zeroclaw_config::schema::ModelProviderConfig {
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
-                    )]),
-                )]),
-                ..Default::default()
+                    },
+                );
+                p
             },
             mcp: zeroclaw_config::schema::McpConfig {
                 enabled: true,
@@ -1295,20 +1295,18 @@ mod tests {
 
     #[test]
     fn handle_initialize_default_model_reflects_configured_provider() {
-        use zeroclaw_config::schema::ModelProviderConfig;
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("myprovider".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
                     model: Some("llama3.2".to_string()),
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
         let server = AcpServer::new(config, AcpServerConfig::default());
         let result = server.handle_initialize(&serde_json::json!({})).unwrap();
         assert_eq!(result["_meta"]["zeroclaw"]["defaultModel"], "llama3.2");
@@ -1459,18 +1457,18 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = Config {
             workspace_dir: cwd.path().to_path_buf(),
-            providers: zeroclaw_config::providers::ProvidersConfig {
-                models: HashMap::from([(
-                    "anthropic".to_string(),
-                    HashMap::from([(
-                        "default".to_string(),
-                        zeroclaw_config::schema::ModelProviderConfig {
+            providers: {
+                let mut p = zeroclaw_config::providers::ProvidersConfig::default();
+                p.models.anthropic.insert(
+                    "default".to_string(),
+                    zeroclaw_config::schema::AnthropicModelProviderConfig {
+                        base: zeroclaw_config::schema::ModelProviderConfig {
                             model: Some("claude-haiku-4-5".to_string()),
                             ..Default::default()
                         },
-                    )]),
-                )]),
-                ..Default::default()
+                    },
+                );
+                p
             },
             ..Default::default()
         };

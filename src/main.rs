@@ -4329,10 +4329,8 @@ mod tests {
         config
             .providers
             .models
-            .entry("openai".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default()
+            .ensure("openai", "default")
+            .expect("known family")
             .temperature = Some(1.5);
 
         let user_temperature: Option<f64> = std::hint::black_box(None);

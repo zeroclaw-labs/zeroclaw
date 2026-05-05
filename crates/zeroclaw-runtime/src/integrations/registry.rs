@@ -1123,7 +1123,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure_alias_base_mut("minimax-cn", "default")
+            .ensure("minimax-cn", "default")
             .expect("known provider type");
 
         let minimax = entries.iter().find(|e| e.name == "MiniMax").unwrap();
@@ -1136,7 +1136,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure_alias_base_mut("glm-cn", "default")
+            .ensure("glm-cn", "default")
             .expect("known provider type");
         let glm = entries.iter().find(|e| e.name == "GLM").unwrap();
         assert!(matches!(
@@ -1148,7 +1148,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure_alias_base_mut("moonshot-intl", "default")
+            .ensure("moonshot-intl", "default")
             .expect("known provider type");
         let moonshot = entries.iter().find(|e| e.name == "Moonshot").unwrap();
         assert!(matches!(
@@ -1160,7 +1160,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure_alias_base_mut("qwen-intl", "default")
+            .ensure("qwen-intl", "default")
             .expect("known provider type");
         let qwen = entries.iter().find(|e| e.name == "Qwen").unwrap();
         assert!(matches!(
@@ -1172,7 +1172,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure_alias_base_mut("zai-cn", "default")
+            .ensure("zai-cn", "default")
             .expect("known provider type");
         let zai = entries.iter().find(|e| e.name == "Z.AI").unwrap();
         assert!(matches!(
@@ -1184,7 +1184,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure_alias_base_mut("baidu", "default")
+            .ensure("baidu", "default")
             .expect("known provider type");
         let qianfan = entries.iter().find(|e| e.name == "Qianfan").unwrap();
         assert!(matches!(

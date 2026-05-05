@@ -85,7 +85,15 @@ temperature = 99.0
 "#;
     let config: Config = toml::from_str(toml_str).expect("parses");
     // Out-of-range temperature is stored but caught by validate().
-    assert!(config.providers.models["test"]["default"].temperature == Some(99.0));
+    assert!(
+        config
+            .providers
+            .models
+            .find("test", "default")
+            .expect("entry exists")
+            .temperature
+            == Some(99.0)
+    );
 }
 
 #[test]
@@ -95,7 +103,15 @@ fn config_negative_temperature_fails() {
 temperature = -0.5
 "#;
     let config: Config = toml::from_str(toml_str).expect("parses");
-    assert!(config.providers.models["test"]["default"].temperature == Some(-0.5));
+    assert!(
+        config
+            .providers
+            .models
+            .find("test", "default")
+            .expect("entry exists")
+            .temperature
+            == Some(-0.5)
+    );
 }
 
 #[test]

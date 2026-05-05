@@ -1076,7 +1076,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure_alias_base_mut("default", "default")
+            .ensure("default", "default")
             .expect("known provider type")
             .temperature = Some(5.0);
         let mut items = Vec::new();
@@ -1093,7 +1093,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure_alias_base_mut("openrouter", "default")
+            .ensure("openrouter", "default")
             .expect("known provider type")
             .temperature = Some(0.7);
         let mut items = Vec::new();
@@ -1120,7 +1120,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure_alias_base_mut("totally-fake", "default")
+            .ensure("totally-fake", "default")
             .expect("known provider type");
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);

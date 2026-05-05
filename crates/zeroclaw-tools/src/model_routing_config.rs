@@ -414,7 +414,7 @@ impl ModelRoutingConfigTool {
         let entry = cfg
             .providers
             .models
-            .ensure_alias_base_mut(&type_k, &alias_k)
+            .ensure(&type_k, &alias_k)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "unknown provider type `{type_k}` — no typed slot in ModelProviders"
@@ -462,10 +462,7 @@ impl ModelRoutingConfigTool {
                 // restore cycle because we only ever mutated baseline fields
                 // (model, temperature, api_key) above.
                 if let Some(prev_entry) = previous_first_provider
-                    && let Some(slot) = cfg
-                        .providers
-                        .models
-                        .ensure_alias_base_mut(&type_k, &alias_k)
+                    && let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k)
                 {
                     *slot = prev_entry;
                 }
@@ -745,15 +742,15 @@ impl ModelRoutingConfigTool {
         // V3: synthesize providers.models[provider][name] from inline brain params.
         let model_provider = format!("{provider}.{name}");
         {
-            let provider_entry = cfg
-                .providers
-                .models
-                .ensure_alias_base_mut(&provider, &name)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "unknown provider type `{provider}` — no typed slot in ModelProviders"
-                    )
-                })?;
+            let provider_entry =
+                cfg.providers
+                    .models
+                    .ensure(&provider, &name)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown provider type `{provider}` — no typed slot in ModelProviders"
+                        )
+                    })?;
             provider_entry.model = Some(model.clone());
             match api_key_update {
                 MaybeSet::Set(ref v) => provider_entry.api_key = Some(v.clone()),

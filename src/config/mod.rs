@@ -42,6 +42,32 @@ pub use schema::{
 };
 
 pub use schema::ModelProviderConfig;
+// Per-family model provider configs (typed split — #6273). Re-exported here
+// so tests + downstream binary callers can construct typed family entries
+// without reaching into `zeroclaw_config::schema` directly.
+pub use schema::{
+    Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
+    AnyscaleModelProviderConfig, AstraiModelProviderConfig, AvianModelProviderConfig,
+    AzureModelProviderConfig, BaichuanModelProviderConfig, BasetenModelProviderConfig,
+    BedrockModelProviderConfig, CerebrasModelProviderConfig, CloudflareModelProviderConfig,
+    CohereModelProviderConfig, CopilotModelProviderConfig, CustomModelProviderConfig,
+    DeepinfraModelProviderConfig, DeepmystModelProviderConfig, DeepseekModelProviderConfig,
+    DoubaoModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
+    GeminiCliModelProviderConfig, GeminiModelProviderConfig, GlmModelProviderConfig,
+    GroqModelProviderConfig, HuggingfaceModelProviderConfig, HunyuanModelProviderConfig,
+    HyperbolicModelProviderConfig, KiloCliModelProviderConfig, LeptonModelProviderConfig,
+    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
+    MinimaxModelProviderConfig, MistralModelProviderConfig, MoonshotModelProviderConfig,
+    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
+    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
+    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
+    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
+    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
+    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+};
 pub use traits::HasPropKind;
 pub use traits::PropFieldInfo;
 pub use traits::PropKind;

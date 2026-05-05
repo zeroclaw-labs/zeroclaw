@@ -132,21 +132,19 @@ fn memory_config_default_vector_keyword_weights_sum_to_one() {
 
 #[test]
 fn config_toml_roundtrip_preserves_provider() {
-    use zeroclaw::config::ModelProviderConfig;
+    use zeroclaw::config::{DeepseekModelProviderConfig, ModelProviderConfig};
     let mut config = Config::default();
-    config
-        .providers
-        .models
-        .entry("deepseek".into())
-        .or_default()
-        .insert(
-            "default".to_string(),
-            ModelProviderConfig {
+    config.providers.models.deepseek.insert(
+        "default".to_string(),
+        DeepseekModelProviderConfig {
+            base: ModelProviderConfig {
                 model: Some("deepseek-chat".into()),
                 temperature: Some(0.5),
                 ..Default::default()
             },
-        );
+            ..Default::default()
+        },
+    );
 
     let toml_str = toml::to_string(&config).expect("config should serialize to TOML");
     let parsed = zeroclaw::config::migration::migrate_to_current(&toml_str)
@@ -215,23 +213,21 @@ fn config_toml_roundtrip_preserves_memory_config() {
 
 #[test]
 fn config_file_write_read_roundtrip() {
-    use zeroclaw::config::ModelProviderConfig;
+    use zeroclaw::config::{MistralModelProviderConfig, ModelProviderConfig};
     let tmp = tempfile::TempDir::new().expect("tempdir creation should succeed");
     let config_path = tmp.path().join("config.toml");
 
     let mut config = Config::default();
-    config
-        .providers
-        .models
-        .entry("mistral".into())
-        .or_default()
-        .insert(
-            "default".to_string(),
-            ModelProviderConfig {
+    config.providers.models.mistral.insert(
+        "default".to_string(),
+        MistralModelProviderConfig {
+            base: ModelProviderConfig {
                 model: Some("mistral-large".into()),
                 ..Default::default()
             },
-        );
+            ..Default::default()
+        },
+    );
     config
         .agents
         .entry("default".into())

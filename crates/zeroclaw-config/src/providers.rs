@@ -6,19 +6,18 @@ use super::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
     AnyscaleModelProviderConfig, AstraiModelProviderConfig, AvianModelProviderConfig,
     AzureModelProviderConfig, BaichuanModelProviderConfig, BasetenModelProviderConfig,
-    BedrockModelProviderConfig, CerebrasModelProviderConfig, ClaudeCodeModelProviderConfig,
-    CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
-    CustomModelProviderConfig, DeepinfraModelProviderConfig, DeepmystModelProviderConfig,
-    DeepseekModelProviderConfig, DoubaoModelProviderConfig, EmbeddingRouteConfig,
-    FireworksModelProviderConfig, FriendliModelProviderConfig, GeminiCliModelProviderConfig,
-    GeminiModelProviderConfig, GlmModelProviderConfig, GroqModelProviderConfig,
-    HuggingfaceModelProviderConfig, HunyuanModelProviderConfig, HyperbolicModelProviderConfig,
-    KiloCliModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
-    LlamacppModelProviderConfig, LmstudioModelProviderConfig, MinimaxModelProviderConfig,
-    MistralModelProviderConfig, ModelProviderConfig, ModelRouteConfig, MoonshotModelProviderConfig,
-    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
-    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAICodexModelProviderConfig,
-    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeGoModelProviderConfig,
+    BedrockModelProviderConfig, CerebrasModelProviderConfig, CloudflareModelProviderConfig,
+    CohereModelProviderConfig, CopilotModelProviderConfig, CustomModelProviderConfig,
+    DeepinfraModelProviderConfig, DeepmystModelProviderConfig, DeepseekModelProviderConfig,
+    DoubaoModelProviderConfig, EmbeddingRouteConfig, FireworksModelProviderConfig,
+    FriendliModelProviderConfig, GeminiCliModelProviderConfig, GeminiModelProviderConfig,
+    GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
+    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, KiloCliModelProviderConfig,
+    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
+    LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
+    ModelProviderConfig, ModelRouteConfig, MoonshotModelProviderConfig, NebiusModelProviderConfig,
+    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
+    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
     OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
     PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
     RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
@@ -40,12 +39,8 @@ use super::schema::{
 macro_rules! for_each_model_provider_slot {
     ($mac:ident) => {
         $mac! {
-            (openai, "openai", OpenAIModelProviderConfig),
-            (openai_codex, "openai_codex", OpenAICodexModelProviderConfig),
-            (azure_openai, "azure_openai", AzureModelProviderConfig),
-            (anthropic, "anthropic", AnthropicModelProviderConfig),
-            (claude_code, "claude_code", ClaudeCodeModelProviderConfig),
-            (moonshot, "moonshot", MoonshotModelProviderConfig),
+            (openai, "openai", OpenAIModelProviderConfig),            (azure, "azure", AzureModelProviderConfig),
+            (anthropic, "anthropic", AnthropicModelProviderConfig),            (moonshot, "moonshot", MoonshotModelProviderConfig),
             (qwen, "qwen", QwenModelProviderConfig),
             (glm, "glm", GlmModelProviderConfig),
             (minimax, "minimax", MinimaxModelProviderConfig),
@@ -102,9 +97,7 @@ macro_rules! for_each_model_provider_slot {
             (litellm, "litellm", LitellmModelProviderConfig),
             (lepton, "lepton", LeptonModelProviderConfig),
             (synthetic, "synthetic", SyntheticModelProviderConfig),
-            (opencode, "opencode", OpencodeModelProviderConfig),
-            (opencode_go, "opencode_go", OpencodeGoModelProviderConfig),
-            (kilocli, "kilocli", KiloCliModelProviderConfig),
+            (opencode, "opencode", OpencodeModelProviderConfig),            (kilocli, "kilocli", KiloCliModelProviderConfig),
             (custom, "custom", CustomModelProviderConfig),
         }
     };
@@ -185,16 +178,12 @@ impl ModelProviders {
     }
 
     /// Look up the shared base config for a given `<provider_type>.<alias>`
-    /// pair. Returns `None` when the provider type isn't recognized OR when
+    /// pair. Returns `None` when the family isn't recognized OR when
     /// the alias doesn't exist in that family's typed slot.
-    pub fn get_base_for_alias(
-        &self,
-        provider_type: &str,
-        alias: &str,
-    ) -> Option<&ModelProviderConfig> {
+    pub fn find(&self, family: &str, alias: &str) -> Option<&ModelProviderConfig> {
         macro_rules! emit_get {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
-                match provider_type {
+                match family {
                     $( $type_str => self.$field.get(alias).map(|cfg| &cfg.base), )+
                     _ => None,
                 }
@@ -208,14 +197,10 @@ impl ModelProviders {
     /// generic baseline fields (model, temperature, api_key) without caring
     /// about the family's specific extras. Returns `None` for unknown
     /// provider types.
-    pub fn ensure_alias_base_mut(
-        &mut self,
-        provider_type: &str,
-        alias: &str,
-    ) -> Option<&mut ModelProviderConfig> {
+    pub fn ensure(&mut self, family: &str, alias: &str) -> Option<&mut ModelProviderConfig> {
         macro_rules! emit_ensure {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
-                match provider_type {
+                match family {
                     $(
                         $type_str => Some(
                             &mut self
@@ -232,12 +217,12 @@ impl ModelProviders {
         for_each_model_provider_slot!(emit_ensure)
     }
 
-    /// True when `provider_type`'s typed slot has at least one configured
-    /// alias entry. Returns `false` for unknown provider types.
-    pub fn contains_provider_type(&self, provider_type: &str) -> bool {
+    /// True when `family`'s typed slot has at least one configured
+    /// alias entry. Returns `false` for unknown families.
+    pub fn contains_provider_type(&self, family: &str) -> bool {
         macro_rules! emit_contains {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
-                match provider_type {
+                match family {
                     $( $type_str => !self.$field.is_empty(), )+
                     _ => false,
                 }
@@ -248,10 +233,10 @@ impl ModelProviders {
 
     /// Iterate the alias keys for a given provider type. Returns an empty
     /// iterator for unknown provider types.
-    pub fn aliases_of<'a>(&'a self, provider_type: &str) -> Box<dyn Iterator<Item = &'a str> + 'a> {
+    pub fn aliases_of<'a>(&'a self, family: &str) -> Box<dyn Iterator<Item = &'a str> + 'a> {
         macro_rules! emit_aliases {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
-                match provider_type {
+                match family {
                     $( $type_str => Box::new(self.$field.keys().map(String::as_str)), )+
                     _ => Box::new(std::iter::empty()),
                 }
@@ -261,11 +246,11 @@ impl ModelProviders {
     }
 
     /// Remove the entry for `<provider_type>.<alias>`, returning whether it
-    /// existed. Returns `false` for unknown provider types.
-    pub fn remove_alias(&mut self, provider_type: &str, alias: &str) -> bool {
+    /// existed. Returns `false` for unknown families.
+    pub fn remove_alias(&mut self, family: &str, alias: &str) -> bool {
         macro_rules! emit_remove {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
-                match provider_type {
+                match family {
                     $( $type_str => self.$field.remove(alias).is_some(), )+
                     _ => false,
                 }

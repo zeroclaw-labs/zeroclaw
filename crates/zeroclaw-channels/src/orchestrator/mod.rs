@@ -866,12 +866,7 @@ fn runtime_defaults_from_config(
 ) -> anyhow::Result<ChannelRuntimeDefaults> {
     let dotted = model_provider.split_once('.');
     let entry = dotted
-        .and_then(|(type_key, alias_key)| {
-            config
-                .providers
-                .models
-                .get_base_for_alias(type_key, alias_key)
-        })
+        .and_then(|(type_key, alias_key)| config.providers.models.find(type_key, alias_key))
         .or_else(|| config.providers.first_provider());
     let default_provider = dotted
         .map(|(t, _)| t.to_string())

@@ -1653,12 +1653,9 @@ pub async fn run(
             effective_config
                 .providers
                 .models
-                .ensure_alias_base_mut(type_key, alias_key);
+                .ensure(type_key, alias_key);
         } else {
-            effective_config
-                .providers
-                .models
-                .ensure_alias_base_mut(&p, "default");
+            effective_config.providers.models.ensure(&p, "default");
         }
     }
     if let Some(entry) = effective_config.providers.first_provider_mut() {
@@ -2200,7 +2197,7 @@ mod tests {
             let entry = config
                 .providers
                 .models
-                .ensure_alias_base_mut("custom", "default")
+                .ensure("custom", "default")
                 .expect("custom provider type slot");
             entry.api_key = Some("test-key".to_string());
             entry.model = Some("test-model".to_string());

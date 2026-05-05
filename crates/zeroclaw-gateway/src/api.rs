@@ -1305,15 +1305,10 @@ mod tests {
     fn with_test_agent(
         mut config: zeroclaw_config::schema::Config,
     ) -> zeroclaw_config::schema::Config {
-        config
-            .providers
-            .models
-            .entry("openrouter".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                zeroclaw_config::schema::ModelProviderConfig::default(),
-            );
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::OpenRouterModelProviderConfig::default(),
+        );
         config.risk_profiles.insert(
             "test-profile".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),

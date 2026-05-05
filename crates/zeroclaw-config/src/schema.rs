@@ -712,45 +712,6 @@ pub struct OpenAIModelProviderConfig {
     pub wire_api: Option<String>,
 }
 
-// ── OpenAI Codex ──
-
-/// OpenAI Codex / Responses API endpoint. Currently single-variant; future
-/// regional or beta endpoints would be additional variants here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum OpenAICodexEndpoint {
-    #[default]
-    Default,
-}
-
-impl ModelEndpoint for OpenAICodexEndpoint {
-    fn uri(&self) -> &'static str {
-        match self {
-            Self::Default => "https://api.openai.com/v1",
-        }
-    }
-}
-
-/// OpenAI Codex model provider config. Same extras as OpenAI proper plus
-/// `requires_openai_auth` (Codex-specific OAuth-cache integration).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "providers.models.openai_codex"]
-pub struct OpenAICodexModelProviderConfig {
-    #[nested]
-    #[serde(flatten)]
-    pub base: ModelProviderConfig,
-    /// Wire protocol flavor (typically `"responses"` for Codex).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wire_api: Option<String>,
-    /// When true, the client pulls credentials from `OPENAI_API_KEY` or
-    /// `~/.codex/auth.json` instead of the `api_key` field. Codex-specific
-    /// auth-cache integration; off by default.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub requires_openai_auth: bool,
-}
-
 // ── Azure OpenAI ──
 
 /// Azure OpenAI endpoint template. Single variant; the URL is computed at
@@ -781,7 +742,7 @@ impl ModelEndpoint for AzureEndpoint {
 /// still override the entire endpoint via `base.uri`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "providers.models.azure_openai"]
+#[prefix = "providers.models.azure"]
 pub struct AzureModelProviderConfig {
     #[nested]
     #[serde(flatten)]
@@ -2356,31 +2317,6 @@ pub struct OpencodeModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
-// ── OpenCode Go ──
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum OpencodeGoEndpoint {
-    #[default]
-    Default,
-}
-impl ModelEndpoint for OpencodeGoEndpoint {
-    fn uri(&self) -> &'static str {
-        match self {
-            Self::Default => "https://opencode.ai/zen/go/v1",
-        }
-    }
-}
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "providers.models.opencode_go"]
-pub struct OpencodeGoModelProviderConfig {
-    #[nested]
-    #[serde(flatten)]
-    pub base: ModelProviderConfig,
-}
-
 // ── KiloCli (subprocess wrapper) ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2430,31 +2366,6 @@ impl ModelEndpoint for CustomEndpoint {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.custom"]
 pub struct CustomModelProviderConfig {
-    #[nested]
-    #[serde(flatten)]
-    pub base: ModelProviderConfig,
-}
-
-// ── ClaudeCode (Anthropic flavor) ──
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum ClaudeCodeEndpoint {
-    #[default]
-    Default,
-}
-impl ModelEndpoint for ClaudeCodeEndpoint {
-    fn uri(&self) -> &'static str {
-        match self {
-            Self::Default => "https://api.anthropic.com",
-        }
-    }
-}
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "providers.models.claude_code"]
-pub struct ClaudeCodeModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
@@ -2735,9 +2646,7 @@ impl Config {
     pub fn model_provider_for_agent(&self, agent_alias: &str) -> Option<&ModelProviderConfig> {
         let agent = self.agents.get(agent_alias)?;
         let (type_key, alias_key) = agent.model_provider.split_once('.')?;
-        self.providers
-            .models
-            .get_base_for_alias(type_key, alias_key)
+        self.providers.models.find(type_key, alias_key)
     }
 
     /// Reverse-lookup the agent alias that owns a configured channel
@@ -13434,7 +13343,6 @@ impl_enum_prop_kind!(
     AutonomyLevel,
     AuthMode,
     OpenAIEndpoint,
-    OpenAICodexEndpoint,
     AzureEndpoint,
     AnthropicEndpoint,
     MoonshotEndpoint,
@@ -13495,10 +13403,8 @@ impl_enum_prop_kind!(
     LeptonEndpoint,
     SyntheticEndpoint,
     OpencodeEndpoint,
-    OpencodeGoEndpoint,
     KiloCliEndpoint,
     CustomEndpoint,
-    ClaudeCodeEndpoint,
 );
 
 impl HasPropKind for serde_json::Value {
@@ -14642,20 +14548,19 @@ default_temperature = 0.7
 
         let config_path = dir.join("config.toml");
         let mut providers = crate::providers::ProvidersConfig::default();
-        providers
-            .models
-            .entry("openrouter".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     api_key: Some("sk-roundtrip".into()),
                     model: Some("test-model".into()),
                     temperature: Some(0.9),
                     timeout_secs: Some(120),
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
         let config = Config {
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
@@ -14742,7 +14647,11 @@ default_temperature = 0.7
 
         let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
         let loaded = crate::migration::migrate_to_current(&contents).unwrap();
-        let entry = &loaded.providers.models["openrouter"]["default"];
+        let entry = &loaded
+            .providers
+            .models
+            .find("openrouter", "default")
+            .expect("entry exists");
         assert!(
             entry
                 .api_key
@@ -14775,18 +14684,16 @@ default_temperature = 0.7
             config_path: dir.join("config.toml"),
             ..Default::default()
         };
-        config
-            .providers
-            .models
-            .entry("anthropic".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.anthropic.insert(
+            "default".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
                     api_key: Some("root-credential".into()),
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
         // Provider fields are now resolved directly — no cache needed.
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
@@ -14815,19 +14722,16 @@ default_temperature = 0.7
             },
         );
 
-        config
-            .providers
-            .models
-            .entry("openrouter".into())
-            .or_default()
-            .insert(
-                "worker".into(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "worker".into(),
+            crate::schema::OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     api_key: Some("agent-credential".into()),
                     model: Some("model-test".into()),
                     ..Default::default()
                 },
-            );
+            },
+        );
         config.agents.insert(
             "worker".into(),
             DelegateAgentConfig {
@@ -14847,8 +14751,7 @@ default_temperature = 0.7
         let root_encrypted = stored
             .providers
             .models
-            .get("anthropic")
-            .and_then(|m| m.get("default"))
+            .find("anthropic", "default")
             .and_then(|e| e.api_key.as_deref())
             .unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(root_encrypted));
@@ -14889,8 +14792,7 @@ default_temperature = 0.7
         let worker_provider = stored
             .providers
             .models
-            .get("openrouter")
-            .and_then(|m| m.get("worker"))
+            .find("openrouter", "worker")
             .unwrap();
         let worker_encrypted = worker_provider.api_key.as_deref().unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(worker_encrypted));
@@ -14953,26 +14855,23 @@ default_temperature = 0.7
             config_path: config_path.clone(),
             ..Default::default()
         };
-        config
-            .providers
-            .models
-            .entry("test".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     model: Some("model-a".into()),
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
         config.save().await.unwrap();
         assert!(config_path.exists());
 
         config
             .providers
             .models
-            .get_mut("test")
-            .and_then(|m| m.get_mut("default"))
+            .ensure("test", "default")
             .unwrap()
             .model = Some("model-b".into());
         config.save().await.unwrap();
@@ -16067,7 +15966,7 @@ requires_openai_auth = true
 
         let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
         assert!(
-            parsed.providers.models.contains_key("sub2api"),
+            parsed.providers.models.contains_provider_type("sub2api"),
             "expected sub2api in providers.models"
         );
         assert_eq!(
@@ -16080,8 +15979,7 @@ requires_openai_auth = true
         let profile = parsed
             .providers
             .models
-            .get("sub2api")
-            .and_then(|m| m.get("default"))
+            .find("sub2api", "default")
             .expect("profile should exist");
         assert_eq!(profile.wire_api.as_deref(), Some("responses"));
         assert!(profile.requires_openai_auth);
@@ -16091,14 +15989,10 @@ requires_openai_auth = true
     async fn model_provider_profile_maps_to_custom_endpoint() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("sub2api".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     uri: Some("https://api.tonsof.blue/v1".to_string()),
                     wire_api: None,
@@ -16106,14 +16000,15 @@ requires_openai_auth = true
                     max_tokens: None,
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
 
         assert_eq!(
             config
                 .providers
                 .models
-                .get("sub2api")
-                .and_then(|m| m.get("default"))
+                .find("sub2api", "default")
                 .and_then(|e| e.uri.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
@@ -16124,14 +16019,10 @@ requires_openai_auth = true
     async fn model_provider_profile_responses_uses_openai_codex_and_openai_key() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("sub2api".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     uri: Some("https://api.tonsof.blue".to_string()),
                     wire_api: Some("responses".to_string()),
@@ -16139,13 +16030,14 @@ requires_openai_auth = true
                     max_tokens: None,
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
 
         let entry = config
             .providers
             .models
-            .get("sub2api")
-            .and_then(|m| m.get("default"))
+            .find("sub2api", "default")
             .expect("sub2api.default entry");
         assert_eq!(entry.uri.as_deref(), Some("https://api.tonsof.blue"));
         assert_eq!(entry.wire_api.as_deref(), Some("responses"));
@@ -16173,8 +16065,7 @@ model = "primary-model"
             config
                 .providers
                 .models
-                .get("primary")
-                .and_then(|m| m.get("default"))
+                .find("primary", "default")
                 .and_then(|e| e.model.as_deref()),
             Some("primary-model"),
         );
@@ -16202,42 +16093,37 @@ model = "primary-model"
         config
             .providers
             .models
-            .entry("secondary".to_string())
-            .or_default()
-            .insert("default".to_string(), ModelProviderConfig::default());
+            .anthropic
+            .insert("default".into(), AnthropicModelProviderConfig::default());
         assert_eq!(config.providers.resolve_default_model(), None);
 
         // Add an entry with a model -> first-available wins.
-        config
-            .providers
-            .models
-            .entry("tertiary".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.together.insert(
+            "default".to_string(),
+            TogetherModelProviderConfig {
+                base: ModelProviderConfig {
                     model: Some("tertiary-model".to_string()),
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
         assert_eq!(
             config.providers.resolve_default_model().as_deref(),
             Some("tertiary-model"),
         );
 
         // Add a provider with a model — resolve_default_model finds it.
-        config
-            .providers
-            .models
-            .entry("primary".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     model: Some("primary-model".to_string()),
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
         // resolve_default_model returns the first non-empty model across all providers.
         assert!(config.providers.resolve_default_model().is_some());
     }
@@ -16261,18 +16147,16 @@ model = "primary-model"
             config_path: PathBuf::from("config.toml"),
             ..Default::default()
         };
-        config
-            .providers
-            .models
-            .entry("anthropic".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.anthropic.insert(
+            "default".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
                     temperature: Some(0.5),
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
         // Provider fields are now resolved directly — no cache needed.
         config.save().await.unwrap();
 
@@ -16285,8 +16169,7 @@ model = "primary-model"
             (parsed
                 .providers
                 .models
-                .get("anthropic")
-                .and_then(|m| m.get("default"))
+                .find("anthropic", "default")
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
                 - 0.5)
@@ -16310,20 +16193,18 @@ model = "primary-model"
     async fn validate_ollama_cloud_model_requires_remote_api_url() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("ollama".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
                     model: Some("glm-5:cloud".to_string()),
                     uri: None,
                     api_key: Some("ollama-key".to_string()),
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
 
         let error = config.validate().expect_err("expected validation to fail");
         assert!(error.to_string().contains(
@@ -16335,20 +16216,18 @@ model = "primary-model"
     async fn validate_ollama_cloud_model_accepts_remote_endpoint_and_env_key() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("ollama".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
                     model: Some("glm-5:cloud".to_string()),
                     uri: Some("https://ollama.com/api".to_string()),
                     api_key: None,
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("OLLAMA_API_KEY", "ollama-env-key") };
@@ -16363,14 +16242,10 @@ model = "primary-model"
     async fn validate_rejects_unknown_model_provider_wire_api() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("sub2api".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     name: Some("sub2api".to_string()),
                     uri: Some("https://api.tonsof.blue/v1".to_string()),
                     wire_api: Some("ws".to_string()),
@@ -16378,7 +16253,9 @@ model = "primary-model"
                     max_tokens: None,
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
 
         let error = config.validate().expect_err("expected validation failure");
         assert!(
@@ -16860,19 +16737,17 @@ default_model = "persisted-profile"
     #[test]
     async fn validate_rejects_out_of_range_temperature() {
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("test".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     name: Some("test-provider".into()),
                     temperature: Some(99.0),
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
         let err = config.validate().unwrap_err();
         assert!(
             err.to_string().contains("temperature"),
@@ -16883,19 +16758,17 @@ default_model = "persisted-profile"
     #[test]
     async fn validate_rejects_negative_temperature() {
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("test".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     name: Some("test-provider".into()),
                     temperature: Some(-0.5),
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
         let err = config.validate().unwrap_err();
         assert!(
             err.to_string().contains("temperature"),
@@ -16906,19 +16779,17 @@ default_model = "persisted-profile"
     #[test]
     async fn validate_accepts_valid_temperature() {
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("test".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     name: Some("test-provider".into()),
                     temperature: Some(0.7),
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
         assert!(config.validate().is_ok());
     }
 
@@ -18648,13 +18519,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config
             .providers
             .models
-            .entry("anthropic".into())
-            .or_default()
-            .entry("default".to_string())
-            .or_insert_with(|| ModelProviderConfig {
-                api_key: Some("test-key".into()),
-                ..Default::default()
-            })
+            .ensure("anthropic", "default")
+            .expect("anthropic typed slot")
             .api_key = Some("test-key".into());
         config.channels.matrix.insert(
             "default".to_string(),
@@ -19158,13 +19024,13 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     async fn create_map_key_inserts_default_provider() {
         // Round-trip: `+ Add anthropic provider` from the dashboard.
         let mut config = Config::default();
-        assert!(!config.providers.models.contains_key("anthropic"));
+        assert!(!config.providers.models.contains_provider_type("anthropic"));
 
         let created = config
             .create_map_key("providers.models", "anthropic")
             .expect("providers.models should accept new map keys");
         assert!(created, "first add should report created=true");
-        assert!(config.providers.models.contains_key("anthropic"));
+        assert!(config.providers.models.contains_provider_type("anthropic"));
 
         // Idempotent: second add returns false, doesn't error.
         let again = config
@@ -19365,21 +19231,22 @@ allowed_users = []
         let store = crate::secrets::SecretStore::new(dir.path(), true);
 
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("openrouter".into())
-            .or_default()
-            .insert(
-                "test".into(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "test".into(),
+            crate::schema::OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     api_key: Some("secret-key".into()),
                     ..Default::default()
                 },
-            );
+            },
+        );
 
         config.encrypt_secrets(&store).unwrap();
-        let encrypted_key = config.providers.models["openrouter"]["test"]
+        let encrypted_key = config
+            .providers
+            .models
+            .find("openrouter", "test")
+            .expect("entry exists")
             .api_key
             .as_ref()
             .unwrap();
@@ -19387,7 +19254,11 @@ allowed_users = []
 
         config.decrypt_secrets(&store).unwrap();
         assert_eq!(
-            config.providers.models["openrouter"]["test"]
+            config
+                .providers
+                .models
+                .find("openrouter", "test")
+                .expect("entry exists")
                 .api_key
                 .as_deref(),
             Some("secret-key")

@@ -845,12 +845,8 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         // `persist()` for a real value (api_key, model, …) carries it to
         // disk. If the user backs out before any value is set, the back
         // paths drop the entry so it never reaches the file.
-        let is_new_entry = cfg
-            .providers
-            .models
-            .get_base_for_alias(&picked, &alias)
-            .is_none();
-        cfg.providers.models.ensure_alias_base_mut(&picked, &alias);
+        let is_new_entry = cfg.providers.models.find(&picked, &alias).is_none();
+        cfg.providers.models.ensure(&picked, &alias);
 
         // For fresh entries, pre-populate the provider's trait-level defaults
         // into the in-memory entry. Skipped when reconfiguring so existing
@@ -1020,7 +1016,7 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, prefix: &str) ->
     let (provider, profile) = match prefix.strip_prefix("providers.models.") {
         Some(rest) => {
             if let Some((type_k, alias_k)) = rest.split_once('.') {
-                let profile = cfg.providers.models.get_base_for_alias(type_k, alias_k);
+                let profile = cfg.providers.models.find(type_k, alias_k);
                 (type_k.to_string(), profile)
             } else {
                 (rest.to_string(), None)
@@ -1805,7 +1801,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
-    use zeroclaw_config::schema::{Config, ModelProviderConfig};
+    use zeroclaw_config::schema::{AnthropicModelProviderConfig, Config, ModelProviderConfig};
 
     /// Build a `Config` whose `config_path` / `workspace_dir` live inside a
     /// temp directory, so `save()` touches only the scratch tree.
@@ -1863,7 +1859,7 @@ mod tests {
         assert!(!section_has_signal(&cfg, "providers"));
         cfg.providers
             .models
-            .ensure_alias_base_mut("anthropic", "default")
+            .ensure("anthropic", "default")
             .expect("anthropic typed slot");
         assert!(section_has_signal(&cfg, "providers"));
     }
@@ -2116,7 +2112,7 @@ mod tests {
         let model_cfg = cfg
             .providers
             .models
-            .get_base_for_alias(&provider, "default")
+            .find(&provider, "default")
             .expect("custom provider entry should be seeded");
         assert_eq!(model_cfg.api_key.as_deref(), Some("sk-custom-test"));
         assert_eq!(model_cfg.model.as_deref(), Some("qwen-local"));
@@ -2135,7 +2131,7 @@ mod tests {
         let entry = cfg
             .providers
             .models
-            .ensure_alias_base_mut("custom", "default")
+            .ensure("custom", "default")
             .expect("custom typed slot");
         entry.api_key = Some("sk-gateway-test".into());
         entry.uri = Some(base_url);
@@ -2148,7 +2144,7 @@ mod tests {
         let model_cfg = cfg
             .providers
             .models
-            .get_base_for_alias("my-gateway", "default")
+            .find("my-gateway", "default")
             .expect("unknown provider entry should remain configured");
         assert_eq!(model_cfg.model.as_deref(), Some("gateway-large"));
     }
@@ -2178,7 +2174,7 @@ mod tests {
         let model_cfg = cfg
             .providers
             .models
-            .get_base_for_alias("anthropic", "default")
+            .find("anthropic", "default")
             .expect("anthropic.default entry should be seeded");
         assert_eq!(model_cfg.model.as_deref(), Some("claude-opus-4-7"));
         assert_eq!(model_cfg.api_key.as_deref(), Some("sk-ant-test"));
@@ -2452,9 +2448,8 @@ mod tests {
         let mut cfg = test_cfg(&temp);
         cfg.providers
             .models
-            .entry("anthropic".into())
-            .or_default()
-            .insert("work".to_string(), ModelProviderConfig::default());
+            .anthropic
+            .insert("work".into(), AnthropicModelProviderConfig::default());
 
         let mut ui = QuickUi::new().with("Model", "claude-opus-4-7");
         prompt_model(&mut cfg, &mut ui, "providers.models.anthropic.work")
@@ -2464,7 +2459,7 @@ mod tests {
         let work_model = cfg
             .providers
             .models
-            .get_base_for_alias("anthropic", "work")
+            .find("anthropic", "work")
             .and_then(|c| c.model.as_deref());
         assert_eq!(
             work_model,
@@ -2475,7 +2470,7 @@ mod tests {
         let default_model = cfg
             .providers
             .models
-            .get_base_for_alias("anthropic", "default")
+            .find("anthropic", "default")
             .and_then(|c| c.model.as_deref());
         assert!(
             default_model.is_none(),
@@ -2491,18 +2486,17 @@ mod tests {
         let mut cfg = test_cfg(&temp);
 
         // Pre-seed an existing alias with a known api_key.
-        cfg.providers
-            .models
-            .entry("anthropic".into())
-            .or_default()
-            .insert(
-                "my-alias".to_string(),
-                ModelProviderConfig {
+        cfg.providers.models.anthropic.insert(
+            "my-alias".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
                     api_key: Some("sk-original".into()),
                     model: Some("claude-opus-4-7".into()),
                     ..Default::default()
                 },
-            );
+                ..Default::default()
+            },
+        );
 
         // Drive providers(): pick anthropic, pick "my-alias" (existing), ESC at api-key.
         // The loop should continue (not remove the entry) because is_new_entry = false.
@@ -2520,7 +2514,7 @@ mod tests {
         let alias_cfg = cfg
             .providers
             .models
-            .get_base_for_alias("anthropic", "my-alias")
+            .find("anthropic", "my-alias")
             .expect("my-alias must survive ESC on an existing entry");
         assert_eq!(
             alias_cfg.api_key.as_deref(),
@@ -2550,10 +2544,7 @@ mod tests {
             .await
             .unwrap();
 
-        let entry = cfg
-            .providers
-            .models
-            .get_base_for_alias("anthropic", "fresh");
+        let entry = cfg.providers.models.find("anthropic", "fresh");
         assert!(
             entry.is_none(),
             "in-progress 'fresh' alias must be removed after ESC (never persisted)"
@@ -2613,10 +2604,9 @@ mod tests {
     fn create_map_key_rejects_invalid_on_providers_double_nested() {
         let temp = TempDir::new().unwrap();
         let mut cfg = test_cfg(&temp);
-        // First create the outer type bucket.
-        cfg.providers
-            .models
-            .insert("anthropic".into(), Default::default());
+        // The typed `anthropic` slot is already declared on `ModelProviders`;
+        // no insert needed to access it. The test below verifies that a dotted
+        // alias key is rejected by `create_map_key`.
         // Now try to add an alias with a dot in the name.
         let result = cfg.create_map_key("providers.models.anthropic", "my.alias");
         assert!(
@@ -2624,7 +2614,7 @@ mod tests {
             "dot in double-nested alias must be rejected"
         );
         assert!(
-            !cfg.providers.models["anthropic"].contains_key("my.alias"),
+            !cfg.providers.models.find("anthropic", "my.alias").is_some(),
             "no entry should be inserted into the inner map"
         );
     }
@@ -2660,14 +2650,12 @@ mod tests {
         let mut cfg = test_cfg(&temp);
         cfg.providers
             .models
-            .entry("anthropic".into())
-            .or_default()
-            .insert("default".into(), ModelProviderConfig::default());
+            .anthropic
+            .insert("default".into(), AnthropicModelProviderConfig::default());
         cfg.providers
             .models
-            .entry("anthropic".into())
-            .or_default()
-            .insert("work".into(), ModelProviderConfig::default());
+            .anthropic
+            .insert("work".into(), AnthropicModelProviderConfig::default());
 
         let mut keys = cfg
             .get_map_keys("providers.models.anthropic")
