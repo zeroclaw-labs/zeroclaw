@@ -278,6 +278,16 @@ pub struct AcpServer {
     /// Per-session cancellation tokens for aborting in-flight `session/prompt`
     /// turns. Lives outside `Session`'s inner `Mutex` so `session/cancel` can
     /// fire the token without waiting for the turn to release the inner lock.
+    ///
+    /// **Single-turn-per-session invariant:** this map holds at most one token
+    /// per `session_id` because the ACP protocol does not pipeline multiple
+    /// `session/prompt` calls on the same session — each prompt must complete
+    /// (or be cancelled) before the next one is sent. A second `session/prompt`
+    /// arriving while the first is in flight would overwrite turn 1's token in
+    /// this map, so a `session/cancel` fired between the overwrite and turn 1's
+    /// completion would silently target turn 2 instead. The worst-case outcome
+    /// is "cancel doesn't take" rather than data corruption. If pipelining is
+    /// needed in the future, the key should become `(session_id, turn_id)`.
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
 }
 
@@ -637,11 +647,14 @@ impl AcpServer {
         // Create a cancellation token for this turn and register it so that a
         // concurrent `session/cancel` notification can fire it without waiting
         // for the inner session lock (which is held for the full turn duration).
+        // The lock can never be poisoned — all critical sections guarded by this
+        // mutex are short, infallible HashMap operations (insert/remove/get)
+        // that never call user code, panic, or block on I/O.
         let cancel_token = tokio_util::sync::CancellationToken::new();
         {
             self.cancel_tokens
                 .lock()
-                .expect("cancel_tokens lock poisoned")
+                .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
                 .insert(session_id.clone(), cancel_token.clone());
         }
 
@@ -675,10 +688,11 @@ impl AcpServer {
         }
 
         // Remove the cancel token regardless of outcome — the turn is over.
+        // Lock poisoned invariant: same as the insert site above.
         {
             self.cancel_tokens
                 .lock()
-                .expect("cancel_tokens lock poisoned")
+                .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
                 .remove(&session_id);
         }
 
@@ -791,10 +805,16 @@ impl AcpServer {
     /// Fires the cancellation token for the named session's active turn, if
     /// one is running. Idempotent — silently succeeds when there is no active
     /// turn. The return value is ignored for notifications.
+    ///
+    /// Cancel-vs-stop interaction: if `session/cancel` and `session/stop` fire
+    /// nearly simultaneously, both handlers race — cancel fires the token
+    /// (which may or may not interrupt the turn), and stop sets
+    /// `session.stopped = true` and awaits the turn handle. The net effect is
+    /// harmless: either the turn sees the cancellation token or it doesn't, and
+    /// stop always waits for the turn to finish.
     async fn handle_session_cancel(&self, params: &Value) -> RpcResult {
         let session_id = params
             .get("sessionId")
-            .or_else(|| params.get("session_id"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
@@ -805,7 +825,7 @@ impl AcpServer {
         let token = self
             .cancel_tokens
             .lock()
-            .expect("cancel_tokens lock poisoned")
+            .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
             .get(session_id)
             .cloned();
 
@@ -1612,10 +1632,12 @@ mod tests {
         );
     }
 
-    /// After a normal (non-cancelled) turn, the cancel token must be removed from
-    /// `cancel_tokens` so that the map doesn't leak entries across turns.
+    /// Verify that inserting and removing a cancel token from the map works
+    /// correctly. This tests map mechanics directly rather than the
+    /// `handle_session_prompt` lifecycle, so a regression in the production
+    /// path's cleanup wouldn't be caught by this test.
     #[tokio::test]
-    async fn cancel_token_removed_after_successful_turn() {
+    async fn cancel_tokens_map_remove_works() {
         let cwd = tempfile::tempdir().unwrap();
         let config = Config {
             workspace_dir: cwd.path().to_path_buf(),
@@ -1623,8 +1645,7 @@ mod tests {
         };
         let server = Arc::new(AcpServer::new(config, AcpServerConfig::default()));
 
-        // Simulate an active turn by inserting a token directly, then removing it
-        // (mirrors what handle_session_prompt does on turn completion).
+        // Insert and remove a token directly.
         let session_id = "sess_token_leak_test".to_string();
         let token = tokio_util::sync::CancellationToken::new();
         server
@@ -1633,7 +1654,7 @@ mod tests {
             .expect("cancel_tokens lock poisoned")
             .insert(session_id.clone(), token);
 
-        // Simulate turn completion cleanup.
+        // Remove the token.
         server
             .cancel_tokens
             .lock()
