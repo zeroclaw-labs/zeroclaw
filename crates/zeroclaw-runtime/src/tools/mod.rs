@@ -702,11 +702,16 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
-    // Session tools (JSONL path). If a separate SQLite registration path is
-    // added, these tools need to be registered there too.
-    if let Ok(session_store) = zeroclaw_infra::session_store::SessionStore::new(workspace_dir) {
+    // Session tools (SQLite path). The gateway WebSocket handler persists
+    // sessions to SqliteSessionBackend (sessions/sessions.db with `gw_` prefix);
+    // initializing the tools with the JSONL SessionStore made sessions_list /
+    // sessions_history return empty for any gateway session. Both backends
+    // implement the SessionBackend trait with the same `new(&Path)` signature.
+    if let Ok(sqlite_backend) =
+        zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(workspace_dir)
+    {
         let backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
-            Arc::new(session_store);
+            Arc::new(sqlite_backend);
         tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsHistoryTool::new(
