@@ -768,6 +768,15 @@ pub struct ModelProviderConfig {
     /// Path to a custom CA certificate file for TLS connections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca_cert_path: Option<String>,
+    /// Override the provider's default for native tool calling.
+    /// `None` (default) honors the provider's built-in choice. `Some(true)`
+    /// forces native tool calls on, `Some(false)` forces text-fallback.
+    /// Currently consulted only by the Groq factory, which defaults to
+    /// text-fallback because llama-family Groq models reject native tool
+    /// calls with HTTP 400 (#5848). Setting `native_tools = true` re-enables
+    /// native tool calling for Groq models that support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_tools: Option<bool>,
 }
 
 // ── Per-family model model_provider configs ────────────────────────────
