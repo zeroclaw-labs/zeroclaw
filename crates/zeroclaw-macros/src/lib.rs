@@ -18,14 +18,28 @@ fn is_compound_type(ty: &syn::Type) -> bool {
 
 /// Check if any `#[serde(...)]` attribute on the field contains `skip`.
 fn has_serde_skip(field: &syn::Field) -> bool {
+    has_serde_meta(field, "skip")
+}
+
+/// Check if any `#[serde(...)]` attribute on the field contains `flatten`.
+///
+/// A `#[serde(flatten)]` struct field has its inner fields appear at the same
+/// TOML level as the wrapper. The Configurable derive treats such a field as
+/// inheritance: the wrapper's `prop_fields` / `get_prop` / `set_prop` /
+/// `secret_fields` / `prop_is_secret` delegate to the flattened struct after
+/// translating the wrapper's prefix into the flattened struct's own prefix.
+fn has_serde_flatten(field: &syn::Field) -> bool {
+    has_serde_meta(field, "flatten")
+}
+
+fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
     for attr in &field.attrs {
         if attr.path().is_ident("serde") {
-            // Parse the token stream inside the parens and look for `skip`
             if let Ok(nested) = attr.parse_args_with(
                 syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
             ) {
                 for meta in &nested {
-                    if meta.path().is_ident("skip") {
+                    if meta.path().is_ident(ident) {
                         return true;
                     }
                 }
@@ -178,6 +192,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let field_ident = field.ident.as_ref().expect("Named field must have ident");
         let is_secret = has_attr(field, "secret");
         let is_nested = has_attr(field, "nested");
+        let is_serde_flatten = has_serde_flatten(field);
         let serde_skip = has_serde_skip(field);
         let derived_from_secret = has_attr(field, "derived_from_secret");
 
@@ -963,28 +978,126 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     self.#field_ident.restore_secrets_from(&current.#field_ident);
                 });
 
-                // ── Nested property delegation (non-Option) ──
-                nested_prop_fields.push(quote! {
-                    fields.extend(self.#field_ident.prop_fields());
-                });
-                nested_get_prop.push(quote! {
-                    if let Ok(val) = self.#field_ident.get_prop(name) {
-                        return Ok(val);
-                    }
-                });
-                nested_set_prop.push(quote! {
-                    if let Ok(()) = self.#field_ident.set_prop(name, value_str) {
-                        return Ok(());
-                    }
-                });
-
-                // Get the field type for static method dispatch
+                // For `#[serde(flatten)]` struct fields, the inner struct's
+                // fields appear at the same TOML level as the wrapper. Generate
+                // prefix-translating delegation: prop_fields rename inner names
+                // from inner-prefix to wrapper-prefix; get_prop/set_prop strip
+                // wrapper-prefix and re-add inner-prefix before delegating.
+                // Without this, paths look like
+                // `<wrapper-prefix>.<inner-field-name>` from prop_fields() but
+                // `<inner-prefix>.<inner-field-name>` from inner.get_prop() —
+                // the two never agree and routing fails.
                 let field_ty = &field.ty;
-                nested_prop_is_secret.push(quote! {
-                    if <#field_ty>::prop_is_secret(name) {
-                        return true;
-                    }
-                });
+                if is_serde_flatten {
+                    nested_prop_fields.push(quote! {
+                        {
+                            let outer_prefix = Self::configurable_prefix();
+                            let inner_prefix = <#field_ty>::configurable_prefix();
+                            for mut field in self.#field_ident.prop_fields() {
+                                let leaf = if inner_prefix.is_empty() {
+                                    field.name.as_str()
+                                } else {
+                                    field.name
+                                        .strip_prefix(inner_prefix)
+                                        .and_then(|s| s.strip_prefix('.'))
+                                        .unwrap_or(field.name.as_str())
+                                };
+                                field.name = if outer_prefix.is_empty() {
+                                    leaf.to_string()
+                                } else if leaf.is_empty() {
+                                    outer_prefix.to_string()
+                                } else {
+                                    format!("{outer_prefix}.{leaf}")
+                                };
+                                fields.push(field);
+                            }
+                        }
+                    });
+                    nested_get_prop.push(quote! {
+                        {
+                            let outer_prefix = Self::configurable_prefix();
+                            let inner_prefix = <#field_ty>::configurable_prefix();
+                            let leaf = if outer_prefix.is_empty() {
+                                Some(name)
+                            } else {
+                                name.strip_prefix(outer_prefix).and_then(|s| s.strip_prefix('.'))
+                            };
+                            if let Some(leaf) = leaf {
+                                let inner_name = if inner_prefix.is_empty() {
+                                    leaf.to_string()
+                                } else {
+                                    format!("{inner_prefix}.{leaf}")
+                                };
+                                if let Ok(val) = self.#field_ident.get_prop(&inner_name) {
+                                    return Ok(val);
+                                }
+                            }
+                        }
+                    });
+                    nested_set_prop.push(quote! {
+                        {
+                            let outer_prefix = Self::configurable_prefix();
+                            let inner_prefix = <#field_ty>::configurable_prefix();
+                            let leaf = if outer_prefix.is_empty() {
+                                Some(name)
+                            } else {
+                                name.strip_prefix(outer_prefix).and_then(|s| s.strip_prefix('.'))
+                            };
+                            if let Some(leaf) = leaf {
+                                let inner_name = if inner_prefix.is_empty() {
+                                    leaf.to_string()
+                                } else {
+                                    format!("{inner_prefix}.{leaf}")
+                                };
+                                if let Ok(()) = self.#field_ident.set_prop(&inner_name, value_str) {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    });
+                    nested_prop_is_secret.push(quote! {
+                        {
+                            let outer_prefix = Self::configurable_prefix();
+                            let inner_prefix = <#field_ty>::configurable_prefix();
+                            let leaf = if outer_prefix.is_empty() {
+                                Some(name)
+                            } else {
+                                name.strip_prefix(outer_prefix).and_then(|s| s.strip_prefix('.'))
+                            };
+                            if let Some(leaf) = leaf {
+                                let inner_name = if inner_prefix.is_empty() {
+                                    leaf.to_string()
+                                } else {
+                                    format!("{inner_prefix}.{leaf}")
+                                };
+                                if <#field_ty>::prop_is_secret(&inner_name) {
+                                    return true;
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    // ── Nested property delegation (non-Option, non-flatten) ──
+                    nested_prop_fields.push(quote! {
+                        fields.extend(self.#field_ident.prop_fields());
+                    });
+                    nested_get_prop.push(quote! {
+                        if let Ok(val) = self.#field_ident.get_prop(name) {
+                            return Ok(val);
+                        }
+                    });
+                    nested_set_prop.push(quote! {
+                        if let Ok(()) = self.#field_ident.set_prop(name, value_str) {
+                            return Ok(());
+                        }
+                    });
+
+                    nested_prop_is_secret.push(quote! {
+                        if <#field_ty>::prop_is_secret(name) {
+                            return true;
+                        }
+                    });
+                }
 
                 // init_defaults for non-Option nested: delegate
                 init_defaults_ops.push(quote! {
