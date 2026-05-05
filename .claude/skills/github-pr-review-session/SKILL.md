@@ -30,6 +30,8 @@ Read these files at the start of every session. They are authoritative.
   issue format conventions, definition of done (§9–10)
 - `docs/book/src/foundations/fnd-005-contribution-culture.md` — review voice,
   feedback taxonomy, and the norms every review must follow
+- `docs/book/src/contributing/pr-review-protocol.md` — review body Markdown
+  format, including H3 taxonomy headings and draft-delivery preference
 - `tmp/handoff.md` — session state; tells you which PRs are already reviewed,
   what's still open, and what's next in the queue
 
@@ -94,7 +96,9 @@ The protocol specifies:
 - **How to cross-check** the diff against local source files
 - **The take-stock checkpoint** before writing anything
 - **The verdict decision tree** — which flag to use based on review state
-- **The feedback taxonomy** (🔴 / 🟡 / ✅ / 🔵 / 🟢) and how to apply it
+- **The feedback taxonomy** (🔴 / 🟡 / ✅ / 🔵 / 🟢), including the required
+  H3 review-body heading format that starts each formal finding with the
+  taxonomy emoji
 - **The posting convention** (write to `tmp/review-<number>.md`, post with
   `--body-file`)
 
@@ -104,13 +108,15 @@ fetches sequentially wastes time and the results are independent.
 ### Phase 3 — Write and post
 
 1. Write the review body to `tmp/review-<number>.md`.
-2. Post using the verdict flag from the decision tree:
+2. Apply the required Markdown style guidance from `docs/book/src/contributing/pr-review-protocol.md` before showing or posting the draft. Confirm the context intro is present, each formal finding heading is an H3 that starts with the required taxonomy emoji, prose is not accidentally hard-wrapped, and the review has had a plain-language pass.
+3. Show the draft to the active reviewer before posting. Prefer a link to `tmp/review-<number>.md` plus a short summary; if the full draft needs to be inline, paste it as regular text rather than wrapping the whole review in a fenced Markdown block.
+4. Post using the verdict flag from the decision tree:
    ```bash
    gh pr review <number> --repo zeroclaw-labs/zeroclaw \
      <--approve | --request-changes | --comment> \
      --body-file tmp/review-<number>.md
    ```
-3. Confirm the post succeeded.
+5. Confirm the post succeeded.
 
 ### Phase 3.5 — Milestone alignment
 
@@ -233,13 +239,22 @@ These norms are documented in
 4. **Always write to `tmp/review-<number>.md` before posting.** The tmp file
    is the source of truth for what was posted. It also lets you inspect before
    posting if the user asks.
-5. **Always run milestone alignment after posting**, unless the PR is a
+5. **Always apply the Markdown style guide before showing or posting public text.**
+   Use `docs/book/src/contributing/pr-review-protocol.md` for reviews, comments,
+   PR bodies, checklist notes, and handoff notes. This is a required drafting
+   step, not optional cleanup. Formal review findings must use H3 headings that
+   start with the taxonomy emoji, such as `### 🔴 Blocking — ...`; headings such
+   as `### Blocking — ...` or numbered findings do not satisfy the protocol.
+6. **Always show drafts to the active reviewer as a file link or regular text by default.**
+   Do not wrap an entire public review/comment/PR draft in a fenced Markdown
+   block unless the active reviewer explicitly asks for that format.
+7. **Always run milestone alignment after posting**, unless the PR is a
    documented no-milestone type (`chore:`/`deps:` prefix or deps-only diff).
    Note the skip reason in the handoff when bypassing.
-6. **Always update `tmp/handoff.md` after posting.** The handoff is useless if
+8. **Always update `tmp/handoff.md` after posting.** The handoff is useless if
    it's not current. Include the milestone alignment outcome.
-7. **Never merge.** Never push to contributor branches.
-8. **Never approve over another reviewer's active CHANGES_REQUESTED.**
+9. **Never merge.** Never push to contributor branches.
+10. **Never approve over another reviewer's active CHANGES_REQUESTED.**
    Check the reviews API output before choosing a verdict flag.
-9. **Never post a review that re-raises a settled point** without explicitly
+11. **Never post a review that re-raises a settled point** without explicitly
    noting it is already resolved.

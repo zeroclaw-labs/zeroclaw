@@ -89,6 +89,33 @@ Note: commits from the API are in API order, which is typically chronological bu
 
 ### Step 3: Derive the Squash Commit Subject
 
+Before deriving the final merge command, sanitize the squash commit body. Source
+commits and PR bodies may contain AI or bot `Co-authored-by` trailers, or
+generated footers such as `Created with Claude Code`, but the landed squash
+commit on `master` should not attribute authorship to tools or bots. Strip those
+bot/AI trailers and generated footers from `$COMMITS`; preserve intentional
+human co-author trailers when they credit incorporated code or design work.
+
+Strip any `Co-authored-by` / `Co-Authored-By` line where the name or email
+identifies an AI tool, model, automation account, or bot, including:
+
+- `Claude`, `Codex`, `ChatGPT`, `Copilot`, `GitHub Copilot`, `Gemini`
+- names matching `gpt-*`, `claude-*`, `gemini-*`, or `copilot-*`
+- names or emails containing `[bot]`, `dependabot`, `github-actions`,
+  `web-flow`, or `blacksmith`
+- `noreply@anthropic.com` or `noreply@openai.com`
+- generated footers such as `Created with Claude Code` or
+  `Generated with Claude Code`
+
+After sanitizing, run a quick body check before asking for merge confirmation:
+
+```bash
+printf '%s\n' "$COMMITS" | rg -i '(^[[:space:]]*(Co-authored-by|Co-Authored-By):.*(Claude|Codex|ChatGPT|Copilot|GitHub Copilot|Gemini|\[bot\]|dependabot|github-actions|web-flow|blacksmith|noreply@(anthropic|openai)\.com)|^[[:space:]]*(Created with Claude Code|Generated with Claude Code)[[:space:]]*$)'
+```
+
+If this prints anything, stop and strip the remaining bot attribution or
+generated footer before continuing.
+
 ```bash
 PR_TITLE=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json title --jq '.title')
 SUBJECT="${PR_TITLE} (#${NUMBER})"
@@ -119,6 +146,8 @@ gh pr merge $NUMBER --repo zeroclaw-labs/zeroclaw --squash \
   ```
   $COMMITS
   ```
+- Bot/AI co-author trailers and generated tool footers have been stripped from
+  the squash commit body.
 
 Run this command? (yes/no)
 
@@ -158,6 +187,7 @@ Report to the user: merge commit SHA and PR URL.
 - **Never push squash commits directly to `upstream/master`** — always use `gh pr merge`. Direct push produces "Closed" not "Merged", breaks issue auto-close, and loses PR association.
 - **Never use `gh pr merge --squash` without `--subject` and `--body`** — the auto-generated message omits the PR number and uses inconsistent formatting.
 - **Never let GitHub auto-generate the squash message** — no web UI merge, no merge button clicks.
+- **Always strip bot/AI attribution from the squash body** — remove `Co-authored-by` trailers for Claude, Codex, Copilot, ChatGPT, Gemini, automation accounts, and bots before confirmation. Also remove generated tool footers such as `Created with Claude Code` / `Generated with Claude Code`. Preserve intentional human co-author trailers.
 - **Always assign PR title and commit body to shell variables** — never interpolate untrusted content directly into quoted command arguments.
 - **Always run pre-flight checks** (merge conflicts, review decision) before confirming — do not skip them even if the user says "just merge it."
 - **Always confirm before merging, no exceptions** — show the user the exact expanded command with real values and require an explicit yes. Never infer consent.
