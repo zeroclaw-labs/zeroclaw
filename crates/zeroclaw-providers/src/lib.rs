@@ -753,22 +753,22 @@ pub fn provider_runtime_options_from_provider_entry(
     // this lookup based on URL match rather than identity because the entry
     // we were given may itself originate from any of those profiles.
     let merge_system_into_user = entry
-        .and_then(|e| e.base_url.as_deref())
+        .and_then(|e| e.uri.as_deref())
         .map(str::trim)
         .filter(|u| !u.is_empty())
-        .and_then(|active_url| {
+        .and_then(|active_uri| {
             config
                 .providers
                 .models
                 .values()
                 .flat_map(|alias_map| alias_map.values())
                 .find(|p| {
-                    p.base_url
+                    p.uri
                         .as_deref()
                         .map(str::trim)
                         .filter(|u: &&str| !u.is_empty())
                         .map(|u: &str| u.trim_end_matches('/'))
-                        == Some(active_url.trim_end_matches('/'))
+                        == Some(active_uri.trim_end_matches('/'))
                 })
         })
         .map(|p| p.merge_system_into_user)
@@ -776,14 +776,17 @@ pub fn provider_runtime_options_from_provider_entry(
 
     ProviderRuntimeOptions {
         auth_profile_override: None,
-        provider_api_url: entry.and_then(|e| e.base_url.clone()),
+        provider_api_url: entry.and_then(|e| e.uri.clone()),
         zeroclaw_dir: config.config_path.parent().map(PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
         provider_timeout_secs: Some(entry.and_then(|e| e.timeout_secs).unwrap_or(120)),
         extra_headers: entry.map(|e| e.extra_headers.clone()).unwrap_or_default(),
-        api_path: entry.and_then(|e| e.api_path.clone()),
+        // api_path is gone — the schema's `uri` field is now the full endpoint URL.
+        // Runtime-side proxy-routing concatenation (uri + api_path) is no longer
+        // needed; operators set uri to the full endpoint they want hit.
+        api_path: None,
         provider_max_tokens: entry.and_then(|e| e.max_tokens),
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
@@ -1136,7 +1139,7 @@ pub fn default_provider_config(name: &str) -> zeroclaw_config::schema::ModelProv
         return ModelProviderConfig::default();
     };
     ModelProviderConfig {
-        base_url: handle.default_base_url().map(str::to_string),
+        uri: handle.default_base_url().map(str::to_string),
         temperature: Some(handle.default_temperature()),
         max_tokens: Some(handle.default_max_tokens()),
         timeout_secs: Some(handle.default_timeout_secs()),
@@ -3592,15 +3595,13 @@ mod tests {
         let default_alias = ModelProviderConfig {
             model: Some("claude-default".into()),
             api_key: Some("default-key".into()),
-            base_url: Some("https://api.default.example/v1".into()),
-            api_path: Some("/messages".into()),
+            uri: Some("https://api.default.example/v1/messages".into()),
             ..ModelProviderConfig::default()
         };
         let work_alias = ModelProviderConfig {
             model: Some("claude-work".into()),
             api_key: Some("work-key".into()),
-            base_url: Some("https://work-proxy.example/v1".into()),
-            api_path: Some("/v1/anthropic/messages".into()),
+            uri: Some("https://work-proxy.example/v1/v1/anthropic/messages".into()),
             ..ModelProviderConfig::default()
         };
         let mut anthropic_aliases = std::collections::HashMap::new();
@@ -3626,30 +3627,20 @@ mod tests {
     }
 
     #[test]
-    fn provider_runtime_options_for_agent_resolves_alias_specific_base_url() {
+    fn provider_runtime_options_for_agent_resolves_alias_specific_uri() {
         let config = config_with_two_anthropic_aliases();
         let work = provider_runtime_options_for_agent(&config, "work_agent");
         let dflt = provider_runtime_options_for_agent(&config, "default_agent");
 
         assert_eq!(
             work.provider_api_url.as_deref(),
-            Some("https://work-proxy.example/v1"),
-            "work agent must resolve to the work alias's base_url, not the first alias's"
-        );
-        assert_eq!(
-            work.api_path.as_deref(),
-            Some("/v1/anthropic/messages"),
-            "work agent must resolve to the work alias's api_path"
+            Some("https://work-proxy.example/v1/v1/anthropic/messages"),
+            "work agent must resolve to the work alias's full uri (with merged path)"
         );
         assert_eq!(
             dflt.provider_api_url.as_deref(),
-            Some("https://api.default.example/v1"),
-            "default agent must resolve to the default alias's base_url"
-        );
-        assert_eq!(
-            dflt.api_path.as_deref(),
-            Some("/messages"),
-            "default agent must resolve to the default alias's api_path"
+            Some("https://api.default.example/v1/messages"),
+            "default agent must resolve to the default alias's full uri (with merged path)"
         );
     }
 
@@ -3661,7 +3652,8 @@ mod tests {
         // guaranteed but the URL must match one of the configured aliases.
         let url = opts.provider_api_url.as_deref().unwrap_or("");
         assert!(
-            url == "https://work-proxy.example/v1" || url == "https://api.default.example/v1",
+            url == "https://work-proxy.example/v1/v1/anthropic/messages"
+                || url == "https://api.default.example/v1/messages",
             "fallback must resolve to one of the configured anthropic aliases; got `{url}`"
         );
     }

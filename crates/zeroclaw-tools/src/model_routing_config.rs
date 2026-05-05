@@ -512,7 +512,7 @@ impl ModelRoutingConfigTool {
             self.config
                 .providers
                 .first_provider()
-                .and_then(|e| e.base_url.as_deref()),
+                .and_then(|e| e.uri.as_deref()),
         ) {
             Ok(p) => p,
             Err(_) => return Ok(()),

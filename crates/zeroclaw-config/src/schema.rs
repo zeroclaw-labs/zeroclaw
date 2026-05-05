@@ -581,12 +581,9 @@ pub struct ModelProviderConfig {
     /// Override the provider type label. Rarely needed — only useful when you run two profiles against the same provider type (e.g. two different OpenAI-compatible gateways) and want to tell them apart in logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// HTTPS endpoint the client hits. Override when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a regional endpoint, or a proxy; leave unset to use the provider's public endpoint.
+    /// Endpoint URI the client hits. Override the family's default endpoint when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a custom proxy, or any non-standard URL. Leave unset to use the family's default URI from its `ModelEndpoint` impl. Set this to the FULL endpoint URL — there is no separate path-suffix field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
-    /// Path suffix appended to the base URL. Almost no one needs this — only touch it for custom reverse-proxy routing where your gateway mounts the API under a non-standard prefix.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_path: Option<String>,
+    pub uri: Option<String>,
     /// Model identifier to send with each request — the ID string from the provider's catalog (e.g. `gpt-4o`, `claude-sonnet-4-5`, `llama-3.3-70b`). Must match a model the provider actually serves on this account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -10641,20 +10638,21 @@ impl Config {
                     .as_deref()
                     .map(str::trim)
                     .is_some_and(|value| !value.is_empty());
-                let has_base_url = profile
-                    .base_url
+                let has_uri = profile
+                    .uri
                     .as_deref()
                     .map(str::trim)
                     .is_some_and(|value| !value.is_empty());
 
                 // Entries created by migration from top-level fields use the provider
-                // name as the map key and may not have explicit `name` or `base_url`
-                // (the provider factory resolves known names). An entry with no
-                // identifying information at all is almost always an in-progress
-                // onboarding state — the user picked the provider but hasn't filled
-                // anything in yet. Warn but don't bail; the runtime falls back to
-                // provider-trait defaults at use time, and a chat against the
-                // unconfigured provider fails with a clear error then.
+                // name as the map key and may not have explicit `name` or `uri`
+                // (the provider factory resolves the family's default endpoint via
+                // `ModelEndpoint`). An entry with no identifying information at
+                // all is almost always an in-progress onboarding state — the user
+                // picked the provider but hasn't filled anything in yet. Warn but
+                // don't bail; the runtime falls back to family-default endpoint at
+                // use time, and a chat against the unconfigured provider fails
+                // with a clear error then.
                 let has_api_key = profile
                     .api_key
                     .as_deref()
@@ -10663,25 +10661,25 @@ impl Config {
                     .model
                     .as_deref()
                     .is_some_and(|v| !v.trim().is_empty());
-                if !has_name && !has_base_url && !has_api_key && !has_model {
+                if !has_name && !has_uri && !has_api_key && !has_model {
                     tracing::warn!(
                         provider = %profile_name,
-                        "providers.models.{profile_name} is empty (no name / base_url / api_key / model). \
+                        "providers.models.{profile_name} is empty (no name / uri / api_key / model). \
                          Skipping at runtime; finish onboarding via the dashboard or `zeroclaw onboard` \
                          to make this provider usable.",
                     );
                     continue;
                 }
 
-                if let Some(base_url) = profile.base_url.as_deref().map(str::trim)
-                    && !base_url.is_empty()
+                if let Some(uri) = profile.uri.as_deref().map(str::trim)
+                    && !uri.is_empty()
                 {
-                    let parsed = reqwest::Url::parse(base_url).with_context(|| {
-                        format!("model_providers.{profile_name}.base_url is not a valid URL")
+                    let parsed = reqwest::Url::parse(uri).with_context(|| {
+                        format!("model_providers.{profile_name}.uri is not a valid URL")
                     })?;
                     if !matches!(parsed.scheme(), "http" | "https") {
                         anyhow::bail!(
-                            "model_providers.{profile_name}.base_url must use http/https"
+                            "model_providers.{profile_name}.uri must use http/https"
                         );
                     }
                 }
@@ -10737,9 +10735,9 @@ impl Config {
                     .is_some_and(|m| m.trim().ends_with(":cloud"))
             })
         {
-            if is_local_ollama_endpoint(entry.base_url.as_deref()) {
+            if is_local_ollama_endpoint(entry.uri.as_deref()) {
                 anyhow::bail!(
-                    "default_model uses ':cloud' with provider 'ollama', but api_url is local or unset. Set api_url to a remote Ollama endpoint (for example https://ollama.com)."
+                    "default_model uses ':cloud' with provider 'ollama', but uri is local or unset. Set uri to a remote Ollama endpoint (for example https://ollama.com)."
                 );
             }
             if !has_ollama_cloud_credential(entry.api_key.as_deref()) {
@@ -14171,10 +14169,9 @@ requires_openai_auth = true
                 "default".to_string(),
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
-                    base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    uri: Some("https://api.tonsof.blue/v1".to_string()),
                     wire_api: None,
                     requires_openai_auth: false,
-                    api_path: None,
                     max_tokens: None,
                     ..Default::default()
                 },
@@ -14186,7 +14183,7 @@ requires_openai_auth = true
                 .models
                 .get("sub2api")
                 .and_then(|m| m.get("default"))
-                .and_then(|e| e.base_url.as_deref()),
+                .and_then(|e| e.uri.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
         assert!(config.providers.first_provider().is_some());
@@ -14205,10 +14202,9 @@ requires_openai_auth = true
                 "default".to_string(),
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
-                    base_url: Some("https://api.tonsof.blue".to_string()),
+                    uri: Some("https://api.tonsof.blue".to_string()),
                     wire_api: Some("responses".to_string()),
                     requires_openai_auth: true,
-                    api_path: None,
                     max_tokens: None,
                     ..Default::default()
                 },
@@ -14220,7 +14216,7 @@ requires_openai_auth = true
             .get("sub2api")
             .and_then(|m| m.get("default"))
             .expect("sub2api.default entry");
-        assert_eq!(entry.base_url.as_deref(), Some("https://api.tonsof.blue"));
+        assert_eq!(entry.uri.as_deref(), Some("https://api.tonsof.blue"));
         assert_eq!(entry.wire_api.as_deref(), Some("responses"));
         assert!(entry.requires_openai_auth);
     }
@@ -14392,7 +14388,7 @@ model = "primary-model"
                 "default".to_string(),
                 ModelProviderConfig {
                     model: Some("glm-5:cloud".to_string()),
-                    base_url: None,
+                    uri: None,
                     api_key: Some("ollama-key".to_string()),
                     ..Default::default()
                 },
@@ -14400,7 +14396,7 @@ model = "primary-model"
 
         let error = config.validate().expect_err("expected validation to fail");
         assert!(error.to_string().contains(
-            "default_model uses ':cloud' with provider 'ollama', but api_url is local or unset"
+            "default_model uses ':cloud' with provider 'ollama', but uri is local or unset"
         ));
     }
 
@@ -14417,7 +14413,7 @@ model = "primary-model"
                 "default".to_string(),
                 ModelProviderConfig {
                     model: Some("glm-5:cloud".to_string()),
-                    base_url: Some("https://ollama.com/api".to_string()),
+                    uri: Some("https://ollama.com/api".to_string()),
                     api_key: None,
                     ..Default::default()
                 },
@@ -14445,10 +14441,9 @@ model = "primary-model"
                 "default".to_string(),
                 ModelProviderConfig {
                     name: Some("sub2api".to_string()),
-                    base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    uri: Some("https://api.tonsof.blue/v1".to_string()),
                     wire_api: Some("ws".to_string()),
                     requires_openai_auth: false,
-                    api_path: None,
                     max_tokens: None,
                     ..Default::default()
                 },

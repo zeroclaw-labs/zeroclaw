@@ -886,7 +886,7 @@ fn runtime_defaults_from_config(
         model,
         temperature: entry.and_then(|e| e.temperature).unwrap_or(0.7),
         api_key: entry.and_then(|e| e.api_key.clone()),
-        api_url: entry.and_then(|e| e.base_url.clone()),
+        api_url: entry.and_then(|e| e.uri.clone()),
         reliability: config.reliability.clone(),
     })
 }
@@ -5278,7 +5278,7 @@ pub async fn start_channels(
         create_resilient_provider_nonblocking(
             &provider_name,
             agent_provider_entry.and_then(|e| e.api_key.clone()),
-            agent_provider_entry.and_then(|e| e.base_url.clone()),
+            agent_provider_entry.and_then(|e| e.uri.clone()),
             config.reliability.clone(),
             provider_runtime_options.clone(),
         )
@@ -5740,7 +5740,7 @@ pub async fn start_channels(
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_key: agent_provider_entry.and_then(|e| e.api_key.clone()),
-        api_url: agent_provider_entry.and_then(|e| e.base_url.clone()),
+        api_url: agent_provider_entry.and_then(|e| e.uri.clone()),
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),

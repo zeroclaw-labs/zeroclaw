@@ -1047,8 +1047,8 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, prefix: &str) ->
         None => (prefix.to_string(), None),
     };
     let api_key = profile.and_then(|entry| entry.api_key.as_deref());
-    let configured_base_url = profile.and_then(|entry| entry.base_url.as_deref());
-    let discovery_base_url = openai_compat_discovery_base_url(&provider, configured_base_url);
+    let configured_uri = profile.and_then(|entry| entry.uri.as_deref());
+    let discovery_base_url = openai_compat_discovery_base_url(&provider, configured_uri);
     let should_try_openai_compat =
         provider.trim().starts_with("custom:") || !is_known_provider_name(&provider);
 
@@ -2160,7 +2160,7 @@ mod tests {
                 "default".to_string(),
                 ModelProviderConfig {
                     api_key: Some("sk-gateway-test".into()),
-                    base_url: Some(base_url),
+                    uri: Some(base_url),
                     ..Default::default()
                 },
             );

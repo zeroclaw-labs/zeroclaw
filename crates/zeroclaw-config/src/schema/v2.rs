@@ -22,10 +22,13 @@
 //!   `model_provider = "<provider>.agent_<id>"` alias reference
 //! - **V1/V2 `(custom|anthropic-custom):<url>` colon-URL provider strings**
 //!   → split during migration: the prefix becomes the V3 provider type key,
-//!   the URL lands in the alias entry's `base_url`. This avoids embedding a
+//!   the URL lands in the alias entry's `uri`. This avoids embedding a
 //!   dot-bearing string into the V3 `<type>.<alias>` reference grammar
 //!   (`split_once('.')` would otherwise tokenize at the first URL dot, e.g.
 //!   inside `api.z.ai`, instead of the type/alias boundary).
+//! - **V2 per-entry `base_url` + `api_path` → V3 `uri`** (full endpoint URL).
+//!   Migration concatenates `base_url + api_path` (with leading `/` if needed,
+//!   trailing `/` stripped from base) and writes the result into `uri`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -409,14 +412,14 @@ fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
             ("anthropic".to_string(), "claude-code".to_string())
         } else {
             // Colon-URL form like `"anthropic-custom:https://..."`: split
-            // the URL out into `base_url` and use only the prefix as the V3
+            // the URL out into `uri` and use only the prefix as the V3
             // outer key. Avoids dot-bearing keys that would break the
             // `<type>.<alias>` reference grammar (#6266 review).
             let (type_key, url) = split_colon_url_provider(&provider_id);
             if let Some(url) = url
                 && let toml::Value::Table(t) = &mut config
             {
-                t.entry("base_url".to_string())
+                t.entry("uri".to_string())
                     .or_insert(toml::Value::String(url));
             }
             (type_key, "default".to_string())
@@ -435,7 +438,7 @@ fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
 /// onto the V3 per-provider `ModelProviderConfig` entry.
 ///
 /// Field renames applied during the fold:
-/// - `api_url` → `base_url` (matches V3 `ModelProviderConfig.base_url`)
+/// - `api_url` (+ optional `api_path` suffix) → `uri` (matches V3 `ModelProviderConfig.uri`)
 /// - `default_model` → `model`
 /// - `default_temperature` → `temperature`
 /// - `provider_timeout_secs` → `timeout_secs`
@@ -515,13 +518,28 @@ fn fold_providers_globals_into_models(
     // precedence over the global `api_url` field — both originate from V2's
     // top-level providers block, but the colon-URL form was the more specific
     // hint when the user wrote `default_provider = "anthropic-custom:<url>"`.
+    // V3's `uri` field is the full endpoint URL — concatenate any V2 `api_path`
+    // suffix onto it, since `api_path` no longer exists separately.
     let base_url_source = colon_url.map(toml::Value::String).or(g_api_url);
+    let uri_source = match (base_url_source, g_api_path) {
+        (Some(toml::Value::String(b)), Some(toml::Value::String(p))) => {
+            let trimmed_b = b.trim_end_matches('/');
+            let suffix = if p.starts_with('/') {
+                p
+            } else {
+                format!("/{p}")
+            };
+            Some(toml::Value::String(format!("{trimmed_b}{suffix}")))
+        }
+        (Some(b), _) => Some(b),
+        // api_path alone, without a base, has nowhere to live in V3 — drop.
+        (None, _) => None,
+    };
 
     // Per-provider entries take precedence: only fill missing slots.
     for (target_key, source) in [
         ("api_key", g_api_key),
-        ("base_url", base_url_source),
-        ("api_path", g_api_path),
+        ("uri", uri_source),
         ("model", g_default_model),
         ("temperature", g_default_temperature),
         ("timeout_secs", g_provider_timeout_secs),
@@ -898,14 +916,14 @@ fn synthesize_agent_brains(
         let temperature = agent_table.remove("temperature");
         if let Some(toml::Value::String(raw_provider)) = provider {
             // Colon-URL form: split the URL out so the V3 outer key stays
-            // dot-free and the URL lands in `base_url` on the alias entry
+            // dot-free and the URL lands in `uri` on the alias entry
             // (#6266 review — `split_once('.')` would otherwise tokenize at
             // a URL dot like the one inside `api.z.ai`).
             let (provider_type, colon_url) = split_colon_url_provider(&raw_provider);
             let provider_alias = format!("agent_{}", alias);
             let mut entry = toml::Table::new();
             if let Some(url) = colon_url {
-                entry.insert("base_url".to_string(), toml::Value::String(url));
+                entry.insert("uri".to_string(), toml::Value::String(url));
             }
             if let Some(m) = model {
                 entry.insert("model".to_string(), m);

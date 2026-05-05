@@ -481,7 +481,7 @@ pub async fn run_gateway(
                 .first_provider_type()
                 .unwrap_or("openrouter"),
             fallback.and_then(|e| e.api_key.as_deref()),
-            fallback.and_then(|e| e.base_url.as_deref()),
+            fallback.and_then(|e| e.uri.as_deref()),
             &config.reliability,
             &zeroclaw_providers::provider_runtime_options_from_config(&config),
         )?);

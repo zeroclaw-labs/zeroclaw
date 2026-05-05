@@ -90,9 +90,10 @@ fn v1_default_provider_target_holds_globals() {
         .expect("openai.default entry synthesized from V1 default_provider");
     assert_eq!(entry.api_key.as_deref(), Some("sk-v1-test-global"));
     assert_eq!(
-        entry.base_url.as_deref(),
-        Some("https://api.example.com/v1"),
-        "V1 api_url renamed to base_url on the per-provider entry"
+        entry.uri.as_deref(),
+        Some("https://api.example.com/v1/chat/completions"),
+        "V1 api_url + api_path merged into the per-provider entry's uri \
+         (uri is now the full endpoint URL; api_path no longer exists)"
     );
     assert_eq!(entry.model.as_deref(), Some("gpt-4o-mini"));
     assert_eq!(entry.temperature, Some(0.5));
@@ -1036,9 +1037,9 @@ api_key = "sk-zai-test"
             "V3 outer key must be the dot-free prefix `anthropic-custom`, not the raw colon-URL string",
         );
     assert_eq!(
-        entry.base_url.as_deref(),
+        entry.uri.as_deref(),
         Some("https://api.z.ai/api/anthropic"),
-        "the URL portion of the V2 colon-URL form must land in base_url on the alias entry"
+        "the URL portion of the V2 colon-URL form must land in uri on the alias entry"
     );
     assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4"));
     assert_eq!(entry.api_key.as_deref(), Some("sk-zai-test"));
@@ -1059,15 +1060,15 @@ default_model = "local-model"
         .and_then(|m| m.get("default"))
         .expect("V3 outer key must be `custom`, not the raw colon-URL");
     assert_eq!(
-        entry.base_url.as_deref(),
+        entry.uri.as_deref(),
         Some("http://localhost:8080/v1"),
-        "the URL portion of the V2 colon-URL form must land in base_url"
+        "the URL portion of the V2 colon-URL form must land in uri"
     );
     assert_eq!(entry.model.as_deref(), Some("local-model"));
 }
 
 #[test]
-fn agent_inline_brain_colon_url_provider_splits_into_base_url() {
+fn agent_inline_brain_colon_url_provider_splits_into_uri() {
     // Per-agent colon-URL: synthesize_agent_brains used the raw string as
     // the V3 outer provider key. Same dot-bearing-key bug — must split.
     let raw = r#"
@@ -1107,9 +1108,9 @@ api_key = "sk-zai-agent"
         .and_then(|v| v.get("agent_researcher"))
         .expect("providers.models.anthropic-custom.agent_researcher synthesized");
     assert_eq!(
-        synthesized.get("base_url").and_then(toml::Value::as_str),
+        synthesized.get("uri").and_then(toml::Value::as_str),
         Some("https://api.z.ai/api/anthropic"),
-        "the colon-URL's URL portion must land in base_url on the synthesized alias entry"
+        "the colon-URL's URL portion must land in uri on the synthesized alias entry"
     );
     assert_eq!(
         synthesized.get("model").and_then(toml::Value::as_str),

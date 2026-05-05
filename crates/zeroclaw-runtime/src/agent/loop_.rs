@@ -2305,7 +2305,7 @@ pub async fn run(
     let mut provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
         &provider_name,
         primary_provider.and_then(|e| e.api_key.as_deref()),
-        primary_provider.and_then(|e| e.base_url.as_deref()),
+        primary_provider.and_then(|e| e.uri.as_deref()),
         &config.reliability,
         &config.providers.model_routes,
         &model_name,
@@ -2678,7 +2678,7 @@ pub async fn run(
                         provider = zeroclaw_providers::create_routed_provider_with_options(
                             &new_provider,
                             primary_provider.and_then(|e| e.api_key.as_deref()),
-                            primary_provider.and_then(|e| e.base_url.as_deref()),
+                            primary_provider.and_then(|e| e.uri.as_deref()),
                             &config.reliability,
                             &config.providers.model_routes,
                             &new_model,
@@ -2991,7 +2991,7 @@ pub async fn run(
                             provider = zeroclaw_providers::create_routed_provider_with_options(
                                 &new_provider,
                                 primary_provider.and_then(|e| e.api_key.as_deref()),
-                                primary_provider.and_then(|e| e.base_url.as_deref()),
+                                primary_provider.and_then(|e| e.uri.as_deref()),
                                 &config.reliability,
                                 &config.providers.model_routes,
                                 &new_model,
@@ -3309,7 +3309,7 @@ pub async fn process_message(
     let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
         provider_name,
         primary_provider.and_then(|e| e.api_key.as_deref()),
-        primary_provider.and_then(|e| e.base_url.as_deref()),
+        primary_provider.and_then(|e| e.uri.as_deref()),
         &config.reliability,
         &config.providers.model_routes,
         &model_name,
