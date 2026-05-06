@@ -977,6 +977,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "deepmyst" | "deep-myst" => vec!["DEEPMYST_API_KEY"],
         "morph" => vec!["MORPH_API_KEY"],
         "github-models" | "github_models" => vec!["GITHUB_MODELS_TOKEN"],
+        "upstage" => vec!["UPSTAGE_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
@@ -1759,6 +1760,12 @@ fn create_provider_with_url_and_options(
         "github-models" | "github_models" => Ok(compat(OpenAiCompatibleProvider::new(
             "GitHub Models",
             "https://models.github.ai/inference",
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "upstage" => Ok(compat(OpenAiCompatibleProvider::new(
+            "Upstage Solar",
+            "https://api.upstage.ai/v1/solar",
             key,
             AuthStyle::Bearer,
         ))),
@@ -2631,6 +2638,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             activation: ProviderActivation::FallbackKey,
             local: false,
         },
+        ProviderInfo {
+            name: "upstage",
+            display_name: "Upstage Solar",
+            description: "Solar Pro 3 / Solar Mini",
+            aliases: &[],
+            activation: ProviderActivation::FallbackKey,
+            local: false,
+        },
     ]
 }
 
@@ -3477,6 +3492,19 @@ mod tests {
         assert_ne!(resolved, Some("gho_copilot_only".to_string()));
     }
 
+    #[test]
+    fn factory_upstage() {
+        assert!(create_provider("upstage", Some("up-test-key")).is_ok());
+    }
+
+    #[test]
+    fn resolve_provider_credential_upstage_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("UPSTAGE_API_KEY", Some("upstage-test"));
+        let resolved = resolve_provider_credential("upstage", None);
+        assert_eq!(resolved, Some("upstage-test".to_string()));
+    }
+
     // ── Custom / BYOP provider ─────────────────────────────
 
     #[test]
@@ -3804,6 +3832,7 @@ mod tests {
             "avian",
             "morph",
             "github-models",
+            "upstage",
             "ovhcloud",
         ];
         for name in providers {
