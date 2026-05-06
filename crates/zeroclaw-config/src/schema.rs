@@ -1482,6 +1482,46 @@ fn default_local_whisper_timeout_secs() -> u64 {
     300
 }
 
+/// HMAC tool execution receipt configuration (`[agent.tool_receipts]`).
+///
+/// Receipts are short HMAC-SHA256 tags appended to tool results so the model
+/// cannot claim it ran a tool that never actually executed. See
+/// `docs/book/src/security/tool-receipts.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent.tool_receipts"]
+pub struct ToolReceiptsConfig {
+    /// Generate HMAC receipts on every tool execution. Default: `false`.
+    /// When false, the entire receipt subsystem is inert (no key, no
+    /// generation, no append, no system-prompt addendum).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Append a trailing `Tool receipts:` block to user-visible replies so
+    /// receipts are auditable from the channel surface, not just the
+    /// internal history. Default: `false`.
+    #[serde(default)]
+    pub show_in_response: bool,
+    /// Inject the receipt-echo instruction into the system prompt so the
+    /// model carries receipts verbatim into its response. Default: `true`.
+    /// No effect when `enabled = false`.
+    #[serde(default = "default_inject_system_prompt")]
+    pub inject_system_prompt: bool,
+}
+
+fn default_inject_system_prompt() -> bool {
+    true
+}
+
+impl Default for ToolReceiptsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            show_in_response: false,
+            inject_system_prompt: default_inject_system_prompt(),
+        }
+    }
+}
+
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -1566,6 +1606,11 @@ pub struct AgentConfig {
     /// behavior). Default: `2`.
     #[serde(default = "default_keep_tool_context_turns")]
     pub keep_tool_context_turns: usize,
+
+    /// HMAC tool execution receipt configuration.
+    #[nested]
+    #[serde(default)]
+    pub tool_receipts: ToolReceiptsConfig,
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1616,6 +1661,7 @@ impl Default for AgentConfig {
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            tool_receipts: ToolReceiptsConfig::default(),
         }
     }
 }
