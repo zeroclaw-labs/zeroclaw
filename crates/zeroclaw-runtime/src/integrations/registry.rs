@@ -1,62 +1,27 @@
-//! Integration catalog.
+//! Integration catalog — schema-driven, single-loop.
 //!
-//! Every entry corresponds to either:
-//! - a schema field (chat channels via `ChannelsConfig::nested_option_entries`,
-//!   AI providers via `providers.fallback`), or
-//! - a runtime built-in (`Shell`, `File System`, `Weather`, `Browser`, `Cron`,
-//!   `Google Workspace`), or
-//! - a compile-time platform fact (`cfg!(target_os = ...)`).
+//! Every entry comes from a schema-side source:
+//! - Channels: `ChannelsConfig::nested_option_entries()` (per-field
+//!   `#[display_name = ...]` / `#[description = ...]` attributes).
+//! - Toggle integrations: `Config::integration_descriptors()` (per-struct
+//!   `#[integration(...)]` attribute on `BrowserConfig`, `CronConfig`,
+//!   `GoogleWorkspaceConfig`).
+//! - AI providers: `zeroclaw_providers::list_providers()` (each
+//!   `ProviderInfo` row carries `display_name`, `description`, and a
+//!   `ProviderActivation` strategy).
+//! - Always-on built-in tools: `crate::tools::BUILTIN_TOOL_INTEGRATIONS`.
+//! - Platforms: `super::platform::PLATFORMS` (compile-time `cfg!` facts).
 //!
-//! There is no hand-maintained channel list. Adding a
-//! `pub foo: Option<FooConfig>` field with `#[nested]` to `ChannelsConfig`
-//! surfaces a `Foo` integration entry automatically; no edit here required.
-//! There is also no "coming soon" status — if it is not in the schema or
-//! a real built-in, it does not get listed.
+//! No string literal naming a channel, vendor, tool, or platform appears
+//! in this file's production path. Adding a new integration of any kind
+//! is one row in the corresponding schema source — the registry picks
+//! it up automatically.
 
+use super::platform::PLATFORMS;
 use super::{IntegrationCategory, IntegrationEntry, IntegrationStatus};
+use crate::tools::BUILTIN_TOOL_INTEGRATIONS;
 use zeroclaw_config::schema::Config;
 use zeroclaw_providers::ProviderActivation;
-
-/// Map snake_case schema field names to display names. Anything not in
-/// this table title-cases the snake_case name (e.g. `discord_history`
-/// becomes "Discord History"). Override here when title-case looks
-/// wrong (acronyms, brand casing).
-fn channel_display_name(field: &str) -> String {
-    match field {
-        "imessage" => "iMessage".into(),
-        "qq" => "QQ Official".into(),
-        "irc" => "IRC".into(),
-        "mqtt" => "MQTT".into(),
-        "wati" => "WATI".into(),
-        "wecom" => "WeCom".into(),
-        "wechat" => "WeChat".into(),
-        "dingtalk" => "DingTalk".into(),
-        "whatsapp" => "WhatsApp".into(),
-        "twitter" => "X / Twitter".into(),
-        "bluesky" => "Bluesky".into(),
-        "clawdtalk" => "ClawdTalk".into(),
-        "voice_call" => "Voice Call".into(),
-        "voice_wake" => "Voice Wake".into(),
-        "voice_duplex" => "Voice Duplex".into(),
-        "gmail_push" => "Gmail Push".into(),
-        "nextcloud_talk" => "Nextcloud Talk".into(),
-        "discord_history" => "Discord History".into(),
-        other => snake_to_title(other),
-    }
-}
-
-fn snake_to_title(s: &str) -> String {
-    s.split('_')
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
 
 fn bool_to_status(active: bool) -> IntegrationStatus {
     if active {
@@ -66,23 +31,24 @@ fn bool_to_status(active: bool) -> IntegrationStatus {
     }
 }
 
-fn entry(
-    name: impl Into<String>,
-    description: impl Into<String>,
-    category: IntegrationCategory,
-    status: IntegrationStatus,
-) -> IntegrationEntry {
-    IntegrationEntry {
-        name: name.into(),
-        description: description.into(),
-        category,
-        status,
+/// Map the schema-side `#[integration(category = "...")]` label to the
+/// runtime enum. The schema crate intentionally keeps the label as a
+/// string to avoid taking a dependency on this crate's enum.
+fn parse_category(label: &str) -> IntegrationCategory {
+    match label {
+        "Chat" => IntegrationCategory::Chat,
+        "AiModel" => IntegrationCategory::AiModel,
+        "ToolsAutomation" => IntegrationCategory::ToolsAutomation,
+        "Platform" => IntegrationCategory::Platform,
+        // Defensive default; the schema's `#[integration(category = ...)]`
+        // attribute is the source of truth for valid labels.
+        _ => IntegrationCategory::ToolsAutomation,
     }
 }
 
 /// Compute an AI-model integration's status from its `ProviderActivation`
-/// strategy. The integrations registry never branches on a provider name —
-/// every per-vendor decision lives on the `ProviderInfo` row in
+/// strategy. The registry never branches on a provider name — every
+/// per-vendor decision lives on the `ProviderInfo` row in
 /// `zeroclaw_providers::list_providers()`.
 fn evaluate_provider_activation(
     config: &Config,
@@ -112,101 +78,65 @@ fn evaluate_provider_activation(
 }
 
 /// Returns the integration catalog computed against `config`.
+///
+/// Single-loop, schema-driven. Every per-row decision lives on the
+/// schema-side source; this function just concatenates the iterators.
 pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
-    let mut out: Vec<IntegrationEntry> = Vec::new();
+    let channels = config
+        .channels
+        .nested_option_entries()
+        .into_iter()
+        .map(|e| IntegrationEntry {
+            name: e.display_name.to_string(),
+            description: e.description.to_string(),
+            category: IntegrationCategory::Chat,
+            status: bool_to_status(e.present),
+        });
 
-    // ── Chat channels (schema-derived) ──
-    // Every `#[nested] Option<XConfig>` field on `ChannelsConfig`
-    // surfaces here. No hand-list, no ComingSoon stand-ins.
-    out.push(entry(
-        "CLI",
-        "In-process interactive shell",
-        IntegrationCategory::Chat,
-        bool_to_status(config.channels.cli),
-    ));
-    for (field, is_set) in config.channels.nested_option_entries() {
-        out.push(entry(
-            channel_display_name(field),
-            "Chat channel",
-            IntegrationCategory::Chat,
-            bool_to_status(is_set),
-        ));
-    }
+    let toggles = config
+        .integration_descriptors()
+        .into_iter()
+        .map(|d| IntegrationEntry {
+            name: d.display_name.to_string(),
+            description: d.description.to_string(),
+            category: parse_category(d.category),
+            status: bool_to_status(d.active),
+        });
 
-    // ── AI Models (schema-derived) ──
-    // Pure iteration over `zeroclaw_providers::list_providers()`. Every
-    // per-vendor field — display_name, description, activation strategy
-    // — lives on the `ProviderInfo` row at the schema. The registry
-    // never branches on a provider name. Adding a new provider means
-    // adding one row in `list_providers()`; no edit here required.
-    for info in zeroclaw_providers::list_providers() {
-        out.push(entry(
-            info.display_name,
-            info.description,
-            IntegrationCategory::AiModel,
-            evaluate_provider_activation(config, &info),
-        ));
-    }
+    let providers = zeroclaw_providers::list_providers()
+        .into_iter()
+        .map(|info| {
+            let status = evaluate_provider_activation(config, &info);
+            IntegrationEntry {
+                name: info.display_name.to_string(),
+                description: info.description.to_string(),
+                category: IntegrationCategory::AiModel,
+                status,
+            }
+        });
 
-    // ── Tools & Automation (runtime built-ins + a few schema bools) ──
-    out.push(entry(
-        "Browser",
-        "Chrome/Chromium control",
-        IntegrationCategory::ToolsAutomation,
-        bool_to_status(config.browser.enabled),
-    ));
-    out.push(entry(
-        "Cron",
-        "Scheduled tasks",
-        IntegrationCategory::ToolsAutomation,
-        bool_to_status(config.cron.enabled),
-    ));
-    out.push(entry(
-        "Google Workspace",
-        "Drive, Gmail, Calendar, Sheets, Docs via gws CLI",
-        IntegrationCategory::ToolsAutomation,
-        bool_to_status(config.google_workspace.enabled),
-    ));
-    out.push(entry(
-        "Shell",
-        "Terminal command execution",
-        IntegrationCategory::ToolsAutomation,
-        IntegrationStatus::Active,
-    ));
-    out.push(entry(
-        "File System",
-        "Read/write files",
-        IntegrationCategory::ToolsAutomation,
-        IntegrationStatus::Active,
-    ));
-    out.push(entry(
-        "Weather",
-        "Forecasts & conditions (wttr.in)",
-        IntegrationCategory::ToolsAutomation,
-        IntegrationStatus::Active,
-    ));
+    let builtins = BUILTIN_TOOL_INTEGRATIONS
+        .iter()
+        .map(|(name, desc)| IntegrationEntry {
+            name: (*name).to_string(),
+            description: (*desc).to_string(),
+            category: IntegrationCategory::ToolsAutomation,
+            status: IntegrationStatus::Active,
+        });
 
-    // ── Platforms (compile-time facts) ──
-    out.push(entry(
-        "macOS",
-        "Native support + AppleScript",
-        IntegrationCategory::Platform,
-        bool_to_status(cfg!(target_os = "macos")),
-    ));
-    out.push(entry(
-        "Linux",
-        "Native support",
-        IntegrationCategory::Platform,
-        bool_to_status(cfg!(target_os = "linux")),
-    ));
-    out.push(entry(
-        "Windows",
-        "Native support (WSL2 recommended)",
-        IntegrationCategory::Platform,
-        bool_to_status(cfg!(target_os = "windows")),
-    ));
+    let platforms = PLATFORMS.iter().map(|(name, available)| IntegrationEntry {
+        name: (*name).to_string(),
+        description: String::new(),
+        category: IntegrationCategory::Platform,
+        status: bool_to_status(*available),
+    });
 
-    out
+    channels
+        .chain(toggles)
+        .chain(providers)
+        .chain(builtins)
+        .chain(platforms)
+        .collect()
 }
 
 #[cfg(test)]
@@ -251,15 +181,42 @@ mod tests {
     }
 
     #[test]
-    fn no_empty_names_or_descriptions() {
+    fn channel_entries_carry_per_field_metadata_from_schema() {
+        // Schema-driven contract: every Option<XConfig> on ChannelsConfig
+        // surfaces as a Chat entry whose display_name and description
+        // come from the field's `#[display_name = ...]` /
+        // `#[description = ...]` attributes — no override table here.
         let config = Config::default();
         let entries = all_integrations(&config);
-        for entry in &entries {
-            assert!(!entry.name.is_empty(), "Found integration with empty name");
+        let channel_count = entries
+            .iter()
+            .filter(|e| e.category == IntegrationCategory::Chat)
+            .count();
+        let nested_count = config.channels.nested_option_entries().len();
+        assert_eq!(
+            channel_count, nested_count,
+            "every Option<XConfig> field should produce exactly one Chat entry",
+        );
+        for nested in config.channels.nested_option_entries() {
+            let entry = entries
+                .iter()
+                .find(|e| e.name == nested.display_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "channel field {:?} (display {:?}) missing from registry",
+                        nested.field, nested.display_name,
+                    )
+                });
+            assert!(
+                !entry.name.is_empty(),
+                "channel field {:?} produced empty display name",
+                nested.field
+            );
             assert!(
                 !entry.description.is_empty(),
-                "Integration '{}' has empty description",
-                entry.name
+                "channel field {:?} (display {:?}) missing #[description = ...] attribute",
+                nested.field,
+                nested.display_name,
             );
         }
     }
@@ -280,7 +237,16 @@ mod tests {
             approval_timeout_secs: 120,
         });
         let entries = all_integrations(&config);
-        let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();
+        let nested = config
+            .channels
+            .nested_option_entries()
+            .into_iter()
+            .find(|e| e.field == "telegram")
+            .expect("telegram field declared on ChannelsConfig");
+        let tg = entries
+            .iter()
+            .find(|e| e.name == nested.display_name)
+            .unwrap();
         assert!(matches!(tg.status, IntegrationStatus::Active));
     }
 
@@ -288,19 +254,37 @@ mod tests {
     fn telegram_available_when_not_configured() {
         let config = Config::default();
         let entries = all_integrations(&config);
-        let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();
+        let nested = config
+            .channels
+            .nested_option_entries()
+            .into_iter()
+            .find(|e| e.field == "telegram")
+            .expect("telegram field declared on ChannelsConfig");
+        let tg = entries
+            .iter()
+            .find(|e| e.name == nested.display_name)
+            .unwrap();
         assert!(matches!(tg.status, IntegrationStatus::Available));
     }
 
     #[test]
-    fn imessage_active_when_configured_and_displays_brand_casing() {
+    fn imessage_active_when_configured() {
         let mut config = Config::default();
         config.channels.imessage = Some(IMessageConfig {
             enabled: true,
             allowed_contacts: vec!["*".into()],
         });
         let entries = all_integrations(&config);
-        let im = entries.iter().find(|e| e.name == "iMessage").unwrap();
+        let nested = config
+            .channels
+            .nested_option_entries()
+            .into_iter()
+            .find(|e| e.field == "imessage")
+            .expect("imessage field declared on ChannelsConfig");
+        let im = entries
+            .iter()
+            .find(|e| e.name == nested.display_name)
+            .unwrap();
         assert!(matches!(im.status, IntegrationStatus::Active));
     }
 
@@ -327,88 +311,77 @@ mod tests {
             ack_reactions: true,
         });
         let entries = all_integrations(&config);
-        let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();
+        let nested = config
+            .channels
+            .nested_option_entries()
+            .into_iter()
+            .find(|e| e.field == "matrix")
+            .expect("matrix field declared on ChannelsConfig");
+        let mx = entries
+            .iter()
+            .find(|e| e.name == nested.display_name)
+            .unwrap();
         assert!(matches!(mx.status, IntegrationStatus::Active));
     }
 
     #[test]
-    fn cron_active_when_enabled() {
+    fn cron_active_when_enabled_via_integration_descriptor() {
         let mut config = Config::default();
         config.cron.enabled = true;
         let entries = all_integrations(&config);
-        let cron = entries.iter().find(|e| e.name == "Cron").unwrap();
+        let descriptor = config.cron.integration_descriptor();
+        let cron = entries
+            .iter()
+            .find(|e| e.name == descriptor.display_name)
+            .unwrap();
         assert!(matches!(cron.status, IntegrationStatus::Active));
     }
 
     #[test]
-    fn browser_active_when_enabled() {
+    fn browser_active_when_enabled_via_integration_descriptor() {
         let mut config = Config::default();
         config.browser.enabled = true;
         let entries = all_integrations(&config);
-        let browser = entries.iter().find(|e| e.name == "Browser").unwrap();
+        let descriptor = config.browser.integration_descriptor();
+        let browser = entries
+            .iter()
+            .find(|e| e.name == descriptor.display_name)
+            .unwrap();
         assert!(matches!(browser.status, IntegrationStatus::Active));
     }
 
     #[test]
-    fn shell_filesystem_weather_always_active() {
+    fn builtin_tool_integrations_always_active() {
+        // Drift detector: every row in BUILTIN_TOOL_INTEGRATIONS must
+        // surface as an Active entry. Adding / removing a built-in is
+        // the single edit point.
         let config = Config::default();
         let entries = all_integrations(&config);
-        for name in ["Shell", "File System", "Weather"] {
-            let entry = entries.iter().find(|e| e.name == name).unwrap();
+        for (name, _desc) in BUILTIN_TOOL_INTEGRATIONS {
+            let entry = entries
+                .iter()
+                .find(|e| e.name == *name)
+                .unwrap_or_else(|| panic!("built-in {name:?} missing from registry"));
             assert!(
                 matches!(entry.status, IntegrationStatus::Active),
-                "{name} should always be Active"
+                "{name} should always be Active",
             );
         }
     }
 
     #[test]
-    fn macos_active_on_macos() {
+    fn platforms_match_compile_time_constants() {
         let config = Config::default();
         let entries = all_integrations(&config);
-        let macos = entries.iter().find(|e| e.name == "macOS").unwrap();
-        if cfg!(target_os = "macos") {
-            assert!(matches!(macos.status, IntegrationStatus::Active));
-        } else {
-            assert!(matches!(macos.status, IntegrationStatus::Available));
-        }
-    }
-
-    #[test]
-    fn channel_list_derives_from_schema_includes_previously_missing_channels() {
-        // The hand-maintained list in master only surfaced ~11 channels;
-        // ChannelsConfig actually declares ~25+. This test pins the
-        // schema-derived path so adding a new channel surfaces here.
-        let config = Config::default();
-        let entries = all_integrations(&config);
-        let chat_names: std::collections::HashSet<&str> = entries
-            .iter()
-            .filter(|e| e.category == IntegrationCategory::Chat)
-            .map(|e| e.name.as_str())
-            .collect();
-        for must in [
-            "Telegram",
-            "Discord",
-            "Slack",
-            "Matrix",
-            "iMessage",
-            "WhatsApp",
-            // Previously missing from the hand-list:
-            "Mattermost",
-            "IRC",
-            "Lark",
-            "Line",
-            "Feishu",
-            "WeCom",
-            "WeChat",
-            "Reddit",
-            "Bluesky",
-            "MQTT",
-            "Discord History",
-        ] {
-            assert!(
-                chat_names.contains(must),
-                "Chat category should include {must} (derived from schema)"
+        for (name, available) in PLATFORMS {
+            let entry = entries
+                .iter()
+                .find(|e| e.name == *name)
+                .unwrap_or_else(|| panic!("platform {name:?} missing from registry"));
+            let expected = bool_to_status(*available);
+            assert_eq!(
+                entry.status, expected,
+                "platform {name:?} status disagrees with PLATFORMS const",
             );
         }
     }

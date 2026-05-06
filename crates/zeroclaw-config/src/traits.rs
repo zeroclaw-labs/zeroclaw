@@ -143,6 +143,45 @@ pub struct MapKeySection {
     pub description: &'static str,
 }
 
+/// One row emitted by the `Configurable` derive's `nested_option_entries()`
+/// method — every `#[nested] Option<XConfig>` field on a struct shows up here
+/// with its `present` bit and the per-field `#[display_name = "..."]` /
+/// `#[description = "..."]` metadata. The integrations registry consumes
+/// this verbatim instead of carrying its own per-field hand-list.
+#[derive(Debug, Clone, Copy)]
+pub struct NestedOptionEntry {
+    /// snake_case field name on the parent struct (e.g. `"telegram"`,
+    /// `"voice_duplex"`).
+    pub field: &'static str,
+    /// `true` when the parent struct's field is `Some(_)`.
+    pub present: bool,
+    /// Display name from `#[display_name = "..."]`; falls back to a
+    /// title-cased rendering of the snake_case field name when the
+    /// attribute is absent.
+    pub display_name: &'static str,
+    /// One-line summary from `#[description = "..."]`. Empty when the
+    /// attribute is absent.
+    pub description: &'static str,
+}
+
+/// One row emitted by the `Configurable` derive's `integration_descriptor()`
+/// method on structs annotated with `#[integration(...)]`. Used for nested
+/// toggleable configs (e.g. `BrowserConfig`, `CronConfig`) where the
+/// integration is "active" iff a named bool field on the struct is `true`.
+#[derive(Debug, Clone, Copy)]
+pub struct IntegrationDescriptor {
+    pub display_name: &'static str,
+    pub description: &'static str,
+    /// Free-form category label (e.g. `"ToolsAutomation"`). The
+    /// integrations registry maps this string to its own
+    /// `IntegrationCategory` enum so the schema crate doesn't have to
+    /// depend on it.
+    pub category: &'static str,
+    /// Snapshot of the named status field at the moment this descriptor
+    /// was built (`status_field = "enabled"` ⇒ `self.enabled`).
+    pub active: bool,
+}
+
 /// The trait for describing a channel
 pub trait ChannelConfig {
     /// human-readable name

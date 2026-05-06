@@ -264,6 +264,18 @@ pub fn register_skill_tools(
     }
 }
 
+/// Always-on built-in tools that surface in the integrations panel as
+/// `(display_name, description)` pairs. The integrations registry consumes
+/// this verbatim — adding a new always-on built-in is one row here, no
+/// edit to the registry. Tools with a config struct (Browser, Cron,
+/// GoogleWorkspace) declare themselves via the `#[integration(...)]`
+/// attribute on the schema struct instead.
+pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
+    ("Shell", "Terminal command execution"),
+    ("File System", "Read/write files"),
+    ("Weather", "Forecasts & conditions (wttr.in)"),
+];
+
 /// Create full tool registry including memory tools and optional Composio
 #[allow(
     clippy::implicit_hasher,

@@ -1,3 +1,4 @@
+pub mod platform;
 pub mod registry;
 
 use anyhow::Result;

@@ -2718,6 +2718,12 @@ impl Default for BrowserComputerUseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "browser"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Browser",
+    description = "Chrome/Chromium control",
+    status_field = "enabled"
+)]
 pub struct BrowserConfig {
     /// Enable `browser_open` tool (opens URLs in the system browser without scraping)
     #[serde(default = "default_true")]
@@ -3381,6 +3387,12 @@ pub struct GoogleWorkspaceAllowedOperation {
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "google-workspace"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Google Workspace",
+    description = "Drive, Gmail, Calendar, Sheets, Docs via gws CLI",
+    status_field = "enabled"
+)]
 pub struct GoogleWorkspaceConfig {
     /// Enable the `google_workspace` tool. Default: `false`.
     #[serde(default)]
@@ -6321,6 +6333,12 @@ impl Default for HeartbeatConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "cron"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Cron",
+    description = "Scheduled tasks",
+    status_field = "enabled"
+)]
 pub struct CronConfig {
     /// Enable the cron subsystem. Default: `true`.
     #[serde(default = "default_true")]
@@ -6648,103 +6666,169 @@ pub struct ChannelsConfig {
     pub cli: bool,
     /// Telegram bot channel configuration.
     #[nested]
+    #[display_name = "Telegram"]
+    #[description = "Bot API — long-polling"]
     pub telegram: Option<TelegramConfig>,
     /// Discord bot channel configuration.
     #[nested]
+    #[display_name = "Discord"]
+    #[description = "Servers, channels & DMs"]
     pub discord: Option<DiscordConfig>,
     /// Discord history channel — logs ALL messages and forwards @mentions to agent.
     #[nested]
+    #[display_name = "Discord History"]
+    #[description = "Logs all messages, forwards mentions to the agent"]
     pub discord_history: Option<DiscordHistoryConfig>,
     /// Slack bot channel configuration.
     #[nested]
+    #[display_name = "Slack"]
+    #[description = "Workspace apps via Web API"]
     pub slack: Option<SlackConfig>,
     /// Mattermost bot channel configuration.
     #[nested]
+    #[display_name = "Mattermost"]
+    #[description = "Self-hosted team chat"]
     pub mattermost: Option<MattermostConfig>,
     /// Webhook channel configuration.
     #[nested]
+    #[display_name = "Webhooks"]
+    #[description = "HTTP endpoint for triggers"]
     pub webhook: Option<WebhookConfig>,
     /// iMessage channel configuration (macOS only).
     #[nested]
+    #[display_name = "iMessage"]
+    #[description = "macOS AppleScript bridge"]
     pub imessage: Option<IMessageConfig>,
     /// Matrix channel configuration.
     #[nested]
+    #[display_name = "Matrix"]
+    #[description = "Matrix protocol (Element)"]
     pub matrix: Option<MatrixConfig>,
     /// Signal channel configuration.
     #[nested]
+    #[display_name = "Signal"]
+    #[description = "Privacy-focused via signal-cli"]
     pub signal: Option<SignalConfig>,
     /// WhatsApp channel configuration (Cloud API or Web mode).
     #[nested]
+    #[display_name = "WhatsApp"]
+    #[description = "Meta Cloud API or Web mode"]
     pub whatsapp: Option<WhatsAppConfig>,
     /// Linq Partner API channel configuration.
     #[nested]
+    #[display_name = "Linq"]
+    #[description = "Linq Partner API for iMessage/RCS/SMS"]
     pub linq: Option<LinqConfig>,
     /// WATI WhatsApp Business API channel configuration.
     #[nested]
+    #[display_name = "WATI"]
+    #[description = "WhatsApp Business API gateway"]
     pub wati: Option<WatiConfig>,
     /// Nextcloud Talk bot channel configuration.
     #[nested]
+    #[display_name = "Nextcloud Talk"]
+    #[description = "Self-hosted Nextcloud chat"]
     pub nextcloud_talk: Option<NextcloudTalkConfig>,
     /// Email channel configuration.
     #[nested]
+    #[display_name = "Email"]
+    #[description = "IMAP / SMTP inbox bridge"]
     pub email: Option<crate::scattered_types::EmailConfig>,
     /// Gmail Pub/Sub push notification channel configuration.
     #[nested]
+    #[display_name = "Gmail Push"]
+    #[description = "Pub/Sub push notifications for Gmail"]
     pub gmail_push: Option<crate::scattered_types::GmailPushConfig>,
     /// IRC channel configuration.
     #[nested]
+    #[display_name = "IRC"]
+    #[description = "Classic IRC with SASL / NickServ"]
     pub irc: Option<IrcConfig>,
     /// Lark channel configuration.
     #[nested]
+    #[display_name = "Lark"]
+    #[description = "ByteDance Lark / Feishu international"]
     pub lark: Option<LarkConfig>,
     /// LINE Messaging API channel configuration.
     #[nested]
+    #[display_name = "LINE"]
+    #[description = "LINE Messaging API"]
     pub line: Option<LineConfig>,
     /// Feishu channel configuration.
     #[nested]
+    #[display_name = "Feishu"]
+    #[description = "ByteDance Feishu (China)"]
     pub feishu: Option<FeishuConfig>,
     /// DingTalk channel configuration.
     #[nested]
+    #[display_name = "DingTalk"]
+    #[description = "DingTalk Stream Mode"]
     pub dingtalk: Option<DingTalkConfig>,
     /// WeCom (WeChat Enterprise) Bot Webhook channel configuration.
     #[nested]
+    #[display_name = "WeCom"]
+    #[description = "WeChat Enterprise Bot Webhook"]
     pub wecom: Option<WeComConfig>,
     /// WeChat personal iLink Bot channel configuration (QR code login).
     #[nested]
+    #[display_name = "WeChat"]
+    #[description = "WeChat personal iLink Bot (QR login)"]
     pub wechat: Option<WeChatConfig>,
     /// QQ Official Bot channel configuration.
     #[nested]
+    #[display_name = "QQ Official"]
+    #[description = "Tencent QQ Bot SDK"]
     pub qq: Option<QQConfig>,
     /// X/Twitter channel configuration.
     #[nested]
+    #[display_name = "X / Twitter"]
+    #[description = "X / Twitter API"]
     pub twitter: Option<TwitterConfig>,
     /// Mochat customer service channel configuration.
     #[nested]
+    #[display_name = "Mochat"]
+    #[description = "Mochat customer service"]
     pub mochat: Option<MochatConfig>,
     #[cfg(feature = "channel-nostr")]
     #[nested]
+    #[display_name = "Nostr"]
+    #[description = "Decentralized DMs (NIP-04)"]
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
     #[nested]
+    #[display_name = "ClawdTalk"]
+    #[description = "ClawdTalk voice channel"]
     pub clawdtalk: Option<crate::scattered_types::ClawdTalkConfig>,
     /// Reddit channel configuration (OAuth2 bot).
     #[nested]
+    #[display_name = "Reddit"]
+    #[description = "Reddit OAuth2 bot"]
     pub reddit: Option<RedditConfig>,
     /// Bluesky channel configuration (AT Protocol).
     #[nested]
+    #[display_name = "Bluesky"]
+    #[description = "Bluesky / AT Protocol"]
     pub bluesky: Option<BlueskyConfig>,
     /// Voice call channel configuration (Twilio/Telnyx/Plivo).
     #[nested]
+    #[display_name = "Voice Call"]
+    #[description = "Twilio / Telnyx / Plivo voice calls"]
     pub voice_call: Option<crate::scattered_types::VoiceCallConfig>,
     /// Voice wake word detection channel configuration.
     #[cfg(feature = "voice-wake")]
     #[nested]
+    #[display_name = "Voice Wake"]
+    #[description = "Local wake-word detection"]
     pub voice_wake: Option<VoiceWakeConfig>,
     /// Voice duplex configuration (full-duplex voice over WebSocket).
     #[nested]
+    #[display_name = "Voice Duplex"]
+    #[description = "Full-duplex voice over WebSocket"]
     pub voice_duplex: Option<VoiceDuplexConfig>,
     /// MQTT channel configuration (SOP listener).
     #[nested]
+    #[display_name = "MQTT"]
+    #[description = "MQTT SOP listener"]
     pub mqtt: Option<MqttConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
@@ -9963,6 +10047,19 @@ async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
 }
 
 impl Config {
+    /// Collect the `IntegrationDescriptor` from every nested config that
+    /// declares one via `#[integration(...)]`. Adding a new toggleable
+    /// integration is one struct-level attribute on the new config + one
+    /// row in this method. The integrations registry consumes the result
+    /// without per-vendor branches.
+    pub fn integration_descriptors(&self) -> Vec<crate::config::IntegrationDescriptor> {
+        vec![
+            self.browser.integration_descriptor(),
+            self.cron.integration_descriptor(),
+            self.google_workspace.integration_descriptor(),
+        ]
+    }
+
     /// Return top-level TOML keys in `raw_toml` that Config does not recognise.
     ///
     /// Keys present in `Config::default()` serialization pass immediately.
