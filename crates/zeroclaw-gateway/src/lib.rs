@@ -474,20 +474,35 @@ pub async fn run_gateway(
     let display_addr = format!("{host}:{actual_port}");
 
     let fallback = config.providers.first_provider();
+    let provider_name = config
+        .providers
+        .first_provider_type()
+        .unwrap_or("openrouter");
     let provider: Arc<dyn Provider> =
         Arc::from(zeroclaw_providers::create_resilient_provider_with_options(
-            config
-                .providers
-                .first_provider_type()
-                .unwrap_or("openrouter"),
+            provider_name,
             fallback.and_then(|e| e.api_key.as_deref()),
             fallback.and_then(|e| e.base_url.as_deref()),
             &config.reliability,
             &zeroclaw_providers::provider_runtime_options_from_config(&config),
         )?);
-    let model = fallback
-        .and_then(|e| e.model.clone())
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
+    // Model resolution (#6099, #6215): take the first configured
+    // `[providers.models.<type>.<alias>]` entry's `model` field, or hard-fail
+    // with an actionable error. V3 has no global fallback provider — every
+    // gateway request that needs agent context resolves through its
+    // `?agent=` parameter.
+    let model = match fallback
+        .and_then(|e| e.model.as_deref())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        Some(m) => m.to_string(),
+        None => anyhow::bail!(
+            "no model configured: no [providers.models.<type>.<alias>] entry has a \
+             `model` field set. Configure at least one [providers.models.<type>.<alias>] \
+             model = \"...\" before starting the gateway.",
+        ),
+    };
     let temperature = fallback.and_then(|e| e.temperature).unwrap_or(0.7);
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,

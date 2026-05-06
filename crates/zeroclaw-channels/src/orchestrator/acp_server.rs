@@ -14,6 +14,7 @@
 //! | `session/new`     | Create an isolated agent session          |
 //! | `session/prompt`  | Send a prompt, stream back `session/update` events |
 //! | `session/stop`    | Gracefully terminate a session            |
+//! | `session/cancel`  | Abort an in-flight `session/prompt` turn  |
 //! | `session/update`  | Streaming events and bidirectional events |
 
 use anyhow::Result;
@@ -274,6 +275,20 @@ pub struct AcpServer {
     /// Receiver for the writer task. Pulled out (replaced with `None`) the
     /// first time `run()` starts the writer loop.
     writer_rx: std::sync::Mutex<Option<mpsc::Receiver<String>>>,
+    /// Per-session cancellation tokens for aborting in-flight `session/prompt`
+    /// turns. Lives outside `Session`'s inner `Mutex` so `session/cancel` can
+    /// fire the token without waiting for the turn to release the inner lock.
+    ///
+    /// **Single-turn-per-session invariant:** this map holds at most one token
+    /// per `session_id` because the ACP protocol does not pipeline multiple
+    /// `session/prompt` calls on the same session — each prompt must complete
+    /// (or be cancelled) before the next one is sent. A second `session/prompt`
+    /// arriving while the first is in flight would overwrite turn 1's token in
+    /// this map, so a `session/cancel` fired between the overwrite and turn 1's
+    /// completion would silently target turn 2 instead. The worst-case outcome
+    /// is "cancel doesn't take" rather than data corruption. If pipelining is
+    /// needed in the future, the key should become `(session_id, turn_id)`.
+    cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
 }
 
 impl AcpServer {
@@ -302,6 +317,7 @@ impl AcpServer {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
             writer_rx: std::sync::Mutex::new(writer_rx),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -450,6 +466,7 @@ impl AcpServer {
             "session/new" => self.handle_session_new(&request.params).await,
             "session/prompt" => self.handle_session_prompt(&request.params, &id).await,
             "session/stop" => self.handle_session_stop(&request.params).await,
+            "session/cancel" => self.handle_session_cancel(&request.params).await,
             "session/event" | "session/update" => self.handle_session_event(&request.params).await,
             _ => Err(RpcError {
                 code: METHOD_NOT_FOUND,
@@ -656,13 +673,30 @@ impl AcpServer {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
 
+        // Create a cancellation token for this turn and register it so that a
+        // concurrent `session/cancel` notification can fire it without waiting
+        // for the inner session lock (which is held for the full turn duration).
+        // The lock can never be poisoned — all critical sections guarded by this
+        // mutex are short, infallible HashMap operations (insert/remove/get)
+        // that never call user code, panic, or block on I/O.
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        {
+            self.cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
+                .insert(session_id.clone(), cancel_token.clone());
+        }
+
         // Move the Arc into the spawned task and lock inside it.  The inner
         // Mutex stays locked for the duration of the turn, preventing
         // concurrent stop/reap from touching the agent mid-turn. The outer
         // map entry remains in place.
         let turn_handle = tokio::spawn(async move {
             let mut session = session_arc.lock().await;
-            let result = session.agent.turn_streamed(&prompt, event_tx, None).await;
+            let result = session
+                .agent
+                .turn_streamed(&prompt, event_tx, Some(cancel_token))
+                .await;
             session.last_active = Instant::now();
             result
             // guard drops here, releasing the inner lock
@@ -672,9 +706,23 @@ impl AcpServer {
         // notifications: `tool_call` for initial (pending + title/kind for UI/icons),
         // `tool_call_update` for completion (status + rawOutput/content). This enables
         // proper pending→completed flow in ACP clients.
+        // Track streamed text so partial content survives cancellation.
+        let mut accumulated_text = String::new();
         while let Some(event) = event_rx.recv().await {
+            if let TurnEvent::Chunk { ref delta } = event {
+                accumulated_text.push_str(delta);
+            }
             let notification = notification_for_turn_event(&session_id, &event);
             self.write_notification(&notification).await;
+        }
+
+        // Remove the cancel token regardless of outcome — the turn is over.
+        // Lock poisoned invariant: same as the insert site above.
+        {
+            self.cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
+                .remove(&session_id);
         }
 
         let turn_result = turn_handle.await.map_err(|e| RpcError {
@@ -682,6 +730,26 @@ impl AcpServer {
             message: format!("Agent task panicked: {e}"),
             data: None,
         })?;
+
+        // Per ACP spec: a cancelled turn must respond with stopReason "cancelled",
+        // not an error. Detect via ToolLoopCancelled propagated through anyhow.
+        let was_cancelled = match &turn_result {
+            Err(e) => zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(e),
+            Ok(_) => false,
+        };
+
+        if was_cancelled {
+            let content = if accumulated_text.is_empty() {
+                "[interrupted by user]".to_string()
+            } else {
+                format!("{accumulated_text}\n\n[interrupted by user]")
+            };
+            return Ok(serde_json::json!({
+                "sessionId": session_id,
+                "stopReason": "cancelled",
+                "content": content,
+            }));
+        }
 
         let result = turn_result.map_err(|e| RpcError {
             code: INTERNAL_ERROR,
@@ -759,6 +827,43 @@ impl AcpServer {
             "sessionId": session_id,
             "stopped": true,
         }))
+    }
+
+    /// Handle `session/cancel` notifications (ACP spec §Cancellation).
+    ///
+    /// Fires the cancellation token for the named session's active turn, if
+    /// one is running. Idempotent — silently succeeds when there is no active
+    /// turn. The return value is ignored for notifications.
+    ///
+    /// Cancel-vs-stop interaction: if `session/cancel` and `session/stop` fire
+    /// nearly simultaneously, both handlers race — cancel fires the token
+    /// (which may or may not interrupt the turn), and stop sets
+    /// `session.stopped = true` and awaits the turn handle. The net effect is
+    /// harmless: either the turn sees the cancellation token or it doesn't, and
+    /// stop always waits for the turn to finish.
+    async fn handle_session_cancel(&self, params: &Value) -> RpcResult {
+        let session_id = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcError {
+                code: INVALID_PARAMS,
+                message: "Missing required parameter: sessionId".to_string(),
+                data: None,
+            })?;
+
+        let token = self
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
+            .get(session_id)
+            .cloned();
+
+        if let Some(token) = token {
+            token.cancel();
+            debug!("Cancelled active turn for session {session_id}");
+        }
+
+        Ok(serde_json::json!({}))
     }
 
     /// Handle incoming `session/update` (or legacy `session/event`) notifications.
@@ -1527,5 +1632,119 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn make_test_config(cwd: &std::path::Path) -> Config {
+        let mut cfg = Config {
+            workspace_dir: cwd.to_path_buf(),
+            providers: zeroclaw_config::providers::ProvidersConfig {
+                models: HashMap::from([(
+                    "anthropic".to_string(),
+                    HashMap::from([(
+                        "default".to_string(),
+                        zeroclaw_config::schema::ModelProviderConfig {
+                            model: Some("claude-haiku-4-5".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
+                )]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        cfg.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "anthropic.default".to_string(),
+                risk_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
+        cfg
+    }
+
+    /// `session/cancel` on an idle session (no active turn) must succeed silently.
+    #[tokio::test]
+    async fn session_cancel_idle_session_is_noop() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+        ));
+
+        let new_result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = new_result["sessionId"].as_str().unwrap().to_string();
+
+        // No active turn — cancel must not error.
+        let result = server
+            .handle_session_cancel(&serde_json::json!({ "sessionId": session_id }))
+            .await;
+        assert!(result.is_ok(), "idle cancel must succeed: {result:?}");
+    }
+
+    /// `session/cancel` for an unknown session ID must succeed silently (notification
+    /// semantics: no response, no error propagation).
+    #[tokio::test]
+    async fn session_cancel_unknown_session_is_noop() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+        ));
+
+        let result = server
+            .handle_session_cancel(&serde_json::json!({ "sessionId": "sess_does_not_exist" }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "unknown-session cancel must succeed: {result:?}"
+        );
+    }
+
+    /// Verify that inserting and removing a cancel token from the map works
+    /// correctly. This tests map mechanics directly rather than the
+    /// `handle_session_prompt` lifecycle, so a regression in the production
+    /// path's cleanup wouldn't be caught by this test.
+    #[tokio::test]
+    async fn cancel_tokens_map_remove_works() {
+        let cwd = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace_dir: cwd.path().to_path_buf(),
+            ..Default::default()
+        };
+        let server = Arc::new(AcpServer::new(config, AcpServerConfig::default()));
+
+        // Insert and remove a token directly.
+        let session_id = "sess_token_leak_test".to_string();
+        let token = tokio_util::sync::CancellationToken::new();
+        server
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .insert(session_id.clone(), token);
+
+        // Remove the token.
+        server
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .remove(&session_id);
+
+        let remaining = server
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .len();
+        assert_eq!(remaining, 0, "cancel token must be removed after turn ends");
     }
 }

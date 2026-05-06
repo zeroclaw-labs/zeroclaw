@@ -1031,15 +1031,31 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, prefix: &str) ->
     let current = cfg.get_prop(&model_path).unwrap_or_default();
     let is_set = !current.is_empty() && current != "<unset>";
     // Extract type and alias from "providers.models.<type>.<alias>".
+    // Type keys may contain dots (URL-keyed custom providers like
+    // `custom:https://example/v1`), so disambiguate by matching against the
+    // actual configured outer keys; longest match wins.
     let (provider, profile) = match prefix.strip_prefix("providers.models.") {
         Some(rest) => {
-            if let Some((type_k, alias_k)) = rest.split_once('.') {
+            let mut matched = cfg
+                .providers
+                .models
+                .keys()
+                .filter_map(|k| {
+                    let needle = format!("{k}.");
+                    rest.strip_prefix(&needle)
+                        .map(|alias_k| (k.clone(), alias_k.to_string()))
+                })
+                .collect::<Vec<_>>();
+            matched.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+            if let Some((type_k, alias_k)) = matched.into_iter().next() {
                 let profile = cfg
                     .providers
                     .models
-                    .get(type_k)
-                    .and_then(|m| m.get(alias_k));
-                (type_k.to_string(), profile)
+                    .get(&type_k)
+                    .and_then(|m| m.get(&alias_k));
+                (type_k, profile)
+            } else if let Some((type_k, _)) = rest.split_once('.') {
+                (type_k.to_string(), None)
             } else {
                 (rest.to_string(), None)
             }
@@ -1862,7 +1878,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        format!("http://localhost:{port}")
+        format!("http://127.0.0.1:{port}")
     }
 
     #[tokio::test]
@@ -2140,6 +2156,40 @@ mod tests {
             .expect("custom provider entry should be seeded");
         assert_eq!(model_cfg.api_key.as_deref(), Some("sk-custom-test"));
         assert_eq!(model_cfg.model.as_deref(), Some("qwen-local"));
+    }
+
+    #[tokio::test]
+    async fn providers_custom_openai_menu_flow_persists_url_keyed_entry() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        let base_url = spawn_models_endpoint(
+            StatusCode::OK,
+            r#"{"data":[{"id":"local-small"},{"id":"local-large"}]}"#,
+            None,
+        )
+        .await;
+        let provider = format!("custom:{base_url}");
+
+        let flags = Flags::default();
+        let mut ui = QuickUi::new()
+            .with("Provider", CUSTOM_OPENAI_COMPAT_LABEL)
+            .with("OpenAI-compatible base URL", base_url.clone())
+            .with("api-key", "sk-custom-test")
+            .with("Model", "local-large");
+
+        run(&mut cfg, &mut ui, Section::Providers, &flags)
+            .await
+            .unwrap();
+
+        let model_cfg = cfg
+            .providers
+            .models
+            .get(&provider)
+            .and_then(|m| m.get("default"))
+            .expect("custom provider entry should be persisted under its URL key");
+        assert_eq!(model_cfg.api_key.as_deref(), Some("sk-custom-test"));
+        assert_eq!(model_cfg.base_url.as_deref(), Some(base_url.as_str()));
+        assert_eq!(model_cfg.model.as_deref(), Some("local-large"));
     }
 
     #[tokio::test]
