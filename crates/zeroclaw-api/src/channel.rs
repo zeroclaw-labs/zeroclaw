@@ -129,6 +129,66 @@ pub trait Channel: Send + Sync {
         true
     }
 
+    /// Send a discrete-choice prompt with options.
+    ///
+    /// Each `(callback_id, label)` pair represents one choice. Whether
+    /// the `callback_id` round-trips on inbound is **channel-specific**:
+    ///
+    /// - **WhatsApp Cloud** preserves the `callback_id` exactly — it
+    ///   appears as `interactive.button_reply.id` /
+    ///   `interactive.list_reply.id`, surfaced as
+    ///   `[choice]<callback_id>` in the inbound `ChannelMessage.content`.
+    /// - **Signal** uses native polls, which only round-trip the
+    ///   selected option's *label* (signal-cli emits
+    ///   `pollAnswer.selectedTitles`). The inbound surfaces as
+    ///   `[choice]<label>`. Callers needing a stable id should pass
+    ///   the id IN the label, or maintain a side map keyed by label.
+    ///   Avoid duplicate labels: identical labels are
+    ///   indistinguishable on the inbound side.
+    /// - **Default text fallback** (Matrix, SMS, IRC, mock) renders a
+    ///   numbered list with a "reply with name or number" hint and
+    ///   relies on the consumer's own matcher to resolve the user's
+    ///   text reply against the option list.
+    ///
+    /// `options.is_empty()` is treated as "send the prompt as plain
+    /// text with no choices" rather than rendering an empty selection
+    /// hint; if `prompt` is also empty the call is a no-op (returns
+    /// `Ok(())`).
+    ///
+    /// `prompt` is the question / title; rendered ABOVE the options.
+    async fn send_choice(
+        &self,
+        recipient: &str,
+        prompt: &str,
+        options: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        let trimmed_prompt = prompt.trim();
+        if options.is_empty() {
+            // No options to render. Send the prompt as plain text; if
+            // there's nothing to say either, this is a no-op so we
+            // don't ship an empty message that confuses the client.
+            if trimmed_prompt.is_empty() {
+                return Ok(());
+            }
+            return self
+                .send(&SendMessage::new(trimmed_prompt, recipient))
+                .await;
+        }
+
+        let mut text = String::new();
+        if !trimmed_prompt.is_empty() {
+            text.push_str(trimmed_prompt);
+            text.push_str("\n\n");
+        }
+        text.push_str("(reply with name or number)\n");
+        for (idx, (_id, label)) in options.iter().enumerate() {
+            text.push_str(&format!("{}. {}\n", idx + 1, label.trim()));
+        }
+        // Trim trailing newline so the message looks tidy across clients.
+        let trimmed = text.trim_end().to_string();
+        self.send(&SendMessage::new(trimmed, recipient)).await
+    }
+
     /// Signal that the bot is processing a response (e.g. "typing" indicator).
     async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
         Ok(())

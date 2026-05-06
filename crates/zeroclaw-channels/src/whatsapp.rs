@@ -261,13 +261,45 @@ impl WhatsAppChannel {
                         continue;
                     }
 
-                    // Extract text content (support text messages only for now)
+                    // Extract content. Three shapes that produce a usable
+                    // text body:
+                    //   1. text       — plain message; .text.body
+                    //   2. interactive.button_reply  — user tapped a button
+                    //                                  in an interactive message
+                    //   3. interactive.list_reply    — user picked a row in
+                    //                                  an interactive list
+                    //
+                    // For (2) and (3), Calciforge-style consumers want the
+                    // option's `id` (which round-trips to the original
+                    // ChoiceOption.callback_data). We surface that as
+                    // `[choice]<id>` so consumers can recognize the sentinel
+                    // and resolve it back; consumers that don't care can
+                    // ignore the prefix.
                     let content = if let Some(text_obj) = msg.get("text") {
                         text_obj
                             .get("body")
                             .and_then(|b| b.as_str())
                             .unwrap_or("")
                             .to_string()
+                    } else if let Some(interactive) = msg.get("interactive") {
+                        let kind = interactive
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
+                        let reply = match kind {
+                            "button_reply" => interactive.get("button_reply"),
+                            "list_reply" => interactive.get("list_reply"),
+                            _ => None,
+                        };
+                        match reply.and_then(|r| r.get("id")).and_then(|i| i.as_str()) {
+                            Some(id) if !id.is_empty() => format!("[choice]{id}"),
+                            _ => {
+                                tracing::debug!(
+                                    "WhatsApp: interactive reply from {from} missing id, dropping"
+                                );
+                                continue;
+                            }
+                        }
                     } else {
                         // Could be image, audio, etc. — skip for now
                         tracing::debug!("WhatsApp: skipping non-text message from {from}");
@@ -282,19 +314,29 @@ impl WhatsAppChannel {
                     // DMs and group_mention_patterns for groups. When the
                     // applicable pattern set is non-empty, messages without a
                     // match are dropped and matched fragments are stripped.
+                    //
+                    // Bypass for native-interactive replies: a `[choice]<id>`
+                    // body comes from the user tapping a button or list row
+                    // we sent — the bot's own UI counts as an explicit
+                    // interaction with the bot, so the mention requirement
+                    // (intended to gate freeform messages) does not apply.
                     let is_group = Self::is_group_message(msg);
-                    let content = match Self::apply_mention_gating(
-                        &self.dm_mention_patterns,
-                        &self.group_mention_patterns,
-                        &content,
-                        is_group,
-                    ) {
-                        Some(c) => c,
-                        None => {
-                            tracing::debug!(
-                                "WhatsApp: message from {from} did not match mention patterns, dropping"
-                            );
-                            continue;
+                    let content = if content.starts_with("[choice]") {
+                        content
+                    } else {
+                        match Self::apply_mention_gating(
+                            &self.dm_mention_patterns,
+                            &self.group_mention_patterns,
+                            &content,
+                            is_group,
+                        ) {
+                            Some(c) => c,
+                            None => {
+                                tracing::debug!(
+                                    "WhatsApp: message from {from} did not match mention patterns, dropping"
+                                );
+                                continue;
+                            }
                         }
                     };
 
@@ -327,6 +369,178 @@ impl WhatsAppChannel {
 
         messages
     }
+
+    /// Send an interactive button message (≤ 3 buttons per Meta's Cloud
+    /// API limit). Each tuple is `(id, label)`; `id` round-trips back
+    /// through the inbound `interactive.button_reply.id` field as a
+    /// `[choice]<id>` synthetic `ChannelMessage` content (see
+    /// `parse_webhook_payload`).
+    ///
+    /// Meta's `interactive` body schema:
+    /// https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages
+    pub async fn send_interactive_buttons(
+        &self,
+        recipient: &str,
+        body_text: &str,
+        buttons: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        if buttons.is_empty() || buttons.len() > 3 {
+            anyhow::bail!(
+                "WhatsApp interactive buttons require 1..=3 options (got {}); \
+                 use send_interactive_list for more",
+                buttons.len()
+            );
+        }
+        let url = format!(
+            "https://graph.facebook.com/v18.0/{}/messages",
+            self.endpoint_id
+        );
+        ensure_https(&url)?;
+        let to = recipient.strip_prefix('+').unwrap_or(recipient);
+        let action_buttons: Vec<serde_json::Value> = buttons
+            .iter()
+            .map(|(id, label)| {
+                // Meta caps button title at 20 chars and id at 256.
+                let title = label.chars().take(20).collect::<String>();
+                let id_trim = id.chars().take(256).collect::<String>();
+                serde_json::json!({
+                    "type": "reply",
+                    "reply": { "id": id_trim, "title": title },
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": { "text": body_text },
+                "action": { "buttons": action_buttons },
+            }
+        });
+        self.post_to_meta(&url, &body).await
+    }
+
+    /// Send an interactive list message (more than 3 options, up to 10
+    /// rows per section, up to 10 sections per Meta's limits). `sections`
+    /// each carry a section title + rows. Each row's `id` round-trips
+    /// through the inbound `interactive.list_reply.id` as `[choice]<id>`.
+    ///
+    /// `button_text` is the button label that opens the list (Meta limits
+    /// to 20 chars).
+    pub async fn send_interactive_list(
+        &self,
+        recipient: &str,
+        body_text: &str,
+        button_text: &str,
+        sections: &[InteractiveListSection],
+    ) -> anyhow::Result<()> {
+        if sections.is_empty() {
+            anyhow::bail!("WhatsApp interactive list requires at least one section");
+        }
+        if sections.len() > 10 {
+            anyhow::bail!(
+                "WhatsApp interactive list capped at 10 sections (got {})",
+                sections.len()
+            );
+        }
+        for s in sections {
+            if s.rows.len() > 10 {
+                anyhow::bail!(
+                    "WhatsApp interactive list section '{}' capped at 10 rows (got {})",
+                    s.title,
+                    s.rows.len()
+                );
+            }
+        }
+        let url = format!(
+            "https://graph.facebook.com/v18.0/{}/messages",
+            self.endpoint_id
+        );
+        ensure_https(&url)?;
+        let to = recipient.strip_prefix('+').unwrap_or(recipient);
+        let action_sections: Vec<serde_json::Value> = sections
+            .iter()
+            .map(|s| {
+                let rows: Vec<serde_json::Value> = s
+                    .rows
+                    .iter()
+                    .map(|r| {
+                        let mut row = serde_json::json!({
+                            "id": r.id.chars().take(200).collect::<String>(),
+                            "title": r.title.chars().take(24).collect::<String>(),
+                        });
+                        if let Some(d) = &r.description {
+                            row["description"] =
+                                serde_json::Value::String(d.chars().take(72).collect());
+                        }
+                        row
+                    })
+                    .collect();
+                serde_json::json!({
+                    "title": s.title.chars().take(24).collect::<String>(),
+                    "rows": rows,
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "interactive",
+            "interactive": {
+                "type": "list",
+                "body": { "text": body_text },
+                "action": {
+                    "button": button_text.chars().take(20).collect::<String>(),
+                    "sections": action_sections,
+                },
+            }
+        });
+        self.post_to_meta(&url, &body).await
+    }
+
+    async fn post_to_meta(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<()> {
+        let resp = self
+            .http_client()
+            .post(url)
+            .bearer_auth(&self.access_token)
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_body = resp.text().await.unwrap_or_default();
+            tracing::error!("WhatsApp interactive send failed: {status} — {error_body}");
+            anyhow::bail!("WhatsApp API error: {status}");
+        }
+        Ok(())
+    }
+}
+
+/// One section in an interactive list message. Sections group related
+/// rows under a header.
+#[derive(Debug, Clone)]
+pub struct InteractiveListSection {
+    /// Section header (Meta caps at 24 chars; we truncate).
+    pub title: String,
+    /// Rows in this section. Up to 10 per Meta's limit.
+    pub rows: Vec<InteractiveListRow>,
+}
+
+/// One row in an interactive list message.
+#[derive(Debug, Clone)]
+pub struct InteractiveListRow {
+    /// Stable identifier round-tripped via inbound `interactive.list_reply.id`
+    /// as `[choice]<id>`.
+    pub id: String,
+    /// User-visible label (Meta caps at 24 chars).
+    pub title: String,
+    /// Optional secondary line (Meta caps at 72 chars).
+    pub description: Option<String>,
 }
 
 #[async_trait]
@@ -378,6 +592,93 @@ impl Channel for WhatsAppChannel {
         }
 
         Ok(())
+    }
+
+    async fn send_choice(
+        &self,
+        recipient: &str,
+        prompt: &str,
+        options: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        let trimmed_prompt = prompt.trim();
+        // No options → send the prompt as plain text (or no-op when both
+        // empty); never render a "(reply with name or number)" hint with
+        // nothing under it. Mirrors the trait default's empty guard.
+        if options.is_empty() {
+            if trimmed_prompt.is_empty() {
+                return Ok(());
+            }
+            return self
+                .send(&SendMessage::new(trimmed_prompt, recipient))
+                .await;
+        }
+        // WhatsApp Cloud interactive: ≤ 3 buttons OR up to 10×10 list rows.
+        // 1 option falls through to plain text — there's no UX win to a
+        // single-button interactive message.
+        if options.len() >= 2 && options.len() <= 3 {
+            let buttons: Vec<(String, String)> = options
+                .iter()
+                .map(|(id, label)| (id.clone(), label.clone()))
+                .collect();
+            return self
+                .send_interactive_buttons(recipient, prompt, &buttons)
+                .await;
+        }
+        if options.len() > 3 {
+            // List messages: max 10 rows per section, max 10 sections per
+            // message → up to 100 options. Chunk into sections of ≤10 rows
+            // each so we don't blow past the per-section row cap. Section
+            // titles mark the index range so list UIs render cleanly.
+            const MAX_ROWS_PER_SECTION: usize = 10;
+            const MAX_SECTIONS: usize = 10;
+            let max_total = MAX_ROWS_PER_SECTION * MAX_SECTIONS;
+            if options.len() > max_total {
+                anyhow::bail!(
+                    "WhatsApp send_choice: {} options exceeds list cap ({}); split the prompt or call send_interactive_list directly",
+                    options.len(),
+                    max_total
+                );
+            }
+            let sections: Vec<InteractiveListSection> = options
+                .chunks(MAX_ROWS_PER_SECTION)
+                .enumerate()
+                .map(|(chunk_idx, chunk)| {
+                    let start = chunk_idx * MAX_ROWS_PER_SECTION + 1;
+                    let end = start + chunk.len() - 1;
+                    let title = if options.len() <= MAX_ROWS_PER_SECTION {
+                        "Options".to_string()
+                    } else {
+                        format!("Options {start}–{end}")
+                    };
+                    InteractiveListSection {
+                        title,
+                        rows: chunk
+                            .iter()
+                            .map(|(id, label)| InteractiveListRow {
+                                id: id.clone(),
+                                title: label.clone(),
+                                description: None,
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+            return self
+                .send_interactive_list(recipient, prompt, "Choose", &sections)
+                .await;
+        }
+        // Exactly 1 option → defer to plain text. (Empty case handled above.)
+        let mut text = String::new();
+        if !trimmed_prompt.is_empty() {
+            text.push_str(trimmed_prompt);
+            text.push_str("\n\n");
+        }
+        text.push_str("(reply with name or number)\n");
+        for (idx, (_id, label)) in options.iter().enumerate() {
+            text.push_str(&format!("{}. {}\n", idx + 1, label.trim()));
+        }
+        let trimmed = text.trim_end().to_string();
+        self.send(&SendMessage::new(trimmed, recipient)).await
     }
 
     async fn request_approval(
@@ -1924,5 +2225,116 @@ mod tests {
             .lock()
             .await
             .remove("test_share_tok");
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Interactive reply parsing — button_reply / list_reply paths
+    // ══════════════════════════════════════════════════════════
+
+    fn interactive_reply_payload(
+        kind: &str,
+        id: &str,
+        title: &str,
+        from: &str,
+    ) -> serde_json::Value {
+        // WhatsApp Cloud API reply shape for `interactive.button_reply` and
+        // `interactive.list_reply`. Both nest the selected option under the
+        // type-specific key with `id` (callback_id) and `title` (label).
+        serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": from,
+                            "id": "wamid.interactive",
+                            "timestamp": "1700000000",
+                            "type": "interactive",
+                            "interactive": {
+                                "type": kind,
+                                kind: { "id": id, "title": title }
+                            }
+                        }]
+                    }
+                }]
+            }]
+        })
+    }
+
+    #[test]
+    fn whatsapp_parse_interactive_button_reply_emits_choice_sentinel() {
+        let ch = make_channel();
+        let payload = interactive_reply_payload(
+            "button_reply",
+            "cf:agent:librarian",
+            "Librarian",
+            "1234567890",
+        );
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[choice]cf:agent:librarian");
+        assert_eq!(msgs[0].sender, "+1234567890");
+        assert_eq!(msgs[0].channel, "whatsapp");
+    }
+
+    #[test]
+    fn whatsapp_parse_interactive_list_reply_emits_choice_sentinel() {
+        let ch = make_channel();
+        let payload =
+            interactive_reply_payload("list_reply", "cf:session:backend", "backend", "1234567890");
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[choice]cf:session:backend");
+    }
+
+    #[test]
+    fn whatsapp_parse_interactive_reply_missing_id_dropped() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "1234567890",
+                            "timestamp": "1",
+                            "type": "interactive",
+                            "interactive": {
+                                "type": "button_reply",
+                                "button_reply": { "title": "no id here" }
+                            }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(
+            msgs.is_empty(),
+            "interactive reply without id must be dropped, got: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn whatsapp_interactive_reply_bypasses_dm_mention_gating() {
+        // With dm_mention_patterns set, a freeform body without the trigger
+        // is dropped — but a [choice]<id> body produced by an interactive
+        // reply must be passed through, because the user already explicitly
+        // tapped a button the bot rendered.
+        let ch = WhatsAppChannel::new(
+            "tok".into(),
+            "123".into(),
+            "ver".into(),
+            vec!["+1234567890".into()],
+        )
+        .with_dm_mention_patterns(vec!["@?ZeroClaw".into()]);
+        let payload = interactive_reply_payload(
+            "button_reply",
+            "cf:agent:librarian",
+            "Librarian",
+            "1234567890",
+        );
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1, "[choice] body must bypass mention-gating");
+        assert_eq!(msgs[0].content, "[choice]cf:agent:librarian");
     }
 }
