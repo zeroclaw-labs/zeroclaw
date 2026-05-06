@@ -41,6 +41,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rustls-pki-types = "1.14.0"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha1 = { version = "0.10", optional = true }
 sha2 = "0.10"
 tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "fs", "signal"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
@@ -83,7 +84,7 @@ default = [
     "channel-bluesky", "channel-twitter", "channel-reddit", "channel-notion",
     "channel-linq", "channel-wati", "channel-nextcloud", "channel-mochat",
     "channel-wecom", "channel-clawdtalk", "channel-webhook",
-    "channel-whatsapp-cloud", "channel-voice-call",
+    "channel-whatsapp-cloud", "channel-voice-call", "channel-twilio",
 ]
 # Channels with optional deps
 channel-email = ["dep:lettre", "dep:mail-parser", "dep:async-imap"]
@@ -91,6 +92,7 @@ channel-telegram = ["dep:image"]
 channel-lark = ["dep:prost"]
 channel-line = []
 channel-nostr = ["dep:nostr-sdk", "zeroclaw-config/channel-nostr"]
+channel-twilio = ["dep:sha1"]
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:serde-big-array", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:qrcode"]
 # Channels with no optional deps (cfg gate only)
 channel-discord = []

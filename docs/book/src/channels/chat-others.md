@@ -148,6 +148,24 @@ databases = ["..."]                # DB IDs the agent can write to
 
 Treats a Notion database as a message surface. Useful for asynchronous workflows where the "channel" is a task inbox.
 
+## Twilio (SMS)
+
+```toml
+[channels.twilio]
+enabled = true
+account_sid = "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"   # public — Twilio Console → Account Info
+auth_token = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"      # SECRET — used for outbound auth + webhook signing key
+from_number = "+15555550100"                          # E.164 — must be a number you own in the Twilio console
+allowed_numbers = ["+15555550199"]                    # `*` allows anyone (use with care; this is the public PSTN)
+```
+
+- **Auth model:** outbound calls use HTTP Basic auth (`account_sid`:`auth_token`). Inbound webhooks are authenticated via `X-Twilio-Signature` (HMAC-SHA1 over the request URL plus sorted form parameters, keyed by the same `auth_token`). A failed signature returns 401 and the SMS is dropped — no message ever reaches the agent.
+- **Inbound endpoint:** ZeroClaw's gateway hosts `POST /twilio/sms` on its public URL. In the Twilio console, edit the messaging configuration on your number and set **A MESSAGE COMES IN** to `https://{your-public-gateway-url}/twilio/sms` with HTTP method **POST**.
+- **Outbound:** `POST https://api.twilio.com/2010-04-01/Accounts/{AccountSid}/Messages.json` with form fields `From`, `To`, `Body`. Bodies over 1600 chars are split into ≤1600-char chunks at sentence/word boundaries with a `(i/N) ` continuation marker. (Twilio handles the per-segment 160-char SMS encoding transparently within that ceiling.)
+- **Public exposure:** the gateway needs to be reachable from Twilio's public IP range. Use one of the `[tunnel]` providers — Cloudflare Tunnel, Tailscale Funnel, ngrok, Pinggy, or a custom command. The tunnel must terminate TLS on a stable hostname so Twilio's signature stays valid across reconnects (Twilio signs the URL it was configured with).
+- **Trial accounts:** Twilio trial accounts can only message verified destinations and prepend a trial-banner string. This is a Twilio constraint, not a ZeroClaw bug.
+- **Cost:** every outbound SMS segment is billable to your Twilio account. The default `enabled = false` is intentional — opt in only after you've confirmed the configuration is right.
+
 ---
 
 ## When to prefer a dedicated guide

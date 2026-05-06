@@ -51,6 +51,7 @@ pub use crate::signal::SignalChannel;
 pub use crate::slack::SlackChannel;
 pub use crate::transcription;
 pub use crate::tts::{TtsManager, TtsProvider};
+pub use crate::twilio::TwilioChannel;
 pub use crate::twitter::TwitterChannel;
 #[cfg(feature = "channel-voice-call")]
 pub use crate::voice_call::VoiceCallChannel;
@@ -4476,6 +4477,19 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 lq.allowed_senders.clone(),
             )))
         }
+        "twilio" => {
+            let tw = config
+                .channels
+                .twilio
+                .as_ref()
+                .context("Twilio channel is not configured")?;
+            Ok(Arc::new(TwilioChannel::new(
+                tw.account_sid.clone(),
+                tw.auth_token.clone(),
+                tw.from_number.clone(),
+                tw.allowed_numbers.clone(),
+            )))
+        }
         #[cfg(feature = "channel-email")]
         "email" => {
             let em = config
@@ -4949,6 +4963,20 @@ fn collect_configured_channels(
         } else {
             tracing::info!("Linq channel configured but disabled (enabled = false)");
         }
+    }
+
+    if let Some(ref tw) = config.channels.twilio
+        && tw.enabled
+    {
+        channels.push(ConfiguredChannel {
+            display_name: "Twilio",
+            channel: Arc::new(TwilioChannel::new(
+                tw.account_sid.clone(),
+                tw.auth_token.clone(),
+                tw.from_number.clone(),
+                tw.allowed_numbers.clone(),
+            )),
+        });
     }
 
     if let Some(ref wati_cfg) = config.channels.wati {
