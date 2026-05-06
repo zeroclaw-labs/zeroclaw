@@ -1,5 +1,5 @@
-[providers.models."custom:http://127.0.0.1:1337/v1"]
+[providers.models."custom:http://127.0.0.1:6767"]
 kind = "openai-compatible"
-base_url = "http://127.0.0.1:1337/v1"
+base_url = "http://127.0.0.1:6767"
 default_model = "unsloth\\Qwen3_5-9B-IQ4_XS"
 model = "unsloth\\Qwen3_5-9B-IQ4_XS"
