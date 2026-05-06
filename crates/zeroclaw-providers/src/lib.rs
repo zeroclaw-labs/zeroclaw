@@ -3381,6 +3381,28 @@ mod tests {
             Ok(_) => panic!("Expected error for unsupported anthropic-custom URL scheme"),
         }
     }
+    #[test]
+    fn factory_atomic_chat() {
+        assert!(create_provider("atomic-chat", Some("key")).is_ok());
+    }
+    #[test]
+    fn factory_atomic_chat_custom_url() {
+        let options = ProviderRuntimeOptions::default();
+        let p = create_provider_with_url_and_options(
+            "atomic-chat",
+            Some("key"),
+            Some("http://127.0.0.1:1337/v1"),
+            &options,
+        );
+        assert!(p.is_ok());
+    }
+    #[test]
+    fn resolve_provider_credential_atomic_chat_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("ATOMIC_CHAT_API_KEY", Some("test-key"));
+        let resolved = resolve_provider_credential("atomic-chat", None);
+        assert_eq!(resolved, Some("test-key".to_string()));
+    }
 
     // ── Error cases ──────────────────────────────────────────
 
