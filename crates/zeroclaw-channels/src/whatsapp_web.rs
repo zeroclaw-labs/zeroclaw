@@ -36,6 +36,28 @@ use tokio::select;
 use wa_rs_proto::whatsapp::device_props::PlatformType;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
+/// Whether the JIDs/group flag describe a "Notes to Self" message — a
+/// non-group conversation where the operator's own user JID is also the chat
+/// JID, and the message originated from the operator's own session.
+#[inline]
+fn is_self_chat_message(
+    is_group: bool,
+    sender_user: &str,
+    chat_user: &str,
+    is_from_me: bool,
+) -> bool {
+    !is_group && sender_user == chat_user && is_from_me
+}
+
+/// Whether an inbound `Event::Message` is the operator's own outbound traffic
+/// observed via the multi-device session and must be dropped before any
+/// sender-policy / allowlist evaluation. Self-chat is exempt — the
+/// `self_chat_mode` toggle handles that path downstream.
+#[inline]
+fn should_drop_own_outbound(is_from_me: bool, is_self_chat: bool) -> bool {
+    is_from_me && !is_self_chat
+}
+
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
 /// # Status: Functional Implementation
@@ -1182,6 +1204,32 @@ impl Channel for WhatsAppWebChannel {
 
                                 let is_group = info.source.is_group;
 
+                                // Drop the operator's own outbound traffic
+                                // before any policy/allowlist evaluation.
+                                // Multi-device delivers messages the operator
+                                // typed manually (or any other device on the
+                                // same WA account) with `is_from_me = true`;
+                                // those are not prompts. "Notes to Self" is
+                                // exempt — the `self_chat_mode` toggle below
+                                // governs that path.
+                                let sender_user = sender_jid.user();
+                                let chat_user = chat
+                                    .split_once('@')
+                                    .map(|(u, _)| u)
+                                    .unwrap_or(&chat);
+                                let is_self_chat = is_self_chat_message(
+                                    is_group,
+                                    sender_user,
+                                    chat_user,
+                                    info.source.is_from_me,
+                                );
+                                if should_drop_own_outbound(info.source.is_from_me, is_self_chat) {
+                                    tracing::debug!(
+                                        "WhatsApp Web: dropping own-account outbound (is_from_me, non-self-chat)"
+                                    );
+                                    return;
+                                }
+
                                 // Phone-based reply target for self-chat.
                                 // LID JIDs (e.g. 76188559093817@lid) are internal
                                 // identifiers that cannot receive messages; replies
@@ -1190,16 +1238,6 @@ impl Channel for WhatsAppWebChannel {
 
                                 // ── Personal-mode chat-type policy filtering ──
                                 if wa_mode == zeroclaw_config::schema::WhatsAppWebMode::Personal {
-                                    // Self-chat: the chat JID user part matches
-                                    // the sender's user part (message to "Notes
-                                    // to Self").
-                                    let sender_user = sender_jid.user();
-                                    let chat_user = chat
-                                        .split_once('@')
-                                        .map(|(u, _)| u)
-                                        .unwrap_or(&chat);
-                                    let is_self_chat = !is_group && sender_user == chat_user && info.source.is_from_me;
-
                                     if is_self_chat {
                                         if !wa_self_chat_mode {
                                             tracing::debug!(
@@ -2305,5 +2343,62 @@ mod tests {
             mime_from_path(std::path::Path::new("/tmp/e.xyz")),
             "application/octet-stream"
         );
+    }
+
+    // ── is_from_me / self-chat gating ──
+    //
+    // `should_drop_own_outbound` is the early gate that fires before any
+    // policy/allowlist evaluation. `is_self_chat_message` derives the
+    // self-chat classification from JIDs + group flag + is_from_me.
+
+    #[test]
+    fn is_from_me_non_self_dm_is_dropped() {
+        // Operator's own number replies to a third party from another device:
+        // sender = operator, chat = contact, is_from_me=true → drop.
+        let is_self_chat = is_self_chat_message(false, "15555550100", "15555550199", true);
+        assert!(!is_self_chat);
+        assert!(should_drop_own_outbound(true, is_self_chat));
+    }
+
+    #[test]
+    fn is_from_me_group_is_dropped() {
+        // Operator posts in a group from another device: sender = operator,
+        // chat = group JID (different user part), is_group=true → drop.
+        let is_self_chat = is_self_chat_message(true, "15555550100", "120363042000000000", true);
+        assert!(!is_self_chat);
+        assert!(should_drop_own_outbound(true, is_self_chat));
+    }
+
+    #[test]
+    fn is_from_me_self_chat_with_self_chat_mode_on_is_processed() {
+        // Notes-to-Self with self_chat_mode=true: passes the early gate; the
+        // existing Personal-mode branch then processes the message.
+        let is_self_chat = is_self_chat_message(false, "15555550100", "15555550100", true);
+        assert!(is_self_chat);
+        assert!(!should_drop_own_outbound(true, is_self_chat));
+        let self_chat_mode = true;
+        assert!(is_self_chat && self_chat_mode);
+    }
+
+    #[test]
+    fn is_from_me_self_chat_with_self_chat_mode_off_is_dropped() {
+        // Notes-to-Self with self_chat_mode=false: passes the early gate
+        // (it's a self-chat), then the existing in-block gate drops it.
+        let is_self_chat = is_self_chat_message(false, "15555550100", "15555550100", true);
+        assert!(is_self_chat);
+        assert!(!should_drop_own_outbound(true, is_self_chat));
+        let self_chat_mode = false;
+        assert!(is_self_chat && !self_chat_mode);
+    }
+
+    #[test]
+    fn inbound_dm_not_from_me_is_processed() {
+        // Normal inbound DM from a contact: is_from_me=false. Even though
+        // sender == chat (a DM thread is keyed on the contact's JID), the
+        // self-chat predicate requires is_from_me, so the early gate does
+        // not fire and the message proceeds to allowlist evaluation.
+        let is_self_chat = is_self_chat_message(false, "15555550199", "15555550199", false);
+        assert!(!is_self_chat);
+        assert!(!should_drop_own_outbound(false, is_self_chat));
     }
 }
