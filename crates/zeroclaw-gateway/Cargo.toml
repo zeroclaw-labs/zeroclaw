@@ -16,6 +16,7 @@ zeroclaw-providers.workspace = true
 zeroclaw-channels = { workspace = true, default-features = true, features = ["channel-acp-server", "channel-email", "channel-telegram"] }
 zeroclaw-runtime.workspace = true
 zeroclaw-tools.workspace = true
+zeroclaw-updater.workspace = true
 zeroclaw-hardware.workspace = true
 zeroclaw-plugins = { workspace = true, optional = true }
 

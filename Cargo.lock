@@ -13399,6 +13399,7 @@ dependencies = [
  "zeroclaw-providers",
  "zeroclaw-runtime",
  "zeroclaw-tools",
+ "zeroclaw-updater",
 ]
 
 [[package]]
@@ -13707,6 +13708,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-updater"
+version = "0.7.4"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "flate2",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "zeroclawlabs"
 version = "0.7.4"
 dependencies = [
@@ -13799,6 +13816,7 @@ dependencies = [
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
  "zeroclaw-tui",
+ "zeroclaw-updater",
  "zip",
 ]
 

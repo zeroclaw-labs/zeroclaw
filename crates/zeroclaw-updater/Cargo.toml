@@ -1,0 +1,19 @@
+[package]
+name = "zeroclaw-updater"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+flate2 = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tar = "0.4"
+tempfile = "3.26"
+tokio = { version = "1.50", default-features = false, features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+tracing = { version = "0.1", default-features = false }

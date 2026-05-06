@@ -2246,7 +2246,7 @@ async fn main() -> Result<()> {
 
         Commands::Update {
             check,
-            force: _force,
+            force,
             version,
         } => {
             if check {
@@ -2261,7 +2261,11 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             } else {
-                commands::update::run(version.as_deref()).await
+                zeroclaw_updater::run_with_options(
+                    version.as_deref(),
+                    zeroclaw_updater::RunOptions { force },
+                )
+                .await
             }
         }
 
