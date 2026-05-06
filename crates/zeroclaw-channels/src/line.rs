@@ -1830,6 +1830,7 @@ mod tests {
                 max_audio_bytes: 25 * 1024 * 1024,
                 timeout_secs: 300,
             }),
+            inworld: None,
             transcribe_non_ptt_audio: true,
         };
 

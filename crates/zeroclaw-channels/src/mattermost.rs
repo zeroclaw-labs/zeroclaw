@@ -1215,6 +1215,7 @@ mod tests {
                 assemblyai: None,
                 google: None,
                 local_whisper: None,
+                inworld: None,
                 transcribe_non_ptt_audio: false,
             },
         );
@@ -1238,6 +1239,7 @@ mod tests {
                 assemblyai: None,
                 google: None,
                 local_whisper: None,
+                inworld: None,
                 transcribe_non_ptt_audio: false,
             },
         );
@@ -1381,6 +1383,7 @@ mod tests {
                 assemblyai: None,
                 google: None,
                 local_whisper: None,
+                inworld: None,
                 transcribe_non_ptt_audio: false,
             },
         );
@@ -1454,6 +1457,7 @@ mod tests {
                     max_audio_bytes: 25_000_000,
                     timeout_secs: 300,
                 }),
+                inworld: None,
                 transcribe_non_ptt_audio: false,
             });
 
@@ -1504,6 +1508,7 @@ mod tests {
                     max_audio_bytes: 25_000_000,
                     timeout_secs: 300,
                 }),
+                inworld: None,
                 transcribe_non_ptt_audio: false,
             });
 

@@ -912,6 +912,14 @@ fn default_google_stt_language_code() -> String {
     "en-US".into()
 }
 
+fn default_inworld_stt_model_id() -> String {
+    "inworld/inworld-stt-1".into()
+}
+
+fn default_inworld_stt_audio_encoding() -> String {
+    "AUTO_DETECT".into()
+}
+
 /// Voice transcription configuration with multi-provider support.
 ///
 /// The top-level `api_url`, `model`, and `api_key` fields remain for backward
@@ -923,7 +931,7 @@ pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
-    /// Default STT provider: "groq", "openai", "deepgram", "assemblyai", "google".
+    /// Default STT provider: "groq", "openai", "deepgram", "assemblyai", "google", "inworld".
     #[serde(default = "default_transcription_provider")]
     pub default_provider: String,
     /// API key used for transcription requests (Groq provider).
@@ -970,6 +978,10 @@ pub struct TranscriptionConfig {
     #[serde(default)]
     #[nested]
     pub local_whisper: Option<LocalWhisperConfig>,
+    /// Inworld STT provider configuration.
+    #[serde(default)]
+    #[nested]
+    pub inworld: Option<InworldSttConfig>,
     /// Also transcribe non-PTT (forwarded/regular) audio messages on WhatsApp,
     /// not just voice notes.  Default: `false` (preserves legacy behavior).
     #[serde(default)]
@@ -992,6 +1004,7 @@ impl Default for TranscriptionConfig {
             assemblyai: None,
             google: None,
             local_whisper: None,
+            inworld: None,
             transcribe_non_ptt_audio: false,
         }
     }
@@ -1199,6 +1212,22 @@ fn default_piper_tts_api_url() -> String {
     "http://127.0.0.1:5000/v1/audio/speech".into()
 }
 
+fn default_inworld_tts_model_id() -> String {
+    "inworld-tts-1.5-max".into()
+}
+
+fn default_inworld_tts_audio_encoding() -> String {
+    "MP3".into()
+}
+
+fn default_inworld_tts_sample_rate_hertz() -> u32 {
+    24_000
+}
+
+fn default_inworld_tts_speaking_rate() -> f64 {
+    1.0
+}
+
 /// Text-to-Speech configuration (`[tts]`).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -1207,7 +1236,7 @@ pub struct TtsConfig {
     /// Enable TTS synthesis.
     #[serde(default)]
     pub enabled: bool,
-    /// Default TTS provider (`"openai"`, `"elevenlabs"`, `"google"`, `"edge"`).
+    /// Default TTS provider (`"openai"`, `"elevenlabs"`, `"google"`, `"edge"`, `"piper"`, `"inworld"`).
     #[serde(default = "default_tts_provider")]
     pub default_provider: String,
     /// Default voice ID passed to the selected provider.
@@ -1239,6 +1268,10 @@ pub struct TtsConfig {
     #[serde(default)]
     #[nested]
     pub piper: Option<PiperTtsConfig>,
+    /// Inworld TTS provider configuration (`[tts.inworld]`).
+    #[serde(default)]
+    #[nested]
+    pub inworld: Option<InworldTtsConfig>,
 }
 
 impl Default for TtsConfig {
@@ -1254,6 +1287,7 @@ impl Default for TtsConfig {
             google: None,
             edge: None,
             piper: None,
+            inworld: None,
         }
     }
 }
@@ -1344,6 +1378,48 @@ impl Default for PiperTtsConfig {
     fn default() -> Self {
         Self {
             api_url: default_piper_tts_api_url(),
+        }
+    }
+}
+
+/// Inworld TTS provider configuration (`[tts.inworld]`).
+///
+/// Authenticates with a Base64-encoded API key from Inworld Studio
+/// ("Copy Base64" button under Settings → API Keys), sent as
+/// `Authorization: Basic <key>`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "tts.inworld"]
+pub struct InworldTtsConfig {
+    /// API key for Inworld TTS (Base64-encoded, as copied from Inworld Studio).
+    /// Falls back to the `INWORLD_API_KEY` environment variable when unset.
+    #[serde(default)]
+    #[secret]
+    pub api_key: Option<String>,
+    /// Model identifier (default `"inworld-tts-1.5-max"`; `"inworld-tts-1.5-mini"` is also available).
+    #[serde(default = "default_inworld_tts_model_id")]
+    pub model_id: String,
+    /// Audio encoding — one of `"MP3"`, `"PCM"`, `"WAV"`, `"LINEAR16"`,
+    /// `"OGG_OPUS"`, `"ALAW"`, `"MULAW"`, `"FLAC"`. Default `"MP3"`.
+    #[serde(default = "default_inworld_tts_audio_encoding")]
+    pub audio_encoding: String,
+    /// Output sample rate in Hz. Inworld accepts one of
+    /// `8000`, `16000`, `22050`, `24000`, `32000`, `44100`, `48000`. Default `24000`.
+    #[serde(default = "default_inworld_tts_sample_rate_hertz")]
+    pub sample_rate_hertz: u32,
+    /// Speaking rate multiplier (0.5–1.5). Default `1.0`.
+    #[serde(default = "default_inworld_tts_speaking_rate")]
+    pub speaking_rate: f64,
+}
+
+impl Default for InworldTtsConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            model_id: default_inworld_tts_model_id(),
+            audio_encoding: default_inworld_tts_audio_encoding(),
+            sample_rate_hertz: default_inworld_tts_sample_rate_hertz(),
+            speaking_rate: default_inworld_tts_speaking_rate(),
         }
     }
 }
@@ -1453,6 +1529,50 @@ pub struct GoogleSttConfig {
     /// BCP-47 language code (default: "en-US").
     #[serde(default = "default_google_stt_language_code")]
     pub language_code: String,
+}
+
+/// Inworld STT provider configuration (`[transcription.inworld]`).
+///
+/// Authenticates with a Base64-encoded API key from Inworld Studio
+/// ("Copy Base64" button under Settings → API Keys), sent as
+/// `Authorization: Basic <key>`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "transcription.inworld"]
+pub struct InworldSttConfig {
+    /// API key for Inworld STT (Base64-encoded, as copied from Inworld Studio).
+    /// Falls back to the `INWORLD_API_KEY` environment variable when unset.
+    #[serde(default)]
+    #[secret]
+    pub api_key: Option<String>,
+    /// STT model identifier (default `"inworld/inworld-stt-1"`).
+    /// Alternatives include `"groq/whisper-large-v3"` and
+    /// `"assemblyai/universal-streaming-multilingual"`.
+    #[serde(default = "default_inworld_stt_model_id")]
+    pub model_id: String,
+    /// Audio encoding hint (default `"AUTO_DETECT"`). Other accepted values:
+    /// `"LINEAR16"`, `"MP3"`, `"OGG_OPUS"`, `"FLAC"`.
+    #[serde(default = "default_inworld_stt_audio_encoding")]
+    pub audio_encoding: String,
+    /// Optional BCP-47 language code (e.g. `"en-US"`, `"ko-KR"`).
+    /// Omit to let Inworld auto-detect.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Request word-level timestamps in the response.
+    #[serde(default)]
+    pub include_word_timestamps: bool,
+}
+
+impl Default for InworldSttConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            model_id: default_inworld_stt_model_id(),
+            audio_encoding: default_inworld_stt_audio_encoding(),
+            language: None,
+            include_word_timestamps: false,
+        }
+    }
 }
 
 /// Local/self-hosted Whisper-compatible STT endpoint (`[transcription.local_whisper]`).
