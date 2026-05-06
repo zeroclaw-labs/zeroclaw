@@ -68,7 +68,7 @@ export interface Integration {
   name: string;
   description: string;
   category: string;
-  status: 'Available' | 'Active' | 'ComingSoon';
+  status: 'Available' | 'Active';
 }
 
 export interface DiagResult {
