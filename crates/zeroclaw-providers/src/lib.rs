@@ -979,6 +979,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "github-models" | "github_models" => vec!["GITHUB_MODELS_TOKEN"],
         "upstage" => vec!["UPSTAGE_API_KEY"],
         "featherless" => vec!["FEATHERLESS_API_KEY"],
+        "arcee" => vec!["ARCEE_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
@@ -1773,6 +1774,12 @@ fn create_provider_with_url_and_options(
         "featherless" => Ok(compat(OpenAiCompatibleProvider::new(
             "Featherless AI",
             "https://api.featherless.ai/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "arcee" => Ok(compat(OpenAiCompatibleProvider::new(
+            "Arcee AI",
+            "https://api.arcee.ai/api/v1",
             key,
             AuthStyle::Bearer,
         ))),
@@ -2661,6 +2668,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             activation: ProviderActivation::FallbackKey,
             local: false,
         },
+        ProviderInfo {
+            name: "arcee",
+            display_name: "Arcee AI",
+            description: "Trinity / Conductor / Maestro",
+            aliases: &[],
+            activation: ProviderActivation::FallbackKey,
+            local: false,
+        },
     ]
 }
 
@@ -3533,6 +3548,19 @@ mod tests {
         assert_eq!(resolved, Some("featherless-test".to_string()));
     }
 
+    #[test]
+    fn factory_arcee() {
+        assert!(create_provider("arcee", Some("arcee-test")).is_ok());
+    }
+
+    #[test]
+    fn resolve_provider_credential_arcee_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("ARCEE_API_KEY", Some("arcee-test"));
+        let resolved = resolve_provider_credential("arcee", None);
+        assert_eq!(resolved, Some("arcee-test".to_string()));
+    }
+
     // ── Custom / BYOP provider ─────────────────────────────
 
     #[test]
@@ -3862,6 +3890,7 @@ mod tests {
             "github-models",
             "upstage",
             "featherless",
+            "arcee",
             "ovhcloud",
         ];
         for name in providers {
