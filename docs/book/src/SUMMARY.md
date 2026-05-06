@@ -58,6 +58,7 @@
 - [Overview](./tools/overview.md)
 - [MCP (Model Context Protocol)](./tools/mcp.md)
 - [Browser automation](./tools/browser.md)
+- [Philips Hue](./tools/philips_hue.md)
 
 # Security
 

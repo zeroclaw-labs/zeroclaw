@@ -385,6 +385,11 @@ pub struct Config {
     #[nested]
     pub jira: JiraConfig,
 
+    /// Philips Hue integration configuration (`[philips_hue]`).
+    #[serde(default)]
+    #[nested]
+    pub philips_hue: PhilipsHueConfig,
+
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     #[nested]
@@ -9316,6 +9321,101 @@ impl Default for JiraConfig {
     }
 }
 
+/// Philips Hue integration configuration (`[philips_hue]`).
+///
+/// When `enabled = true`, registers the `philips_hue` tool which can list
+/// and control lights, scenes, rooms, and groups on a local Philips Hue
+/// Bridge via its v2 CLIP API. Requires `bridge_address` (the bridge's IP
+/// or `<id>.local` hostname) and `application_key` (the bridge "username"
+/// minted via push-button pairing), or the `PHILIPS_HUE_APPLICATION_KEY`
+/// env var.
+///
+/// ## Defaults
+/// - `enabled`: `false`
+/// - `allowed_resource_types`: `["light", "grouped_light", "scene", "room"]` —
+///   the v2 resource types the agent is permitted to mutate. Read actions
+///   (`list_*`, `get_*`) ignore this allowlist.
+/// - `verify_tls`: `false` — Hue bridges present a self-signed certificate
+///   on the local network, so TLS verification is disabled by default.
+///   Set to `true` only if you have installed the bridge's CA in the
+///   system trust store.
+/// - `request_timeout_secs`: `15`
+///
+/// ## Auth (push-button pairing)
+/// First-time setup, performed once outside ZeroClaw:
+///
+/// 1. Discover the bridge IP via `https://discovery.meethue.com` or mDNS.
+/// 2. Press the round button on top of the bridge.
+/// 3. Within 30 seconds:
+///    `curl -k -X POST -d '{"devicetype":"zeroclaw#host","generateclientkey":true}' \`
+///    `      https://<bridge-ip>/api`
+/// 4. Copy the `username` from the response into `application_key`
+///    (or export `PHILIPS_HUE_APPLICATION_KEY`).
+///
+/// The application key is stored encrypted at rest when
+/// `[secrets] encrypt = true`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "philips-hue"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Philips Hue",
+    description = "Smart lighting via local Hue Bridge",
+    status_field = "enabled"
+)]
+pub struct PhilipsHueConfig {
+    /// Enable the `philips_hue` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Hue Bridge address — IP (`192.168.1.42`) or mDNS hostname
+    /// (`<bridge-id>.local`).
+    #[serde(default)]
+    pub bridge_address: String,
+    /// Application key (bridge "username") minted via push-button pairing.
+    /// Encrypted at rest. Falls back to `PHILIPS_HUE_APPLICATION_KEY` env var.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub application_key: String,
+    /// Resource types the agent is permitted to mutate (`set_*`, `recall_*`).
+    /// Empty means all mutations are blocked.
+    #[serde(default = "default_philips_hue_allowed_resource_types")]
+    pub allowed_resource_types: Vec<String>,
+    /// Verify TLS certificate of the bridge. Default `false` because
+    /// bridges ship with self-signed certs on the local network.
+    #[serde(default)]
+    pub verify_tls: bool,
+    /// Request timeout in seconds. Default: `15`.
+    #[serde(default = "default_philips_hue_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_philips_hue_allowed_resource_types() -> Vec<String> {
+    vec![
+        "light".into(),
+        "grouped_light".into(),
+        "scene".into(),
+        "room".into(),
+    ]
+}
+
+fn default_philips_hue_timeout_secs() -> u64 {
+    15
+}
+
+impl Default for PhilipsHueConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bridge_address: String::new(),
+            application_key: String::new(),
+            allowed_resource_types: default_philips_hue_allowed_resource_types(),
+            verify_tls: false,
+            request_timeout_secs: default_philips_hue_timeout_secs(),
+        }
+    }
+}
+
 ///
 /// Controls the read-only cloud transformation analysis tools:
 /// IaC review, migration assessment, cost analysis, and architecture review.
@@ -9634,6 +9734,7 @@ impl Default for Config {
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            philips_hue: PhilipsHueConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -12595,6 +12696,7 @@ auto_save = true
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            philips_hue: PhilipsHueConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -13166,6 +13268,7 @@ default_temperature = 0.7
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            philips_hue: PhilipsHueConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
