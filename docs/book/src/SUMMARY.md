@@ -58,6 +58,7 @@
 - [Overview](./tools/overview.md)
 - [MCP (Model Context Protocol)](./tools/mcp.md)
 - [Browser automation](./tools/browser.md)
+- [Shazam](./tools/shazam.md)
 
 # Security
 

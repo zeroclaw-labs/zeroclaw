@@ -148,6 +148,16 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    Supports city names, IATA airport codes, GPS coordinates,");
             println!("    postal/zip codes, and Unicode location names.");
         }
+        "Shazam" => {
+            println!("  Setup (unofficial, via RapidAPI):");
+            println!("    1. Sign up at https://rapidapi.com/ and subscribe to a Shazam service.");
+            println!("    2. Add to config:");
+            println!("       [shazam]");
+            println!("       enabled = true");
+            println!("       rapidapi_key = \"...\"  # or SHAZAM_RAPIDAPI_KEY");
+            println!("       rapidapi_host = \"shazam.p.rapidapi.com\"  # default");
+            println!("    3. v1 supports search_track and get_track_details only.");
+        }
         _ if entry.category == IntegrationCategory::Chat => {
             println!("  Setup:");
             println!("    Run: zeroclaw onboard --channels-only");

@@ -63,6 +63,7 @@ pub mod report_template_tool;
 pub mod report_templates;
 pub mod screenshot;
 pub mod sessions;
+pub mod shazam;
 pub mod swarm;
 pub mod text_browser;
 pub mod tool_search;

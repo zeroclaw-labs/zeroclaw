@@ -116,6 +116,7 @@
 
 - `SessionResetTool` and `SessionDeleteTool` for in-agent session management (#5696).
 - `SessionsCurrentTool` exposes the active session identity (#6033).
+- `shazam` tool — Shazam catalogue lookup via a third-party RapidAPI Shazam service. Read-only (`search_track`, `get_track_details`); audio-fingerprint deferred to a follow-up (#6476).
 
 ### Plugins
 
