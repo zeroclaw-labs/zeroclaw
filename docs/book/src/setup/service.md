@@ -1,6 +1,6 @@
 # Service Management
 
-ZeroClaw ships with first-class service integration for systemd (Linux), launchctl (macOS), and Task Scheduler / Windows Service (Windows). All three are driven by one CLI surface:
+ZeroClaw ships with first-class service integration for systemd (Linux), launchctl (macOS), and Task Scheduler (Windows). All three are driven by one CLI surface:
 
 ```bash
 zeroclaw service install     # register the service
@@ -96,28 +96,15 @@ Don't mix `zeroclaw service` CLI commands with `brew services` — pick one. Bot
 
 Verify in Task Scheduler GUI (`taskschd.msc`) under Task Scheduler Library → ZeroClaw.
 
-Logs go to `%LOCALAPPDATA%\ZeroClaw\logs\`:
+Logs go to `%USERPROFILE%\.zeroclaw\logs\`:
 
 ```cmd
-type %LOCALAPPDATA%\ZeroClaw\logs\zeroclaw.log
+type %USERPROFILE%\.zeroclaw\logs\zeroclaw.log
 ```
 
-### Windows Service (system-scope)
+The wrapper script that the scheduled task runs is at `%USERPROFILE%\.zeroclaw\logs\zeroclaw-daemon.cmd`.
 
-For servers or multi-user Windows installs, run `zeroclaw service install` from an Administrator prompt:
-
-```cmd
-:: Administrator cmd.exe
-zeroclaw service install
-```
-
-Running elevated causes the installer to register a real Windows Service under `LocalSystem` instead of a user-scoped scheduled task. Control via `services.msc` or:
-
-```cmd
-sc query ZeroClaw
-sc start ZeroClaw
-sc stop ZeroClaw
-```
+> **No Windows Service / LocalSystem path.** The current release does not register a Windows Service via `sc.exe` even when `zeroclaw service install` is run from an elevated prompt — the underlying code path in `crates/zeroclaw-runtime/src/service/mod.rs` always installs a user-scoped scheduled task on Windows. Running elevated has no effect on which path is used. Native Windows Service / LocalSystem support is on the roadmap but not yet implemented; for headless server installs, use Task Scheduler → ZeroClaw Daemon → Properties → "Run whether user is logged on or not" instead.
 
 ## Config path resolution
 
