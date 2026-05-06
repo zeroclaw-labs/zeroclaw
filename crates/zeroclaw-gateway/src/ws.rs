@@ -390,8 +390,17 @@ async fn handle_socket(
                         let user_msg = zeroclaw_providers::ChatMessage::user(&content);
                         let _ = backend.append(&session_key, &user_msg);
                     }
-                    process_chat_message(&state, &mut agent, &mut sender, &content, &session_key)
-                        .await;
+                    process_chat_message(
+                        &state,
+                        &mut agent,
+                        &mut sender,
+                        &mut receiver,
+                        &mut approval_event_rx,
+                        &pending_approvals,
+                        &content,
+                        &session_key,
+                    )
+                    .await;
                 }
             } else {
                 let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
@@ -533,7 +542,17 @@ async fn handle_socket(
                     let _ = backend.append(&session_key, &user_msg);
                 }
 
-                process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;
+                process_chat_message(
+                    &state,
+                    &mut agent,
+                    &mut sender,
+                    &mut receiver,
+                    &mut approval_event_rx,
+                    &pending_approvals,
+                    &content,
+                    &session_key,
+                )
+                .await;
             }
 
             // ── Broadcast event (cron/heartbeat results) ──────────────
@@ -597,9 +616,13 @@ async fn process_chat_message(
     state: &AppState,
     agent: &mut zeroclaw_runtime::agent::Agent,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    approval_event_rx: &mut tokio::sync::mpsc::Receiver<zeroclaw_api::agent::TurnEvent>,
+    pending_approvals: &PendingApprovals,
     content: &str,
     session_key: &str,
 ) {
+    use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
 
     let provider_label = state
@@ -668,56 +691,109 @@ async fn process_chat_message(
     let mut last_partial_save = std::time::Instant::now();
     let partial_save_interval = std::time::Duration::from_millis(500);
 
+    // Routes the three concurrent streams that the running turn cares
+    // about. Without this, the outer `select!` arm that drains
+    // `approval_event_rx` and `receiver.next()` is suspended for the whole
+    // turn, so a pending tool approval can neither be sent to the client
+    // nor answered before the timeout fires.
     let forward_fut = async {
-        while let Some(event) = event_rx.recv().await {
-            let ws_msg = match event {
-                TurnEvent::Chunk { ref delta } => {
-                    accumulated_text.push_str(delta);
-
-                    // Incremental persistence: save partial content so it
-                    // survives a crash. First chunk appends, subsequent
-                    // chunks update in-place.
-                    if last_partial_save.elapsed() >= partial_save_interval {
-                        if let Some(ref backend) = state.session_backend {
-                            let partial =
-                                zeroclaw_providers::ChatMessage::assistant(&accumulated_text);
-                            if partial_saved {
-                                let _ = backend.update_last(session_key, &partial);
-                            } else {
-                                let _ = backend.append(session_key, &partial);
-                                partial_saved = true;
-                            }
-                        }
-                        last_partial_save = std::time::Instant::now();
+        loop {
+            tokio::select! {
+                biased;
+                client_msg = receiver.next() => {
+                    let Some(Ok(Message::Text(text))) = client_msg else { continue };
+                    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        continue;
+                    };
+                    if parsed["type"].as_str() != Some("approval_response") {
+                        // Mid-turn `message` / other frames are ignored. The
+                        // outer `select!` will not see them either; we drop
+                        // them deliberately rather than queueing.
+                        continue;
                     }
-
-                    serde_json::json!({ "type": "chunk", "content": delta })
+                    let request_id = parsed["request_id"].as_str().unwrap_or("");
+                    let decision = match parsed["decision"].as_str().unwrap_or("") {
+                        "approve" => Some(ChannelApprovalResponse::Approve),
+                        "always" => Some(ChannelApprovalResponse::AlwaysApprove),
+                        "deny" => Some(ChannelApprovalResponse::Deny),
+                        _ => None,
+                    };
+                    if request_id.is_empty() || decision.is_none() {
+                        continue;
+                    }
+                    if let Some(tx) = pending_approvals.lock().remove(request_id) {
+                        let _ = tx.send(decision.expect("checked above"));
+                    } else {
+                        debug!(%request_id, "approval_response with no matching pending request (mid-turn)");
+                    }
                 }
-                TurnEvent::Thinking { delta } => {
-                    serde_json::json!({ "type": "thinking", "content": delta })
+                approval = approval_event_rx.recv() => {
+                    let Some(event) = approval else { continue };
+                    if let TurnEvent::ApprovalRequest {
+                        request_id,
+                        tool_name,
+                        arguments_summary,
+                        timeout_secs,
+                    } = event {
+                        let frame = serde_json::json!({
+                            "type": "approval_request",
+                            "request_id": request_id,
+                            "tool": tool_name,
+                            "arguments_summary": arguments_summary,
+                            "timeout_secs": timeout_secs,
+                        });
+                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                    }
                 }
-                TurnEvent::ToolCall { id, name, args } => {
-                    serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
+                event_opt = event_rx.recv() => {
+                    let Some(event) = event_opt else { break };
+                    let ws_msg = match event {
+                        TurnEvent::Chunk { ref delta } => {
+                            accumulated_text.push_str(delta);
+                            // Incremental persistence: save partial content so it
+                            // survives a crash. First chunk appends, subsequent
+                            // chunks update in-place.
+                            if last_partial_save.elapsed() >= partial_save_interval {
+                                if let Some(ref backend) = state.session_backend {
+                                    let partial = zeroclaw_providers::ChatMessage::assistant(
+                                        &accumulated_text,
+                                    );
+                                    if partial_saved {
+                                        let _ = backend.update_last(session_key, &partial);
+                                    } else {
+                                        let _ = backend.append(session_key, &partial);
+                                        partial_saved = true;
+                                    }
+                                }
+                                last_partial_save = std::time::Instant::now();
+                            }
+                            serde_json::json!({ "type": "chunk", "content": delta })
+                        }
+                        TurnEvent::Thinking { delta } => {
+                            serde_json::json!({ "type": "thinking", "content": delta })
+                        }
+                        TurnEvent::ToolCall { id, name, args } => {
+                            serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
+                        }
+                        TurnEvent::ToolResult { id, name, output } => {
+                            serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
+                        }
+                        TurnEvent::ApprovalRequest {
+                            request_id,
+                            tool_name,
+                            arguments_summary,
+                            timeout_secs,
+                        } => serde_json::json!({
+                            "type": "approval_request",
+                            "request_id": request_id,
+                            "tool": tool_name,
+                            "arguments_summary": arguments_summary,
+                            "timeout_secs": timeout_secs,
+                        }),
+                    };
+                    let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
                 }
-                TurnEvent::ToolResult { id, name, output } => {
-                    serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
-                }
-                TurnEvent::ApprovalRequest {
-                    request_id,
-                    tool_name,
-                    arguments_summary,
-                    timeout_secs,
-                } => {
-                    serde_json::json!({
-                        "type": "approval_request",
-                        "request_id": request_id,
-                        "tool": tool_name,
-                        "arguments_summary": arguments_summary,
-                        "timeout_secs": timeout_secs,
-                    })
-                }
-            };
-            let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
+            }
         }
     };
 
