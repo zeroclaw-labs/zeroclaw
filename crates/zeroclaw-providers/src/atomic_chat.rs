@@ -7,9 +7,6 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use futures_util::StreamExt;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::BufReader;
 
 #[derive(Clone)]
 pub struct AtomicChatProvider {
@@ -51,7 +48,7 @@ struct Delta {
 impl AtomicChatProvider {
     pub fn new(base_url: String, api_key: Option<String>) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(300))
             .build()
             .expect("failed to build reqwest client");
 
@@ -68,25 +65,29 @@ impl AtomicChatProvider {
         }
     }
 
-    #[inline]
-    fn endpoint(&self) -> &str {
-        &self.endpoint
+    /// 🔥 CRITICAL: force Jan/Atomic to create runtime session
+    async fn warmup(&self, model: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": "warmup"
+            }],
+            "stream": false
+        });
+
+        let mut req = self.client.post(&self.endpoint).json(&body);
+
+        if let Some(key) = &self.api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let _ = req.send().await?;
+        Ok(())
     }
 
-    #[inline]
-    fn map_messages(messages: &[ChatMessage]) -> Vec<Message<'_>> {
-        messages
-            .iter()
-            .map(|m| Message {
-                role: m.role.as_str(),
-                content: &m.content,
-            })
-            .collect()
-    }
-
-    #[inline]
-    fn extract_content(chunk: &str) -> Option<String> {
-        serde_json::from_str::<StreamChunk>(chunk)
+    fn extract_content(data: &str) -> Option<String> {
+        serde_json::from_str::<StreamChunk>(data)
             .ok()?
             .choices
             .first()?
@@ -98,20 +99,27 @@ impl AtomicChatProvider {
 
 #[async_trait]
 impl Provider for AtomicChatProvider {
+
     async fn stream_chat(
         &self,
         req: ProviderChatRequest,
         mut tx: tokio::sync::mpsc::Sender<StreamEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
+        // 🔥 STEP 1: warmup session (FIX FOR YOUR ERROR)
+        let _ = self.warmup(&req.model).await;
+
         let body = ChatCompletionRequest {
             model: &req.model,
-            messages: Self::map_messages(&req.messages),
+            messages: req.messages.iter().map(|m| Message {
+                role: m.role.as_str(),
+                content: &m.content,
+            }).collect(),
             temperature: req.temperature,
             stream: true,
         };
 
-        let mut request = self.client.post(self.endpoint()).json(&body);
+        let mut request = self.client.post(&self.endpoint).json(&body);
 
         if let Some(key) = &self.api_key {
             request = request.header("Authorization", format!("Bearer {}", key));
@@ -125,52 +133,36 @@ impl Provider for AtomicChatProvider {
             return Ok(());
         }
 
-        // --- STREAM HANDLING (FIXED) ---
+        // 🔥 SIMPLE SSE STREAM (FIXED)
+        let mut stream = response.bytes_stream();
 
-        let stream = response.bytes_stream();
-        let mut reader = BufReader::new(tokio_util::io::StreamReader::new(
-            stream.map(|res| res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
-        ));
-
-        let mut line = String::new();
+        use futures_util::StreamExt;
 
         let mut buffer = String::new();
 
-        loop {
-            line.clear();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
 
-            let bytes = reader.read_line(&mut line).await?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-            if bytes == 0 {
-                break;
-            }
+            for line in buffer.split("\n") {
+                let line = line.trim();
 
-            let line = line.trim();
+                if line.starts_with("data: ") {
+                    let data = &line[6..];
 
-            // ignore SSE comments / keep-alives
-            if line.is_empty() || line.starts_with(':') {
-                continue;
-            }
+                    if data == "[DONE]" {
+                        let _ = tx.send(StreamEvent::End).await;
+                        return Ok(());
+                    }
 
-            // only process data lines
-            if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim();
-
-                if data == "[DONE]" {
-                    let _ = tx.send(StreamEvent::End).await;
-                    return Ok(());
-                }
-
-                // parse safely
-                match Self::extract_content(data) {
-                    Some(content) if !content.is_empty() => {
+                    if let Some(content) = Self::extract_content(data) {
                         let _ = tx.send(StreamEvent::Token(content)).await;
                     }
-                    _ => {
-                        // ignore malformed chunks silently (or log if you want)
-                    }
                 }
             }
+
+            buffer.clear();
         }
 
         let _ = tx.send(StreamEvent::End).await;
