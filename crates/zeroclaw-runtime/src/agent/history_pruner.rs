@@ -43,6 +43,17 @@ fn protected_indices(messages: &[ChatMessage], keep_recent: usize) -> Vec<bool> 
             protected[i] = true;
         }
     }
+    // Protect the first `user` turn following the leading system block so
+    // pruning can never strip the canonical conversation prefix. Without
+    // this, large multi-iteration agent loops can prune the original user
+    // message while keeping later assistant tool_calls / tool results,
+    // producing histories that begin with `assistant` (or worse, contain no
+    // `user` turn at all). Strict providers — notably Google Gemini —
+    // reject those with "function call turn must come immediately after a
+    // user turn or after a function response turn" (issue #6302).
+    if let Some(first_user) = messages.iter().position(|m| m.role == "user") {
+        protected[first_user] = true;
+    }
     let recent_start = len.saturating_sub(keep_recent);
     for p in protected.iter_mut().skip(recent_start) {
         *p = true;
@@ -131,10 +142,37 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
             i += 1;
         }
     }
+    // Pass 3: Drop a leading orphan assistant/tool block that lacks a
+    // preceding `user` turn. After phase-2 budget enforcement (or any
+    // upstream truncation) the first non-system message can be `assistant`
+    // — typically an `assistant` carrying `tool_calls` followed by its
+    // `tool` results. Without a `user` predecessor that block is not
+    // interpretable by any provider; strict providers (Gemini) return a
+    // 400. Stop at the first `user` turn so we never leave the conversation
+    // empty. See issue #6302.
+    let first_non_system = messages.iter().position(|m| m.role != "system");
+    if let Some(start) = first_non_system {
+        let mut drop_to = start;
+        while drop_to < messages.len() && messages[drop_to].role != "user" {
+            drop_to += 1;
+        }
+        // Only drop when we have a real `user` to land on — otherwise
+        // leave the messages alone and let the upstream error surface.
+        if drop_to > start && drop_to < messages.len() {
+            let leading_removed = drop_to - start;
+            messages.drain(start..drop_to);
+            removed += leading_removed;
+            tracing::warn!(
+                count = leading_removed,
+                "Removed {leading_removed} leading non-user turn(s) from history — likely \
+                 caused by a prior prune/trim that dropped the original user message (#6302)"
+            );
+        }
+    }
     if removed > 0 {
         tracing::warn!(
             count = removed,
-            "Removed {removed} orphaned tool message(s) from history — this indicates a prior \
+            "Removed {removed} orphaned/leading message(s) from history — this indicates a prior \
              tool_use/tool_result pairing inconsistency that was auto-healed"
         );
     }
@@ -355,6 +393,7 @@ mod tests {
         let tool_result = "a".repeat(160);
         let mut messages = vec![
             msg("system", "sys"),
+            msg("user", "kick off"),
             msg("assistant", "calling tool X"),
             msg("tool", &tool_result),
             msg("user", "thanks"),
@@ -368,9 +407,9 @@ mod tests {
         };
         let stats = prune_history(&mut messages, &config);
         assert_eq!(stats.collapsed_pairs, 1);
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[1].role, "assistant");
-        assert!(messages[1].content.contains("1 tool call(s)"));
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[2].role, "assistant");
+        assert!(messages[2].content.contains("1 tool call(s)"));
     }
 
     #[test]
@@ -435,6 +474,7 @@ mod tests {
     fn prune_collapses_multi_tool_group() {
         let mut messages = vec![
             msg("system", "sys"),
+            msg("user", "kick off"),
             msg(
                 "assistant",
                 r#"{"content":null,"tool_calls":[{"id":"t1","name":"shell","arguments":"{}"},{"id":"t2","name":"web","arguments":"{}"}]}"#,
@@ -453,8 +493,8 @@ mod tests {
         let stats = prune_history(&mut messages, &config);
         assert_eq!(stats.collapsed_pairs, 2);
         // assistant(tool_calls) + 2 tool messages → 1 summary assistant
-        assert_eq!(messages.len(), 4); // sys, summary, user, assistant
-        assert!(messages[1].content.contains("2 tool call(s)"));
+        assert_eq!(messages.len(), 5); // sys, user(kick off), summary, user, assistant
+        assert!(messages[2].content.contains("2 tool call(s)"));
         // No tool messages remain
         assert!(!messages.iter().any(|m| m.role == "tool"));
     }
@@ -688,6 +728,7 @@ mod tests {
         // a subsequent tool message referenced the original tool_call_id.
         let mut messages = vec![
             msg("system", "sys"),
+            msg("user", "kick off"),
             msg("assistant", "[Tool result: truncated...]"), // collapsed
             msg(
                 "tool",
@@ -698,9 +739,10 @@ mod tests {
         ];
         let removed = remove_orphaned_tool_messages(&mut messages);
         assert_eq!(removed, 1);
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[1].role, "assistant");
-        assert_eq!(messages[2].role, "user");
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[3].role, "user");
     }
 
     #[test]
@@ -800,6 +842,7 @@ mod tests {
              and returned ok.";
         let mut messages = vec![
             msg("system", "sys"),
+            msg("user", "kick off"),
             msg("assistant", summary),
             msg(
                 "tool",
@@ -827,16 +870,18 @@ mod tests {
             r#"{"content":"search results","tool_call_id":"chatcmpl-tool-92a12a15c14f3b36"}"#;
         let mut messages = vec![
             msg("system", "You are a helpful assistant"),
+            msg("user", "search the web"),
             msg("tool", tool_result),
             msg("assistant", "Here are the search results"),
             msg("user", "Thanks, now summarize them"),
         ];
         let removed = remove_orphaned_tool_messages(&mut messages);
         assert_eq!(removed, 1, "orphaned tool message should be removed");
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[1].role, "assistant");
-        assert_eq!(messages[2].role, "user");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[3].role, "user");
     }
 
     /// Regression for #5823:
@@ -892,5 +937,95 @@ mod tests {
              got roles {:?}",
             messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Issue #6302 regressions: pruning must never leave a history whose
+    // first non-system turn is anything other than `user`.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn first_user_turn_is_protected_from_budget_pruning() {
+        // A long conversation that exceeds the budget. Without the fix the
+        // pruner happily drops the original user message because it falls
+        // outside the keep_recent window.
+        let big = "x".repeat(2000);
+        let mut messages = vec![
+            msg("system", "preamble"),
+            msg("user", "the original prompt"),
+            msg("assistant", &big),
+            msg("user", &big),
+            msg("assistant", &big),
+            msg("user", &big),
+            msg("assistant", &big),
+        ];
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            keep_recent: 2,
+            max_tokens: 200,
+            collapse_tool_results: false,
+        };
+        prune_history(&mut messages, &config);
+        assert!(
+            messages.iter().any(|m| m.content == "the original prompt"),
+            "first user message must survive aggressive pruning; got roles {:?}",
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn remove_orphaned_drops_leading_assistant_tool_call_block() {
+        // Reproduces the post-#6303 residual: pruning has stripped the
+        // user message and left an orphan assistant/tool exchange. This
+        // would 400 on Gemini.
+        let mut messages = vec![
+            msg("system", "preamble"),
+            msg(
+                "assistant",
+                r#"{"content":"","tool_calls":[{"id":"c1","name":"x","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"content":"r","tool_call_id":"c1"}"#),
+            msg("user", "actual prompt"),
+            msg("assistant", "ok"),
+        ];
+        let removed = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(removed, 2, "expected 2 leading non-user turns dropped");
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content, "actual prompt");
+    }
+
+    #[test]
+    fn remove_orphaned_keeps_messages_when_no_user_exists() {
+        // Conservative: don't synthesize an empty conversation — let the
+        // upstream provider error surface naturally.
+        let mut messages = vec![
+            msg("system", "preamble"),
+            msg(
+                "assistant",
+                r#"{"content":"","tool_calls":[{"id":"c1","name":"x","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"content":"r","tool_call_id":"c1"}"#),
+        ];
+        let removed = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(removed, 0);
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn remove_orphaned_noop_when_user_already_first() {
+        let mut messages = vec![
+            msg("system", "preamble"),
+            msg("user", "hi"),
+            msg(
+                "assistant",
+                r#"{"content":"","tool_calls":[{"id":"c1","name":"x","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"content":"r","tool_call_id":"c1"}"#),
+        ];
+        let before = messages.len();
+        remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(messages.len(), before);
+        assert_eq!(messages[1].role, "user");
     }
 }

@@ -68,6 +68,7 @@ pub use zeroclaw_tools::hardware_board_info::HardwareBoardInfoTool;
 pub use zeroclaw_tools::hardware_memory_map::HardwareMemoryMapTool;
 pub use zeroclaw_tools::hardware_memory_read::HardwareMemoryReadTool;
 pub use zeroclaw_tools::http_request::HttpRequestTool;
+pub use zeroclaw_tools::gemini_image_gen::GeminiImageGenTool;
 pub use zeroclaw_tools::image_gen::ImageGenTool;
 pub use zeroclaw_tools::image_info::ImageInfoTool;
 pub use zeroclaw_tools::jira_tool::JiraTool;
@@ -758,6 +759,15 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
             root_config.image_gen.default_model.clone(),
             root_config.image_gen.api_key_env.clone(),
+        )));
+    }
+
+    // Gemini image generation via LiteLLM (config-gated)
+    if root_config.gemini_image_gen.enabled {
+        tool_arcs.push(Arc::new(GeminiImageGenTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+            root_config.gemini_image_gen.default_model.clone(),
         )));
     }
 

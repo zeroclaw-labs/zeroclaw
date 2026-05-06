@@ -552,6 +552,97 @@ impl TranscriptionProvider for GoogleSttProvider {
     }
 }
 
+// ── ElevenLabsProvider ──────────────────────────────────────────
+
+/// ElevenLabs Scribe STT API provider.
+pub struct ElevenLabsProvider {
+    api_key: String,
+    model_id: String,
+    language_code: Option<String>,
+}
+
+impl ElevenLabsProvider {
+    pub fn from_config(config: &zeroclaw_config::schema::ElevenLabsSttConfig) -> Result<Self> {
+        let api_key = config
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                std::env::var("ELEVENLABS_API_KEY")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
+            .context(
+                "Missing ElevenLabs STT API key: set [transcription.elevenlabs].api_key or ELEVENLABS_API_KEY env",
+            )?;
+
+        Ok(Self {
+            api_key,
+            model_id: config.model_id.clone(),
+            language_code: config
+                .language_code
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned),
+        })
+    }
+}
+
+#[async_trait]
+impl TranscriptionProvider for ElevenLabsProvider {
+    fn name(&self) -> &str {
+        "elevenlabs"
+    }
+
+    async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
+        let (normalized_name, mime) = validate_audio(audio_data, file_name)?;
+
+        let client =
+            zeroclaw_config::schema::build_runtime_proxy_client("transcription.elevenlabs");
+
+        let file_part = Part::bytes(audio_data.to_vec())
+            .file_name(normalized_name)
+            .mime_str(mime)?;
+
+        let mut form = Form::new()
+            .part("file", file_part)
+            .text("model_id", self.model_id.clone());
+        if let Some(ref lang) = self.language_code {
+            form = form.text("language_code", lang.clone());
+        }
+
+        let resp = client
+            .post("https://api.elevenlabs.io/v1/speech-to-text")
+            .header("xi-api-key", &self.api_key)
+            .multipart(form)
+            .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
+            .send()
+            .await
+            .context("Failed to send transcription request to ElevenLabs")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("ElevenLabs STT API error ({status}): {}", body.trim());
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse ElevenLabs STT response")?;
+
+        let text = body["text"]
+            .as_str()
+            .context("ElevenLabs STT response missing 'text' field")?
+            .to_string();
+        Ok(text)
+    }
+}
+
 // ── LocalWhisperProvider ────────────────────────────────────────
 
 /// Self-hosted faster-whisper-compatible STT provider.
@@ -723,6 +814,12 @@ impl TranscriptionManager {
             providers.insert("google".to_string(), Box::new(p));
         }
 
+        if let Some(ref el_cfg) = config.elevenlabs
+            && let Ok(p) = ElevenLabsProvider::from_config(el_cfg)
+        {
+            providers.insert("elevenlabs".to_string(), Box::new(p));
+        }
+
         if let Some(ref local_cfg) = config.local_whisper {
             match LocalWhisperProvider::from_config(local_cfg) {
                 Ok(p) => {
@@ -836,6 +933,13 @@ pub async fn transcribe_audio(
             )?;
             let google = GoogleSttProvider::from_config(google_cfg)?;
             google.transcribe(&audio_data, file_name).await
+        }
+        "elevenlabs" => {
+            let el_cfg = config.elevenlabs.as_ref().context(
+                "Default transcription provider 'elevenlabs' is not configured. Add [transcription.elevenlabs]",
+            )?;
+            let el = ElevenLabsProvider::from_config(el_cfg)?;
+            el.transcribe(&audio_data, file_name).await
         }
         other => bail!("Unsupported transcription provider '{other}'"),
     }

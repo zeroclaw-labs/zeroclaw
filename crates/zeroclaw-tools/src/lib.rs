@@ -31,6 +31,7 @@ pub mod hardware_board_info;
 pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
+pub mod gemini_image_gen;
 pub mod image_gen;
 pub mod image_info;
 pub mod jira_tool;

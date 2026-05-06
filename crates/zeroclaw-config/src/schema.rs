@@ -405,6 +405,11 @@ pub struct Config {
     #[nested]
     pub image_gen: ImageGenConfig,
 
+    /// Gemini image generation tool routed via LiteLLM (`[gemini_image_gen]`).
+    #[serde(default)]
+    #[nested]
+    pub gemini_image_gen: GeminiImageGenConfig,
+
     /// Plugin system configuration (`[plugins]`).
     #[serde(default)]
     #[nested]
@@ -970,6 +975,10 @@ pub struct TranscriptionConfig {
     #[serde(default)]
     #[nested]
     pub local_whisper: Option<LocalWhisperConfig>,
+    /// ElevenLabs Scribe STT provider configuration.
+    #[serde(default)]
+    #[nested]
+    pub elevenlabs: Option<ElevenLabsSttConfig>,
     /// Also transcribe non-PTT (forwarded/regular) audio messages on WhatsApp,
     /// not just voice notes.  Default: `false` (preserves legacy behavior).
     #[serde(default)]
@@ -992,6 +1001,7 @@ impl Default for TranscriptionConfig {
             assemblyai: None,
             google: None,
             local_whisper: None,
+            elevenlabs: None,
             transcribe_non_ptt_audio: false,
         }
     }
@@ -1453,6 +1463,38 @@ pub struct GoogleSttConfig {
     /// BCP-47 language code (default: "en-US").
     #[serde(default = "default_google_stt_language_code")]
     pub language_code: String,
+}
+
+/// ElevenLabs Scribe STT provider configuration (`[transcription.elevenlabs]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "transcription.elevenlabs"]
+pub struct ElevenLabsSttConfig {
+    /// ElevenLabs API key.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: Option<String>,
+    /// Model id (default: "scribe_v1").
+    #[serde(default = "default_elevenlabs_stt_model_id")]
+    pub model_id: String,
+    /// Optional ISO-639 language code hint. Leave unset for auto-detect (recommended for multilingual usage).
+    #[serde(default)]
+    pub language_code: Option<String>,
+}
+
+fn default_elevenlabs_stt_model_id() -> String {
+    "scribe_v1".into()
+}
+
+impl Default for ElevenLabsSttConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            model_id: default_elevenlabs_stt_model_id(),
+            language_code: None,
+        }
+    }
 }
 
 /// Local/self-hosted Whisper-compatible STT endpoint (`[transcription.local_whisper]`).
@@ -3967,6 +4009,40 @@ impl Default for ImageGenConfig {
             enabled: false,
             default_model: default_image_gen_model(),
             api_key_env: default_image_gen_api_key_env(),
+        }
+    }
+}
+
+/// Gemini image generation tool (`[gemini_image_gen]`).
+///
+/// When enabled, registers a `gemini_image_gen` tool that calls the
+/// LiteLLM `/chat/completions` endpoint with `modalities: ["image","text"]`
+/// against Gemini image models (Nano Banana / Nano Banana Pro). Reads
+/// `LITELLM_BASE_URL`/`LITELLM_API_KEY` from env, falling back to
+/// `[providers.models.litellm]` in `~/.zeroclaw/config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "gemini-image-gen"]
+pub struct GeminiImageGenConfig {
+    /// Enable the Gemini-via-LiteLLM image tool. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Default model identifier. Allowed: `gemini-api-image-banana`,
+    /// `gemini-api-image-banana2` (default).
+    #[serde(default = "default_gemini_image_gen_model")]
+    pub default_model: String,
+}
+
+fn default_gemini_image_gen_model() -> String {
+    "gemini-api-image-banana2".into()
+}
+
+impl Default for GeminiImageGenConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_model: default_gemini_image_gen_model(),
         }
     }
 }
@@ -9638,6 +9714,7 @@ impl Default for Config {
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
+            gemini_image_gen: GeminiImageGenConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -11231,10 +11308,11 @@ impl Config {
         {
             let dp = self.transcription.default_provider.trim();
             match dp {
-                "groq" | "openai" | "deepgram" | "assemblyai" | "google" | "local_whisper" => {}
+                "groq" | "openai" | "deepgram" | "assemblyai" | "google" | "local_whisper"
+                | "elevenlabs" => {}
                 other => {
                     anyhow::bail!(
-                        "transcription.default_provider must be one of: groq, openai, deepgram, assemblyai, google, local_whisper (got '{other}')"
+                        "transcription.default_provider must be one of: groq, openai, deepgram, assemblyai, google, local_whisper, elevenlabs (got '{other}')"
                     );
                 }
             }
@@ -12599,6 +12677,7 @@ auto_save = true
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
+            gemini_image_gen: GeminiImageGenConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -13170,6 +13249,7 @@ default_temperature = 0.7
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
+            gemini_image_gen: GeminiImageGenConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
