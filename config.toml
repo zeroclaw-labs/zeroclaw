@@ -1,6 +1,6 @@
-default_model = "atomic-chat"
+default_model = "atomic"
 
-[providers.models.atomic-chat]
+[providers.models.atomic]
 kind = "openai-compatible"
 base_url = "http://127.0.0.1:1337/v1"
 model = "unsloth/Qwen3_5-9B-IQ4_XS"
