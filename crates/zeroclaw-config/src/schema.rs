@@ -5858,7 +5858,7 @@ pub struct AutonomyConfig {
     /// Extra directory roots the agent may read/write outside the workspace.
     /// Supports absolute, `~/...`, and workspace-relative entries.
     /// Resolved paths under any of these roots pass `is_resolved_path_allowed`.
-    #[serde(default)]
+    #[serde(default, alias = "allowed_path", alias = "allowed_paths")]
     pub allowed_roots: Vec<String>,
 
     /// Tools to exclude from non-CLI channels (e.g. Telegram, Discord).

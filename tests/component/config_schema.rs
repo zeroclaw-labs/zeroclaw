@@ -364,6 +364,26 @@ fn autonomy_config_toml_roundtrip() {
     assert!(!parsed.autonomy.workspace_only);
 }
 
+#[test]
+fn autonomy_config_allowed_path_alias_maps_to_allowed_roots() {
+    let toml_str = r#"
+[autonomy]
+allowed_path = ["~/work", "~/"]
+"#;
+    let parsed: Config = toml::from_str(toml_str).expect("allowed_path alias should parse");
+    assert_eq!(parsed.autonomy.allowed_roots, vec!["~/work", "~/"]);
+}
+
+#[test]
+fn autonomy_config_allowed_paths_alias_maps_to_allowed_roots() {
+    let toml_str = r#"
+[autonomy]
+allowed_paths = ["/tmp/data"]
+"#;
+    let parsed: Config = toml::from_str(toml_str).expect("allowed_paths alias should parse");
+    assert_eq!(parsed.autonomy.allowed_roots, vec!["/tmp/data"]);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Backward compatibility
 // ─────────────────────────────────────────────────────────────────────────────
