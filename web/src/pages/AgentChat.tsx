@@ -57,6 +57,11 @@ export default function AgentChat() {
   const [showToolActivity, setShowToolActivity] = useState(() => {
     try { return localStorage.getItem('zeroclaw_show_tool_activity') === '1'; } catch { return false; }
   });
+  // The WebSocket onMessage handler is installed once with `[]` deps so it
+  // can read the latest toggle without a reconnect-per-toggle. Mirror the
+  // state into a ref the handler reads at message time.
+  const showToolActivityRef = useRef(showToolActivity);
+  useEffect(() => { showToolActivityRef.current = showToolActivity; }, [showToolActivity]);
   const pendingContentRef = useRef('');
   const pendingThinkingRef = useRef('');
   // Snapshot of thinking captured at chunk_reset, so it survives the reset.
@@ -187,7 +192,7 @@ export default function AgentChat() {
         }
 
         case 'tool_call': {
-          if (!showToolActivity) {
+          if (!showToolActivityRef.current) {
             break;
           }
           const toolName = msg.name ?? 'unknown';
@@ -219,7 +224,7 @@ export default function AgentChat() {
         }
 
         case 'tool_result': {
-          if (!showToolActivity) {
+          if (!showToolActivityRef.current) {
             break;
           }
           setMessages((prev) => {
