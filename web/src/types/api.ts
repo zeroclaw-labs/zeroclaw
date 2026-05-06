@@ -67,7 +67,10 @@ export interface CronRun {
 export interface Integration {
   name: string;
   description: string;
+  /** Stable enum-variant key (e.g. `"ToolsAutomation"`); use for grouping/filtering. */
   category: string;
+  /** Human-readable label (e.g. `"Tools & Automation"`); use for display. */
+  category_label: string;
   status: 'Available' | 'Active';
 }
 

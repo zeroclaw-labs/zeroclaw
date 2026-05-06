@@ -583,6 +583,7 @@ pub async fn handle_api_integrations(
                 "name": entry.name,
                 "description": entry.description,
                 "category": entry.category,
+                "category_label": entry.category_label,
                 "status": entry.status,
             })
         })
@@ -614,6 +615,7 @@ pub async fn handle_api_integrations_settings(
             serde_json::json!({
                 "enabled": enabled,
                 "category": entry.category,
+                "category_label": entry.category_label,
                 "status": entry.status,
             }),
         );

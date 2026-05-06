@@ -142,6 +142,7 @@
 - Bug-fix bundle: Overview crash, model save, editor caret, chat CPU usage (#6161).
 - Array-returning API helpers now guard against non-array responses (#6162).
 - WebSocket session ID persists in `localStorage` across page reloads (#5641).
+- Integrations page renders human-readable category headings (`Tools & Automation` instead of `TOOLSAUTOMATION`); `/api/integrations` and `/api/integrations/settings` now include a `category_label` field alongside the stable enum-key `category`. Catches up to the post-#6386 4-category catalog.
 
 ### Configuration
 
