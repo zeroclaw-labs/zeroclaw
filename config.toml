@@ -3,6 +3,6 @@ fallback = "atomic-chat"
 
 [providers.models.atomic-chat]
 kind = "openai-compatible"
-base_url = "http://localhost:8000/v1"
+base_url = "http://host.docker.internal:1337/v1"
 model = "atomic-chat"
 api_key = "none"
