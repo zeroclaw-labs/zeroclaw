@@ -787,6 +787,37 @@ impl WaAttachmentKind {
     }
 }
 
+/// Decide whether a `fromMe` message outside the operator's self-chat is an
+/// intentional operator-typed bot trigger.
+///
+/// The default response to a `fromMe` mirror is to drop, because WhatsApp Web
+/// echoes every message the operator types from any linked device and replying
+/// would impersonate them. The exception is when the operator has configured
+/// `dm_mention_patterns` / `group_mention_patterns` and the text matches —
+/// that is the explicit opt-in that distinguishes a deliberate trigger
+/// (e.g. typing `TinyBot foo` in a friend's DM) from a normal mirrored
+/// message.
+///
+/// Returns `true` when the message should fall through to the regular policy
+/// branches; `false` when it should be dropped as a mirror.
+#[cfg(feature = "whatsapp-web")]
+fn fromme_outside_self_chat_is_operator_trigger(
+    is_group: bool,
+    dm_mention_patterns: &[regex::Regex],
+    group_mention_patterns: &[regex::Regex],
+    text: &str,
+) -> bool {
+    let applicable = if is_group {
+        group_mention_patterns
+    } else {
+        dm_mention_patterns
+    };
+    if applicable.is_empty() {
+        return false;
+    }
+    super::whatsapp::WhatsAppChannel::text_matches_patterns(applicable, text)
+}
+
 /// Find the closing `]` that matches an already-consumed opening `[`.
 #[cfg(feature = "whatsapp-web")]
 #[allow(dead_code)] // WIP: used by parse_attachment_markers
@@ -1197,12 +1228,22 @@ impl Channel for WhatsAppWebChannel {
                                                 );
                                             }
                                         }
-                                    } else if info.source.is_from_me {
+                                    } else if info.source.is_from_me
+                                        && !fromme_outside_self_chat_is_operator_trigger(
+                                            is_group,
+                                            &wa_dm_mention_patterns,
+                                            &wa_group_mention_patterns,
+                                            msg.text_content().unwrap_or(""),
+                                        )
+                                    {
                                         // fromMe outside the self-chat thread is a mirror of the
                                         // operator's own outbound message to a third party (DM or
-                                        // group). Replying would impersonate the operator to the
-                                        // recipient. Drop unconditionally — `self_chat_mode` only
-                                        // gates the dedicated self-chat thread above.
+                                        // group). Replying would impersonate the operator. Drop —
+                                        // unless the operator has configured a mention pattern
+                                        // and the text matches it (the workflow @ilteoood uses
+                                        // with `TinyBot ...` triggers), in which case the helper
+                                        // returns true and we fall through to the policy branches
+                                        // below to treat the message like an inbound trigger.
                                         tracing::debug!(
                                             "WhatsApp Web: ignoring fromMe message outside self-chat thread (chat={chat}, sender={sender})"
                                         );
@@ -2223,5 +2264,136 @@ mod tests {
             mime_from_path(std::path::Path::new("/tmp/e.xyz")),
             "application/octet-stream"
         );
+    }
+
+    // ── fromme_outside_self_chat_is_operator_trigger (#6351) ───────────
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fromme_trigger_drops_when_no_mention_patterns_configured() {
+        let dm: Vec<regex::Regex> = vec![];
+        let group: Vec<regex::Regex> = vec![];
+        // Without configured patterns, a fromMe message in a third-party
+        // DM or group must drop — there is no opt-in signal that says the
+        // operator wants outbound mirrors to be treated as triggers.
+        assert!(!fromme_outside_self_chat_is_operator_trigger(
+            false,
+            &dm,
+            &group,
+            "TinyBot foo"
+        ));
+        assert!(!fromme_outside_self_chat_is_operator_trigger(
+            true,
+            &dm,
+            &group,
+            "TinyBot foo"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fromme_trigger_falls_through_when_dm_pattern_matches() {
+        // @ilteoood's configured workflow: dm_mention_patterns = ["TinyBot"].
+        // Operator types "TinyBot translate this" in a friend's DM →
+        // intentional invocation, must fall through.
+        let dm = vec![
+            regex::RegexBuilder::new("TinyBot")
+                .case_insensitive(true)
+                .build()
+                .unwrap(),
+        ];
+        let group: Vec<regex::Regex> = vec![];
+        assert!(fromme_outside_self_chat_is_operator_trigger(
+            false,
+            &dm,
+            &group,
+            "TinyBot translate this"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fromme_trigger_drops_when_dm_pattern_does_not_match() {
+        // Operator types a normal message in a friend's DM — even with
+        // patterns configured, no match means it stays an outbound mirror
+        // and must be dropped to prevent impersonation.
+        let dm = vec![
+            regex::RegexBuilder::new("TinyBot")
+                .case_insensitive(true)
+                .build()
+                .unwrap(),
+        ];
+        let group: Vec<regex::Regex> = vec![];
+        assert!(!fromme_outside_self_chat_is_operator_trigger(
+            false,
+            &dm,
+            &group,
+            "see you at 7"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fromme_trigger_uses_group_patterns_for_group_threads() {
+        // group_mention_patterns gates the group case; dm patterns must
+        // not be consulted for group messages and vice versa. This pins
+        // the predicate's branch selection.
+        let dm: Vec<regex::Regex> = vec![
+            regex::RegexBuilder::new("DmTrigger")
+                .case_insensitive(true)
+                .build()
+                .unwrap(),
+        ];
+        let group = vec![
+            regex::RegexBuilder::new("GroupTrigger")
+                .case_insensitive(true)
+                .build()
+                .unwrap(),
+        ];
+        // In a group, only group_patterns matter.
+        assert!(fromme_outside_self_chat_is_operator_trigger(
+            true,
+            &dm,
+            &group,
+            "GroupTrigger hi"
+        ));
+        assert!(!fromme_outside_self_chat_is_operator_trigger(
+            true,
+            &dm,
+            &group,
+            "DmTrigger hi"
+        ));
+        // In a DM, only dm_patterns matter.
+        assert!(fromme_outside_self_chat_is_operator_trigger(
+            false,
+            &dm,
+            &group,
+            "DmTrigger hi"
+        ));
+        assert!(!fromme_outside_self_chat_is_operator_trigger(
+            false,
+            &dm,
+            &group,
+            "GroupTrigger hi"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fromme_trigger_drops_when_text_is_empty() {
+        // Voice notes and media-only messages return empty text. With no
+        // text to match against, the operator-trigger path must drop —
+        // never transcribe a fromMe voice note just to check whether it
+        // is a bot trigger (cost + impersonation risk).
+        let dm = vec![
+            regex::RegexBuilder::new("TinyBot")
+                .case_insensitive(true)
+                .build()
+                .unwrap(),
+        ];
+        let group: Vec<regex::Regex> = vec![];
+        assert!(!fromme_outside_self_chat_is_operator_trigger(
+            false, &dm, &group, ""
+        ));
     }
 }
