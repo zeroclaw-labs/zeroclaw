@@ -442,6 +442,8 @@ impl Agent {
                 self.history.push(ConversationMessage::Chat(msg.clone()));
             }
         }
+        // Enforce history window so seeded sessions respect max_history.
+        self.trim_history();
     }
 
     pub async fn from_config(config: &Config) -> Result<Self> {
