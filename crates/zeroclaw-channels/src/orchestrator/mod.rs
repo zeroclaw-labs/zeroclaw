@@ -4484,7 +4484,7 @@ fn collect_configured_channels(
         .agents
         .values()
         .filter(|a| a.enabled)
-        .flat_map(|a| a.channels.iter().cloned())
+        .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
         .collect();
 
     #[cfg(feature = "channel-telegram")]
@@ -5147,7 +5147,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
             .agents
             .values()
             .filter(|a| a.enabled)
-            .flat_map(|a| a.channels.iter().cloned())
+            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
             .collect();
         for (alias, ns) in &config.channels.nostr {
             if !active_nostr.contains(&format!("nostr.{alias}")) {
@@ -7776,7 +7776,7 @@ BTC is currently around $65,000 based on latest tool output."#
         route_overrides.insert(
             route_key,
             ChannelRouteSelection {
-                model_provider: "openrouter".to_string(),
+                model_provider: "openrouter".into(),
                 model: "route-model".to_string(),
                 api_key: None,
             },
@@ -8011,7 +8011,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 config_path.clone(),
                 RuntimeConfigState {
                     defaults: ChannelRuntimeDefaults {
-                        default_model_provider: "test-model_provider".to_string(),
+                        default_model_provider: "test-model_provider".into(),
                         model: "hot-reloaded-model".to_string(),
                         temperature: 0.5,
                         api_key: None,
@@ -10756,7 +10756,7 @@ This is an example JSON object for profile settings."#;
         config.agents.insert(
             "mattermost-default".to_string(),
             zeroclaw_config::schema::DelegateAgentConfig {
-                channels: vec!["mattermost.default".to_string()],
+                channels: vec!["mattermost.default".into()],
                 ..Default::default()
             },
         );

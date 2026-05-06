@@ -1020,7 +1020,7 @@ mod tests {
     #[test]
     fn test_resolve_searxng_instance_url_from_boot() {
         let tool = WebSearchTool {
-            model_provider: "searxng".to_string(),
+            model_provider: "searxng".into(),
             boot_brave_api_key: None,
             boot_tavily_api_key: None,
             searxng_instance_url: Some("https://searx.example.com".to_string()),

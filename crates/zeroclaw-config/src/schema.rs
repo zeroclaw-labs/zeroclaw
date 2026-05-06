@@ -2451,13 +2451,16 @@ pub struct DelegateAgentConfig {
     /// Optional system prompt. Prefer placing prose in `agents/<alias>/AGENTS.md`.
     #[serde(default)]
     pub system_prompt: Option<String>,
-    /// Channel aliases this agent handles (e.g. `["telegram.default", "discord.work"]`).
+    /// Channel aliases this agent handles (e.g. `["telegram.<alias>", "discord.<alias>"]`).
+    /// Each entry is a `ChannelRef` resolving through `[channels.<type>.<alias>]`;
+    /// `Config::validate()` fails loud on dangling references.
     #[serde(default)]
-    pub channels: Vec<String>,
-    /// Dotted model-model_provider alias (e.g. `"anthropic.default"`).
-    /// Resolves through `providers.models.<type>.<alias>` at runtime.
+    pub channels: Vec<crate::providers::ChannelRef>,
+    /// Dotted model-provider alias (e.g. `"anthropic.<alias>"`).
+    /// Resolves through `providers.models.<type>.<alias>` at runtime;
+    /// `Config::validate()` fails loud on dangling references.
     #[serde(default)]
-    pub model_provider: String,
+    pub model_provider: crate::providers::ModelProviderRef,
     /// Risk profile alias (e.g. `"default"`). Resolves delegation guardrails at runtime.
     #[serde(default)]
     pub risk_profile: String,
@@ -2493,14 +2496,16 @@ pub struct DelegateAgentConfig {
     /// Empty = no TTS for this agent (V3 has no global default-provider concept;
     /// every agent that wants TTS sets its own `tts_provider`).
     #[serde(default)]
-    pub tts_provider: String,
+    pub tts_provider: crate::providers::TtsProviderRef,
     /// Transcription / STT provider as a dotted alias reference
     /// (`<type>.<alias>`, e.g. `"groq.<alias>"`). Resolves through
-    /// `providers.transcription.<type>.<alias>`. Empty = no per-agent
-    /// transcription preference (channels that ingest voice fall back to
-    /// their own `transcription_provider` setting; V3 has no global default).
+    /// `providers.transcription.<type>.<alias>`. Empty = agent has no
+    /// transcription preference; channels that ingest voice still need a
+    /// resolved provider (V3 has no global default), so an inbound voice
+    /// flow into an agent with empty `transcription_provider` errors loudly
+    /// at the channel boundary.
     #[serde(default)]
-    pub transcription_provider: String,
+    pub transcription_provider: crate::providers::TranscriptionProviderRef,
 
     // ── Agent loop / runtime tunables (folded from V2 `[agent]` ──────
     // V3 makes these per-agent. Defaults preserve V2 behavior so an
@@ -2589,7 +2594,7 @@ impl Default for DelegateAgentConfig {
             enabled: true,
             system_prompt: None,
             channels: Vec::new(),
-            model_provider: String::new(),
+            model_provider: crate::providers::ModelProviderRef::default(),
             risk_profile: String::new(),
             runtime_profile: String::new(),
             skill_bundles: Vec::new(),
@@ -2597,8 +2602,8 @@ impl Default for DelegateAgentConfig {
             mcp_bundles: Vec::new(),
             memory_namespace: String::new(),
             cron_jobs: Vec::new(),
-            tts_provider: String::new(),
-            transcription_provider: String::new(),
+            tts_provider: crate::providers::TtsProviderRef::default(),
+            transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             compact_context: default_agent_compact_context(),
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),

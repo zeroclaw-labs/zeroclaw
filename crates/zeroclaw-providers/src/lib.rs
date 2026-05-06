@@ -3309,12 +3309,12 @@ mod tests {
             .anthropic
             .insert("work".to_string(), work_alias);
         let work_agent = DelegateAgentConfig {
-            model_provider: "anthropic.work".to_string(),
+            model_provider: "anthropic.work".into(),
             ..DelegateAgentConfig::default()
         };
         config.agents.insert("work_agent".to_string(), work_agent);
         let default_agent = DelegateAgentConfig {
-            model_provider: "anthropic.default".to_string(),
+            model_provider: "anthropic.default".into(),
             ..DelegateAgentConfig::default()
         };
         config

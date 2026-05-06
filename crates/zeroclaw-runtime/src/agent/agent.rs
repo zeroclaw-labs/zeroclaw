@@ -2232,7 +2232,7 @@ mod tests {
             .expect("model_provider configured above")
             .to_string();
         let agent_cfg = zeroclaw_config::schema::DelegateAgentConfig {
-            model_provider: format!("{provider_alias}.default"),
+            model_provider: format!("{provider_alias}.default").into(),
             risk_profile: "test-profile".to_string(),
             ..zeroclaw_config::schema::DelegateAgentConfig::default()
         };

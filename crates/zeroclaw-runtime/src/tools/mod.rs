@@ -1258,7 +1258,7 @@ mod tests {
         agents.insert(
             "researcher".to_string(),
             DelegateAgentConfig {
-                model_provider: "ollama.researcher".to_string(),
+                model_provider: "ollama.researcher".into(),
                 ..Default::default()
             },
         );

@@ -3496,7 +3496,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
                     // Save pending login for paste-redirect fallback
                     let pending = PendingOAuthLogin {
-                        model_provider: "gemini".to_string(),
+                        model_provider: "gemini".into(),
                         profile: profile.clone(),
                         code_verifier: pkce.code_verifier.clone(),
                         state: pkce.state.clone(),
@@ -3590,7 +3590,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
                     let pkce = auth::openai_oauth::generate_pkce_state();
                     let pending = PendingOAuthLogin {
-                        model_provider: "openai".to_string(),
+                        model_provider: "openai".into(),
                         profile: profile.clone(),
                         code_verifier: pkce.code_verifier.clone(),
                         state: pkce.state.clone(),

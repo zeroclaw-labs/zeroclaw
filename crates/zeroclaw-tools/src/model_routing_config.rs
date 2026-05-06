@@ -814,7 +814,7 @@ impl ModelRoutingConfigTool {
 
         // Get or create the agent and wire up V3 alias references.
         let next_agent = cfg.agents.entry(name.clone()).or_default();
-        next_agent.model_provider = agent_model_provider_ref;
+        next_agent.model_provider = agent_model_provider_ref.into();
         next_agent.risk_profile = name.clone();
         next_agent.runtime_profile = name.clone();
         match system_prompt_update {

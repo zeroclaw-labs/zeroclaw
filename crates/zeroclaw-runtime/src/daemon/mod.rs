@@ -213,7 +213,7 @@ pub async fn run(
             .agents
             .values()
             .filter(|a| a.enabled)
-            .flat_map(|a| a.channels.iter().cloned())
+            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
             .collect();
         let mut mqtt_started = false;
         for (alias, mqtt_config) in &config.channels.mqtt {

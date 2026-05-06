@@ -36,6 +36,120 @@ use super::schema::{
     OpenAITtsProviderConfig, PiperTtsProviderConfig, TtsProviderConfig as TtsBaseConfig,
 };
 
+// ── Per-category typed alias-ref newtypes ────────────────────────────────
+//
+// Every per-agent provider field is a reference into a specific configured
+// `[providers.<category>.<type>.<alias>]` (or `[channels.<type>.<alias>]`)
+// entry. The newtype carries the category at the type level — readers know
+// `agent.tts_provider: TtsProviderRef` is a TTS-provider reference, not a
+// free string, just by looking at the field declaration.
+//
+// `#[serde(transparent)]` keeps the on-disk TOML shape identical to the
+// previous `String` field. `Deref<Target = str>` and `AsRef<str>` keep
+// every `.is_empty()` / `.split_once('.')` / `.eq_ignore_ascii_case` /
+// `&value[..]` consumer working unchanged. Assignment from a string literal
+// goes through `.into()` (`From<&str>` / `From<String>`).
+//
+// Validation that each non-empty ref resolves to a configured alias lives
+// in `Config::validate()` (see `agent.tts_provider` / `agent.transcription_provider`
+// blocks in schema.rs); the newtype's job is to encode the *category* in
+// the type, not the existence — both layers reinforce each other.
+
+macro_rules! define_provider_ref {
+    ($name:ident, $category_doc:literal) => {
+        #[doc = concat!("Reference to a configured `[", $category_doc, ".<type>.<alias>]` entry.")]
+        ///
+        /// Empty value means "no preference" (opt-out). Non-empty values must
+        /// resolve to a configured alias; `Config::validate()` enforces this.
+        #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+        #[serde(transparent)]
+        pub struct $name(pub String);
+
+        impl $name {
+            #[must_use]
+            pub fn new(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            #[must_use]
+            pub fn is_empty(&self) -> bool {
+                self.0.is_empty()
+            }
+
+            #[must_use]
+            pub fn into_inner(self) -> String {
+                self.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Display::fmt(&self.0, f)
+            }
+        }
+
+        impl std::ops::Deref for $name {
+            type Target = str;
+            fn deref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(v: String) -> Self {
+                Self(v)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(v: &str) -> Self {
+                Self(v.to_string())
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(v: $name) -> Self {
+                v.0
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0 == *other
+            }
+        }
+
+        impl PartialEq<String> for $name {
+            fn eq(&self, other: &String) -> bool {
+                &self.0 == other
+            }
+        }
+    };
+}
+
+define_provider_ref!(ModelProviderRef, "providers.models");
+define_provider_ref!(TtsProviderRef, "providers.tts");
+define_provider_ref!(TranscriptionProviderRef, "providers.transcription");
+define_provider_ref!(ChannelRef, "channels");
+
 /// Macro that expands to a single source of truth for the per-model_provider-type
 /// slot list on `ModelProviders`. Every helper that needs to walk every slot
 /// (`first_model_provider`, `iter_entries`, `is_empty`, etc.) goes through this

@@ -1479,14 +1479,14 @@ mod tests {
             "researcher".to_string(),
             DelegateAgentConfig {
                 system_prompt: Some("You are a research assistant.".to_string()),
-                model_provider: "ollama.researcher".to_string(),
+                model_provider: "ollama.researcher".into(),
                 ..Default::default()
             },
         );
         agents.insert(
             "coder".to_string(),
             DelegateAgentConfig {
-                model_provider: "openrouter.coder".to_string(),
+                model_provider: "openrouter.coder".into(),
                 ..Default::default()
             },
         );
@@ -1635,7 +1635,7 @@ mod tests {
     fn agentic_agent_config() -> DelegateAgentConfig {
         DelegateAgentConfig {
             system_prompt: Some("You are agentic.".to_string()),
-            model_provider: "openrouter.agentic".to_string(),
+            model_provider: "openrouter.agentic".into(),
             runtime_profile: "agentic_test".to_string(),
             ..Default::default()
         }
@@ -1772,7 +1772,7 @@ mod tests {
         agents.insert(
             "broken".to_string(),
             DelegateAgentConfig {
-                model_provider: "totally-invalid-model_provider.default".to_string(),
+                model_provider: "totally-invalid-model_provider.default".into(),
                 ..Default::default()
             },
         );
@@ -1880,7 +1880,7 @@ mod tests {
         agents.insert(
             "tester".to_string(),
             DelegateAgentConfig {
-                model_provider: "invalid-for-test.default".to_string(),
+                model_provider: "invalid-for-test.default".into(),
                 ..Default::default()
             },
         );
@@ -1910,7 +1910,7 @@ mod tests {
         agents.insert(
             "tester".to_string(),
             DelegateAgentConfig {
-                model_provider: "invalid-for-test.default".to_string(),
+                model_provider: "invalid-for-test.default".into(),
                 ..Default::default()
             },
         );
@@ -2239,7 +2239,7 @@ mod tests {
     fn enriched_prompt_includes_tools_workspace_datetime() {
         let config = DelegateAgentConfig {
             system_prompt: Some("You are a code reviewer.".to_string()),
-            model_provider: "openrouter.test".to_string(),
+            model_provider: "openrouter.test".into(),
             ..Default::default()
         };
 
