@@ -755,7 +755,7 @@ impl LinkedInClient {
 
 // ── Image Generation ─────────────────────────────────────────────
 
-/// Multi-model_provider image generator with SVG fallback card.
+/// Multi-provider image generator with SVG fallback card.
 ///
 /// Tries AI model_providers in configured priority order. If all fail (missing keys,
 /// API errors, exhausted credits), falls back to generating a branded SVG card.

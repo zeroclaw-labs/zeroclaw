@@ -825,7 +825,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
     }
 }
 
-/// Verify `name` matches a canonical model-model_provider family known to the
+/// Verify `name` matches a canonical model provider family known to the
 /// runtime registry. Returns the canonical (case-corrected) name, or `None`
 /// when the input doesn't name a known family. Originally an alias resolver;
 /// post-#6273 there are no aliases left to resolve, just a canonical-name
@@ -1605,7 +1605,7 @@ fn build_models_help_response(
     if cached_models.is_empty() {
         let _ = writeln!(
             response,
-            "\nNo cached model list found for `{}`. Ask the operator to run `zeroclaw models refresh --model_provider {}`.",
+            "\nNo cached model list found for `{}`. Ask the operator to run `zeroclaw models refresh --model-provider {}`.",
             current.model_provider, current.model_provider
         );
     } else {
@@ -1827,7 +1827,7 @@ async fn handle_runtime_command_if_needed(
                             }
 
                             format!(
-                                "ModelProvider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a model_provider-compatible model.",
+                                "ModelProvider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
                                 current.model
                             )
                         }
@@ -6523,7 +6523,7 @@ mod tests {
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -6651,7 +6651,7 @@ mod tests {
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -6740,7 +6740,7 @@ mod tests {
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -6844,7 +6844,7 @@ mod tests {
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -7447,7 +7447,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingModelProvider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
@@ -7928,7 +7928,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingModelProvider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
@@ -8038,7 +8038,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(RawToolArtifactModelProvider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
@@ -8133,7 +8133,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingAliasModelProvider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
@@ -8233,7 +8233,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
-            "test-model_provider".to_string(),
+            "test-provider".to_string(),
             Arc::clone(&default_model_provider),
         );
         provider_cache_seed.insert("openrouter".to_string(), alt_model_provider);
@@ -8241,7 +8241,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -8356,7 +8356,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
-            "test-model_provider".to_string(),
+            "test-provider".to_string(),
             Arc::clone(&default_model_provider),
         );
         provider_cache_seed.insert("openrouter".to_string(), routed_model_provider);
@@ -8375,7 +8375,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -8485,12 +8485,12 @@ BTC is currently around $65,000 based on latest tool output."#
         let reloaded_model_provider: Arc<dyn ModelProvider> = reloaded_model_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
-        provider_cache_seed.insert("test-model_provider".to_string(), reloaded_model_provider);
+        provider_cache_seed.insert("test-provider".to_string(), reloaded_model_provider);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::clone(&startup_model_provider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -8552,7 +8552,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx,
             zeroclaw_api::channel::ChannelMessage {
-                id: "msg-default-model_provider-cache".to_string(),
+                id: "msg-default-provider-cache".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "hello cached default model_provider".to_string(),
@@ -8591,10 +8591,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
-        provider_cache_seed.insert(
-            "test-model_provider".to_string(),
-            Arc::clone(&model_provider),
-        );
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&model_provider));
 
         let temp = tempfile::TempDir::new().expect("temp dir");
         let config_path = temp.path().join("config.toml");
@@ -8607,7 +8604,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 config_path.clone(),
                 RuntimeConfigState {
                     defaults: ChannelRuntimeDefaults {
-                        default_model_provider: "test-model_provider".into(),
+                        default_model_provider: "test-provider".into(),
                         model: "hot-reloaded-model".to_string(),
                         temperature: 0.5,
                         api_key: None,
@@ -8622,7 +8619,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::clone(&model_provider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -8732,7 +8729,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider: Arc::new(IterativeToolModelProvider {
                 required_tool_iterations: 11,
             }),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
@@ -8832,7 +8829,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider: Arc::new(IterativeToolModelProvider {
                 required_tool_iterations: 20,
             }),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
@@ -9058,7 +9055,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider: Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(250),
             }),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -9176,7 +9173,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -9313,7 +9310,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -9447,7 +9444,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider: Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(180),
             }),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -9559,7 +9556,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider: Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(20),
             }),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -9652,7 +9649,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(NoReplyModelProvider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -9745,7 +9742,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider: Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(5),
             }),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -10643,7 +10640,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -10793,7 +10790,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -10984,7 +10981,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(RecallMemory),
             tools_registry: Arc::new(vec![]),
@@ -11108,7 +11105,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -12144,10 +12141,10 @@ This is an example JSON object for profile settings."#;
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
-            "test-model_provider".to_string(),
+            "test-provider".to_string(),
             Arc::clone(&default_model_provider),
         );
-        provider_cache_seed.insert("vision-model_provider".to_string(), vision_model_provider);
+        provider_cache_seed.insert("vision-provider".to_string(), vision_model_provider);
 
         let classification_config = zeroclaw_config::schema::QueryClassificationConfig {
             enabled: true,
@@ -12160,7 +12157,7 @@ This is an example JSON object for profile settings."#;
 
         let model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "vision".into(),
-            model_provider: "vision-model_provider".into(),
+            model_provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
         }];
@@ -12168,7 +12165,7 @@ This is an example JSON object for profile settings."#;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -12280,10 +12277,10 @@ This is an example JSON object for profile settings."#;
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
-            "test-model_provider".to_string(),
+            "test-provider".to_string(),
             Arc::clone(&default_model_provider),
         );
-        provider_cache_seed.insert("vision-model_provider".to_string(), vision_model_provider);
+        provider_cache_seed.insert("vision-provider".to_string(), vision_model_provider);
 
         // Classification is disabled — matching keyword should NOT trigger reroute.
         let classification_config = zeroclaw_config::schema::QueryClassificationConfig {
@@ -12297,7 +12294,7 @@ This is an example JSON object for profile settings."#;
 
         let model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "vision".into(),
-            model_provider: "vision-model_provider".into(),
+            model_provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
         }];
@@ -12305,7 +12302,7 @@ This is an example JSON object for profile settings."#;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -12409,10 +12406,10 @@ This is an example JSON object for profile settings."#;
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
-            "test-model_provider".to_string(),
+            "test-provider".to_string(),
             Arc::clone(&default_model_provider),
         );
-        provider_cache_seed.insert("vision-model_provider".to_string(), vision_model_provider);
+        provider_cache_seed.insert("vision-provider".to_string(), vision_model_provider);
 
         // Classification enabled with a rule that won't match the message.
         let classification_config = zeroclaw_config::schema::QueryClassificationConfig {
@@ -12426,7 +12423,7 @@ This is an example JSON object for profile settings."#;
 
         let model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "vision".into(),
-            model_provider: "vision-model_provider".into(),
+            model_provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
         }];
@@ -12434,7 +12431,7 @@ This is an example JSON object for profile settings."#;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -12540,11 +12537,11 @@ This is an example JSON object for profile settings."#;
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
-            "test-model_provider".to_string(),
+            "test-provider".to_string(),
             Arc::clone(&default_model_provider),
         );
-        provider_cache_seed.insert("fast-model_provider".to_string(), fast_model_provider);
-        provider_cache_seed.insert("code-model_provider".to_string(), code_model_provider);
+        provider_cache_seed.insert("fast-provider".to_string(), fast_model_provider);
+        provider_cache_seed.insert("code-provider".to_string(), code_model_provider);
 
         // Both rules match "code" keyword, but "code" rule has higher priority.
         let classification_config = zeroclaw_config::schema::QueryClassificationConfig {
@@ -12568,13 +12565,13 @@ This is an example JSON object for profile settings."#;
         let model_routes = vec![
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "fast".into(),
-                model_provider: "fast-model_provider".into(),
+                model_provider: "fast-provider".into(),
                 model: "fast-model".into(),
                 api_key: None,
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "code".into(),
-                model_provider: "code-model_provider".into(),
+                model_provider: "code-provider".into(),
                 model: "code-model".into(),
                 api_key: None,
             },
@@ -12583,7 +12580,7 @@ This is an example JSON object for profile settings."#;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
@@ -12684,6 +12681,7 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[cfg(feature = "channel-telegram")]
     #[test]
     fn build_channel_by_id_unconfigured_telegram_returns_error() {
         let config = Config::default();
@@ -12699,6 +12697,7 @@ This is an example JSON object for profile settings."#;
         }
     }
 
+    #[cfg(feature = "channel-telegram")]
     #[test]
     fn build_channel_by_id_configured_telegram_succeeds() {
         let mut config = Config::default();
@@ -12920,7 +12919,7 @@ This is an example JSON object for profile settings."#;
             model_provider: Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(150),
             }),
-            default_model_provider: Arc::new("test-model_provider".to_string()),
+            default_model_provider: Arc::new("test-provider".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),

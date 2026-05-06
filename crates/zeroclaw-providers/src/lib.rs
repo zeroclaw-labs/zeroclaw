@@ -922,7 +922,7 @@ pub async fn api_error(model_provider: &str, response: reqwest::Response) -> any
 /// 2. ModelProvider-specific environment variable (e.g., `ANTHROPIC_OAUTH_TOKEN`, `OPENROUTER_API_KEY`)
 /// 3. Generic env variables (`ZEROCLAW_API_KEY`, `API_KEY`)
 ///
-/// For Anthropic, the model_provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
+/// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
 /// followed by `ANTHROPIC_API_KEY` (for regular API keys).
 ///
 /// For MiniMax, OAuth mode supports `api_key = "minimax-oauth"`, resolving credentials from
@@ -946,7 +946,7 @@ fn resolve_model_provider_credential(
                     return Some(credential);
                 }
             } else if name == "anthropic" || name == "openai" || name == "groq" {
-                // For well-known model_providers, prefer model_provider-specific env vars over the
+                // For well-known model_providers, prefer provider-specific env vars over the
                 // global api_key override, since the global key may belong to a different
                 // model_provider (e.g. a custom: gateway).
                 let env_candidates: &[&str] = match name {
@@ -1076,7 +1076,7 @@ const KEY_PREFIX_MODEL_PROVIDERS: &[(&str, &str)] = &[
 /// Check whether an API key's prefix matches the selected model model_provider.
 ///
 /// Returns `Some("likely_model_provider")` when the key clearly belongs to a
-/// *different* model model_provider (cross-model-model_provider mismatch). Returns `None`
+/// *different* model model_provider (cross-provider mismatch). Returns `None`
 /// when everything looks fine or the format is unrecognised.
 fn check_api_key_prefix(model_provider_name: &str, key: &str) -> Option<&'static str> {
     let likely_model_provider = KEY_PREFIX_MODEL_PROVIDERS
@@ -1217,7 +1217,7 @@ fn create_model_provider_with_url_and_options(
             anyhow::bail!(
                 "API key prefix mismatch: key \"{visible}...\" looks like a \
                      {likely_model_provider} key, but model_provider \"{name}\" is selected. \
-                     Set the correct model_provider-specific env var or use `-p {likely_model_provider}`."
+                     Set the correct provider-specific env var or use `-p {likely_model_provider}`."
             );
         }
     }
@@ -2505,20 +2505,18 @@ mod tests {
 
     #[test]
     fn factory_openrouter() {
-        assert!(
-            create_model_provider("openrouter", Some("model_provider-test-credential")).is_ok()
-        );
+        assert!(create_model_provider("openrouter", Some("provider-test-credential")).is_ok());
         assert!(create_model_provider("openrouter", None).is_ok());
     }
 
     #[test]
     fn factory_anthropic() {
-        assert!(create_model_provider("anthropic", Some("model_provider-test-credential")).is_ok());
+        assert!(create_model_provider("anthropic", Some("provider-test-credential")).is_ok());
     }
 
     #[test]
     fn factory_openai() {
-        assert!(create_model_provider("openai", Some("model_provider-test-credential")).is_ok());
+        assert!(create_model_provider("openai", Some("provider-test-credential")).is_ok());
     }
 
     #[test]
@@ -3016,7 +3014,7 @@ mod tests {
         let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
         let model_provider = create_resilient_model_provider(
             "totally-invalid",
-            Some("model_provider-test-credential"),
+            Some("provider-test-credential"),
             None,
             &reliability,
         );
@@ -3128,7 +3126,7 @@ mod tests {
                 continue;
             }
             assert!(
-                create_model_provider(model_provider.name, Some("model_provider-test-credential"))
+                create_model_provider(model_provider.name, Some("provider-test-credential"))
                     .is_ok(),
                 "Canonical model model_provider id should be constructible: {}",
                 model_provider.name

@@ -150,7 +150,7 @@ define_provider_ref!(TtsProviderRef, "providers.tts");
 define_provider_ref!(TranscriptionProviderRef, "providers.transcription");
 define_provider_ref!(ChannelRef, "channels");
 
-/// Macro that expands to a single source of truth for the per-model_provider-type
+/// Macro that expands to a single source of truth for the per-provider-type
 /// slot list on `ModelProviders`. Every helper that needs to walk every slot
 /// (`first_model_provider`, `iter_entries`, `is_empty`, etc.) goes through this
 /// macro so adding a new model_provider type is a one-line addition here, not a
@@ -228,7 +228,7 @@ macro_rules! for_each_model_provider_slot {
 
 macro_rules! emit_model_providers_struct {
     ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
-        /// Typed model-model_provider container — one slot per canonical model_provider type.
+        /// Typed model provider container — one slot per canonical model_provider type.
         ///
         /// Replaces the `HashMap<String, HashMap<String, ModelProviderConfig>>`
         /// with a typed struct so each family's per-alias map carries its own
@@ -419,7 +419,7 @@ impl ModelProviders {
     }
 }
 
-/// Typed TTS-model_provider container — one slot per TTS family. Mirrors
+/// Typed TTS-provider container — one slot per TTS family. Mirrors
 /// `ModelProviders` but smaller (TTS has a closed set of 5 families:
 /// openai, elevenlabs, google, edge, piper). No catch-all needed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]

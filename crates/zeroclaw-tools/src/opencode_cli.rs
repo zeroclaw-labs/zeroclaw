@@ -20,7 +20,7 @@ const SAFE_ENV_VARS: &[&str] = &[
 /// agent loop with file editing and shell tools.
 ///
 /// Authentication uses the `opencode` binary's own session by default. No API
-/// key is needed unless `env_passthrough` includes model_provider-specific keys.
+/// key is needed unless `env_passthrough` includes provider-specific keys.
 pub struct OpenCodeCliTool {
     security: Arc<SecurityPolicy>,
     config: OpenCodeCliConfig,

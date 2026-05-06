@@ -6,9 +6,9 @@ use std::sync::{Arc, OnceLock};
 
 // ── Cost tracking via task-local ──
 
-/// Per-model-model_provider pricing snapshot consumed by the cost tracker.
+/// Per-provider pricing snapshot consumed by the cost tracker.
 ///
-/// Outer key: model-model_provider alias (e.g. `openrouter`, `anthropic`,
+/// Outer key: model provider alias (e.g. `openrouter`, `anthropic`,
 /// `azure-openai`). Inner key: user-defined model identifier, optionally
 /// suffixed with `.input` / `.output` to encode pricing dimension. Values
 /// are USD per 1M tokens.
@@ -39,7 +39,7 @@ tokio::task_local! {
 }
 
 /// Resolve `(input, output)` per-1M-token rates for a given model on a given
-/// model-model_provider's pricing map. Lookup order:
+/// model provider's pricing map. Lookup order:
 ///
 /// 1. Dimension-specific keys: `{model}.input` / `{model}.output`.
 /// 2. Bare model key as a flat fallback applied to whichever dimension
@@ -151,7 +151,7 @@ fn warn_once_missing_pricing(model_provider: &str, model: &str) {
             model,
             "Cost tracking: no pricing entry found for {model_provider}/{model} — \
              token usage will be recorded with zero cost and budget enforcement \
-             is inert for this model. Add a `pricing` table to the model-model_provider \
+             is inert for this model. Add a `pricing` table to the model provider \
              entry in config.toml (under `[providers.models.\"{model_provider}\"]`) \
              with `\"{model}.input\"` and `\"{model}.output\"` keys (USD per 1M tokens). \
              This warning fires once per (model_provider, model) pair per process.",

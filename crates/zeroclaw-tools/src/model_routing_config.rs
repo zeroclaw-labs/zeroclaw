@@ -394,7 +394,7 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        // Capture previous first-model_provider entry for rollback on probe failure.
+        // Capture previous first-provider entry for rollback on probe failure.
         let previous_first_model_provider = cfg.providers.first_model_provider().cloned();
 
         // Determine which models entry to update.

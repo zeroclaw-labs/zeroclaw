@@ -1,4 +1,4 @@
-//! Multi-model_provider Text-to-Speech (TTS) subsystem.
+//! Multi-provider Text-to-Speech (TTS) subsystem.
 //!
 //! Supports OpenAI, ElevenLabs, Google Cloud TTS, Edge TTS (free, subprocess-based),
 //! and Piper TTS (local GPU-accelerated, OpenAI-compatible endpoint).

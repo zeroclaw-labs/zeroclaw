@@ -203,8 +203,8 @@ impl std::fmt::Debug for ResolvedEmbeddingConfig {
     }
 }
 
-/// Look up the model_provider-specific environment variable for common embedding model_providers,
-/// so that `OPENAI_API_KEY` (etc.) takes precedence over the default-model_provider key
+/// Look up the provider-specific environment variable for common embedding model_providers,
+/// so that `OPENAI_API_KEY` (etc.) takes precedence over the default-provider key
 /// that the caller passes in. Returns `None` for unknown model_providers.
 fn embedding_provider_env_key(model_provider: &str) -> Option<String> {
     let env_var = match model_provider.trim() {
@@ -228,7 +228,7 @@ fn resolve_embedding_config(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    // Prefer a model_provider-specific env var over the caller-supplied key, which
+    // Prefer a provider-specific env var over the caller-supplied key, which
     // may come from the default (chat) model_provider and differ from the embedding
     // model_provider (issue #3083: gemini key leaking to openai embeddings endpoint).
     let fallback_api_key =

@@ -651,7 +651,7 @@ pub struct ModelProviderConfig {
     #[serde(default, skip_serializing_if = "is_false")]
     pub merge_system_into_user: bool,
     /// Extra JSON parameters to include in API requests.
-    /// Merged at the top level of the request body, allowing model_provider-specific
+    /// Merged at the top level of the request body, allowing provider-specific
     /// features (routing, transforms, etc.) without code changes.
     /// Example: `provider_extra = { model_provider = { only = ["Anthropic"] } }`
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -694,7 +694,7 @@ pub struct ModelProviderConfig {
 // - Multi-region family with a required `endpoint` field: see `MoonshotModelProviderConfig`
 //
 // The `ModelProviders` container in `crates/zeroclaw-config/src/model_providers.rs`
-// holds a typed slot per family; the runtime impls in zeroclaw-model_providers
+// holds a typed slot per family; the runtime impls in zeroclaw-providers
 // consume the typed configs directly.
 
 // ── OpenAI ──
@@ -3129,7 +3129,7 @@ fn default_google_stt_language_code() -> String {
     "en-US".into()
 }
 
-/// Voice transcription configuration with multi-model_provider support.
+/// Voice transcription configuration with multi-provider support.
 ///
 /// The top-level `api_url`, `model`, and `api_key` fields remain for backward
 /// compatibility with existing Groq-based configurations.
@@ -3418,7 +3418,7 @@ impl Default for TtsConfig {
 /// are quietly ignored.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "tts-model_provider"]
+#[prefix = "tts-provider"]
 #[serde(default)]
 pub struct TtsProviderConfig {
     /// API key (openai, elevenlabs, google).
@@ -3449,7 +3449,7 @@ pub struct TtsProviderConfig {
 
 // ── TTS endpoint trait + per-family typed configs ──────────────────────────
 //
-// Mirrors the model-model_provider typed-family pattern. Each TTS family carries
+// Mirrors the model provider typed-family pattern. Each TTS family carries
 // its own typed config (composing TtsProviderConfig as the shared base via
 // `#[serde(flatten)]`) and a single-variant `*TtsEndpoint` enum impl'ing
 // `TtsEndpoint`. Edge and Piper skip the base — they're subprocess / local
@@ -6381,7 +6381,7 @@ impl Default for GeminiCliConfig {
 ///
 /// Delegates coding tasks to the `opencode run` CLI. Authentication uses the
 /// binary's own session by default — no API key needed unless
-/// `env_passthrough` includes model_provider-specific keys.
+/// `env_passthrough` includes provider-specific keys.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "opencode-cli"]
@@ -13472,7 +13472,7 @@ impl Config {
             if mp.is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
-                    format!("agents.{alias}.model-model_provider"),
+                    format!("agents.{alias}.model_provider"),
                     "agents.{alias}.model_provider must reference a configured model model_provider (e.g. \"anthropic.default\")",
                 );
             }
@@ -13484,14 +13484,14 @@ impl Config {
                     if !exists {
                         validation_bail!(
                             DanglingReference,
-                            format!("agents.{alias}.model-model_provider"),
+                            format!("agents.{alias}.model_provider"),
                             "agents.{alias}.model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
                 }
                 _ => validation_bail!(
                     InvalidFormat,
-                    format!("agents.{alias}.model-model_provider"),
+                    format!("agents.{alias}.model_provider"),
                     "agents.{alias}.model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
                 ),
             }
@@ -17319,7 +17319,7 @@ default_model = "persisted-profile"
             "default".to_string(),
             OpenRouterModelProviderConfig {
                 base: ModelProviderConfig {
-                    name: Some("test-model_provider".into()),
+                    name: Some("test-provider".into()),
                     temperature: Some(99.0),
                     ..Default::default()
                 },
@@ -17339,7 +17339,7 @@ default_model = "persisted-profile"
             "default".to_string(),
             OpenRouterModelProviderConfig {
                 base: ModelProviderConfig {
-                    name: Some("test-model_provider".into()),
+                    name: Some("test-provider".into()),
                     temperature: Some(-0.5),
                     ..Default::default()
                 },
@@ -17359,7 +17359,7 @@ default_model = "persisted-profile"
             "default".to_string(),
             OpenRouterModelProviderConfig {
                 base: ModelProviderConfig {
-                    name: Some("test-model_provider".into()),
+                    name: Some("test-provider".into()),
                     temperature: Some(0.7),
                     ..Default::default()
                 },

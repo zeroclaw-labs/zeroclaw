@@ -48,7 +48,7 @@ async fn gemini_warmup_refreshes_expired_oauth_token() -> Result<()> {
             "⚠️  No auth-profiles.json found at {:?}",
             auth_profiles_path
         );
-        eprintln!("Run: zeroclaw auth login --model_provider gemini");
+        eprintln!("Run: zeroclaw auth login --model-provider gemini");
         return Ok(());
     }
 
@@ -69,7 +69,7 @@ async fn gemini_warmup_refreshes_expired_oauth_token() -> Result<()> {
         .find(|k| k.starts_with("gemini:"))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "No Gemini OAuth profile found. Run: zeroclaw auth login --model_provider gemini"
+                "No Gemini OAuth profile found. Run: zeroclaw auth login --model-provider gemini"
             )
         })?
         .clone();

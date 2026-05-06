@@ -816,8 +816,8 @@ fn resolve_onboard_target(
         (
             providers_only,
             Section::Providers,
-            "--model_providers-only",
-            "model_providers",
+            "--providers-only",
+            "providers",
         ),
         (memory_only, Section::Memory, "--memory-only", "memory"),
         (
@@ -1469,7 +1469,7 @@ async fn main() -> Result<()> {
                     entry.temperature = Some(final_temperature);
                 } else if config.providers.first_model_provider().is_none() {
                     anyhow::bail!(
-                        "No model model_provider configured. Pass --model_provider <type> or run \
+                        "No model model_provider configured. Pass --model-provider <type> or run \
                          `zeroclaw onboard model_providers` to configure one."
                     );
                 }
@@ -3450,7 +3450,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             let model_provider = auth::normalize_model_provider(&model_provider)?;
             if import.is_some() && model_provider != "openai-codex" {
                 bail!(
-                    "`auth login --import` currently supports only --model_provider openai-codex"
+                    "`auth login --import` currently supports only --model-provider openai-codex"
                 );
             }
             let client = reqwest::Client::new();
@@ -3521,7 +3521,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         Err(e) => {
                             println!("Callback capture failed: {e}");
                             println!(
-                                "Run `zeroclaw auth paste-redirect --model_provider gemini --profile {profile}`"
+                                "Run `zeroclaw auth paste-redirect --model-provider gemini --profile {profile}`"
                             );
                             return Ok(());
                         }
@@ -3614,7 +3614,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         Err(e) => {
                             println!("Callback capture failed: {e}");
                             println!(
-                                "Run `zeroclaw auth paste-redirect --model_provider openai-codex --profile {profile}`"
+                                "Run `zeroclaw auth paste-redirect --model-provider openai-codex --profile {profile}`"
                             );
                             return Ok(());
                         }
@@ -3635,7 +3635,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 }
                 _ => {
                     bail!(
-                        "`auth login` supports --model_provider openai-codex or gemini, got: {model_provider}"
+                        "`auth login` supports --model-provider openai-codex or gemini, got: {model_provider}"
                     );
                 }
             }
@@ -3652,7 +3652,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 "openai-codex" => {
                     let pending = load_pending_oauth_login(config, "openai")?.ok_or_else(|| {
                         anyhow::anyhow!(
-                            "No pending OpenAI login found. Run `zeroclaw auth login --model_provider openai-codex` first."
+                            "No pending OpenAI login found. Run `zeroclaw auth login --model-provider openai-codex` first."
                         )
                     })?;
 
@@ -3696,7 +3696,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 "gemini" => {
                     let pending = load_pending_oauth_login(config, "gemini")?.ok_or_else(|| {
                         anyhow::anyhow!(
-                            "No pending Gemini login found. Run `zeroclaw auth login --model_provider gemini` first."
+                            "No pending Gemini login found. Run `zeroclaw auth login --model-provider gemini` first."
                         )
                     })?;
 
@@ -3741,7 +3741,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                     println!("Active profile for gemini: {profile}");
                 }
                 _ => {
-                    bail!("`auth paste-redirect` supports --model_provider openai-codex or gemini");
+                    bail!("`auth paste-redirect` supports --model-provider openai-codex or gemini");
                 }
             }
             Ok(())
@@ -3820,7 +3820,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         }
                         None => {
                             bail!(
-                                "No OpenAI Codex auth profile found. Run `zeroclaw auth login --model_provider openai-codex`."
+                                "No OpenAI Codex auth profile found. Run `zeroclaw auth login --model-provider openai-codex`."
                             )
                         }
                     }
@@ -3838,12 +3838,12 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         }
                         None => {
                             bail!(
-                                "No Gemini auth profile found. Run `zeroclaw auth login --model_provider gemini`."
+                                "No Gemini auth profile found. Run `zeroclaw auth login --model-provider gemini`."
                             )
                         }
                     }
                 }
-                _ => bail!("`auth refresh` supports --model_provider openai-codex or gemini"),
+                _ => bail!("`auth refresh` supports --model-provider openai-codex or gemini"),
             }
         }
 
@@ -4176,8 +4176,8 @@ mod tests {
             (
                 [false, true, false, false, false, false],
                 Section::Providers,
-                "--model_providers-only",
-                "model_providers",
+                "--providers-only",
+                "providers",
             ),
             (
                 [false, false, true, false, false, false],

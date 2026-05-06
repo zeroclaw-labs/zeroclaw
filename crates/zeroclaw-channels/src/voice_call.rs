@@ -62,7 +62,7 @@ pub enum CallDirection {
 /// Tracks an active call's metadata and transcription.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallRecord {
-    /// Unique call identifier (model_provider-specific SID/UUID).
+    /// Unique call identifier (provider-specific SID/UUID).
     pub call_id: String,
     /// Direction: inbound or outbound.
     pub direction: CallDirection,
@@ -111,7 +111,7 @@ impl VoiceCallChannel {
         }
     }
 
-    /// Get the model_provider-specific API base URL.
+    /// Get the provider-specific API base URL.
     fn api_base_url(&self) -> &str {
         match self.config.model_provider {
             VoiceProvider::Twilio => "https://api.twilio.com/2010-04-01",
@@ -403,7 +403,7 @@ impl Channel for VoiceCallChannel {
         // - WebSocket /voice/media — Bidirectional audio streaming
         //
         // For now, we set up the server structure. Full endpoint
-        // implementation depends on model_provider-specific webhook payloads.
+        // implementation depends on provider-specific webhook payloads.
 
         let app = axum::Router::new()
             .route("/voice/health", axum::routing::get(|| async { "ok" }))

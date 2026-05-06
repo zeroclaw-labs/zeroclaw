@@ -1092,7 +1092,7 @@ pub async fn run_tool_call_loop(
             ));
         }
 
-        // Unified path via ModelProvider::chat so model_provider-specific native tool logic
+        // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         let request_tools = if use_native_tools {
             Some(tool_specs.as_slice())
@@ -4634,7 +4634,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -4692,7 +4692,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -4744,7 +4744,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -4795,7 +4795,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -4843,7 +4843,7 @@ mod tests {
         let observer = NoopObserver;
 
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
-            vision_model_provider: Some("nonexistent-model_provider-xyz".to_string()),
+            vision_model_provider: Some("nonexistent-provider-xyz".to_string()),
             vision_model: Some("some-model".to_string()),
             ..Default::default()
         };
@@ -4853,7 +4853,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -4900,7 +4900,7 @@ mod tests {
         let observer = NoopObserver;
 
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
-            vision_model_provider: Some("nonexistent-model_provider-xyz".to_string()),
+            vision_model_provider: Some("nonexistent-provider-xyz".to_string()),
             vision_model: Some("some-model".to_string()),
             ..Default::default()
         };
@@ -4961,7 +4961,7 @@ mod tests {
         // fall back to the default model. Since the model_provider name is invalid,
         // we just verify the error path references the correct model_provider.
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
-            vision_model_provider: Some("nonexistent-model_provider-xyz".to_string()),
+            vision_model_provider: Some("nonexistent-provider-xyz".to_string()),
             vision_model: None,
             ..Default::default()
         };
@@ -4971,7 +4971,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -5020,7 +5020,7 @@ mod tests {
         let observer = NoopObserver;
 
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
-            vision_model_provider: Some("nonexistent-model_provider-xyz".to_string()),
+            vision_model_provider: Some("nonexistent-provider-xyz".to_string()),
             ..Default::default()
         };
 
@@ -5076,7 +5076,7 @@ mod tests {
         let observer = NoopObserver;
 
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
-            vision_model_provider: Some("nonexistent-model_provider-xyz".to_string()),
+            vision_model_provider: Some("nonexistent-provider-xyz".to_string()),
             vision_model: Some("llava:7b".to_string()),
             ..Default::default()
         };
@@ -5086,7 +5086,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -5227,7 +5227,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -5307,7 +5307,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -5379,7 +5379,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -5446,7 +5446,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -5526,7 +5526,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -5596,7 +5596,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -5686,7 +5686,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -5750,7 +5750,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -5842,7 +5842,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -5910,7 +5910,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -5981,7 +5981,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -6060,7 +6060,7 @@ mod tests {
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -6243,7 +6243,7 @@ mod tests {
                 &mut history,
                 &tools_registry,
                 &observer,
-                "mock-model_provider",
+                "mock-provider",
                 "mock-model",
                 0.0,
                 true,
@@ -7369,7 +7369,7 @@ Let me check the result."#;
             &mut history,
             &tools_registry,
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,
@@ -7513,7 +7513,7 @@ Let me check the result."#;
         model_pricing.insert("mock-model.input".to_string(), 3.0);
         model_pricing.insert("mock-model.output".to_string(), 15.0);
         let mut pricing: crate::agent::cost::ModelProviderPricing = HashMap::new();
-        pricing.insert("mock-model_provider".to_string(), model_pricing);
+        pricing.insert("mock-provider".to_string(), model_pricing);
         let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing));
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
@@ -7525,7 +7525,7 @@ Let me check the result."#;
                     &mut history,
                     &[],
                     &observer,
-                    "mock-model_provider",
+                    "mock-provider",
                     "mock-model",
                     0.0,
                     true,
@@ -7597,7 +7597,7 @@ Let me check the result."#;
         model_pricing.insert("mock-model.input".to_string(), 1.0);
         model_pricing.insert("mock-model.output".to_string(), 1.0);
         let mut pricing: crate::agent::cost::ModelProviderPricing = HashMap::new();
-        pricing.insert("mock-model_provider".to_string(), model_pricing);
+        pricing.insert("mock-provider".to_string(), model_pricing);
         let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing));
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
@@ -7609,7 +7609,7 @@ Let me check the result."#;
                     &mut history,
                     &[],
                     &observer,
-                    "mock-model_provider",
+                    "mock-provider",
                     "mock-model",
                     0.0,
                     true,
@@ -7670,7 +7670,7 @@ Let me check the result."#;
             &mut history,
             &[],
             &observer,
-            "mock-model_provider",
+            "mock-provider",
             "mock-model",
             0.0,
             true,

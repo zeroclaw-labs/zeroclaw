@@ -91,7 +91,7 @@ pub fn run(
                 fill(&root, &po_file, locale, true, p, batch)?;
             } else {
                 println!(
-                    "==> {locale}: --force requested but no --model_provider specified — skipping AI step"
+                    "==> {locale}: --force requested but no --model-provider specified — skipping AI step"
                 );
             }
         } else {
@@ -102,7 +102,7 @@ pub fn run(
                     fill(&root, &po_file, locale, false, p, batch)?;
                 } else {
                     println!(
-                        "==> {locale}: {delta} entries need translation (use --model_provider <name> to auto-fill)"
+                        "==> {locale}: {delta} entries need translation (use --model-provider <name> to auto-fill)"
                     );
                 }
             } else {
@@ -151,7 +151,7 @@ fn fill(
     cmd.args(["--po"])
         .arg(po_file)
         .args(["--locale", locale])
-        .args(["--model_provider", model_provider]);
+        .args(["--model-provider", model_provider]);
     if let Some(b) = batch {
         cmd.args(["--batch", &b.to_string()]);
     }

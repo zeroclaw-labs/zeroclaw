@@ -3,7 +3,7 @@
 //! model-picker dropdown share the same source of truth as the CLI.
 //!
 //! No catalog data is hand-maintained at this layer. `list_model_providers()` lives
-//! in `zeroclaw-model_providers` and is the canonical list; `list_models()` per
+//! in `zeroclaw-providers` and is the canonical list; `list_models()` per
 //! model_provider fetches from models.dev (cached) or the model_provider's own /models
 //! endpoint. Same code paths as the CLI wizard.
 //!
@@ -414,7 +414,7 @@ fn section_help(key: &str) -> &'static str {
         }
         "model_providers" => {
             "Paste an API key (e.g. `sk-ant-...` for Anthropic, `sk-...` for OpenAI) when prompted. \
-                        For OAuth-based model_providers run: zeroclaw auth login --model_provider <name>"
+                        For OAuth-based model_providers run: zeroclaw auth login --model-provider <name>"
         }
         "channels" => {
             "Pick which chat platforms ZeroClaw should listen on. You can configure multiple."

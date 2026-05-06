@@ -366,7 +366,7 @@ pub trait ModelProvider: Send + Sync {
         BASELINE_WIRE_API
     }
 
-    /// Convert tool specifications to model_provider-native format.
+    /// Convert tool specifications to provider-native format.
     fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
         ToolsPayload::PromptGuided {
             instructions: build_tool_instructions_text(tools),

@@ -79,7 +79,7 @@ fn read_model_provider_config(provider_name: &str) -> anyhow::Result<ProviderCon
         .ok_or_else(|| anyhow::anyhow!("config.toml not found (tried ~/.zeroclaw/config.toml)"))?;
     let table: toml::Table = raw.parse()?;
     let model_provider = table
-        .get("model_providers")
+        .get("providers")
         .and_then(|v| v.get("models"))
         .and_then(|v| v.get(provider_name))
         .ok_or_else(|| {

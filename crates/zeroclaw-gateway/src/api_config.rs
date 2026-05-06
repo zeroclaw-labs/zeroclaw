@@ -1601,7 +1601,7 @@ mod tests {
         // pin the contract.
         let mut cfg = zeroclaw_config::schema::Config::default();
         // autonomy doesn't carry floats today; use a model_provider temperature
-        // by setting a known model-model_provider entry. The model-model_providers map
+        // by setting a known model provider entry. The model providers map
         // is set up via map keys, so use a path that's unambiguously float.
         // Fall back to set_prop on a known float location:
         match cfg.set_prop("providers.models.openai.temperature", "0.7") {

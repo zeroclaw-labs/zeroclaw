@@ -2142,14 +2142,14 @@ mod tests {
         let config = "\
 [default]
 region=us-west-2
-credential_process=ada credentials print --account=123 --model_provider=conduit --role=MyRole
+credential_process=ada credentials print --account=123 --provider=conduit --role=MyRole
 ";
         let result = AwsCredentials::parse_aws_config(config, "default");
         assert!(result.is_some());
         let (cmd, region) = result.unwrap();
         assert_eq!(
             cmd,
-            "ada credentials print --account=123 --model_provider=conduit --role=MyRole"
+            "ada credentials print --account=123 --provider=conduit --role=MyRole"
         );
         assert_eq!(region.as_deref(), Some("us-west-2"));
     }

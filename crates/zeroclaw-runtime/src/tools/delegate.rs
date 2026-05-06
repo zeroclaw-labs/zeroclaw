@@ -81,7 +81,7 @@ pub struct DelegateTool {
     cancellation_token: CancellationToken,
     /// Optional memory instance for namespace isolation on delegate agents.
     memory: Option<Arc<dyn Memory>>,
-    /// nested model-model_provider map for brain resolution.
+    /// nested model provider map for brain resolution.
     providers_models: Arc<HashMap<String, HashMap<String, ModelProviderConfig>>>,
     /// named risk profiles for delegation depth and timeout resolution.
     risk_profiles: Arc<HashMap<String, RiskProfileConfig>>,
@@ -229,7 +229,7 @@ impl DelegateTool {
         self
     }
 
-    /// Attach nested model-model_provider map for brain resolution.
+    /// Attach nested model provider map for brain resolution.
     pub fn with_providers_models(
         mut self,
         m: HashMap<String, HashMap<String, ModelProviderConfig>>,
@@ -1801,7 +1801,7 @@ mod tests {
         agents.insert(
             "broken".to_string(),
             DelegateAgentConfig {
-                model_provider: "totally-invalid-model_provider.default".into(),
+                model_provider: "totally-invalid-provider.default".into(),
                 ..Default::default()
             },
         );

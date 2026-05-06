@@ -41,7 +41,7 @@ pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
         .flatten()
 }
 
-/// Run the given future within a model_provider-fallback scope.
+/// Run the given future within a provider-fallback scope.
 /// Both `record_provider_fallback` (inside ReliableModelProvider) and
 /// `take_last_provider_fallback` (post-loop channel code) must execute
 /// within this scope for the data to be visible.
@@ -365,7 +365,7 @@ fn push_failure(
 // error message gives operators a complete diagnostic trail.
 
 /// ModelProvider wrapper with retry + auth-key rotation. The model_provider Vec exists
-/// for tests to exercise multi-model_provider failover; production wiring always
+/// for tests to exercise multi-provider failover; production wiring always
 /// passes a single primary. Per-model failover chains are also test-only —
 /// the schema no longer surfaces them.
 pub struct ReliableModelProvider {

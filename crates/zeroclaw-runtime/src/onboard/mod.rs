@@ -417,7 +417,7 @@ async fn prompt_field(
 
 /// Iterate every field under `prefix` in `prop_fields()` and prompt for each.
 /// `excludes` lists leaf field names to skip. `defaults` carries per-field
-/// fallback values (e.g. model_provider-trait defaults) surfaced in the prompt
+/// fallback values (e.g. provider-trait defaults) surfaced in the prompt
 /// when the field is unset. Rewinds on `Nav::Back`; propagates `Back` to
 /// the caller when the user rewinds past the first prompt.
 async fn prompt_fields_under(
@@ -740,7 +740,7 @@ async fn model_providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags
     ui.note(
         "Paste an API key (e.g. `sk-ant-…` for Anthropic, `sk-…` for OpenAI) \
          when prompted. For OAuth-based model_providers run: \
-         zeroclaw auth login --model_provider <name>",
+         zeroclaw auth login --model-provider <name>",
     );
 
     // Menu is driven by zeroclaw_providers::list_model_providers() — single source
@@ -800,7 +800,7 @@ async fn model_providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags
             }
         };
 
-        // When --model_provider is forced via CLI flags skip the alias prompt.
+        // When --model-provider is forced via CLI flags skip the alias prompt.
         // Otherwise show existing aliases as a selectable list with "+ Add new".
         let alias = if flags.model_provider.is_some() {
             "default".to_string()
@@ -938,7 +938,7 @@ async fn model_providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags
     Ok(Nav::Done)
 }
 
-/// Opt-in gate for the per-model_provider advanced field sweep. Default N so the
+/// Opt-in gate for the per-provider advanced field sweep. Default N so the
 /// user breezes through onboarding after auth + model; Y walks them through
 /// every remaining field (temperature, max_tokens, timeout_secs, base_url,
 /// wire_api, azure_*, etc.) with the model_provider's trait defaults pre-filled.
@@ -971,7 +971,7 @@ async fn offer_advanced_settings(
 
 /// Prompt for the model field using the model_provider's live model catalog.
 ///
-/// Calls `ModelProvider::list_models()` (no auth — see `zeroclaw-model_providers`
+/// Calls `ModelProvider::list_models()` (no auth — see `zeroclaw-providers`
 /// models_dev + native public endpoints). Falls back to a manual string
 /// input when the model_provider doesn't expose a no-auth list or the fetch fails.
 /// `prefix` is the full alias-level path: `providers.models.<type>.<alias>`.
@@ -1053,7 +1053,7 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, prefix: &str) ->
         None => {
             // Live fetch failed or returned empty (model_provider doesn't expose
             // a no-auth listing). The underlying error was traced at debug
-            // level; surface a short model_provider-named nudge to the user and
+            // level; surface a short provider-named nudge to the user and
             // fall back to manual entry.
             ui.note(&format!(
                 "Catalog lookup failed for {model_provider} — enter a model id manually \
@@ -1740,7 +1740,7 @@ fn available_channel_aliases(cfg: &Config) -> Vec<String> {
     out
 }
 
-/// All currently-configured model-model_provider aliases in dotted form
+/// All currently-configured model provider aliases in dotted form
 /// (`anthropic.default`, `openrouter.work`). Pulled from `prop_fields`.
 fn available_model_provider_aliases(cfg: &Config) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -2119,7 +2119,7 @@ mod tests {
         assert_eq!(model_cfg.model.as_deref(), Some("gateway-large"));
     }
 
-    /// Providers section driven entirely by CLI flags: the `--model_provider`,
+    /// Providers section driven entirely by CLI flags: the `--model-provider`,
     /// `--api-key`, and `--model` overrides fire up-front, bypassing the
     /// `ui.select` menu, the api-key prompt, and `prompt_model` (which
     /// would otherwise reach out to `models.dev` for the live catalog).

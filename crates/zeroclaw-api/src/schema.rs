@@ -1,7 +1,7 @@
 //! JSON Schema cleaning and validation for LLM tool-calling compatibility.
 //!
 //! Different model_providers support different subsets of JSON Schema. This module
-//! normalizes tool schemas to improve cross-model_provider compatibility while
+//! normalizes tool schemas to improve cross-provider compatibility while
 //! preserving semantic intent.
 //!
 //! ## What this module does

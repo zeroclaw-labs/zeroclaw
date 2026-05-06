@@ -41,7 +41,7 @@ pub fn run(
 
     let provider_name = model_provider.ok_or_else(|| {
         anyhow::anyhow!(
-            "--model_provider <name> is required (configured in [providers.models.<name>] in config.toml)"
+            "--model-provider <name> is required (configured in [providers.models.<name>] in config.toml)"
         )
     })?;
     let backend = resolve_backend(provider_name)?;

@@ -1,4 +1,4 @@
-//! Unauthenticated cross-model_provider model catalog via models.dev.
+//! Unauthenticated cross-provider model catalog via models.dev.
 //!
 //! `https://models.dev/api.json` is a community-maintained public aggregator
 //! that lists model IDs for 100+ model_providers (Anthropic, OpenAI, Google,
