@@ -13341,6 +13341,46 @@ impl Config {
                 }
             }
 
+            // Per-agent provider refs that resolve into the typed provider
+            // sections. Empty = no preference for that category (no TTS / no
+            // STT for this agent), which is valid. Non-empty values must
+            // match a configured `[providers.<category>.<type>.<alias>]`
+            // entry, fail loud with the dangling ref otherwise.
+            // V3 has no global default-X-provider concept — every consumer
+            // either picks a configured alias or opts out entirely.
+            let typed_provider_refs: &[(&str, &str, &str)] = &[
+                ("providers.tts", "tts_provider", agent.tts_provider.trim()),
+                (
+                    "providers.transcription",
+                    "transcription_provider",
+                    agent.transcription_provider.trim(),
+                ),
+            ];
+            for (section_prefix, field, value) in typed_provider_refs {
+                if value.is_empty() {
+                    continue;
+                }
+                match value.split_once('.') {
+                    Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                        let exists = self
+                            .get_map_keys(&format!("{section_prefix}.{ty}"))
+                            .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                        if !exists {
+                            validation_bail!(
+                                DanglingReference,
+                                format!("agents.{alias}.{field}"),
+                                "agents.{alias}.{field} = {value:?} but {section_prefix}.{ty}.{inner} is not configured",
+                            );
+                        }
+                    }
+                    _ => validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.{field}"),
+                        "agents.{alias}.{field} must be dotted form `<type>.<alias>` (got {value:?})",
+                    ),
+                }
+            }
+
             // Bare-alias bundle refs. Tuple is (kebab section path, kebab
             // agent field name, value list). Both names use the schema's
             // kebab form: section name matches what `get_map_keys` expects
