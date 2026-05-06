@@ -223,7 +223,7 @@ function AppContent() {
 }
 
 // Redirects fresh installs (no completed onboarding sections, no provider
-// configured) from the default ``/` landing to `/onboard`. The daemon
+// configured) from the default `/` landing to `/onboard`. The daemon
 // always writes a default config.toml on init, so file existence isn't
 // the right signal — we ask the gateway via /api/onboard/status which
 // inspects the in-memory config for explicit user-driven markers
