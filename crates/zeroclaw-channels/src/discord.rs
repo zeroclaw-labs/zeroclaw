@@ -1192,7 +1192,15 @@ impl Channel for DiscordChannel {
                     // inherently private and implicitly addressed to the bot, so bypass
                     // the mention gate — requiring a @mention in a DM is never correct.
                     let is_dm = d.get("guild_id").is_none();
-                    let effective_mention_only = self.mention_only && !is_dm;
+                    // Treat a reply to one of the bot's own messages as an implicit mention.
+                    let is_reply_to_bot = d
+                        .get("referenced_message")
+                        .and_then(|r| r.get("author"))
+                        .and_then(|a| a.get("id"))
+                        .and_then(|i| i.as_str())
+                        == Some(bot_user_id.as_str());
+                    let effective_mention_only =
+                        self.mention_only && !is_dm && !is_reply_to_bot;
                     let Some(clean_content) =
                         normalize_incoming_content(content, effective_mention_only, &bot_user_id)
                     else {
