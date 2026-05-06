@@ -963,7 +963,7 @@ fn load_jsonl_messages(path: &std::path::Path) -> Vec<zeroclaw_providers::traits
 /// Auto-detect the best channel for heartbeat delivery by checking which
 /// channels are configured. Returns the first match in priority order.
 fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
-    // Priority order: telegram > discord > slack > mattermost
+    // Priority order: telegram > discord > slack > mattermost > matrix
     if let Some(tg) = &config.channels.telegram {
         // Use the first allowed_user as target, or fall back to empty (broadcast)
         let target = tg.allowed_users.first().cloned().unwrap_or_default();
@@ -982,6 +982,13 @@ fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
     if config.channels.mattermost.is_some() {
         // Mattermost requires explicit target
         return None;
+    }
+    if let Some(mx) = &config.channels.matrix {
+        // Use the first allowed_room as target, or fall back to empty (broadcast)
+        let target = mx.allowed_rooms.first().cloned().unwrap_or_default();
+        if !target.is_empty() {
+            return Some(("matrix".to_string(), target));
+        }
     }
     None
 }
@@ -1013,6 +1020,13 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
             if config.channels.mattermost.is_none() {
                 anyhow::bail!(
                     "heartbeat.target is set to mattermost but channels.mattermost is not configured"
+                );
+            }
+        }
+        "matrix" => {
+            if config.channels.matrix.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to matrix but channels.matrix is not configured"
                 );
             }
         }
@@ -1295,6 +1309,82 @@ mod tests {
         let config = Config::default();
         let target = auto_detect_heartbeat_channel(&config);
         assert!(target.is_none());
+    }
+
+    #[test]
+    fn resolve_delivery_accepts_matrix_configuration() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("matrix".into());
+        config.heartbeat.to = Some("!room123:matrix.org".into());
+        config.channels.matrix = Some(zeroclaw_config::schema::MatrixConfig {
+            enabled: true,
+            homeserver: "https://matrix.org".into(),
+            access_token: "access-token".into(),
+            user_id: None,
+            device_id: None,
+            allowed_users: vec![],
+            allowed_rooms: vec!["!room123:matrix.org".into()],
+            stream_mode: zeroclaw_config::schema::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            multi_message_delay_ms: 100,
+            interrupt_on_new_message: false,
+            mention_only: false,
+            recovery_key: None,
+            password: None,
+            approval_timeout_secs: 120,
+            reply_in_thread: true,
+            ack_reactions: true,
+        });
+
+        let target = resolve_heartbeat_delivery(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("matrix".to_string(), "!room123:matrix.org".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_rejects_matrix_when_not_configured() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("matrix".into());
+        config.heartbeat.to = Some("!room123:matrix.org".into());
+        // channels.matrix is not configured
+
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("channels.matrix is not configured")
+        );
+    }
+
+    #[test]
+    fn auto_detect_matrix_when_configured() {
+        let mut config = Config::default();
+        config.channels.matrix = Some(zeroclaw_config::schema::MatrixConfig {
+            enabled: true,
+            homeserver: "https://matrix.org".into(),
+            access_token: "access-token".into(),
+            user_id: None,
+            device_id: None,
+            allowed_users: vec![],
+            allowed_rooms: vec!["!room123:matrix.org".into()],
+            stream_mode: zeroclaw_config::schema::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            multi_message_delay_ms: 100,
+            interrupt_on_new_message: false,
+            mention_only: false,
+            recovery_key: None,
+            password: None,
+            approval_timeout_secs: 120,
+            reply_in_thread: true,
+            ack_reactions: true,
+        });
+
+        let target = auto_detect_heartbeat_channel(&config);
+        assert_eq!(
+            target,
+            Some(("matrix".to_string(), "!room123:matrix.org".to_string()))
+        );
     }
 
     /// Verify that SIGHUP does not cause shutdown — the daemon should ignore it
