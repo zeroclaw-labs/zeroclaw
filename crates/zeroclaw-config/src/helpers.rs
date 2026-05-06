@@ -7,6 +7,11 @@ use crate::traits::{PropFieldInfo, PropKind};
 /// return the HashMap key + the fully-qualified inner name that the value
 /// type's own `get_prop` / `set_prop` expects.
 ///
+/// HashMap keys are user-controlled and may contain dots, URLs, or hostnames
+/// (for example `providers.models.custom:https://example.invalid/v1.api-key`).
+/// Current map-keyed config sections expose leaf fields, so split from the
+/// right and preserve any dots inside the runtime key.
+///
 /// Returns `None` when the path doesn't match, letting the derive's
 /// generated code fall through to the next nested field.
 pub fn route_hashmap_path<'a>(
@@ -21,7 +26,7 @@ pub fn route_hashmap_path<'a>(
         format!("{my_prefix}.{field_name}")
     };
     let rest = name.strip_prefix(&key_prefix)?.strip_prefix('.')?;
-    let (hm_key, inner_suffix) = rest.split_once('.')?;
+    let (hm_key, inner_suffix) = rest.rsplit_once('.')?;
     let inner_name = if inner_prefix.is_empty() {
         inner_suffix.to_string()
     } else {

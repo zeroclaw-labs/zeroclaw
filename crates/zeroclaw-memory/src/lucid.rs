@@ -1,5 +1,5 @@
 use super::sqlite::SqliteMemory;
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query};
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
@@ -345,9 +345,11 @@ impl Memory for LucidMemory {
             anyhow::bail!("'since' must be before 'until'");
         }
 
+        let recall_query = normalize_recent_recall_query(query);
+
         let local_results = self
             .local
-            .recall(query, limit, session_id, since, until)
+            .recall(recall_query, limit, session_id, since, until)
             .await?;
         if limit == 0
             || local_results.len() >= limit
@@ -360,7 +362,7 @@ impl Memory for LucidMemory {
             return Ok(local_results);
         }
 
-        match self.recall_from_lucid(query).await {
+        match self.recall_from_lucid(recall_query).await {
             Ok(lucid_results) if !lucid_results.is_empty() => {
                 self.clear_failure();
                 let merged = Self::merge_results(local_results, lucid_results, limit);

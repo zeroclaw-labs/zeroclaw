@@ -1131,18 +1131,8 @@ data: [DONE]
     #[test]
     fn capabilities_includes_vision() {
         let options = ProviderRuntimeOptions {
-            provider_api_url: None,
-            zeroclaw_dir: None,
             secrets_encrypt: false,
-            auth_profile_override: None,
-            reasoning_enabled: None,
-            reasoning_effort: None,
-            provider_timeout_secs: None,
-            extra_headers: std::collections::HashMap::new(),
-            api_path: None,
-            provider_max_tokens: None,
-            merge_system_into_user: false,
-            provider_extra: None,
+            ..Default::default()
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");

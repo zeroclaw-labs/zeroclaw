@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
 const DEFAULT_API_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
@@ -73,6 +74,14 @@ type Aes128EcbDec = ecb::Decryptor<aes::Aes128>;
 
 fn long_poll_client_timeout(timeout_ms: u64) -> Duration {
     Duration::from_millis(timeout_ms + 5_000)
+}
+
+fn wechat_cli_string(key: &str) -> String {
+    i18n::get_required_cli_string(key)
+}
+
+fn wechat_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    i18n::get_required_cli_string_with_args(key, args)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -566,8 +575,17 @@ impl WeChatChannel {
         let pairing = if allowed_users.is_empty() {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
-                println!("  🔐 WeChat pairing required. One-time bind code: {code}");
-                println!("     Send `{WECHAT_BIND_COMMAND} <code>` from your WeChat.");
+                println!(
+                    "  {}",
+                    wechat_cli_string_with_args("cli-wechat-pairing-required", &[("code", &code)],)
+                );
+                println!(
+                    "     {}",
+                    wechat_cli_string_with_args(
+                        "cli-wechat-send-bind-command",
+                        &[("command", WECHAT_BIND_COMMAND)],
+                    )
+                );
             }
             Some(guard)
         } else {
@@ -1234,7 +1252,14 @@ impl WeChatChannel {
         loop {
             qr_refresh_count += 1;
             if qr_refresh_count > MAX_QR_REFRESH {
-                anyhow::bail!("WeChat: QR code expired {MAX_QR_REFRESH} times, giving up");
+                let max = MAX_QR_REFRESH.to_string();
+                anyhow::bail!(
+                    "{}",
+                    wechat_cli_string_with_args(
+                        "cli-wechat-qr-expired-giving-up",
+                        &[("max", &max)],
+                    )
+                );
             }
 
             // Fetch QR code
@@ -1245,19 +1270,30 @@ impl WeChatChannel {
                 .timeout(API_TIMEOUT)
                 .send()
                 .await
-                .context("Failed to fetch WeChat QR code")?;
+                .with_context(|| wechat_cli_string("cli-wechat-qr-fetch-failed"))?;
 
             if !resp.status().is_success() {
-                let status = resp.status();
+                let status = resp.status().to_string();
                 let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("WeChat QR code fetch failed ({status}): {body}");
+                anyhow::bail!(
+                    "{}",
+                    wechat_cli_string_with_args(
+                        "cli-wechat-qr-fetch-status-failed",
+                        &[("status", &status), ("body", &body)],
+                    )
+                );
             }
 
             let qr_data: serde_json::Value = resp.json().await?;
             let qrcode = qr_data
                 .get("qrcode")
                 .and_then(|v| v.as_str())
-                .context("Missing qrcode in response")?
+                .with_context(|| {
+                    wechat_cli_string_with_args(
+                        "cli-wechat-missing-response-field",
+                        &[("field", "qrcode")],
+                    )
+                })?
                 .to_string();
             let qrcode_img_url = qr_data
                 .get("qrcode_img_content")
@@ -1265,8 +1301,16 @@ impl WeChatChannel {
                 .unwrap_or("");
 
             // Display QR code
-            println!("\n  📱 WeChat QR Login ({qr_refresh_count}/{MAX_QR_REFRESH})");
-            println!("  Scan with WeChat to connect.\n");
+            let qr_attempt = qr_refresh_count.to_string();
+            let qr_max = MAX_QR_REFRESH.to_string();
+            println!(
+                "\n  {}",
+                wechat_cli_string_with_args(
+                    "cli-wechat-qr-login",
+                    &[("attempt", &qr_attempt), ("max", &qr_max)],
+                )
+            );
+            println!("  {}\n", wechat_cli_string("cli-wechat-scan-to-connect"));
             let qr_payload = if qrcode_img_url.is_empty() {
                 qrcode.as_str()
             } else {
@@ -1277,7 +1321,10 @@ impl WeChatChannel {
                 Err(err) => tracing::warn!("WeChat: failed to render terminal QR code: {err}"),
             }
             if !qrcode_img_url.is_empty() {
-                println!("  QR URL: {qrcode_img_url}");
+                println!(
+                    "  {}",
+                    wechat_cli_string_with_args("cli-wechat-qr-url", &[("url", qrcode_img_url)],)
+                );
             }
 
             // Poll for scan status
@@ -1334,31 +1381,44 @@ impl WeChatChannel {
                     "wait" => {}
                     "scaned" => {
                         if !scanned_printed {
-                            println!("  👀 Scanned! Confirm on your phone...");
+                            println!("  {}", wechat_cli_string("cli-wechat-scanned-confirm"));
                             scanned_printed = true;
                         }
                     }
                     "expired" => {
-                        println!("  ⏳ QR code expired, refreshing...");
+                        println!(
+                            "  {}",
+                            wechat_cli_string("cli-wechat-qr-expired-refreshing")
+                        );
                         break; // Will loop back and get a new QR code
                     }
                     "confirmed" => {
                         let bot_token = status
                             .get("bot_token")
                             .and_then(|v| v.as_str())
-                            .context("Login confirmed but bot_token missing")?
+                            .with_context(|| {
+                                wechat_cli_string_with_args(
+                                    "cli-wechat-login-confirmed-missing-field",
+                                    &[("field", "bot_token")],
+                                )
+                            })?
                             .to_string();
                         let account_id = status
                             .get("ilink_bot_id")
                             .and_then(|v| v.as_str())
-                            .context("Login confirmed but ilink_bot_id missing")?
+                            .with_context(|| {
+                                wechat_cli_string_with_args(
+                                    "cli-wechat-login-confirmed-missing-field",
+                                    &[("field", "ilink_bot_id")],
+                                )
+                            })?
                             .to_string();
                         let user_id = status
                             .get("ilink_user_id")
                             .and_then(|v| v.as_str())
                             .map(String::from);
 
-                        println!("  ✅ WeChat connected!");
+                        println!("  {}", wechat_cli_string("cli-wechat-connected"));
                         return Ok((bot_token, account_id, user_id));
                     }
                     other => {
@@ -1564,24 +1624,14 @@ impl WeChatChannel {
                     Ok(Some(_token)) => {
                         self.add_allowed_identity_runtime(from_user_id);
                         let ctx = self.get_context_token(from_user_id);
-                        let _ = self
-                            .send_text(
-                                from_user_id,
-                                "✅ WeChat account bound successfully. You can talk to ZeroClaw now.",
-                                ctx.as_deref(),
-                            )
-                            .await;
+                        let reply = wechat_cli_string("cli-wechat-bound-success");
+                        let _ = self.send_text(from_user_id, &reply, ctx.as_deref()).await;
                         tracing::info!("WeChat: user {from_user_id} bound via pairing code");
                     }
                     Ok(None) => {
                         let ctx = self.get_context_token(from_user_id);
-                        let _ = self
-                            .send_text(
-                                from_user_id,
-                                "❌ Invalid bind code. Please try again.",
-                                ctx.as_deref(),
-                            )
-                            .await;
+                        let reply = wechat_cli_string("cli-wechat-invalid-bind-code");
+                        let _ = self.send_text(from_user_id, &reply, ctx.as_deref()).await;
                     }
                     Err(e) => {
                         tracing::warn!("WeChat: pairing error: {e}");

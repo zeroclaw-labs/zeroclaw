@@ -1,7 +1,7 @@
 use super::traits::{Memory, MemoryCategory};
 use super::{
     MemoryBackendKind, classify_memory_backend, create_memory_for_migration,
-    effective_memory_backend_name,
+    create_memory_with_storage_and_routes, effective_memory_backend_name,
 };
 use crate::config::Config;
 use anyhow::{Result, bail};
@@ -21,7 +21,56 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
         crate::MemoryCommands::Clear { key, category, yes } => {
             handle_clear(config, key, category, yes).await
         }
+        crate::MemoryCommands::Reindex => handle_reindex(config).await,
     }
+}
+
+/// Create a memory backend with the configured embedder wired in.
+///
+/// Unlike `create_cli_memory`, which skips embedding setup for pure
+/// read/delete operations, this factory is used by commands that must
+/// actually compute embeddings (e.g. `reindex`). Mirrors the gateway's
+/// memory construction so the same provider/route resolution applies.
+fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
+    let backend = effective_memory_backend_name(
+        &config.memory.backend,
+        Some(&config.storage.provider.config),
+    );
+    if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
+        bail!("Memory backend is 'none' (disabled). No entries to manage.");
+    }
+    let fallback_api_key = config
+        .providers
+        .fallback
+        .as_ref()
+        .and_then(|name| config.providers.models.get(name))
+        .and_then(|e| e.api_key.as_deref());
+    create_memory_with_storage_and_routes(
+        &config.memory,
+        &config.providers.embedding_routes,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        fallback_api_key,
+    )
+}
+
+async fn handle_reindex(config: &Config) -> Result<()> {
+    let mem = create_memory_with_embedder(config)?;
+    println!("{} Reindexing memory backend...", style("→").cyan());
+    let count = mem.reindex().await?;
+    if count == 0 {
+        println!(
+            "{} FTS rebuilt. No embeddings to fill in (either everything is already embedded or the backend has no embedder configured).",
+            style("✓").green()
+        );
+    } else {
+        println!(
+            "{} FTS rebuilt. Re-embedded {count} {}.",
+            style("✓").green(),
+            if count == 1 { "entry" } else { "entries" }
+        );
+    }
+    Ok(())
 }
 
 /// Create a lightweight memory backend for CLI management operations.

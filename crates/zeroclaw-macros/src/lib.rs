@@ -301,9 +301,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 // Path routing through HashMap<String, T>: the one parser
                 // lives in `crate::config::route_hashmap_path` so get/set
                 // don't duplicate it. Paths look like
-                // `<my_prefix>.<field>.<key>.<inner_suffix>`; on a hit the
-                // dispatch is forwarded to the value type's own get_prop /
-                // set_prop via its `configurable_prefix()`.
+                // `<my_prefix>.<field>.<key>.<inner_suffix>`; keys may contain
+                // dots/URLs, so the shared parser preserves the runtime key and
+                // splits on the final field separator. On a hit the dispatch is
+                // forwarded to the value type's own get_prop / set_prop via its
+                // `configurable_prefix()`.
                 let field_name_lit = snake_to_kebab(&field_ident.to_string());
                 nested_prop_is_secret.push(quote! {
                     if let Some((_hm_key, inner_name)) = crate::config::route_hashmap_path(

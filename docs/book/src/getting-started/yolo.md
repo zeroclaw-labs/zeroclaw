@@ -38,10 +38,10 @@ enabled = false
 enabled = false
 
 [security.sandbox]
-backend = "noop"
+backend = "none"
 
 [gateway]
-pairing_required = false
+require_pairing = false
 ```
 
 Or — coming soon — a single preset:

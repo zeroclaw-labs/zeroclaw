@@ -506,6 +506,7 @@ mod tests {
                     id: "call_router_1".to_string(),
                     name: "shell".to_string(),
                     arguments: r#"{"command":"date"}"#.to_string(),
+                    extra_content: None,
                 })),
                 Ok(StreamEvent::Final),
             ])

@@ -186,6 +186,7 @@ impl Provider for TraceLlmProvider {
                         id: tc.id,
                         name: tc.name,
                         arguments: serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                        extra_content: None,
                     })
                     .collect();
                 Ok(ChatResponse {

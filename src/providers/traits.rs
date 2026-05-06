@@ -73,6 +73,7 @@ mod tests {
                 id: "1".into(),
                 name: "shell".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             }],
             usage: None,
             reasoning_content: None,
@@ -110,6 +111,7 @@ mod tests {
             id: "call_123".into(),
             name: "file_read".into(),
             arguments: r#"{"path":"test.txt"}"#.into(),
+            extra_content: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         assert!(json.contains("call_123"));

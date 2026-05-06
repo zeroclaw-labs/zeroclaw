@@ -25,9 +25,9 @@ For developers and home-lab users who understand the trade-offs, there's [YOLO m
 
 ## 3. Minimal — in binary size, dependencies, and surface area
 
-ZeroClaw is written in Rust and optimised for a small binary and fast startup. A microkernel roadmap (RFC #5574) is actively splitting functionality behind feature flags so you only ship what you use. A release build of the core runtime fits in tens of megabytes; adding channel integrations or hardware support is opt-in.
+ZeroClaw is written in Rust and optimised for a small binary and fast startup. A microkernel roadmap ([RFC #5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)) is actively splitting functionality behind feature flags so you only ship what you use. A release build of the core runtime fits in tens of megabytes; adding channel integrations or hardware support is opt-in.
 
-The same discipline applies to the agent's prompt surface. Tool descriptions are Fluent-localised and terse. There are no hidden system prompts injecting personality. The model sees what you configure.
+The same discipline applies to the agent's prompt surface. Tool descriptions are [Fluent](https://projectfluent.org/)-localised and terse. There are no hidden system prompts injecting personality. The model sees what you configure.
 
 ## 4. Provider-agnostic
 
@@ -48,9 +48,9 @@ Substantive changes go through the RFC process — see [Contributing → RFCs](.
 
 Ratified foundational RFCs:
 
-- **#5574** — Microkernel transition (v0.7.0 → v1.0.0). Crate splits, feature-flag taxonomy.
-- **#5576** — Documentation standards and knowledge architecture.
-- **#5577** — Project governance: core-team structure, two-thirds-majority voting.
-- **#5579** — Engineering infrastructure: CI pipelines, release automation.
-- **#5615** — Contribution culture: human/AI co-authorship norms.
-- **#5653** — Zero Compromise: error handling, dead-code policy, release-readiness.
+- **[#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)** — Microkernel transition (v0.7.0 → v1.0.0). Crate splits, feature-flag taxonomy.
+- **[#5576]((https://github.com/zeroclaw-labs/zeroclaw/issues/5576)** — Documentation standards and knowledge architecture.
+- **[#5577]((https://github.com/zeroclaw-labs/zeroclaw/issues/5577)** — Project governance: core-team structure, two-thirds-majority voting.
+- **[#5579]((https://github.com/zeroclaw-labs/zeroclaw/issues/5579)** — Engineering infrastructure: CI pipelines, release automation.
+- **[#5615]((https://github.com/zeroclaw-labs/zeroclaw/issues/5615)** — Contribution culture: human/AI co-authorship norms.
+- **[#5653]((https://github.com/zeroclaw-labs/zeroclaw/issues/5653)** — Zero Compromise: error handling, dead-code policy, release-readiness.

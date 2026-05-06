@@ -1,5 +1,5 @@
 use super::embeddings::EmbeddingProvider;
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, is_recent_recall_query};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -294,7 +294,7 @@ impl Memory for QdrantMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        if query.trim().is_empty() {
+        if is_recent_recall_query(query) {
             let mut entries = self.list(None, session_id).await?;
             if let Some(s) = since {
                 entries.retain(|e| e.timestamp.as_str() >= s);

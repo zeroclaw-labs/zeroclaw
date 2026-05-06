@@ -313,6 +313,7 @@ mod tests {
                 id: "tc1".into(),
                 name: "file_read".into(),
                 arguments: "{\"path\":\"a.txt\"}".into(),
+                extra_content: None,
             }],
             usage: None,
             reasoning_content: None,
@@ -386,6 +387,7 @@ mod tests {
                 id: "tc_1".into(),
                 name: "shell".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             }],
             reasoning_content: Some("thinking step".into()),
         }];
@@ -409,6 +411,7 @@ mod tests {
                 id: "tc_1".into(),
                 name: "shell".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             }],
             reasoning_content: None,
         }];
@@ -429,6 +432,7 @@ mod tests {
                 id: "tc_1".into(),
                 name: "shell".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             }],
             reasoning_content: Some("should be ignored".into()),
         }];

@@ -148,6 +148,28 @@ If the client never replies (crash, network drop, user closes IDE), the request 
 
 `ask_user` uses the same `session/request_permission` mechanism, mapping the question's `choices` to permission options. Free-form (no-choices) `ask_user` is not supported until the [ACP elicitation RFD](https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx) lands. Calling `ask_user` without `choices` on an ACP session fast-fails with a clear error.
 
+### `session/cancel`
+
+Abort an in-flight `session/prompt` turn. Not in the base ACP spec — ZeroClaw-specific. If a future ACP spec revision adds `session/cancel` with different semantics, this will be renamed `_meta/session/cancel`.
+
+**Cancel vs. stop:** `session/cancel` aborts an in-flight prompt turn and returns `stopReason: "cancelled"` with any streamed text accumulated up to the interrupt point. `session/stop` gracefully ends the session after the current turn completes — it waits for the turn to finish rather than interrupting it.
+
+```json
+→ {"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s-ab12cd"}}
+← {"jsonrpc":"2.0","id":null,"result":{}}
+← {"jsonrpc":"2.0","method":"session/update","params":{
+    "sessionId": "s-ab12cd",
+    "update": {"sessionUpdate": "agent_message_chunk", "content": {"type":"text","text":"partial..."}}
+  }}
+← {"jsonrpc":"2.0","id":3,"result":{
+    "sessionId": "s-ab12cd",
+    "stopReason": "cancelled",
+    "content": "partial...\n\n[interrupted by user]"
+  }}
+```
+
+If no turn is active for the session, the cancel is a noop — it succeeds silently without error. This follows ACP notification semantics: notifications must not produce errors.
+
 ### `session/stop` _(ZeroClaw extension)_
 
 Cleanly end a session. Not in the base ACP spec — ZeroClaw-specific. If a future ACP spec revision adds `session/stop` with different semantics, this will be renamed `_meta/session/stop`.
