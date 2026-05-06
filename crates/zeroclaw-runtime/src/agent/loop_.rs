@@ -35,7 +35,7 @@ use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use regex::Regex;
 use std::collections::HashSet;
@@ -2073,6 +2073,7 @@ pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
 #[allow(clippy::too_many_lines)]
 pub async fn run(
     config: Config,
+    agent_alias: &str,
     message: Option<String>,
     provider_override: Option<String>,
     model_override: Option<String>,
@@ -2082,25 +2083,35 @@ pub async fn run(
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
 ) -> Result<String> {
+    let agent = config
+        .agent(agent_alias)
+        .with_context(|| format!("agents.{agent_alias} is not configured"))?
+        .clone();
+    let risk_profile = config
+        .risk_profile_for_agent(agent_alias)
+        .with_context(|| {
+            format!(
+                "agents.{agent_alias}.risk_profile does not name a configured risk_profiles entry"
+            )
+        })?
+        .clone();
+
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
 
-    let fallback_provider_loop = config.providers.fallback_provider();
+    let primary_provider = config.providers.first_provider();
 
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
         &config.providers.embedding_routes,
-        Some(&config.storage.provider.config),
+        config.resolve_active_storage(),
         &config.workspace_dir,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
+        primary_provider.and_then(|e| e.api_key.as_deref()),
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
@@ -2131,6 +2142,8 @@ pub async fn run(
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
+        &risk_profile,
+        agent_alias,
         runtime,
         mem.clone(),
         composio_key,
@@ -2140,7 +2153,7 @@ pub async fn run(
         &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
+        primary_provider.and_then(|e| e.api_key.as_deref()),
         &config,
         None,
     );
@@ -2245,13 +2258,13 @@ pub async fn run(
     // ── Resolve provider ─────────────────────────────────────────
     let mut provider_name = provider_override
         .as_deref()
-        .or(config.providers.fallback.as_deref())
+        .or(config.providers.first_provider_type())
         .unwrap_or("openrouter")
         .to_string();
 
     let mut model_name = model_override
         .as_deref()
-        .or(fallback_provider_loop.and_then(|e| e.model.as_deref()))
+        .or(primary_provider.and_then(|e| e.model.as_deref()))
         .unwrap_or("anthropic/claude-sonnet-4")
         .to_string();
 
@@ -2260,8 +2273,8 @@ pub async fn run(
 
     let mut provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
         &provider_name,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-        fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+        primary_provider.and_then(|e| e.api_key.as_deref()),
+        primary_provider.and_then(|e| e.base_url.as_deref()),
         &config.reliability,
         &config.providers.model_routes,
         &model_name,
@@ -2428,7 +2441,7 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
-    let bootstrap_max_chars = if config.agent.compact_context {
+    let bootstrap_max_chars = if agent.compact_context {
         Some(6000)
     } else {
         None
@@ -2441,11 +2454,11 @@ pub async fn run(
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
-        Some(&config.autonomy),
+        Some(&risk_profile),
         native_tools,
         config.skills.prompt_injection_mode,
-        config.agent.compact_context,
-        config.agent.max_system_prompt_chars,
+        agent.compact_context,
+        agent.max_system_prompt_chars,
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
@@ -2461,7 +2474,7 @@ pub async fn run(
 
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = if interactive {
-        Some(ApprovalManager::from_config(&config.autonomy))
+        Some(ApprovalManager::from_risk_profile(&risk_profile))
     } else {
         None
     };
@@ -2479,7 +2492,18 @@ pub async fn run(
     let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
         crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.workspace_dir)
             .map(|tracker| {
-                ToolLoopCostTrackingContext::new(tracker, Arc::new(config.cost.prices.clone()))
+                let pricing: crate::agent::cost::ModelProviderPricing = config
+                    .providers
+                    .models
+                    .iter()
+                    .flat_map(|(type_k, alias_map)| {
+                        alias_map.iter().map(move |(alias_k, profile)| {
+                            (format!("{type_k}.{alias_k}"), profile.pricing.clone())
+                        })
+                    })
+                    .filter(|(_, p)| !p.is_empty())
+                    .collect();
+                ToolLoopCostTrackingContext::new(tracker, Arc::new(pricing))
             });
 
     // ── Execute ──────────────────────────────────────────────────
@@ -2504,7 +2528,7 @@ pub async fn run(
         let thinking_level = crate::agent::thinking::resolve_thinking_level(
             thinking_directive,
             None,
-            &config.agent.thinking,
+            &agent.thinking,
         );
         let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
         let effective_temperature = crate::agent::thinking::clamp_temperature(
@@ -2540,7 +2564,7 @@ pub async fn run(
             memory_session_id.as_deref(),
         )
         .await;
-        let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+        let rag_limit = if agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
             .map(|r| build_hardware_context(r, &effective_msg, &board_names, rag_limit))
@@ -2559,19 +2583,14 @@ pub async fn run(
         ];
 
         // Prune history for token efficiency (when enabled).
-        if config.agent.history_pruning.enabled {
-            let _stats = crate::agent::history_pruner::prune_history(
-                &mut history,
-                &config.agent.history_pruning,
-            );
+        if agent.history_pruning.enabled {
+            let _stats =
+                crate::agent::history_pruner::prune_history(&mut history, &agent.history_pruning);
         }
 
         // Compute per-turn excluded MCP tools from tool_filter_groups.
-        let excluded_tools = compute_excluded_mcp_tools(
-            &tools_registry,
-            &config.agent.tool_filter_groups,
-            &effective_msg,
-        );
+        let excluded_tools =
+            compute_excluded_mcp_tools(&tools_registry, &agent.tool_filter_groups, &effective_msg);
 
         #[allow(unused_assignments)]
         let mut response = String::new();
@@ -2592,17 +2611,17 @@ pub async fn run(
                         channel_name,
                         None,
                         &config.multimodal,
-                        config.agent.max_tool_iterations,
+                        agent.max_tool_iterations,
                         None,
                         None,
                         None,
                         &excluded_tools,
-                        &config.agent.tool_call_dedup_exempt,
+                        &agent.tool_call_dedup_exempt,
                         activated_handle.as_ref(),
                         Some(model_switch_callback.clone()),
                         &config.pacing,
-                        config.agent.max_tool_result_chars,
-                        config.agent.max_context_tokens,
+                        agent.max_tool_result_chars,
+                        agent.max_context_tokens,
                         None, // shared_budget
                         None, // channel: CLI mode — uses prompt_cli
                         None, // receipt_generator
@@ -2627,8 +2646,8 @@ pub async fn run(
 
                         provider = zeroclaw_providers::create_routed_provider_with_options(
                             &new_provider,
-                            fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-                            fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+                            primary_provider.and_then(|e| e.api_key.as_deref()),
+                            primary_provider.and_then(|e| e.base_url.as_deref()),
                             &config.reliability,
                             &config.providers.model_routes,
                             &new_model,
@@ -2784,7 +2803,7 @@ pub async fn run(
             let thinking_level = crate::agent::thinking::resolve_thinking_level(
                 thinking_directive,
                 None,
-                &config.agent.thinking,
+                &agent.thinking,
             );
             let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
             let turn_temperature = crate::agent::thinking::clamp_temperature(
@@ -2827,7 +2846,7 @@ pub async fn run(
                 memory_session_id.as_deref(),
             )
             .await;
-            let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+            let rag_limit = if agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
                 .map(|r| build_hardware_context(r, &effective_input, &board_names, rag_limit))
@@ -2845,7 +2864,7 @@ pub async fn run(
             // Compute per-turn excluded MCP tools from tool_filter_groups.
             let excluded_tools = compute_excluded_mcp_tools(
                 &tools_registry,
-                &config.agent.tool_filter_groups,
+                &agent.tool_filter_groups,
                 &effective_input,
             );
 
@@ -2904,17 +2923,17 @@ pub async fn run(
                             channel_name,
                             None,
                             &config.multimodal,
-                            config.agent.max_tool_iterations,
+                            agent.max_tool_iterations,
                             Some(cancel_token.clone()),
                             Some(delta_tx.clone()),
                             None,
                             &excluded_tools,
-                            &config.agent.tool_call_dedup_exempt,
+                            &agent.tool_call_dedup_exempt,
                             activated_handle.as_ref(),
                             Some(model_switch_callback.clone()),
                             &config.pacing,
-                            config.agent.max_tool_result_chars,
-                            config.agent.max_context_tokens,
+                            agent.max_tool_result_chars,
+                            agent.max_context_tokens,
                             None, // shared_budget
                             None, // channel: interactive CLI — uses prompt_cli
                             None, // receipt_generator
@@ -2940,8 +2959,8 @@ pub async fn run(
 
                             provider = zeroclaw_providers::create_routed_provider_with_options(
                                 &new_provider,
-                                fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-                                fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+                                primary_provider.and_then(|e| e.api_key.as_deref()),
+                                primary_provider.and_then(|e| e.base_url.as_deref()),
                                 &config.reliability,
                                 &config.providers.model_routes,
                                 &new_model,
@@ -2967,8 +2986,8 @@ pub async fn run(
                             );
                             let mut compressor =
                                 crate::agent::context_compressor::ContextCompressor::new(
-                                    config.agent.context_compression.clone(),
-                                    config.agent.max_context_tokens,
+                                    agent.context_compression.clone(),
+                                    agent.max_context_tokens,
                                 )
                                 .with_memory(mem.clone());
                             let error_msg = format!("{e}");
@@ -3026,8 +3045,8 @@ pub async fn run(
             // Context compression before hard trimming to preserve long-context signal.
             {
                 let compressor = crate::agent::context_compressor::ContextCompressor::new(
-                    config.agent.context_compression.clone(),
-                    config.agent.max_context_tokens,
+                    agent.context_compression.clone(),
+                    agent.max_context_tokens,
                 )
                 .with_memory(mem.clone());
                 match compressor
@@ -3048,13 +3067,13 @@ pub async fn run(
                             error = %e,
                             "Context compression failed, falling back to history trim"
                         );
-                        trim_history(&mut history, config.agent.max_history_messages / 2);
+                        trim_history(&mut history, agent.max_history_messages / 2);
                     }
                 }
             }
 
             // Hard cap as a safety net.
-            trim_history(&mut history, config.agent.max_history_messages);
+            trim_history(&mut history, agent.max_history_messages);
 
             // Restore base system prompt (remove per-turn thinking prefix).
             if thinking_params.system_prompt_prefix.is_some()
@@ -3086,25 +3105,36 @@ pub async fn run(
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(
     config: Config,
+    agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
 ) -> Result<String> {
+    let agent = config
+        .agent(agent_alias)
+        .with_context(|| format!("agents.{agent_alias} is not configured"))?
+        .clone();
+    let risk_profile = config
+        .risk_profile_for_agent(agent_alias)
+        .with_context(|| {
+            format!(
+                "agents.{agent_alias}.risk_profile does not name a configured risk_profiles entry"
+            )
+        })?
+        .clone();
+
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
-    let fallback_provider_pm = config.providers.fallback_provider();
-    let approval_manager = ApprovalManager::for_non_interactive(&config.autonomy);
+    let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
+    let primary_provider = config.providers.first_provider();
+    let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
         &config.providers.embedding_routes,
-        Some(&config.storage.provider.config),
+        config.resolve_active_storage(),
         &config.workspace_dir,
-        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
+        primary_provider.and_then(|e| e.api_key.as_deref()),
     )?);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
@@ -3125,6 +3155,8 @@ pub async fn process_message(
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
+        &risk_profile,
+        agent_alias,
         runtime,
         mem.clone(),
         composio_key,
@@ -3134,7 +3166,7 @@ pub async fn process_message(
         &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
-        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
+        primary_provider.and_then(|e| e.api_key.as_deref()),
         &config,
         None,
     );
@@ -3211,8 +3243,11 @@ pub async fn process_message(
         }
     }
 
-    let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
-    let model_name = match fallback_provider_pm
+    let provider_name = config
+        .providers
+        .first_provider_type()
+        .unwrap_or("openrouter");
+    let model_name = match primary_provider
         .and_then(|e| e.model.as_deref())
         .map(str::trim)
         .filter(|m| !m.is_empty())
@@ -3231,11 +3266,9 @@ pub async fn process_message(
             }
             None => {
                 anyhow::bail!(
-                    "no model configured: providers.fallback = {:?} resolves with no model, \
-                     and no [[providers.models.*]] entry has a `model` field set. \
-                     Configure at least one [providers.models.<name>] model = \"...\" \
+                    "no model configured: providers.models is empty or has no `model` field set. \
+                     Configure at least one [providers.models.<type>.<alias>] model = \"...\" \
                      or define a [[model_routes]] hint.",
-                    config.providers.fallback,
                 )
             }
         },
@@ -3244,8 +3277,8 @@ pub async fn process_message(
         zeroclaw_providers::provider_runtime_options_from_config(&config);
     let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
         provider_name,
-        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
-        fallback_provider_pm.and_then(|e| e.base_url.as_deref()),
+        primary_provider.and_then(|e| e.api_key.as_deref()),
+        primary_provider.and_then(|e| e.base_url.as_deref()),
         &config.reliability,
         &config.providers.model_routes,
         &model_name,
@@ -3339,15 +3372,19 @@ pub async fn process_message(
     }
 
     // Filter out tools excluded for non-CLI channels (gateway counts as non-CLI).
-    // Skip when autonomy is `Full` — full-autonomy agents keep all tools.
-    if config.autonomy.level != AutonomyLevel::Full {
-        let excluded = &config.autonomy.non_cli_excluded_tools;
-        if !excluded.is_empty() {
-            tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+    // Skip when the active risk profile's autonomy is `Full` — full-autonomy
+    // agents keep all tools.
+    {
+        let active_profile = &risk_profile;
+        if active_profile.level != AutonomyLevel::Full {
+            let excluded = &active_profile.excluded_tools;
+            if !excluded.is_empty() {
+                tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+            }
         }
     }
 
-    let bootstrap_max_chars = if config.agent.compact_context {
+    let bootstrap_max_chars = if agent.compact_context {
         Some(6000)
     } else {
         None
@@ -3360,11 +3397,11 @@ pub async fn process_message(
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
-        Some(&config.autonomy),
+        Some(&risk_profile),
         native_tools,
         config.skills.prompt_injection_mode,
-        config.agent.compact_context,
-        config.agent.max_system_prompt_chars,
+        agent.compact_context,
+        agent.max_system_prompt_chars,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
@@ -3383,16 +3420,13 @@ pub async fn process_message(
             }
             None => (None, message.to_string()),
         };
-    let thinking_level = crate::agent::thinking::resolve_thinking_level(
-        thinking_directive,
-        None,
-        &config.agent.thinking,
-    );
+    let thinking_level =
+        crate::agent::thinking::resolve_thinking_level(thinking_directive, None, &agent.thinking);
     let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
     let effective_temperature = crate::agent::thinking::clamp_temperature(
         config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             + thinking_params.temperature_adjustment,
@@ -3411,7 +3445,7 @@ pub async fn process_message(
         session_id,
     )
     .await;
-    let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+    let rag_limit = if agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
         .map(|r| build_hardware_context(r, effective_msg_ref, &board_names, rag_limit))
@@ -3430,11 +3464,14 @@ pub async fn process_message(
     ];
     let mut excluded_tools = compute_excluded_mcp_tools(
         &tools_registry,
-        &config.agent.tool_filter_groups,
+        &agent.tool_filter_groups,
         effective_msg_ref,
     );
-    if config.autonomy.level != AutonomyLevel::Full {
-        excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
+    {
+        let active_profile = &risk_profile;
+        if active_profile.level != AutonomyLevel::Full {
+            excluded_tools.extend(active_profile.excluded_tools.iter().cloned());
+        }
     }
 
     agent_turn(
@@ -3449,10 +3486,10 @@ pub async fn process_message(
         "daemon",
         None,
         &config.multimodal,
-        config.agent.max_tool_iterations,
+        agent.max_tool_iterations,
         Some(&approval_manager),
         &excluded_tools,
-        &config.agent.tool_call_dedup_exempt,
+        &agent.tool_call_dedup_exempt,
         activated_handle_pm.as_ref(),
         None,
         None, // channel: process_message path has no channel ref
@@ -5095,8 +5132,8 @@ mod tests {
                 tool_call_id: None,
             },
         ];
-        let approval_cfg = zeroclaw_config::schema::AutonomyConfig::default();
-        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
+        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
 
         assert!(!should_execute_tools_in_parallel(
             &calls,
@@ -5118,11 +5155,11 @@ mod tests {
                 tool_call_id: None,
             },
         ];
-        let approval_cfg = zeroclaw_config::schema::AutonomyConfig {
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
             level: crate::security::AutonomyLevel::Full,
-            ..zeroclaw_config::schema::AutonomyConfig::default()
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
-        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
 
         assert!(should_execute_tools_in_parallel(
             &calls,
@@ -5159,11 +5196,11 @@ mod tests {
             )),
         ];
 
-        let approval_cfg = zeroclaw_config::schema::AutonomyConfig {
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
             level: crate::security::AutonomyLevel::Full,
-            ..zeroclaw_config::schema::AutonomyConfig::default()
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
-        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -5467,7 +5504,7 @@ mod tests {
         ];
         let observer = NoopObserver;
         let approval_mgr = ApprovalManager::for_non_interactive(
-            &zeroclaw_config::schema::AutonomyConfig::default(),
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
         );
 
         let result = run_tool_call_loop(
@@ -6252,8 +6289,8 @@ mod tests {
     #[test]
     fn build_tool_instructions_includes_all_tools() {
         use crate::security::SecurityPolicy;
-        let security = Arc::new(SecurityPolicy::from_config(
-            &zeroclaw_config::schema::AutonomyConfig::default(),
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
@@ -6269,8 +6306,8 @@ mod tests {
     #[test]
     fn tools_to_openai_format_produces_valid_schema() {
         use crate::security::SecurityPolicy;
-        let security = Arc::new(SecurityPolicy::from_config(
-            &zeroclaw_config::schema::AutonomyConfig::default(),
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
@@ -7434,7 +7471,6 @@ Let me check the result."#;
         use crate::cost::CostTracker;
         use crate::observability::noop::NoopObserver;
         use std::collections::HashMap;
-        use zeroclaw_config::schema::ModelPricing;
 
         let provider = ScriptedProvider {
             responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
@@ -7451,22 +7487,17 @@ Let me check the result."#;
         };
         let observer = NoopObserver;
         let workspace = tempfile::TempDir::new().unwrap();
-        let mut cost_config = zeroclaw_config::schema::CostConfig {
+        let cost_config = zeroclaw_config::schema::CostConfig {
             enabled: true,
             ..zeroclaw_config::schema::CostConfig::default()
         };
-        cost_config.prices = HashMap::from([(
-            "mock-model".to_string(),
-            ModelPricing {
-                input: 3.0,
-                output: 15.0,
-            },
-        )]);
         let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
-        let ctx = ToolLoopCostTrackingContext::new(
-            Arc::clone(&tracker),
-            Arc::new(cost_config.prices.clone()),
-        );
+        let mut model_pricing: HashMap<String, f64> = HashMap::new();
+        model_pricing.insert("mock-model.input".to_string(), 3.0);
+        model_pricing.insert("mock-model.output".to_string(), 15.0);
+        let mut pricing: crate::agent::cost::ModelProviderPricing = HashMap::new();
+        pricing.insert("mock-provider".to_string(), model_pricing);
+        let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing));
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = TOOL_LOOP_COST_TRACKING_CONTEXT
@@ -7523,7 +7554,6 @@ Let me check the result."#;
         use crate::cost::CostTracker;
         use crate::observability::noop::NoopObserver;
         use std::collections::HashMap;
-        use zeroclaw_config::schema::ModelPricing;
 
         let provider = ScriptedProvider::from_text_responses(vec!["should not reach this"]);
         let observer = NoopObserver;
@@ -7545,16 +7575,12 @@ Let me check the result."#;
             ))
             .unwrap();
 
-        let ctx = ToolLoopCostTrackingContext::new(
-            Arc::clone(&tracker),
-            Arc::new(HashMap::from([(
-                "mock-model".to_string(),
-                ModelPricing {
-                    input: 1.0,
-                    output: 1.0,
-                },
-            )])),
-        );
+        let mut model_pricing: HashMap<String, f64> = HashMap::new();
+        model_pricing.insert("mock-model.input".to_string(), 1.0);
+        model_pricing.insert("mock-model.output".to_string(), 1.0);
+        let mut pricing: crate::agent::cost::ModelProviderPricing = HashMap::new();
+        pricing.insert("mock-provider".to_string(), model_pricing);
+        let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing));
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let err = TOOL_LOOP_COST_TRACKING_CONTEXT

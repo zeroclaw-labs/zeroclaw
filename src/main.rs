@@ -285,7 +285,8 @@ enum Commands {
         #[arg(long)]
         api_key: Option<String>,
 
-        /// Provider name (sets providers.fallback).
+        /// Provider name. Used as the type key for the synthesized
+        /// `[providers.models.<type>.default]` entry.
         #[arg(long)]
         provider: Option<String>,
 
@@ -326,6 +327,11 @@ Examples:
   zeroclaw agent -p anthropic --model claude-sonnet-4-20250514
   zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0")]
     Agent {
+        /// Configured agent alias to run as (must match `[agents.<alias>]`).
+        /// Required: V3 has no default agent.
+        #[arg(short = 'a', long)]
+        agent: String,
+
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
         message: Option<String>,
@@ -761,6 +767,8 @@ enum OnboardSection {
     Tunnel,
     /// Edit the markdown files that shape your agent (SOUL, IDENTITY, USER, …).
     Personality,
+    /// Define and configure agent aliases (channel bindings, provider, profiles).
+    Agents,
 }
 
 /// Stub enum that mirrors the old `props` subcommands so clap can still parse
@@ -837,6 +845,7 @@ fn resolve_onboard_target(
         OnboardSection::Hardware => Section::Hardware,
         OnboardSection::Tunnel => Section::Tunnel,
         OnboardSection::Personality => Section::Personality,
+        OnboardSection::Agents => Section::Agents,
     });
 
     let target = explicit_section
@@ -874,8 +883,9 @@ enum ConfigCommands {
     /// the schema fragment for that property only — same payload `OPTIONS
     /// /api/config/prop?path=...` returns over HTTP.
     Schema {
-        /// Property path to scope the schema dump (e.g. `providers.fallback`).
-        /// Without it, dumps the whole-config schema.
+        /// Property path to scope the schema dump (e.g.
+        /// `agents.researcher.model_provider`). Without it, dumps the
+        /// whole-config schema.
         #[arg(long)]
         path: Option<String>,
     },
@@ -1336,7 +1346,6 @@ async fn main() -> Result<()> {
         }
 
         let mut cfg = Box::pin(Config::load_or_init()).await?;
-        cfg.apply_env_overrides();
 
         let flags = Flags {
             force: *force,
@@ -1404,7 +1413,6 @@ async fn main() -> Result<()> {
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
-    config.apply_env_overrides();
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
     #[cfg(feature = "agent-runtime")]
@@ -1427,34 +1435,56 @@ async fn main() -> Result<()> {
         // Kernel-only mode: minimal CLI agent without channels/tools/gateway
         match cli.command {
             Commands::Agent {
+                agent: agent_alias,
                 message,
                 provider,
                 model,
                 temperature,
                 ..
             } => {
-                let fallback = config.providers.fallback_provider();
-                let final_temperature = temperature
-                    .unwrap_or_else(|| fallback.and_then(|e| e.temperature).unwrap_or(0.7));
+                if config.agent(&agent_alias).is_none() {
+                    anyhow::bail!(
+                        "`zeroclaw agent --agent {agent_alias}` is not configured (no [agents.{agent_alias}] entry)"
+                    );
+                }
+                let final_temperature = temperature.unwrap_or_else(|| {
+                    config
+                        .providers
+                        .first_provider()
+                        .and_then(|e| e.temperature)
+                        .unwrap_or(0.7)
+                });
                 if let Some(p) = &provider {
-                    config.providers.fallback = Some(p.clone());
+                    // Upsert the requested provider type under "default" alias.
+                    let entry = config
+                        .providers
+                        .models
+                        .entry(p.clone())
+                        .or_default()
+                        .entry("default".to_string())
+                        .or_default();
+                    if let Some(m) = &model {
+                        entry.model = Some(m.clone());
+                    }
+                    entry.temperature = Some(final_temperature);
+                } else if config.providers.first_provider().is_none() {
+                    anyhow::bail!(
+                        "No model provider configured. Pass --provider <type> or run \
+                         `zeroclaw onboard providers` to configure one."
+                    );
                 }
-                if let Some(m) = &model {
-                    config.ensure_fallback_provider().model = Some(m.clone());
-                }
-                config.ensure_fallback_provider().temperature = Some(final_temperature);
 
-                let provider_name = config.providers.fallback.as_deref().unwrap_or("openai");
+                let provider_name = config.providers.first_provider_type().unwrap_or("openai");
                 let provider = zeroclaw::providers::create_provider(
                     provider_name,
                     config
                         .providers
-                        .fallback_provider()
+                        .first_provider()
                         .and_then(|e| e.api_key.as_deref()),
                 )?;
                 let model_name = config
                     .providers
-                    .fallback_provider()
+                    .first_provider()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("default");
                 match message {
@@ -1524,6 +1554,7 @@ async fn main() -> Result<()> {
         | Commands::MarkdownSchema => unreachable!(),
 
         Commands::Agent {
+            agent: agent_alias,
             message,
             session_state_file,
             provider,
@@ -1534,10 +1565,19 @@ async fn main() -> Result<()> {
             let final_temperature = temperature.unwrap_or_else(|| {
                 config
                     .providers
-                    .fallback_provider()
+                    .first_provider()
                     .and_then(|e| e.temperature)
                     .unwrap_or(0.7)
             });
+
+            // Validate up-front: bail with a clear message if the alias
+            // isn't configured. The runtime would error too, but this
+            // catches typos before any subsystem spins up.
+            if config.agent(&agent_alias).is_none() {
+                anyhow::bail!(
+                    "`zeroclaw agent --agent {agent_alias}` is not configured (no [agents.{agent_alias}] entry)"
+                );
+            }
 
             // Wire CLI channel for interactive mode
             zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
@@ -1546,6 +1586,7 @@ async fn main() -> Result<()> {
 
             Box::pin(agent::run(
                 config,
+                &agent_alias,
                 message,
                 provider,
                 model,
@@ -1708,8 +1749,15 @@ async fn main() -> Result<()> {
             #[cfg(target_os = "linux")]
             {
                 use zeroclaw_config::schema::SandboxBackend;
-                let sandbox_docker =
-                    matches!(config.security.sandbox.backend, SandboxBackend::Docker);
+                // Any enabled agent whose risk_profile uses the docker
+                // sandbox triggers the warning — we just need to know
+                // *some* agent is using it.
+                let sandbox_docker = config
+                    .agents
+                    .iter()
+                    .filter(|(_, a)| a.enabled)
+                    .filter_map(|(alias, _)| config.risk_profile_for_agent(alias))
+                    .any(|p| matches!(p.sandbox_config().backend, SandboxBackend::Docker));
                 let runtime_docker_mem = config.runtime.kind == "docker"
                     && config
                         .runtime
@@ -1832,7 +1880,6 @@ async fn main() -> Result<()> {
                     daemon::DaemonExit::Reload => {
                         info!("🔄 Daemon reload — re-reading config from disk");
                         current_config = Box::pin(Config::load_or_init()).await?;
-                        current_config.apply_env_overrides();
                         // Continue loop: fresh subsystems with the new config.
                     }
                 }
@@ -1872,13 +1919,16 @@ async fn main() -> Result<()> {
             println!();
             println!(
                 "🤖 Provider:      {}",
-                config.providers.fallback.as_deref().unwrap_or("openrouter")
+                config
+                    .providers
+                    .first_provider_type()
+                    .unwrap_or("openrouter")
             );
             println!(
                 "   Model:         {}",
                 config
                     .providers
-                    .fallback_provider()
+                    .first_provider()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("(default)")
             );
@@ -1887,17 +1937,34 @@ async fn main() -> Result<()> {
                 "🧾 Trace storage:  {} ({})",
                 config.observability.runtime_trace_mode, config.observability.runtime_trace_path
             );
-            println!("🛡️  Autonomy:      {:?}", config.autonomy.level);
+            // Per-agent autonomy: each enabled agent picks its own
+            // risk_profile, so list them rather than collapsing to one.
+            let mut agent_aliases: Vec<&String> = config
+                .agents
+                .iter()
+                .filter(|(_, a)| a.enabled)
+                .map(|(alias, _)| alias)
+                .collect();
+            agent_aliases.sort();
+            if agent_aliases.is_empty() {
+                println!("🛡️  Agents:        (none configured)");
+            } else {
+                let summary: Vec<String> = agent_aliases
+                    .iter()
+                    .map(|alias| match config.risk_profile_for_agent(alias) {
+                        Some(p) => format!("{alias}={:?}", p.level),
+                        None => format!("{alias}=<no risk_profile>"),
+                    })
+                    .collect();
+                println!("🛡️  Agents:        {}", summary.join(", "));
+            }
             println!("⚙️  Runtime:       {}", config.runtime.kind);
             if service::is_running() {
                 println!("🟢 Service:       running");
             } else {
                 println!("🔴 Service:       stopped");
             }
-            let effective_memory_backend = memory::effective_memory_backend_name(
-                &config.memory.backend,
-                Some(&config.storage.provider.config),
-            );
+            let effective_memory_backend = config.resolve_active_storage().kind();
             println!(
                 "💓 Heartbeat:      {}",
                 if config.heartbeat.enabled {
@@ -1913,24 +1980,28 @@ async fn main() -> Result<()> {
             );
 
             println!();
-            println!("Security:");
-            println!("  Workspace only:    {}", config.autonomy.workspace_only);
-            println!(
-                "  Allowed roots:     {}",
-                if config.autonomy.allowed_roots.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    config.autonomy.allowed_roots.join(", ")
-                }
-            );
-            println!(
-                "  Allowed commands:  {}",
-                config.autonomy.allowed_commands.join(", ")
-            );
-            println!(
-                "  Max actions/hour:  {}",
-                config.autonomy.max_actions_per_hour
-            );
+            // Per-agent security: each enabled agent's risk profile.
+            for alias in &agent_aliases {
+                let Some(profile) = config.risk_profile_for_agent(alias) else {
+                    println!("Security ({alias}): <no risk_profile>");
+                    continue;
+                };
+                println!("Security ({alias}):");
+                println!("  Workspace only:    {}", profile.workspace_only);
+                println!(
+                    "  Allowed roots:     {}",
+                    if profile.allowed_roots.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        profile.allowed_roots.join(", ")
+                    }
+                );
+                println!(
+                    "  Allowed commands:  {}",
+                    profile.allowed_commands.join(", ")
+                );
+                println!("  Max actions/hour:  {}", profile.max_actions_per_hour);
+            }
             println!(
                 "  Cost tracking:     {}",
                 if config.cost.enabled {
@@ -2017,8 +2088,7 @@ async fn main() -> Result<()> {
             let providers = providers::list_providers();
             let current = config
                 .providers
-                .fallback
-                .as_deref()
+                .first_provider_type()
                 .unwrap_or("openrouter")
                 .trim()
                 .to_ascii_lowercase();
@@ -2397,6 +2467,7 @@ async fn main() -> Result<()> {
                 comment,
                 json,
             } => {
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 if no_interactive {
                     let val = value.ok_or_else(|| {
                         anyhow::anyhow!(
@@ -2498,6 +2569,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Init { section, json } => {
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let initialized: Vec<String> = config
                     .init_defaults(section.as_deref())
                     .into_iter()
@@ -2524,26 +2596,18 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Migrate { json } => {
-                let raw = tokio::fs::read_to_string(&config.config_path)
-                    .await
-                    .context("Failed to read config file")?;
-                match crate::config::migration::migrate_file(&raw)? {
-                    Some(migrated) => {
-                        let backup_path = config.config_path.with_extension("toml.bak");
-                        tokio::fs::copy(&config.config_path, &backup_path)
-                            .await
-                            .context("Failed to create config backup")?;
-                        tokio::fs::write(&config.config_path, &migrated).await?;
-                        let to = crate::config::migration::CURRENT_SCHEMA_VERSION;
+                match crate::config::migration::migrate_file_in_place(&config.config_path)? {
+                    Some(report) => {
+                        let to = report.to_version;
                         if json {
                             let envelope = serde_json::json!({
                                 "migrated": true,
-                                "backup_path": backup_path.display().to_string(),
+                                "backup_path": report.backup_path.display().to_string(),
                                 "schema_version": to,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
                         } else {
-                            println!("Backed up to {}", backup_path.display());
+                            println!("Backed up to {}", report.backup_path.display());
                             println!(
                                 "Migrated {} to schema version {to}.",
                                 config.config_path.display()
@@ -2565,6 +2629,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Patch { input, json } => {
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let body = match input.as_deref() {
                     None | Some("-") => {
                         use std::io::Read;
@@ -4192,8 +4257,15 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_with_temperature() {
-        let cli = Cli::try_parse_from(["zeroclaw", "agent", "--temperature", "0.5"])
-            .expect("agent command with temperature should parse");
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "agent",
+            "--agent",
+            "morning-shift",
+            "--temperature",
+            "0.5",
+        ])
+        .expect("agent command with temperature should parse");
 
         match cli.command {
             Commands::Agent { temperature, .. } => {
@@ -4206,8 +4278,15 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_without_temperature() {
-        let cli = Cli::try_parse_from(["zeroclaw", "agent", "--message", "hello"])
-            .expect("agent command without temperature should parse");
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "agent",
+            "--agent",
+            "morning-shift",
+            "--message",
+            "hello",
+        ])
+        .expect("agent command without temperature should parse");
 
         match cli.command {
             Commands::Agent { temperature, .. } => {
@@ -4220,9 +4299,15 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_session_state_file() {
-        let cli =
-            Cli::try_parse_from(["zeroclaw", "agent", "--session-state-file", "session.json"])
-                .expect("agent command with session state file should parse");
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "agent",
+            "--agent",
+            "morning-shift",
+            "--session-state-file",
+            "session.json",
+        ])
+        .expect("agent command with session state file should parse");
 
         match cli.command {
             Commands::Agent {
@@ -4236,18 +4321,25 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn agent_fallback_uses_config_default_temperature() {
-        // Test that when user doesn't provide --temperature,
-        // the fallback logic works correctly
+    fn agent_uses_first_provider_temperature_when_unset() {
+        // When the user doesn't pass --temperature, the kernel-only agent
+        // CLI walks `config.providers.first_provider().temperature` before
+        // bottoming out at 0.7.
         let mut config = Config::default();
-        config.ensure_fallback_provider().temperature = Some(1.5);
+        config
+            .providers
+            .models
+            .entry("openai".to_string())
+            .or_default()
+            .entry("default".to_string())
+            .or_default()
+            .temperature = Some(1.5);
 
-        // Simulate None temperature (user didn't provide --temperature)
         let user_temperature: Option<f64> = std::hint::black_box(None);
         let final_temperature = user_temperature.unwrap_or_else(|| {
             config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
         });
@@ -4266,7 +4358,7 @@ mod tests {
         let final_temperature = user_temperature.unwrap_or_else(|| {
             config
                 .providers
-                .fallback_provider()
+                .first_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
         });

@@ -737,7 +737,6 @@ mod tests {
     #[test]
     fn email_config_custom() {
         let config = EmailConfig {
-            enabled: true,
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             imap_folder: "Archive".to_string(),
@@ -752,6 +751,7 @@ mod tests {
             allowed_senders: vec!["allowed@example.com".to_string()],
             default_subject: "Custom Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: vec![],
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
@@ -762,7 +762,6 @@ mod tests {
     #[test]
     fn email_config_clone() {
         let config = EmailConfig {
-            enabled: true,
             imap_host: "imap.test.com".to_string(),
             imap_port: 993,
             imap_folder: "INBOX".to_string(),
@@ -777,6 +776,7 @@ mod tests {
             allowed_senders: vec!["*".to_string()],
             default_subject: "Test Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: vec![],
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
@@ -1012,7 +1012,6 @@ mod tests {
     #[test]
     fn email_config_serialize_deserialize() {
         let config = EmailConfig {
-            enabled: true,
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             imap_folder: "INBOX".to_string(),
@@ -1027,6 +1026,7 @@ mod tests {
             allowed_senders: vec!["allowed@example.com".to_string()],
             default_subject: "Serialization Test".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: vec![],
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -1115,7 +1115,6 @@ mod tests {
     #[test]
     fn email_config_debug_output() {
         let config = EmailConfig {
-            enabled: true,
             imap_host: "imap.debug.com".to_string(),
             ..Default::default()
         };

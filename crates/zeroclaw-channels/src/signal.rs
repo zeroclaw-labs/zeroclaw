@@ -28,7 +28,10 @@ enum RecipientTarget {
 pub struct SignalChannel {
     http_url: String,
     account: String,
-    group_id: Option<String>,
+    /// Empty = no group filter (all groups accepted).
+    group_ids: Vec<String>,
+    /// When true, accept only DMs and reject all group traffic.
+    dm_only: bool,
     allowed_from: Vec<String>,
     ignore_attachments: bool,
     ignore_stories: bool,
@@ -84,7 +87,8 @@ impl SignalChannel {
     pub fn new(
         http_url: String,
         account: String,
-        group_id: Option<String>,
+        group_ids: Vec<String>,
+        dm_only: bool,
         allowed_from: Vec<String>,
         ignore_attachments: bool,
         ignore_stories: bool,
@@ -93,7 +97,8 @@ impl SignalChannel {
         Self {
             http_url,
             account,
-            group_id,
+            group_ids,
+            dm_only,
             allowed_from,
             ignore_attachments,
             ignore_stories,
@@ -165,20 +170,29 @@ impl SignalChannel {
         }
     }
 
-    /// Check whether the message targets the configured group.
-    /// If no `group_id` is configured (None), all DMs and groups are accepted.
-    /// Use "dm" to filter DMs only.
+    /// Check whether the message passes the group/DM filter.
+    ///
+    /// - `dm_only = true`: only DMs accepted; all group messages rejected.
+    /// - `dm_only = false`, `group_ids` empty: accept all (DMs and any group).
+    /// - `dm_only = false`, `group_ids` non-empty: accept DMs and listed
+    ///   groups only.
     fn matches_group(&self, data_msg: &DataMessage) -> bool {
-        let Some(ref expected) = self.group_id else {
-            return true;
-        };
-        match data_msg
+        let incoming_group = data_msg
             .group_info
             .as_ref()
-            .and_then(|g| g.group_id.as_deref())
-        {
-            Some(gid) => gid == expected.as_str(),
-            None => expected.eq_ignore_ascii_case("dm"),
+            .and_then(|g| g.group_id.as_deref());
+
+        if self.dm_only {
+            return incoming_group.is_none();
+        }
+
+        if self.group_ids.is_empty() {
+            return true;
+        }
+
+        match incoming_group {
+            Some(gid) => self.group_ids.iter().any(|allowed| allowed == gid),
+            None => true,
         }
     }
 
@@ -538,7 +552,8 @@ mod tests {
         SignalChannel::new(
             "http://127.0.0.1:8686".to_string(),
             "+1234567890".to_string(),
-            None,
+            Vec::new(),
+            false,
             vec!["+1111111111".to_string()],
             false,
             false,
@@ -546,10 +561,16 @@ mod tests {
     }
 
     fn make_channel_with_group(group_id: &str) -> SignalChannel {
+        let (group_ids, dm_only) = if group_id == "dm" {
+            (Vec::new(), true)
+        } else {
+            (vec![group_id.to_string()], false)
+        };
         SignalChannel::new(
             "http://127.0.0.1:8686".to_string(),
             "+1234567890".to_string(),
-            Some(group_id.to_string()),
+            group_ids,
+            dm_only,
             vec!["*".to_string()],
             true,
             true,
@@ -576,7 +597,8 @@ mod tests {
         let ch = make_channel();
         assert_eq!(ch.http_url, "http://127.0.0.1:8686");
         assert_eq!(ch.account, "+1234567890");
-        assert!(ch.group_id.is_none());
+        assert!(ch.group_ids.is_empty());
+        assert!(!ch.dm_only);
         assert_eq!(ch.allowed_from.len(), 1);
         assert!(!ch.ignore_attachments);
         assert!(!ch.ignore_stories);
@@ -587,7 +609,8 @@ mod tests {
         let ch = SignalChannel::new(
             "http://127.0.0.1:8686/".to_string(),
             "+1234567890".to_string(),
-            None,
+            Vec::new(),
+            false,
             vec![],
             false,
             false,
@@ -618,7 +641,8 @@ mod tests {
         let ch = SignalChannel::new(
             "http://127.0.0.1:8686".to_string(),
             "+1234567890".to_string(),
-            None,
+            Vec::new(),
+            false,
             vec![],
             false,
             false,
@@ -807,7 +831,8 @@ mod tests {
         let ch = SignalChannel::new(
             "http://127.0.0.1:8686".to_string(),
             "+1234567890".to_string(),
-            None,
+            Vec::new(),
+            false,
             vec!["*".to_string()],
             false,
             false,
@@ -840,7 +865,8 @@ mod tests {
         let ch = SignalChannel::new(
             "http://127.0.0.1:8686".to_string(),
             "+1234567890".to_string(),
-            Some("testgroup".to_string()),
+            vec!["testgroup".to_string()],
+            false,
             vec!["*".to_string()],
             false,
             false,

@@ -748,6 +748,21 @@ export function getOnboardStatus(): Promise<OnboardStatusResponse> {
   return apiFetch<OnboardStatusResponse>('/api/onboard/status');
 }
 
+export interface AgentOptionsResponse {
+  channels: string[];
+  model_providers: string[];
+  risk_profiles: string[];
+  runtime_profiles: string[];
+  skill_bundles: string[];
+  knowledge_bundles: string[];
+  mcp_bundles: string[];
+  memory_namespaces: string[];
+}
+
+export function getAgentOptions(): Promise<AgentOptionsResponse> {
+  return apiFetch<AgentOptionsResponse>('/api/onboard/agent-options');
+}
+
 export interface PickerItem {
   key: string;
   label: string;
@@ -773,11 +788,55 @@ export interface SelectItemResponse {
   created: boolean;
 }
 
-export function selectSectionItem(section: string, key: string): Promise<SelectItemResponse> {
+export function selectSectionItem(
+  section: string,
+  key: string,
+  alias?: string,
+): Promise<SelectItemResponse> {
+  const body = alias ? JSON.stringify({ alias }) : undefined;
   return apiFetch<SelectItemResponse>(
     `/api/onboard/sections/${encodeURIComponent(section)}/items/${encodeURIComponent(key)}`,
-    { method: 'POST' },
+    {
+      method: 'POST',
+      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      body,
+    },
   );
+}
+
+// ── Map-keyed alias CRUD ─────────────────────────────────────────────
+
+export interface MapKeysResponse {
+  path: string;
+  keys: string[];
+}
+
+export function getMapKeys(path: string): Promise<MapKeysResponse> {
+  return apiFetch<MapKeysResponse>(
+    `/api/config/map-keys?path=${encodeURIComponent(path)}`,
+  );
+}
+
+export interface MapKeyMutResponse {
+  path: string;
+  key: string;
+  renamed?: boolean;
+  created?: boolean;
+}
+
+export function deleteMapKey(path: string, key: string): Promise<MapKeyMutResponse> {
+  return apiFetch<MapKeyMutResponse>(
+    `/api/config/map-key?path=${encodeURIComponent(path)}&key=${encodeURIComponent(key)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export function renameMapKey(path: string, from: string, to: string): Promise<MapKeyMutResponse> {
+  return apiFetch<MapKeyMutResponse>('/api/config/rename-map-key', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, from, to }),
+  });
 }
 
 // ── Daemon admin (localhost-only on the gateway) ─────────────────────

@@ -490,7 +490,7 @@ impl AcpServer {
         let default_model = self
             .config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.model.clone());
 
         let mut zeroclaw_meta = serde_json::json!({
@@ -556,6 +556,34 @@ impl AcpServer {
             .to_string_lossy()
             .into_owned();
 
+        // V3 has no default agent — every ACP session is bound to an
+        // explicit agent. Accept `agentAlias` (camelCase) or `agent_alias`
+        // / `agent` from the JSON-RPC params object.
+        let agent_alias = params
+            .get("agentAlias")
+            .or_else(|| params.get("agent_alias"))
+            .or_else(|| params.get("agent"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| RpcError {
+                code: INVALID_PARAMS,
+                message: "session/new requires `agentAlias` (alias of a configured \
+                          [agents.<alias>] entry)"
+                    .to_string(),
+                data: None,
+            })?
+            .to_string();
+        if self.config.agent(&agent_alias).is_none() {
+            return Err(RpcError {
+                code: INVALID_PARAMS,
+                message: format!(
+                    "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured"
+                ),
+                data: None,
+            });
+        }
+
         let session_id = Uuid::new_v4().to_string();
 
         // Build agent from global config, with the session's cwd pinned as
@@ -564,6 +592,7 @@ impl AcpServer {
         // `config.workspace_dir`.
         let agent = Agent::from_config_with_session_cwd_and_mcp(
             &self.config,
+            &agent_alias,
             Some(std::path::Path::new(&workspace_dir)),
             false,
         )
@@ -958,7 +987,7 @@ fn map_tool_kind(name: &str) -> &'static str {
         "ask_user" | "calculator" | "claude_code" | "claude_code_runner" | "codex_cli"
         | "composio" | "delegate" | "escalate_to_human" | "execute_pipeline" | "gemini_cli"
         | "jira" | "llm_task" | "opencode_cli" | "schedule" | "security_ops" | "shell"
-        | "sop_advance" | "sop_approve" | "sop_execute" | "swarm" | "vi_verify" => "execute",
+        | "sop_advance" | "sop_approve" | "sop_execute" | "vi_verify" => "execute",
         "backup" | "browser_open" | "canvas" | "cloud_ops" | "file_edit" | "file_write"
         | "memory_export" | "memory_store" | "report_template" => "edit",
         "cron_add" | "poll" | "reaction" => "edit",
@@ -1198,34 +1227,6 @@ mod tests {
     }
 
     #[test]
-    fn handle_initialize_default_model_absent_when_unconfigured() {
-        let server = AcpServer::new(Config::default(), AcpServerConfig::default());
-        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
-        assert!(
-            result["_meta"]["zeroclaw"].get("defaultModel").is_none(),
-            "defaultModel must be absent when no provider is configured, got: {}",
-            result["_meta"]["zeroclaw"]["defaultModel"]
-        );
-    }
-
-    #[test]
-    fn handle_initialize_default_model_reflects_configured_provider() {
-        use zeroclaw_config::schema::ModelProviderConfig;
-        let mut config = Config::default();
-        config.providers.fallback = Some("myprovider".to_string());
-        config.providers.models.insert(
-            "myprovider".to_string(),
-            ModelProviderConfig {
-                model: Some("llama3.2".to_string()),
-                ..Default::default()
-            },
-        );
-        let server = AcpServer::new(config, AcpServerConfig::default());
-        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
-        assert_eq!(result["_meta"]["zeroclaw"]["defaultModel"], "llama3.2");
-    }
-
-    #[test]
     fn session_new_defaults_to_launch_cwd_when_client_omits_cwd() {
         let config = Config {
             workspace_dir: PathBuf::from("/not/the/project"),
@@ -1254,16 +1255,18 @@ mod tests {
     #[tokio::test]
     async fn session_new_does_not_wait_for_configured_mcp_servers() {
         let cwd = tempfile::tempdir().unwrap();
-        let config = Config {
+        let mut config = Config {
             workspace_dir: cwd.path().to_path_buf(),
             providers: zeroclaw_config::providers::ProvidersConfig {
-                fallback: Some("openrouter".to_string()),
                 models: HashMap::from([(
                     "openrouter".to_string(),
-                    zeroclaw_config::schema::ModelProviderConfig {
-                        model: Some("test-model".to_string()),
-                        ..Default::default()
-                    },
+                    HashMap::from([(
+                        "default".to_string(),
+                        zeroclaw_config::schema::ModelProviderConfig {
+                            model: Some("test-model".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
                 )]),
                 ..Default::default()
             },
@@ -1280,12 +1283,25 @@ mod tests {
             },
             ..Default::default()
         };
+        config.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "openrouter.default".to_string(),
+                risk_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
         let server = AcpServer::new(config, AcpServerConfig::default());
 
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             server.handle_session_new(&serde_json::json!({
                 "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent",
                 "mcpServers": []
             })),
         )
@@ -1369,6 +1385,38 @@ mod tests {
         let missing_params = serde_json::json!({});
         let result = AcpServer::parse_prompt(&missing_params);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_initialize_default_model_absent_when_unconfigured() {
+        let server = AcpServer::new(Config::default(), AcpServerConfig::default());
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+        assert!(
+            result["_meta"]["zeroclaw"].get("defaultModel").is_none(),
+            "defaultModel must be absent when no provider is configured, got: {}",
+            result["_meta"]["zeroclaw"]["defaultModel"]
+        );
+    }
+
+    #[test]
+    fn handle_initialize_default_model_reflects_configured_provider() {
+        use zeroclaw_config::schema::ModelProviderConfig;
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .entry("myprovider".to_string())
+            .or_default()
+            .insert(
+                "default".to_string(),
+                ModelProviderConfig {
+                    model: Some("llama3.2".to_string()),
+                    ..Default::default()
+                },
+            );
+        let server = AcpServer::new(config, AcpServerConfig::default());
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+        assert_eq!(result["_meta"]["zeroclaw"]["defaultModel"], "llama3.2");
     }
 
     #[test]
@@ -1514,27 +1562,42 @@ mod tests {
     #[tokio::test]
     async fn session_stop_finds_session_during_active_prompt_turn() {
         let cwd = tempfile::tempdir().unwrap();
-        let config = Config {
+        let mut config = Config {
             workspace_dir: cwd.path().to_path_buf(),
             providers: zeroclaw_config::providers::ProvidersConfig {
-                fallback: Some("anthropic".to_string()),
                 models: HashMap::from([(
                     "anthropic".to_string(),
-                    zeroclaw_config::schema::ModelProviderConfig {
-                        model: Some("claude-haiku-4-5".to_string()),
-                        ..Default::default()
-                    },
+                    HashMap::from([(
+                        "default".to_string(),
+                        zeroclaw_config::schema::ModelProviderConfig {
+                            model: Some("claude-haiku-4-5".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
                 )]),
                 ..Default::default()
             },
             ..Default::default()
         };
+        config.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "anthropic.default".to_string(),
+                risk_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
         let server = Arc::new(AcpServer::new(config, AcpServerConfig::default()));
 
         // Create a real session via the normal path.
         let new_result = server
             .handle_session_new(&serde_json::json!({
-                "cwd": cwd.path().to_string_lossy()
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
             }))
             .await
             .expect("session/new must succeed");
@@ -1572,21 +1635,36 @@ mod tests {
     }
 
     fn make_test_config(cwd: &std::path::Path) -> Config {
-        Config {
+        let mut cfg = Config {
             workspace_dir: cwd.to_path_buf(),
             providers: zeroclaw_config::providers::ProvidersConfig {
-                fallback: Some("anthropic".to_string()),
                 models: HashMap::from([(
                     "anthropic".to_string(),
-                    zeroclaw_config::schema::ModelProviderConfig {
-                        model: Some("claude-haiku-4-5".to_string()),
-                        ..Default::default()
-                    },
+                    HashMap::from([(
+                        "default".to_string(),
+                        zeroclaw_config::schema::ModelProviderConfig {
+                            model: Some("claude-haiku-4-5".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
                 )]),
                 ..Default::default()
             },
             ..Default::default()
-        }
+        };
+        cfg.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        cfg.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "anthropic.default".to_string(),
+                risk_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
+        cfg
     }
 
     /// `session/cancel` on an idle session (no active turn) must succeed silently.
@@ -1600,7 +1678,8 @@ mod tests {
 
         let new_result = server
             .handle_session_new(&serde_json::json!({
-                "cwd": cwd.path().to_string_lossy()
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
             }))
             .await
             .expect("session/new must succeed");

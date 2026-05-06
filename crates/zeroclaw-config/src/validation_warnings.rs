@@ -25,9 +25,6 @@ use serde::{Deserialize, Serialize};
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
-/// - `dangling_provider_fallback` — `providers.fallback` references a key
-///   that does not exist in `providers.models`. Provider resolution will
-///   fail at runtime when the fallback is hit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {
@@ -36,7 +33,7 @@ pub struct ValidationWarning {
     /// Human-readable description suitable for direct display.
     pub message: String,
     /// Dotted property path the warning concerns
-    /// (e.g. `"providers.fallback"`).
+    /// (e.g. `"agents.researcher.model_provider"`).
     pub path: String,
 }
 

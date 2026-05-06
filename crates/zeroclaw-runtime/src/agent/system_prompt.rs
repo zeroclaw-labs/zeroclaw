@@ -83,7 +83,7 @@ pub fn build_system_prompt_with_mode(
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     autonomy_level: AutonomyLevel,
 ) -> String {
-    let autonomy_cfg = zeroclaw_config::schema::AutonomyConfig {
+    let autonomy_cfg = zeroclaw_config::schema::RiskProfileConfig {
         level: autonomy_level,
         ..Default::default()
     };
@@ -110,7 +110,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     skills: &[Skill],
     identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
-    autonomy_config: Option<&zeroclaw_config::schema::AutonomyConfig>,
+    autonomy_config: Option<&zeroclaw_config::schema::RiskProfileConfig>,
     native_tools: bool,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     compact_context: bool,

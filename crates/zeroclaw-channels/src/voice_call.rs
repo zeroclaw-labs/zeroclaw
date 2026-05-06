@@ -517,7 +517,6 @@ mod tests {
 
     fn test_config() -> VoiceCallConfig {
         VoiceCallConfig {
-            enabled: true,
             provider: VoiceProvider::Twilio,
             account_id: "AC_TEST_ACCOUNT".into(),
             auth_token: "test_token".into(),
@@ -528,6 +527,7 @@ mod tests {
             tts_voice: None,
             max_call_duration_secs: 3600,
             webhook_base_url: Some("https://tunnel.example.com".into()),
+            excluded_tools: vec![],
         }
     }
 

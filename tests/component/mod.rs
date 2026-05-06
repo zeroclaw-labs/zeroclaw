@@ -1,4 +1,3 @@
-mod config_migration;
 mod config_persistence;
 mod config_schema;
 mod dockerignore_test;

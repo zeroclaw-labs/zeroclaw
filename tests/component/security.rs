@@ -5,7 +5,7 @@
 //! behavior through the public API surface: configuration defaults, autonomy
 //! config validation, and credential scrubbing patterns.
 
-use zeroclaw::config::{AutonomyConfig, Config};
+use zeroclaw::config::{Config, RiskProfileConfig};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Autonomy configuration defaults and validation
@@ -14,7 +14,7 @@ use zeroclaw::config::{AutonomyConfig, Config};
 /// Default autonomy level is "supervised".
 #[test]
 fn security_default_autonomy_is_supervised() {
-    let config = AutonomyConfig::default();
+    let config = RiskProfileConfig::default();
     assert_eq!(
         format!("{:?}", config.level),
         "Supervised",
@@ -25,7 +25,7 @@ fn security_default_autonomy_is_supervised() {
 /// Default workspace_only is true (restricts file access to workspace).
 #[test]
 fn security_default_workspace_only() {
-    let config = AutonomyConfig::default();
+    let config = RiskProfileConfig::default();
     assert!(
         config.workspace_only,
         "Default workspace_only should be true for safety"
@@ -35,7 +35,7 @@ fn security_default_workspace_only() {
 /// Max actions per hour has a reasonable default.
 #[test]
 fn security_default_max_actions_per_hour() {
-    let config = AutonomyConfig::default();
+    let config = RiskProfileConfig::default();
     assert!(
         config.max_actions_per_hour > 0,
         "max_actions_per_hour should be positive"
@@ -49,7 +49,7 @@ fn security_default_max_actions_per_hour() {
 /// Require approval for medium risk is enabled by default.
 #[test]
 fn security_default_require_approval_for_medium_risk() {
-    let config = AutonomyConfig::default();
+    let config = RiskProfileConfig::default();
     assert!(
         config.require_approval_for_medium_risk,
         "Should require approval for medium-risk commands by default"
@@ -59,7 +59,7 @@ fn security_default_require_approval_for_medium_risk() {
 /// Block high risk commands is enabled by default.
 #[test]
 fn security_default_block_high_risk_commands() {
-    let config = AutonomyConfig::default();
+    let config = RiskProfileConfig::default();
     assert!(
         config.block_high_risk_commands,
         "Should block high-risk commands by default"
@@ -80,14 +80,15 @@ fn security_secrets_encryption_default() {
     );
 }
 
-/// Full config has security sections populated with defaults.
+/// `RiskProfileConfig::default()` defaults to Supervised — the safe baseline
+/// used as the seed for migration-synthesized risk profiles.
 #[test]
-fn security_full_config_has_autonomy() {
-    let config = Config::default();
+fn security_default_risk_profile_is_supervised() {
+    let profile = RiskProfileConfig::default();
     assert_eq!(
-        format!("{:?}", config.autonomy.level),
+        format!("{:?}", profile.level),
         "Supervised",
-        "Default config autonomy should be Supervised"
+        "Default RiskProfileConfig autonomy level should be Supervised"
     );
 }
 
@@ -95,13 +96,13 @@ fn security_full_config_has_autonomy() {
 // Autonomy level serialization round-trip
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// AutonomyConfig serializes and deserializes correctly via TOML.
+/// RiskProfileConfig serializes and deserializes correctly via TOML.
 #[test]
 fn security_autonomy_config_toml_roundtrip() {
-    let original = AutonomyConfig::default();
-    let toml_str = toml::to_string(&original).expect("Failed to serialize AutonomyConfig");
-    let deserialized: AutonomyConfig =
-        toml::from_str(&toml_str).expect("Failed to deserialize AutonomyConfig");
+    let original = RiskProfileConfig::default();
+    let toml_str = toml::to_string(&original).expect("Failed to serialize RiskProfileConfig");
+    let deserialized: RiskProfileConfig =
+        toml::from_str(&toml_str).expect("Failed to deserialize RiskProfileConfig");
     assert_eq!(
         format!("{:?}", deserialized.level),
         format!("{:?}", original.level),
@@ -116,23 +117,23 @@ fn security_autonomy_config_toml_roundtrip() {
 /// ReadOnly autonomy level parses from TOML string (with all required fields).
 #[test]
 fn security_readonly_autonomy_parses() {
-    let original = AutonomyConfig::default();
+    let original = RiskProfileConfig::default();
     let mut toml_str = toml::to_string(&original).expect("Failed to serialize");
     // Override the level to readonly
     toml_str = toml_str.replace("level = \"supervised\"", "level = \"readonly\"");
-    let config: AutonomyConfig = toml::from_str(&toml_str).expect("Failed to parse readonly");
+    let config: RiskProfileConfig = toml::from_str(&toml_str).expect("Failed to parse readonly");
     assert_eq!(format!("{:?}", config.level), "ReadOnly");
 }
 
 /// Full autonomy level parses from TOML string (with all required fields).
 #[test]
 fn security_full_autonomy_parses() {
-    let original = AutonomyConfig::default();
+    let original = RiskProfileConfig::default();
     let mut toml_str = toml::to_string(&original).expect("Failed to serialize");
     // Override the level to full and workspace_only to false
     toml_str = toml_str.replace("level = \"supervised\"", "level = \"full\"");
     toml_str = toml_str.replace("workspace_only = true", "workspace_only = false");
-    let config: AutonomyConfig = toml::from_str(&toml_str).expect("Failed to parse full");
+    let config: RiskProfileConfig = toml::from_str(&toml_str).expect("Failed to parse full");
     assert_eq!(format!("{:?}", config.level), "Full");
     assert!(!config.workspace_only);
 }
@@ -145,14 +146,18 @@ fn security_full_autonomy_parses() {
 #[test]
 fn security_config_debug_does_not_leak_api_key() {
     let mut config = Config::default();
-    config.providers.fallback = Some("test".into());
-    config.providers.models.insert(
-        "test".into(),
-        zeroclaw::config::ModelProviderConfig {
-            api_key: Some("sk-1234567890abcdef".to_string()),
-            ..Default::default()
-        },
-    );
+    config
+        .providers
+        .models
+        .entry("test".into())
+        .or_default()
+        .insert(
+            "default".to_string(),
+            zeroclaw::config::ModelProviderConfig {
+                api_key: Some("sk-1234567890abcdef".to_string()),
+                ..Default::default()
+            },
+        );
 
     let debug_output = format!("{:?}", config);
 

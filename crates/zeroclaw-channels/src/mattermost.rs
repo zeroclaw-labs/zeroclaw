@@ -1,7 +1,8 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 const MAX_MATTERMOST_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
@@ -10,8 +11,19 @@ const MAX_MATTERMOST_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 /// Mattermost is API-compatible with many Slack patterns but uses a dedicated v4 structure.
 pub struct MattermostChannel {
     base_url: String, // e.g., https://mm.example.com
-    bot_token: String,
-    channel_id: Option<String>,
+    /// Static bot token from the config. Preferred over login when set.
+    bot_token: Option<String>,
+    /// Login ID for the password login flow. Used when `bot_token` is None.
+    login_id: Option<String>,
+    /// Password for the login flow. Used when `bot_token` is None.
+    password: Option<String>,
+    /// Resolved session token used by all API calls. Populated lazily on
+    /// first use, either by copying `bot_token` or by performing the login
+    /// flow with `login_id` and `password`.
+    session_token: OnceCell<String>,
+    /// Channel IDs to listen on. Currently only the first is used at runtime;
+    /// multi-channel listening lands separately.
+    channel_ids: Vec<String>,
     allowed_users: Vec<String>,
     /// When true (default), replies thread on the original post's root_id.
     /// When false, replies go to the channel root.
@@ -29,8 +41,10 @@ pub struct MattermostChannel {
 impl MattermostChannel {
     pub fn new(
         base_url: String,
-        bot_token: String,
-        channel_id: Option<String>,
+        bot_token: Option<String>,
+        login_id: Option<String>,
+        password: Option<String>,
+        channel_ids: Vec<String>,
         allowed_users: Vec<String>,
         thread_replies: bool,
         mention_only: bool,
@@ -40,7 +54,10 @@ impl MattermostChannel {
         Self {
             base_url,
             bot_token,
-            channel_id,
+            login_id,
+            password,
+            session_token: OnceCell::new(),
+            channel_ids,
             allowed_users,
             thread_replies,
             mention_only,
@@ -49,6 +66,61 @@ impl MattermostChannel {
             transcription: None,
             transcription_manager: None,
         }
+    }
+
+    /// Resolve the session token, performing the login flow on first call
+    /// if `bot_token` is not set.
+    async fn token(&self) -> Result<&str> {
+        self.session_token
+            .get_or_try_init(|| async {
+                if let Some(ref t) = self.bot_token {
+                    return Ok::<String, anyhow::Error>(t.clone());
+                }
+                let login_id = self.login_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Mattermost: bot_token is unset; configure either bot_token or both login_id and password"
+                    )
+                })?;
+                let password = self.password.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Mattermost: bot_token is unset and password is missing; both login_id and password must be set"
+                    )
+                })?;
+                self.login(login_id, password).await
+            })
+            .await
+            .map(String::as_str)
+    }
+
+    /// Perform the Mattermost password login flow and return the session
+    /// token. The session token is returned via the `Token` response header
+    /// per Mattermost API v4.
+    async fn login(&self, login_id: &str, password: &str) -> Result<String> {
+        let resp = self
+            .http_client()
+            .post(format!("{}/api/v4/users/login", self.base_url))
+            .json(&serde_json::json!({
+                "login_id": login_id,
+                "password": password,
+            }))
+            .send()
+            .await
+            .context("Mattermost login request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Mattermost login failed ({status}): {body}");
+        }
+        let token = resp
+            .headers()
+            .get("Token")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Mattermost login succeeded but the response had no Token header")
+            })?
+            .to_string();
+        tracing::info!("Mattermost login succeeded; session token cached");
+        Ok(token)
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -96,10 +168,17 @@ impl MattermostChannel {
     /// Get the bot's own user ID and username so we can ignore our own messages
     /// and detect @-mentions by username.
     async fn get_bot_identity(&self) -> (String, String) {
+        let token = match self.token().await {
+            Ok(t) => t.to_string(),
+            Err(e) => {
+                tracing::warn!("Mattermost auth failed in get_bot_identity: {e}");
+                return (String::new(), String::new());
+            }
+        };
         let resp: Option<serde_json::Value> = async {
             self.http_client()
                 .get(format!("{}/api/v4/users/me", self.base_url))
-                .bearer_auth(&self.bot_token)
+                .bearer_auth(&token)
                 .send()
                 .await
                 .ok()?
@@ -153,10 +232,17 @@ impl MattermostChannel {
             .and_then(|n| n.as_str())
             .unwrap_or("audio");
 
+        let token = match self.token().await {
+            Ok(t) => t.to_string(),
+            Err(e) => {
+                tracing::warn!("Mattermost: audio download auth failed for {file_id}: {e}");
+                return None;
+            }
+        };
         let response = match self
             .http_client()
             .get(format!("{}/api/v4/files/{}", self.base_url, file_id))
-            .bearer_auth(&self.bot_token)
+            .bearer_auth(&token)
             .send()
             .await
         {
@@ -235,10 +321,11 @@ impl Channel for MattermostChannel {
             );
         }
 
+        let token = self.token().await?;
         let resp = self
             .http_client()
             .post(format!("{}/api/v4/posts", self.base_url))
-            .bearer_auth(&self.bot_token)
+            .bearer_auth(token)
             .json(&body_map)
             .send()
             .await?;
@@ -256,10 +343,18 @@ impl Channel for MattermostChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let channel_id = self
-            .channel_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Mattermost channel_id required for listening"))?;
+        let channel_id = self.channel_ids.first().cloned().ok_or_else(|| {
+            anyhow::anyhow!("Mattermost channel_ids must contain at least one entry for listening")
+        })?;
+        if self.channel_ids.len() > 1 {
+            tracing::warn!(
+                "Mattermost channel_ids has {} entries; only the first ({channel_id}) is currently used for listening",
+                self.channel_ids.len()
+            );
+        }
+
+        // Resolve auth up front so misconfiguration fails fast at listen-time.
+        let initial_token = self.token().await?.to_string();
 
         let (bot_user_id, bot_username) = self.get_bot_identity().await;
         #[allow(clippy::cast_possible_truncation)]
@@ -279,7 +374,7 @@ impl Channel for MattermostChannel {
                     "{}/api/v4/channels/{}/posts",
                     self.base_url, channel_id
                 ))
-                .bearer_auth(&self.bot_token)
+                .bearer_auth(&initial_token)
                 .query(&[("since", last_create_at.to_string())])
                 .send()
                 .await
@@ -342,9 +437,12 @@ impl Channel for MattermostChannel {
     }
 
     async fn health_check(&self) -> bool {
+        let Ok(token) = self.token().await else {
+            return false;
+        };
         self.http_client()
             .get(format!("{}/api/v4/users/me", self.base_url))
-            .bearer_auth(&self.bot_token)
+            .bearer_auth(token)
             .send()
             .await
             .map(|r| r.status().is_success())
@@ -356,7 +454,7 @@ impl Channel for MattermostChannel {
         self.stop_typing(recipient).await?;
 
         let client = self.http_client();
-        let token = self.bot_token.clone();
+        let token = self.token().await?.to_string();
         let base_url = self.base_url.clone();
 
         // recipient is "channel_id" or "channel_id:root_id"
@@ -624,8 +722,10 @@ mod tests {
     fn make_channel(allowed: Vec<String>, thread_replies: bool) -> MattermostChannel {
         MattermostChannel::new(
             "url".into(),
-            "token".into(),
+            Some("token".into()),
             None,
+            None,
+            Vec::new(),
             allowed,
             thread_replies,
             false,
@@ -636,8 +736,10 @@ mod tests {
     fn make_mention_only_channel() -> MattermostChannel {
         MattermostChannel::new(
             "url".into(),
-            "token".into(),
+            Some("token".into()),
             None,
+            None,
+            Vec::new(),
             vec!["*".into()],
             true,
             true,
@@ -648,8 +750,10 @@ mod tests {
     fn mattermost_url_trimming() {
         let ch = MattermostChannel::new(
             "https://mm.example.com/".into(),
-            "token".into(),
+            Some("token".into()),
             None,
+            None,
+            Vec::new(),
             vec![],
             false,
             false,
@@ -1429,8 +1533,10 @@ mod tests {
             let whisper_url = format!("{}/v1/audio/transcriptions", mock_server.uri());
             let ch = MattermostChannel::new(
                 mock_server.uri(),
-                "test_token".to_string(),
+                Some("test_token".to_string()),
                 None,
+                None,
+                Vec::new(),
                 vec!["*".into()],
                 false,
                 false,
@@ -1479,8 +1585,10 @@ mod tests {
 
             let ch = MattermostChannel::new(
                 mock_server.uri(),
-                "test_token".to_string(),
+                Some("test_token".to_string()),
                 None,
+                None,
+                Vec::new(),
                 vec!["*".into()],
                 false,
                 false,

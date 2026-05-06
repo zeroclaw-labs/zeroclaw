@@ -9,7 +9,7 @@ use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write as IoWrite;
@@ -32,7 +32,7 @@ pub struct Agent {
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
     memory_loader: Box<dyn MemoryLoader>,
-    config: zeroclaw_config::schema::AgentConfig,
+    config: zeroclaw_config::schema::DelegateAgentConfig,
     model_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
@@ -130,7 +130,7 @@ pub struct AgentBuilder {
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_loader: Option<Box<dyn MemoryLoader>>,
-    config: Option<zeroclaw_config::schema::AgentConfig>,
+    config: Option<zeroclaw_config::schema::DelegateAgentConfig>,
     model_name: Option<String>,
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
@@ -224,7 +224,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn config(mut self, config: zeroclaw_config::schema::AgentConfig) -> Self {
+    pub fn config(mut self, config: zeroclaw_config::schema::DelegateAgentConfig) -> Self {
         self.config = Some(config);
         self
     }
@@ -444,8 +444,8 @@ impl Agent {
         }
     }
 
-    pub async fn from_config(config: &Config) -> Result<Self> {
-        Self::from_config_with_session_cwd(config, None).await
+    pub async fn from_config(config: &Config, agent_alias: &str) -> Result<Self> {
+        Self::from_config_with_session_cwd(config, agent_alias, None).await
     }
 
     /// Build an Agent with an optional per-session working directory override.
@@ -460,9 +460,10 @@ impl Agent {
     /// IDE-provided `cwd` without relocating the agent's data directory.
     pub async fn from_config_with_session_cwd(
         config: &Config,
+        agent_alias: &str,
         session_cwd: Option<&Path>,
     ) -> Result<Self> {
-        Self::from_config_with_session_cwd_and_mcp(config, session_cwd, true).await
+        Self::from_config_with_session_cwd_and_mcp(config, agent_alias, session_cwd, true).await
     }
 
     /// Build an Agent while optionally skipping eager MCP initialization.
@@ -472,26 +473,38 @@ impl Agent {
     /// they time out, so ACP uses this with `initialize_mcp = false`.
     pub async fn from_config_with_session_cwd_and_mcp(
         config: &Config,
+        agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
     ) -> Result<Self> {
+        let agent_cfg = config
+            .agent(agent_alias)
+            .with_context(|| format!("agents.{agent_alias} is not configured"))?;
+        let risk_profile = config
+            .risk_profile_for_agent(agent_alias)
+            .with_context(|| {
+                format!(
+                    "agents.{agent_alias}.risk_profile does not name a configured risk_profiles entry"
+                )
+            })?;
+
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            risk_profile,
             session_cwd.unwrap_or(&config.workspace_dir),
         ));
 
-        let fallback_provider_ag = config.providers.fallback_provider();
+        let primary_provider = config.providers.first_provider();
         let memory: Arc<dyn Memory> =
             Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
                 &config.providers.embedding_routes,
-                Some(&config.storage.provider.config),
+                config.resolve_active_storage(),
                 &config.workspace_dir,
-                fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
+                primary_provider.and_then(|e| e.api_key.as_deref()),
             )?);
 
         let composio_key = if config.composio.enabled {
@@ -515,6 +528,8 @@ impl Agent {
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
+            risk_profile,
+            agent_alias,
             runtime,
             memory.clone(),
             composio_key,
@@ -524,7 +539,7 @@ impl Agent {
             &config.web_fetch,
             &security.workspace_dir,
             &config.agents,
-            fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
+            primary_provider.and_then(|e| e.api_key.as_deref()),
             config,
             None,
         );
@@ -590,9 +605,12 @@ impl Agent {
             }
         }
 
-        let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
+        let provider_name = config
+            .providers
+            .first_provider_type()
+            .unwrap_or("openrouter");
 
-        let model_name = match fallback_provider_ag
+        let model_name = match primary_provider
             .and_then(|e| e.model.as_deref())
             .map(str::trim)
             .filter(|m| !m.is_empty())
@@ -611,11 +629,9 @@ impl Agent {
                 }
                 None => {
                     anyhow::bail!(
-                        "no model configured: providers.fallback = {:?} resolves with no model, \
-                         and no [[providers.models.*]] entry has a `model` field set. \
-                         Configure at least one [providers.models.<name>] model = \"...\" \
-                         or define a [[model_routes]] hint.",
-                        config.providers.fallback,
+                        "no model configured: providers.models is empty or has no `model` field \
+                         set. Configure at least one [providers.models.<type>.<alias>] \
+                         model = \"...\" or define a [[model_routes]] hint.",
                     )
                 }
             },
@@ -626,15 +642,15 @@ impl Agent {
 
         let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
             provider_name,
-            fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
-            fallback_provider_ag.and_then(|e| e.base_url.as_deref()),
+            primary_provider.and_then(|e| e.api_key.as_deref()),
+            primary_provider.and_then(|e| e.base_url.as_deref()),
             &config.reliability,
             &config.providers.model_routes,
             &model_name,
             &provider_runtime_options,
         )?;
 
-        let dispatcher_choice = config.agent.tool_dispatcher.as_str();
+        let dispatcher_choice = agent_cfg.tool_dispatcher.as_str();
         let tool_dispatcher: Box<dyn ToolDispatcher> = match dispatcher_choice {
             "native" => Box::new(NativeToolDispatcher),
             "xml" => Box::new(XmlToolDispatcher),
@@ -663,10 +679,10 @@ impl Agent {
             None
         };
 
-        // Filter out excluded tools (non_cli_excluded_tools). The channel
-        // orchestrator applies this, but Agent::from_config (used by ws.rs)
-        // doesn't go through that path.
-        let excluded = &config.autonomy.non_cli_excluded_tools;
+        // Filter out tools excluded by this agent's risk profile. The
+        // channel orchestrator applies this for channel-driven runs, but
+        // Agent::from_config (used by ws.rs) doesn't go through that path.
+        let excluded = &risk_profile.excluded_tools;
         if !excluded.is_empty() {
             tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
         }
@@ -688,13 +704,9 @@ impl Agent {
                 config.memory.min_relevance_score,
             )))
             .prompt_builder(SystemPromptBuilder::with_defaults())
-            .config(config.agent.clone())
+            .config(agent_cfg.clone())
             .model_name(model_name)
-            .temperature(
-                fallback_provider_ag
-                    .and_then(|e| e.temperature)
-                    .unwrap_or(0.7),
-            )
+            .temperature(primary_provider.and_then(|e| e.temperature).unwrap_or(0.7))
             .workspace_dir(security.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
@@ -704,7 +716,7 @@ impl Agent {
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
             .security_summary(Some(security.prompt_summary()))
-            .autonomy_level(config.autonomy.level)
+            .autonomy_level(risk_profile.level)
             .activated_tools(activated_tools)
             .hook_runner(if config.hooks.enabled {
                 let mut runner = crate::hooks::HookRunner::new();
@@ -721,7 +733,7 @@ impl Agent {
                 None
             })
             .approval_manager(Some(Arc::new(ApprovalManager::for_non_interactive(
-                &config.autonomy,
+                risk_profile,
             ))))
             .build()?;
 
@@ -1625,6 +1637,7 @@ impl Agent {
 
 pub async fn run(
     config: Config,
+    agent_alias: &str,
     message: Option<String>,
     provider_override: Option<String>,
     model_override: Option<String>,
@@ -1634,19 +1647,38 @@ pub async fn run(
 
     let mut effective_config = config;
     if let Some(p) = provider_override {
-        effective_config.providers.fallback = Some(p);
+        // When a provider override is specified, ensure that provider type exists
+        // in models and is set as the first (and only) entry for routing purposes.
+        if let Some((type_key, alias_key)) = p.split_once('.') {
+            effective_config
+                .providers
+                .models
+                .entry(type_key.to_string())
+                .or_default()
+                .entry(alias_key.to_string())
+                .or_default();
+        } else {
+            effective_config
+                .providers
+                .models
+                .entry(p.clone())
+                .or_default()
+                .entry("default".to_string())
+                .or_default();
+        }
     }
-    if let Some(m) = model_override {
-        effective_config.ensure_fallback_provider().model = Some(m);
+    if let Some(entry) = effective_config.providers.first_provider_mut() {
+        if let Some(m) = model_override {
+            entry.model = Some(m);
+        }
+        entry.temperature = Some(temperature);
     }
-    effective_config.ensure_fallback_provider().temperature = Some(temperature);
 
-    let mut agent = Agent::from_config(&effective_config).await?;
+    let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
 
     let provider_name = effective_config
         .providers
-        .fallback
-        .as_deref()
+        .first_provider_type()
         .unwrap_or("openrouter")
         .to_string();
     // `Agent::from_config` above has already errored if no model could be resolved,
@@ -1655,7 +1687,7 @@ pub async fn run(
     // never silently substitute a hardcoded vendor model.
     let model_name = effective_config
         .providers
-        .fallback_provider()
+        .first_provider()
         .and_then(|e| e.model.as_deref())
         .map(str::trim)
         .filter(|m| !m.is_empty())
@@ -1902,9 +1934,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let tool_calls = Arc::new(AtomicUsize::new(0));
         let approval_requests = Arc::new(AtomicUsize::new(0));
-        let approval_cfg = zeroclaw_config::schema::AutonomyConfig {
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
             always_ask: vec!["echo".into()],
-            ..zeroclaw_config::schema::AutonomyConfig::default()
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
         let mut agent = Agent::builder()
             .provider(provider)
@@ -1959,9 +1991,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let tool_calls = Arc::new(AtomicUsize::new(0));
         let approval_requests = Arc::new(AtomicUsize::new(0));
-        let approval_cfg = zeroclaw_config::schema::AutonomyConfig {
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
             always_ask: vec!["echo".into()],
-            ..zeroclaw_config::schema::AutonomyConfig::default()
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
         let mut agent = Agent::builder()
             .provider(provider)
@@ -2147,7 +2179,7 @@ mod tests {
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let mock_addr = listener.local_addr().unwrap();
         let server_handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -2161,9 +2193,21 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Default::default()
         };
-        config.providers.fallback = Some(format!("custom:http://{addr}"));
         {
-            let entry = config.ensure_fallback_provider();
+            // Use the `custom:<url>` provider — it builds an
+            // OpenAiCompatibleProvider routed through the `compat`
+            // closure, which is the only path that actually wires
+            // `extra_headers` onto outgoing requests. (The native
+            // `openai` factory ignores extra_headers; OpenRouter
+            // hardcodes the upstream URL.)
+            let provider_type = format!("custom:http://{mock_addr}");
+            let entry = config
+                .providers
+                .models
+                .entry(provider_type)
+                .or_default()
+                .entry("default".to_string())
+                .or_default();
             entry.api_key = Some("test-key".to_string());
             entry.model = Some("test-model".to_string());
             entry.extra_headers.insert(
@@ -2177,7 +2221,28 @@ mod tests {
         config.memory.backend = "none".to_string();
         config.memory.auto_save = false;
 
-        let mut agent = Agent::from_config(&config)
+        // V3 requires an explicit agent. Wire up a minimal agent that
+        // points at the synthesized provider entry, then construct
+        // Agent::from_config against it.
+        config.risk_profiles.insert(
+            "test-profile".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let provider_alias = config
+            .providers
+            .models
+            .keys()
+            .next()
+            .expect("provider configured above")
+            .clone();
+        let agent_cfg = zeroclaw_config::schema::DelegateAgentConfig {
+            model_provider: format!("{provider_alias}.default"),
+            risk_profile: "test-profile".to_string(),
+            ..zeroclaw_config::schema::DelegateAgentConfig::default()
+        };
+        config.agents.insert("test-agent".to_string(), agent_cfg);
+
+        let mut agent = Agent::from_config(&config, "test-agent")
             .await
             .expect("agent from config");
         let response = agent.turn("hello").await.expect("agent turn");
@@ -2674,9 +2739,9 @@ mod tests {
         // Force trimming with the boundary landing inside a pair:
         // 5 entries (AC, TR, AC, TR, AC) > 4 → drop_count = 1 → AC1 dropped,
         // TR1 left as an orphan unless the trim guards against it.
-        let agent_config = zeroclaw_config::schema::AgentConfig {
+        let agent_config = zeroclaw_config::schema::DelegateAgentConfig {
             max_history_messages: 4,
-            ..zeroclaw_config::schema::AgentConfig::default()
+            ..zeroclaw_config::schema::DelegateAgentConfig::default()
         };
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});

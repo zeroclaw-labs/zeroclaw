@@ -141,6 +141,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let mut nested_encrypt = Vec::new();
     let mut nested_decrypt = Vec::new();
 
+    // ── MaskSecrets codegen accumulators ──
+    let mut mask_ops = Vec::new();
+    let mut restore_ops = Vec::new();
+
     // ── Property codegen accumulators ──
     let mut prop_field_entries = Vec::new();
     let mut prop_names: Vec<String> = Vec::new();
@@ -160,9 +164,15 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     //    `handle_map_key` walks `Config::map_key_sections()` and matches
     //    on the path string — no hand-maintained list anywhere.
     let mut map_key_section_entries: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut get_map_keys_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut create_map_key_arms: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut delete_map_key_arms: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut rename_map_key_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut get_map_keys_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut create_map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut delete_map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut rename_map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
 
     for field in fields {
         let field_ident = field.ident.as_ref().expect("Named field must have ident");
@@ -188,6 +198,18 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             let category_lit = &category;
 
             if is_vec_string {
+                // Vec<String> with #[secret]: mask each element
+                mask_ops.push(quote! {
+                    for element in &mut self.#field_ident {
+                        crate::traits::mask_required_secret(element);
+                    }
+                });
+                restore_ops.push(quote! {
+                    for (element, cur) in self.#field_ident.iter_mut().zip(current.#field_ident.iter()) {
+                        crate::traits::restore_required_secret(element, cur);
+                    }
+                });
+
                 // Vec<String> with #[secret]: iterate elements for encrypt/decrypt
                 secret_field_entries.push(quote! {
                     crate::config::SecretFieldInfo {
@@ -213,6 +235,13 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
             } else if is_option {
+                mask_ops.push(quote! {
+                    crate::traits::mask_optional_secret(&mut self.#field_ident);
+                });
+                restore_ops.push(quote! {
+                    crate::traits::restore_optional_secret(&mut self.#field_ident, &current.#field_ident);
+                });
+
                 secret_field_entries.push(quote! {
                     crate::config::SecretFieldInfo {
                         name: #full_name_lit,
@@ -244,6 +273,13 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
             } else {
+                mask_ops.push(quote! {
+                    crate::traits::mask_required_secret(&mut self.#field_ident);
+                });
+                restore_ops.push(quote! {
+                    crate::traits::restore_required_secret(&mut self.#field_ident, &current.#field_ident);
+                });
+
                 secret_field_entries.push(quote! {
                     crate::config::SecretFieldInfo {
                         name: #full_name_lit,
@@ -275,161 +311,646 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             let hashmap_value_ty = extract_hashmap_value_type(&field.ty);
 
             if let Some(value_ty) = hashmap_value_ty {
-                // HashMap<String, T> with #[nested]: iterate values for secret ops
-                nested_collect.push(quote! {
-                    for inner in self.#field_ident.values() {
-                        fields.extend(inner.secret_fields());
-                    }
+                // Check whether this is a double-nested HashMap<String, HashMap<String, T>>.
+                let double_value_ty = extract_hashmap_value_type(value_ty);
+
+                // MaskSecrets — the blanket impl handles both single and double nesting.
+                mask_ops.push(quote! {
+                    crate::traits::MaskSecrets::mask_secrets(&mut self.#field_ident);
                 });
-                nested_set.push(quote! {
-                    for inner in self.#field_ident.values_mut() {
-                        if let Ok(()) = inner.set_secret(name, value.clone()) {
-                            return Ok(());
-                        }
-                    }
-                });
-                nested_encrypt.push(quote! {
-                    for inner in self.#field_ident.values_mut() {
-                        inner.encrypt_secrets(store)?;
-                    }
-                });
-                nested_decrypt.push(quote! {
-                    for inner in self.#field_ident.values_mut() {
-                        inner.decrypt_secrets(store)?;
-                    }
-                });
-                // Path routing through HashMap<String, T>: the one parser
-                // lives in `crate::config::route_hashmap_path` so get/set
-                // don't duplicate it. Paths look like
-                // `<my_prefix>.<field>.<key>.<inner_suffix>`; keys may contain
-                // dots/URLs, so the shared parser preserves the runtime key and
-                // splits on the final field separator. On a hit the dispatch is
-                // forwarded to the value type's own get_prop / set_prop via its
-                // `configurable_prefix()`.
-                let field_name_lit = snake_to_kebab(&field_ident.to_string());
-                nested_prop_is_secret.push(quote! {
-                    if let Some((_hm_key, inner_name)) = crate::config::route_hashmap_path(
-                        name,
-                        Self::configurable_prefix(),
-                        #field_name_lit,
-                        <#value_ty>::configurable_prefix(),
-                    ) && <#value_ty>::prop_is_secret(&inner_name)
-                    {
-                        return true;
-                    }
-                });
-                nested_get_prop.push(quote! {
-                    if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
-                        name,
-                        Self::configurable_prefix(),
-                        #field_name_lit,
-                        <#value_ty>::configurable_prefix(),
-                    ) && let Some(inner) = self.#field_ident.get(hm_key)
-                        && let Ok(val) = inner.get_prop(&inner_name)
-                    {
-                        return Ok(val);
-                    }
-                });
-                nested_set_prop.push(quote! {
-                    if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
-                        name,
-                        Self::configurable_prefix(),
-                        #field_name_lit,
-                        <#value_ty>::configurable_prefix(),
-                    ) && let Some(inner) = self.#field_ident.get_mut(hm_key)
-                        && let Ok(()) = inner.set_prop(&inner_name, value_str)
-                    {
-                        return Ok(());
-                    }
+                restore_ops.push(quote! {
+                    crate::traits::MaskSecrets::restore_secrets_from(&mut self.#field_ident, &current.#field_ident);
                 });
 
-                // Enumerate every HashMap entry and inject its runtime key
-                // into the child's static field paths: a child field named
-                // `<inner_prefix>.api-key` becomes
-                // `<my_prefix>.<field>.<hm_key>.api-key`. Without this, prop_fields()
-                // never surfaces e.g. `providers.models.anthropic.api-key`,
-                // so onboard has no way to prompt for it.
-                nested_prop_fields.push(quote! {
-                    {
-                        let inner_prefix = <#value_ty>::configurable_prefix();
-                        let outer_prefix = if Self::configurable_prefix().is_empty() {
-                            #field_name_lit.to_string()
-                        } else {
-                            format!("{}.{}", Self::configurable_prefix(), #field_name_lit)
-                        };
-                        for (hm_key, inner) in &self.#field_ident {
-                            let base = format!("{outer_prefix}.{hm_key}");
-                            for mut field in inner.prop_fields() {
-                                let leaf = field
-                                    .name
-                                    .strip_prefix(inner_prefix)
-                                    .and_then(|s| s.strip_prefix('.'))
-                                    .unwrap_or(field.name.as_str())
-                                    .to_string();
-                                field.name = if leaf.is_empty() {
-                                    base.clone()
-                                } else {
-                                    format!("{base}.{leaf}")
-                                };
-                                fields.push(field);
+                let field_name_lit = snake_to_kebab(&field_ident.to_string());
+                let field_doc = extract_doc(&field.attrs);
+                let value_ty_name = value_ty.to_token_stream().to_string();
+
+                if double_value_ty.is_none() {
+                    // Single-level `HashMap<String, T: Configurable>` only.
+                    // The double-nested branch below emits its own
+                    // `route_double_hashmap_path` based dispatch and does
+                    // not need the single-level `route_hashmap_path` ops
+                    // (they wouldn't typecheck against the inner HashMap).
+                    nested_set.push(quote! {
+                        for inner in self.#field_ident.values_mut() {
+                            if let Ok(()) = inner.set_secret(name, value.clone()) {
+                                return Ok(());
                             }
                         }
-                    }
-                });
+                    });
+                    nested_encrypt.push(quote! {
+                        for inner in self.#field_ident.values_mut() {
+                            inner.encrypt_secrets(store)?;
+                        }
+                    });
+                    nested_decrypt.push(quote! {
+                        for inner in self.#field_ident.values_mut() {
+                            inner.decrypt_secrets(store)?;
+                        }
+                    });
+                    // Path routing through HashMap<String, T>: the one parser
+                    // lives in `crate::config::route_hashmap_path` so get/set
+                    // don't duplicate it. Paths look like
+                    // `<my_prefix>.<field>.<key>.<inner_suffix>`; keys may contain
+                    // dots/URLs, so the shared parser preserves the runtime key and
+                    // splits on the final field separator. On a hit the dispatch is
+                    // forwarded to the value type's own get_prop / set_prop via its
+                    // `configurable_prefix()`.
+                    nested_prop_is_secret.push(quote! {
+                        if let Some((_hm_key, inner_name)) = crate::config::route_hashmap_path(
+                            name,
+                            Self::configurable_prefix(),
+                            #field_name_lit,
+                            <#value_ty>::configurable_prefix(),
+                        ) && <#value_ty>::prop_is_secret(&inner_name)
+                        {
+                            return true;
+                        }
+                    });
+                    nested_get_prop.push(quote! {
+                        if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
+                            name,
+                            Self::configurable_prefix(),
+                            #field_name_lit,
+                            <#value_ty>::configurable_prefix(),
+                        ) && let Some(inner) = self.#field_ident.get(hm_key)
+                            && let Ok(val) = inner.get_prop(&inner_name)
+                        {
+                            return Ok(val);
+                        }
+                    });
+                    nested_set_prop.push(quote! {
+                        if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
+                            name,
+                            Self::configurable_prefix(),
+                            #field_name_lit,
+                            <#value_ty>::configurable_prefix(),
+                        ) && let Some(inner) = self.#field_ident.get_mut(hm_key)
+                            && let Ok(()) = inner.set_prop(&inner_name, value_str)
+                        {
+                            return Ok(());
+                        }
+                    });
+                }
 
-                // ── Map-key section emission (HashMap<String, T>) ──
-                // The dashboard / CLI consume `Self::map_key_sections()` to
-                // surface "+ Add" affordances; `create_map_key()` is the
-                // typed insertion. Both auto-derived — no hand-table.
-                let value_ty_name = value_ty.to_token_stream().to_string();
-                let field_doc = extract_doc(&field.attrs);
-                map_key_section_entries.push(quote! {
-                    out.push(crate::config::MapKeySection {
-                        // Path is computed at static-init time via the
-                        // configurable_prefix const + field name literal.
-                        path: {
-                            // SAFETY: leak-once for static lifetime; runs
-                            // exactly per (Type, field) pair, bounded by the
-                            // schema's field count.
+                if let Some(inner_ty) = double_value_ty {
+                    // ── HashMap<String, HashMap<String, T: Configurable>> ──
+                    // Two-level alias map: outer key = type (e.g. "anthropic"),
+                    // inner key = alias (e.g. "default").  Paths look like
+                    // `<prefix>.<field>.<outer>.<inner>.<leaf>`.
+                    let inner_ty_name = inner_ty.to_token_stream().to_string();
+
+                    nested_collect.push(quote! {
+                        for inner_map in self.#field_ident.values() {
+                            for inner in inner_map.values() {
+                                fields.extend(inner.secret_fields());
+                            }
+                        }
+                    });
+                    nested_set.push(quote! {
+                        for inner_map in self.#field_ident.values_mut() {
+                            for inner in inner_map.values_mut() {
+                                if let Ok(()) = inner.set_secret(name, value.clone()) {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    });
+                    nested_encrypt.push(quote! {
+                        for inner_map in self.#field_ident.values_mut() {
+                            for inner in inner_map.values_mut() {
+                                inner.encrypt_secrets(store)?;
+                            }
+                        }
+                    });
+                    nested_decrypt.push(quote! {
+                        for inner_map in self.#field_ident.values_mut() {
+                            for inner in inner_map.values_mut() {
+                                inner.decrypt_secrets(store)?;
+                            }
+                        }
+                    });
+
+                    // Outer-key disambiguation for double-nested HashMaps:
+                    // outer keys may legitimately contain dots (URL-keyed
+                    // custom provider types like `custom:https://example/v1`),
+                    // so a left-to-right `split_once('.')` would mis-route.
+                    // For instance-aware paths (get/set), match against the
+                    // actual map keys present and pick the longest match.
+                    // For prop_is_secret (type-only, no instance), iterate
+                    // every plausible `<outer>.<alias>.<suffix>` split where
+                    // `<alias>` passes alias validation, and OR the
+                    // T::prop_is_secret answers — false negatives here mean
+                    // a secret leak through encryption-skip.
+                    nested_prop_is_secret.push(quote! {
+                        {
+                            let path_prefix = if Self::configurable_prefix().is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{}.{}", Self::configurable_prefix(), #field_name_lit)
+                            };
+                            if let Some(rest) = name
+                                .strip_prefix(&path_prefix)
+                                .and_then(|s| s.strip_prefix('.'))
+                            {
+                                let dots: Vec<usize> = rest
+                                    .match_indices('.')
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                for window in dots.windows(2) {
+                                    let outer_end = window[0];
+                                    let inner_end = window[1];
+                                    let inner_key = &rest[outer_end + 1..inner_end];
+                                    if crate::config::validate_alias_key(inner_key).is_err() {
+                                        continue;
+                                    }
+                                    let inner_suffix = &rest[inner_end + 1..];
+                                    let inner_prefix = <#inner_ty>::configurable_prefix();
+                                    let inner_name = if inner_prefix.is_empty() {
+                                        inner_suffix.to_string()
+                                    } else {
+                                        format!("{inner_prefix}.{inner_suffix}")
+                                    };
+                                    if <#inner_ty>::prop_is_secret(&inner_name) {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    nested_get_prop.push(quote! {
+                        {
+                            let path_prefix = if Self::configurable_prefix().is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{}.{}", Self::configurable_prefix(), #field_name_lit)
+                            };
+                            if let Some(rest) = name
+                                .strip_prefix(&path_prefix)
+                                .and_then(|s| s.strip_prefix('.'))
+                            {
+                                let mut matches: Vec<(String, String)> = self.#field_ident
+                                    .keys()
+                                    .filter_map(|k| {
+                                        let needle = format!("{k}.");
+                                        rest.strip_prefix(&needle)
+                                            .map(|after| (k.clone(), after.to_string()))
+                                    })
+                                    .collect();
+                                matches.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                                for (outer_key, after_outer) in matches {
+                                    let Some((inner_key, inner_suffix)) =
+                                        after_outer.split_once('.')
+                                    else {
+                                        continue;
+                                    };
+                                    let inner_prefix = <#inner_ty>::configurable_prefix();
+                                    let inner_name = if inner_prefix.is_empty() {
+                                        inner_suffix.to_string()
+                                    } else {
+                                        format!("{inner_prefix}.{inner_suffix}")
+                                    };
+                                    if let Some(inner_map) = self.#field_ident.get(&outer_key)
+                                        && let Some(inner) = inner_map.get(inner_key)
+                                        && let Ok(val) = inner.get_prop(&inner_name)
+                                    {
+                                        return Ok(val);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    nested_set_prop.push(quote! {
+                        {
+                            let path_prefix = if Self::configurable_prefix().is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{}.{}", Self::configurable_prefix(), #field_name_lit)
+                            };
+                            if let Some(rest) = name
+                                .strip_prefix(&path_prefix)
+                                .and_then(|s| s.strip_prefix('.'))
+                            {
+                                let mut matches: Vec<(String, String)> = self.#field_ident
+                                    .keys()
+                                    .filter_map(|k| {
+                                        let needle = format!("{k}.");
+                                        rest.strip_prefix(&needle)
+                                            .map(|after| (k.clone(), after.to_string()))
+                                    })
+                                    .collect();
+                                matches.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                                for (outer_key, after_outer) in matches {
+                                    let Some((inner_key, inner_suffix)) =
+                                        after_outer.split_once('.')
+                                    else {
+                                        continue;
+                                    };
+                                    let inner_key = inner_key.to_string();
+                                    let inner_prefix = <#inner_ty>::configurable_prefix();
+                                    let inner_name = if inner_prefix.is_empty() {
+                                        inner_suffix.to_string()
+                                    } else {
+                                        format!("{inner_prefix}.{inner_suffix}")
+                                    };
+                                    if let Some(inner_map) = self.#field_ident.get_mut(&outer_key)
+                                        && let Some(inner) = inner_map.get_mut(&inner_key)
+                                        && inner.set_prop(&inner_name, value_str).is_ok()
+                                    {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    nested_prop_fields.push(quote! {
+                        {
+                            let inner_prefix = <#inner_ty>::configurable_prefix();
+                            let outer_base = if Self::configurable_prefix().is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{}.{}", Self::configurable_prefix(), #field_name_lit)
+                            };
+                            for (outer_key, inner_map) in &self.#field_ident {
+                                let type_base = format!("{outer_base}.{outer_key}");
+                                for (inner_key, inner) in inner_map {
+                                    let alias_base = format!("{type_base}.{inner_key}");
+                                    for mut field in inner.prop_fields() {
+                                        let leaf = field
+                                            .name
+                                            .strip_prefix(inner_prefix)
+                                            .and_then(|s| s.strip_prefix('.'))
+                                            .unwrap_or(field.name.as_str())
+                                            .to_string();
+                                        field.name = if leaf.is_empty() {
+                                            alias_base.clone()
+                                        } else {
+                                            format!("{alias_base}.{leaf}")
+                                        };
+                                        fields.push(field);
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    // map_key_sections: expose the outer path as a Map section.
+                    // value_type names the leaf type (T), not the intermediate
+                    // HashMap<String, T>, so the dashboard knows what shape it
+                    // is actually creating.
+                    map_key_section_entries.push(quote! {
+                        out.push(crate::config::MapKeySection {
+                            path: {
+                                let prefix = Self::configurable_prefix();
+                                let s = if prefix.is_empty() {
+                                    #field_name_lit.to_string()
+                                } else {
+                                    format!("{prefix}.{}", #field_name_lit)
+                                };
+                                Box::leak(s.into_boxed_str())
+                            },
+                            kind: crate::config::MapKeyKind::Map,
+                            value_type: #inner_ty_name,
+                            description: #field_doc,
+                        });
+                    });
+
+                    // create_map_key: two arms.
+                    // Arm 1: outer key creates type bucket + pre-inserts "default" alias.
+                    // Arm 2: `<outer_path>.<outer_key>` creates an alias in existing bucket.
+                    create_map_key_arms.push(quote! {
+                        {
                             let prefix = Self::configurable_prefix();
-                            let s = if prefix.is_empty() {
+                            let outer_expected = if prefix.is_empty() {
                                 #field_name_lit.to_string()
                             } else {
                                 format!("{prefix}.{}", #field_name_lit)
                             };
-                            Box::leak(s.into_boxed_str())
-                        },
-                        kind: crate::config::MapKeyKind::Map,
-                        value_type: #value_ty_name,
-                        description: #field_doc,
+                            if section_path == outer_expected {
+                                // map_key here is the type name (e.g. "anthropic") — no alias
+                                // is implied. Create an empty inner map; callers add aliases
+                                // separately via a second create_map_key on the inner path.
+                                let already_exists = self.#field_ident.contains_key(map_key);
+                                if !already_exists {
+                                    self.#field_ident.insert(
+                                        map_key.to_string(),
+                                        std::collections::HashMap::new(),
+                                    );
+                                }
+                                return Ok(!already_exists);
+                            }
+                            let inner_expected_prefix = format!("{outer_expected}.");
+                            if let Some(outer_key) = section_path.strip_prefix(&inner_expected_prefix) {
+                                if let Some(inner_map) = self.#field_ident.get_mut(outer_key) {
+                                    crate::config::validate_alias_key(map_key)
+                                        .map_err(|e| e)?;
+                                    if inner_map.contains_key(map_key) {
+                                        return Ok(false);
+                                    }
+                                    inner_map.insert(map_key.to_string(), <#inner_ty>::default());
+                                    return Ok(true);
+                                }
+                                return Err(format!(
+                                    "outer key `{outer_key}` not found in `{outer_expected}`",
+                                ));
+                            }
+                        }
                     });
-                });
-                create_map_key_arms.push(quote! {
-                    {
-                        let prefix = Self::configurable_prefix();
-                        let expected = if prefix.is_empty() {
-                            #field_name_lit.to_string()
-                        } else {
-                            format!("{prefix}.{}", #field_name_lit)
-                        };
-                        if section_path == expected {
-                            if self.#field_ident.contains_key(map_key) {
+
+                    // get_map_keys for double-nested HashMap.
+                    get_map_keys_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let outer_expected = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            if section_path == outer_expected {
+                                return Some(self.#field_ident.keys().cloned().collect());
+                            }
+                            let inner_expected_prefix = format!("{outer_expected}.");
+                            if let Some(outer_key) = section_path.strip_prefix(&inner_expected_prefix) {
+                                if let Some(inner_map) = self.#field_ident.get(outer_key) {
+                                    return Some(inner_map.keys().cloned().collect());
+                                }
+                                return Some(vec![]);
+                            }
+                        }
+                    });
+
+                    // delete_map_key for double-nested HashMap.
+                    // section_path == outer_expected → delete entire type bucket.
+                    // section_path == outer_expected.<outer_key> → delete one alias.
+                    delete_map_key_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let outer_expected = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            if section_path == outer_expected {
+                                let removed = self.#field_ident.remove(map_key).is_some();
+                                return Ok(removed);
+                            }
+                            let inner_expected_prefix = format!("{outer_expected}.");
+                            if let Some(outer_key) = section_path.strip_prefix(&inner_expected_prefix) {
+                                if let Some(inner_map) = self.#field_ident.get_mut(outer_key) {
+                                    let removed = inner_map.remove(map_key).is_some();
+                                    return Ok(removed);
+                                }
+                                return Err(format!(
+                                    "outer key `{outer_key}` not found in `{outer_expected}`",
+                                ));
+                            }
+                        }
+                    });
+
+                    // rename_map_key for double-nested HashMap.
+                    rename_map_key_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let outer_expected = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            let inner_expected_prefix = format!("{outer_expected}.");
+                            if let Some(outer_key) = section_path.strip_prefix(&inner_expected_prefix) {
+                                if let Some(inner_map) = self.#field_ident.get_mut(outer_key) {
+                                    crate::config::validate_alias_key(new_key)
+                                        .map_err(|e| e)?;
+                                    if inner_map.contains_key(new_key) {
+                                        return Err(format!("alias `{new_key}` already exists"));
+                                    }
+                                    if let Some(val) = inner_map.remove(map_key) {
+                                        inner_map.insert(new_key.to_string(), val);
+                                        return Ok(true);
+                                    }
+                                    return Ok(false);
+                                }
+                                return Err(format!(
+                                    "outer key `{outer_key}` not found in `{outer_expected}`",
+                                ));
+                            }
+                        }
+                    });
+                } else {
+                    // ── HashMap<String, T: Configurable> (single-level) ──
+
+                    nested_collect.push(quote! {
+                        for inner in self.#field_ident.values() {
+                            fields.extend(inner.secret_fields());
+                        }
+                    });
+                    nested_set.push(quote! {
+                        for inner in self.#field_ident.values_mut() {
+                            if let Ok(()) = inner.set_secret(name, value.clone()) {
+                                return Ok(());
+                            }
+                        }
+                    });
+                    nested_encrypt.push(quote! {
+                        for inner in self.#field_ident.values_mut() {
+                            inner.encrypt_secrets(store)?;
+                        }
+                    });
+                    nested_decrypt.push(quote! {
+                        for inner in self.#field_ident.values_mut() {
+                            inner.decrypt_secrets(store)?;
+                        }
+                    });
+                    // Path routing through HashMap<String, T>: the one parser
+                    // lives in `crate::config::route_hashmap_path` so get/set
+                    // don't duplicate it. Paths look like
+                    // `<my_prefix>.<field>.<key>.<inner_suffix>`; on a hit the
+                    // dispatch is forwarded to the value type's own get_prop /
+                    // set_prop via its `configurable_prefix()`.
+                    nested_prop_is_secret.push(quote! {
+                        if let Some((_hm_key, inner_name)) = crate::config::route_hashmap_path(
+                            name,
+                            Self::configurable_prefix(),
+                            #field_name_lit,
+                            <#value_ty>::configurable_prefix(),
+                        ) && <#value_ty>::prop_is_secret(&inner_name)
+                        {
+                            return true;
+                        }
+                    });
+                    nested_get_prop.push(quote! {
+                        if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
+                            name,
+                            Self::configurable_prefix(),
+                            #field_name_lit,
+                            <#value_ty>::configurable_prefix(),
+                        ) && let Some(inner) = self.#field_ident.get(hm_key)
+                            && let Ok(val) = inner.get_prop(&inner_name)
+                        {
+                            return Ok(val);
+                        }
+                    });
+                    nested_set_prop.push(quote! {
+                        if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
+                            name,
+                            Self::configurable_prefix(),
+                            #field_name_lit,
+                            <#value_ty>::configurable_prefix(),
+                        ) && let Some(inner) = self.#field_ident.get_mut(hm_key)
+                            && let Ok(()) = inner.set_prop(&inner_name, value_str)
+                        {
+                            return Ok(());
+                        }
+                    });
+
+                    // Enumerate every HashMap entry and inject its runtime key
+                    // into the child's static field paths: a child field named
+                    // `<inner_prefix>.api-key` becomes
+                    // `<my_prefix>.<field>.<hm_key>.api-key`. Without this, prop_fields()
+                    // never surfaces e.g. `providers.models.anthropic.default.api-key`,
+                    // so onboard has no way to prompt for it.
+                    nested_prop_fields.push(quote! {
+                        {
+                            let inner_prefix = <#value_ty>::configurable_prefix();
+                            let outer_prefix = if Self::configurable_prefix().is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{}.{}", Self::configurable_prefix(), #field_name_lit)
+                            };
+                            for (hm_key, inner) in &self.#field_ident {
+                                let base = format!("{outer_prefix}.{hm_key}");
+                                for mut field in inner.prop_fields() {
+                                    let leaf = field
+                                        .name
+                                        .strip_prefix(inner_prefix)
+                                        .and_then(|s| s.strip_prefix('.'))
+                                        .unwrap_or(field.name.as_str())
+                                        .to_string();
+                                    field.name = if leaf.is_empty() {
+                                        base.clone()
+                                    } else {
+                                        format!("{base}.{leaf}")
+                                    };
+                                    fields.push(field);
+                                }
+                            }
+                        }
+                    });
+
+                    // ── Map-key section emission (HashMap<String, T>) ──
+                    // The dashboard / CLI consume `Self::map_key_sections()` to
+                    // surface "+ Add" affordances; `create_map_key()` is the
+                    // typed insertion. Both auto-derived — no hand-table.
+                    map_key_section_entries.push(quote! {
+                        out.push(crate::config::MapKeySection {
+                            // Path is computed at static-init time via the
+                            // configurable_prefix const + field name literal.
+                            path: {
+                                // SAFETY: leak-once for static lifetime; runs
+                                // exactly per (Type, field) pair, bounded by the
+                                // schema's field count.
+                                let prefix = Self::configurable_prefix();
+                                let s = if prefix.is_empty() {
+                                    #field_name_lit.to_string()
+                                } else {
+                                    format!("{prefix}.{}", #field_name_lit)
+                                };
+                                Box::leak(s.into_boxed_str())
+                            },
+                            kind: crate::config::MapKeyKind::Map,
+                            value_type: #value_ty_name,
+                            description: #field_doc,
+                        });
+                    });
+                    create_map_key_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let expected = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            if section_path == expected {
+                                crate::config::validate_alias_key(map_key)
+                                    .map_err(|e| e)?;
+                                if self.#field_ident.contains_key(map_key) {
+                                    return Ok(false);
+                                }
+                                self.#field_ident.insert(map_key.to_string(), <#value_ty>::default());
+                                return Ok(true);
+                            }
+                        }
+                    });
+
+                    // get_map_keys for single-level HashMap.
+                    get_map_keys_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let expected = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            if section_path == expected {
+                                return Some(self.#field_ident.keys().cloned().collect());
+                            }
+                        }
+                    });
+
+                    // delete_map_key for single-level HashMap.
+                    delete_map_key_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let expected = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            if section_path == expected {
+                                let removed = self.#field_ident.remove(map_key).is_some();
+                                return Ok(removed);
+                            }
+                        }
+                    });
+
+                    // rename_map_key for single-level HashMap.
+                    rename_map_key_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let expected = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            if section_path == expected {
+                                crate::config::validate_alias_key(new_key)
+                                    .map_err(|e| e)?;
+                                if self.#field_ident.contains_key(new_key) {
+                                    return Err(format!("alias `{new_key}` already exists"));
+                                }
+                                if let Some(val) = self.#field_ident.remove(map_key) {
+                                    self.#field_ident.insert(new_key.to_string(), val);
+                                    return Ok(true);
+                                }
                                 return Ok(false);
                             }
-                            let value: #value_ty = serde_json::from_value(
-                                serde_json::json!({}),
-                            ).map_err(|e| format!(
-                                "default-construct {} failed: {e}",
-                                stringify!(#value_ty)
-                            ))?;
-                            self.#field_ident.insert(map_key.to_string(), value);
-                            return Ok(true);
                         }
-                    }
-                });
+                    });
+                } // end single-level HashMap branch
 
                 continue;
             } else if is_option {
+                mask_ops.push(quote! {
+                    if let Some(inner) = &mut self.#field_ident { inner.mask_secrets(); }
+                });
+                restore_ops.push(quote! {
+                    if let Some(inner) = &mut self.#field_ident {
+                        if let Some(cur) = &current.#field_ident { inner.restore_secrets_from(cur); }
+                    }
+                });
+
                 nested_collect.push(quote! {
                     if let Some(inner) = &self.#field_ident {
                         fields.extend(inner.secret_fields());
@@ -598,6 +1119,13 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     self.#field_ident.decrypt_secrets(store)?;
                 });
 
+                mask_ops.push(quote! {
+                    self.#field_ident.mask_secrets();
+                });
+                restore_ops.push(quote! {
+                    self.#field_ident.restore_secrets_from(&current.#field_ident);
+                });
+
                 // ── Nested property delegation (non-Option) ──
                 nested_prop_fields.push(quote! {
                     fields.extend(self.#field_ident.prop_fields());
@@ -634,9 +1162,24 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 map_key_recurse.push(quote! {
                     out.extend(<#field_ty>::map_key_sections());
                 });
+                get_map_keys_recurse.push(quote! {
+                    if let Some(keys) = self.#field_ident.get_map_keys(section_path) {
+                        return Some(keys);
+                    }
+                });
                 create_map_key_recurse.push(quote! {
                     if let Ok(created) = self.#field_ident.create_map_key(section_path, map_key) {
                         return Ok(created);
+                    }
+                });
+                delete_map_key_recurse.push(quote! {
+                    if let Ok(removed) = self.#field_ident.delete_map_key(section_path, map_key) {
+                        return Ok(removed);
+                    }
+                });
+                rename_map_key_recurse.push(quote! {
+                    if let Ok(renamed) = self.#field_ident.rename_map_key(section_path, map_key, new_key) {
+                        return Ok(renamed);
                     }
                 });
 
@@ -901,6 +1444,14 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 out
             }
 
+            /// Return the current alias keys at `section_path`, or `None` if
+            /// the path doesn't resolve to a map-keyed section in this tree.
+            pub fn get_map_keys(&self, section_path: &str) -> Option<Vec<String>> {
+                #(#get_map_keys_arms)*
+                #(#get_map_keys_recurse)*
+                None
+            }
+
             /// Insert a default-valued entry under a map-keyed section, or
             /// append to a list-shaped one, with `map_key` as the new entry's
             /// natural identifier (HashMap key for Map sections; identifier
@@ -921,6 +1472,56 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     section_path,
                     Self::configurable_prefix(),
                 ))
+            }
+
+            /// Remove the entry identified by `map_key` from the map-keyed
+            /// section at `section_path`.
+            ///
+            /// Returns `Ok(true)` if the entry existed and was removed,
+            /// `Ok(false)` if it didn't exist, or `Err(reason)` if the
+            /// section path doesn't resolve.
+            pub fn delete_map_key(
+                &mut self,
+                section_path: &str,
+                map_key: &str,
+            ) -> Result<bool, String> {
+                #(#delete_map_key_arms)*
+                #(#delete_map_key_recurse)*
+                Err(format!(
+                    "no map-keyed/list section at `{}` in `{}`",
+                    section_path,
+                    Self::configurable_prefix(),
+                ))
+            }
+
+            /// Rename `map_key` to `new_key` within the map-keyed section at
+            /// `section_path`, preserving the entry's value.
+            ///
+            /// Returns `Ok(true)` if renamed, `Ok(false)` if `map_key` didn't
+            /// exist, or `Err(reason)` if `new_key` already exists or the
+            /// section path doesn't resolve.
+            pub fn rename_map_key(
+                &mut self,
+                section_path: &str,
+                map_key: &str,
+                new_key: &str,
+            ) -> Result<bool, String> {
+                #(#rename_map_key_arms)*
+                #(#rename_map_key_recurse)*
+                Err(format!(
+                    "no map-keyed/list section at `{}` in `{}`",
+                    section_path,
+                    Self::configurable_prefix(),
+                ))
+            }
+        }
+
+        impl crate::traits::MaskSecrets for #struct_name {
+            fn mask_secrets(&mut self) {
+                #(#mask_ops)*
+            }
+            fn restore_secrets_from(&mut self, current: &Self) {
+                #(#restore_ops)*
             }
         }
     };

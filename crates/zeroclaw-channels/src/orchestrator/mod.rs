@@ -27,7 +27,6 @@ pub use crate::bluesky::BlueskyChannel;
 pub use crate::clawdtalk::ClawdTalkChannel;
 pub use crate::dingtalk::DingTalkChannel;
 pub use crate::discord::DiscordChannel;
-pub use crate::discord_history::DiscordHistoryChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::email_channel::EmailChannel;
 #[cfg(feature = "channel-email")]
@@ -336,7 +335,7 @@ impl InterruptOnNewMessageConfig {
 #[derive(Clone)]
 struct ChannelCostTrackingState {
     tracker: Arc<zeroclaw_runtime::cost::CostTracker>,
-    prices: Arc<HashMap<String, zeroclaw_config::schema::ModelPricing>>,
+    model_provider_pricing: Arc<zeroclaw_runtime::agent::cost::ModelProviderPricing>,
 }
 
 #[derive(Clone)]
@@ -344,6 +343,10 @@ struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
     provider: Arc<dyn Provider>,
     default_provider: Arc<String>,
+    /// Resolved delegate-agent config for the agent owning this
+    /// runtime context. Per-channel agent dispatch (one agent per
+    /// channel.<type>.<alias>) is a follow-up.
+    agent_cfg: Arc<zeroclaw_config::schema::DelegateAgentConfig>,
     prompt_config: Arc<zeroclaw_config::schema::Config>,
     memory: Arc<dyn Memory>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
@@ -841,62 +844,66 @@ fn resolve_provider_alias(name: &str) -> Option<String> {
 fn resolved_default_provider(config: &Config) -> String {
     config
         .providers
-        .fallback
-        .clone()
-        .unwrap_or_else(|| "openrouter".to_string())
+        .first_provider_type()
+        .unwrap_or("openrouter")
+        .to_string()
 }
 
-/// Three-step model resolution mirroring `agent::Agent::from_config` (#6099):
-/// (1) the fallback provider's `model`, (2) the first configured
-/// `[providers.models.*]` model with a WARN naming what to set,
-/// (3) hard fail with an actionable error. No silent vendor-default.
+/// Resolve the default model for channel startup: the first configured
+/// `[providers.models.<type>.<alias>]` entry's `model` field. Hard-fails
+/// with an actionable error when nothing is configured (#6099,
+/// #6215). V3 has no global fallback provider — every callsite either
+/// resolves through an agent's `model_provider` or comes through
+/// `first_provider()`.
 fn resolved_default_model(config: &Config) -> anyhow::Result<String> {
-    let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
     if let Some(m) = config
         .providers
-        .fallback_provider()
+        .first_provider()
         .and_then(|e| e.model.as_deref())
         .map(str::trim)
         .filter(|m| !m.is_empty())
     {
         return Ok(m.to_string());
     }
-    if let Some(m) = config.providers.resolve_default_model() {
-        tracing::warn!(
-            provider = provider_name,
-            model = %m,
-            "fallback provider has no `model` set; using first configured \
-             providers.models entry as default. Set [providers.models.{provider_name}] \
-             model = \"...\" to silence this warning.",
-        );
-        return Ok(m);
-    }
     anyhow::bail!(
-        "no model configured: providers.fallback = {:?} resolves with no model, \
-         and no [providers.models.*] entry has a `model` field set. \
-         Configure at least one [providers.models.<name>] model = \"...\", \
-         or define a [[model_routes]] hint, before starting channels.",
-        config.providers.fallback,
+        "no model configured: no [providers.models.<type>.<alias>] entry has a \
+         `model` field set. Configure at least one [providers.models.<type>.<alias>] \
+         model = \"...\", or define a [[model_routes]] hint, before starting channels.",
     )
 }
 
-fn runtime_defaults_from_config(config: &Config) -> anyhow::Result<ChannelRuntimeDefaults> {
+/// Resolve runtime defaults from `config` against a specific dotted
+/// `model_provider` reference (`"<type>.<alias>"`) — the per-agent
+/// resolution path (#6266 review). Falls back to `first_provider()` when
+/// the reference is empty or doesn't resolve, preserving the conservative
+/// pre-V3 behavior so misconfigured callsites still get safe defaults.
+fn runtime_defaults_from_config(
+    config: &Config,
+    model_provider: &str,
+) -> anyhow::Result<ChannelRuntimeDefaults> {
+    let dotted = model_provider.split_once('.');
+    let entry = dotted
+        .and_then(|(type_key, alias_key)| config.providers.models.get(type_key)?.get(alias_key))
+        .or_else(|| config.providers.first_provider());
+    let default_provider = dotted
+        .map(|(t, _)| t.to_string())
+        .unwrap_or_else(|| resolved_default_provider(config));
+    let model = entry
+        .and_then(|e| e.model.clone())
+        .or_else(|| resolved_default_model(config).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model configured: model_provider '{model_provider}' does not resolve to a \
+                 ModelProviderConfig with a `model` field, and providers.models has no \
+                 fallback entry."
+            )
+        })?;
     Ok(ChannelRuntimeDefaults {
-        default_provider: resolved_default_provider(config),
-        model: resolved_default_model(config)?,
-        temperature: config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.temperature)
-            .unwrap_or(0.7),
-        api_key: config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.clone()),
-        api_url: config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.base_url.clone()),
+        default_provider,
+        model,
+        temperature: entry.and_then(|e| e.temperature).unwrap_or(0.7),
+        api_key: entry.and_then(|e| e.api_key.clone()),
+        api_url: entry.and_then(|e| e.base_url.clone()),
         reliability: config.reliability.clone(),
     })
 }
@@ -954,7 +961,10 @@ fn decrypt_optional_secret_for_runtime_reload(
     Ok(())
 }
 
-async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRuntimeDefaults> {
+async fn load_runtime_defaults_from_config_file(
+    path: &Path,
+    model_provider: &str,
+) -> Result<ChannelRuntimeDefaults> {
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -965,39 +975,24 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
     if let Some(zeroclaw_dir) = path.parent() {
         let store =
             zeroclaw_runtime::security::SecretStore::new(zeroclaw_dir, parsed.secrets.encrypt);
-        if let Some(fallback_entry) = parsed.providers.fallback_provider_mut() {
+        if let Some(fallback_entry) = parsed.providers.first_provider_mut() {
             decrypt_optional_secret_for_runtime_reload(
                 &store,
                 &mut fallback_entry.api_key,
-                "config.providers.fallback.api_key",
+                "config.providers.models.api_key",
             )?;
         }
-        // Decrypt TTS provider API keys for runtime reload
-        if let Some(ref mut openai) = parsed.tts.openai {
-            decrypt_optional_secret_for_runtime_reload(
-                &store,
-                &mut openai.api_key,
-                "config.tts.openai.api_key",
-            )?;
-        }
-        if let Some(ref mut elevenlabs) = parsed.tts.elevenlabs {
-            decrypt_optional_secret_for_runtime_reload(
-                &store,
-                &mut elevenlabs.api_key,
-                "config.tts.elevenlabs.api_key",
-            )?;
-        }
-        if let Some(ref mut google) = parsed.tts.google {
-            decrypt_optional_secret_for_runtime_reload(
-                &store,
-                &mut google.api_key,
-                "config.tts.google.api_key",
-            )?;
+        // Decrypt TTS provider API keys for runtime reload (V3: per-instance
+        // entries under [providers.tts.<type>.<alias>]).
+        for (ty, alias_map) in parsed.providers.tts.iter_mut() {
+            for (alias, instance) in alias_map.iter_mut() {
+                let label = format!("config.providers.tts.{ty}.{alias}.api_key");
+                decrypt_optional_secret_for_runtime_reload(&store, &mut instance.api_key, &label)?;
+            }
         }
     }
 
-    parsed.apply_env_overrides();
-    runtime_defaults_from_config(&parsed)
+    runtime_defaults_from_config(&parsed, model_provider)
 }
 
 async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
@@ -1020,7 +1015,8 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         }
     }
 
-    let next_defaults = load_runtime_defaults_from_config_file(&config_path).await?;
+    let next_defaults =
+        load_runtime_defaults_from_config_file(&config_path, &ctx.agent_cfg.model_provider).await?;
     let next_default_provider = zeroclaw_providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
         next_defaults.api_key.as_deref(),
@@ -1256,7 +1252,7 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     // Use the user-configured max_history_messages (fall back to
     // MAX_CHANNEL_HISTORY when the config value is 0 or absent).
     let max_history = {
-        let configured = ctx.prompt_config.agent.max_history_messages;
+        let configured = ctx.agent_cfg.max_history_messages;
         if configured > 0 {
             configured
         } else {
@@ -2972,7 +2968,7 @@ async fn process_channel_message(
     // before the LLM call, preventing context-window-exceeded errors
     // and preserving key decisions through LLM-driven summarization.
     {
-        let cc_config = ctx.prompt_config.agent.context_compression.clone();
+        let cc_config = ctx.agent_cfg.context_compression.clone();
         let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
             cc_config,
             ctx.context_token_budget,
@@ -3228,7 +3224,7 @@ async fn process_channel_message(
     let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
         zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
             state.tracker,
-            state.prices,
+            state.model_provider_pricing,
         )
     });
     let llm_call_start = Instant::now();
@@ -3533,7 +3529,7 @@ async fn process_channel_message(
             // Persist intermediate tool-call/result messages from this turn
             // so the model retains concrete "I used tools" examples in
             // context, preventing drift toward tool-less responses (#4827).
-            let keep_tool_turns = ctx.prompt_config.agent.keep_tool_context_turns;
+            let keep_tool_turns = ctx.agent_cfg.keep_tool_context_turns;
             if keep_tool_turns > 0 {
                 // Find tool messages for the current turn: everything after
                 // the last user message up to (but not including) the final
@@ -4046,7 +4042,7 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<(
     }
 
     let mut updated = config.clone();
-    let Some(telegram) = updated.channels.telegram.as_mut() else {
+    let Some(telegram) = updated.channels.telegram.get_mut("default") else {
         anyhow::bail!(
             "Telegram channel is not configured. Run `zeroclaw onboard --channels-only` first"
         );
@@ -4193,7 +4189,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let tg = config
                 .channels
                 .telegram
-                .as_ref()
+                .get("default")
                 .context("Telegram channel is not configured")?;
             let ack = tg.ack_reactions.unwrap_or(config.channels.ack_reactions);
             Ok(Arc::new(
@@ -4205,7 +4201,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
-                .with_tts(config.tts.clone())
+                .with_tts(config)
                 .with_workspace_dir(config.workspace_dir.clone())
                 .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
@@ -4214,16 +4210,17 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let dc = config
                 .channels
                 .discord
-                .as_ref()
+                .get("default")
                 .context("Discord channel is not configured")?;
             Ok(Arc::new(
                 DiscordChannel::new(
                     dc.bot_token.clone(),
-                    dc.guild_id.clone(),
+                    dc.guild_ids.clone(),
                     dc.allowed_users.clone(),
                     dc.listen_to_bots,
                     dc.mention_only,
                 )
+                .with_channel_ids(dc.channel_ids.clone())
                 .with_workspace_dir(config.workspace_dir.clone())
                 .with_streaming(
                     dc.stream_mode,
@@ -4239,7 +4236,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let sl = config
                 .channels
                 .slack
-                .as_ref()
+                .get("default")
                 .context("Slack channel is not configured")?;
             Ok(Arc::new(
                 SlackChannel::new(
@@ -4260,12 +4257,14 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let mm = config
                 .channels
                 .mattermost
-                .as_ref()
+                .get("default")
                 .context("Mattermost channel is not configured")?;
             Ok(Arc::new(MattermostChannel::new(
                 mm.url.clone(),
                 mm.bot_token.clone(),
-                mm.channel_id.clone(),
+                mm.login_id.clone(),
+                mm.password.clone(),
+                mm.channel_ids.clone(),
                 mm.allowed_users.clone(),
                 mm.thread_replies.unwrap_or(true),
                 mm.mention_only.unwrap_or(false),
@@ -4275,13 +4274,14 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let sg = config
                 .channels
                 .signal
-                .as_ref()
+                .get("default")
                 .context("Signal channel is not configured")?;
             Ok(Arc::new(
                 SignalChannel::new(
                     sg.http_url.clone(),
                     sg.account.clone(),
-                    sg.group_id.clone(),
+                    sg.group_ids.clone(),
+                    sg.dm_only,
                     sg.allowed_from.clone(),
                     sg.ignore_attachments,
                     sg.ignore_stories,
@@ -4295,7 +4295,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 let mx = config
                     .channels
                     .matrix
-                    .as_ref()
+                    .get("default")
                     .context("Matrix channel is not configured")?;
                 let state_dir = config
                     .config_path
@@ -4319,7 +4319,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 let wa = config
                     .channels
                     .whatsapp
-                    .as_ref()
+                    .get("default")
                     .context("WhatsApp channel is not configured")?;
                 if !wa.is_web_config() {
                     anyhow::bail!(
@@ -4347,7 +4347,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let qq = config
                 .channels
                 .qq
-                .as_ref()
+                .get("default")
                 .context("QQ channel is not configured")?;
             Ok(Arc::new(QQChannel::new(
                 qq.app_id.clone(),
@@ -4361,7 +4361,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 let lk = config
                     .channels
                     .lark
-                    .as_ref()
+                    .get("default")
                     .context("Lark channel is not configured")?;
                 Ok(Arc::new(LarkChannel::from_lark_config(lk)))
             }
@@ -4373,14 +4373,14 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
         "feishu" => {
             #[cfg(feature = "channel-lark")]
             {
-                if let Some(ref fs) = config.channels.feishu {
+                if let Some(fs) = config.channels.feishu.values().next() {
                     return Ok(Arc::new(LarkChannel::from_feishu_config(fs)));
                 }
                 // Legacy: [channels_config.lark] with use_feishu = true
                 let lk = config
                     .channels
                     .lark
-                    .as_ref()
+                    .get("default")
                     .context("Feishu channel is not configured")?;
                 Ok(Arc::new(LarkChannel::from_config(lk)))
             }
@@ -4393,7 +4393,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let dt = config
                 .channels
                 .dingtalk
-                .as_ref()
+                .get("default")
                 .context("DingTalk channel is not configured")?;
             Ok(Arc::new(
                 DingTalkChannel::new(
@@ -4408,7 +4408,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let wc = config
                 .channels
                 .wecom
-                .as_ref()
+                .get("default")
                 .context("WeCom channel is not configured")?;
             Ok(Arc::new(WeComChannel::new(
                 wc.webhook_key.clone(),
@@ -4420,7 +4420,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let wc = config
                 .channels
                 .wechat
-                .as_ref()
+                .get("default")
                 .context("WeChat channel is not configured")?;
             Ok(Arc::new(
                 WeChatChannel::new(
@@ -4440,7 +4440,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let nc = config
                 .channels
                 .nextcloud_talk
-                .as_ref()
+                .get("default")
                 .context("Nextcloud Talk channel is not configured")?;
             Ok(Arc::new(NextcloudTalkChannel::new_with_proxy(
                 nc.base_url.clone(),
@@ -4454,7 +4454,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let wati_cfg = config
                 .channels
                 .wati
-                .as_ref()
+                .get("default")
                 .context("WATI channel is not configured")?;
             Ok(Arc::new(WatiChannel::new_with_proxy(
                 wati_cfg.api_token.clone(),
@@ -4468,7 +4468,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let lq = config
                 .channels
                 .linq
-                .as_ref()
+                .get("default")
                 .context("Linq channel is not configured")?;
             Ok(Arc::new(LinqChannel::new(
                 lq.api_token.clone(),
@@ -4481,7 +4481,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let em = config
                 .channels
                 .email
-                .as_ref()
+                .get("default")
                 .context("Email channel is not configured")?;
             Ok(Arc::new(EmailChannel::new(em.clone())))
         }
@@ -4490,7 +4490,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let gp = config
                 .channels
                 .gmail_push
-                .as_ref()
+                .get("default")
                 .context("Gmail Push channel is not configured")?;
             Ok(Arc::new(GmailPushChannel::new(gp.clone())))
         }
@@ -4498,7 +4498,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let irc_cfg = config
                 .channels
                 .irc
-                .as_ref()
+                .get("default")
                 .context("IRC channel is not configured")?;
             Ok(Arc::new(IrcChannel::new(crate::irc::IrcChannelConfig {
                 server: irc_cfg.server.clone(),
@@ -4518,7 +4518,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let tw = config
                 .channels
                 .twitter
-                .as_ref()
+                .get("default")
                 .context("X/Twitter channel is not configured")?;
             Ok(Arc::new(TwitterChannel::new(
                 tw.bearer_token.clone(),
@@ -4529,7 +4529,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             let mc = config
                 .channels
                 .mochat
-                .as_ref()
+                .get("default")
                 .context("Mochat channel is not configured")?;
             Ok(Arc::new(MochatChannel::new(
                 mc.api_url.clone(),
@@ -4538,30 +4538,11 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 mc.poll_interval_secs,
             )))
         }
-        "discord_history" | "discord-history" => {
-            let dh = config
-                .channels
-                .discord_history
-                .as_ref()
-                .context("Discord History channel is not configured")?;
-            let discord_mem =
-                zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "discord")
-                    .context("Discord History: failed to open discord.db")?;
-            Ok(Arc::new(DiscordHistoryChannel::new(
-                dh.bot_token.clone(),
-                dh.guild_id.clone(),
-                dh.allowed_users.clone(),
-                dh.channel_ids.clone(),
-                Arc::new(discord_mem),
-                dh.store_dms,
-                dh.respond_to_dms,
-            )))
-        }
         "imessage" => {
             let im = config
                 .channels
                 .imessage
-                .as_ref()
+                .get("default")
                 .context("iMessage channel is not configured")?;
             Ok(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())))
         }
@@ -4571,7 +4552,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 let ln = config
                     .channels
                     .line
-                    .as_ref()
+                    .get("default")
                     .context("LINE channel is not configured")?;
                 Ok(Arc::new(LineChannel::from_config(ln)))
             }
@@ -4586,7 +4567,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 let vc = config
                     .channels
                     .voice_call
-                    .as_ref()
+                    .get("default")
                     .context("Voice Call channel is not configured")?;
                 Ok(Arc::new(VoiceCallChannel::new(vc.clone())))
             }
@@ -4598,7 +4579,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, voice-call"
+            email, gmail_push, irc, twitter, mochat, imessage, line, voice-call"
         ),
     }
 }
@@ -4651,503 +4632,479 @@ fn collect_configured_channels(
     let _ = tool_specs;
     let mut channels = Vec::new();
 
+    let active_channel_aliases: std::collections::HashSet<String> = config
+        .agents
+        .values()
+        .filter(|a| a.enabled)
+        .flat_map(|a| a.channels.iter().cloned())
+        .collect();
+
     #[cfg(feature = "channel-telegram")]
-    if let Some(ref tg) = config.channels.telegram {
-        if tg.enabled {
-            let ack = tg.ack_reactions.unwrap_or(config.channels.ack_reactions);
-            channels.push(ConfiguredChannel {
-                display_name: "Telegram",
-                channel: Arc::new(
-                    TelegramChannel::new(
-                        tg.bot_token.clone(),
-                        tg.allowed_users.clone(),
-                        tg.mention_only,
-                    )
-                    .with_ack_reactions(ack)
-                    .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                    .with_transcription(config.transcription.clone())
-                    .with_tts(config.tts.clone())
-                    .with_workspace_dir(config.workspace_dir.clone())
-                    .with_proxy_url(tg.proxy_url.clone())
-                    .with_tool_command_specs(tool_specs.to_vec())
-                    .with_approval_timeout_secs(tg.approval_timeout_secs),
-                ),
-            });
-        } else {
-            tracing::info!("Telegram channel configured but disabled (enabled = false)");
+    for (alias, tg) in &config.channels.telegram {
+        if !active_channel_aliases.contains(&format!("telegram.{alias}")) {
+            continue;
         }
+        let ack = tg.ack_reactions.unwrap_or(config.channels.ack_reactions);
+        channels.push(ConfiguredChannel {
+            display_name: "Telegram",
+            channel: Arc::new(
+                TelegramChannel::new(
+                    tg.bot_token.clone(),
+                    tg.allowed_users.clone(),
+                    tg.mention_only,
+                )
+                .with_ack_reactions(ack)
+                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_transcription(config.transcription.clone())
+                .with_tts(config)
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_proxy_url(tg.proxy_url.clone())
+                .with_tool_command_specs(tool_specs.to_vec())
+                .with_approval_timeout_secs(tg.approval_timeout_secs),
+            ),
+        });
     }
 
-    if let Some(ref dc) = config.channels.discord {
-        if dc.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "Discord",
-                channel: Arc::new(
-                    DiscordChannel::new(
-                        dc.bot_token.clone(),
-                        dc.guild_id.clone(),
-                        dc.allowed_users.clone(),
-                        dc.listen_to_bots,
-                        dc.mention_only,
-                    )
-                    .with_workspace_dir(config.workspace_dir.clone())
-                    .with_streaming(
-                        dc.stream_mode,
-                        dc.draft_update_interval_ms,
-                        dc.multi_message_delay_ms,
-                    )
-                    .with_proxy_url(dc.proxy_url.clone())
-                    .with_transcription(config.transcription.clone())
-                    .with_stall_timeout(dc.stall_timeout_secs)
-                    .with_approval_timeout_secs(dc.approval_timeout_secs),
-                ),
-            });
-        } else {
-            tracing::info!("Discord channel configured but disabled (enabled = false)");
+    for (alias, dc) in &config.channels.discord {
+        if !active_channel_aliases.contains(&format!("discord.{alias}")) {
+            continue;
         }
-    }
-
-    if let Some(ref dh) = config.channels.discord_history {
-        if dh.enabled {
+        let mut discord_ch = DiscordChannel::new(
+            dc.bot_token.clone(),
+            dc.guild_ids.clone(),
+            dc.allowed_users.clone(),
+            dc.listen_to_bots,
+            dc.mention_only,
+        )
+        .with_channel_ids(dc.channel_ids.clone())
+        .with_workspace_dir(config.workspace_dir.clone())
+        .with_streaming(
+            dc.stream_mode,
+            dc.draft_update_interval_ms,
+            dc.multi_message_delay_ms,
+        )
+        .with_proxy_url(dc.proxy_url.clone())
+        .with_transcription(config.transcription.clone())
+        .with_stall_timeout(dc.stall_timeout_secs)
+        .with_approval_timeout_secs(dc.approval_timeout_secs);
+        if dc.archive {
             match zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "discord") {
-                Ok(discord_mem) => {
-                    channels.push(ConfiguredChannel {
-                        display_name: "Discord History",
-                        channel: Arc::new(
-                            DiscordHistoryChannel::new(
-                                dh.bot_token.clone(),
-                                dh.guild_id.clone(),
-                                dh.allowed_users.clone(),
-                                dh.channel_ids.clone(),
-                                Arc::new(discord_mem),
-                                dh.store_dms,
-                                dh.respond_to_dms,
-                            )
-                            .with_proxy_url(dh.proxy_url.clone()),
-                        ),
-                    });
+                Ok(mem) => {
+                    discord_ch = discord_ch.with_archive_memory(std::sync::Arc::new(mem));
                 }
                 Err(e) => {
-                    tracing::error!("discord_history: failed to open discord.db: {e}");
+                    tracing::warn!("discord: archive enabled but failed to open discord.db: {e}");
                 }
             }
-        } else {
-            tracing::info!("Discord History channel configured but disabled (enabled = false)");
         }
+        channels.push(ConfiguredChannel {
+            display_name: "Discord",
+            channel: Arc::new(discord_ch),
+        });
     }
 
-    if let Some(ref sl) = config.channels.slack {
-        if sl.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "Slack",
-                channel: Arc::new(
-                    SlackChannel::new(
-                        sl.bot_token.clone(),
-                        sl.app_token.clone(),
-                        sl.channel_ids.clone(),
-                        sl.allowed_users.clone(),
-                    )
-                    .with_thread_replies(sl.thread_replies.unwrap_or(true))
-                    .with_group_reply_policy(sl.mention_only, Vec::new())
-                    .with_strict_mention_in_thread(sl.strict_mention_in_thread)
-                    .with_workspace_dir(config.workspace_dir.clone())
-                    .with_markdown_blocks(sl.use_markdown_blocks)
-                    .with_proxy_url(sl.proxy_url.clone())
-                    .with_transcription(config.transcription.clone())
-                    .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
-                    .with_cancel_reaction(sl.cancel_reaction.clone())
-                    .with_approval_timeout_secs(sl.approval_timeout_secs),
-                ),
-            });
-        } else {
-            tracing::info!("Slack channel configured but disabled (enabled = false)");
+    for (alias, sl) in &config.channels.slack {
+        if !active_channel_aliases.contains(&format!("slack.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "Slack",
+            channel: Arc::new(
+                SlackChannel::new(
+                    sl.bot_token.clone(),
+                    sl.app_token.clone(),
+                    sl.channel_ids.clone(),
+                    sl.allowed_users.clone(),
+                )
+                .with_thread_replies(sl.thread_replies.unwrap_or(true))
+                .with_group_reply_policy(sl.mention_only, Vec::new())
+                .with_strict_mention_in_thread(sl.strict_mention_in_thread)
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_markdown_blocks(sl.use_markdown_blocks)
+                .with_proxy_url(sl.proxy_url.clone())
+                .with_transcription(config.transcription.clone())
+                .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
+                .with_cancel_reaction(sl.cancel_reaction.clone())
+                .with_approval_timeout_secs(sl.approval_timeout_secs),
+            ),
+        });
     }
 
-    if let Some(ref mm) = config.channels.mattermost {
-        if mm.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "Mattermost",
-                channel: Arc::new(
-                    MattermostChannel::new(
-                        mm.url.clone(),
-                        mm.bot_token.clone(),
-                        mm.channel_id.clone(),
-                        mm.allowed_users.clone(),
-                        mm.thread_replies.unwrap_or(true),
-                        mm.mention_only.unwrap_or(false),
-                    )
-                    .with_proxy_url(mm.proxy_url.clone())
-                    .with_transcription(config.transcription.clone()),
-                ),
-            });
-        } else {
-            tracing::info!("Mattermost channel configured but disabled (enabled = false)");
+    for (alias, mm) in &config.channels.mattermost {
+        if !active_channel_aliases.contains(&format!("mattermost.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "Mattermost",
+            channel: Arc::new(
+                MattermostChannel::new(
+                    mm.url.clone(),
+                    mm.bot_token.clone(),
+                    mm.login_id.clone(),
+                    mm.password.clone(),
+                    mm.channel_ids.clone(),
+                    mm.allowed_users.clone(),
+                    mm.thread_replies.unwrap_or(true),
+                    mm.mention_only.unwrap_or(false),
+                )
+                .with_proxy_url(mm.proxy_url.clone())
+                .with_transcription(config.transcription.clone()),
+            ),
+        });
     }
 
-    if let Some(ref im) = config.channels.imessage {
-        if im.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "iMessage",
-                channel: Arc::new(IMessageChannel::new(im.allowed_contacts.clone())),
-            });
-        } else {
-            tracing::info!("iMessage channel configured but disabled (enabled = false)");
+    for (alias, im) in &config.channels.imessage {
+        if !active_channel_aliases.contains(&format!("imessage.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "iMessage",
+            channel: Arc::new(IMessageChannel::new(im.allowed_contacts.clone())),
+        });
     }
 
     #[cfg(feature = "channel-matrix")]
-    if let Some(ref mx) = config.channels.matrix {
-        if mx.enabled {
-            let state_dir = config
-                .config_path
-                .parent()
-                .map(|p| p.join("state").join("matrix"))
-                .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix"));
-            match MatrixChannel::new(mx.clone(), state_dir) {
-                Ok(channel) => {
-                    let channel = channel
-                        .with_transcription(config.transcription.clone())
-                        .with_workspace_dir(config.workspace_dir.clone());
-                    channels.push(ConfiguredChannel {
-                        display_name: "Matrix",
-                        channel: Arc::new(channel),
-                    });
-                }
-                Err(e) => {
-                    tracing::error!("Matrix channel construction failed: {e}");
-                }
+    for (alias, mx) in &config.channels.matrix {
+        if !active_channel_aliases.contains(&format!("matrix.{alias}")) {
+            continue;
+        }
+        let state_dir = config
+            .config_path
+            .parent()
+            .map(|p| p.join("state").join("matrix"))
+            .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix"));
+        match MatrixChannel::new(mx.clone(), state_dir) {
+            Ok(channel) => {
+                let channel = channel
+                    .with_transcription(config.transcription.clone())
+                    .with_workspace_dir(config.workspace_dir.clone());
+                channels.push(ConfiguredChannel {
+                    display_name: "Matrix",
+                    channel: Arc::new(channel),
+                });
             }
-        } else {
-            tracing::info!("Matrix channel configured but disabled (enabled = false)");
+            Err(e) => {
+                tracing::error!("Matrix channel construction failed: {e}");
+            }
         }
     }
 
     #[cfg(not(feature = "channel-matrix"))]
-    if config.channels.matrix.is_some() {
+    if !config.channels.matrix.is_empty() {
         tracing::warn!(
             "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix {}.",
             matrix_skip_context
         );
     }
 
-    if let Some(ref sig) = config.channels.signal {
-        if sig.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "Signal",
-                channel: Arc::new(
-                    SignalChannel::new(
-                        sig.http_url.clone(),
-                        sig.account.clone(),
-                        sig.group_id.clone(),
-                        sig.allowed_from.clone(),
-                        sig.ignore_attachments,
-                        sig.ignore_stories,
-                    )
-                    .with_proxy_url(sig.proxy_url.clone())
-                    .with_approval_timeout_secs(sig.approval_timeout_secs),
-                ),
-            });
-        } else {
-            tracing::info!("Signal channel configured but disabled (enabled = false)");
+    for (alias, sig) in &config.channels.signal {
+        if !active_channel_aliases.contains(&format!("signal.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "Signal",
+            channel: Arc::new(
+                SignalChannel::new(
+                    sig.http_url.clone(),
+                    sig.account.clone(),
+                    sig.group_ids.clone(),
+                    sig.dm_only,
+                    sig.allowed_from.clone(),
+                    sig.ignore_attachments,
+                    sig.ignore_stories,
+                )
+                .with_proxy_url(sig.proxy_url.clone())
+                .with_approval_timeout_secs(sig.approval_timeout_secs),
+            ),
+        });
     }
 
-    if let Some(ref wa) = config.channels.whatsapp {
-        if wa.enabled {
-            if wa.is_ambiguous_config() {
-                tracing::warn!(
-                    "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
-                );
-            }
-            // Runtime negotiation: detect backend type from config
-            match wa.backend_type() {
-                "cloud" => {
-                    // Cloud API mode: requires phone_number_id, access_token, verify_token
-                    if wa.is_cloud_config() {
-                        channels.push(ConfiguredChannel {
-                            display_name: "WhatsApp",
-                            channel: Arc::new(
-                                WhatsAppChannel::new(
-                                    wa.access_token.clone().unwrap_or_default(),
-                                    wa.phone_number_id.clone().unwrap_or_default(),
-                                    wa.verify_token.clone().unwrap_or_default(),
-                                    wa.allowed_numbers.clone(),
-                                )
-                                .with_proxy_url(wa.proxy_url.clone())
-                                .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                                .with_group_mention_patterns(wa.group_mention_patterns.clone())
-                                .with_approval_timeout_secs(wa.approval_timeout_secs),
-                            ),
-                        });
-                    } else {
-                        tracing::warn!(
-                            "WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)"
-                        );
-                    }
-                }
-                "web" => {
-                    // Web mode: requires session_path
-                    #[cfg(feature = "whatsapp-web")]
-                    if wa.is_web_config() {
-                        channels.push(ConfiguredChannel {
-                            display_name: "WhatsApp",
-                            channel: Arc::new(
-                                WhatsAppWebChannel::new(
-                                    wa.session_path.clone().unwrap_or_default(),
-                                    wa.pair_phone.clone(),
-                                    wa.pair_code.clone(),
-                                    wa.allowed_numbers.clone(),
-                                    wa.mention_only,
-                                    wa.mode.clone(),
-                                    wa.dm_policy.clone(),
-                                    wa.group_policy.clone(),
-                                    wa.self_chat_mode,
-                                )
-                                .with_transcription(config.transcription.clone())
-                                .with_tts(config.tts.clone())
-                                .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                                .with_group_mention_patterns(wa.group_mention_patterns.clone()),
-                            ),
-                        });
-                    } else {
-                        tracing::warn!("WhatsApp Web configured but session_path not set");
-                    }
-                    #[cfg(not(feature = "whatsapp-web"))]
-                    {
-                        tracing::warn!(
-                            "WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web"
-                        );
-                        eprintln!(
-                            "  ⚠ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled in."
-                        );
-                        eprintln!("    Rebuild with: cargo build --features whatsapp-web");
-                    }
-                }
-                _ => {
+    for (alias, wa) in &config.channels.whatsapp {
+        if !active_channel_aliases.contains(&format!("whatsapp.{alias}")) {
+            continue;
+        }
+        if wa.is_ambiguous_config() {
+            tracing::warn!(
+                "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
+            );
+        }
+        // Runtime negotiation: detect backend type from config
+        match wa.backend_type() {
+            "cloud" => {
+                // Cloud API mode: requires phone_number_id, access_token, verify_token
+                if wa.is_cloud_config() {
+                    channels.push(ConfiguredChannel {
+                        display_name: "WhatsApp",
+                        channel: Arc::new(
+                            WhatsAppChannel::new(
+                                wa.access_token.clone().unwrap_or_default(),
+                                wa.phone_number_id.clone().unwrap_or_default(),
+                                wa.verify_token.clone().unwrap_or_default(),
+                                wa.allowed_numbers.clone(),
+                            )
+                            .with_proxy_url(wa.proxy_url.clone())
+                            .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
+                            .with_group_mention_patterns(wa.group_mention_patterns.clone())
+                            .with_approval_timeout_secs(wa.approval_timeout_secs),
+                        ),
+                    });
+                } else {
                     tracing::warn!(
-                        "WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set"
+                        "WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)"
                     );
                 }
             }
-        } else {
-            tracing::info!("WhatsApp channel configured but disabled (enabled = false)");
+            "web" => {
+                // Web mode: requires session_path
+                #[cfg(feature = "whatsapp-web")]
+                if wa.is_web_config() {
+                    channels.push(ConfiguredChannel {
+                        display_name: "WhatsApp",
+                        channel: Arc::new(
+                            WhatsAppWebChannel::new(
+                                wa.session_path.clone().unwrap_or_default(),
+                                wa.pair_phone.clone(),
+                                wa.pair_code.clone(),
+                                wa.allowed_numbers.clone(),
+                                wa.mention_only,
+                                wa.mode.clone(),
+                                wa.dm_policy.clone(),
+                                wa.group_policy.clone(),
+                                wa.self_chat_mode,
+                            )
+                            .with_transcription(config.transcription.clone())
+                            .with_tts(config)
+                            .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
+                            .with_group_mention_patterns(wa.group_mention_patterns.clone()),
+                        ),
+                    });
+                } else {
+                    tracing::warn!("WhatsApp Web configured but session_path not set");
+                }
+                #[cfg(not(feature = "whatsapp-web"))]
+                {
+                    tracing::warn!(
+                        "WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web"
+                    );
+                    eprintln!(
+                        "  ⚠ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled in."
+                    );
+                    eprintln!("    Rebuild with: cargo build --features whatsapp-web");
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    "WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set"
+                );
+            }
         }
     }
 
-    if let Some(ref lq) = config.channels.linq {
-        if lq.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "Linq",
-                channel: Arc::new(LinqChannel::new(
-                    lq.api_token.clone(),
-                    lq.from_phone.clone(),
-                    lq.allowed_senders.clone(),
-                )),
-            });
-        } else {
-            tracing::info!("Linq channel configured but disabled (enabled = false)");
+    for (alias, lq) in &config.channels.linq {
+        if !active_channel_aliases.contains(&format!("linq.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "Linq",
+            channel: Arc::new(LinqChannel::new(
+                lq.api_token.clone(),
+                lq.from_phone.clone(),
+                lq.allowed_senders.clone(),
+            )),
+        });
     }
 
-    if let Some(ref wati_cfg) = config.channels.wati {
-        if wati_cfg.enabled {
-            let wati_channel = WatiChannel::new_with_proxy(
-                wati_cfg.api_token.clone(),
-                wati_cfg.api_url.clone(),
-                wati_cfg.tenant_id.clone(),
-                wati_cfg.allowed_numbers.clone(),
-                wati_cfg.proxy_url.clone(),
-            )
-            .with_transcription(config.transcription.clone());
-
-            channels.push(ConfiguredChannel {
-                display_name: "WATI",
-                channel: Arc::new(wati_channel),
-            });
-        } else {
-            tracing::info!("WATI channel configured but disabled (enabled = false)");
+    for (alias, wati_cfg) in &config.channels.wati {
+        if !active_channel_aliases.contains(&format!("wati.{alias}")) {
+            continue;
         }
+        let wati_channel = WatiChannel::new_with_proxy(
+            wati_cfg.api_token.clone(),
+            wati_cfg.api_url.clone(),
+            wati_cfg.tenant_id.clone(),
+            wati_cfg.allowed_numbers.clone(),
+            wati_cfg.proxy_url.clone(),
+        )
+        .with_transcription(config.transcription.clone());
+        channels.push(ConfiguredChannel {
+            display_name: "WATI",
+            channel: Arc::new(wati_channel),
+        });
     }
 
-    if let Some(ref nc) = config.channels.nextcloud_talk {
-        if nc.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "Nextcloud Talk",
-                channel: Arc::new(NextcloudTalkChannel::new_with_proxy(
-                    nc.base_url.clone(),
-                    nc.app_token.clone(),
-                    nc.bot_name.clone().unwrap_or_default(),
-                    nc.allowed_users.clone(),
-                    nc.proxy_url.clone(),
-                )),
-            });
-        } else {
-            tracing::info!("Nextcloud Talk channel configured but disabled (enabled = false)");
+    for (alias, nc) in &config.channels.nextcloud_talk {
+        if !active_channel_aliases.contains(&format!("nextcloud_talk.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "Nextcloud Talk",
+            channel: Arc::new(NextcloudTalkChannel::new_with_proxy(
+                nc.base_url.clone(),
+                nc.app_token.clone(),
+                nc.bot_name.clone().unwrap_or_default(),
+                nc.allowed_users.clone(),
+                nc.proxy_url.clone(),
+            )),
+        });
     }
 
     #[cfg(feature = "channel-email")]
-    if let Some(ref email_cfg) = config.channels.email {
-        if email_cfg.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "Email",
-                channel: Arc::new(EmailChannel::new(email_cfg.clone())),
-            });
-        } else {
-            tracing::info!("Email channel configured but disabled (enabled = false)");
+    for (alias, email_cfg) in &config.channels.email {
+        if !active_channel_aliases.contains(&format!("email.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "Email",
+            channel: Arc::new(EmailChannel::new(email_cfg.clone())),
+        });
     }
 
     #[cfg(feature = "channel-email")]
-    if let Some(ref gp_cfg) = config.channels.gmail_push
-        && gp_cfg.enabled
-    {
+    for (alias, gp_cfg) in &config.channels.gmail_push {
+        if !active_channel_aliases.contains(&format!("gmail_push.{alias}")) {
+            continue;
+        }
         channels.push(ConfiguredChannel {
             display_name: "Gmail Push",
             channel: Arc::new(GmailPushChannel::new(gp_cfg.clone())),
         });
     }
 
-    if let Some(ref irc) = config.channels.irc {
-        if irc.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "IRC",
-                channel: Arc::new(IrcChannel::new(crate::irc::IrcChannelConfig {
-                    server: irc.server.clone(),
-                    port: irc.port,
-                    nickname: irc.nickname.clone(),
-                    username: irc.username.clone(),
-                    channels: irc.channels.clone(),
-                    allowed_users: irc.allowed_users.clone(),
-                    server_password: irc.server_password.clone(),
-                    nickserv_password: irc.nickserv_password.clone(),
-                    sasl_password: irc.sasl_password.clone(),
-                    verify_tls: irc.verify_tls.unwrap_or(true),
-                    mention_only: irc.mention_only,
-                })),
-            });
-        } else {
-            tracing::info!("IRC channel configured but disabled (enabled = false)");
+    for (alias, irc) in &config.channels.irc {
+        if !active_channel_aliases.contains(&format!("irc.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "IRC",
+            channel: Arc::new(IrcChannel::new(crate::irc::IrcChannelConfig {
+                server: irc.server.clone(),
+                port: irc.port,
+                nickname: irc.nickname.clone(),
+                username: irc.username.clone(),
+                channels: irc.channels.clone(),
+                allowed_users: irc.allowed_users.clone(),
+                server_password: irc.server_password.clone(),
+                nickserv_password: irc.nickserv_password.clone(),
+                sasl_password: irc.sasl_password.clone(),
+                verify_tls: irc.verify_tls.unwrap_or(true),
+                mention_only: irc.mention_only,
+            })),
+        });
     }
 
     #[cfg(feature = "channel-lark")]
-    if let Some(ref lk) = config.channels.lark {
-        if lk.enabled {
-            if lk.use_feishu {
-                if config.channels.feishu.is_some() {
-                    tracing::warn!(
-                        "Both [channels_config.feishu] and legacy [channels_config.lark].use_feishu=true are configured; ignoring legacy Feishu fallback in lark."
-                    );
-                } else {
-                    tracing::warn!(
-                        "Using legacy [channels_config.lark].use_feishu=true compatibility path; prefer [channels_config.feishu]."
-                    );
-                    channels.push(ConfiguredChannel {
-                        display_name: "Feishu",
-                        channel: Arc::new(
-                            LarkChannel::from_config(lk)
-                                .with_transcription(config.transcription.clone()),
-                        ),
-                    });
-                }
+    for (alias, lk) in &config.channels.lark {
+        if !active_channel_aliases.contains(&format!("lark.{alias}")) {
+            continue;
+        }
+        if lk.use_feishu {
+            if !config.channels.feishu.is_empty() {
+                tracing::warn!(
+                    "Both [channels_config.feishu] and legacy [channels_config.lark].use_feishu=true are configured; ignoring legacy Feishu fallback in lark."
+                );
             } else {
+                tracing::warn!(
+                    "Using legacy [channels_config.lark].use_feishu=true compatibility path; prefer [channels_config.feishu]."
+                );
                 channels.push(ConfiguredChannel {
-                    display_name: "Lark",
+                    display_name: "Feishu",
                     channel: Arc::new(
-                        LarkChannel::from_lark_config(lk)
+                        LarkChannel::from_config(lk)
                             .with_transcription(config.transcription.clone()),
                     ),
                 });
             }
         } else {
-            tracing::info!("Lark channel configured but disabled (enabled = false)");
+            channels.push(ConfiguredChannel {
+                display_name: "Lark",
+                channel: Arc::new(
+                    LarkChannel::from_lark_config(lk)
+                        .with_transcription(config.transcription.clone()),
+                ),
+            });
         }
     }
 
     #[cfg(feature = "channel-lark")]
-    if let Some(ref fs) = config.channels.feishu {
-        if fs.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "Feishu",
-                channel: Arc::new(
-                    LarkChannel::from_feishu_config(fs)
-                        .with_transcription(config.transcription.clone()),
-                ),
-            });
-        } else {
-            tracing::info!("Feishu channel configured but disabled (enabled = false)");
+    for (alias, fs) in &config.channels.feishu {
+        if !active_channel_aliases.contains(&format!("feishu.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "Feishu",
+            channel: Arc::new(
+                LarkChannel::from_feishu_config(fs)
+                    .with_transcription(config.transcription.clone()),
+            ),
+        });
     }
 
     #[cfg(not(feature = "channel-lark"))]
-    if config.channels.lark.is_some() || config.channels.feishu.is_some() {
+    if !config.channels.lark.is_empty() || !config.channels.feishu.is_empty() {
         tracing::warn!(
             "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check."
         );
     }
 
     #[cfg(feature = "channel-line")]
-    if let Some(ref ln) = config.channels.line {
-        if ln.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "LINE",
-                channel: Arc::new(
-                    LineChannel::from_config(ln).with_transcription(config.transcription.clone()),
-                ),
-            });
-        } else {
-            tracing::info!("LINE channel configured but disabled (enabled = false)");
+    for (alias, ln) in &config.channels.line {
+        if !active_channel_aliases.contains(&format!("line.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "LINE",
+            channel: Arc::new(
+                LineChannel::from_config(ln).with_transcription(config.transcription.clone()),
+            ),
+        });
     }
 
     #[cfg(not(feature = "channel-line"))]
-    if config.channels.line.is_some() {
+    if !config.channels.line.is_empty() {
         tracing::warn!(
             "LINE channel is configured but this build was compiled without `channel-line`; skipping LINE health check."
         );
     }
 
-    if let Some(ref dt) = config.channels.dingtalk {
-        if dt.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "DingTalk",
-                channel: Arc::new(
-                    DingTalkChannel::new(
-                        dt.client_id.clone(),
-                        dt.client_secret.clone(),
-                        dt.allowed_users.clone(),
-                    )
-                    .with_proxy_url(dt.proxy_url.clone()),
-                ),
-            });
-        } else {
-            tracing::info!("DingTalk channel configured but disabled (enabled = false)");
+    for (alias, dt) in &config.channels.dingtalk {
+        if !active_channel_aliases.contains(&format!("dingtalk.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "DingTalk",
+            channel: Arc::new(
+                DingTalkChannel::new(
+                    dt.client_id.clone(),
+                    dt.client_secret.clone(),
+                    dt.allowed_users.clone(),
+                )
+                .with_proxy_url(dt.proxy_url.clone()),
+            ),
+        });
     }
 
-    if let Some(ref qq) = config.channels.qq {
-        if qq.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "QQ",
-                channel: Arc::new(
-                    QQChannel::new(
-                        qq.app_id.clone(),
-                        qq.app_secret.clone(),
-                        qq.allowed_users.clone(),
-                    )
-                    .with_workspace_dir(config.workspace_dir.clone())
-                    .with_proxy_url(qq.proxy_url.clone()),
-                ),
-            });
-        } else {
-            tracing::info!("QQ channel configured but disabled (enabled = false)");
+    for (alias, qq) in &config.channels.qq {
+        if !active_channel_aliases.contains(&format!("qq.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "QQ",
+            channel: Arc::new(
+                QQChannel::new(
+                    qq.app_id.clone(),
+                    qq.app_secret.clone(),
+                    qq.allowed_users.clone(),
+                )
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_proxy_url(qq.proxy_url.clone()),
+            ),
+        });
     }
 
-    if let Some(ref tw) = config.channels.twitter {
+    for (alias, tw) in &config.channels.twitter {
+        if !active_channel_aliases.contains(&format!("twitter.{alias}")) {
+            continue;
+        }
         channels.push(ConfiguredChannel {
             display_name: "X/Twitter",
             channel: Arc::new(TwitterChannel::new(
@@ -5157,80 +5114,76 @@ fn collect_configured_channels(
         });
     }
 
-    if let Some(ref mc) = config.channels.mochat {
-        if mc.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "Mochat",
-                channel: Arc::new(MochatChannel::new(
-                    mc.api_url.clone(),
-                    mc.api_token.clone(),
-                    mc.allowed_users.clone(),
-                    mc.poll_interval_secs,
-                )),
-            });
-        } else {
-            tracing::info!("Mochat channel configured but disabled (enabled = false)");
+    for (alias, mc) in &config.channels.mochat {
+        if !active_channel_aliases.contains(&format!("mochat.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "Mochat",
+            channel: Arc::new(MochatChannel::new(
+                mc.api_url.clone(),
+                mc.api_token.clone(),
+                mc.allowed_users.clone(),
+                mc.poll_interval_secs,
+            )),
+        });
     }
 
-    if let Some(ref wc) = config.channels.wecom {
-        if wc.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "WeCom",
-                channel: Arc::new(WeComChannel::new(
-                    wc.webhook_key.clone(),
-                    wc.allowed_users.clone(),
-                )),
-            });
-        } else {
-            tracing::info!("WeCom channel configured but disabled (enabled = false)");
+    for (alias, wc) in &config.channels.wecom {
+        if !active_channel_aliases.contains(&format!("wecom.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "WeCom",
+            channel: Arc::new(WeComChannel::new(
+                wc.webhook_key.clone(),
+                wc.allowed_users.clone(),
+            )),
+        });
     }
 
     #[cfg(feature = "channel-wechat")]
-    if let Some(ref wechat) = config.channels.wechat {
-        if wechat.enabled {
-            match WeChatChannel::new(
-                wechat.allowed_users.clone(),
-                wechat.api_base_url.clone(),
-                wechat.cdn_base_url.clone(),
-                wechat.state_dir.as_ref().map(std::path::PathBuf::from),
-            ) {
-                Ok(channel) => {
-                    channels.push(ConfiguredChannel {
-                        display_name: "WeChat",
-                        channel: Arc::new(channel.with_workspace_dir(config.workspace_dir.clone())),
-                    });
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "WeChat channel configuration is invalid; skipping WeChat {matrix_skip_context}: {err}"
-                    );
-                }
+    for (alias, wechat) in &config.channels.wechat {
+        if !active_channel_aliases.contains(&format!("wechat.{alias}")) {
+            continue;
+        }
+        match WeChatChannel::new(
+            wechat.allowed_users.clone(),
+            wechat.api_base_url.clone(),
+            wechat.cdn_base_url.clone(),
+            wechat.state_dir.as_ref().map(std::path::PathBuf::from),
+        ) {
+            Ok(channel) => {
+                channels.push(ConfiguredChannel {
+                    display_name: "WeChat",
+                    channel: Arc::new(channel.with_workspace_dir(config.workspace_dir.clone())),
+                });
             }
-        } else {
-            tracing::info!("WeChat channel configured but disabled (enabled = false)");
+            Err(err) => {
+                tracing::warn!(
+                    "WeChat channel configuration is invalid; skipping WeChat {matrix_skip_context}: {err}"
+                );
+            }
         }
     }
 
     #[cfg(not(feature = "channel-wechat"))]
-    if let Some(ref wechat) = config.channels.wechat
-        && wechat.enabled
-    {
-        tracing::warn!(
-            "WeChat channel is configured but this build was compiled without `channel-wechat`; skipping WeChat {matrix_skip_context}."
-        );
+    for alias in config.channels.wechat.keys() {
+        if active_channel_aliases.contains(&format!("wechat.{alias}")) {
+            tracing::warn!(
+                "WeChat channel is configured but this build was compiled without `channel-wechat`; skipping WeChat {matrix_skip_context}."
+            );
+        }
     }
 
-    if let Some(ref ct) = config.channels.clawdtalk {
-        if ct.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "ClawdTalk",
-                channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
-            });
-        } else {
-            tracing::info!("ClawdTalk channel configured but disabled (enabled = false)");
+    for (alias, ct) in &config.channels.clawdtalk {
+        if !active_channel_aliases.contains(&format!("clawdtalk.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "ClawdTalk",
+            channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
+        });
     }
 
     // Notion database poller channel
@@ -5261,7 +5214,10 @@ fn collect_configured_channels(
         }
     }
 
-    if let Some(ref rd) = config.channels.reddit {
+    for (alias, rd) in &config.channels.reddit {
+        if !active_channel_aliases.contains(&format!("reddit.{alias}")) {
+            continue;
+        }
         channels.push(ConfiguredChannel {
             display_name: "Reddit",
             channel: Arc::new(RedditChannel::new(
@@ -5269,12 +5225,15 @@ fn collect_configured_channels(
                 rd.client_secret.clone(),
                 rd.refresh_token.clone(),
                 rd.username.clone(),
-                rd.subreddit.clone(),
+                rd.subreddits.clone(),
             )),
         });
     }
 
-    if let Some(ref bs) = config.channels.bluesky {
+    for (alias, bs) in &config.channels.bluesky {
+        if !active_channel_aliases.contains(&format!("bluesky.{alias}")) {
+            continue;
+        }
         channels.push(ConfiguredChannel {
             display_name: "Bluesky",
             channel: Arc::new(BlueskyChannel::new(
@@ -5285,7 +5244,10 @@ fn collect_configured_channels(
     }
 
     #[cfg(feature = "voice-wake")]
-    if let Some(ref vw) = config.channels.voice_wake {
+    for (alias, vw) in &config.channels.voice_wake {
+        if !active_channel_aliases.contains(&format!("voice_wake.{alias}")) {
+            continue;
+        }
         channels.push(ConfiguredChannel {
             display_name: "VoiceWake",
             channel: Arc::new(VoiceWakeChannel::new(
@@ -5296,33 +5258,31 @@ fn collect_configured_channels(
     }
 
     #[cfg(feature = "channel-voice-call")]
-    if let Some(ref vc) = config.channels.voice_call {
-        if vc.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "Voice Call",
-                channel: Arc::new(VoiceCallChannel::new(vc.clone())),
-            });
-        } else {
-            tracing::info!("Voice Call channel configured but disabled (enabled = false)");
+    for (alias, vc) in &config.channels.voice_call {
+        if !active_channel_aliases.contains(&format!("voice_call.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "Voice Call",
+            channel: Arc::new(VoiceCallChannel::new(vc.clone())),
+        });
     }
 
-    if let Some(ref wh) = config.channels.webhook {
-        if wh.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "Webhook",
-                channel: Arc::new(WebhookChannel::new(
-                    wh.port,
-                    wh.listen_path.clone(),
-                    wh.send_url.clone(),
-                    wh.send_method.clone(),
-                    wh.auth_header.clone(),
-                    wh.secret.clone(),
-                )),
-            });
-        } else {
-            tracing::info!("Webhook channel configured but disabled (enabled = false)");
+    for (alias, wh) in &config.channels.webhook {
+        if !active_channel_aliases.contains(&format!("webhook.{alias}")) {
+            continue;
         }
+        channels.push(ConfiguredChannel {
+            display_name: "Webhook",
+            channel: Arc::new(WebhookChannel::new(
+                wh.port,
+                wh.listen_path.clone(),
+                wh.send_url.clone(),
+                wh.send_method.clone(),
+                wh.auth_header.clone(),
+                wh.secret.clone(),
+            )),
+        });
     }
 
     channels
@@ -5334,13 +5294,25 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     let mut channels = collect_configured_channels(&config, "health check", &[]);
 
     #[cfg(feature = "channel-nostr")]
-    if let Some(ref ns) = config.channels.nostr {
-        channels.push(ConfiguredChannel {
-            display_name: "Nostr",
-            channel: Arc::new(
-                NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
-            ),
-        });
+    {
+        let active_nostr: std::collections::HashSet<String> = config
+            .agents
+            .values()
+            .filter(|a| a.enabled)
+            .flat_map(|a| a.channels.iter().cloned())
+            .collect();
+        for (alias, ns) in &config.channels.nostr {
+            if !active_nostr.contains(&format!("nostr.{alias}")) {
+                continue;
+            }
+            channels.push(ConfiguredChannel {
+                display_name: "Nostr",
+                channel: Arc::new(
+                    NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys)
+                        .await?,
+                ),
+            });
+        }
     }
 
     if channels.is_empty() {
@@ -5379,7 +5351,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         }
     }
 
-    if config.channels.webhook.is_some() {
+    if !config.channels.webhook.is_empty() {
         println!("  ℹ️  Webhook   check via `zeroclaw gateway` then GET /health");
     }
 
@@ -5394,20 +5366,67 @@ pub async fn start_channels(
     config: Config,
     canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
 ) -> Result<()> {
-    let provider_name = resolved_default_provider(&config);
+    // V3 model: each channel is owned by exactly one Agent (via
+    // agent_for_channel). Per-channel runtime contexts (one SecurityPolicy
+    // / tools_registry / ChannelRuntimeContext per owning agent) are the
+    // correct shape and tracked as follow-up. For now the orchestrator
+    // builds ONE shared runtime context off the migration-synthesized
+    // "default" agent (or the first enabled agent if no "default"
+    // exists); a multi-agent config still loads, but every channel runs
+    // through that single agent's policy until the per-channel dispatch
+    // refactor lands.
+    let agent_alias = config
+        .agents
+        .keys()
+        .find(|k| k.as_str() == "default")
+        .or_else(|| {
+            config
+                .agents
+                .iter()
+                .find(|(_, a)| a.enabled)
+                .map(|(alias, _)| alias)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "start_channels requires at least one configured [agents.<alias>] entry"
+            )
+        })?
+        .clone();
+    let agent = config
+        .agent(&agent_alias)
+        .with_context(|| format!("agents.{agent_alias} is not configured"))?
+        .clone();
+    let risk_profile = config
+        .risk_profile_for_agent(&agent_alias)
+        .with_context(|| {
+            format!(
+                "agents.{agent_alias}.risk_profile does not name a configured risk_profiles entry"
+            )
+        })?
+        .clone();
+
+    // Per-agent provider resolution (#6266 review). Each channel-server
+    // starts under a known `agent_alias`, so the correct provider entry is
+    // the one named by `agents.<alias>.model_provider`, not whatever
+    // happens to come first in `providers.models` iteration order. Falls
+    // back to `first_provider()` when the agent has no model_provider set
+    // or names a missing entry; logged at debug level inside
+    // `provider_runtime_options_for_agent`.
+    let agent_provider_entry = config
+        .model_provider_for_agent(&agent_alias)
+        .or_else(|| config.providers.first_provider());
+    let provider_name = config
+        .agents
+        .get(&agent_alias)
+        .and_then(|a| a.model_provider.split_once('.').map(|(t, _)| t.to_string()))
+        .unwrap_or_else(|| resolved_default_provider(&config));
     let provider_runtime_options =
-        zeroclaw_providers::provider_runtime_options_from_config(&config);
+        zeroclaw_providers::provider_runtime_options_for_agent(&config, &agent_alias);
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
             &provider_name,
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.api_key.clone()),
-            config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.base_url.clone()),
+            agent_provider_entry.and_then(|e| e.api_key.clone()),
+            agent_provider_entry.and_then(|e| e.base_url.clone()),
             config.reliability.clone(),
             provider_runtime_options.clone(),
         )
@@ -5428,7 +5447,7 @@ pub async fn start_channels(
         store.insert(
             config.config_path.clone(),
             RuntimeConfigState {
-                defaults: runtime_defaults_from_config(&config)?,
+                defaults: runtime_defaults_from_config(&config, &agent.model_provider)?,
                 last_applied_stamp: initial_stamp,
             },
         );
@@ -5438,25 +5457,33 @@ pub async fn start_channels(
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
-    let model = resolved_default_model(&config)?;
-    let temperature = config
-        .providers
-        .fallback_provider()
+    let security = Arc::new(SecurityPolicy::for_agent(&config, &agent_alias)?);
+    let model = agent_provider_entry
+        .and_then(|e| e.model.clone())
+        .or_else(|| {
+            tracing::debug!(
+                agent = agent_alias,
+                "model_provider has no `model` set; falling back to resolved_default_model"
+            );
+            resolved_default_model(&config).ok()
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model configured: agents.{agent_alias}.model_provider does not resolve to a \
+                 ModelProviderConfig with a `model` field, and providers.models is empty. \
+                 Configure `[providers.models.<type>.<alias>] model = \"...\"` and reference it \
+                 from `agents.{agent_alias}.model_provider`."
+            )
+        })?;
+    let temperature = agent_provider_entry
         .and_then(|e| e.temperature)
         .unwrap_or(0.7);
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
         &config.providers.embedding_routes,
-        Some(&config.storage.provider.config),
+        config.resolve_active_storage(),
         &config.workspace_dir,
-        config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.as_deref()),
+        agent_provider_entry.and_then(|e| e.api_key.as_deref()),
     )?);
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -5478,6 +5505,8 @@ pub async fn start_channels(
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
+        &risk_profile,
+        &agent_alias,
         runtime,
         Arc::clone(&mem),
         composio_key,
@@ -5487,10 +5516,7 @@ pub async fn start_channels(
         &config.web_fetch,
         &workspace,
         &config.agents,
-        config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.as_deref()),
+        agent_provider_entry.and_then(|e| e.api_key.as_deref()),
         &config,
         // Share the gateway's canvas store so frames pushed from
         // channel-side agents reach the same WebSocket subscribers and
@@ -5659,14 +5685,17 @@ pub async fn start_channels(
 
     // Filter out tools excluded for non-CLI channels so the system prompt
     // does not advertise them for channel-driven runs.
-    // Skip this filter when autonomy is `Full` — full-autonomy agents keep
-    // all tools available regardless of channel.
-    let excluded = &config.autonomy.non_cli_excluded_tools;
-    if !excluded.is_empty() && config.autonomy.level != AutonomyLevel::Full {
-        tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+    // Skip this filter when the active risk profile's autonomy is `Full` —
+    // full-autonomy agents keep all tools available regardless of channel.
+    {
+        let active_profile = &risk_profile;
+        let excluded = &active_profile.excluded_tools;
+        if !excluded.is_empty() && active_profile.level != AutonomyLevel::Full {
+            tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+        }
     }
 
-    let bootstrap_max_chars = if config.agent.compact_context {
+    let bootstrap_max_chars = if agent.compact_context {
         Some(6000)
     } else {
         None
@@ -5679,11 +5708,11 @@ pub async fn start_channels(
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
-        Some(&config.autonomy),
+        Some(&risk_profile),
         native_tools,
         config.skills.prompt_injection_mode,
-        config.agent.compact_context,
-        config.agent.max_system_prompt_chars,
+        agent.compact_context,
+        agent.max_system_prompt_chars,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
@@ -5697,7 +5726,7 @@ pub async fn start_channels(
 
     // Append the receipt-echo instruction so the model carries
     // `[receipt: zc-receipt-...]` markers verbatim into its response.
-    if config.agent.tool_receipts.enabled && config.agent.tool_receipts.inject_system_prompt {
+    if agent.tool_receipts.enabled && agent.tool_receipts.inject_system_prompt {
         system_prompt.push_str(
             "\n## Tool Execution Receipts\n\n\
              Every tool result includes a `[receipt: ...]` field. This is a cryptographic \
@@ -5727,7 +5756,7 @@ pub async fn start_channels(
             .collect();
 
     #[cfg(feature = "channel-nostr")]
-    if let Some(ref ns) = config.channels.nostr {
+    if let Some(ns) = config.channels.nostr.values().next() {
         channels.push(Arc::new(
             NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
         ));
@@ -5739,10 +5768,7 @@ pub async fn start_channels(
 
     println!("🦀 ZeroClaw Channel Server");
     println!("  🤖 Model:    {model}");
-    let effective_backend = zeroclaw_memory::effective_memory_backend_name(
-        &config.memory.backend,
-        Some(&config.storage.provider.config),
-    );
+    let effective_backend = config.resolve_active_storage().kind();
     println!(
         "  🧠 Memory:   {} (auto-save: {})",
         effective_backend,
@@ -5829,33 +5855,34 @@ pub async fn start_channels(
     let interrupt_on_new_message = config
         .channels
         .telegram
-        .as_ref()
+        .get("default")
         .is_some_and(|tg| tg.interrupt_on_new_message);
     let interrupt_on_new_message_slack = config
         .channels
         .slack
-        .as_ref()
+        .get("default")
         .is_some_and(|sl| sl.interrupt_on_new_message);
     let interrupt_on_new_message_discord = config
         .channels
         .discord
-        .as_ref()
+        .get("default")
         .is_some_and(|dc| dc.interrupt_on_new_message);
     let interrupt_on_new_message_mattermost = config
         .channels
         .mattermost
-        .as_ref()
+        .get("default")
         .is_some_and(|mm| mm.interrupt_on_new_message);
     let interrupt_on_new_message_matrix = config
         .channels
         .matrix
-        .as_ref()
+        .get("default")
         .is_some_and(|mx| mx.interrupt_on_new_message);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
         default_provider: Arc::new(provider_name),
+        agent_cfg: Arc::new(agent.clone()),
         prompt_config: Arc::new(config.clone()),
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
@@ -5864,7 +5891,7 @@ pub async fn start_channels(
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
-        max_tool_iterations: config.agent.max_tool_iterations,
+        max_tool_iterations: agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
         conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -5872,14 +5899,8 @@ pub async fn start_channels(
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
-        api_key: config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.clone()),
-        api_url: config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.base_url.clone()),
+        api_key: agent_provider_entry.and_then(|e| e.api_key.clone()),
+        api_url: agent_provider_entry.and_then(|e| e.base_url.clone()),
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
@@ -5912,9 +5933,9 @@ pub async fn start_channels(
         } else {
             None
         },
-        non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
-        autonomy_level: config.autonomy.level,
-        tool_call_dedup_exempt: Arc::new(config.agent.tool_call_dedup_exempt.clone()),
+        non_cli_excluded_tools: Arc::new(risk_profile.excluded_tools.clone()),
+        autonomy_level: risk_profile.level,
+        tool_call_dedup_exempt: Arc::new(agent.tool_call_dedup_exempt.clone()),
         model_routes: Arc::new(config.providers.model_routes.clone()),
         query_classification: config.query_classification.clone(),
         ack_reactions: config.channels.ack_reactions,
@@ -5933,28 +5954,41 @@ pub async fn start_channels(
         } else {
             None
         },
-        approval_manager: Arc::new(ApprovalManager::for_non_interactive(&config.autonomy)),
+        approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
         activated_tools: ch_activated_handle,
         cost_tracking: zeroclaw_runtime::cost::CostTracker::get_or_init_global(
             config.cost.clone(),
             &config.workspace_dir,
         )
-        .map(|tracker| ChannelCostTrackingState {
-            tracker,
-            prices: Arc::new(config.cost.prices.clone()),
+        .map(|tracker| {
+            let pricing: zeroclaw_runtime::agent::cost::ModelProviderPricing = config
+                .providers
+                .models
+                .iter()
+                .flat_map(|(type_k, alias_map)| {
+                    alias_map.iter().map(move |(alias_k, profile)| {
+                        (format!("{type_k}.{alias_k}"), profile.pricing.clone())
+                    })
+                })
+                .filter(|(_, p)| !p.is_empty())
+                .collect();
+            ChannelCostTrackingState {
+                tracker,
+                model_provider_pricing: Arc::new(pricing),
+            }
         }),
         pacing: config.pacing.clone(),
-        max_tool_result_chars: config.agent.max_tool_result_chars,
-        context_token_budget: config.agent.max_context_tokens,
+        max_tool_result_chars: agent.max_tool_result_chars,
+        context_token_budget: agent.max_context_tokens,
         debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
             Duration::from_millis(config.channels.debounce_ms),
         )),
-        receipt_generator: if config.agent.tool_receipts.enabled {
+        receipt_generator: if agent.tool_receipts.enabled {
             Some(zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new())
         } else {
             None
         },
-        show_receipts_in_response: config.agent.tool_receipts.show_in_response,
+        show_receipts_in_response: agent.tool_receipts.show_in_response,
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
@@ -6068,7 +6102,7 @@ pub async fn deliver_announcement(
             let tg = config
                 .channels
                 .telegram
-                .as_ref()
+                .get("default")
                 .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
             let ch = TelegramChannel::new(
                 tg.bot_token.clone(),
@@ -6082,15 +6116,16 @@ pub async fn deliver_announcement(
             let dc = config
                 .channels
                 .discord
-                .as_ref()
+                .get("default")
                 .ok_or_else(|| anyhow::anyhow!("discord channel not configured"))?;
             let ch = DiscordChannel::new(
                 dc.bot_token.clone(),
-                dc.guild_id.clone(),
+                dc.guild_ids.clone(),
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
             )
+            .with_channel_ids(dc.channel_ids.clone())
             .with_workspace_dir(config.workspace_dir.clone());
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
                 .await?;
@@ -6099,7 +6134,7 @@ pub async fn deliver_announcement(
             let sl = config
                 .channels
                 .slack
-                .as_ref()
+                .get("default")
                 .ok_or_else(|| anyhow::anyhow!("slack channel not configured"))?;
             let ch = SlackChannel::new(
                 sl.bot_token.clone(),
@@ -6115,12 +6150,13 @@ pub async fn deliver_announcement(
             let sg = config
                 .channels
                 .signal
-                .as_ref()
+                .get("default")
                 .ok_or_else(|| anyhow::anyhow!("signal channel not configured"))?;
             let ch = SignalChannel::new(
                 sg.http_url.clone(),
                 sg.account.clone(),
-                sg.group_id.clone(),
+                sg.group_ids.clone(),
+                sg.dm_only,
                 sg.allowed_from.clone(),
                 sg.ignore_attachments,
                 sg.ignore_stories,
@@ -6133,7 +6169,7 @@ pub async fn deliver_announcement(
             let wc = config
                 .channels
                 .wechat
-                .as_ref()
+                .get("default")
                 .ok_or_else(|| anyhow::anyhow!("wechat channel not configured"))?;
             let ch = WeChatChannel::new(
                 wc.allowed_users.clone(),
@@ -6482,6 +6518,7 @@ mod tests {
             channels_by_name: Arc::new(HashMap::new()),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -6522,7 +6559,7 @@ mod tests {
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -6608,6 +6645,7 @@ mod tests {
             channels_by_name: Arc::new(HashMap::new()),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -6650,7 +6688,7 @@ mod tests {
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -6695,6 +6733,7 @@ mod tests {
             channels_by_name: Arc::new(HashMap::new()),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -6735,7 +6774,7 @@ mod tests {
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -6797,6 +6836,7 @@ mod tests {
             channels_by_name: Arc::new(HashMap::new()),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -6837,7 +6877,7 @@ mod tests {
             show_tool_calls: true,
             session_store: Some(Arc::clone(&store)),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -7398,6 +7438,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(ToolCallingProvider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
@@ -7440,7 +7481,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -7547,12 +7588,13 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&{
-                let mut autonomy = zeroclaw_config::schema::AutonomyConfig::default();
-                autonomy.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
-                autonomy.auto_approve.push("mock_price".to_string());
-                autonomy
-            })),
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig {
+                    level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+                    auto_approve: vec!["mock_price".to_string()],
+                    ..Default::default()
+                },
+            )),
             activated_tools: None,
             cost_tracking: None,
             pacing: zeroclaw_config::schema::PacingConfig::default(),
@@ -7565,6 +7607,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new(),
             ),
             show_receipts_in_response: true,
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
         });
 
         process_channel_message(
@@ -7681,12 +7724,13 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&{
-                let mut autonomy = zeroclaw_config::schema::AutonomyConfig::default();
-                autonomy.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
-                autonomy.auto_approve.push("mock_price".to_string());
-                autonomy
-            })),
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig {
+                    level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+                    auto_approve: vec!["mock_price".to_string()],
+                    ..Default::default()
+                },
+            )),
             activated_tools: None,
             cost_tracking: None,
             pacing: zeroclaw_config::schema::PacingConfig::default(),
@@ -7699,6 +7743,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new(),
             ),
             show_receipts_in_response: false,
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
         });
 
         process_channel_message(
@@ -7786,12 +7831,13 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&{
-                let mut autonomy = zeroclaw_config::schema::AutonomyConfig::default();
-                autonomy.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
-                autonomy.auto_approve.push("mock_price".to_string());
-                autonomy
-            })),
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig {
+                    level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+                    auto_approve: vec!["mock_price".to_string()],
+                    ..Default::default()
+                },
+            )),
             activated_tools: None,
             cost_tracking: None,
             pacing: zeroclaw_config::schema::PacingConfig::default(),
@@ -7802,6 +7848,7 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             receipt_generator: None,
             show_receipts_in_response: false,
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
         });
 
         process_channel_message(
@@ -7868,6 +7915,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(ToolCallingProvider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
@@ -7910,7 +7958,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -7976,6 +8024,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(RawToolArtifactProvider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
@@ -8018,7 +8067,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8069,6 +8118,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(ToolCallingAliasProvider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
@@ -8111,7 +8161,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8161,17 +8211,18 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let default_provider_impl = Arc::new(ModelCaptureProvider::default());
         let default_provider: Arc<dyn Provider> = default_provider_impl.clone();
-        let fallback_provider_impl = Arc::new(ModelCaptureProvider::default());
-        let fallback_provider: Arc<dyn Provider> = fallback_provider_impl.clone();
+        let alt_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let alt_provider: Arc<dyn Provider> = alt_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
         provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
-        provider_cache_seed.insert("openrouter".to_string(), fallback_provider);
+        provider_cache_seed.insert("openrouter".to_string(), alt_provider);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -8214,7 +8265,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8261,7 +8312,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(route.model, "default-model");
 
         assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
-        assert_eq!(fallback_provider_impl.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(alt_provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -8296,6 +8347,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -8338,7 +8390,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8401,6 +8453,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&startup_provider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -8443,7 +8496,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8518,6 +8571,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&provider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -8563,7 +8617,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8626,6 +8680,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 required_tool_iterations: 11,
             }),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
@@ -8668,7 +8723,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8724,6 +8779,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 required_tool_iterations: 20,
             }),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
@@ -8766,7 +8822,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -8948,6 +9004,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 delay: Duration::from_millis(250),
             }),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -8990,7 +9047,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -9064,6 +9121,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -9106,7 +9164,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -9199,6 +9257,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -9240,7 +9299,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -9331,6 +9390,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 delay: Duration::from_millis(180),
             }),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -9373,7 +9433,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -9441,6 +9501,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 delay: Duration::from_millis(20),
             }),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -9483,7 +9544,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -9532,6 +9593,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(NoReplyProvider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -9574,7 +9636,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -9623,6 +9685,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 delay: Duration::from_millis(5),
             }),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -9665,7 +9728,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -10063,9 +10126,9 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn full_autonomy_prompt_executes_allowed_tools_without_extra_approval() {
         let ws = make_workspace();
-        let config = zeroclaw_config::schema::AutonomyConfig {
+        let config = zeroclaw_config::schema::RiskProfileConfig {
             level: zeroclaw_runtime::security::AutonomyLevel::Full,
-            ..zeroclaw_config::schema::AutonomyConfig::default()
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
         let prompt = build_system_prompt_with_mode_and_autonomy(
             ws.path(),
@@ -10094,9 +10157,9 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn readonly_prompt_explains_policy_blocks_without_fake_approval() {
         let ws = make_workspace();
-        let config = zeroclaw_config::schema::AutonomyConfig {
+        let config = zeroclaw_config::schema::RiskProfileConfig {
             level: zeroclaw_runtime::security::AutonomyLevel::ReadOnly,
-            ..zeroclaw_config::schema::AutonomyConfig::default()
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
         let prompt = build_system_prompt_with_mode_and_autonomy(
             ws.path(),
@@ -10519,6 +10582,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -10561,7 +10625,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -10667,6 +10731,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -10709,7 +10774,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -10856,6 +10921,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(RecallMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -10898,7 +10964,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -10978,6 +11044,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -11018,7 +11085,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -11340,17 +11407,30 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn collect_configured_channels_includes_mattermost_when_configured() {
         let mut config = Config::default();
-        config.channels.mattermost = Some(zeroclaw_config::schema::MattermostConfig {
-            enabled: true,
-            url: "https://mattermost.example.com".to_string(),
-            bot_token: "test-token".to_string(),
-            channel_id: Some("channel-1".to_string()),
-            allowed_users: vec![],
-            thread_replies: Some(true),
-            mention_only: Some(false),
-            interrupt_on_new_message: false,
-            proxy_url: None,
-        });
+        config.channels.mattermost.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::MattermostConfig {
+                url: "https://mattermost.example.com".to_string(),
+                bot_token: Some("test-token".to_string()),
+                login_id: None,
+                password: None,
+                channel_ids: vec!["channel-1".to_string()],
+                allowed_users: vec![],
+                thread_replies: Some(true),
+                mention_only: Some(false),
+                interrupt_on_new_message: false,
+                proxy_url: None,
+                excluded_tools: vec![],
+            },
+        );
+        // In V3, a channel is only collected when an enabled agent references it.
+        config.agents.insert(
+            "mattermost-default".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                channels: vec!["mattermost.default".to_string()],
+                ..Default::default()
+            },
+        );
 
         let channels = collect_configured_channels(&config, "test", &[]);
 
@@ -11368,35 +11448,35 @@ This is an example JSON object for profile settings."#;
 
     #[cfg(feature = "channel-email")]
     #[test]
-    fn collect_configured_channels_skips_disabled_email() {
+    fn collect_configured_channels_skips_unreferenced_email() {
         let mut config = Config::default();
-        config.channels.email = Some(zeroclaw_config::scattered_types::EmailConfig {
-            enabled: false,
-            ..Default::default()
-        });
+        config.channels.email.insert(
+            "default".to_string(),
+            zeroclaw_config::scattered_types::EmailConfig::default(),
+        );
 
         let channels = collect_configured_channels(&config, "test", &[]);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
-            "disabled email should not be collected"
+            "email with no agent reference should not be collected"
         );
     }
 
     #[cfg(feature = "channel-voice-call")]
     #[test]
-    fn collect_configured_channels_skips_disabled_voice_call() {
+    fn collect_configured_channels_skips_unreferenced_voice_call() {
         let mut config = Config::default();
-        config.channels.voice_call = Some(zeroclaw_config::scattered_types::VoiceCallConfig {
-            enabled: false,
-            ..Default::default()
-        });
+        config.channels.voice_call.insert(
+            "default".to_string(),
+            zeroclaw_config::scattered_types::VoiceCallConfig::default(),
+        );
 
         let channels = collect_configured_channels(&config, "test", &[]);
         assert!(
             !channels
                 .iter()
                 .any(|entry| entry.display_name == "Voice Call"),
-            "disabled voice-call should not be collected"
+            "voice-call with no agent reference should not be collected"
         );
     }
 
@@ -11602,6 +11682,7 @@ This is an example JSON object for profile settings."#;
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("dummy".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -11644,7 +11725,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -11702,6 +11783,7 @@ This is an example JSON object for profile settings."#;
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("dummy".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -11744,7 +11826,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -11836,6 +11918,7 @@ This is an example JSON object for profile settings."#;
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(FormatErrorProvider),
             default_provider: Arc::new("dummy".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -11876,7 +11959,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -12014,6 +12097,7 @@ This is an example JSON object for profile settings."#;
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -12056,7 +12140,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -12138,6 +12222,7 @@ This is an example JSON object for profile settings."#;
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -12180,7 +12265,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -12254,6 +12339,7 @@ This is an example JSON object for profile settings."#;
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -12296,7 +12382,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -12390,6 +12476,7 @@ This is an example JSON object for profile settings."#;
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -12432,7 +12519,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -12495,18 +12582,21 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn build_channel_by_id_configured_telegram_succeeds() {
         let mut config = Config::default();
-        config.channels.telegram = Some(zeroclaw_config::schema::TelegramConfig {
-            enabled: true,
-            bot_token: "test-token".to_string(),
-            allowed_users: vec![],
-            stream_mode: zeroclaw_config::schema::StreamMode::Off,
-            draft_update_interval_ms: 1000,
-            interrupt_on_new_message: false,
-            mention_only: false,
-            ack_reactions: None,
-            proxy_url: None,
-            approval_timeout_secs: 120,
-        });
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                bot_token: "test-token".to_string(),
+                allowed_users: vec![],
+                stream_mode: zeroclaw_config::schema::StreamMode::Off,
+                draft_update_interval_ms: 1000,
+                interrupt_on_new_message: false,
+                mention_only: false,
+                ack_reactions: None,
+                proxy_url: None,
+                approval_timeout_secs: 120,
+                excluded_tools: vec![],
+            },
+        );
         match build_channel_by_id(&config, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
@@ -12533,19 +12623,22 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn build_channel_by_id_configured_voice_call_succeeds() {
         let mut config = Config::default();
-        config.channels.voice_call = Some(zeroclaw_config::scattered_types::VoiceCallConfig {
-            enabled: true,
-            provider: zeroclaw_config::scattered_types::VoiceProvider::Twilio,
-            account_id: "AC_TEST".to_string(),
-            auth_token: "test_token".to_string(),
-            from_number: "+15551234567".to_string(),
-            webhook_port: 8090,
-            require_outbound_approval: true,
-            transcription_logging: true,
-            tts_voice: None,
-            max_call_duration_secs: 3600,
-            webhook_base_url: None,
-        });
+        config.channels.voice_call.insert(
+            "default".to_string(),
+            zeroclaw_config::scattered_types::VoiceCallConfig {
+                provider: zeroclaw_config::scattered_types::VoiceProvider::Twilio,
+                account_id: "AC_TEST".to_string(),
+                auth_token: "test_token".to_string(),
+                from_number: "+15551234567".to_string(),
+                webhook_port: 8090,
+                require_outbound_approval: true,
+                transcription_logging: true,
+                tts_voice: None,
+                max_call_duration_secs: 3600,
+                webhook_base_url: None,
+                excluded_tools: vec![],
+            },
+        );
         match build_channel_by_id(&config, "voice-call") {
             Ok(channel) => assert_eq!(channel.name(), "voice_call"),
             Err(e) => panic!("should succeed when voice-call is configured: {e}"),
@@ -12708,6 +12801,7 @@ This is an example JSON object for profile settings."#;
                 delay: Duration::from_millis(150),
             }),
             default_provider: Arc::new("test-provider".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::DelegateAgentConfig::default()),
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
@@ -12750,7 +12844,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::AutonomyConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -12950,7 +13044,7 @@ This is an example JSON object for profile settings."#;
 
     #[test]
     fn default_keep_tool_context_turns_is_two() {
-        let config = zeroclaw_config::schema::AgentConfig::default();
+        let config = zeroclaw_config::schema::DelegateAgentConfig::default();
         assert_eq!(config.keep_tool_context_turns, 2);
     }
 

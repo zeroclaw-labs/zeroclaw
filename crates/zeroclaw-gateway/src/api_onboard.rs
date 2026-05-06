@@ -184,9 +184,9 @@ pub struct OnboardStatusResponse {
 /// first init, so file existence isn't a useful "is the user new?" check.
 /// Instead we look at two explicit user-driven markers: any
 /// `onboard_state.completed_sections` entry (set when the wizard finishes
-/// a section) OR any usable provider (`providers.fallback` set, or any
-/// entry under `providers.models`). When neither is present, the user is
-/// fresh and should land at `/onboard` instead of the empty Dashboard.
+/// a section) OR any entry under `providers.models`. When neither is
+/// present, the user is fresh and should land at `/onboard` instead of
+/// the empty Dashboard.
 pub async fn handle_onboard_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -194,7 +194,7 @@ pub async fn handle_onboard_status(State(state): State<AppState>, headers: Heade
     let cfg = state.config.lock().clone();
 
     let has_completed = !cfg.onboard_state.completed_sections.is_empty();
-    let has_provider = cfg.providers.fallback.is_some() || !cfg.providers.models.is_empty();
+    let has_provider = !cfg.providers.models.is_empty();
 
     let (needs_onboarding, reason) = if has_completed {
         (false, "has_completed_sections")
@@ -209,6 +209,64 @@ pub async fn handle_onboard_status(State(state): State<AppState>, headers: Heade
         reason,
     })
     .into_response()
+}
+
+/// All alias-reference choices an agent form needs, in one round-trip.
+/// Channels and model providers are returned in dotted form
+/// (`telegram.default`, `anthropic.work`); the bundle/profile/namespace
+/// lists are bare HashMap keys.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct AgentOptionsResponse {
+    pub channels: Vec<String>,
+    pub model_providers: Vec<String>,
+    pub risk_profiles: Vec<String>,
+    pub runtime_profiles: Vec<String>,
+    pub skill_bundles: Vec<String>,
+    pub knowledge_bundles: Vec<String>,
+    pub mcp_bundles: Vec<String>,
+    pub memory_namespaces: Vec<String>,
+}
+
+/// `GET /api/onboard/agent-options` — every alias-reference list the
+/// agent form needs, derived from the live config. Mirrors the lists the
+/// TUI computes locally for its alias pickers.
+pub async fn handle_agent_options(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let cfg = state.config.lock().clone();
+
+    fn dotted_aliases(cfg: &zeroclaw_config::schema::Config, prefix: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for f in cfg.prop_fields() {
+            if let Some(rest) = f.name.strip_prefix(&format!("{prefix}.")) {
+                let mut parts = rest.splitn(3, '.');
+                if let (Some(ty), Some(alias), Some(_)) = (parts.next(), parts.next(), parts.next())
+                {
+                    let dotted = format!("{ty}.{alias}");
+                    if !out.contains(&dotted) {
+                        out.push(dotted);
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    let response = AgentOptionsResponse {
+        channels: dotted_aliases(&cfg, "channels"),
+        model_providers: dotted_aliases(&cfg, "providers.models"),
+        risk_profiles: cfg.get_map_keys("risk_profiles").unwrap_or_default(),
+        runtime_profiles: cfg.get_map_keys("runtime_profiles").unwrap_or_default(),
+        skill_bundles: cfg.get_map_keys("skill_bundles").unwrap_or_default(),
+        knowledge_bundles: cfg.get_map_keys("knowledge_bundles").unwrap_or_default(),
+        mcp_bundles: cfg.get_map_keys("mcp_bundles").unwrap_or_default(),
+        memory_namespaces: cfg.get_map_keys("memory_namespaces").unwrap_or_default(),
+    };
+
+    axum::Json(response).into_response()
 }
 
 /// `GET /api/onboard/sections` — list every top-level config section.
@@ -253,6 +311,12 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
             .filter_map(|s| s.path.split('.').next())
             .collect();
 
+    // Ensure map-keyed sections surface even when their HashMap is empty
+    // (prop_fields() only yields paths for populated entries).
+    for &prefix in &map_keyed_roots {
+        roots.insert(prefix.to_string());
+    }
+
     let sections: Vec<SectionInfo> = roots
         .into_iter()
         .map(|key| {
@@ -279,7 +343,7 @@ const HIDDEN_TOP_LEVEL: &[&str] = &["schema-version", "onboard-state"];
 /// Sections whose picker semantics are non-generic and live in the
 /// per-section dispatch in `handle_section_picker` (catalog of providers,
 /// memory backend list, tunnel-with-none, channel sub-table walk).
-const SECTIONS_WITH_PICKER: &[&str] = &["providers", "channels", "memory", "tunnel"];
+const SECTIONS_WITH_PICKER: &[&str] = &["providers", "channels", "memory", "tunnel", "agents"];
 
 /// Humanize a section key for display (`google_workspace` → `Google workspace`).
 /// Keeps things simple and predictable; specific wording overrides go in
@@ -304,7 +368,9 @@ fn section_group(key: &str) -> &'static str {
         // The 6 foundation sections (TUI's `Section` enum) — every install
         // touches these. Named for the role they play, not for the wizard
         // that happens to walk them on first run.
-        "workspace" | "providers" | "channels" | "memory" | "hardware" | "tunnel" => "Foundation",
+        "workspace" | "providers" | "channels" | "memory" | "hardware" | "tunnel" | "agents" => {
+            "Foundation"
+        }
         // Agent loop, scheduling, and orchestration.
         "agent"
         | "autonomy"
@@ -321,7 +387,7 @@ fn section_group(key: &str) -> &'static str {
         | "sop"
         | "verifiable_intent" => "Agent",
         // Multi-agent / delegation.
-        "agents" | "swarms" | "delegate" => "Multi-agent",
+        "delegate" => "Multi-agent",
         // Tool integrations.
         "browser" | "browser_delegate" | "http_request" | "image_gen" | "knowledge"
         | "link_enricher" | "mcp" | "media_pipeline" | "multimodal" | "plugins"
@@ -363,6 +429,11 @@ fn section_help(key: &str) -> &'static str {
         "tunnel" => {
             "Optional: expose your gateway over the public internet via Cloudflare or ngrok. \
                      Pick `none` to keep it localhost-only."
+        }
+        "agents" => {
+            "An agent binds a model provider, profiles, bundles, and channels into one \
+                     dispatchable unit. Add one per persona; reuse the same alias across channels \
+                     to share state."
         }
         _ => "",
     }
@@ -437,6 +508,7 @@ pub async fn handle_section_picker(
             schema_walk_picker_with_none(&cfg, "tunnel", "tunnel.provider"),
             section_help("tunnel").to_string(),
         ),
+        "agents" => (agents_picker(&cfg), section_help("agents").to_string()),
         other => {
             return error_response(
                 ConfigApiError::new(
@@ -501,15 +573,14 @@ fn memory_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
 }
 
 /// Generic schema-walk picker for sections like `channels` whose subsections
-/// are `#[nested] Option<T>` fields. Discovery: clone the config,
-/// init_defaults the section to materialize every Option<T> as Some(default),
-/// then read prop_fields() on the probe — every reachable subsection's name
-/// surfaces as a path segment under `<section>.`.
+/// are `#[nested] HashMap<String, T>` fields. Discovery: use `map_key_sections()`
+/// to enumerate all statically-known sub-sections under `<section>.` — this
+/// works for V3 HashMap-based channels without needing init_defaults to insert
+/// entries (HashMap fields start empty and init_defaults leaves them empty).
 fn schema_walk_picker(cfg: &zeroclaw_config::schema::Config, section: &str) -> Vec<PickerItem> {
-    let mut probe = cfg.clone();
-    probe.init_defaults(Some(section));
     let prefix_with_dot = format!("{section}.");
 
+    // Configured: any alias present on this type (has at least one entry in its HashMap).
     let configured: std::collections::BTreeSet<String> = cfg
         .prop_fields()
         .iter()
@@ -517,27 +588,25 @@ fn schema_walk_picker(cfg: &zeroclaw_config::schema::Config, section: &str) -> V
         .filter_map(|suffix| suffix.split_once('.').map(|(head, _)| head.to_string()))
         .collect();
 
-    let all: std::collections::BTreeSet<String> = probe
-        .prop_fields()
-        .iter()
-        .filter_map(|f| f.name.strip_prefix(&prefix_with_dot))
-        .filter_map(|suffix| suffix.split_once('.').map(|(head, _)| head.to_string()))
-        .collect();
+    // All known channel/section types from schema metadata — statically known,
+    // no HashMap entries needed.
+    let all: std::collections::BTreeSet<String> =
+        zeroclaw_config::schema::Config::map_key_sections()
+            .into_iter()
+            .filter_map(|s| {
+                s.path
+                    .strip_prefix(&prefix_with_dot)
+                    .filter(|rest| !rest.contains('.'))
+                    .map(String::from)
+            })
+            .collect();
 
     all.into_iter()
         .map(|name| {
-            // Two-tier badge: `configured` = a block exists on disk for this
-            // item (auto-created on click + persisted). `active` = the block
-            // exists AND its `enabled` field is currently `true`. Items
-            // without an `enabled` field stay at `configured`. Surfaces the
-            // "is this actually doing anything?" distinction the contributor
-            // feedback on PR #6179 asked for, without changing init-on-click
-            // semantics (the macro-level fix lands in schema v3 / #5947).
-            let enabled_path = format!("{prefix_with_dot}{name}.enabled");
-            let is_active = cfg.get_prop(&enabled_path).ok().as_deref() == Some("true");
-            let badge = if is_active {
-                Some("active".to_string())
-            } else if configured.contains(&name) {
+            // V3: channel configs no longer carry an `enabled` field; a channel is
+            // active when an enabled agent references it. Badge = "configured" when
+            // at least one alias exists, absent otherwise.
+            let badge = if configured.contains(&name) {
                 Some("configured".to_string())
             } else {
                 None
@@ -550,6 +619,27 @@ fn schema_walk_picker(cfg: &zeroclaw_config::schema::Config, section: &str) -> V
             }
         })
         .collect()
+}
+
+/// Agents picker: walks `cfg.agents` and returns each alias with an activity badge.
+/// `active` = agent exists and `enabled = true`; `configured` = exists but disabled.
+fn agents_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
+    let mut items: Vec<PickerItem> = cfg
+        .agents
+        .iter()
+        .map(|(alias, agent)| PickerItem {
+            key: alias.clone(),
+            label: alias.clone(),
+            description: None,
+            badge: if agent.enabled {
+                Some("active".to_string())
+            } else {
+                Some("configured".to_string())
+            },
+        })
+        .collect();
+    items.sort_by(|a, b| a.key.cmp(&b.key));
+    items
 }
 
 /// `tunnel`-flavored picker: same as `schema_walk_picker` plus a synthetic
@@ -612,28 +702,55 @@ pub struct SectionItemPath {
 /// * `tunnel` → set_prop `tunnel.provider = <key>` (and init_defaults the
 ///   subsection if `<key>` is not "none"), return `tunnel.<key>` (or `tunnel`
 ///   for the `none` case).
+///
+/// The optional JSON body `{"alias": "<name>"}` names the entry being created,
+/// e.g. `"work"` for `providers.models.anthropic.work`. Omit to use `"default"`.
+#[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct SectionSelectBody {
+    pub alias: Option<String>,
+}
+
 pub async fn handle_section_select(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::extract::Path(SectionItemPath { section, key }): axum::extract::Path<SectionItemPath>,
+    body: Option<axum::extract::Json<SectionSelectBody>>,
 ) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
+    let alias = body
+        .and_then(|b| b.0.alias)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+
     let mut working = state.config.lock().clone();
 
     let (fields_prefix, created) = match section.as_str() {
         "providers" => {
+            // Arm 1: create the outer type bucket if it doesn't exist yet.
+            if let Err(msg) = working.create_map_key("providers.models", &key) {
+                return error_response(
+                    ConfigApiError::new(
+                        ConfigApiCode::PathNotFound,
+                        format!("could not select provider `{key}`: {msg}"),
+                    )
+                    .with_path("providers.models"),
+                );
+            }
+            // Arm 2: create the named alias entry inside the type bucket.
             let created = working
-                .create_map_key("providers.models", &key)
+                .create_map_key(&format!("providers.models.{key}"), &alias)
                 .map_err(|msg| {
                     error_response(
                         ConfigApiError::new(
                             ConfigApiCode::PathNotFound,
-                            format!("could not select provider `{key}`: {msg}"),
+                            format!("could not select provider `{key}` alias `{alias}`: {msg}"),
                         )
-                        .with_path("providers.models"),
+                        .with_path(format!("providers.models.{key}")),
                     )
                 });
             let created = match created {
@@ -644,9 +761,8 @@ pub async fn handle_section_select(
             // Ollama, default temperature / max_tokens / etc.) so the form
             // opens with sensible values instead of a sea of empty inputs.
             // Idempotent — only fills paths that are still unset, so a user
-            // who's already overridden a field doesn't get clobbered on
-            // re-select.
-            let prefix = format!("providers.models.{key}");
+            // who's already overridden a field doesn't get clobbered on re-select.
+            let prefix = format!("providers.models.{key}.{alias}");
             if let Err(e) =
                 zeroclaw_runtime::onboard::field_visibility::apply_provider_trait_defaults(
                     &mut working,
@@ -654,26 +770,47 @@ pub async fn handle_section_select(
                     &prefix,
                 )
             {
-                tracing::warn!(provider = %key, error = ?e, "failed to apply trait defaults; form will start blank");
-            }
-            // Make the picked provider the runtime fallback so chat actually
-            // routes to it. Without this, picking Ollama in onboarding would
-            // create the entry but the chat path keeps using the prior
-            // fallback (or fails because none is set), and the user lands
-            // on "OpenRouter API key not set" trying to chat with a model
-            // they thought they'd configured. Mirrors `zeroclaw onboard`'s
-            // post-pick semantics.
-            if let Err(e) = working.set_prop("providers.fallback", &key) {
-                tracing::warn!(provider = %key, error = %e, "failed to set providers.fallback after pick");
+                tracing::warn!(provider = %key, alias = %alias, error = ?e, "failed to apply trait defaults; form will start blank");
             }
             (prefix, created)
         }
         "channels" => {
-            let prefix = format!("channels.{key}");
-            // init_defaults instantiates the subsection if it doesn't exist.
-            // The set returned tells us whether something was newly created.
-            let initialized = working.init_defaults(Some(&prefix));
-            (prefix, !initialized.is_empty())
+            let created = working
+                .create_map_key(&format!("channels.{key}"), &alias)
+                .map_err(|msg| {
+                    error_response(
+                        ConfigApiError::new(
+                            ConfigApiCode::PathNotFound,
+                            format!("could not select channel `{key}` alias `{alias}`: {msg}"),
+                        )
+                        .with_path(format!("channels.{key}")),
+                    )
+                });
+            let created = match created {
+                Ok(c) => c,
+                Err(resp) => return resp,
+            };
+            let prefix = format!("channels.{key}.{alias}");
+            (prefix, created)
+        }
+        "agents" => {
+            // Agents are flat (one level): the URL path key IS the alias.
+            // create_map_key is idempotent, so selecting an existing alias
+            // just returns the form prefix without modifying anything.
+            let created = working.create_map_key("agents", &key).map_err(|msg| {
+                error_response(
+                    ConfigApiError::new(
+                        ConfigApiCode::PathNotFound,
+                        format!("could not select agent alias `{key}`: {msg}"),
+                    )
+                    .with_path("agents"),
+                )
+            });
+            let created = match created {
+                Ok(c) => c,
+                Err(resp) => return resp,
+            };
+            (format!("agents.{key}"), created)
         }
         "memory" => {
             // Set memory.backend to the picked key. Fields_prefix points at
@@ -791,28 +928,32 @@ mod tests {
     fn channels_select_initializes_subsection_so_set_prop_works() {
         // Regression for the channels init/set flow: after
         // handle_section_select for channels/matrix, the in-memory config
-        // must have channels.matrix = Some(...) so a subsequent set_prop on
+        // must have channels.matrix.<alias> so a subsequent set_prop on
         // channels.matrix.* succeeds rather than bailing "Unknown property".
-        // Calls init_defaults directly (the synchronous core of the select
+        // Uses create_map_key directly (the synchronous core of the select
         // endpoint) to keep the test free of HTTP machinery.
         let mut cfg = empty_cfg();
-        assert!(cfg.channels.matrix.is_none(), "fresh config: matrix unset");
+        assert!(cfg.channels.matrix.is_empty(), "fresh config: matrix unset");
 
-        let initialized = cfg.init_defaults(Some("channels.matrix"));
+        cfg.create_map_key("channels.matrix", "my-matrix-alias")
+            .expect("create_map_key must succeed for channels.matrix");
         assert!(
-            initialized.contains(&"channels.matrix"),
-            "init_defaults must report channels.matrix initialized; got: {initialized:?}",
-        );
-        assert!(
-            cfg.channels.matrix.is_some(),
-            "channels.matrix must be Some after init_defaults",
+            cfg.channels.matrix.contains_key("my-matrix-alias"),
+            "channels.matrix must have alias after create_map_key",
         );
 
         // The form would issue a PATCH whose set_prop call hits this path.
-        cfg.set_prop("channels.matrix.allowed-rooms", r#"["alice","bob"]"#)
-            .expect("set_prop on initialized matrix subsection must succeed");
+        cfg.set_prop(
+            "channels.matrix.my-matrix-alias.allowed-rooms",
+            r#"["alice","bob"]"#,
+        )
+        .expect("set_prop on initialized matrix subsection must succeed");
         assert_eq!(
-            cfg.channels.matrix.as_ref().unwrap().allowed_rooms,
+            cfg.channels
+                .matrix
+                .get("my-matrix-alias")
+                .unwrap()
+                .allowed_rooms,
             vec!["alice".to_string(), "bob".to_string()],
         );
     }
@@ -908,15 +1049,16 @@ mod tests {
     }
 
     #[test]
-    fn channels_picker_marks_configured_after_init_defaults() {
+    fn channels_picker_marks_configured_after_create_map_key() {
         let mut cfg = empty_cfg();
-        cfg.init_defaults(Some("channels.matrix"));
+        cfg.create_map_key("channels.matrix", "my-matrix-alias")
+            .expect("create_map_key must succeed for channels.matrix");
         let items = schema_walk_picker(&cfg, "channels");
         let matrix = items.iter().find(|i| i.key == "matrix").unwrap();
         assert_eq!(
             matrix.badge.as_deref(),
             Some("configured"),
-            "matrix should be marked configured after init_defaults"
+            "matrix should be marked configured after create_map_key"
         );
     }
 

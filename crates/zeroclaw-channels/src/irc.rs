@@ -992,7 +992,6 @@ mod tests {
         use zeroclaw_config::schema::IrcConfig;
 
         let config = IrcConfig {
-            enabled: true,
             server: "irc.example.com".into(),
             port: 6697,
             nickname: "zcbot".into(),
@@ -1004,6 +1003,7 @@ mod tests {
             sasl_password: None,
             verify_tls: Some(true),
             mention_only: false,
+            excluded_tools: vec![],
         };
 
         let toml_str = toml::to_string(&config).unwrap();

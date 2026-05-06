@@ -19,16 +19,19 @@
 // On error: structured ApiError envelope binds inline to the field by .path.
 
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useState } from 'react';
-import { List as ListIcon, Plus, Save, Trash2, Type as TypeIcon } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { ExternalLink, List as ListIcon, Plus, Save, Trash2, Type as TypeIcon } from 'lucide-react';
 import {
   ApiError,
   deleteProp,
   descriptionForPath,
   fetchConfigSchema,
+  getAgentOptions,
   getCatalogModels,
   listProps,
   objectArrayElementProps,
   patchConfig,
+  type AgentOptionsResponse,
   type ConfigApiError,
   type DriftEntry,
   type ListResponseEntry,
@@ -175,6 +178,119 @@ function isOptionalArray(typeHint: string): boolean {
 }
 
 const modelsCache: Record<string, { models: string[]; live: boolean }> = {};
+
+// Shared agent-options cache. Populated lazily by the first FieldRow on
+// an `agents.<alias>.<field>` path; lives module-level so every row in
+// the same agent form reuses one fetch instead of N fetches.
+let agentOptionsCache: AgentOptionsResponse | null = null;
+let agentOptionsPromise: Promise<AgentOptionsResponse> | null = null;
+function loadAgentOptions(): Promise<AgentOptionsResponse> {
+  if (agentOptionsCache) return Promise.resolve(agentOptionsCache);
+  if (agentOptionsPromise) return agentOptionsPromise;
+  agentOptionsPromise = getAgentOptions()
+    .then((r) => {
+      agentOptionsCache = r;
+      return r;
+    })
+    .finally(() => {
+      agentOptionsPromise = null;
+    });
+  return agentOptionsPromise;
+}
+
+// Single-select alias-ref fields on an agent: render as <select> with the
+// matched options. Mandatory-vs-optional is enforced by `Config::validate()`
+// at the backend on save — the frontend just submits whatever the user
+// picks (including empty) and surfaces structured errors inline.
+//
+// Keys are kebab-case to match `prop_fields()` emission (the macro at
+// crates/zeroclaw-macros/src/lib.rs:1056 converts every snake_case Rust
+// field name to kebab-case for the schema path).
+const AGENT_SINGLE_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
+  'model-provider': 'model_providers',
+  'risk-profile': 'risk_profiles',
+  'runtime-profile': 'runtime_profiles',
+  'memory-namespace': 'memory_namespaces',
+};
+
+// Multi-select alias-ref fields on an agent: render as the chip editor with
+// a `<datalist>` of the available aliases (no free text expected — the
+// suggestions list is the canonical input source). Same kebab-case
+// convention as AGENT_SINGLE_ALIAS_FIELDS above.
+const AGENT_MULTI_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
+  channels: 'channels',
+  'skill-bundles': 'skill_bundles',
+  'knowledge-bundles': 'knowledge_bundles',
+  'mcp-bundles': 'mcp_bundles',
+};
+
+function agentFieldKey(path: string): string | null {
+  const m = path.match(/^agents\.[^.]+\.(.+)$/);
+  return m && m[1] ? m[1] : null;
+}
+
+// Cross-section navigation map for agent alias-ref fields. Each entry
+// answers: "where does this field's source live in /config/?"
+// Used both by the empty-state hint and the per-item edit-jump links.
+const AGENT_ALIAS_SOURCE_PATH: Record<keyof AgentOptionsResponse, string> = {
+  channels: '/config/channels',
+  model_providers: '/config/providers',
+  risk_profiles: '/config/risk_profiles',
+  runtime_profiles: '/config/runtime_profiles',
+  skill_bundles: '/config/skill_bundles',
+  knowledge_bundles: '/config/knowledge_bundles',
+  mcp_bundles: '/config/mcp_bundles',
+  memory_namespaces: '/config/memory_namespaces',
+};
+
+function AgentEmptyAliasFallback({
+  fieldKind,
+}: {
+  fieldKind: keyof AgentOptionsResponse;
+}) {
+  const path = AGENT_ALIAS_SOURCE_PATH[fieldKind];
+  const label = fieldKind.replace(/_/g, ' ');
+  return (
+    <div
+      className="text-xs px-3 py-2 rounded border"
+      style={{
+        color: 'var(--pc-text-muted)',
+        borderColor: 'var(--pc-border)',
+        background: 'var(--pc-bg-surface-subtle)',
+      }}
+    >
+      No {label} configured yet.{' '}
+      <Link
+        to={path}
+        className="inline-flex items-center gap-1 underline"
+        style={{ color: 'var(--pc-text-link)' }}
+      >
+        Configure {label} <ExternalLink className="h-3 w-3" />
+      </Link>
+    </div>
+  );
+}
+
+/// Path resolver for the per-item edit-jump beside picker entries.
+/// `channels` → `/config/channels/<type>/<alias>`; bare-alias sections
+/// like risk_profiles use `/config/<section>/<alias>`. Shape parallels the
+/// AliasListView routes already configured in `Config.tsx`.
+function agentAliasJumpPath(
+  fieldKind: keyof AgentOptionsResponse,
+  alias: string,
+): string {
+  const base = AGENT_ALIAS_SOURCE_PATH[fieldKind];
+  // Channels and model_providers use dotted alias (`telegram.default`,
+  // `anthropic.work`); split into the two URL segments. Single-tier
+  // sections use the alias directly.
+  if (fieldKind === 'channels' || fieldKind === 'model_providers') {
+    const dot = alias.indexOf('.');
+    if (dot > 0) {
+      return `${base}/${encodeURIComponent(alias.slice(0, dot))}/${encodeURIComponent(alias.slice(dot + 1))}`;
+    }
+  }
+  return `${base}/${encodeURIComponent(alias)}`;
+}
 
 const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm(
   { prefix, onSaved, showDelete = true, title, drift },
@@ -541,6 +657,27 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
   const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
   const isProviderModelField = /^providers\.models\.[^.]+\.model$/.test(entry.path);
 
+  // Agent-form alias pickers. Each `agents.<alias>.<field>` row that
+  // references another section's aliases (channels, model_provider, etc.)
+  // renders as a picker over the live config rather than a free-text
+  // input. The `system_prompt` field gets a textarea.
+  const agentField = agentFieldKey(entry.path);
+  // Schema path is kebab-case (matches prop_fields() emission).
+  const isAgentSystemPrompt = agentField === 'system-prompt';
+  const agentSingleAliasKind: keyof AgentOptionsResponse | null =
+    agentField && AGENT_SINGLE_ALIAS_FIELDS[agentField]
+      ? AGENT_SINGLE_ALIAS_FIELDS[agentField]
+      : null;
+  const agentMultiAliasKind: keyof AgentOptionsResponse | null =
+    agentField && AGENT_MULTI_ALIAS_FIELDS[agentField]
+      ? AGENT_MULTI_ALIAS_FIELDS[agentField]
+      : null;
+  const agentNeedsOptions =
+    agentSingleAliasKind !== null || agentMultiAliasKind !== null;
+  const [agentOptions, setAgentOptions] = useState<AgentOptionsResponse | null>(
+    agentOptionsCache,
+  );
+
   useEffect(() => {
     if (!isProviderModelField) return;
     const provider = entry.path.split('.')[2];
@@ -563,6 +700,15 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
         setModelsFetchFailed(true);
       });
   }, [isProviderModelField, entry.path]);
+
+  useEffect(() => {
+    if (!agentNeedsOptions || agentOptions !== null) return;
+    void loadAgentOptions()
+      .then((r) => setAgentOptions(r))
+      .catch(() => {
+        // Fail-open: leave options null so the field falls back to text.
+      });
+  }, [agentNeedsOptions, agentOptions]);
 
   return (
     <div className="px-4 py-3">
@@ -684,6 +830,56 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
               Fetching available models from the provider's catalog…
             </p>
           </>
+        ) : isAgentSystemPrompt ? (
+          <textarea
+            id={entry.path}
+            rows={Math.max(4, Math.min(value.split('\n').length + 1, 14))}
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            className="input-electric w-full px-3 py-2 text-sm font-mono resize-y"
+            placeholder="Optional. Prefer placing prose in agents/<alias>/AGENTS.md."
+          />
+        ) : agentSingleAliasKind && agentOptions ? (
+          agentOptions[agentSingleAliasKind].length === 0 ? (
+            <AgentEmptyAliasFallback fieldKind={agentSingleAliasKind} />
+          ) : (
+            <div className="flex items-center gap-2">
+              <select
+                id={entry.path}
+                value={value}
+                onChange={(e) => onChange(e.target.value)}
+                className="input-electric flex-1 px-3 py-2 text-sm appearance-none cursor-pointer"
+              >
+                <option value="">— (none)</option>
+                {agentOptions[agentSingleAliasKind].map((a) => (
+                  <option key={a} value={a}>
+                    {a}
+                  </option>
+                ))}
+              </select>
+              {value && (
+                <Link
+                  to={agentAliasJumpPath(agentSingleAliasKind, value)}
+                  title={`Edit ${value} in its source section`}
+                  className="btn-icon flex-shrink-0"
+                >
+                  <ExternalLink className="h-4 w-4" />
+                </Link>
+              )}
+            </div>
+          )
+        ) : agentMultiAliasKind && agentOptions ? (
+          agentOptions[agentMultiAliasKind].length === 0 ? (
+            <AgentEmptyAliasFallback fieldKind={agentMultiAliasKind} />
+          ) : (
+            <ArrayFieldEditor
+              inputId={entry.path}
+              value={value}
+              onChange={onChange}
+              isOptional={isOptionalArray(entry.type_hint)}
+              suggestions={agentOptions[agentMultiAliasKind]}
+            />
+          )
         ) : renderer === 'array' ? (
           <ArrayFieldEditor
             inputId={entry.path}
@@ -747,6 +943,10 @@ interface ArrayFieldEditorProps {
   value: string;
   onChange: (next: string) => void;
   isOptional: boolean;
+  /** When provided, each chip input gets an attached `<datalist>` so
+   *  users can pick from a known list of valid values (e.g. channel
+   *  aliases on an agent's `channels` field) instead of typing free text. */
+  suggestions?: string[];
 }
 
 // Per-row chip editor for `Vec<String>` / `Option<Vec<String>>` fields with
@@ -754,7 +954,7 @@ interface ArrayFieldEditorProps {
 // JSON array string) so toggling preserves edits. Trim + drop-empty runs
 // at save time in `parseArrayDraft`, not on every keystroke — typing a
 // space inside a chip shouldn't truncate the entry.
-function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEditorProps) {
+function ArrayFieldEditor({ inputId, value, onChange, isOptional, suggestions }: ArrayFieldEditorProps) {
   const [mode, setMode] = useState<'rows' | 'text'>('rows');
   const rows = useMemo(() => parseArrayRows(value), [value]);
 
@@ -830,7 +1030,8 @@ function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEd
                     value={row}
                     onChange={(e) => setRow(i, e.target.value)}
                     className="input-electric flex-1 px-3 py-1.5 text-sm"
-                    placeholder="empty"
+                    placeholder={suggestions && suggestions.length > 0 ? 'pick from list' : 'empty'}
+                    list={suggestions ? `${inputId}-suggestions` : undefined}
                   />
                   <button
                     type="button"
@@ -843,6 +1044,13 @@ function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEd
                 </li>
               ))}
             </ul>
+          )}
+          {suggestions && (
+            <datalist id={`${inputId}-suggestions`}>
+              {suggestions.map((s) => (
+                <option key={s} value={s} />
+              ))}
+            </datalist>
           )}
           <button
             type="button"

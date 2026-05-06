@@ -74,34 +74,30 @@ pub use traits::{
 use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
-use zeroclaw_config::schema::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
+use zeroclaw_config::schema::{
+    ActiveStorage, EmbeddingRouteConfig, MemoryConfig, PostgresStorageConfig,
+};
 
 #[cfg(feature = "memory-postgres")]
-fn build_postgres_memory(
-    memory_config: &MemoryConfig,
-    storage_provider: &StorageProviderConfig,
-) -> anyhow::Result<Box<dyn Memory>> {
+fn build_postgres_memory(storage: &PostgresStorageConfig) -> anyhow::Result<Box<dyn Memory>> {
     use postgres::PostgresMemory;
-    let db_url = storage_provider
+    let db_url = storage
         .db_url
         .as_deref()
-        .context("memory backend 'postgres' requires [storage.provider.config].db_url")?;
+        .context("memory backend 'postgres' requires [storage.postgres.<alias>].db_url")?;
     let memory = PostgresMemory::new(
         db_url,
-        &storage_provider.schema,
-        &storage_provider.table,
-        storage_provider.connect_timeout_secs,
-        Some(memory_config.postgres.vector_enabled),
-        Some(memory_config.postgres.vector_dimensions),
+        &storage.schema,
+        &storage.table,
+        storage.connect_timeout_secs,
+        Some(storage.vector_enabled),
+        Some(storage.vector_dimensions),
     )?;
     Ok(Box::new(memory))
 }
 
 #[cfg(not(feature = "memory-postgres"))]
-fn build_postgres_memory(
-    _memory_config: &MemoryConfig,
-    _storage_provider: &StorageProviderConfig,
-) -> anyhow::Result<Box<dyn Memory>> {
+fn build_postgres_memory(_storage: &PostgresStorageConfig) -> anyhow::Result<Box<dyn Memory>> {
     anyhow::bail!(
         "memory backend 'postgres' requested but this build was compiled without \
          `memory-postgres`; rebuild with `--features memory-postgres`"
@@ -124,7 +120,7 @@ where
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
         MemoryBackendKind::Postgres => {
-            // Postgres requires a real MemoryConfig + StorageProviderConfig, which this
+            // Postgres requires a typed `[storage.postgres.<alias>]` config, which this
             // builder-only entry point does not receive. All supported call paths go
             // through `create_memory_with_storage_and_routes`, which handles postgres via
             // an early return. Fail loudly if a caller ever reaches this arm, rather than
@@ -147,18 +143,14 @@ where
     }
 }
 
-pub fn effective_memory_backend_name(
-    memory_backend: &str,
-    storage_provider: Option<&StorageProviderConfig>,
-) -> String {
-    if let Some(override_provider) = storage_provider
-        .map(|cfg| cfg.provider.trim())
-        .filter(|provider| !provider.is_empty())
-    {
-        return override_provider.to_ascii_lowercase();
-    }
-
-    memory_backend.trim().to_ascii_lowercase()
+/// Extract the backend kind from a V3 dotted reference (`<kind>.<alias>`).
+/// Bare names (`"sqlite"`) are returned as-is. Returned lowercase.
+pub fn backend_kind_from_dotted(memory_backend: &str) -> String {
+    memory_backend
+        .trim()
+        .split_once('.')
+        .map_or(memory_backend.trim(), |(kind, _)| kind)
+        .to_ascii_lowercase()
 }
 
 /// Legacy auto-save key used for model-authored assistant summaries.
@@ -300,28 +292,23 @@ pub fn create_memory(
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes(config, &[], None, workspace_dir, api_key)
+    create_memory_with_storage_and_routes(config, &[], ActiveStorage::None, workspace_dir, api_key)
 }
 
-/// Factory: create memory with optional storage-provider override.
-pub fn create_memory_with_storage(
-    config: &MemoryConfig,
-    storage_provider: Option<&StorageProviderConfig>,
-    workspace_dir: &Path,
-    api_key: Option<&str>,
-) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes(config, &[], storage_provider, workspace_dir, api_key)
-}
-
-/// Factory: create memory with optional storage-provider override and embedding routes.
+/// Factory: create memory with a resolved active storage backend and embedding routes.
+///
+/// Pass [`ActiveStorage::None`] when no typed storage config is needed (sqlite,
+/// markdown, lucid, none — all infer settings from the workspace). Postgres and
+/// Qdrant require their typed variants and will error if the wrong variant is
+/// supplied.
 pub fn create_memory_with_storage_and_routes(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
-    storage_provider: Option<&StorageProviderConfig>,
+    active_storage: ActiveStorage<'_>,
     workspace_dir: &Path,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    let backend_name = effective_memory_backend_name(&config.backend, storage_provider);
+    let backend_name = backend_kind_from_dotted(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
     let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key);
 
@@ -366,6 +353,7 @@ pub fn create_memory_with_storage_and_routes(
 
     fn build_sqlite_memory(
         config: &MemoryConfig,
+        sqlite_open_timeout_secs: Option<u64>,
         workspace_dir: &Path,
         resolved_embedding: &ResolvedEmbeddingConfig,
     ) -> anyhow::Result<SqliteMemory> {
@@ -384,29 +372,41 @@ pub fn create_memory_with_storage_and_routes(
             config.vector_weight as f32,
             config.keyword_weight as f32,
             config.embedding_cache_size,
-            config.sqlite_open_timeout_secs,
+            sqlite_open_timeout_secs,
             config.search_mode.clone(),
         )?;
         Ok(mem)
     }
 
+    // Per-backend SQLite open-timeout override comes from the active storage
+    // alias (V3); when no typed entry resolves, sqlite waits indefinitely.
+    let sqlite_open_timeout_secs = match active_storage {
+        ActiveStorage::Sqlite(sq) => sq.open_timeout_secs,
+        _ => None,
+    };
+
     if matches!(backend_kind, MemoryBackendKind::Qdrant) {
-        let url = config
-            .qdrant
+        let qdrant_cfg = match active_storage {
+            ActiveStorage::Qdrant(q) => q,
+            _ => anyhow::bail!(
+                "memory backend 'qdrant' requires a `[storage.qdrant.<alias>]` entry \
+                 referenced by `memory.backend = \"qdrant.<alias>\"`"
+            ),
+        };
+        let url = qdrant_cfg
             .url
             .clone()
             .filter(|s| !s.trim().is_empty())
             .or_else(|| std::env::var("QDRANT_URL").ok())
             .filter(|s| !s.trim().is_empty())
             .context(
-                "Qdrant memory backend requires url in [memory.qdrant] or QDRANT_URL env var",
+                "Qdrant memory backend requires url in [storage.qdrant.<alias>] or QDRANT_URL env var",
             )?;
         let collection = std::env::var("QDRANT_COLLECTION")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| config.qdrant.collection.clone());
-        let qdrant_api_key = config
-            .qdrant
+            .unwrap_or_else(|| qdrant_cfg.collection.clone());
+        let qdrant_api_key = qdrant_cfg
             .api_key
             .clone()
             .or_else(|| std::env::var("QDRANT_API_KEY").ok())
@@ -432,15 +432,27 @@ pub fn create_memory_with_storage_and_routes(
     }
 
     if matches!(backend_kind, MemoryBackendKind::Postgres) {
-        let fallback = StorageProviderConfig::default();
-        let provider = storage_provider.unwrap_or(&fallback);
-        return build_postgres_memory(config, provider);
+        let pg_cfg = match active_storage {
+            ActiveStorage::Postgres(p) => p,
+            _ => anyhow::bail!(
+                "memory backend 'postgres' requires a `[storage.postgres.<alias>]` entry \
+                 referenced by `memory.backend = \"postgres.<alias>\"`"
+            ),
+        };
+        return build_postgres_memory(pg_cfg);
     }
 
     create_memory_with_builders(
         &backend_name,
         workspace_dir,
-        || build_sqlite_memory(config, workspace_dir, &resolved_embedding),
+        || {
+            build_sqlite_memory(
+                config,
+                sqlite_open_timeout_secs,
+                workspace_dir,
+                &resolved_embedding,
+            )
+        },
         "",
     )
 }
@@ -493,7 +505,7 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use zeroclaw_config::schema::{EmbeddingRouteConfig, StorageProviderConfig};
+    use zeroclaw_config::schema::EmbeddingRouteConfig;
 
     #[test]
     fn factory_sqlite() {
@@ -580,18 +592,69 @@ mod tests {
     #[cfg(not(feature = "memory-postgres"))]
     #[test]
     fn factory_postgres_without_feature_gives_clear_error() {
+        use zeroclaw_config::schema::PostgresStorageConfig;
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
-            backend: "postgres".into(),
+            backend: "postgres.default".into(),
             ..MemoryConfig::default()
         };
-        let error = create_memory(&cfg, tmp.path(), None)
-            .err()
-            .expect("backend=postgres without memory-postgres feature should fail");
+        let storage = PostgresStorageConfig {
+            db_url: Some("postgres://placeholder".into()),
+            ..PostgresStorageConfig::default()
+        };
+        let error = create_memory_with_storage_and_routes(
+            &cfg,
+            &[],
+            ActiveStorage::Postgres(&storage),
+            tmp.path(),
+            None,
+        )
+        .err()
+        .expect("backend=postgres without memory-postgres feature should fail");
         assert!(
             error.to_string().contains("memory-postgres"),
             "error should mention the feature flag: {error}"
         );
+    }
+
+    #[test]
+    fn factory_postgres_without_storage_alias_errors() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "postgres.default".into(),
+            ..MemoryConfig::default()
+        };
+        let error = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("backend=postgres requires a [storage.postgres.<alias>] entry");
+        assert!(
+            error.to_string().contains("storage.postgres"),
+            "error should reference storage.postgres alias: {error}"
+        );
+    }
+
+    #[test]
+    fn factory_qdrant_without_storage_alias_errors() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "qdrant.default".into(),
+            ..MemoryConfig::default()
+        };
+        let error = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("backend=qdrant requires a [storage.qdrant.<alias>] entry");
+        assert!(
+            error.to_string().contains("storage.qdrant"),
+            "error should reference storage.qdrant alias: {error}"
+        );
+    }
+
+    #[test]
+    fn backend_kind_extraction_strips_alias_suffix() {
+        assert_eq!(backend_kind_from_dotted("sqlite"), "sqlite");
+        assert_eq!(backend_kind_from_dotted("sqlite.default"), "sqlite");
+        assert_eq!(backend_kind_from_dotted("postgres.work"), "postgres");
+        assert_eq!(backend_kind_from_dotted("  Qdrant.Prod  "), "qdrant");
     }
 
     #[test]
@@ -619,19 +682,6 @@ mod tests {
             .err()
             .expect("backend=none should be rejected for migration");
         assert!(error.to_string().contains("disables persistence"));
-    }
-
-    #[test]
-    fn effective_backend_name_prefers_storage_override() {
-        let storage = StorageProviderConfig {
-            provider: "qdrant".into(),
-            ..StorageProviderConfig::default()
-        };
-
-        assert_eq!(
-            effective_memory_backend_name("sqlite", Some(&storage)),
-            "qdrant"
-        );
     }
 
     #[test]

@@ -6,10 +6,9 @@
 //! `"anthropic"`, `"ollama"`, `"gemini"`). Provider aliases are resolved internally
 //! so that user-facing keys remain stable.
 //!
-//! The subsystem supports resilient multi-provider configurations through the
-//! [`ReliableProvider`] wrapper, which handles fallback
-//! chains and automatic retry. Model routing across providers is available via
-//! [`create_routed_provider`].
+//! Each provider call goes through the [`ReliableProvider`] wrapper, which adds
+//! automatic retry with exponential backoff and API-key rotation on rate limits.
+//! Model routing across multiple providers is available via [`create_routed_provider`].
 //!
 //! # Extension
 //!
@@ -20,7 +19,6 @@ pub mod anthropic;
 pub mod auth;
 pub mod azure_openai;
 pub mod bedrock;
-pub mod claude_code;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
@@ -747,47 +745,86 @@ impl Default for ProviderRuntimeOptions {
     }
 }
 
-pub fn provider_runtime_options_from_config(
+/// Build `ProviderRuntimeOptions` from a *specific* `ModelProviderConfig`
+/// entry plus the global config's process-wide settings (zeroclaw_dir,
+/// secrets, runtime). Splits out the per-entry resolution so callers with
+/// agent context can pass in the alias-resolved entry instead of hitting
+/// `first_provider()` (#6266 review).
+///
+/// Pass `None` when no provider entry is resolvable (e.g. tests or fresh
+/// config with no models configured); falls back to safe defaults.
+pub fn provider_runtime_options_from_provider_entry(
     config: &zeroclaw_config::schema::Config,
+    entry: Option<&zeroclaw_config::schema::ModelProviderConfig>,
 ) -> ProviderRuntimeOptions {
-    let fallback = config.providers.fallback_provider();
-    // Resolve merge_system_into_user from the active model provider profile by
-    // matching api_url — apply_named_model_provider_profile() has already run
-    // and rewritten providers.fallback, but providers.models retains all profiles.
-    let merge_system_into_user = fallback
+    // Resolve merge_system_into_user from the active model provider profile
+    // by matching api_url — providers.models retains all profiles. We keep
+    // this lookup based on URL match rather than identity because the entry
+    // we were given may itself originate from any of those profiles.
+    let merge_system_into_user = entry
         .and_then(|e| e.base_url.as_deref())
         .map(str::trim)
         .filter(|u| !u.is_empty())
         .and_then(|active_url| {
-            config.providers.models.values().find(|p| {
-                p.base_url
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|u| !u.is_empty())
-                    .map(|u| u.trim_end_matches('/'))
-                    == Some(active_url.trim_end_matches('/'))
-            })
+            config
+                .providers
+                .models
+                .values()
+                .flat_map(|alias_map| alias_map.values())
+                .find(|p| {
+                    p.base_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|u: &&str| !u.is_empty())
+                        .map(|u: &str| u.trim_end_matches('/'))
+                        == Some(active_url.trim_end_matches('/'))
+                })
         })
         .map(|p| p.merge_system_into_user)
         .unwrap_or(false);
 
     ProviderRuntimeOptions {
         auth_profile_override: None,
-        provider_api_url: fallback.and_then(|e| e.base_url.clone()),
+        provider_api_url: entry.and_then(|e| e.base_url.clone()),
         zeroclaw_dir: config.config_path.parent().map(PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
-        provider_timeout_secs: Some(fallback.and_then(|e| e.timeout_secs).unwrap_or(120)),
-        extra_headers: fallback
-            .map(|e| e.extra_headers.clone())
-            .unwrap_or_default(),
-        api_path: fallback.and_then(|e| e.api_path.clone()),
-        provider_max_tokens: fallback.and_then(|e| e.max_tokens),
+        provider_timeout_secs: Some(entry.and_then(|e| e.timeout_secs).unwrap_or(120)),
+        extra_headers: entry.map(|e| e.extra_headers.clone()).unwrap_or_default(),
+        api_path: entry.and_then(|e| e.api_path.clone()),
+        provider_max_tokens: entry.and_then(|e| e.max_tokens),
         merge_system_into_user,
-        provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
-        native_tools: fallback.and_then(|e| e.native_tools),
+        provider_extra: entry.and_then(|e| e.provider_extra.clone()),
+        native_tools: entry.and_then(|e| e.native_tools),
     }
+}
+
+/// Resolve `ProviderRuntimeOptions` from an agent's `model_provider` alias
+/// (`"<type>.<alias>"`). Falls back to `first_provider()` when the agent
+/// alias doesn't exist, doesn't have a `model_provider` set, or names a
+/// non-existent provider entry — preserving the conservative pre-V3
+/// behavior so misconfigured callsites still get *something* instead of
+/// crashing the channel server. The fallback is logged so multi-alias
+/// users can spot misconfiguration.
+pub fn provider_runtime_options_for_agent(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> ProviderRuntimeOptions {
+    let entry = config.model_provider_for_agent(agent_alias).or_else(|| {
+        tracing::debug!(
+            agent = agent_alias,
+            "model_provider_for_agent returned None; falling back to providers.first_provider()"
+        );
+        config.providers.first_provider()
+    });
+    provider_runtime_options_from_provider_entry(config, entry)
+}
+
+pub fn provider_runtime_options_from_config(
+    config: &zeroclaw_config::schema::Config,
+) -> ProviderRuntimeOptions {
+    provider_runtime_options_from_provider_entry(config, config.providers.first_provider())
 }
 
 fn is_secret_char(c: char) -> bool {
@@ -876,7 +913,7 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 /// Resolution order:
 /// 1. Explicitly provided `api_key` parameter (trimmed, filtered if empty)
 /// 2. Provider-specific environment variable (e.g., `ANTHROPIC_OAUTH_TOKEN`, `OPENROUTER_API_KEY`)
-/// 3. Generic fallback variables (`ZEROCLAW_API_KEY`, `API_KEY`)
+/// 3. Generic env variables (`ZEROCLAW_API_KEY`, `API_KEY`)
 ///
 /// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
 /// followed by `ANTHROPIC_API_KEY` (for regular API keys).
@@ -901,8 +938,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
             } else if name == "anthropic" || name == "openai" || name == "groq" {
                 // For well-known providers, prefer provider-specific env vars over the
                 // global api_key override, since the global key may belong to a different
-                // provider (e.g. a custom: gateway). This enables multi-provider setups
-                // where the primary uses a custom gateway and fallbacks use named providers.
+                // provider (e.g. a custom: gateway).
                 let env_candidates: &[&str] = match name {
                     "anthropic" => &["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
                     "openai" => &["OPENAI_API_KEY"],
@@ -1498,7 +1534,6 @@ fn create_provider_with_url_and_options(
             AuthStyle::Bearer,
         ))),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
-        "claude-code" => Ok(Box::new(claude_code::ClaudeCodeProvider::new())),
         "gemini-cli" => Ok(Box::new(gemini_cli::GeminiCliProvider::new())),
         "kilocli" | "kilo" => Ok(Box::new(kilocli::KiloCliProvider::new())),
         "lmstudio" | "lm-studio" => {
@@ -1800,23 +1835,7 @@ fn create_provider_with_url_and_options(
     }
 }
 
-/// Parse `"provider:profile"` syntax for fallback entries.
-///
-/// Returns `(provider_name, Some(profile))` when the entry contains a colon-
-/// delimited profile, or `(original_str, None)` otherwise.  Entries starting
-/// with `custom:` or `anthropic-custom:` are left untouched because the colon
-/// is part of the URL scheme.
-fn parse_provider_profile(s: &str) -> (&str, Option<&str>) {
-    if s.starts_with("custom:") || s.starts_with("anthropic-custom:") {
-        return (s, None);
-    }
-    match s.split_once(':') {
-        Some((provider, profile)) if !profile.is_empty() => (provider, Some(profile)),
-        _ => (s, None),
-    }
-}
-
-/// Create provider chain with retry and fallback behavior.
+/// Wrap the primary provider in a retry/backoff harness.
 pub fn create_resilient_provider(
     primary_name: &str,
     api_key: Option<&str>,
@@ -1832,7 +1851,7 @@ pub fn create_resilient_provider(
     )
 }
 
-/// Create provider chain with retry/fallback behavior and auth runtime options.
+/// Wrap the primary provider in a retry/backoff harness, threading auth runtime options.
 pub fn create_resilient_provider_with_options(
     primary_name: &str,
     api_key: Option<&str>,
@@ -1840,66 +1859,26 @@ pub fn create_resilient_provider_with_options(
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
-
     let primary_provider = match primary_name {
         "openai-codex" | "openai_codex" | "codex" => {
             create_provider_with_options(primary_name, api_key, options)?
         }
         _ => create_provider_with_url_and_options(primary_name, api_key, api_url, options)?,
     };
-    providers.push((primary_name.to_string(), primary_provider));
-
-    for fallback in &reliability.fallback_providers {
-        if fallback == primary_name || providers.iter().any(|(name, _)| name == fallback) {
-            continue;
-        }
-
-        let (provider_name, profile_override) = parse_provider_profile(fallback);
-
-        // Each fallback provider resolves its own credential via provider-
-        // specific env vars (e.g. DEEPSEEK_API_KEY for "deepseek") instead
-        // of inheriting the primary provider's key. Passing `None` lets
-        // `resolve_provider_credential` check the correct env var for the
-        // fallback provider name.
-        //
-        // When a profile override is present (e.g. "openai-codex:second"),
-        // propagate it through `auth_profile_override` so the provider
-        // picks up the correct OAuth credential set.
-        let fallback_options = match profile_override {
-            Some(profile) => {
-                let mut opts = options.clone();
-                opts.auth_profile_override = Some(profile.to_string());
-                opts
-            }
-            None => options.clone(),
-        };
-
-        match create_provider_with_options(provider_name, None, &fallback_options) {
-            Ok(provider) => providers.push((fallback.clone(), provider)),
-            Err(_error) => {
-                tracing::warn!(
-                    fallback_provider = fallback,
-                    "Ignoring invalid fallback provider during initialization"
-                );
-            }
-        }
-    }
 
     let reliable = ReliableProvider::new(
-        providers,
+        vec![(primary_name.to_string(), primary_provider)],
         reliability.provider_retries,
         reliability.provider_backoff_ms,
     )
-    .with_api_keys(reliability.api_keys.clone())
-    .with_model_fallbacks(reliability.model_fallbacks.clone());
+    .with_api_keys(reliability.api_keys.clone());
 
     Ok(Box::new(reliable))
 }
 
 /// Create a RouterProvider if model routes are configured, otherwise return a
 /// standard resilient provider. The router wraps individual providers per route,
-/// each with its own retry/fallback chain.
+/// each with its own retry harness.
 pub fn create_routed_provider(
     primary_name: &str,
     api_key: Option<&str>,
@@ -2239,12 +2218,6 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             display_name: "GitHub Copilot",
             aliases: &["github-copilot"],
             local: false,
-        },
-        ProviderInfo {
-            name: "claude-code",
-            display_name: "Claude Code (CLI)",
-            aliases: &[],
-            local: true,
         },
         ProviderInfo {
             name: "gemini-cli",
@@ -3122,16 +3095,22 @@ mod tests {
     #[test]
     fn provider_runtime_options_from_config_propagates_native_tools() {
         // The end-to-end path the operator uses: setting `native_tools` on
-        // the active provider profile must reach `ProviderRuntimeOptions`
-        // so the Groq factory branch sees it (#5932).
+        // the first configured provider profile must reach
+        // `ProviderRuntimeOptions` so the Groq factory branch sees it
+        // (#5932). V3 has no global `providers.fallback`; the orchestrator
+        // resolves per-agent and falls back to `first_provider()`.
         let mut config = zeroclaw_config::schema::Config::default();
         let mut groq = zeroclaw_config::schema::ModelProviderConfig {
             native_tools: Some(true),
             ..Default::default()
         };
         groq.base_url = Some("https://api.groq.com/openai/v1".to_string());
-        config.providers.models.insert("groq".to_string(), groq);
-        config.providers.fallback = Some("groq".to_string());
+        config
+            .providers
+            .models
+            .entry("groq".to_string())
+            .or_default()
+            .insert("default".to_string(), groq);
 
         let options = provider_runtime_options_from_config(&config);
         assert_eq!(
@@ -3195,11 +3174,6 @@ mod tests {
     fn factory_copilot() {
         assert!(create_provider("copilot", Some("key")).is_ok());
         assert!(create_provider("github-copilot", Some("key")).is_ok());
-    }
-
-    #[test]
-    fn factory_claude_code() {
-        assert!(create_provider("claude-code", None).is_ok());
     }
 
     #[test]
@@ -3375,34 +3349,6 @@ mod tests {
     }
 
     #[test]
-    fn resilient_provider_ignores_duplicate_and_invalid_fallbacks() {
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec![
-                "openrouter".into(),
-                "nonexistent-provider".into(),
-                "openai".into(),
-                "openai".into(),
-            ],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        let provider = create_resilient_provider(
-            "openrouter",
-            Some("provider-test-credential"),
-            None,
-            &reliability,
-        );
-        assert!(provider.is_ok());
-    }
-
-    #[test]
     fn resilient_provider_errors_for_invalid_primary() {
         let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
         let provider = create_resilient_provider(
@@ -3412,76 +3358,6 @@ mod tests {
             &reliability,
         );
         assert!(provider.is_err());
-    }
-
-    /// Fallback providers resolve their own credentials via provider-specific
-    /// env vars rather than inheriting the primary provider's key.  A provider
-    /// that requires no key (e.g. lmstudio, ollama) must initialize
-    /// successfully even when the primary uses a completely different key.
-    #[test]
-    fn resilient_fallback_resolves_own_credential() {
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec!["lmstudio".into(), "ollama".into()],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        // Primary uses a ZAI key; fallbacks (lmstudio, ollama) should NOT
-        // receive this key; they resolve their own credentials independently.
-        let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
-        assert!(provider.is_ok());
-    }
-
-    /// `custom:` URL entries work as fallback providers, enabling arbitrary
-    /// OpenAI-compatible endpoints (e.g. local LM Studio on a Docker host).
-    #[test]
-    fn resilient_fallback_supports_custom_url() {
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec!["custom:http://host.docker.internal:1234/v1".into()],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        let provider =
-            create_resilient_provider("openai", Some("openai-test-key"), None, &reliability);
-        assert!(provider.is_ok());
-    }
-
-    /// Mixed fallback chain: named providers, custom URLs, and invalid entries
-    /// all coexist.  Invalid entries are silently ignored; valid ones initialize.
-    #[test]
-    fn resilient_fallback_mixed_chain() {
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec![
-                "deepseek".into(),
-                "custom:http://localhost:8080/v1".into(),
-                "nonexistent-provider".into(),
-                "lmstudio".into(),
-            ],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
-        assert!(provider.is_ok());
     }
 
     #[test]
@@ -3494,25 +3370,6 @@ mod tests {
     fn ollama_cloud_with_custom_url() {
         let provider =
             create_provider_with_url("ollama", Some("ollama-key"), Some("https://ollama.com"));
-        assert!(provider.is_ok());
-    }
-
-    /// Osaurus works as a fallback provider alongside other named providers.
-    #[test]
-    fn resilient_fallback_includes_osaurus() {
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec!["osaurus".into(), "lmstudio".into()],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
         assert!(provider.is_ok());
     }
 
@@ -3565,7 +3422,6 @@ mod tests {
             "perplexity",
             "cohere",
             "copilot",
-            "claude-code",
             "gemini-cli",
             "kilocli",
             "nvidia",
@@ -3746,103 +3602,6 @@ mod tests {
         assert_eq!(result, "failed: [REDACTED]");
     }
 
-    // --- parse_provider_profile ---
-
-    #[test]
-    fn parse_provider_profile_plain_name() {
-        let (name, profile) = parse_provider_profile("gemini");
-        assert_eq!(name, "gemini");
-        assert_eq!(profile, None);
-    }
-
-    #[test]
-    fn parse_provider_profile_with_profile() {
-        let (name, profile) = parse_provider_profile("openai-codex:second");
-        assert_eq!(name, "openai-codex");
-        assert_eq!(profile, Some("second"));
-    }
-
-    #[test]
-    fn parse_provider_profile_custom_url_not_split() {
-        let input = "custom:https://my-api.example.com/v1";
-        let (name, profile) = parse_provider_profile(input);
-        assert_eq!(name, input);
-        assert_eq!(profile, None);
-    }
-
-    #[test]
-    fn parse_provider_profile_anthropic_custom_not_split() {
-        let input = "anthropic-custom:https://bedrock.example.com";
-        let (name, profile) = parse_provider_profile(input);
-        assert_eq!(name, input);
-        assert_eq!(profile, None);
-    }
-
-    #[test]
-    fn parse_provider_profile_empty_profile_ignored() {
-        let (name, profile) = parse_provider_profile("openai-codex:");
-        assert_eq!(name, "openai-codex:");
-        assert_eq!(profile, None);
-    }
-
-    #[test]
-    fn parse_provider_profile_extra_colons_kept() {
-        let (name, profile) = parse_provider_profile("provider:profile:extra");
-        assert_eq!(name, "provider");
-        assert_eq!(profile, Some("profile:extra"));
-    }
-
-    // --- resilient fallback with profile syntax ---
-
-    #[test]
-    fn resilient_fallback_with_profile_syntax() {
-        let _guard = env_lock();
-
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec!["openai-codex:second".into()],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        // openai-codex resolves its own OAuth credential; it should not
-        // fail even with a profile override that has no local token file.
-        // The provider initializes successfully and will attempt auth at
-        // request time.
-        let provider = create_resilient_provider("lmstudio", None, None, &reliability);
-        assert!(provider.is_ok());
-    }
-
-    #[test]
-    fn resilient_fallback_mixed_profiles_and_custom() {
-        let _guard = env_lock();
-
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec![
-                "openai-codex:second".into(),
-                "custom:http://localhost:8080/v1".into(),
-                "lmstudio".into(),
-                "nonexistent-provider".into(),
-            ],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        let provider = create_resilient_provider("ollama", None, None, &reliability);
-        assert!(provider.is_ok());
-    }
-
     // ── API key prefix pre-flight ───────────────────────────
 
     #[test]
@@ -3924,5 +3683,90 @@ mod tests {
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_PROVIDER_URL") };
+    }
+
+    // ── Per-alias provider_runtime_options resolution (#6266 review) ──
+
+    /// Build a `Config` with two `anthropic` aliases at different base_urls
+    /// so the test can prove `provider_runtime_options_for_agent` selects
+    /// the alias-specific entry rather than `first_provider()`.
+    fn config_with_two_anthropic_aliases() -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{Config, DelegateAgentConfig, ModelProviderConfig};
+        let mut config = Config::default();
+        let default_alias = ModelProviderConfig {
+            model: Some("claude-default".into()),
+            api_key: Some("default-key".into()),
+            base_url: Some("https://api.default.example/v1".into()),
+            api_path: Some("/messages".into()),
+            ..ModelProviderConfig::default()
+        };
+        let work_alias = ModelProviderConfig {
+            model: Some("claude-work".into()),
+            api_key: Some("work-key".into()),
+            base_url: Some("https://work-proxy.example/v1".into()),
+            api_path: Some("/v1/anthropic/messages".into()),
+            ..ModelProviderConfig::default()
+        };
+        let mut anthropic_aliases = std::collections::HashMap::new();
+        anthropic_aliases.insert("default".to_string(), default_alias);
+        anthropic_aliases.insert("work".to_string(), work_alias);
+        config
+            .providers
+            .models
+            .insert("anthropic".to_string(), anthropic_aliases);
+        let work_agent = DelegateAgentConfig {
+            model_provider: "anthropic.work".to_string(),
+            ..DelegateAgentConfig::default()
+        };
+        config.agents.insert("work_agent".to_string(), work_agent);
+        let default_agent = DelegateAgentConfig {
+            model_provider: "anthropic.default".to_string(),
+            ..DelegateAgentConfig::default()
+        };
+        config
+            .agents
+            .insert("default_agent".to_string(), default_agent);
+        config
+    }
+
+    #[test]
+    fn provider_runtime_options_for_agent_resolves_alias_specific_base_url() {
+        let config = config_with_two_anthropic_aliases();
+        let work = provider_runtime_options_for_agent(&config, "work_agent");
+        let dflt = provider_runtime_options_for_agent(&config, "default_agent");
+
+        assert_eq!(
+            work.provider_api_url.as_deref(),
+            Some("https://work-proxy.example/v1"),
+            "work agent must resolve to the work alias's base_url, not the first alias's"
+        );
+        assert_eq!(
+            work.api_path.as_deref(),
+            Some("/v1/anthropic/messages"),
+            "work agent must resolve to the work alias's api_path"
+        );
+        assert_eq!(
+            dflt.provider_api_url.as_deref(),
+            Some("https://api.default.example/v1"),
+            "default agent must resolve to the default alias's base_url"
+        );
+        assert_eq!(
+            dflt.api_path.as_deref(),
+            Some("/messages"),
+            "default agent must resolve to the default alias's api_path"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_for_agent_falls_back_to_first_provider_when_unknown_agent() {
+        let config = config_with_two_anthropic_aliases();
+        let opts = provider_runtime_options_for_agent(&config, "nonexistent");
+        // Falls back to first_provider() — order across HashMap is not
+        // guaranteed but the URL must match one of the configured aliases.
+        let url = opts.provider_api_url.as_deref().unwrap_or("");
+        assert!(
+            url == "https://work-proxy.example/v1" || url == "https://api.default.example/v1",
+            "fallback must resolve to one of the configured anthropic aliases; got `{url}`"
+        );
     }
 }

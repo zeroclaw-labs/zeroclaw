@@ -99,10 +99,10 @@ pub struct PatchResponse {
     pub results: Vec<PatchOpResult>,
     /// Non-fatal validation warnings against the post-save config state.
     /// Empty when nothing is flagged. Surfaces what the CLI prints on
-    /// stderr so dashboard callers see the same signal — e.g.
-    /// `providers.fallback` referencing a non-existent provider returns
-    /// HTTP 200 with the save committed, plus a `dangling_provider_fallback`
-    /// warning here.
+    /// stderr so dashboard callers see the same signal — e.g. an
+    /// `agents.<x>.model_provider` referencing an unconfigured provider
+    /// returns HTTP 200 with the save committed, plus a structured
+    /// validation warning here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<zeroclaw_config::validation_warnings::ValidationWarning>,
 }
@@ -399,7 +399,7 @@ pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<D
 
 // ── Handlers ────────────────────────────────────────────────────────
 
-/// GET /api/config/prop?path=providers.fallback
+/// GET /api/config/prop?path=agents.researcher.model_provider
 ///
 /// Returns the user's current value for non-secret fields. For secret fields,
 /// returns `{path, populated}` only — the value, length, and any encoded form
@@ -643,7 +643,7 @@ pub async fn handle_drift(State(state): State<AppState>, headers: HeaderMap) -> 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct MapKeyQuery {
-    /// Map-keyed section path, e.g. `providers.models`, `agents`, `swarms`.
+    /// Map-keyed section path, e.g. `providers.models`, `agents`, `risk_profiles`.
     pub path: String,
     /// New key to insert under that section, e.g. `anthropic`.
     pub key: String,
@@ -703,6 +703,67 @@ pub async fn handle_templates(State(state): State<AppState>, headers: HeaderMap)
     axum::Json(TemplatesResponse { templates }).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct MapPathQuery {
+    pub path: String,
+}
+
+/// `GET /api/config/map-keys?path=<section>` — list the current alias keys at
+/// a map-keyed section path, e.g. `channels.discord` → `["default","work"]`.
+pub async fn handle_get_map_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<MapPathQuery>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let cfg = state.config.lock().clone();
+    match cfg.get_map_keys(&q.path) {
+        Some(keys) => {
+            axum::Json(serde_json::json!({ "path": q.path, "keys": keys })).into_response()
+        }
+        None => error_response(
+            ConfigApiError::new(
+                ConfigApiCode::PathNotFound,
+                format!("no map-keyed section at `{}`", q.path),
+            )
+            .with_path(&q.path),
+        ),
+    }
+}
+
+/// `DELETE /api/config/map-key?path=<section>&key=<alias>` — remove an alias
+/// from a map-keyed section. Persists on success.
+pub async fn handle_delete_map_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<MapKeyQuery>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let mut working = state.config.lock().clone();
+    let removed = match working.delete_map_key(&q.path, &q.key) {
+        Ok(b) => b,
+        Err(msg) => {
+            return error_response(
+                ConfigApiError::new(ConfigApiCode::PathNotFound, msg).with_path(&q.path),
+            );
+        }
+    };
+    if removed && let Err(e) = persist_and_swap(&state, working).await {
+        return error_response(e);
+    }
+    axum::Json(MapKeyResponse {
+        path: q.path,
+        key: q.key,
+        created: false,
+    })
+    .into_response()
+}
+
 /// `POST /api/config/map-key?path=<section>&key=<name>` — instantiate a new
 /// entry under a map-keyed section with default values, or append to a
 /// list-shaped one with `key` as the new entry's natural identifier.
@@ -740,6 +801,61 @@ pub async fn handle_map_key(
     }
 
     axum::Json(MapKeyResponse { path, key, created }).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct RenameMapKeyBody {
+    /// Section path, e.g. `channels.discord` or `providers.models.anthropic`.
+    pub path: String,
+    /// Current alias name.
+    pub from: String,
+    /// New alias name.
+    pub to: String,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct RenameMapKeyResponse {
+    pub path: String,
+    pub from: String,
+    pub to: String,
+    pub renamed: bool,
+}
+
+/// `POST /api/config/rename-map-key` — rename an alias within a map-keyed
+/// section, preserving the entry's value. Atomic: persists only on success.
+pub async fn handle_rename_map_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<RenameMapKeyBody>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut working = state.config.lock().clone();
+
+    let renamed = match working.rename_map_key(&body.path, &body.from, &body.to) {
+        Ok(b) => b,
+        Err(msg) => {
+            return error_response(
+                ConfigApiError::new(ConfigApiCode::ValidationFailed, msg).with_path(&body.path),
+            );
+        }
+    };
+
+    if renamed && let Err(e) = persist_and_swap(&state, working).await {
+        return error_response(e);
+    }
+
+    axum::Json(RenameMapKeyResponse {
+        path: body.path,
+        from: body.from,
+        to: body.to,
+        renamed,
+    })
+    .into_response()
 }
 
 /// PATCH /api/config — apply a JSON Patch document atomically.
@@ -986,10 +1102,11 @@ pub async fn handle_patch(
     .into_response()
 }
 
-/// Convert a JSON Pointer (`/providers/fallback`) to the dotted path the
-/// `Config::set_prop` machinery expects (`providers.fallback`). Accepts both
-/// forms — passing already-dotted paths through unchanged so dashboard clients
-/// can use whichever is more natural.
+/// Convert a JSON Pointer (`/agents/researcher/model_provider`) to the
+/// dotted path the `Config::set_prop` machinery expects
+/// (`agents.researcher.model_provider`). Accepts both forms — passing
+/// already-dotted paths through unchanged so dashboard clients can use
+/// whichever is more natural.
 fn json_pointer_to_dotted(path: &str) -> String {
     if path.starts_with('/') {
         path.trim_start_matches('/').replace('/', ".")
@@ -1091,18 +1208,89 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
 
     match migrated {
         Some(new_content) => {
+            // Atomic write path mirrors `Config::save()` and `migration::migrate_file_in_place`
+            // (#6266 review): write temp + fsync → backup → atomic rename → fsync directory.
+            // Without this sequence the documented durability guarantee on the comment above
+            // doesn't hold: a copy-then-write window leaves both the original and the new
+            // content vulnerable to power loss.
             let backup_path = config_path.with_extension("toml.bak");
+            let parent = match config_path.parent() {
+                Some(p) => p.to_path_buf(),
+                None => {
+                    return error_response(ConfigApiError::new(
+                        ConfigApiCode::InternalError,
+                        format!("config path has no parent: {}", config_path.display()),
+                    ));
+                }
+            };
+            let file_name = match config_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => {
+                    return error_response(ConfigApiError::new(
+                        ConfigApiCode::InternalError,
+                        format!("config path has no file name: {}", config_path.display()),
+                    ));
+                }
+            };
+            let temp_path = parent.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
+
+            // 1. Write migrated content to temp + fsync.
+            match tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp_path)
+                .await
+            {
+                Ok(mut temp) => {
+                    use tokio::io::AsyncWriteExt;
+                    if let Err(e) = temp.write_all(new_content.as_bytes()).await {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return error_response(ConfigApiError::new(
+                            ConfigApiCode::InternalError,
+                            format!("failed to write migrated config to temp: {e}"),
+                        ));
+                    }
+                    if let Err(e) = temp.sync_all().await {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return error_response(ConfigApiError::new(
+                            ConfigApiCode::InternalError,
+                            format!("failed to fsync migrated config temp: {e}"),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return error_response(ConfigApiError::new(
+                        ConfigApiCode::InternalError,
+                        format!("failed to create temp config file: {e}"),
+                    ));
+                }
+            }
+
+            // 2. Backup BEFORE replacing the original.
             if let Err(e) = tokio::fs::copy(&config_path, &backup_path).await {
+                let _ = tokio::fs::remove_file(&temp_path).await;
                 return error_response(ConfigApiError::new(
                     ConfigApiCode::InternalError,
                     format!("failed to write backup: {e}"),
                 ));
             }
-            if let Err(e) = tokio::fs::write(&config_path, &new_content).await {
+
+            // 3. Atomic rename. On failure, restore from backup.
+            if let Err(e) = tokio::fs::rename(&temp_path, &config_path).await {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                if backup_path.exists() {
+                    let _ = tokio::fs::copy(&backup_path, &config_path).await;
+                }
                 return error_response(ConfigApiError::new(
                     ConfigApiCode::InternalError,
-                    format!("failed to write migrated config: {e}"),
+                    format!("failed to atomically replace config: {e}"),
                 ));
+            }
+
+            // 4. Fsync the parent directory so the rename is durable.
+            #[cfg(unix)]
+            if let Ok(dir) = tokio::fs::File::open(&parent).await {
+                let _ = dir.sync_all().await;
             }
 
             // Re-read into memory so subsequent requests see the migrated state.
@@ -1159,7 +1347,7 @@ pub async fn handle_options_config(headers: HeaderMap) -> Response {
     schema_response("zeroclaw_config_schema_full")
 }
 
-/// OPTIONS /api/config/prop?path=providers.fallback — per-field schema fragment.
+/// OPTIONS /api/config/prop?path=agents.researcher.model_provider — per-field schema fragment.
 ///
 /// Returns 404 with `path_not_found` if the path doesn't resolve against the
 /// in-memory config — same contract as `GET /api/config/prop`. Previously
@@ -1317,10 +1505,6 @@ mod tests {
     #[test]
     fn json_pointer_to_dotted_handles_pointer_form() {
         assert_eq!(
-            json_pointer_to_dotted("/providers/fallback"),
-            "providers.fallback"
-        );
-        assert_eq!(
             json_pointer_to_dotted("/providers/models/openrouter/api-key"),
             "providers.models.openrouter.api-key"
         );
@@ -1329,8 +1513,8 @@ mod tests {
     #[test]
     fn json_pointer_to_dotted_passes_dotted_through() {
         assert_eq!(
-            json_pointer_to_dotted("providers.fallback"),
-            "providers.fallback"
+            json_pointer_to_dotted("providers.models.openrouter.api-key"),
+            "providers.models.openrouter.api-key"
         );
         assert_eq!(
             json_pointer_to_dotted("scheduler.max_concurrent"),
@@ -1363,9 +1547,15 @@ mod tests {
     #[test]
     fn test_op_coercion_bool_typed_value_matches_stored() {
         let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.set_prop("autonomy.workspace-only", "true")
+        cfg.risk_profiles.insert(
+            "default".into(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        cfg.set_prop("risk-profiles.default.workspace-only", "true")
             .expect("set_prop bool");
-        let actual = cfg.get_prop("autonomy.workspace-only").expect("get_prop");
+        let actual = cfg
+            .get_prop("risk-profiles.default.workspace-only")
+            .expect("get_prop");
         let want_typed = json_to_setprop_string(&serde_json::json!(true), Some(PropKind::Bool))
             .expect("coerce bool true");
         assert_eq!(
@@ -1448,50 +1638,17 @@ mod tests {
     }
 
     #[test]
-    fn collect_warnings_surfaces_dangling_provider_fallback() {
-        // Pin the contract that drives the WARN-visibility fix: a config
-        // where `providers.fallback` references a key not present in
-        // `providers.models` returns a structured warning with a stable
-        // code, suitable for inclusion in PUT/PATCH/GET responses.
-        let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.set_prop("providers.fallback", "nonexistent")
-            .expect("set_prop fallback");
-
-        let warnings = cfg.collect_warnings();
-        let dangling = warnings
-            .iter()
-            .find(|w| w.code == "dangling_provider_fallback")
-            .expect("expected dangling_provider_fallback warning");
-        assert_eq!(dangling.path, "providers.fallback");
-        assert!(
-            dangling.message.contains("nonexistent"),
-            "warning message should name the dangling key, got {:?}",
-            dangling.message
-        );
-    }
-
-    #[test]
-    fn collect_warnings_empty_when_fallback_unset() {
-        // Default config has no `providers.fallback` set → no dangling
-        // warning (the check is gated on `Some(fallback_key)`). Pin the
-        // negative case so a regression that always-emits the warning
-        // gets caught.
-        let cfg = zeroclaw_config::schema::Config::default();
-        let warnings = cfg.collect_warnings();
-        assert!(
-            !warnings
-                .iter()
-                .any(|w| w.code == "dangling_provider_fallback"),
-            "default config should have no dangling-fallback warning, got {warnings:?}"
-        );
-    }
-
-    #[test]
     fn test_op_coercion_mismatched_value_correctly_fails() {
         let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.set_prop("autonomy.workspace-only", "true")
+        cfg.risk_profiles.insert(
+            "default".into(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        cfg.set_prop("risk-profiles.default.workspace-only", "true")
             .expect("set_prop");
-        let actual = cfg.get_prop("autonomy.workspace-only").expect("get_prop");
+        let actual = cfg
+            .get_prop("risk-profiles.default.workspace-only")
+            .expect("get_prop");
         let want = json_to_setprop_string(&serde_json::json!(false), Some(PropKind::Bool))
             .expect("coerce bool false");
         assert_ne!(

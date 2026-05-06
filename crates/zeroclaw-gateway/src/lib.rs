@@ -473,8 +473,11 @@ pub async fn run_gateway(
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    let fallback = config.providers.fallback_provider();
-    let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
+    let fallback = config.providers.first_provider();
+    let provider_name = config
+        .providers
+        .first_provider_type()
+        .unwrap_or("openrouter");
     let provider: Arc<dyn Provider> =
         Arc::from(zeroclaw_providers::create_resilient_provider_with_options(
             provider_name,
@@ -483,52 +486,67 @@ pub async fn run_gateway(
             &config.reliability,
             &zeroclaw_providers::provider_runtime_options_from_config(&config),
         )?);
-    // Three-step model resolution mirroring agent::Agent::from_config (#6099):
-    // (1) the fallback provider's `model`, (2) the first configured
-    // `[providers.models.*]` model with a WARN naming what to set, (3) hard
-    // fail with an actionable error. No silent vendor-default substitution.
+    // Model resolution (#6099, #6215): take the first configured
+    // `[providers.models.<type>.<alias>]` entry's `model` field, or hard-fail
+    // with an actionable error. V3 has no global fallback provider — every
+    // gateway request that needs agent context resolves through its
+    // `?agent=` parameter.
     let model = match fallback
         .and_then(|e| e.model.as_deref())
         .map(str::trim)
         .filter(|m| !m.is_empty())
     {
         Some(m) => m.to_string(),
-        None => match config.providers.resolve_default_model() {
-            Some(m) => {
-                tracing::warn!(
-                    provider = provider_name,
-                    model = %m,
-                    "fallback provider has no `model` set; using first configured \
-                     providers.models entry as default. Set [providers.models.{provider_name}] \
-                     model = \"...\" to silence this warning.",
-                );
-                m
-            }
-            None => {
-                anyhow::bail!(
-                    "no model configured: providers.fallback = {:?} resolves with no model, \
-                     and no [providers.models.*] entry has a `model` field set. \
-                     Configure at least one [providers.models.<name>] model = \"...\" \
-                     before starting the gateway.",
-                    config.providers.fallback,
-                )
-            }
-        },
+        None => anyhow::bail!(
+            "no model configured: no [providers.models.<type>.<alias>] entry has a \
+             `model` field set. Configure at least one [providers.models.<type>.<alias>] \
+             model = \"...\" before starting the gateway.",
+        ),
     };
     let temperature = fallback.and_then(|e| e.temperature).unwrap_or(0.7);
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
         &config.providers.embedding_routes,
-        Some(&config.storage.provider.config),
+        config.resolve_active_storage(),
         &config.workspace_dir,
         fallback.and_then(|e| e.api_key.as_deref()),
     )?);
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    // Gateway is infrastructure — it doesn't run as an agent. Endpoints
+    // that need an agent context (`/webhook?agent=`, `/ws/chat?agent=`,
+    // ACP `session/new`, agent-scoped tools/memory) take it from the
+    // request. The shared SecurityPolicy / risk_profile / tools_registry
+    // built here are V2 vestiges driving the legacy single-agent
+    // `/api/tools` listing and the `run_gateway_chat_with_tools` test
+    // mock; per-request agent dispatch is tracked as a follow-up. Pick
+    // the migration-synthesized "default" agent when present, else the
+    // first enabled agent — purely to seed AppState for those legacy
+    // surfaces; new V3 endpoints don't read from this state.
+    let agent_alias = config
+        .agents
+        .keys()
+        .find(|k| k.as_str() == "default")
+        .or_else(|| {
+            config
+                .agents
+                .iter()
+                .find(|(_, a)| a.enabled)
+                .map(|(alias, _)| alias)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("gateway start requires at least one configured [agents.<alias>] entry")
+        })?
+        .clone();
+    let risk_profile = config
+        .risk_profile_for_agent(&agent_alias)
+        .with_context(|| {
+            format!(
+                "agents.{agent_alias}.risk_profile does not name a configured risk_profiles entry"
+            )
+        })?
+        .clone();
+    let security = Arc::new(SecurityPolicy::for_agent(&config, &agent_alias)?);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -556,6 +574,8 @@ pub async fn run_gateway(
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
+        &risk_profile,
+        &agent_alias,
         runtime,
         Arc::clone(&mem),
         composio_key,
@@ -567,7 +587,7 @@ pub async fn run_gateway(
         &config.agents,
         config
             .providers
-            .fallback_provider()
+            .first_provider()
             .and_then(|e| e.api_key.as_deref()),
         &config,
         Some(canvas_store.clone()),
@@ -645,7 +665,7 @@ pub async fn run_gateway(
     let event_buffer = Arc::new(sse::EventBuffer::new(500));
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
-        config.channels.webhook.as_ref().and_then(|webhook| {
+        config.channels.webhook.values().next().and_then(|webhook| {
             webhook.secret.as_ref().and_then(|raw_secret| {
                 let trimmed_secret = raw_secret.trim();
                 (!trimmed_secret.is_empty())
@@ -657,7 +677,7 @@ pub async fn run_gateway(
     let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
         .channels
         .whatsapp
-        .as_ref()
+        .get("default")
         .filter(|wa| wa.is_cloud_config())
         .map(|wa| {
             Arc::new(WhatsAppChannel::new(
@@ -677,7 +697,7 @@ pub async fn run_gateway(
             (!secret.is_empty()).then(|| secret.to_owned())
         })
         .or_else(|| {
-            config.channels.whatsapp.as_ref().and_then(|wa| {
+            config.channels.whatsapp.values().next().and_then(|wa| {
                 wa.app_secret
                     .as_deref()
                     .map(str::trim)
@@ -688,7 +708,7 @@ pub async fn run_gateway(
         .map(Arc::from);
 
     // Linq channel (if configured)
-    let linq_channel: Option<Arc<LinqChannel>> = config.channels.linq.as_ref().map(|lq| {
+    let linq_channel: Option<Arc<LinqChannel>> = config.channels.linq.values().next().map(|lq| {
         Arc::new(LinqChannel::new(
             lq.api_token.clone(),
             lq.from_phone.clone(),
@@ -705,7 +725,7 @@ pub async fn run_gateway(
             (!secret.is_empty()).then(|| secret.to_owned())
         })
         .or_else(|| {
-            config.channels.linq.as_ref().and_then(|lq| {
+            config.channels.linq.values().next().and_then(|lq| {
                 lq.signing_secret
                     .as_deref()
                     .map(str::trim)
@@ -716,21 +736,22 @@ pub async fn run_gateway(
         .map(Arc::from);
 
     // WATI channel (if configured)
-    let wati_channel: Option<Arc<WatiChannel>> = config.channels.wati.as_ref().map(|wati_cfg| {
-        Arc::new(
-            WatiChannel::new(
-                wati_cfg.api_token.clone(),
-                wati_cfg.api_url.clone(),
-                wati_cfg.tenant_id.clone(),
-                wati_cfg.allowed_numbers.clone(),
+    let wati_channel: Option<Arc<WatiChannel>> =
+        config.channels.wati.values().next().map(|wati_cfg| {
+            Arc::new(
+                WatiChannel::new(
+                    wati_cfg.api_token.clone(),
+                    wati_cfg.api_url.clone(),
+                    wati_cfg.tenant_id.clone(),
+                    wati_cfg.allowed_numbers.clone(),
+                )
+                .with_transcription(config.transcription.clone()),
             )
-            .with_transcription(config.transcription.clone()),
-        )
-    });
+        });
 
     // Nextcloud Talk channel (if configured)
     let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
-        config.channels.nextcloud_talk.as_ref().map(|nc| {
+        config.channels.nextcloud_talk.values().next().map(|nc| {
             Arc::new(NextcloudTalkChannel::new(
                 nc.base_url.clone(),
                 nc.app_token.clone(),
@@ -749,23 +770,35 @@ pub async fn run_gateway(
                 (!secret.is_empty()).then(|| secret.to_owned())
             })
             .or_else(|| {
-                config.channels.nextcloud_talk.as_ref().and_then(|nc| {
-                    nc.webhook_secret
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|secret| !secret.is_empty())
-                        .map(ToOwned::to_owned)
-                })
+                config
+                    .channels
+                    .nextcloud_talk
+                    .get("default")
+                    .and_then(|nc| {
+                        nc.webhook_secret
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|secret| !secret.is_empty())
+                            .map(ToOwned::to_owned)
+                    })
             })
             .map(Arc::from);
 
-    // Gmail Push channel (if configured and enabled)
-    let gmail_push_channel: Option<Arc<GmailPushChannel>> = config
-        .channels
-        .gmail_push
-        .as_ref()
-        .filter(|gp| gp.enabled)
-        .map(|gp| Arc::new(GmailPushChannel::new(gp.clone())));
+    // Gmail Push channel (if configured and referenced by an enabled agent)
+    let gmail_push_channel: Option<Arc<GmailPushChannel>> = {
+        let active: std::collections::HashSet<String> = config
+            .agents
+            .values()
+            .filter(|a| a.enabled)
+            .flat_map(|a| a.channels.iter().cloned())
+            .collect();
+        config
+            .channels
+            .gmail_push
+            .iter()
+            .find(|(alias, _)| active.contains(&format!("gmail_push.{alias}")))
+            .map(|(_, gp)| Arc::new(GmailPushChannel::new(gp.clone())))
+    };
 
     // ── Session persistence for WS chat ─────────────────────
     let session_backend: Option<Arc<dyn SessionBackend>> = if config.gateway.session_persistence {
@@ -1058,13 +1091,22 @@ pub async fn run_gateway(
         .route("/api/config/list", get(api_config::handle_list))
         .route("/api/config/drift", get(api_config::handle_drift))
         .route("/api/config/templates", get(api_config::handle_templates))
-        .route("/api/config/map-key", post(api_config::handle_map_key))
+        .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
+        .route(
+            "/api/config/map-key",
+            post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
+        )
+        .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
         .route("/api/onboard/catalog", get(api_onboard::handle_catalog))
         .route(
             "/api/onboard/catalog/models",
             get(api_onboard::handle_catalog_models),
         )
         .route("/api/onboard/status", get(api_onboard::handle_onboard_status))
+        .route(
+            "/api/onboard/agent-options",
+            get(api_onboard::handle_agent_options),
+        )
         .route("/api/onboard/sections", get(api_onboard::handle_sections))
         .route(
             "/api/onboard/sections/{section}",
@@ -1496,8 +1538,32 @@ async fn run_gateway_chat_with_tools(
     #[cfg(not(test))]
     {
         let config = state.config.lock().clone();
+        // V2 vestige: webhook chat / SSE / pairing endpoints don't yet
+        // accept an explicit agent in the request payload. Pick the
+        // migration-synthesized "default" agent (or first enabled) until
+        // the per-request agent dispatch refactor lands.
+        let agent_alias = config
+            .agents
+            .keys()
+            .find(|k| k.as_str() == "default")
+            .or_else(|| {
+                config
+                    .agents
+                    .iter()
+                    .find(|(_, a)| a.enabled)
+                    .map(|(alias, _)| alias)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "webhook chat requires at least one configured [agents.<alias>] entry"
+                )
+            })?
+            .clone();
         Box::pin(zeroclaw_runtime::agent::process_message(
-            config, message, session_id,
+            config,
+            &agent_alias,
+            message,
+            session_id,
         ))
         .await
     }
@@ -1619,9 +1685,9 @@ async fn handle_webhook(
         .config
         .lock()
         .providers
-        .fallback
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
+        .first_provider_type()
+        .unwrap_or("unknown")
+        .to_string();
     let model_label = state.model.clone();
     let started_at = Instant::now();
 
