@@ -58,6 +58,8 @@ pub mod signal;
 pub mod slack;
 #[cfg(feature = "channel-telegram")]
 pub mod telegram;
+#[cfg(feature = "channel-twilio")]
+pub mod twilio;
 #[cfg(feature = "channel-twitter")]
 pub mod twitter;
 #[cfg(feature = "channel-voice-call")]
