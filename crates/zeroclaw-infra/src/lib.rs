@@ -76,8 +76,8 @@ fn open_sqlite_with_jsonl_import(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_api::provider::ChatMessage;
     use tempfile::TempDir;
+    use zeroclaw_api::provider::ChatMessage;
 
     fn user_msg(content: &str) -> ChatMessage {
         ChatMessage::user(content)
@@ -114,7 +114,10 @@ mod tests {
         let backend = make_session_backend(tmp.path(), "totally-not-a-backend").unwrap();
         backend.append("k1", &user_msg("hello-fallback")).unwrap();
         let db = tmp.path().join("sessions").join("sessions.db");
-        assert!(db.exists(), "unknown value must fall back to sqlite, not error");
+        assert!(
+            db.exists(),
+            "unknown value must fall back to sqlite, not error"
+        );
     }
 
     #[test]
@@ -130,11 +133,18 @@ mod tests {
         }
         let sqlite = make_session_backend(tmp.path(), "sqlite").unwrap();
         let loaded = sqlite.load("legacy");
-        assert_eq!(loaded.len(), 1, "legacy JSONL session must hydrate via SQLite");
+        assert_eq!(
+            loaded.len(),
+            1,
+            "legacy JSONL session must hydrate via SQLite"
+        );
         // .jsonl renamed to .jsonl.migrated; original gone.
         let jsonl_orig = tmp.path().join("sessions").join("legacy.jsonl");
         let jsonl_migrated = tmp.path().join("sessions").join("legacy.jsonl.migrated");
         assert!(!jsonl_orig.exists(), "original .jsonl should be renamed");
-        assert!(jsonl_migrated.exists(), ".jsonl.migrated rollback file should remain");
+        assert!(
+            jsonl_migrated.exists(),
+            ".jsonl.migrated rollback file should remain"
+        );
     }
 }
