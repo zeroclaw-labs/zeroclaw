@@ -102,7 +102,10 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             }
             anyhow::bail!("Skill audit failed.");
         }
-        crate::SkillCommands::Install { source, quiet } => {
+        crate::SkillCommands::Install {
+            source,
+            no_tier_banner,
+        } => {
             println!("Installing skill from: {source}");
 
             let skills_path = skills_dir(workspace_dir);
@@ -122,7 +125,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                     config.skills.allow_scripts,
                     workspace_dir,
                     config.skills.registry_url.as_deref(),
-                    quiet,
+                    no_tier_banner,
                 )
                 .with_context(|| format!("failed to install skill from registry: {source}"))?
             } else {

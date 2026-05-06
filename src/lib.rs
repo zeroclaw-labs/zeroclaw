@@ -287,9 +287,10 @@ pub enum SkillCommands {
     Install {
         /// Source URL or local path
         source: String,
-        /// Suppress the install-time tier banner
+        /// Suppress only the install-time tier banner; other install
+        /// progress output (resolving, installed, audited) is unaffected.
         #[arg(long)]
-        quiet: bool,
+        no_tier_banner: bool,
     },
     /// Remove an installed skill
     Remove {

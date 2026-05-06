@@ -108,6 +108,14 @@ fn default_version() -> String {
 /// Derived from the `tags` array in `registry.json`. `Unknown` is used as the
 /// "no recognized tier tag" fallback and is treated like `Community` for trust
 /// purposes when displaying the install banner.
+///
+/// `Featured` is intentionally kept as a distinct variant even though it
+/// renders identically to `Community` today: the registry's `Featured` tag is
+/// a separate curation signal (zeroclaw-labs hand-picked, but still authored
+/// outside zeroclaw-labs) and we expect to render it differently later — e.g.
+/// "Featured — community-curated by zeroclaw-labs but not maintained by us".
+/// Keeping the variant now avoids a churn-y enum extension once that copy
+/// lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillTier {
     Official,
@@ -1678,7 +1686,7 @@ pub fn install_registry_skill_source(
     allow_scripts: bool,
     workspace_dir: &Path,
     registry_url: Option<&str>,
-    quiet: bool,
+    suppress_tier_banner: bool,
 ) -> Result<(PathBuf, usize)> {
     let registry_dir = ensure_skills_registry(workspace_dir, registry_url)?;
     let skill_dir = registry_dir.join("skills").join(source);
@@ -1694,7 +1702,7 @@ pub fn install_registry_skill_source(
         );
     }
 
-    if !quiet {
+    if !suppress_tier_banner {
         let (tier, version) = lookup_registry_skill_tier(&registry_dir, source);
         print_install_tier_banner(source, version.as_deref(), tier);
     }
