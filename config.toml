@@ -1,8 +1,8 @@
 [providers]
-fallback = "ollama"
+fallback = "atomic-chat"
 
-[providers.models.llama]
+[providers.models.atomic-chat]
 kind = "openai-compatible"
-base_url = "http://localhost:11434/v1"
-model = "llama3"
+base_url = "http://localhost:8000/v1"
+model = "atomic-chat"
 api_key = "none"
