@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -70,6 +70,13 @@ pub struct SkillTool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SkillManifest {
     skill: SkillMeta,
+    /// SkillForge-emitted provenance metadata. Lives in a top-level `[forge]`
+    /// table so that `SkillMeta` (the canonical skill-identity contract) is
+    /// not coupled to the SkillForge integrator's emit format. Hand-authored
+    /// SKILL.toml files omit this; auto-integrated skills carry it. See
+    /// #6210 for the architectural rationale (FND-001 §4.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    forge: Option<ForgeMetadata>,
     #[serde(default)]
     tools: Vec<SkillTool>,
     #[serde(default)]
@@ -77,6 +84,7 @@ struct SkillManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SkillMeta {
     name: String,
     description: String,
@@ -88,6 +96,43 @@ struct SkillMeta {
     tags: Vec<String>,
     #[serde(default)]
     prompts: Vec<String>,
+}
+
+/// Provenance metadata emitted by the SkillForge integrator (see
+/// `crates/zeroclaw-runtime/src/skillforge/integrate.rs`). Lives at the
+/// top level of SKILL.toml under `[forge]`, kept separate from
+/// `[skill]` so the canonical skill identity stays decoupled from the
+/// integrator's emit format. Strict by design: a typo here is just as
+/// bad as a typo in `[skill]` (silent misconfiguration of provenance).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForgeMetadata {
+    /// Upstream URL the skill was integrated from.
+    #[serde(default)]
+    source: Option<String>,
+    /// Upstream owner (GitHub user / org).
+    #[serde(default)]
+    owner: Option<String>,
+    /// Primary language reported by the source (or `"unknown"`).
+    #[serde(default)]
+    language: Option<String>,
+    /// `true` if the upstream repo carries a license file.
+    #[serde(default)]
+    license: Option<bool>,
+    /// Upstream star count at integration time.
+    #[serde(default)]
+    stars: Option<u64>,
+    /// Upstream `updated_at` timestamp formatted `YYYY-MM-DD`, or
+    /// `"unknown"` if the integrator could not resolve one.
+    #[serde(default)]
+    updated_at: Option<String>,
+    /// Runtime/version requirements declared by the integrator.
+    #[serde(default)]
+    requirements: BTreeMap<String, toml::Value>,
+    /// Free-form integrator metadata (e.g. `auto_integrated`,
+    /// `forge_timestamp`).
+    #[serde(default)]
+    metadata: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -274,9 +319,18 @@ pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec
         };
 
         if let Some(toml_path) = toml_path {
-            if let Ok(skill) = load_skill_toml(&toml_path) {
-                warn_metadata_drift(&path, &skill, &md_path);
-                skills.push(skill);
+            match load_skill_toml(&toml_path) {
+                Ok(skill) => {
+                    warn_metadata_drift(&path, &skill, &md_path);
+                    skills.push(skill);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %toml_path.display(),
+                        err  = %e,
+                        "failed to load SKILL.toml — skill directory skipped",
+                    );
+                }
             }
         } else if md_path.exists()
             && let Ok(skill) = load_skill_md(&md_path, &path)
@@ -347,9 +401,18 @@ fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Ve
         };
 
         if let Some(toml_path) = toml_path {
-            if let Ok(skill) = load_skill_toml(&toml_path) {
-                warn_metadata_drift(&path, &skill, &md_path);
-                skills.push(finalize_open_skill(skill));
+            match load_skill_toml(&toml_path) {
+                Ok(skill) => {
+                    warn_metadata_drift(&path, &skill, &md_path);
+                    skills.push(finalize_open_skill(skill));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %toml_path.display(),
+                        err  = %e,
+                        "failed to load SKILL.toml — skill directory skipped",
+                    );
+                }
             }
         } else if md_path.exists()
             && let Ok(skill) = load_open_skill_md(&md_path)
@@ -1816,6 +1879,316 @@ prompts = ["from-skill-section"]
         assert_eq!(
             skill.prompts,
             vec!["from-skill-section".to_string(), "from-root".to_string(),]
+        );
+    }
+}
+
+#[cfg(test)]
+mod skill_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn parses_valid_skill_manifest() {
+        let toml_str = r#"
+[skill]
+name = "x"
+description = "y"
+"#;
+        let manifest: SkillManifest =
+            toml::from_str(toml_str).expect("valid manifest should parse");
+        assert_eq!(manifest.skill.name, "x");
+        assert_eq!(manifest.skill.description, "y");
+        assert_eq!(manifest.skill.version, "0.1.0");
+        assert!(manifest.tools.is_empty());
+        assert!(manifest.prompts.is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_skill_block() {
+        let toml_str = r#"
+[skill]
+name = "x"
+description = "y"
+descriptin = "oops"
+"#;
+        let err = toml::from_str::<SkillManifest>(toml_str)
+            .expect_err("unknown field in [skill] should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("descriptin"),
+            "error should mention the unknown field 'descriptin'; got: {msg}"
+        );
+    }
+
+    /// Positive control covering the new field × strictness intersection:
+    /// after the rebase onto master (which added `prompts: Vec<String>`
+    /// to `SkillMeta` per #5972), the field must continue to parse cleanly
+    /// under `#[serde(deny_unknown_fields)]`.
+    #[test]
+    fn accepts_prompts_in_skill_block_with_strictness() {
+        let toml_str = r#"
+[skill]
+name = "x"
+description = "y"
+prompts = ["one", "two"]
+"#;
+        let manifest: SkillManifest = toml::from_str(toml_str)
+            .expect("manifest with prompts in [skill] should parse under deny_unknown_fields");
+        assert_eq!(
+            manifest.skill.prompts,
+            vec!["one".to_string(), "two".to_string()]
+        );
+    }
+
+    /// Hand-authored skills that don't carry SkillForge provenance must parse
+    /// without error — `forge` is `Option<ForgeMetadata>` with `default`.
+    #[test]
+    fn parses_skill_without_forge_block() {
+        let toml_str = r#"
+[skill]
+name = "hand-authored"
+description = "no forge block"
+"#;
+        let manifest: SkillManifest =
+            toml::from_str(toml_str).expect("manifest without [forge] should parse cleanly");
+        assert!(
+            manifest.forge.is_none(),
+            "forge should be None when [forge] is absent"
+        );
+        assert_eq!(manifest.skill.name, "hand-authored");
+    }
+
+    /// Happy path: a SkillForge-emitted manifest with a fully populated
+    /// `[forge]` table, including the nested `[forge.requirements]` and
+    /// `[forge.metadata]` sub-tables.
+    #[test]
+    fn parses_skill_with_forge_block() {
+        let toml_str = r#"
+[skill]
+name = "auto-integrated"
+description = "from skillforge"
+
+[forge]
+source = "https://github.com/user/auto-integrated"
+owner = "user"
+language = "Rust"
+license = true
+stars = 42
+updated_at = "2026-04-30"
+
+[forge.requirements]
+runtime = "zeroclaw >= 0.1"
+
+[forge.metadata]
+auto_integrated = true
+forge_timestamp = "2026-04-30T12:00:00Z"
+"#;
+        let manifest: SkillManifest =
+            toml::from_str(toml_str).expect("manifest with [forge] block should parse cleanly");
+        let forge = manifest
+            .forge
+            .expect("forge should be Some when [forge] is present");
+        assert_eq!(
+            forge.source.as_deref(),
+            Some("https://github.com/user/auto-integrated")
+        );
+        assert_eq!(forge.owner.as_deref(), Some("user"));
+        assert_eq!(forge.language.as_deref(), Some("Rust"));
+        assert_eq!(forge.license, Some(true));
+        assert_eq!(forge.stars, Some(42));
+        assert_eq!(forge.updated_at.as_deref(), Some("2026-04-30"));
+        assert_eq!(
+            forge.requirements.get("runtime").and_then(|v| v.as_str()),
+            Some("zeroclaw >= 0.1"),
+        );
+        assert_eq!(
+            forge
+                .metadata
+                .get("auto_integrated")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+        );
+    }
+
+    /// `ForgeMetadata` carries `#[serde(deny_unknown_fields)]` — a typo at
+    /// the `[forge]` level (e.g. `licence` next to `license`) must surface
+    /// loudly the same way a typo in `[skill]` does.
+    #[test]
+    fn rejects_unknown_field_in_forge_block() {
+        let toml_str = r#"
+[skill]
+name = "x"
+description = "y"
+
+[forge]
+source = "https://github.com/user/x"
+licence = true
+"#;
+        let err = toml::from_str::<SkillManifest>(toml_str)
+            .expect_err("unknown field in [forge] should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("licence"),
+            "error should mention the unknown field 'licence'; got: {msg}"
+        );
+    }
+
+    /// Round-trip guard: the SkillForge integrator must emit `[forge]` keys
+    /// at the top level (sibling to `[skill]`), not inside `[skill]`. If a
+    /// future refactor moves these back, this test fails because the parsed
+    /// manifest's `forge` field would be `None` (and `SkillMeta` would
+    /// reject the unknown keys via `deny_unknown_fields`).
+    #[test]
+    fn integrate_round_trip_emits_top_level_forge() {
+        use crate::skillforge::scout::{ScoutResult, ScoutSource};
+        use chrono::Utc;
+        let candidate = ScoutResult {
+            name: "round-trip".into(),
+            url: "https://github.com/user/round-trip".into(),
+            description: "round-trip test".into(),
+            stars: 7,
+            language: Some("Rust".into()),
+            updated_at: Some(Utc::now()),
+            source: ScoutSource::GitHub,
+            owner: "user".into(),
+            has_license: true,
+        };
+
+        // Generate the TOML the integrator would write and parse it back.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let integrator = crate::skillforge::integrate::Integrator::new(
+            tmp.path().to_string_lossy().into_owned(),
+        );
+        let skill_dir = integrator.integrate(&candidate).unwrap();
+        let toml_str = std::fs::read_to_string(skill_dir.join("SKILL.toml")).unwrap();
+
+        let manifest: SkillManifest = toml::from_str(&toml_str).unwrap_or_else(|e| {
+            panic!(
+                "integrator output must parse against SkillManifest with strict SkillMeta + ForgeMetadata; \
+                 got error: {e}\n--- toml ---\n{toml_str}"
+            )
+        });
+        let forge = manifest
+            .forge
+            .expect("integrator must emit a [forge] table");
+        assert_eq!(forge.owner.as_deref(), Some("user"));
+        assert_eq!(forge.stars, Some(7));
+        assert_eq!(forge.license, Some(true));
+        assert!(
+            forge
+                .source
+                .as_deref()
+                .is_some_and(|s| s.contains("round-trip")),
+            "forge.source should carry the upstream URL"
+        );
+        // Crucial guard: none of the provenance keys leaked into [skill].
+        // A failure here means generate_toml regressed and is putting forge
+        // keys back inside `[skill]` — `deny_unknown_fields` on `SkillMeta`
+        // would have caught that already as a parse error, but assert
+        // explicitly so the failure is unambiguous in CI output.
+        assert_eq!(manifest.skill.name, "round-trip");
+        assert_eq!(manifest.skill.description, "round-trip test");
+    }
+
+    /// Behavioral assertion for the swallow-site fix: a SKILL.toml whose
+    /// `[skill]` block has a typo causes `load_skill_toml` to return `Err`,
+    /// and `load_skills_from_directory` skips it without panicking and
+    /// without including it in the loaded set. The accompanying
+    /// `tracing::warn!` call (with structured `path` and `err` fields) is
+    /// verified by source inspection — the codebase does not currently
+    /// pull in a `tracing-subscriber` test harness, and adding one purely
+    /// for this assertion would violate the AGENTS.md anti-pattern of
+    /// adding dependencies for minor convenience.
+    #[test]
+    fn workspace_swallow_site_skips_invalid_toml_without_panicking() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        // Bad skill: typo in [skill] — rejected by deny_unknown_fields.
+        let bad_dir = skills_dir.join("bad-skill");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(
+            bad_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "bad"
+description = "has a typo"
+descriptin = "oops"
+"#,
+        )
+        .unwrap();
+
+        // Good skill: parses cleanly — must still load.
+        let good_dir = skills_dir.join("good-skill");
+        std::fs::create_dir_all(&good_dir).unwrap();
+        std::fs::write(
+            good_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "good"
+description = "fine"
+"#,
+        )
+        .unwrap();
+
+        let skills = load_skills_from_directory(&skills_dir, false);
+        // The bad skill is skipped (not panicked-on). The good skill loads.
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"good"),
+            "good skill must load; got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"bad"),
+            "bad skill must be skipped, not silently accepted; got: {names:?}"
+        );
+    }
+
+    /// Behavioral assertion for the open-skills swallow-site fix.
+    /// Same shape as the workspace test above; covers `load_open_skills_from_directory`.
+    #[test]
+    fn open_skills_swallow_site_skips_invalid_toml_without_panicking() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("open-skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let bad_dir = skills_dir.join("bad-open-skill");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(
+            bad_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "bad-open"
+description = "has a typo"
+autor = "oops"
+"#,
+        )
+        .unwrap();
+
+        let good_dir = skills_dir.join("good-open-skill");
+        std::fs::create_dir_all(&good_dir).unwrap();
+        std::fs::write(
+            good_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "good-open"
+description = "fine"
+"#,
+        )
+        .unwrap();
+
+        let skills = load_open_skills_from_directory(&skills_dir, false);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"good-open"),
+            "good open-skill must load; got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"bad-open"),
+            "bad open-skill must be skipped, not silently accepted; got: {names:?}"
         );
     }
 }
