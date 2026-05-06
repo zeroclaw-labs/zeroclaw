@@ -21,6 +21,24 @@ Before opening or updating a PR body, read `.github/pull_request_template.md` an
 
 This parsed structure drives how you fill, present, and edit the PR body.
 
+## Shared: Authorship Hygiene
+
+ZeroClaw PR bodies and commits should not end with bot or AI attribution such as
+`Co-authored-by: Claude <...>`, `Co-authored-by: Codex <...>`, or generated
+footers like `Created with Claude Code` / `Generated with Claude Code`.
+
+Before opening a PR, scan local commit messages and the drafted PR body:
+
+```bash
+git log origin/master..HEAD --format=%B | rg -i '(^[[:space:]]*(Co-authored-by|Co-Authored-By):.*(Claude|Codex|ChatGPT|Copilot|GitHub Copilot|Gemini|\[bot\]|dependabot|github-actions|web-flow|blacksmith|noreply@(anthropic|openai)\.com)|^[[:space:]]*(Created with Claude Code|Generated with Claude Code)[[:space:]]*$)'
+```
+
+Before updating a PR body, scan the proposed body for the same patterns. Remove
+bot/AI co-author trailers and generated tool footers from PR text before showing
+or submitting it. If local unpublished commits contain those footers, tell the
+user and ask before rewriting commit history. Do not rewrite a pushed branch or
+any contributor branch solely for attribution cleanup without explicit approval.
+
 ---
 
 ## Mode: Open a New PR
@@ -43,6 +61,10 @@ rustc --version 2>/dev/null
 ```
 
 Also review the changed files and commit messages to understand the nature of the change (bug fix, feature, refactor, docs, chore, etc.) and which subsystems are affected.
+
+Run the authorship-hygiene scan from the shared section before pushing or
+opening the PR. Remove bot/AI attribution from the PR body. If commit messages
+need cleanup, ask the user before amending or rebasing.
 
 ### Step 1a: Run the Validation Battery (required before drafting)
 
@@ -74,6 +96,8 @@ Using the parsed template structure and gathered context, draft a complete PR bo
 - For Yes/No fields, infer from the diff (e.g., if no files in `src/security/` changed, security impact is likely all No).
 - For required sections, always provide a substantive answer. For optional sections, fill if there's enough context, otherwise leave the template prompts in place.
 - Draft a conventional commit-style PR title based on the changes (e.g., `feat(provider): add retry budget override`, `fix(channel): handle disconnect gracefully`, `chore(ci): update workflow targets`).
+- Do not include bot/AI `Co-authored-by` trailers or generated tool footers in
+  the PR body.
 
 ### Step 3: Present Draft for Review
 
@@ -188,7 +212,10 @@ When the user wants to sync the PR description after pushing new changes:
 
 3. **If any of the new commits touch code (not pure docs)**, re-run the validation battery from Step 1a before updating the Validation Evidence section. Stale validation evidence is worse than no evidence — it misleads the reviewer.
 
-4. Present proposed updates section-by-section and confirm before applying.
+4. Scan the proposed body for bot/AI co-author trailers or generated tool
+   footers and remove them before showing or submitting the update.
+
+5. Present proposed updates section-by-section and confirm before applying.
 
 ### Step 6: Apply Updates
 
@@ -227,6 +254,10 @@ Return the PR URL.
 - **For updates, only modify requested sections.** Preserve everything else exactly as-is.
 - **Always show diffs before applying body edits.** Present current vs proposed for each changed section.
 - **Never include personal/sensitive data** in PR content per ZeroClaw's privacy contract.
+- **Never include bot/AI attribution footers** in PR body text. Strip
+  `Co-authored-by` trailers for AI tools/bots and generated footers such as
+  `Created with Claude Code`; preserve human attribution where the template asks
+  for incorporated contributors.
 - **For label changes**, only use labels that exist in the repository. Check with `gh label list` if unsure.
 - **Fetch the latest body before editing** to avoid clobbering concurrent changes.
 - **For new PRs**, push the branch before creating (with `-u` to set upstream tracking).

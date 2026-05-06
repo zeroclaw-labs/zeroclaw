@@ -67,7 +67,7 @@ refactor(runtime): split agent loop into steps
 chore: bump tokio to 1.43
 ```
 
-Co-authoring with AI is encouraged; add `Co-Authored-By:` trailers in commit messages where AI tools materially contributed. See FND-005 (Contribution Culture) for the full norm.
+AI-assisted collaboration is welcome, but do not add bot/AI attribution trailers or generated tool footers to PR bodies or commit-message tails. Preserve human `Co-authored-by:` trailers when they credit incorporated contributor work. See FND-005 (Contribution Culture) for the full norm.
 
 ## Pull requests
 

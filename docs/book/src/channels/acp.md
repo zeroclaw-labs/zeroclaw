@@ -148,9 +148,9 @@ If the client never replies (crash, network drop, user closes IDE), the request 
 
 `ask_user` uses the same `session/request_permission` mechanism, mapping the question's `choices` to permission options. Free-form (no-choices) `ask_user` is not supported until the [ACP elicitation RFD](https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx) lands. Calling `ask_user` without `choices` on an ACP session fast-fails with a clear error.
 
-### `session/cancel`
+### `session/cancel` _(ZeroClaw extension)_
 
-Abort an in-flight `session/prompt` turn.
+Abort an in-flight `session/prompt` turn. `session/cancel` is a ZeroClaw-specific extension, not part of the base ACP spec. If a future ACP spec revision adds `session/cancel` with different semantics, ZeroClaw will move this extension to `_meta/session/cancel` rather than changing the method's meaning in place.
 
 **Cancel vs. stop:** `session/cancel` aborts an in-flight prompt turn and returns `stopReason: "cancelled"` with any streamed text accumulated up to the interrupt point. `session/stop` gracefully ends the session after the current turn completes — it waits for the turn to finish rather than interrupting it.
 
