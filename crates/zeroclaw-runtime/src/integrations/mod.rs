@@ -148,6 +148,17 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    Supports city names, IATA airport codes, GPS coordinates,");
             println!("    postal/zip codes, and Unicode location names.");
         }
+        "Home Assistant" => {
+            println!("  Setup:");
+            println!("    1. Generate a long-lived access token in HA:");
+            println!("       Profile → Security → Long-lived access tokens");
+            println!("    2. Add to config:");
+            println!("       [home_assistant]");
+            println!("       enabled = true");
+            println!("       base_url = \"http://homeassistant.local:8123\"");
+            println!("       access_token = \"...\"  # or set HOME_ASSISTANT_TOKEN");
+            println!("    3. Narrow `allowed_domains` to only the service domains you trust.");
+        }
         _ if entry.category == IntegrationCategory::Chat => {
             println!("  Setup:");
             println!("    Run: zeroclaw onboard --channels-only");

@@ -385,6 +385,11 @@ pub struct Config {
     #[nested]
     pub jira: JiraConfig,
 
+    /// Home Assistant integration configuration (`[home_assistant]`).
+    #[serde(default)]
+    #[nested]
+    pub home_assistant: HomeAssistantConfig,
+
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     #[nested]
@@ -9316,6 +9321,86 @@ impl Default for JiraConfig {
     }
 }
 
+/// Home Assistant integration configuration (`[home_assistant]`).
+///
+/// When `enabled = true`, registers the `home_assistant` tool which can read
+/// entity state and call services on a self-hosted Home Assistant instance via
+/// its REST API. Requires `base_url` (e.g. `http://homeassistant.local:8123`)
+/// and `access_token` (a long-lived access token), or the
+/// `HOME_ASSISTANT_TOKEN` env var.
+///
+/// ## Defaults
+/// - `enabled`: `false`
+/// - `allowed_domains`: `["light", "switch", "scene", "climate", "media_player",
+///   "input_boolean", "script", "automation"]` — the service domains the agent
+///   is permitted to call. Add or remove entries to widen or narrow the
+///   blast radius.
+/// - `request_timeout_secs`: `15`
+///
+/// ## Auth
+/// Generate a long-lived access token from the HA UI under
+/// *Profile → Security → Long-lived access tokens*. The token is stored
+/// encrypted at rest when `[secrets] encrypt = true`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "home-assistant"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Home Assistant",
+    description = "Home automation hub",
+    status_field = "enabled"
+)]
+pub struct HomeAssistantConfig {
+    /// Enable the `home_assistant` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Home Assistant base URL, e.g. `http://homeassistant.local:8123`.
+    #[serde(default)]
+    pub base_url: String,
+    /// Long-lived access token. Encrypted at rest. Falls back to
+    /// `HOME_ASSISTANT_TOKEN` env var.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub access_token: String,
+    /// Service domains the agent is permitted to call. Empty means
+    /// no `call_service` actions are allowed.
+    #[serde(default = "default_home_assistant_allowed_domains")]
+    pub allowed_domains: Vec<String>,
+    /// Request timeout in seconds. Default: `15`.
+    #[serde(default = "default_home_assistant_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_home_assistant_allowed_domains() -> Vec<String> {
+    vec![
+        "light".into(),
+        "switch".into(),
+        "scene".into(),
+        "climate".into(),
+        "media_player".into(),
+        "input_boolean".into(),
+        "script".into(),
+        "automation".into(),
+    ]
+}
+
+fn default_home_assistant_timeout_secs() -> u64 {
+    15
+}
+
+impl Default for HomeAssistantConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            access_token: String::new(),
+            allowed_domains: default_home_assistant_allowed_domains(),
+            request_timeout_secs: default_home_assistant_timeout_secs(),
+        }
+    }
+}
+
 ///
 /// Controls the read-only cloud transformation analysis tools:
 /// IaC review, migration assessment, cost analysis, and architecture review.
@@ -9634,6 +9719,7 @@ impl Default for Config {
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            home_assistant: HomeAssistantConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -12595,6 +12681,7 @@ auto_save = true
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            home_assistant: HomeAssistantConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -13166,6 +13253,7 @@ default_temperature = 0.7
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            home_assistant: HomeAssistantConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),

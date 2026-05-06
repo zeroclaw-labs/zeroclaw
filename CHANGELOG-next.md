@@ -116,6 +116,7 @@
 
 - `SessionResetTool` and `SessionDeleteTool` for in-agent session management (#5696).
 - `SessionsCurrentTool` exposes the active session identity (#6033).
+- `home_assistant` tool — REST-API client for a self-hosted Home Assistant instance, gated by long-lived access token and `allowed_domains` allowlist (#6448).
 
 ### Plugins
 
