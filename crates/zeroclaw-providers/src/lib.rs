@@ -978,6 +978,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "morph" => vec!["MORPH_API_KEY"],
         "github-models" | "github_models" => vec!["GITHUB_MODELS_TOKEN"],
         "upstage" => vec!["UPSTAGE_API_KEY"],
+        "featherless" => vec!["FEATHERLESS_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
@@ -1766,6 +1767,12 @@ fn create_provider_with_url_and_options(
         "upstage" => Ok(compat(OpenAiCompatibleProvider::new(
             "Upstage Solar",
             "https://api.upstage.ai/v1/solar",
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "featherless" => Ok(compat(OpenAiCompatibleProvider::new(
+            "Featherless AI",
+            "https://api.featherless.ai/v1",
             key,
             AuthStyle::Bearer,
         ))),
@@ -2646,6 +2653,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             activation: ProviderActivation::FallbackKey,
             local: false,
         },
+        ProviderInfo {
+            name: "featherless",
+            display_name: "Featherless AI",
+            description: "Serverless OSS models",
+            aliases: &[],
+            activation: ProviderActivation::FallbackKey,
+            local: false,
+        },
     ]
 }
 
@@ -3505,6 +3520,19 @@ mod tests {
         assert_eq!(resolved, Some("upstage-test".to_string()));
     }
 
+    #[test]
+    fn factory_featherless() {
+        assert!(create_provider("featherless", Some("ftherless-test")).is_ok());
+    }
+
+    #[test]
+    fn resolve_provider_credential_featherless_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("FEATHERLESS_API_KEY", Some("featherless-test"));
+        let resolved = resolve_provider_credential("featherless", None);
+        assert_eq!(resolved, Some("featherless-test".to_string()));
+    }
+
     // ── Custom / BYOP provider ─────────────────────────────
 
     #[test]
@@ -3833,6 +3861,7 @@ mod tests {
             "morph",
             "github-models",
             "upstage",
+            "featherless",
             "ovhcloud",
         ];
         for name in providers {
