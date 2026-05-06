@@ -624,6 +624,9 @@ if [ -n "$PATH_BIN" ]; then
       esac
     fi
   fi
+  if [ "$PRESET" = "full" ] && [ "$DRY_RUN" != true ] && [ -t 1 ]; then
+    info "--preset full: building from source with the full default feature set."
+  fi
 fi
 
 # ── Dry run ───────────────────────────────────────────────────────
