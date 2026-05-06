@@ -1,3 +1,4 @@
+default_provider = "atomic"
 [providers.models.atomic]
 kind = "openai-compatible"
 base_url = "http://127.0.0.1:1337/v1"
