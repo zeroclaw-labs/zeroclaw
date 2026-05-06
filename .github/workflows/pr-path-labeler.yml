@@ -14,6 +14,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/labeler@8558fd74291d67161a8a78ce36a881fa63b766a9 # v5
+      - uses: actions/labeler@f27b608878404679385c85cfa523b85ccb86e213 # v6.1.0
         with:
           sync-labels: true
