@@ -3088,6 +3088,15 @@ mod tests {
             );
         }
     }
+    
+    #[test]
+    fn factory_atomic_chat() {
+        let provider = create_provider("atomic-chat", Some("test-key")).unwrap();
+        assert!(provider.capabilities().streaming);
+        let caps = provider.capabilities();
+        assert!(caps.streaming, "AtomicChat should support streaming");
+    }
+    
     #[test]
     fn factory_atomic_chat() {
         let provider = create_provider("atomic-chat", Some("key"))
@@ -3095,17 +3104,20 @@ mod tests {
     
         assert!(provider.capabilities().streaming);
     }
+    
     #[test]
     fn factory_atomic_chat_aliases() {
         assert!(create_provider("atomic-chat", Some("key")).is_ok());
         assert!(create_provider("atomic_chat", Some("key")).is_ok());
         assert!(create_provider("atomicchat", Some("key")).is_ok());
     }
+    
     #[test]
     fn factory_atomic_chat_allows_missing_key() {
         let result = create_provider("atomic-chat", None);
         assert!(result.is_ok());
     }
+    
     #[test]
     fn atomic_chat_capabilities() {
         let provider = create_provider("atomic-chat", Some("key"))
