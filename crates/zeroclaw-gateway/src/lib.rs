@@ -53,7 +53,7 @@ use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_api::tool::ToolSpec;
 use zeroclaw_channels::{
     gmail_push::GmailPushChannel, linq::LinqChannel, nextcloud_talk::NextcloudTalkChannel,
-    wati::WatiChannel, whatsapp::WhatsAppChannel,
+    telnyx::TelnyxChannel, wati::WatiChannel, whatsapp::WhatsAppChannel,
 };
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
@@ -122,6 +122,10 @@ fn whatsapp_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
 
 fn linq_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("linq_{}_{}", msg.sender, msg.id)
+}
+
+fn telnyx_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    format!("telnyx_{}_{}", msg.sender, msg.id)
 }
 
 fn wati_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
@@ -382,6 +386,8 @@ pub struct AppState {
     pub linq: Option<Arc<LinqChannel>>,
     /// Linq webhook signing secret for signature verification
     pub linq_signing_secret: Option<Arc<str>>,
+    /// Telnyx SMS channel (Ed25519-signed inbound webhooks).
+    pub telnyx: Option<Arc<TelnyxChannel>>,
     pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
     /// Nextcloud Talk webhook secret for signature verification
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
@@ -715,6 +721,33 @@ pub async fn run_gateway(
         })
         .map(Arc::from);
 
+    // Telnyx channel (if configured AND enabled). Constructor returns Err
+    // when `public_key` fails to decode — log + skip rather than panic the
+    // daemon over a config typo.
+    let telnyx_channel: Option<Arc<TelnyxChannel>> = config
+        .channels
+        .telnyx
+        .as_ref()
+        .filter(|tx| tx.enabled)
+        .and_then(|tx| {
+            match TelnyxChannel::new(
+                tx.api_key.clone(),
+                tx.from_number.clone(),
+                tx.messaging_profile_id.clone(),
+                tx.allowed_numbers.clone(),
+                &tx.public_key,
+            ) {
+                Ok(c) => Some(Arc::new(c)),
+                Err(e) => {
+                    tracing::error!(
+                        "Telnyx channel construction failed (check public_key): {e:#}. \
+                             Skipping Telnyx — fix the config and reload."
+                    );
+                    None
+                }
+            }
+        });
+
     // WATI channel (if configured)
     let wati_channel: Option<Arc<WatiChannel>> = config.channels.wati.as_ref().map(|wati_cfg| {
         Arc::new(
@@ -916,6 +949,9 @@ pub async fn run_gateway(
     if linq_channel.is_some() {
         println!("  POST {pfx}/linq      — Linq message webhook (iMessage/RCS/SMS)");
     }
+    if telnyx_channel.is_some() {
+        println!("  POST {pfx}/telnyx/sms — Telnyx SMS webhook");
+    }
     if wati_channel.is_some() {
         println!("  GET  {pfx}/wati      — WATI webhook verification");
         println!("  POST {pfx}/wati      — WATI message webhook");
@@ -985,6 +1021,7 @@ pub async fn run_gateway(
         whatsapp_app_secret,
         linq: linq_channel,
         linq_signing_secret,
+        telnyx: telnyx_channel,
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
         wati: wati_channel,
@@ -1047,6 +1084,7 @@ pub async fn run_gateway(
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
+        .route("/telnyx/sms", post(handle_telnyx_sms_webhook))
         .route("/wati", get(handle_wati_verify))
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
@@ -2091,6 +2129,131 @@ async fn handle_linq_webhook(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// POST /telnyx/sms — incoming SMS webhook from Telnyx Programmable Messaging.
+///
+/// Telnyx sends `application/json` POSTs containing an `event_type` and a
+/// nested `payload` with `from.phone_number`, `to[].phone_number`, and
+/// `text`. The handler:
+///
+/// 1. Reads the `telnyx-signature-ed25519` (base64-encoded 64-byte Ed25519
+///    signature) and `telnyx-timestamp` (unix epoch seconds, as a string)
+///    headers.
+/// 2. Verifies the signature against the operator-configured public key
+///    over the message bytes `{timestamp}|{raw_body}`. The verifier also
+///    enforces a 5-minute timestamp anti-replay window. A failure returns
+///    401 and the SMS is dropped — no message ever reaches the agent.
+/// 3. Parses the JSON body and calls `TelnyxChannel::parse_webhook_payload`,
+///    which filters out non-`message.received` events and applies the
+///    `allowed_numbers` allowlist.
+/// 4. Forwards the resulting `ChannelMessage` to the agent loop and replies
+///    via `TelnyxChannel::send`.
+///
+/// Successful runs return `200 OK` with an empty body.
+async fn handle_telnyx_sms_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref telnyx) = state.telnyx else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Telnyx not configured"})),
+        );
+    };
+
+    let signature = headers
+        .get("telnyx-signature-ed25519")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let timestamp = headers
+        .get("telnyx-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let now_unix = chrono::Utc::now().timestamp();
+
+    if !telnyx.verify_signature(timestamp, &body, signature, now_unix) {
+        tracing::warn!(
+            "Telnyx webhook signature verification failed (signature: {}, timestamp: {})",
+            if signature.is_empty() {
+                "missing"
+            } else {
+                "invalid-or-out-of-window"
+            },
+            if timestamp.is_empty() {
+                "missing"
+            } else {
+                "present"
+            }
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid signature"})),
+        );
+    }
+
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    let Some(msg) = telnyx.parse_webhook_payload(&payload) else {
+        // Either the sender wasn't on the allowlist, the body was empty,
+        // or the event type is not `message.received` (e.g. delivery
+        // status events). Acknowledge with 200 so Telnyx doesn't retry.
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    };
+
+    tracing::info!(
+        "Telnyx SMS from {}: {}",
+        msg.sender,
+        truncate_with_ellipsis(&msg.content, 50)
+    );
+    let session_id = sender_session_id("telnyx", &msg);
+
+    if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
+        let key = telnyx_memory_key(&msg);
+        let _ = state
+            .mem
+            .store(
+                &key,
+                &msg.content,
+                MemoryCategory::Conversation,
+                Some(&session_id),
+            )
+            .await;
+    }
+
+    match Box::pin(run_gateway_chat_with_tools(
+        &state,
+        &msg.content,
+        Some(&session_id),
+    ))
+    .await
+    {
+        Ok(GatewayChatOutcome { response, .. }) => {
+            if let Err(e) = telnyx
+                .send(&SendMessage::new(response, &msg.reply_target))
+                .await
+            {
+                tracing::error!("Failed to send Telnyx reply: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::error!("LLM error for Telnyx message: {e:#}");
+            let _ = telnyx
+                .send(&SendMessage::new(
+                    "Sorry, I couldn't process your message right now.",
+                    &msg.reply_target,
+                ))
+                .await;
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
 /// GET /wati — WATI webhook verification (echoes hub.challenge)
 async fn handle_wati_verify(
     State(state): State<AppState>,
@@ -2678,6 +2841,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            telnyx: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -2752,6 +2916,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            telnyx: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3211,6 +3376,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            telnyx: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3293,6 +3459,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            telnyx: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3387,6 +3554,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            telnyx: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3453,6 +3621,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            telnyx: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3524,6 +3693,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            telnyx: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3600,6 +3770,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            telnyx: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3673,6 +3844,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            telnyx: None,
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             wati: None,

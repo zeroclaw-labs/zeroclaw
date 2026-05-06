@@ -148,6 +148,29 @@ databases = ["..."]                # DB IDs the agent can write to
 
 Treats a Notion database as a message surface. Useful for asynchronous workflows where the "channel" is a task inbox.
 
+## Telnyx (SMS)
+
+```toml
+[channels.telnyx]
+enabled = false                          # default: off — opt in explicitly
+api_key = "KEY01234..."                  # V2 API key — Bearer auth for outbound
+from_number = "+15555550100"             # E.164 — must be provisioned in Telnyx
+messaging_profile_id = "mp_..."          # optional — send via a Messaging Profile
+allowed_numbers = ["+15555550199"]       # E.164 allowlist; "*" = anyone (careful!)
+public_key = "MCowBQYDK2VwAyEA..."       # base64 Ed25519 public key — see below
+```
+
+Telnyx's Programmable Messaging is a Twilio sibling. Inbound traffic arrives via webhooks at the gateway-hosted path `POST /telnyx/sms` — point Telnyx's webhook URL at `https://{tunnel}/telnyx/sms`, behind one of the configured `[tunnel]` providers (Cloudflare Tunnel, Tailscale Funnel, ngrok, Pinggy, or a custom command). A public tunnel is required because Telnyx will not deliver to non-routable addresses.
+
+**Two distinct credentials**, copied separately from the Telnyx portal — operators routinely conflate them, so the names matter:
+
+* `api_key` is the **V2 API key**. Sent as `Authorization: Bearer ...` on every outbound REST call (`POST https://api.telnyx.com/v2/messages`). Treat as a secret.
+* `public_key` is the **Ed25519 webhook public key**, base64-encoded. Used to verify the `telnyx-signature-ed25519` header on inbound webhooks. Public, but copied from a different page in the portal than the API key. **When Telnyx rotates the signing key (or you provision a new portal user), you must update `public_key` here** — otherwise inbound webhooks will start failing signature verification.
+
+Webhooks are signed with Ed25519 over the bytes `{telnyx-timestamp}|{raw_body}` (literal pipe separator). The gateway also enforces a **5-minute timestamp anti-replay window**: inbound requests with a `telnyx-timestamp` more than 300 seconds away from the gateway's clock are rejected with 401, even if the signature itself is valid. Keep your gateway host's clock in sync (NTP).
+
+If your Telnyx account is on a trial plan, outbound numbers must be verified in the portal first — otherwise `POST /v2/messages` returns 4xx and the gateway logs the failure. SMS is metered per segment; long agent replies are split into ≤1600-char chunks with a `(i/N)` continuation marker, so a single agent turn can produce multiple billable segments.
+
 ---
 
 ## When to prefer a dedicated guide
