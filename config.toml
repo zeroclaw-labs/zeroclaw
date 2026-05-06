@@ -1,4 +1,4 @@
 [providers.models.atomic]
 kind = "openai-compatible"
-base_url = "http://127.0.0.1:1337/v1"
+base_url = "http://127.0.0.1:4000/v1"
 model = "unsloth/Qwen3_5-9B-IQ4_XS"
