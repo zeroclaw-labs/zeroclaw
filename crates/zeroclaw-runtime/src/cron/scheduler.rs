@@ -1,7 +1,7 @@
 use crate::cron::{
     CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs,
-    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    sync_declarative_jobs, update_job,
+    claim_job, due_jobs, next_run_for_schedule, record_last_run, record_run, release_job,
+    remove_job, reschedule_after_run, sync_declarative_jobs, unlock_all_jobs, update_job,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -70,6 +70,11 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             }
         }
         Err(e) => tracing::warn!("Failed to sync declarative cron jobs: {e}"),
+    }
+
+    // Clear any stale execution locks left behind by a previous crash.
+    if let Err(e) = unlock_all_jobs(&config) {
+        tracing::warn!("Failed to unlock cron jobs at startup: {e}");
     }
 
     // ── Startup catch-up: run ALL overdue jobs before entering the
@@ -228,6 +233,25 @@ async fn execute_and_persist_job(
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
+    // Claim the job atomically so concurrent scheduler polls cannot
+    // select it again while it is already in flight.
+    match claim_job(config, &job.id) {
+        Ok(true) => {}
+        Ok(false) => {
+            // In test environments a job may be constructed directly and passed
+            // to process_due_jobs without ever being inserted into the DB.
+            // Only skip when the job really exists and is already locked.
+            if crate::cron::get_job(config, &job.id).is_ok() {
+                tracing::warn!(job_id = %job.id, "Cron job is already locked; skipping duplicate execution");
+                return (job.id.clone(), false, "job already in flight".to_string());
+            }
+        }
+        Err(e) => {
+            tracing::warn!(job_id = %job.id, "Failed to claim cron job: {e}");
+            return (job.id.clone(), false, format!("claim failed: {e}"));
+        }
+    }
+
     let started_at = Utc::now();
     let (success, output) = Box::pin(execute_job_with_retry(config, security, job)).await;
     let finished_at = Utc::now();
@@ -240,6 +264,10 @@ async fn execute_and_persist_job(
         finished_at,
     ))
     .await;
+
+    if let Err(e) = release_job(config, &job.id) {
+        tracing::warn!(job_id = %job.id, "Failed to release cron job lock: {e}");
+    }
 
     (job.id.clone(), success, output)
 }
