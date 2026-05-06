@@ -7,12 +7,24 @@ use zeroclaw_config::schema::ModelPricing;
 
 // ── Cost tracking via task-local ──
 
+/// Per-scope token/cost accumulator. Records pushed by
+/// `record_tool_loop_cost_usage` alongside the shared `CostTracker` so the
+/// wrapping code can read out the total for *this* call after the scope
+/// exits, without racing concurrent requests sharing the same tracker.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct TurnUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+}
+
 /// Context for cost tracking within the tool call loop.
 /// Scoped via `tokio::task_local!` at call sites (channels, gateway).
 #[derive(Clone)]
 pub struct ToolLoopCostTrackingContext {
     pub tracker: Arc<CostTracker>,
     pub prices: Arc<std::collections::HashMap<String, ModelPricing>>,
+    pub turn_usage: Arc<Mutex<TurnUsage>>,
 }
 
 impl ToolLoopCostTrackingContext {
@@ -20,12 +32,49 @@ impl ToolLoopCostTrackingContext {
         tracker: Arc<CostTracker>,
         prices: Arc<std::collections::HashMap<String, ModelPricing>>,
     ) -> Self {
-        Self { tracker, prices }
+        Self {
+            tracker,
+            prices,
+            turn_usage: Arc::new(Mutex::new(TurnUsage::default())),
+        }
+    }
+
+    /// Snapshot the per-scope usage. Wrapping code calls this after the
+    /// scoped future completes to populate observer-event annotations.
+    pub fn snapshot_turn_usage(&self) -> TurnUsage {
+        *self.turn_usage.lock()
     }
 }
 
 tokio::task_local! {
     pub static TOOL_LOOP_COST_TRACKING_CONTEXT: Option<ToolLoopCostTrackingContext>;
+}
+
+/// 3-tier model pricing lookup. Order matters and is the contract:
+/// 1. `<provider>/<model>` — most specific. Per-provider pricing
+///    (`[providers.models.<id>].pricing`) lands here via `combined_pricing`,
+///    so an operator who configures a per-provider override wins over a
+///    same-named bare-model entry. This order is what makes the
+///    disambiguation case work: two providers serving the same model name
+///    at different rates.
+/// 2. `<model>` (bare) — fallback for top-level `[cost.prices.<model>]`
+///    catalogs that don't qualify by provider.
+/// 3. Suffix after the last `/` — fallback for slash-bearing model IDs
+///    (e.g. OpenRouter's `anthropic/claude-sonnet-4-5` resolving against
+///    a bare `claude-sonnet-4-5` entry).
+fn lookup_pricing<'a>(
+    prices: &'a std::collections::HashMap<String, ModelPricing>,
+    provider_name: &str,
+    model: &str,
+) -> Option<&'a ModelPricing> {
+    prices
+        .get(&format!("{provider_name}/{model}"))
+        .or_else(|| prices.get(model))
+        .or_else(|| {
+            model
+                .rsplit_once('/')
+                .and_then(|(_, suffix)| prices.get(suffix))
+        })
 }
 
 /// Record token usage from an LLM response via the task-local cost tracker.
@@ -46,16 +95,7 @@ pub fn record_tool_loop_cost_usage(
         .try_with(Clone::clone)
         .ok()
         .flatten()?;
-    // 3-tier model pricing lookup: direct name → provider/model → suffix after last `/`
-    let pricing = ctx
-        .prices
-        .get(model)
-        .or_else(|| ctx.prices.get(&format!("{provider_name}/{model}")))
-        .or_else(|| {
-            model
-                .rsplit_once('/')
-                .and_then(|(_, suffix)| ctx.prices.get(suffix))
-        });
+    let pricing = lookup_pricing(&ctx.prices, provider_name, model);
     let cost_usage = CostTokenUsage::new(
         model,
         input_tokens,
@@ -74,6 +114,13 @@ pub fn record_tool_loop_cost_usage(
             model,
             "Failed to record cost tracking usage: {error}"
         );
+    }
+
+    {
+        let mut usage = ctx.turn_usage.lock();
+        usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
+        usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
+        usage.cost_usd += cost_usage.cost_usd;
     }
 
     Some((cost_usage.total_tokens, cost_usage.cost_usd))
@@ -141,9 +188,87 @@ pub fn check_tool_loop_budget() -> Option<BudgetCheck> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn fresh_seen() -> Mutex<HashSet<(String, String)>> {
         Mutex::new(HashSet::new())
+    }
+
+    fn pricing(input: f64, output: f64) -> ModelPricing {
+        ModelPricing { input, output }
+    }
+
+    // ── lookup_pricing: 3-tier resolution order (#6251) ──────────────
+
+    #[test]
+    fn lookup_pricing_provider_qualified_beats_bare_model() {
+        // Operator has a generic top-level price for "gpt-4o" AND a
+        // per-provider override on "openai/gpt-4o" (e.g. they bill OpenAI
+        // direct at one rate and a proxy provider at another). The
+        // qualified entry must win — that is the entire point of the
+        // disambiguation feature added in #6251.
+        let mut prices = HashMap::new();
+        prices.insert("gpt-4o".to_string(), pricing(2.5, 10.0));
+        prices.insert("openai/gpt-4o".to_string(), pricing(1.5, 6.0));
+
+        let entry = lookup_pricing(&prices, "openai", "gpt-4o").expect("qualified entry");
+        assert_eq!(
+            entry.input, 1.5,
+            "per-provider <provider>/<model> entry must win over bare <model>"
+        );
+        assert_eq!(entry.output, 6.0);
+    }
+
+    #[test]
+    fn lookup_pricing_bare_model_fallback_when_no_qualified_entry() {
+        // No per-provider entry — the bare top-level catalog must still
+        // resolve. This is the legacy operator who has only set
+        // `[cost.prices.gpt-4o]` and has not adopted per-provider pricing.
+        let mut prices = HashMap::new();
+        prices.insert("gpt-4o".to_string(), pricing(2.5, 10.0));
+
+        let entry = lookup_pricing(&prices, "openai", "gpt-4o").expect("bare entry");
+        assert_eq!(entry.input, 2.5);
+        assert_eq!(entry.output, 10.0);
+    }
+
+    #[test]
+    fn lookup_pricing_suffix_fallback_for_slash_bearing_model_ids() {
+        // OpenRouter-style model IDs like "anthropic/claude-sonnet-4-5":
+        // the qualified key would be "openrouter/anthropic/claude-..."
+        // (highly unusual to configure), and the bare key is the model
+        // string itself. If neither is configured, the suffix-after-last-/
+        // fallback resolves against `claude-sonnet-4-5`. This preserves
+        // the legacy behaviour for operators using OpenRouter aliases.
+        let mut prices = HashMap::new();
+        prices.insert("claude-sonnet-4-5".to_string(), pricing(3.0, 15.0));
+
+        let entry =
+            lookup_pricing(&prices, "openrouter", "anthropic/claude-sonnet-4-5").expect("suffix");
+        assert_eq!(entry.input, 3.0);
+        assert_eq!(entry.output, 15.0);
+    }
+
+    #[test]
+    fn lookup_pricing_returns_none_when_no_tier_matches() {
+        let prices: HashMap<String, ModelPricing> = HashMap::new();
+        assert!(lookup_pricing(&prices, "openai", "gpt-4o").is_none());
+    }
+
+    #[test]
+    fn lookup_pricing_disambiguates_two_providers_serving_same_model() {
+        // The motivating case for #6251: the same model name "gpt-4o"
+        // served by "openai" and by "azure" at different per-provider
+        // rates. The merged pricing map carries both qualified entries;
+        // the lookup must route each provider to its own price.
+        let mut prices = HashMap::new();
+        prices.insert("openai/gpt-4o".to_string(), pricing(2.5, 10.0));
+        prices.insert("azure/gpt-4o".to_string(), pricing(1.0, 4.0));
+
+        let openai_entry = lookup_pricing(&prices, "openai", "gpt-4o").expect("openai entry");
+        assert_eq!(openai_entry.input, 2.5);
+        let azure_entry = lookup_pricing(&prices, "azure", "gpt-4o").expect("azure entry");
+        assert_eq!(azure_entry.input, 1.0);
     }
 
     #[test]

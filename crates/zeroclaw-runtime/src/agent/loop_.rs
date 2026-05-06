@@ -57,8 +57,8 @@ use zeroclaw_providers::{
 
 // Cost tracking moved to `super::cost`.
 pub use super::cost::{
-    TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, check_tool_loop_budget,
-    record_tool_loop_cost_usage,
+    TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, TurnUsage,
+    check_tool_loop_budget, record_tool_loop_cost_usage,
 };
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -335,11 +335,17 @@ fn autosave_memory_key(prefix: &str) -> String {
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
 /// Core memories are exempt from time decay (evergreen).
+///
+/// `exclude_conversation` skips `MemoryCategory::Conversation` entries
+/// regardless of their key shape. Set to `true` for autonomous/scheduled
+/// runs (cron, daemon heartbeat) so chat memory cannot leak into prompts
+/// the user did not initiate. See #5415 / #5456.
 async fn build_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
     session_id: Option<&str>,
+    exclude_conversation: bool,
 ) -> String {
     let mut context = String::new();
 
@@ -359,6 +365,14 @@ async fn build_context(
         if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &relevant {
+                // Scheduled (cron / heartbeat) runs must not see chat-origin
+                // memories. The autosave-key checks below catch the agent's
+                // own autosaves but miss Conversation entries written by
+                // channel handlers (Discord, gateway, WhatsApp, …) under
+                // their own keys. See #5415 / #5456.
+                if exclude_conversation && matches!(entry.category, MemoryCategory::Conversation) {
+                    continue;
+                }
                 if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
@@ -554,6 +568,7 @@ struct StreamedChatOutcome {
     reasoning_content: String,
     tool_calls: Vec<ToolCall>,
     forwarded_live_deltas: bool,
+    usage: Option<zeroclaw_providers::traits::TokenUsage>,
 }
 
 async fn consume_provider_streaming_response(
@@ -596,6 +611,9 @@ async fn consume_provider_streaming_response(
         let event = event_result.map_err(|err| anyhow::anyhow!("provider stream error: {err}"))?;
         match event {
             StreamEvent::Final => break,
+            StreamEvent::Usage(usage) => {
+                outcome.usage = Some(usage);
+            }
             StreamEvent::ToolCall(tool_call) => {
                 outcome.tool_calls.push(tool_call);
                 suppress_forwarding = true;
@@ -826,31 +844,6 @@ fn maybe_inject_channel_delivery_defaults(
 //   • the cancellation token fires (external abort).
 
 /// Append a receipt footer to the response text if any receipts were collected.
-///
-/// Format:
-/// ```text
-/// \n\n---\nTool receipts:\n  shell: zc-receipt-...\n  web_search: zc-receipt-...
-/// ```
-pub fn append_receipt_footer(
-    response: String,
-    collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
-) -> String {
-    let Some(store) = collected_receipts else {
-        return response;
-    };
-    let Ok(receipts) = store.lock() else {
-        return response;
-    };
-    if receipts.is_empty() {
-        return response;
-    }
-    let mut footer = format!("{response}\n\n---\nTool receipts:");
-    for entry in receipts.iter() {
-        footer.push_str(&format!("\n  {entry}"));
-    }
-    footer
-}
-
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 #[allow(clippy::too_many_arguments)]
@@ -1152,7 +1145,7 @@ pub async fn run_tool_call_loop(
                     Ok(zeroclaw_providers::ChatResponse {
                         text: Some(streamed.response_text),
                         tool_calls: streamed.tool_calls,
-                        usage: None,
+                        usage: streamed.usage,
                         reasoning_content,
                     })
                 }
@@ -1495,10 +1488,7 @@ pub async fn run_tool_call_loop(
             }
 
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(append_receipt_footer(
-                accumulated_display_text,
-                collected_receipts,
-            ));
+            return Ok(accumulated_display_text);
         }
 
         // Accumulate text from this iteration (tool calls present, loop continues).
@@ -2052,10 +2042,7 @@ pub async fn run_tool_call_loop(
                 anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
             }
             accumulated_display_text.push_str(&text);
-            Ok(append_receipt_footer(
-                accumulated_display_text,
-                collected_receipts,
-            ))
+            Ok(accumulated_display_text)
         }
         Err(e) => {
             tracing::warn!(error = %e, "Final summary LLM call failed, bailing");
@@ -2510,7 +2497,7 @@ pub async fn run(
     let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
         crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.workspace_dir)
             .map(|tracker| {
-                ToolLoopCostTrackingContext::new(tracker, Arc::new(config.cost.prices.clone()))
+                ToolLoopCostTrackingContext::new(tracker, Arc::new(config.combined_pricing()))
             });
 
     // ── Execute ──────────────────────────────────────────────────
@@ -2563,12 +2550,16 @@ pub async fn run(
                 .await;
         }
 
-        // Inject memory + hardware RAG context into user message
+        // Inject memory + hardware RAG context into user message.
+        // For non-interactive runs (cron, daemon heartbeat), exclude
+        // Conversation-category memories so chat history does not leak
+        // into autonomous executions. See #5415 / #5456.
         let mem_context = build_context(
             mem.as_ref(),
             &effective_msg,
             config.memory.min_relevance_score,
             memory_session_id.as_deref(),
+            !interactive,
         )
         .await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -2850,12 +2841,15 @@ pub async fn run(
                     .await;
             }
 
-            // Inject memory + hardware RAG context into user message
+            // Inject memory + hardware RAG context into user message.
+            // Interactive REPL: keep Conversation memories (user is actively
+            // chatting in this session and may want their own history recalled).
             let mem_context = build_context(
                 mem.as_ref(),
                 &effective_input,
                 config.memory.min_relevance_score,
                 memory_session_id.as_deref(),
+                false,
             )
             .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -3435,11 +3429,15 @@ pub async fn process_message(
     }
 
     let effective_msg_ref = effective_message.as_str();
+    // process_message is the channel entrypoint (Discord, Telegram, gateway,
+    // etc.) — recall is scoped to the channel's session_id, so retrieving the
+    // user's own Conversation history within their session is intended.
     let mem_context = build_context(
         mem.as_ref(),
         effective_msg_ref,
         config.memory.min_relevance_score,
         session_id,
+        false,
     )
     .await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -6410,7 +6408,7 @@ mod tests {
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0, None).await;
+        let context = build_context(&mem, "status updates", 0.0, None, false).await;
         assert!(context.contains("user_preference"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
@@ -6445,10 +6443,54 @@ mod tests {
         .await
         .unwrap();
 
-        let context = build_context(&mem, "answers", 0.0, None).await;
+        let context = build_context(&mem, "answers", 0.0, None, false).await;
         assert!(context.contains("user_preference"));
         assert!(!context.contains("user_msg"));
         assert!(!context.contains("embedding prior context"));
+    }
+
+    /// Regression: cron / heartbeat runs must not surface chat-origin
+    /// `Conversation` memories — the leak path the #5456 prefix filter
+    /// missed because `agent::run` performs a second, unfiltered recall
+    /// inside `build_context`. See #5415.
+    #[tokio::test]
+    async fn build_context_excludes_conversation_when_flag_set() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        // A Conversation entry written by a chat channel with a non-autosave
+        // key (autosave keys are already skipped by the existing filters).
+        mem.store(
+            "discord:guild:chan:msg-42",
+            "Reminder for Alice: the API key is in 1Password vault Foo.",
+            MemoryCategory::Conversation,
+            Some("discord:guild:chan"),
+        )
+        .await
+        .unwrap();
+        // A non-Conversation memory that should still surface so we know the
+        // function still does its job — only Conversation should be dropped.
+        mem.store(
+            "team_oncall",
+            "Primary on-call rotates every Monday at 09:00 UTC.",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let context = build_context(&mem, "Alice on-call", 0.0, None, true).await;
+        assert!(
+            !context.contains("Alice"),
+            "Conversation memory leaked into scheduled context: {context}"
+        );
+        assert!(
+            !context.contains("API key"),
+            "Conversation memory leaked into scheduled context: {context}"
+        );
+        assert!(
+            context.contains("team_oncall"),
+            "Non-Conversation memory should still surface: {context}"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -7685,45 +7727,5 @@ Let me check the result."#;
         .expect("should succeed without cost scope");
 
         assert_eq!(result, "ok");
-    }
-
-    // ── append_receipt_footer tests ──────────────────────────────
-
-    #[test]
-    fn receipt_footer_empty_receipts_unchanged() {
-        let store = std::sync::Mutex::new(Vec::<String>::new());
-        let result = super::append_receipt_footer("Hello world".to_string(), Some(&store));
-        assert_eq!(result, "Hello world");
-    }
-
-    #[test]
-    fn receipt_footer_none_store_unchanged() {
-        let result = super::append_receipt_footer("Hello world".to_string(), None);
-        assert_eq!(result, "Hello world");
-    }
-
-    #[test]
-    fn receipt_footer_single_receipt() {
-        let store = std::sync::Mutex::new(vec!["shell: zc-receipt-1234567890-abcdef".to_string()]);
-        let result = super::append_receipt_footer("The date is Monday.".to_string(), Some(&store));
-        assert_eq!(
-            result,
-            "The date is Monday.\n\n---\nTool receipts:\n  shell: zc-receipt-1234567890-abcdef"
-        );
-    }
-
-    #[test]
-    fn receipt_footer_multiple_receipts() {
-        let store = std::sync::Mutex::new(vec![
-            "shell: zc-receipt-100-aaa".to_string(),
-            "web_search: zc-receipt-200-bbb".to_string(),
-            "file_read: zc-receipt-300-ccc".to_string(),
-        ]);
-        let result = super::append_receipt_footer("Done.".to_string(), Some(&store));
-        let expected = "Done.\n\n---\nTool receipts:\
-            \n  shell: zc-receipt-100-aaa\
-            \n  web_search: zc-receipt-200-bbb\
-            \n  file_read: zc-receipt-300-ccc";
-        assert_eq!(result, expected);
     }
 }

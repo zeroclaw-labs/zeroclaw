@@ -680,11 +680,20 @@ impl AcpServer {
         // Track streamed text so partial content survives cancellation.
         let mut accumulated_text = String::new();
         while let Some(event) = event_rx.recv().await {
+            // ACP has no `session/update` shape for token-usage events; the
+            // task-local cost tracker records them out-of-band. Skip before
+            // dispatching to the notification builder so the helper match
+            // can stay exhaustive on the four UI-relevant variants.
+            if matches!(event, TurnEvent::Usage { .. }) {
+                continue;
+            }
+            // Track streamed text so partial content survives cancellation.
             if let TurnEvent::Chunk { ref delta } = event {
                 accumulated_text.push_str(delta);
             }
-            let notification = notification_for_turn_event(&session_id, &event);
-            self.write_notification(&notification).await;
+            if let Some(notification) = notification_for_turn_event(&session_id, &event) {
+                self.write_notification(&notification).await;
+            }
         }
 
         // Remove the cancel token regardless of outcome — the turn is over.
@@ -1005,8 +1014,8 @@ fn map_tool_kind(name: &str) -> &'static str {
     }
 }
 
-fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> JsonRpcNotification {
-    match event {
+fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<JsonRpcNotification> {
+    Some(match event {
         TurnEvent::Chunk { delta } => JsonRpcNotification {
             jsonrpc: "2.0",
             method: "session/update",
@@ -1075,7 +1084,20 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> JsonRpcNo
                 }
             }),
         },
-    }
+        // ACP has its own approval mechanism via `session/request_permission`
+        // routed through the channel's `request_choice` impl. The agent only
+        // emits ApprovalRequest events when a back-channel like the gateway
+        // WS is registered to handle them; on ACP-only sessions they should
+        // not arrive here.
+        TurnEvent::ApprovalRequest { .. } => return None,
+        // Usage events are filtered out at every call site (ACP has no
+        // `session/update` shape for them; the cost tracker records them
+        // out-of-band). Reaching this arm means a caller forgot the filter.
+        TurnEvent::Usage { .. } => unreachable!(
+            "TurnEvent::Usage must be filtered before notification_for_turn_event; \
+             ACP has no session/update notification for token usage"
+        ),
+    })
 }
 
 // ── Error helper ─────────────────────────────────────────────────
@@ -1460,7 +1482,8 @@ mod tests {
                 args: serde_json::json!({"command": "ls -la"}),
             },
         );
-        let call_value = serde_json::to_value(call).unwrap();
+        let call_value =
+            serde_json::to_value(call.expect("ToolCall maps to a notification")).unwrap();
         assert_eq!(call_value["method"], "session/update");
         assert_eq!(call_value["params"]["update"]["sessionUpdate"], "tool_call");
         assert_eq!(call_value["params"]["update"]["toolCallId"], "tc-12345");
@@ -1480,7 +1503,8 @@ mod tests {
                 output: "file1.txt\nfile2.txt".to_string(),
             },
         );
-        let result_value = serde_json::to_value(result).unwrap();
+        let result_value =
+            serde_json::to_value(result.expect("ToolResult maps to a notification")).unwrap();
         assert_eq!(
             result_value["params"]["update"]["sessionUpdate"],
             "tool_call_update"

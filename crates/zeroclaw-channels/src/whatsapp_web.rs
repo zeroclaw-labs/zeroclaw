@@ -264,6 +264,33 @@ impl WhatsAppWebChannel {
         }
     }
 
+    /// Build the LID-aware diagnostic suffix appended to allowlist-rejection
+    /// logs so the operator sees why a known phone number didn't match.
+    /// Only meaningful inside an actual rejection branch (`normalized.is_none()`
+    /// under `Allowlist` policy); outside that branch the LID resolution
+    /// state is not the operator's concern, since the message is being
+    /// processed normally (#6354 review).
+    #[cfg(feature = "whatsapp-web")]
+    fn lid_rejection_diagnostic(
+        sender: &wa_rs_binary::jid::Jid,
+        mapped_phone: Option<&str>,
+    ) -> String {
+        if !sender.is_lid() {
+            return String::new();
+        }
+        if mapped_phone.is_none() {
+            format!(
+                " (LID→phone resolution returned None for sender {sender}; \
+                 allowlist phone-number entries cannot match. Workaround: \
+                 add the LID-form (+{}) to allowed_numbers, or wait for the \
+                 in-memory LID cache to populate for this contact.)",
+                sender.user
+            )
+        } else {
+            " (sender is LID; resolved phone did not match any allowlist entry)".to_string()
+        }
+    }
+
     /// Build normalized sender candidates from sender JID, optional alt JID, and optional LID->PN mapping.
     #[cfg(feature = "whatsapp-web")]
     fn sender_phone_candidates(
@@ -787,6 +814,37 @@ impl WaAttachmentKind {
     }
 }
 
+/// Decide whether a `fromMe` message outside the operator's self-chat is an
+/// intentional operator-typed bot trigger.
+///
+/// The default response to a `fromMe` mirror is to drop, because WhatsApp Web
+/// echoes every message the operator types from any linked device and replying
+/// would impersonate them. The exception is when the operator has configured
+/// `dm_mention_patterns` / `group_mention_patterns` and the text matches —
+/// that is the explicit opt-in that distinguishes a deliberate trigger
+/// (e.g. typing `TinyBot foo` in a friend's DM) from a normal mirrored
+/// message.
+///
+/// Returns `true` when the message should fall through to the regular policy
+/// branches; `false` when it should be dropped as a mirror.
+#[cfg(feature = "whatsapp-web")]
+fn fromme_outside_self_chat_is_operator_trigger(
+    is_group: bool,
+    dm_mention_patterns: &[regex::Regex],
+    group_mention_patterns: &[regex::Regex],
+    text: &str,
+) -> bool {
+    let applicable = if is_group {
+        group_mention_patterns
+    } else {
+        dm_mention_patterns
+    };
+    if applicable.is_empty() {
+        return false;
+    }
+    super::whatsapp::WhatsAppChannel::text_matches_patterns(applicable, text)
+}
+
 /// Find the closing `]` that matches an already-consumed opening `[`.
 #[cfg(feature = "whatsapp-web")]
 #[allow(dead_code)] // WIP: used by parse_attachment_markers
@@ -1197,6 +1255,26 @@ impl Channel for WhatsAppWebChannel {
                                                 );
                                             }
                                         }
+                                    } else if info.source.is_from_me
+                                        && !fromme_outside_self_chat_is_operator_trigger(
+                                            is_group,
+                                            &wa_dm_mention_patterns,
+                                            &wa_group_mention_patterns,
+                                            msg.text_content().unwrap_or(""),
+                                        )
+                                    {
+                                        // fromMe outside the self-chat thread is a mirror of the
+                                        // operator's own outbound message to a third party (DM or
+                                        // group). Replying would impersonate the operator. Drop —
+                                        // unless the operator has configured a mention pattern
+                                        // and the text matches it (the workflow @ilteoood uses
+                                        // with `TinyBot ...` triggers), in which case the helper
+                                        // returns true and we fall through to the policy branches
+                                        // below to treat the message like an inbound trigger.
+                                        tracing::debug!(
+                                            "WhatsApp Web: ignoring fromMe message outside self-chat thread (chat={chat}, sender={sender})"
+                                        );
+                                        return;
                                     } else if is_group {
                                         match wa_group_policy {
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Ignore => {
@@ -1210,9 +1288,14 @@ impl Channel for WhatsAppWebChannel {
                                             }
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist => {
                                                 if normalized.is_none() {
+                                                    let lid_diag = Self::lid_rejection_diagnostic(
+                                                        &sender_jid,
+                                                        mapped_phone.as_deref(),
+                                                    );
                                                     tracing::warn!(
-                                                        "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={})",
-                                                        sender_candidates.len()
+                                                        "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={}){}",
+                                                        sender_candidates.len(),
+                                                        lid_diag,
                                                     );
                                                     return;
                                                 }
@@ -1232,9 +1315,14 @@ impl Channel for WhatsAppWebChannel {
                                             }
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist => {
                                                 if normalized.is_none() {
+                                                    let lid_diag = Self::lid_rejection_diagnostic(
+                                                        &sender_jid,
+                                                        mapped_phone.as_deref(),
+                                                    );
                                                     tracing::warn!(
-                                                        "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={})",
-                                                        sender_candidates.len()
+                                                        "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={}){}",
+                                                        sender_candidates.len(),
+                                                        lid_diag,
                                                     );
                                                     return;
                                                 }
@@ -1830,6 +1918,61 @@ mod tests {
         assert!(candidates.contains(&"+15551234567".to_string()));
     }
 
+    // ── lid_rejection_diagnostic: scoped LID warning (#6354 review) ────
+    //
+    // The diagnostic fires only inside the `Allowlist::normalized.is_none()`
+    // branch. These tests pin the three shapes the function returns; the
+    // call-site composition (suffix appended to the rejection log) is
+    // covered by reading the surrounding code path.
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn lid_rejection_diagnostic_empty_for_non_lid_sender() {
+        let sender = Jid::pn("15551234567");
+        let diag = WhatsAppWebChannel::lid_rejection_diagnostic(&sender, None);
+        assert!(
+            diag.is_empty(),
+            "non-LID senders must not generate any LID-resolution suffix; got {diag:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn lid_rejection_diagnostic_names_resolution_failure_for_lid_with_no_phone() {
+        let sender = Jid::lid("76188559093817");
+        let diag = WhatsAppWebChannel::lid_rejection_diagnostic(&sender, None);
+        assert!(
+            diag.contains("LID→phone resolution returned None"),
+            "diagnostic must name the resolution failure mode #6350 describes; got {diag:?}"
+        );
+        assert!(
+            diag.contains("76188559093817"),
+            "diagnostic must surface the LID identifier so the operator can add the LID-form workaround; got {diag:?}"
+        );
+        assert!(
+            diag.contains("allowed_numbers"),
+            "diagnostic must point at the config knob to fix this; got {diag:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn lid_rejection_diagnostic_distinguishes_resolved_phone_mismatch() {
+        // LID resolved successfully but the resulting phone wasn't in the
+        // allowlist. Different cause from the resolution failure path; the
+        // operator shouldn't be steered toward the LID workaround.
+        let sender = Jid::lid("76188559093817");
+        let diag = WhatsAppWebChannel::lid_rejection_diagnostic(&sender, Some("15551234567"));
+        assert!(
+            !diag.contains("LID→phone resolution returned None"),
+            "must not suggest resolution failed when mapped_phone is Some; got {diag:?}"
+        );
+        assert!(
+            diag.contains("did not match"),
+            "diagnostic must explain the resolved phone failed the allowlist; got {diag:?}"
+        );
+    }
+
     #[tokio::test]
     #[cfg(feature = "whatsapp-web")]
     async fn whatsapp_web_health_check_disconnected() {
@@ -2213,5 +2356,136 @@ mod tests {
             mime_from_path(std::path::Path::new("/tmp/e.xyz")),
             "application/octet-stream"
         );
+    }
+
+    // ── fromme_outside_self_chat_is_operator_trigger (#6351) ───────────
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fromme_trigger_drops_when_no_mention_patterns_configured() {
+        let dm: Vec<regex::Regex> = vec![];
+        let group: Vec<regex::Regex> = vec![];
+        // Without configured patterns, a fromMe message in a third-party
+        // DM or group must drop — there is no opt-in signal that says the
+        // operator wants outbound mirrors to be treated as triggers.
+        assert!(!fromme_outside_self_chat_is_operator_trigger(
+            false,
+            &dm,
+            &group,
+            "TinyBot foo"
+        ));
+        assert!(!fromme_outside_self_chat_is_operator_trigger(
+            true,
+            &dm,
+            &group,
+            "TinyBot foo"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fromme_trigger_falls_through_when_dm_pattern_matches() {
+        // @ilteoood's configured workflow: dm_mention_patterns = ["TinyBot"].
+        // Operator types "TinyBot translate this" in a friend's DM →
+        // intentional invocation, must fall through.
+        let dm = vec![
+            regex::RegexBuilder::new("TinyBot")
+                .case_insensitive(true)
+                .build()
+                .unwrap(),
+        ];
+        let group: Vec<regex::Regex> = vec![];
+        assert!(fromme_outside_self_chat_is_operator_trigger(
+            false,
+            &dm,
+            &group,
+            "TinyBot translate this"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fromme_trigger_drops_when_dm_pattern_does_not_match() {
+        // Operator types a normal message in a friend's DM — even with
+        // patterns configured, no match means it stays an outbound mirror
+        // and must be dropped to prevent impersonation.
+        let dm = vec![
+            regex::RegexBuilder::new("TinyBot")
+                .case_insensitive(true)
+                .build()
+                .unwrap(),
+        ];
+        let group: Vec<regex::Regex> = vec![];
+        assert!(!fromme_outside_self_chat_is_operator_trigger(
+            false,
+            &dm,
+            &group,
+            "see you at 7"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fromme_trigger_uses_group_patterns_for_group_threads() {
+        // group_mention_patterns gates the group case; dm patterns must
+        // not be consulted for group messages and vice versa. This pins
+        // the predicate's branch selection.
+        let dm: Vec<regex::Regex> = vec![
+            regex::RegexBuilder::new("DmTrigger")
+                .case_insensitive(true)
+                .build()
+                .unwrap(),
+        ];
+        let group = vec![
+            regex::RegexBuilder::new("GroupTrigger")
+                .case_insensitive(true)
+                .build()
+                .unwrap(),
+        ];
+        // In a group, only group_patterns matter.
+        assert!(fromme_outside_self_chat_is_operator_trigger(
+            true,
+            &dm,
+            &group,
+            "GroupTrigger hi"
+        ));
+        assert!(!fromme_outside_self_chat_is_operator_trigger(
+            true,
+            &dm,
+            &group,
+            "DmTrigger hi"
+        ));
+        // In a DM, only dm_patterns matter.
+        assert!(fromme_outside_self_chat_is_operator_trigger(
+            false,
+            &dm,
+            &group,
+            "DmTrigger hi"
+        ));
+        assert!(!fromme_outside_self_chat_is_operator_trigger(
+            false,
+            &dm,
+            &group,
+            "GroupTrigger hi"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fromme_trigger_drops_when_text_is_empty() {
+        // Voice notes and media-only messages return empty text. With no
+        // text to match against, the operator-trigger path must drop —
+        // never transcribe a fromMe voice note just to check whether it
+        // is a bot trigger (cost + impersonation risk).
+        let dm = vec![
+            regex::RegexBuilder::new("TinyBot")
+                .case_insensitive(true)
+                .build()
+                .unwrap(),
+        ];
+        let group: Vec<regex::Regex> = vec![];
+        assert!(!fromme_outside_self_chat_is_operator_trigger(
+            false, &dm, &group, ""
+        ));
     }
 }
