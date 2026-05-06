@@ -57,7 +57,6 @@ use zeroclaw_channels::{
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
-use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, Provider};
 use zeroclaw_runtime::cost::CostTracker;
@@ -474,17 +473,47 @@ pub async fn run_gateway(
     let display_addr = format!("{host}:{actual_port}");
 
     let fallback = config.providers.fallback_provider();
+    let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
     let provider: Arc<dyn Provider> =
         Arc::from(zeroclaw_providers::create_resilient_provider_with_options(
-            config.providers.fallback.as_deref().unwrap_or("openrouter"),
+            provider_name,
             fallback.and_then(|e| e.api_key.as_deref()),
             fallback.and_then(|e| e.base_url.as_deref()),
             &config.reliability,
             &zeroclaw_providers::provider_runtime_options_from_config(&config),
         )?);
-    let model = fallback
-        .and_then(|e| e.model.clone())
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
+    // Three-step model resolution mirroring agent::Agent::from_config (#6099):
+    // (1) the fallback provider's `model`, (2) the first configured
+    // `[providers.models.*]` model with a WARN naming what to set, (3) hard
+    // fail with an actionable error. No silent vendor-default substitution.
+    let model = match fallback
+        .and_then(|e| e.model.as_deref())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        Some(m) => m.to_string(),
+        None => match config.providers.resolve_default_model() {
+            Some(m) => {
+                tracing::warn!(
+                    provider = provider_name,
+                    model = %m,
+                    "fallback provider has no `model` set; using first configured \
+                     providers.models entry as default. Set [providers.models.{provider_name}] \
+                     model = \"...\" to silence this warning.",
+                );
+                m
+            }
+            None => {
+                anyhow::bail!(
+                    "no model configured: providers.fallback = {:?} resolves with no model, \
+                     and no [providers.models.*] entry has a `model` field set. \
+                     Configure at least one [providers.models.<name>] model = \"...\" \
+                     before starting the gateway.",
+                    config.providers.fallback,
+                )
+            }
+        },
+    };
     let temperature = fallback.and_then(|e| e.temperature).unwrap_or(0.7);
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
@@ -738,17 +767,28 @@ pub async fn run_gateway(
         .map(|gp| Arc::new(GmailPushChannel::new(gp.clone())));
 
     // ── Session persistence for WS chat ─────────────────────
+    // Routes through `make_session_backend` so `[channels].session_backend`
+    // is the single source of truth for which backend stores sessions.
+    // Picking `"jsonl"` would otherwise leave gateway WS sessions writing
+    // to SQLite while channel + tool reads went to JSONL — the original
+    // #5769 split, just on a different backend pairing.
     let session_backend: Option<Arc<dyn SessionBackend>> = if config.gateway.session_persistence {
-        match SqliteSessionBackend::new(&config.workspace_dir) {
-            Ok(b) => {
-                tracing::info!("Gateway session persistence enabled (SQLite)");
+        match zeroclaw_infra::make_session_backend(
+            &config.workspace_dir,
+            &config.channels.session_backend,
+        ) {
+            Ok(backend) => {
+                tracing::info!(
+                    "Gateway session persistence enabled (backend={})",
+                    config.channels.session_backend,
+                );
                 if config.gateway.session_ttl_hours > 0
-                    && let Ok(cleaned) = b.cleanup_stale(config.gateway.session_ttl_hours)
+                    && let Ok(cleaned) = backend.cleanup_stale(config.gateway.session_ttl_hours)
                     && cleaned > 0
                 {
                     tracing::info!("Cleaned up {cleaned} stale gateway sessions");
                 }
-                Some(Arc::new(b))
+                Some(backend)
             }
             Err(e) => {
                 tracing::warn!("Session persistence disabled: {e}");

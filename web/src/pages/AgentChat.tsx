@@ -1,5 +1,5 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown } from 'lucide-react';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
@@ -35,6 +35,15 @@ export default function AgentChat() {
   const [compact, setCompact] = useState(() => {
     try { return localStorage.getItem('zeroclaw_chat_compact') === '1'; } catch { return false; }
   });
+  // Tool execution is plumbing, not chat. Default off so tool_call /
+  // tool_result frames do not surface inline in the conversation transcript.
+  // Toggleable from the chat toolbar (Wrench button). The WebSocket lives in
+  // AgentContext, which always pushes tool cards into messages; this toggle
+  // filters them at render time so toggling on retroactively reveals prior
+  // tool activity.
+  const [showToolActivity, setShowToolActivity] = useState(() => {
+    try { return localStorage.getItem('zeroclaw_show_tool_activity') === '1'; } catch { return false; }
+  });
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -45,7 +54,10 @@ export default function AgentChat() {
     saveDraft(input);
   }, [input, saveDraft]);
 
-  // Scroll to bottom on new messages / streaming
+  // Scroll to bottom on new messages / streaming.
+  // Note: WebSocket lifecycle, hydration, and tool_call/tool_result handling
+  // moved to AgentContext (PR #6101). Tool activity is filtered at render
+  // time below using `showToolActivity`, not at the message-handler layer.
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typing, streamingContent]);
@@ -129,6 +141,14 @@ export default function AgentChat() {
     setCompact((prev) => {
       const next = !prev;
       try { localStorage.setItem('zeroclaw_chat_compact', next ? '1' : '0'); } catch { /* noop */ }
+      return next;
+    });
+  }, []);
+
+  const toggleToolActivity = useCallback(() => {
+    setShowToolActivity((prev) => {
+      const next = !prev;
+      try { localStorage.setItem('zeroclaw_show_tool_activity', next ? '1' : '0'); } catch { /* noop */ }
       return next;
     });
   }, []);
@@ -264,6 +284,17 @@ export default function AgentChat() {
           </button>
           <button
             type="button"
+            onClick={toggleToolActivity}
+            className="btn-secondary flex items-center gap-1.5 text-xs"
+            style={{ padding: '0.3rem 0.75rem', borderRadius: '0.5rem' }}
+            aria-label={showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
+            aria-pressed={showToolActivity}
+          >
+            <Wrench className="h-3 w-3" />
+            {showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
+          </button>
+          <button
+            type="button"
             onClick={handleClearAll}
             className="btn-danger flex items-center gap-1.5 text-xs"
             style={{ padding: '0.3rem 0.75rem', borderRadius: '0.5rem' }}
@@ -287,17 +318,19 @@ export default function AgentChat() {
           </div>
         )}
 
-        {messages.map((msg, idx) => (
-          <MessageItem
-            key={msg.id}
-            msg={msg}
-            idx={idx}
-            compact={compact}
-            isCopied={copiedId === msg.id}
-            onCopy={handleCopy}
-            onDelete={handleDeleteMessage}
-          />
-        ))}
+        {messages
+          .filter((msg) => showToolActivity || !msg.toolCall)
+          .map((msg, idx) => (
+            <MessageItem
+              key={msg.id}
+              msg={msg}
+              idx={idx}
+              compact={compact}
+              isCopied={copiedId === msg.id}
+              onCopy={handleCopy}
+              onDelete={handleDeleteMessage}
+            />
+          ))}
 
         {typing && (
           <div className="flex items-start gap-3 animate-fade-in">

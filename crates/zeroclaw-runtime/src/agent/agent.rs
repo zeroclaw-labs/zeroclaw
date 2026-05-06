@@ -2010,6 +2010,7 @@ mod tests {
                         id: "tc1".into(),
                         name: "echo".into(),
                         arguments: "{}".into(),
+                        extra_content: None,
                     }],
                     usage: None,
                     reasoning_content: None,
@@ -2345,6 +2346,7 @@ mod tests {
                         id: "00000000-0000-0000-0000-000000000001".into(),
                         name: "echo".into(),
                         arguments: "{}".into(),
+                        extra_content: None,
                     }],
                     usage: None,
                     reasoning_content: None,
@@ -2383,6 +2385,7 @@ mod tests {
                         id: "00000000-0000-0000-0000-000000000001".into(),
                         name: "echo".into(),
                         arguments: "{}".into(),
+                        extra_content: None,
                     },
                 );
                 stream::iter(vec![
@@ -2698,6 +2701,7 @@ mod tests {
                     id: format!("tc{i}"),
                     name: format!("tool{i}"),
                     arguments: "{}".into(),
+                    extra_content: None,
                 }],
                 reasoning_content: None,
             });
@@ -2768,6 +2772,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "echo".into(),
                     arguments: "{}".into(),
+                    extra_content: None,
                 }],
                 usage: None,
                 reasoning_content: None,
@@ -2868,6 +2873,7 @@ mod tests {
                             id: "tc1".into(),
                             name: "echo".into(),
                             arguments: "{}".into(),
+                            extra_content: None,
                         },
                     )),
                     Ok(zeroclaw_providers::traits::StreamEvent::Final),

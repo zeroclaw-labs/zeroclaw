@@ -9,7 +9,7 @@
 //! a single durable memory store with concurrent writes — the SQLite backend
 //! cannot serve that use case.
 
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -307,7 +307,7 @@ impl Memory for PostgresMemory {
     ) -> Result<Vec<MemoryEntry>> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
-        let query = query.trim().to_string();
+        let query = normalize_recent_recall_query(query).trim().to_string();
         let sid = session_id.map(str::to_string);
         let since_owned = since.map(str::to_string);
         let until_owned = until.map(str::to_string);

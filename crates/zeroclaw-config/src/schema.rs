@@ -603,6 +603,15 @@ pub struct ModelProviderConfig {
     /// Example: `provider_extra = { provider = { only = ["Anthropic"] } }`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_extra: Option<serde_json::Value>,
+    /// Override the provider's default for native tool calling.
+    /// `None` (default) honors the provider's built-in choice. `Some(true)`
+    /// forces native tool calls on, `Some(false)` forces text-fallback.
+    /// Currently consulted only by the Groq factory, which defaults to
+    /// text-fallback because llama-family Groq models reject native tool
+    /// calls with HTTP 400 (#5848). Setting `native_tools = true` re-enables
+    /// native tool calling for Groq models that support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_tools: Option<bool>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -1473,6 +1482,46 @@ fn default_local_whisper_timeout_secs() -> u64 {
     300
 }
 
+/// HMAC tool execution receipt configuration (`[agent.tool_receipts]`).
+///
+/// Receipts are short HMAC-SHA256 tags appended to tool results so the model
+/// cannot claim it ran a tool that never actually executed. See
+/// `docs/book/src/security/tool-receipts.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent.tool_receipts"]
+pub struct ToolReceiptsConfig {
+    /// Generate HMAC receipts on every tool execution. Default: `false`.
+    /// When false, the entire receipt subsystem is inert (no key, no
+    /// generation, no append, no system-prompt addendum).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Append a trailing `Tool receipts:` block to user-visible replies so
+    /// receipts are auditable from the channel surface, not just the
+    /// internal history. Default: `false`.
+    #[serde(default)]
+    pub show_in_response: bool,
+    /// Inject the receipt-echo instruction into the system prompt so the
+    /// model carries receipts verbatim into its response. Default: `true`.
+    /// No effect when `enabled = false`.
+    #[serde(default = "default_inject_system_prompt")]
+    pub inject_system_prompt: bool,
+}
+
+fn default_inject_system_prompt() -> bool {
+    true
+}
+
+impl Default for ToolReceiptsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            show_in_response: false,
+            inject_system_prompt: default_inject_system_prompt(),
+        }
+    }
+}
+
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -1557,6 +1606,11 @@ pub struct AgentConfig {
     /// behavior). Default: `2`.
     #[serde(default = "default_keep_tool_context_turns")]
     pub keep_tool_context_turns: usize,
+
+    /// HMAC tool execution receipt configuration.
+    #[nested]
+    #[serde(default)]
+    pub tool_receipts: ToolReceiptsConfig,
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1607,6 +1661,7 @@ impl Default for AgentConfig {
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            tool_receipts: ToolReceiptsConfig::default(),
         }
     }
 }
@@ -3064,7 +3119,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), or "searxng" (self-hosted)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), or "searxng" (self-hosted)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Brave Search API key (required if provider is "brave")
@@ -3072,6 +3127,11 @@ pub struct WebSearchConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub brave_api_key: Option<String>,
+    /// Tavily Search API key (required if provider is "tavily")
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub tavily_api_key: Option<String>,
     /// SearXNG instance URL (required if provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -3101,6 +3161,7 @@ impl Default for WebSearchConfig {
             enabled: true,
             provider: default_web_search_provider(),
             brave_api_key: None,
+            tavily_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -9110,6 +9171,8 @@ impl Default for NotionConfig {
 ///
 /// ## Auth
 /// Jira Cloud uses HTTP Basic auth: `email` + `api_token`.
+/// Jira Server/Data Center uses Bearer token auth: omit `email` and set
+/// `api_token` to a personal access token.
 /// `api_token` is stored encrypted at rest; set it here or via `JIRA_API_TOKEN`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -9121,9 +9184,10 @@ pub struct JiraConfig {
     /// Atlassian instance base URL, e.g. `https://yourco.atlassian.net`.
     #[serde(default)]
     pub base_url: String,
-    /// Jira account email used for Basic auth.
-    #[serde(default)]
-    pub email: String,
+    /// Jira account email used for Basic auth (Cloud).
+    /// Omit for Server/DC deployments using Bearer token auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
     /// Jira API token. Encrypted at rest. Falls back to `JIRA_API_TOKEN` env var.
     #[serde(default)]
     #[secret]
@@ -9152,7 +9216,7 @@ impl Default for JiraConfig {
         Self {
             enabled: false,
             base_url: String::new(),
-            email: String::new(),
+            email: None,
             api_token: String::new(),
             allowed_actions: default_jira_allowed_actions(),
             timeout_secs: default_jira_timeout_secs(),
@@ -10972,9 +11036,6 @@ impl Config {
             if self.jira.base_url.trim().is_empty() {
                 anyhow::bail!("jira.base_url must not be empty when jira.enabled = true");
             }
-            if self.jira.email.trim().is_empty() {
-                anyhow::bail!("jira.email must not be empty when jira.enabled = true");
-            }
             if self.jira.api_token.trim().is_empty()
                 && std::env::var("JIRA_API_TOKEN")
                     .unwrap_or_default()
@@ -11335,6 +11396,16 @@ impl Config {
             let api_key = api_key.trim();
             if !api_key.is_empty() {
                 self.web_search.brave_api_key = Some(api_key.to_string());
+            }
+        }
+
+        // Tavily API key: ZEROCLAW_TAVILY_API_KEY or TAVILY_API_KEY
+        if let Ok(api_key) =
+            std::env::var("ZEROCLAW_TAVILY_API_KEY").or_else(|_| std::env::var("TAVILY_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.tavily_api_key = Some(api_key.to_string());
             }
         }
 
@@ -13022,6 +13093,7 @@ default_temperature = 0.7
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
+        config.web_search.tavily_api_key = Some("tavily-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
         config.channels.feishu = Some(FeishuConfig {
             enabled: true,
@@ -13097,6 +13169,13 @@ default_temperature = 0.7
         assert_eq!(
             store.decrypt(web_search_encrypted).unwrap(),
             "brave-credential"
+        );
+
+        let tavily_encrypted = stored.web_search.tavily_api_key.as_deref().unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(tavily_encrypted));
+        assert_eq!(
+            store.decrypt(tavily_encrypted).unwrap(),
+            "tavily-credential"
         );
 
         let worker = stored.agents.get("worker").unwrap();
@@ -15645,6 +15724,26 @@ default_model = "persisted-profile"
     }
 
     #[test]
+    async fn validate_rejects_unpublished_jira_actions() {
+        for action in ["list_projects", "myself"] {
+            let mut config = Config::default();
+            config.jira.enabled = true;
+            config.jira.base_url = "https://jira.example.test".into();
+            config.jira.api_token = "token".into();
+            config.jira.allowed_actions = vec![action.into()];
+
+            let err = config
+                .validate()
+                .expect_err("unpublished Jira action should be rejected")
+                .to_string();
+            assert!(
+                err.contains("jira.allowed_actions contains unknown action"),
+                "expected Jira allowed action error for {action}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
     async fn env_override_reasoning_enabled() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
@@ -18019,6 +18118,95 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert!(!Config::prop_is_secret(
             "providers.models.openrouter.context-window"
         ));
+    }
+
+    #[test]
+    async fn hashmap_property_paths_preserve_url_like_keys() {
+        let dir = TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            workspace_dir: dir.path().join("workspace"),
+            ..Default::default()
+        };
+        let provider_key = "custom:https://api.example.invalid/v1";
+        config
+            .providers
+            .models
+            .insert(provider_key.to_string(), ModelProviderConfig::default());
+
+        let api_key_path = format!("providers.models.{provider_key}.api-key");
+        let base_url_path = format!("providers.models.{provider_key}.base-url");
+        let model_path = format!("providers.models.{provider_key}.model");
+        let temperature_path = format!("providers.models.{provider_key}.temperature");
+
+        assert!(
+            Config::prop_is_secret(&api_key_path),
+            "url-like provider keys must still route secret metadata"
+        );
+
+        config.set_prop(&api_key_path, "sk-test-custom").unwrap();
+        config
+            .set_prop(&base_url_path, "https://api.example.invalid/v1")
+            .unwrap();
+        config.set_prop(&model_path, "local-large").unwrap();
+        config.set_prop(&temperature_path, "0.2").unwrap();
+
+        let provider = config
+            .providers
+            .models
+            .get(provider_key)
+            .expect("custom provider key should be preserved exactly");
+        assert_eq!(provider.api_key.as_deref(), Some("sk-test-custom"));
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://api.example.invalid/v1")
+        );
+        assert_eq!(provider.model.as_deref(), Some("local-large"));
+        assert_eq!(provider.temperature, Some(0.2));
+
+        assert_eq!(config.get_prop(&api_key_path).unwrap(), "**** (encrypted)");
+        assert_eq!(
+            config.get_prop(&base_url_path).unwrap(),
+            "https://api.example.invalid/v1"
+        );
+
+        config.save().await.unwrap();
+        let raw_toml = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(
+            raw_toml.contains(provider_key),
+            "saved TOML should preserve the exact URL-like provider key"
+        );
+        assert!(
+            !raw_toml.contains("sk-test-custom"),
+            "saved TOML must not contain the plaintext custom provider API key"
+        );
+
+        let mut loaded: Config = toml::from_str::<crate::migration::V1Compat>(&raw_toml)
+            .unwrap()
+            .into_config();
+        loaded.config_path = config.config_path.clone();
+        loaded.workspace_dir = config.workspace_dir.clone();
+        let store = crate::secrets::SecretStore::new(dir.path(), loaded.secrets.encrypt);
+        loaded.decrypt_secrets(&store).unwrap();
+        let loaded_provider = loaded
+            .providers
+            .models
+            .get(provider_key)
+            .expect("saved custom provider key should reload exactly");
+        assert_eq!(
+            loaded.providers.fallback.as_deref(),
+            None,
+            "property round-trip should not invent a fallback provider"
+        );
+        assert_eq!(loaded_provider.api_key.as_deref(), Some("sk-test-custom"));
+        assert_eq!(
+            loaded_provider.base_url.as_deref(),
+            Some("https://api.example.invalid/v1")
+        );
+        assert_eq!(loaded_provider.model.as_deref(), Some("local-large"));
+        assert_eq!(loaded_provider.temperature, Some(0.2));
     }
 
     #[test]
