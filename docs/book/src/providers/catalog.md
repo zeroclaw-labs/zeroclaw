@@ -128,6 +128,16 @@ model = "..."
 
 Local inference via KiloCLI.
 
+### Atomic Chat
+
+```toml
+[providers.models.atomic-chat]
+kind = "atomic-chat"
+model = "..."
+```
+
+Custom streaming SSE-based chat provider
+
 ---
 
 ## OpenAI-compatible (`compatible.rs`, ~20+ endpoints)
