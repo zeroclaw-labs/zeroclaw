@@ -2217,7 +2217,11 @@ async fn classify_channel_reply_intent(
             "assistant" => "assistant",
             _ => "user",
         };
-        let _ = writeln!(convo, "[{role}] {}", msg.content);
+        // Strip media markers — auxiliary classifier does not need image
+        // content, and forwarding `[IMAGE:/local/path]` would reach the
+        // provider as a malformed `image_url.url` and trigger 400 errors.
+        let safe_content = zeroclaw_providers::multimodal::strip_media_markers(&msg.content);
+        let _ = writeln!(convo, "[{role}] {safe_content}");
     }
 
     let response = provider
