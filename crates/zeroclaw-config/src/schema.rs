@@ -2701,6 +2701,31 @@ impl Config {
         self.agents.get(agent_alias)
     }
 
+    /// Resolve the runtime-active agent alias the orchestrator binds
+    /// channels to. Mirrors the same selection logic as
+    /// `start_channels()` in zeroclaw-channels: prefer the migration-
+    /// synthesized `"default"` agent, fall back to the first enabled
+    /// agent. Returns `None` only when no agent is configured at all.
+    ///
+    /// Used by per-agent infrastructure (TtsManager, TranscriptionManager)
+    /// to pick which agent's `tts_provider` / `transcription_provider`
+    /// drives the manager's resolved alias. Until the per-channel
+    /// dispatch refactor lands, the orchestrator runs in single-agent
+    /// mode, so all manager instances share the same resolved agent.
+    #[must_use]
+    pub fn resolved_runtime_agent_alias(&self) -> Option<&str> {
+        self.agents
+            .keys()
+            .find(|k| k.as_str() == "default")
+            .or_else(|| {
+                self.agents
+                    .iter()
+                    .find(|(_, a)| a.enabled)
+                    .map(|(alias, _)| alias)
+            })
+            .map(String::as_str)
+    }
+
     /// Resolve the active storage backend for the memory subsystem.
     ///
     /// `MemoryConfig.backend` is a dotted reference (`<backend>.<alias>`) into
@@ -2949,10 +2974,6 @@ fn default_transcription_max_duration_secs() -> u64 {
     120
 }
 
-fn default_transcription_provider_legacy() -> String {
-    "groq".into()
-}
-
 fn default_openai_stt_model() -> String {
     "whisper-1".into()
 }
@@ -2976,15 +2997,6 @@ pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
-    /// Default STT/transcription provider (legacy V2 field). Will be removed
-    /// once the typed-family split for transcription lands; for now it satisfies
-    /// the existing TranscriptionManager dispatch.
-    #[serde(
-        default = "default_transcription_provider_legacy",
-        alias = "default_provider",
-        alias = "default_model_provider"
-    )]
-    pub default_transcription_provider: String,
     /// API key used for transcription requests (Groq transcription provider).
     ///
     /// If unset, runtime falls back to `GROQ_API_KEY` for backward compatibility.
@@ -3039,7 +3051,6 @@ impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            default_transcription_provider: default_transcription_provider_legacy(),
             api_key: None,
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
@@ -3234,10 +3245,6 @@ pub struct TtsConfig {
     /// Enable TTS synthesis.
     #[serde(default)]
     pub enabled: bool,
-    /// Default TTS provider (legacy V2 field). Will be removed once the
-    /// per-agent tts_provider plumbing lands across all channel TTS paths.
-    #[serde(default, alias = "default_provider", alias = "default_model_provider")]
-    pub default_tts_provider: String,
     /// Default voice ID passed to the selected tts provider.
     #[serde(default = "default_tts_voice")]
     pub default_voice: String,
@@ -3253,7 +3260,6 @@ impl Default for TtsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            default_tts_provider: String::new(),
             default_voice: default_tts_voice(),
             default_format: default_tts_format(),
             max_text_length: default_tts_max_text_length(),
@@ -13251,19 +13257,6 @@ impl Config {
             anyhow::bail!("security.nevis: {msg}");
         }
 
-        // Transcription (legacy default — slated for removal with the typed-family split)
-        {
-            let dp = self.transcription.default_transcription_provider.trim();
-            match dp {
-                "groq" | "openai" | "deepgram" | "assemblyai" | "google" | "local_whisper" => {}
-                other => {
-                    anyhow::bail!(
-                        "transcription.default_transcription_provider must be one of: groq, openai, deepgram, assemblyai, google, local_whisper (got '{other}')"
-                    );
-                }
-            }
-        }
-
         // Delegate tool global defaults
         if self.delegate.timeout_secs == 0 {
             validation_bail!(
@@ -17937,30 +17930,12 @@ require_otp_to_resume = true
         assert!(err.to_string().contains("gated_domains"));
     }
 
-    #[test]
-    async fn validate_accepts_local_whisper_as_transcription_default_provider() {
-        let mut config = Config::default();
-        config.transcription.default_transcription_provider = "local_whisper".to_string();
-
-        config.validate().expect(
-            "local_whisper must be accepted by the transcription.default_transcription_provider allowlist",
-        );
-    }
-
-    #[test]
-    async fn validate_rejects_unknown_transcription_default_provider() {
-        let mut config = Config::default();
-        config.transcription.default_transcription_provider = "unknown_stt".to_string();
-
-        let err = config
-            .validate()
-            .expect_err("expected validation to reject unknown transcription model_provider");
-        assert!(
-            err.to_string()
-                .contains("transcription.default_transcription_provider"),
-            "got: {err}"
-        );
-    }
+    // The two `validate_*_transcription_default_provider` tests were removed
+    // alongside the deleted `TranscriptionConfig.default_transcription_provider`
+    // field in #6273. V3 has no global default-provider concept; the equivalent
+    // dangling-reference enforcement now lives on the per-agent
+    // `agent.transcription_provider` field (see
+    // `Config::validate()` checks for `tts_provider` / `transcription_provider`).
 
     #[tokio::test]
     async fn channel_secret_telegram_bot_token_roundtrip() {

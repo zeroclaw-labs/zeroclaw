@@ -555,16 +555,20 @@ impl TtsProvider for PiperTtsProvider {
 
 // ── TtsManager ───────────────────────────────────────────────────
 
-/// Central manager for multi-model_provider TTS synthesis.
+/// Central manager for per-agent TTS synthesis.
 ///
-/// V3: tts_providers are keyed by their dotted alias (`<type>.<alias>`, e.g.
-/// `openai.default`). `default_tts_provider` carries that same dotted form.
-/// Per-model_provider voice overrides come from the `voice` field on each
-/// `TtsProviderConfig` instance.
+/// V3: `tts_providers` are keyed by their dotted alias (`<type>.<alias>`).
+/// Per-instance voice overrides come from the `voice` field on each
+/// `TtsProviderConfig`. The `agent_tts_provider` field carries the
+/// resolved alias for the agent that owns this manager instance — empty
+/// means the agent doesn't want TTS, and `synthesize_for_agent` fails
+/// loud rather than silently pick a default.
 pub struct TtsManager {
     tts_providers: HashMap<String, Box<dyn TtsProvider>>,
     voice_by_alias: HashMap<String, String>,
-    default_tts_provider: String,
+    /// Resolved alias for the agent that owns this manager. Empty when
+    /// the agent has no TTS preference (opt-out).
+    agent_tts_provider: String,
     default_voice: String,
     max_text_length: usize,
 }
@@ -574,6 +578,11 @@ impl TtsManager {
     /// in `Config`. Each instance is registered under its dotted alias key
     /// (`<type>.<alias>`). Failures to construct a particular instance are
     /// logged at warn but do not abort the manager.
+    /// Build a `TtsManager` from `[providers.tts.<type>.<alias>]` instances.
+    /// The manager's resolved alias comes from the runtime-active agent's
+    /// `tts_provider` field — V3 has no global default-provider concept,
+    /// so when no agent-bound resolution is available the manager refuses
+    /// to silently pick a provider (`synthesize` fails loud).
     pub fn from_config(config: &Config) -> Result<Self> {
         let mut tts_providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
         let mut voice_by_alias: HashMap<String, String> = HashMap::new();
@@ -604,7 +613,7 @@ impl TtsManager {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Skipping TTS model_provider {dotted}: {e}");
+                    tracing::warn!("Skipping TTS provider {dotted}: {e}");
                 }
             }
         }
@@ -615,19 +624,40 @@ impl TtsManager {
             config.tts.max_text_length
         };
 
+        // Per-agent join: the runtime-active agent's `tts_provider` is the
+        // resolved alias for this manager instance. Empty (or no resolved
+        // agent) = no TTS; `synthesize` fails loud rather than silently
+        // pick a provider.
+        let agent_tts_provider = config
+            .resolved_runtime_agent_alias()
+            .and_then(|alias| config.agents.get(alias))
+            .map(|a| a.tts_provider.as_str().to_string())
+            .unwrap_or_default();
+
         Ok(Self {
             tts_providers,
             voice_by_alias,
-            default_tts_provider: config.tts.default_tts_provider.clone(),
+            agent_tts_provider,
             default_voice: config.tts.default_voice.clone(),
             max_text_length,
         })
     }
 
-    /// Synthesize text using the default dotted-alias model_provider and that
-    /// instance's voice (or the global default_voice fallback).
+    /// Synthesize text using the runtime-active agent's resolved
+    /// `tts_provider` reference and the per-instance voice override (or
+    /// `default_voice` as the per-instance fallback). Fails loud when the
+    /// agent has no `tts_provider` configured — V3 has no global
+    /// default-provider concept and this manager refuses to silently pick
+    /// one.
     pub async fn synthesize(&self, text: &str) -> Result<Vec<u8>> {
-        let provider_alias = self.default_tts_provider.as_str();
+        let provider_alias = self.agent_tts_provider.as_str();
+        if provider_alias.is_empty() {
+            bail!(
+                "Agent has no tts_provider configured. Set \
+                 `agent.<alias>.tts_provider = \"<type>.<alias>\"` referencing a \
+                 [providers.tts.<type>.<alias>] entry."
+            );
+        }
         let voice = self
             .voice_by_alias
             .get(provider_alias)
@@ -682,7 +712,13 @@ mod tests {
 
     fn config_with_edge_alias() -> Config {
         let mut cfg = Config::default();
-        cfg.tts.default_tts_provider = "edge.default".to_string();
+        cfg.agents.insert(
+            "default".into(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                tts_provider: "edge.default".into(),
+                ..Default::default()
+            },
+        );
         cfg.providers.tts.edge.insert(
             "default".to_string(),
             zeroclaw_config::schema::EdgeTtsProviderConfig {
@@ -697,7 +733,13 @@ mod tests {
 
     fn config_with_piper_alias() -> Config {
         let mut cfg = Config::default();
-        cfg.tts.default_tts_provider = "piper.default".to_string();
+        cfg.agents.insert(
+            "default".into(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                tts_provider: "piper.default".into(),
+                ..Default::default()
+            },
+        );
         cfg.providers.tts.piper.insert(
             "default".to_string(),
             zeroclaw_config::schema::PiperTtsProviderConfig {
@@ -808,7 +850,8 @@ mod tests {
     fn tts_config_defaults() {
         let config = zeroclaw_config::schema::TtsConfig::default();
         assert!(!config.enabled);
-        assert!(config.default_tts_provider.is_empty());
+        // V3: TtsConfig has no global default-provider field; per-agent
+        // `tts_provider` is the only selector.
         assert_eq!(config.default_voice, "alloy");
         assert_eq!(config.default_format, "mp3");
         assert_eq!(config.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
