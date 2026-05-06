@@ -1,5 +1,7 @@
-default_provider = "atomic"
-[providers.models.atomic]
-kind = "openai-compatible"
-base_url = "http://127.0.0.1:1337/v1"
-model = "default"
+default_provider = "ollama"
+default_model = "qwen3.6:35b-a3b"
+
+[providers.models.ollama]
+kind = "ollama"
+base_url = "http://localhost:11434"
+model = "qwen3.6:35b-a3b"
