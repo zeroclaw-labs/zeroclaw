@@ -4442,13 +4442,16 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .nextcloud_talk
                 .as_ref()
                 .context("Nextcloud Talk channel is not configured")?;
-            Ok(Arc::new(NextcloudTalkChannel::new_with_proxy(
-                nc.base_url.clone(),
-                nc.app_token.clone(),
-                nc.bot_name.clone().unwrap_or_default(),
-                nc.allowed_users.clone(),
-                nc.proxy_url.clone(),
-            )))
+            Ok(Arc::new(
+                NextcloudTalkChannel::new_with_proxy(
+                    nc.base_url.clone(),
+                    nc.app_token.clone(),
+                    nc.bot_name.clone().unwrap_or_default(),
+                    nc.allowed_users.clone(),
+                    nc.proxy_url.clone(),
+                )
+                .with_streaming(nc.stream_mode, nc.draft_update_interval_ms),
+            ))
         }
         "wati" => {
             let wati_cfg = config
