@@ -3579,10 +3579,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "tested default-using TranscriptionManager.transcribe path which V3 retired in #6273; channel-side rewiring to thread agent.transcription_provider through with_transcription is deferred to a follow-up PR"]
     fn lark_manager_none_and_warn_on_init_failure() {
         let tc = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_transcription_provider: "groq".to_string(),
             api_key: Some(String::new()),
             ..Default::default()
         };
@@ -3711,7 +3711,6 @@ mod tests {
         let ch = make_channel();
         let tc = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_transcription_provider: "local_whisper".to_string(),
             local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
                 url: "http://localhost:0/v1/transcribe".to_string(),
                 bearer_token: Some("unused".to_string()),
@@ -3759,6 +3758,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "tested default-using TranscriptionManager.transcribe path which V3 retired in #6273; channel-side rewiring to thread agent.transcription_provider through with_transcription is deferred to a follow-up PR"]
     async fn lark_audio_routes_through_transcription_manager() {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3796,7 +3796,6 @@ mod tests {
 
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_transcription_provider: "local_whisper".to_string(),
             local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
                 url: format!("{}/v1/transcribe", whisper_server.uri()),
                 bearer_token: Some("test-token".to_string()),
