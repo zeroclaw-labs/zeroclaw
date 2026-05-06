@@ -4241,9 +4241,15 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .slack
                 .as_ref()
                 .context("Slack channel is not configured")?;
+            let bot_token = sl.bot_token.clone().filter(|s| !s.is_empty()).context(
+                "Slack channel requires a bot token. Set `bot_token` in \
+                     `[channels.slack]` of config.toml, or export \
+                     `ZEROCLAW_SLACK_BOT_TOKEN` / `SLACK_BOT_TOKEN` before \
+                     starting ZeroClaw.",
+            )?;
             Ok(Arc::new(
                 SlackChannel::new(
-                    sl.bot_token.clone(),
+                    bot_token,
                     sl.app_token.clone(),
                     sl.channel_ids.clone(),
                     sl.allowed_users.clone(),
@@ -4737,12 +4743,14 @@ fn collect_configured_channels(
     }
 
     if let Some(ref sl) = config.channels.slack {
-        if sl.enabled {
+        if !sl.enabled {
+            tracing::info!("Slack channel configured but disabled (enabled = false)");
+        } else if let Some(bot_token) = sl.bot_token.clone().filter(|s| !s.is_empty()) {
             channels.push(ConfiguredChannel {
                 display_name: "Slack",
                 channel: Arc::new(
                     SlackChannel::new(
-                        sl.bot_token.clone(),
+                        bot_token,
                         sl.app_token.clone(),
                         sl.channel_ids.clone(),
                         sl.allowed_users.clone(),
@@ -4760,7 +4768,12 @@ fn collect_configured_channels(
                 ),
             });
         } else {
-            tracing::info!("Slack channel configured but disabled (enabled = false)");
+            tracing::error!(
+                "Slack channel is enabled but no bot_token is configured. \
+                 Set `bot_token` in `[channels.slack]` of config.toml, or \
+                 export ZEROCLAW_SLACK_BOT_TOKEN / SLACK_BOT_TOKEN before \
+                 starting. Skipping Slack channel."
+            );
         }
     }
 
@@ -6100,8 +6113,20 @@ pub async fn deliver_announcement(
                 .slack
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("slack channel not configured"))?;
+            let bot_token = sl
+                .bot_token
+                .clone()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Slack channel requires a bot token. Set `bot_token` in \
+                         `[channels.slack]` of config.toml, or export \
+                         ZEROCLAW_SLACK_BOT_TOKEN / SLACK_BOT_TOKEN before \
+                         starting ZeroClaw."
+                    )
+                })?;
             let ch = SlackChannel::new(
-                sl.bot_token.clone(),
+                bot_token,
                 sl.app_token.clone(),
                 sl.channel_ids.clone(),
                 sl.allowed_users.clone(),
