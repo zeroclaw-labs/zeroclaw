@@ -385,6 +385,11 @@ pub struct Config {
     #[nested]
     pub jira: JiraConfig,
 
+    /// Shazam integration configuration (`[shazam]`).
+    #[serde(default)]
+    #[nested]
+    pub shazam: ShazamConfig,
+
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     #[nested]
@@ -9316,6 +9321,76 @@ impl Default for JiraConfig {
     }
 }
 
+/// Shazam integration configuration (`[shazam]`).
+///
+/// Shazam does not publish a free public API; this integration wraps a
+/// third-party RapidAPI Shazam service (default host
+/// `shazam.p.rapidapi.com`). The wrapping service may rate-limit, change
+/// response shapes, or sunset endpoints — treat as best-effort.
+///
+/// When `enabled = true`, registers the `shazam` tool which can search
+/// the Shazam catalogue by text query and fetch detailed metadata for
+/// a given track key. Audio-fingerprint identification is **not**
+/// included in v1 (the multipart/audio surface is the most fragile path
+/// on a third-party wrapper).
+///
+/// ## Defaults
+/// - `enabled`: `false`
+/// - `rapidapi_host`: `shazam.p.rapidapi.com`
+/// - `request_timeout_secs`: `15`
+///
+/// ## Auth
+/// Sign up at <https://rapidapi.com/>, subscribe to a Shazam service
+/// (the default points at the most common one), and copy your RapidAPI
+/// key. Set `rapidapi_key` (or export `SHAZAM_RAPIDAPI_KEY`). The key
+/// is encrypted at rest when `[secrets] encrypt = true`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "shazam"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Shazam",
+    description = "Song recognition (via RapidAPI)",
+    status_field = "enabled"
+)]
+pub struct ShazamConfig {
+    /// Enable the `shazam` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// RapidAPI key. Encrypted at rest. Falls back to
+    /// `SHAZAM_RAPIDAPI_KEY` env var.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub rapidapi_key: String,
+    /// RapidAPI host header. Override only if you've subscribed to a
+    /// different Shazam-compatible service.
+    #[serde(default = "default_shazam_rapidapi_host")]
+    pub rapidapi_host: String,
+    /// Request timeout in seconds. Default: `15`.
+    #[serde(default = "default_shazam_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_shazam_rapidapi_host() -> String {
+    "shazam.p.rapidapi.com".into()
+}
+
+fn default_shazam_timeout_secs() -> u64 {
+    15
+}
+
+impl Default for ShazamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rapidapi_key: String::new(),
+            rapidapi_host: default_shazam_rapidapi_host(),
+            request_timeout_secs: default_shazam_timeout_secs(),
+        }
+    }
+}
+
 ///
 /// Controls the read-only cloud transformation analysis tools:
 /// IaC review, migration assessment, cost analysis, and architecture review.
@@ -9634,6 +9709,7 @@ impl Default for Config {
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            shazam: ShazamConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -12595,6 +12671,7 @@ auto_save = true
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            shazam: ShazamConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -13166,6 +13243,7 @@ default_temperature = 0.7
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            shazam: ShazamConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),

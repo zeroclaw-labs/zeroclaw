@@ -102,6 +102,7 @@ pub use zeroclaw_tools::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
 };
+pub use zeroclaw_tools::shazam::ShazamTool;
 pub use zeroclaw_tools::swarm::SwarmTool;
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
@@ -599,6 +600,31 @@ pub fn all_tools_with_runtime(
                 root_config.jira.allowed_actions.clone(),
                 security.clone(),
                 root_config.jira.timeout_secs,
+            )));
+        }
+    }
+
+    // Shazam integration (config-gated, RapidAPI wrapper)
+    if root_config.shazam.enabled {
+        let rapidapi_key = if root_config.shazam.rapidapi_key.trim().is_empty() {
+            std::env::var("SHAZAM_RAPIDAPI_KEY").unwrap_or_default()
+        } else {
+            root_config.shazam.rapidapi_key.trim().to_string()
+        };
+        if rapidapi_key.trim().is_empty() {
+            tracing::warn!(
+                "shazam: enabled but no RapidAPI key found (set shazam.rapidapi_key or SHAZAM_RAPIDAPI_KEY env var) — skipping registration"
+            );
+        } else if root_config.shazam.rapidapi_host.trim().is_empty() {
+            tracing::warn!(
+                "shazam: enabled but shazam.rapidapi_host is empty — skipping registration"
+            );
+        } else {
+            tool_arcs.push(Arc::new(ShazamTool::new(
+                rapidapi_key,
+                root_config.shazam.rapidapi_host.trim().to_string(),
+                root_config.shazam.request_timeout_secs,
+                security.clone(),
             )));
         }
     }
