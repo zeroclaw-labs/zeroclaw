@@ -40,8 +40,8 @@ pub async fn run_quick(config: &crate::config::Config) -> Result<Vec<CheckResult
     // 3. SQLite memory backend opens
     results.push(check_sqlite(&config.workspace_dir));
 
-    // 4. Provider registry has entries
-    results.push(check_provider_registry());
+    // 4. ModelProvider registry has entries
+    results.push(check_model_provider_registry());
 
     // 5. Tool registry has entries
     results.push(check_tool_registry(config));
@@ -150,14 +150,14 @@ fn check_sqlite(workspace_dir: &Path) -> CheckResult {
     }
 }
 
-fn check_provider_registry() -> CheckResult {
-    let providers = crate::providers::list_providers();
-    if providers.is_empty() {
-        CheckResult::fail("providers", "no providers registered")
+fn check_model_provider_registry() -> CheckResult {
+    let model_providers = crate::providers::list_model_providers();
+    if model_providers.is_empty() {
+        CheckResult::fail("model_providers", "no model providers registered")
     } else {
         CheckResult::pass(
-            "providers",
-            format!("{} providers available", providers.len()),
+            "model_providers",
+            format!("{} model providers available", model_providers.len()),
         )
     }
 }
@@ -297,7 +297,7 @@ async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
         &config.workspace_dir,
         config
             .providers
-            .first_provider()
+            .first_model_provider()
             .and_then(|e| e.api_key.as_deref()),
     ) {
         Ok(m) => m,

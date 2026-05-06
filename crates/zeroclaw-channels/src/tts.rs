@@ -1,4 +1,4 @@
-//! Multi-provider Text-to-Speech (TTS) subsystem.
+//! Multi-model_provider Text-to-Speech (TTS) subsystem.
 //!
 //! Supports OpenAI, ElevenLabs, Google Cloud TTS, Edge TTS (free, subprocess-based),
 //! and Piper TTS (local GPU-accelerated, OpenAI-compatible endpoint).
@@ -24,22 +24,22 @@ const TTS_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60)
 /// Trait for pluggable TTS backends.
 #[async_trait::async_trait]
 pub trait TtsProvider: Send + Sync {
-    /// Provider identifier (e.g. `"openai"`, `"elevenlabs"`).
+    /// ModelProvider identifier (e.g. `"openai"`, `"elevenlabs"`).
     fn name(&self) -> &str;
 
     /// Synthesize `text` using the given `voice`, returning raw audio bytes.
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>>;
 
-    /// Voices supported by this provider.
+    /// Voices supported by this model_provider.
     fn supported_voices(&self) -> Vec<String>;
 
-    /// Audio output formats supported by this provider.
+    /// Audio output formats supported by this model_provider.
     fn supported_formats(&self) -> Vec<String>;
 }
 
 // ── OpenAI TTS ───────────────────────────────────────────────────
 
-/// OpenAI TTS provider (`POST /v1/audio/speech`).
+/// OpenAI TTS model_provider (`POST /v1/audio/speech`).
 pub struct OpenAiTtsProvider {
     api_key: String,
     model: String,
@@ -48,7 +48,7 @@ pub struct OpenAiTtsProvider {
 }
 
 impl OpenAiTtsProvider {
-    /// Create a new OpenAI TTS provider from config, resolving the API key
+    /// Create a new OpenAI TTS model_provider from config, resolving the API key
     /// from config or `OPENAI_API_KEY` env var.
     pub fn new(config: &TtsProviderConfig) -> Result<Self> {
         let api_key = config
@@ -143,7 +143,7 @@ impl TtsProvider for OpenAiTtsProvider {
 
 // ── ElevenLabs TTS ───────────────────────────────────────────────
 
-/// ElevenLabs TTS provider (`POST /v1/text-to-speech/{voice_id}`).
+/// ElevenLabs TTS model_provider (`POST /v1/text-to-speech/{voice_id}`).
 pub struct ElevenLabsTtsProvider {
     api_key: String,
     model_id: String,
@@ -153,7 +153,7 @@ pub struct ElevenLabsTtsProvider {
 }
 
 impl ElevenLabsTtsProvider {
-    /// Create a new ElevenLabs TTS provider from config, resolving the API key
+    /// Create a new ElevenLabs TTS model_provider from config, resolving the API key
     /// from config or `ELEVENLABS_API_KEY` env var.
     pub fn new(config: &TtsProviderConfig) -> Result<Self> {
         let api_key = config
@@ -256,7 +256,7 @@ impl TtsProvider for ElevenLabsTtsProvider {
 
 // ── Google Cloud TTS ─────────────────────────────────────────────
 
-/// Google Cloud TTS provider (`POST /v1/text:synthesize`).
+/// Google Cloud TTS model_provider (`POST /v1/text:synthesize`).
 pub struct GoogleTtsProvider {
     api_key: String,
     language_code: String,
@@ -264,7 +264,7 @@ pub struct GoogleTtsProvider {
 }
 
 impl GoogleTtsProvider {
-    /// Create a new Google Cloud TTS provider from config, resolving the API key
+    /// Create a new Google Cloud TTS model_provider from config, resolving the API key
     /// from config or `GOOGLE_TTS_API_KEY` env var.
     pub fn new(config: &TtsProviderConfig) -> Result<Self> {
         let api_key = config
@@ -373,7 +373,7 @@ impl TtsProvider for GoogleTtsProvider {
 
 // ── Edge TTS (subprocess) ────────────────────────────────────────
 
-/// Edge TTS provider — free, uses the `edge-tts` CLI subprocess.
+/// Edge TTS model_provider — free, uses the `edge-tts` CLI subprocess.
 pub struct EdgeTtsProvider {
     binary_path: String,
 }
@@ -382,7 +382,7 @@ impl EdgeTtsProvider {
     /// Allowed basenames for the Edge TTS binary.
     const ALLOWED_BINARIES: &[&str] = &["edge-tts", "edge-playback"];
 
-    /// Create a new Edge TTS provider from config.
+    /// Create a new Edge TTS model_provider from config.
     ///
     /// `binary_path` must be a bare command name (no path separators) matching
     /// one of `ALLOWED_BINARIES`. This prevents arbitrary executable
@@ -475,14 +475,14 @@ impl TtsProvider for EdgeTtsProvider {
 
 // ── Piper TTS (local, OpenAI-compatible) ─────────────────────────
 
-/// Piper TTS provider — local GPU-accelerated server with an OpenAI-compatible endpoint.
+/// Piper TTS model_provider — local GPU-accelerated server with an OpenAI-compatible endpoint.
 pub struct PiperTtsProvider {
     client: reqwest::Client,
     api_url: String,
 }
 
 impl PiperTtsProvider {
-    /// Create a new Piper TTS provider from config. Falls back to
+    /// Create a new Piper TTS model_provider from config. Falls back to
     /// `http://127.0.0.1:5000/v1/audio/speech` when no `api_url` is supplied.
     pub fn new(config: &TtsProviderConfig) -> Self {
         let api_url = config
@@ -555,16 +555,16 @@ impl TtsProvider for PiperTtsProvider {
 
 // ── TtsManager ───────────────────────────────────────────────────
 
-/// Central manager for multi-provider TTS synthesis.
+/// Central manager for multi-model_provider TTS synthesis.
 ///
-/// V3: providers are keyed by their dotted alias (`<type>.<alias>`, e.g.
-/// `openai.default`). `default_provider` carries that same dotted form.
-/// Per-provider voice overrides come from the `voice` field on each
+/// V3: tts_providers are keyed by their dotted alias (`<type>.<alias>`, e.g.
+/// `openai.default`). `default_tts_provider` carries that same dotted form.
+/// Per-model_provider voice overrides come from the `voice` field on each
 /// `TtsProviderConfig` instance.
 pub struct TtsManager {
-    providers: HashMap<String, Box<dyn TtsProvider>>,
+    tts_providers: HashMap<String, Box<dyn TtsProvider>>,
     voice_by_alias: HashMap<String, String>,
-    default_provider: String,
+    default_tts_provider: String,
     default_voice: String,
     max_text_length: usize,
 }
@@ -575,7 +575,7 @@ impl TtsManager {
     /// (`<type>.<alias>`). Failures to construct a particular instance are
     /// logged at warn but do not abort the manager.
     pub fn from_config(config: &Config) -> Result<Self> {
-        let mut providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
+        let mut tts_providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
         let mut voice_by_alias: HashMap<String, String> = HashMap::new();
 
         // Typed dispatch over the TtsProviders container's named slots. The
@@ -593,7 +593,7 @@ impl TtsManager {
             };
             match result {
                 Ok(p) => {
-                    providers.insert(dotted.clone(), p);
+                    tts_providers.insert(dotted.clone(), p);
                     if let Some(voice) = instance
                         .voice
                         .as_deref()
@@ -604,7 +604,7 @@ impl TtsManager {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Skipping TTS provider {dotted}: {e}");
+                    tracing::warn!("Skipping TTS model_provider {dotted}: {e}");
                 }
             }
         }
@@ -616,18 +616,18 @@ impl TtsManager {
         };
 
         Ok(Self {
-            providers,
+            tts_providers,
             voice_by_alias,
-            default_provider: config.tts.default_provider.clone(),
+            default_tts_provider: config.tts.default_tts_provider.clone(),
             default_voice: config.tts.default_voice.clone(),
             max_text_length,
         })
     }
 
-    /// Synthesize text using the default dotted-alias provider and that
+    /// Synthesize text using the default dotted-alias model_provider and that
     /// instance's voice (or the global default_voice fallback).
     pub async fn synthesize(&self, text: &str) -> Result<Vec<u8>> {
-        let provider_alias = self.default_provider.as_str();
+        let provider_alias = self.default_tts_provider.as_str();
         let voice = self
             .voice_by_alias
             .get(provider_alias)
@@ -636,7 +636,7 @@ impl TtsManager {
             .await
     }
 
-    /// Synthesize text using a specific dotted-alias provider and voice.
+    /// Synthesize text using a specific dotted-alias model_provider and voice.
     pub async fn synthesize_with_provider(
         &self,
         text: &str,
@@ -655,9 +655,9 @@ impl TtsManager {
             );
         }
 
-        let tts = self.providers.get(provider_alias).ok_or_else(|| {
+        let tts = self.tts_providers.get(provider_alias).ok_or_else(|| {
             anyhow::anyhow!(
-                "TTS provider '{}' not configured (available: {})",
+                "TTS model_provider '{}' not configured (available: {})",
                 provider_alias,
                 self.available_providers().join(", ")
             )
@@ -666,9 +666,9 @@ impl TtsManager {
         tts.synthesize(text, voice).await
     }
 
-    /// List dotted aliases of all initialized providers.
+    /// List dotted aliases of all initialized tts_providers.
     pub fn available_providers(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.providers.keys().cloned().collect();
+        let mut names: Vec<_> = self.tts_providers.keys().cloned().collect();
         names.sort();
         names
     }
@@ -682,7 +682,7 @@ mod tests {
 
     fn config_with_edge_alias() -> Config {
         let mut cfg = Config::default();
-        cfg.tts.default_provider = "edge.default".to_string();
+        cfg.tts.default_tts_provider = "edge.default".to_string();
         cfg.providers.tts.edge.insert(
             "default".to_string(),
             zeroclaw_config::schema::EdgeTtsProviderConfig {
@@ -697,7 +697,7 @@ mod tests {
 
     fn config_with_piper_alias() -> Config {
         let mut cfg = Config::default();
-        cfg.tts.default_provider = "piper.default".to_string();
+        cfg.tts.default_tts_provider = "piper.default".to_string();
         cfg.providers.tts.piper.insert(
             "default".to_string(),
             zeroclaw_config::schema::PiperTtsProviderConfig {
@@ -770,11 +770,17 @@ mod tests {
 
     #[test]
     fn piper_provider_creation_uses_default_url_when_unset() {
-        let provider = PiperTtsProvider::new(&TtsProviderConfig::default());
-        assert_eq!(provider.name(), "piper");
-        assert_eq!(provider.api_url, "http://127.0.0.1:5000/v1/audio/speech");
-        assert_eq!(provider.supported_formats(), vec!["mp3", "wav", "opus"]);
-        assert!(provider.supported_voices().is_empty());
+        let model_provider = PiperTtsProvider::new(&TtsProviderConfig::default());
+        assert_eq!(model_provider.name(), "piper");
+        assert_eq!(
+            model_provider.api_url,
+            "http://127.0.0.1:5000/v1/audio/speech"
+        );
+        assert_eq!(
+            model_provider.supported_formats(),
+            vec!["mp3", "wav", "opus"]
+        );
+        assert!(model_provider.supported_voices().is_empty());
     }
 
     #[test]
@@ -802,7 +808,7 @@ mod tests {
     fn tts_config_defaults() {
         let config = zeroclaw_config::schema::TtsConfig::default();
         assert!(!config.enabled);
-        assert!(config.default_provider.is_empty());
+        assert!(config.default_tts_provider.is_empty());
         assert_eq!(config.default_voice, "alloy");
         assert_eq!(config.default_format, "mp3");
         assert_eq!(config.max_text_length, DEFAULT_MAX_TEXT_LENGTH);

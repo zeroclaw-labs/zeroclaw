@@ -301,7 +301,7 @@ impl Tool for SessionsSendTool {
             });
         }
 
-        let chat_msg = zeroclaw_api::provider::ChatMessage::user(message);
+        let chat_msg = zeroclaw_api::model_provider::ChatMessage::user(message);
 
         match self.backend.append(session_id, &chat_msg) {
             Ok(()) => Ok(ToolResult {
@@ -559,7 +559,7 @@ impl Tool for SessionDeleteTool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use zeroclaw_api::provider::ChatMessage;
+    use zeroclaw_api::model_provider::ChatMessage;
     use zeroclaw_infra::session_store::SessionStore;
 
     fn test_security() -> Arc<SecurityPolicy> {

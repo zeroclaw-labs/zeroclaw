@@ -78,15 +78,15 @@ impl AuthService {
         Ok(profile)
     }
 
-    pub async fn store_provider_token(
+    pub async fn store_model_provider_token(
         &self,
-        provider: &str,
+        model_provider: &str,
         profile_name: &str,
         token: &str,
         metadata: HashMap<String, String>,
         set_active: bool,
     ) -> Result<AuthProfile> {
-        let mut profile = AuthProfile::new_token(provider, profile_name, token.to_string());
+        let mut profile = AuthProfile::new_token(model_provider, profile_name, token.to_string());
         profile.metadata.extend(metadata);
         self.store
             .upsert_profile(profile.clone(), set_active)
@@ -96,46 +96,50 @@ impl AuthService {
 
     pub async fn set_active_profile(
         &self,
-        provider: &str,
+        model_provider: &str,
         requested_profile: &str,
     ) -> Result<String> {
-        let provider = normalize_provider(provider)?;
+        let model_provider = normalize_model_provider(model_provider)?;
         let data = self.store.load().await?;
-        let profile_id = resolve_requested_profile_id(&provider, requested_profile);
+        let profile_id = resolve_requested_profile_id(&model_provider, requested_profile);
 
         let profile = data
             .profiles
             .get(&profile_id)
             .ok_or_else(|| anyhow::anyhow!("Auth profile not found: {profile_id}"))?;
 
-        if profile.provider != provider {
+        if profile.model_provider != model_provider {
             anyhow::bail!(
-                "Profile {profile_id} belongs to provider {}, not {}",
-                profile.provider,
-                provider
+                "Profile {profile_id} belongs to model_provider {}, not {}",
+                profile.model_provider,
+                model_provider
             );
         }
 
         self.store
-            .set_active_profile(&provider, &profile_id)
+            .set_active_profile(&model_provider, &profile_id)
             .await?;
         Ok(profile_id)
     }
 
-    pub async fn remove_profile(&self, provider: &str, requested_profile: &str) -> Result<bool> {
-        let provider = normalize_provider(provider)?;
-        let profile_id = resolve_requested_profile_id(&provider, requested_profile);
+    pub async fn remove_profile(
+        &self,
+        model_provider: &str,
+        requested_profile: &str,
+    ) -> Result<bool> {
+        let model_provider = normalize_model_provider(model_provider)?;
+        let profile_id = resolve_requested_profile_id(&model_provider, requested_profile);
         self.store.remove_profile(&profile_id).await
     }
 
     pub async fn get_profile(
         &self,
-        provider: &str,
+        model_provider: &str,
         profile_override: Option<&str>,
     ) -> Result<Option<AuthProfile>> {
-        let provider = normalize_provider(provider)?;
+        let model_provider = normalize_model_provider(model_provider)?;
         let data = self.store.load().await?;
-        let Some(profile_id) = select_profile_id(&data, &provider, profile_override) else {
+        let Some(profile_id) = select_profile_id(&data, &model_provider, profile_override) else {
             return Ok(None);
         };
         Ok(data.profiles.get(&profile_id).cloned())
@@ -143,10 +147,10 @@ impl AuthService {
 
     pub async fn get_provider_bearer_token(
         &self,
-        provider: &str,
+        model_provider: &str,
         profile_override: Option<&str>,
     ) -> Result<Option<String>> {
-        let profile = self.get_profile(provider, profile_override).await?;
+        let profile = self.get_profile(model_provider, profile_override).await?;
         let Some(profile) = profile else {
             return Ok(None);
         };
@@ -338,7 +342,7 @@ impl AuthService {
         Ok(updated.token_set.map(|t| t.access_token))
     }
 
-    /// Get Gemini profile info (for provider initialization).
+    /// Get Gemini profile info (for model_provider initialization).
     pub async fn get_gemini_profile(
         &self,
         profile_override: Option<&str>,
@@ -347,14 +351,14 @@ impl AuthService {
     }
 }
 
-pub fn normalize_provider(provider: &str) -> Result<String> {
-    let normalized = provider.trim().to_ascii_lowercase();
+pub fn normalize_model_provider(model_provider: &str) -> Result<String> {
+    let normalized = model_provider.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "openai-codex" | "openai_codex" | "codex" => Ok(OPENAI_CODEX_PROVIDER.to_string()),
         "anthropic" | "claude" => Ok(ANTHROPIC_PROVIDER.to_string()),
         "gemini" | "google" | "vertex" => Ok(GEMINI_PROVIDER.to_string()),
         other if !other.is_empty() => Ok(other.to_string()),
-        _ => anyhow::bail!("Provider name cannot be empty"),
+        _ => anyhow::bail!("ModelProvider name cannot be empty"),
     }
 }
 
@@ -365,45 +369,45 @@ pub fn state_dir_from_config(config: &Config) -> PathBuf {
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
-pub fn default_profile_id(provider: &str) -> String {
-    profile_id(provider, DEFAULT_PROFILE_NAME)
+pub fn default_profile_id(model_provider: &str) -> String {
+    profile_id(model_provider, DEFAULT_PROFILE_NAME)
 }
 
-fn resolve_requested_profile_id(provider: &str, requested: &str) -> String {
+fn resolve_requested_profile_id(model_provider: &str, requested: &str) -> String {
     if requested.contains(':') {
         requested.to_string()
     } else {
-        profile_id(provider, requested)
+        profile_id(model_provider, requested)
     }
 }
 
 pub fn select_profile_id(
     data: &AuthProfilesData,
-    provider: &str,
+    model_provider: &str,
     profile_override: Option<&str>,
 ) -> Option<String> {
     if let Some(override_profile) = profile_override {
-        let requested = resolve_requested_profile_id(provider, override_profile);
+        let requested = resolve_requested_profile_id(model_provider, override_profile);
         if data.profiles.contains_key(&requested) {
             return Some(requested);
         }
         return None;
     }
 
-    if let Some(active) = data.active_profiles.get(provider)
+    if let Some(active) = data.active_profiles.get(model_provider)
         && data.profiles.contains_key(active)
     {
         return Some(active.clone());
     }
 
-    let default = default_profile_id(provider);
+    let default = default_profile_id(model_provider);
     if data.profiles.contains_key(&default) {
         return Some(default);
     }
 
     data.profiles
         .iter()
-        .find_map(|(id, profile)| (profile.provider == provider).then(|| id.clone()))
+        .find_map(|(id, profile)| (profile.model_provider == model_provider).then(|| id.clone()))
 }
 
 async fn refresh_openai_access_token_with_retries(
@@ -515,9 +519,9 @@ mod tests {
 
     #[test]
     fn normalize_provider_aliases() {
-        assert_eq!(normalize_provider("codex").unwrap(), "openai-codex");
-        assert_eq!(normalize_provider("claude").unwrap(), "anthropic");
-        assert_eq!(normalize_provider("openai").unwrap(), "openai");
+        assert_eq!(normalize_model_provider("codex").unwrap(), "openai-codex");
+        assert_eq!(normalize_model_provider("claude").unwrap(), "anthropic");
+        assert_eq!(normalize_model_provider("openai").unwrap(), "openai");
     }
 
     #[test]
@@ -530,7 +534,7 @@ mod tests {
             id_default.clone(),
             AuthProfile {
                 id: id_default.clone(),
-                provider: "openai-codex".into(),
+                model_provider: "openai-codex".into(),
                 profile_name: "default".into(),
                 kind: AuthProfileKind::Token,
                 account_id: None,
@@ -546,7 +550,7 @@ mod tests {
             id_active.clone(),
             AuthProfile {
                 id: id_active.clone(),
-                provider: "openai-codex".into(),
+                model_provider: "openai-codex".into(),
                 profile_name: "work".into(),
                 kind: AuthProfileKind::Token,
                 account_id: None,

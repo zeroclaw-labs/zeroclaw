@@ -6,7 +6,7 @@ use std::panic::AssertUnwindSafe;
 use tracing::info;
 
 use zeroclaw_api::channel::ChannelMessage;
-use zeroclaw_api::provider::{ChatMessage, ChatResponse};
+use zeroclaw_api::model_provider::{ChatMessage, ChatResponse};
 use zeroclaw_api::tool::ToolResult;
 
 use super::traits::{HookHandler, HookResult};
@@ -128,17 +128,17 @@ impl HookRunner {
 
     pub async fn run_before_model_resolve(
         &self,
-        mut provider: String,
+        mut model_provider: String,
         mut model: String,
     ) -> HookResult<(String, String)> {
         for h in &self.handlers {
             let hook_name = h.name();
-            match AssertUnwindSafe(h.before_model_resolve(provider.clone(), model.clone()))
+            match AssertUnwindSafe(h.before_model_resolve(model_provider.clone(), model.clone()))
                 .catch_unwind()
                 .await
             {
                 Ok(HookResult::Continue((p, m))) => {
-                    provider = p;
+                    model_provider = p;
                     model = m;
                 }
                 Ok(HookResult::Cancel(reason)) => {
@@ -156,7 +156,7 @@ impl HookRunner {
                 }
             }
         }
-        HookResult::Continue((provider, model))
+        HookResult::Continue((model_provider, model))
     }
 
     pub async fn run_before_prompt_build(&self, mut prompt: String) -> HookResult<String> {

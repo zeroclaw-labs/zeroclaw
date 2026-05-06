@@ -187,7 +187,7 @@ pub fn should_skip_autosave_content(content: &str) -> bool {
 
 #[derive(Clone, PartialEq, Eq)]
 struct ResolvedEmbeddingConfig {
-    provider: String,
+    model_provider: String,
     model: String,
     dimensions: usize,
     api_key: Option<String>,
@@ -196,18 +196,18 @@ struct ResolvedEmbeddingConfig {
 impl std::fmt::Debug for ResolvedEmbeddingConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResolvedEmbeddingConfig")
-            .field("provider", &self.provider)
+            .field("model_provider", &self.model_provider)
             .field("model", &self.model)
             .field("dimensions", &self.dimensions)
             .finish_non_exhaustive()
     }
 }
 
-/// Look up the provider-specific environment variable for common embedding providers,
-/// so that `OPENAI_API_KEY` (etc.) takes precedence over the default-provider key
-/// that the caller passes in. Returns `None` for unknown providers.
-fn embedding_provider_env_key(provider: &str) -> Option<String> {
-    let env_var = match provider.trim() {
+/// Look up the model_provider-specific environment variable for common embedding model_providers,
+/// so that `OPENAI_API_KEY` (etc.) takes precedence over the default-model_provider key
+/// that the caller passes in. Returns `None` for unknown model_providers.
+fn embedding_provider_env_key(model_provider: &str) -> Option<String> {
+    let env_var = match model_provider.trim() {
         "openai" => "OPENAI_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
         "cohere" => "COHERE_API_KEY",
@@ -228,13 +228,13 @@ fn resolve_embedding_config(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    // Prefer a provider-specific env var over the caller-supplied key, which
-    // may come from the default (chat) provider and differ from the embedding
-    // provider (issue #3083: gemini key leaking to openai embeddings endpoint).
+    // Prefer a model_provider-specific env var over the caller-supplied key, which
+    // may come from the default (chat) model_provider and differ from the embedding
+    // model_provider (issue #3083: gemini key leaking to openai embeddings endpoint).
     let fallback_api_key =
         embedding_provider_env_key(config.embedding_provider.trim()).or(caller_api_key);
     let fallback = ResolvedEmbeddingConfig {
-        provider: config.embedding_provider.trim().to_string(),
+        model_provider: config.embedding_provider.trim().to_string(),
         model: config.embedding_model.trim().to_string(),
         dimensions: config.embedding_dimensions,
         api_key: fallback_api_key.clone(),
@@ -260,10 +260,10 @@ fn resolve_embedding_config(
         return fallback;
     };
 
-    let provider = route.provider.trim();
+    let model_provider = route.model_provider.trim();
     let model = route.model.trim();
     let dimensions = route.dimensions.unwrap_or(config.embedding_dimensions);
-    if provider.is_empty() || model.is_empty() || dimensions == 0 {
+    if model_provider.is_empty() || model.is_empty() || dimensions == 0 {
         tracing::warn!(
             hint,
             "Invalid embedding route configuration; falling back to [memory] embedding settings"
@@ -279,7 +279,7 @@ fn resolve_embedding_config(
         .map(|value| value.to_string());
 
     ResolvedEmbeddingConfig {
-        provider: provider.to_string(),
+        model_provider: model_provider.to_string(),
         model: model.to_string(),
         dimensions,
         api_key: routed_api_key.or(fallback_api_key),
@@ -359,7 +359,7 @@ pub fn create_memory_with_storage_and_routes(
     ) -> anyhow::Result<SqliteMemory> {
         let embedder: Arc<dyn embeddings::EmbeddingProvider> =
             Arc::from(embeddings::create_embedding_provider(
-                &resolved_embedding.provider,
+                &resolved_embedding.model_provider,
                 resolved_embedding.api_key.as_deref(),
                 &resolved_embedding.model,
                 resolved_embedding.dimensions,
@@ -413,7 +413,7 @@ pub fn create_memory_with_storage_and_routes(
             .filter(|s| !s.trim().is_empty());
         let embedder: Arc<dyn embeddings::EmbeddingProvider> =
             Arc::from(embeddings::create_embedding_provider(
-                &resolved_embedding.provider,
+                &resolved_embedding.model_provider,
                 resolved_embedding.api_key.as_deref(),
                 &resolved_embedding.model,
                 resolved_embedding.dimensions,
@@ -697,7 +697,7 @@ mod tests {
         assert_eq!(
             resolved,
             ResolvedEmbeddingConfig {
-                provider: "openai".into(),
+                model_provider: "openai".into(),
                 model: "text-embedding-3-small".into(),
                 dimensions: 1536,
                 api_key: Some("base-key".into()),
@@ -715,7 +715,7 @@ mod tests {
         };
         let routes = vec![EmbeddingRouteConfig {
             hint: "semantic".into(),
-            provider: "custom:https://api.example.com/v1".into(),
+            model_provider: "custom:https://api.example.com/v1".into(),
             model: "custom-embed-v2".into(),
             dimensions: Some(1024),
             api_key: Some("route-key".into()),
@@ -725,7 +725,7 @@ mod tests {
         assert_eq!(
             resolved,
             ResolvedEmbeddingConfig {
-                provider: "custom:https://api.example.com/v1".into(),
+                model_provider: "custom:https://api.example.com/v1".into(),
                 model: "custom-embed-v2".into(),
                 dimensions: 1024,
                 api_key: Some("route-key".into()),
@@ -746,7 +746,7 @@ mod tests {
         assert_eq!(
             resolved,
             ResolvedEmbeddingConfig {
-                provider: "openai".into(),
+                model_provider: "openai".into(),
                 model: "hint:semantic".into(),
                 dimensions: 1536,
                 api_key: Some("base-key".into()),
@@ -764,7 +764,7 @@ mod tests {
         };
         let routes = vec![EmbeddingRouteConfig {
             hint: "semantic".into(),
-            provider: String::new(),
+            model_provider: String::new(),
             model: "text-embedding-3-small".into(),
             dimensions: Some(0),
             api_key: None,
@@ -774,7 +774,7 @@ mod tests {
         assert_eq!(
             resolved,
             ResolvedEmbeddingConfig {
-                provider: "openai".into(),
+                model_provider: "openai".into(),
                 model: "hint:semantic".into(),
                 dimensions: 1536,
                 api_key: Some("base-key".into()),
@@ -782,10 +782,10 @@ mod tests {
         );
     }
 
-    // Regression guard for issue #3083: when default_provider is "gemini"
+    // Regression guard for issue #3083: when default_model_provider is "gemini"
     // (api_key = gemini key) but embedding_provider is "cohere", the
-    // embedding provider's own env var (COHERE_API_KEY) must take precedence
-    // over the caller-supplied key (which belongs to the default provider).
+    // embedding model_provider's own env var (COHERE_API_KEY) must take precedence
+    // over the caller-supplied key (which belongs to the default model_provider).
     //
     // Uses COHERE_API_KEY to avoid accidental collision with OPENAI_API_KEY
     // that may be set in the developer environment.
@@ -803,7 +803,7 @@ mod tests {
             ..MemoryConfig::default()
         };
 
-        // Simulate: caller passes the Gemini (default_provider) api key.
+        // Simulate: caller passes the Gemini (default_model_provider) api key.
         let resolved = resolve_embedding_config(&cfg, &[], Some("gemini-key-must-not-be-used"));
 
         // Restore env.
@@ -817,12 +817,12 @@ mod tests {
         assert_eq!(
             resolved.api_key.as_deref(),
             Some("cohere-from-env"),
-            "embedding api_key must come from COHERE_API_KEY env var, not from the default provider key"
+            "embedding api_key must come from COHERE_API_KEY env var, not from the default model_provider key"
         );
         assert_ne!(
             resolved.api_key.as_deref(),
             Some("gemini-key-must-not-be-used"),
-            "default_provider key must not leak to the embedding provider"
+            "default_model_provider key must not leak to the embedding model_provider"
         );
     }
 }

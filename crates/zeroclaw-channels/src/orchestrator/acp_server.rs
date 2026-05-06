@@ -473,7 +473,7 @@ impl AcpServer {
         let default_model = self
             .config
             .providers
-            .first_provider()
+            .first_model_provider()
             .and_then(|e| e.model.clone());
 
         let mut zeroclaw_meta = serde_json::json!({
@@ -1288,7 +1288,7 @@ mod tests {
         let result = server.handle_initialize(&serde_json::json!({})).unwrap();
         assert!(
             result["_meta"]["zeroclaw"].get("defaultModel").is_none(),
-            "defaultModel must be absent when no provider is configured, got: {}",
+            "defaultModel must be absent when no model_provider is configured, got: {}",
             result["_meta"]["zeroclaw"]["defaultModel"]
         );
     }

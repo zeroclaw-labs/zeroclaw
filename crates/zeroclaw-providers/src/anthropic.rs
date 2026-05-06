@@ -1,6 +1,6 @@
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
+    ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
     StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
@@ -15,7 +15,7 @@ const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `providers.models.<name>.base_url`.
 const BASE_URL: &str = "https://api.anthropic.com";
 
-pub struct AnthropicProvider {
+pub struct AnthropicModelProvider {
     credential: Option<String>,
     base_url: String,
     max_tokens: u32,
@@ -186,7 +186,7 @@ struct NativeContentIn {
     input: Option<serde_json::Value>,
 }
 
-impl AnthropicProvider {
+impl AnthropicModelProvider {
     pub fn new(credential: Option<&str>) -> Self {
         Self::with_base_url(credential, None)
     }
@@ -202,7 +202,7 @@ impl AnthropicProvider {
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
             base_url,
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
         }
     }
 
@@ -565,7 +565,7 @@ impl AnthropicProvider {
 
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "provider.anthropic",
+            "model_provider.anthropic",
             120,
             10,
         )
@@ -744,7 +744,9 @@ impl AnthropicProvider {
                         .and_then(|e| e.get("message"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown streaming error");
-                    let _ = tx.send(Err(StreamError::Provider(msg.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(msg.to_string())))
+                        .await;
                     return;
                 }
                 _ => {}
@@ -756,8 +758,8 @@ impl AnthropicProvider {
 }
 
 #[async_trait]
-impl Provider for AnthropicProvider {
-    // ── Provider-family defaults ──
+impl ModelProvider for AnthropicModelProvider {
+    // ── ModelProvider-family defaults ──
     fn default_temperature(&self) -> f64 {
         TEMPERATURE_DEFAULT
     }
@@ -997,7 +999,7 @@ impl Provider for AnthropicProvider {
             Some(c) => c.clone(),
             None => {
                 return stream::once(async {
-                    Err(StreamError::Provider(
+                    Err(StreamError::ModelProvider(
                         "Anthropic credentials not set".to_string(),
                     ))
                 })
@@ -1080,7 +1082,9 @@ impl Provider for AnthropicProvider {
                     .await
                     .unwrap_or_else(|_| format!("HTTP error: {status}"));
                 let _ = tx
-                    .send(Err(StreamError::Provider(format!("{status}: {error}"))))
+                    .send(Err(StreamError::ModelProvider(format!(
+                        "{status}: {error}"
+                    ))))
                     .await;
                 return;
             }
@@ -1102,7 +1106,7 @@ mod tests {
 
     #[test]
     fn creates_with_key() {
-        let p = AnthropicProvider::new(Some("anthropic-test-credential"));
+        let p = AnthropicModelProvider::new(Some("anthropic-test-credential"));
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("anthropic-test-credential"));
         assert_eq!(p.base_url, "https://api.anthropic.com");
@@ -1110,27 +1114,27 @@ mod tests {
 
     #[test]
     fn creates_without_key() {
-        let p = AnthropicProvider::new(None);
+        let p = AnthropicModelProvider::new(None);
         assert!(p.credential.is_none());
         assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[test]
     fn creates_with_empty_key() {
-        let p = AnthropicProvider::new(Some(""));
+        let p = AnthropicModelProvider::new(Some(""));
         assert!(p.credential.is_none());
     }
 
     #[test]
     fn creates_with_whitespace_key() {
-        let p = AnthropicProvider::new(Some("  anthropic-test-credential  "));
+        let p = AnthropicModelProvider::new(Some("  anthropic-test-credential  "));
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("anthropic-test-credential"));
     }
 
     #[test]
     fn creates_with_custom_base_url() {
-        let p = AnthropicProvider::with_base_url(
+        let p = AnthropicModelProvider::with_base_url(
             Some("anthropic-credential"),
             Some("https://api.example.com"),
         );
@@ -1140,19 +1144,19 @@ mod tests {
 
     #[test]
     fn custom_base_url_trims_trailing_slash() {
-        let p = AnthropicProvider::with_base_url(None, Some("https://api.example.com/"));
+        let p = AnthropicModelProvider::with_base_url(None, Some("https://api.example.com/"));
         assert_eq!(p.base_url, "https://api.example.com");
     }
 
     #[test]
     fn default_base_url_when_none_provided() {
-        let p = AnthropicProvider::with_base_url(None, None);
+        let p = AnthropicModelProvider::with_base_url(None, None);
         assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[tokio::test]
     async fn chat_fails_without_key() {
-        let p = AnthropicProvider::new(None);
+        let p = AnthropicModelProvider::new(None);
         let result = p
             .chat_with_system(None, "hello", "claude-3-opus", Some(0.7))
             .await;
@@ -1166,16 +1170,18 @@ mod tests {
 
     #[test]
     fn setup_token_detection_works() {
-        assert!(AnthropicProvider::is_setup_token("sk-ant-oat01-abcdef"));
-        assert!(!AnthropicProvider::is_setup_token("sk-ant-api-key"));
+        assert!(AnthropicModelProvider::is_setup_token(
+            "sk-ant-oat01-abcdef"
+        ));
+        assert!(!AnthropicModelProvider::is_setup_token("sk-ant-api-key"));
     }
 
     #[test]
     fn apply_auth_uses_bearer_and_beta_for_setup_tokens() {
-        let provider = AnthropicProvider::new(None);
-        let request = provider
+        let model_provider = AnthropicModelProvider::new(None);
+        let request = model_provider
             .apply_auth(
-                provider
+                model_provider
                     .http_client()
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-oat01-test-token",
@@ -1209,10 +1215,10 @@ mod tests {
 
     #[test]
     fn apply_auth_uses_x_api_key_for_regular_tokens() {
-        let provider = AnthropicProvider::new(None);
-        let request = provider
+        let model_provider = AnthropicModelProvider::new(None);
+        let request = model_provider
             .apply_auth(
-                provider
+                model_provider
                     .http_client()
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-api-key",
@@ -1233,7 +1239,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
-        let p = AnthropicProvider::new(None);
+        let p = AnthropicModelProvider::new(None);
         let result = p
             .chat_with_system(
                 Some("You are ZeroClaw"),
@@ -1452,22 +1458,24 @@ mod tests {
     #[test]
     fn should_cache_system_small_prompt() {
         let small_prompt = "You are a helpful assistant.";
-        assert!(!AnthropicProvider::should_cache_system(small_prompt));
+        assert!(!AnthropicModelProvider::should_cache_system(small_prompt));
     }
 
     #[test]
     fn should_cache_system_large_prompt() {
         let large_prompt = "a".repeat(3073); // Just over 3072 bytes
-        assert!(AnthropicProvider::should_cache_system(&large_prompt));
+        assert!(AnthropicModelProvider::should_cache_system(&large_prompt));
     }
 
     #[test]
     fn should_cache_system_boundary() {
         let boundary_prompt = "a".repeat(3072); // Exactly 3072 bytes
-        assert!(!AnthropicProvider::should_cache_system(&boundary_prompt));
+        assert!(!AnthropicModelProvider::should_cache_system(
+            &boundary_prompt
+        ));
 
         let over_boundary = "a".repeat(3073);
-        assert!(AnthropicProvider::should_cache_system(&over_boundary));
+        assert!(AnthropicModelProvider::should_cache_system(&over_boundary));
     }
 
     #[test]
@@ -1483,7 +1491,9 @@ mod tests {
             },
         ];
         // Only 1 non-system message — should not cache
-        assert!(!AnthropicProvider::should_cache_conversation(&messages));
+        assert!(!AnthropicModelProvider::should_cache_conversation(
+            &messages
+        ));
     }
 
     #[test]
@@ -1499,7 +1509,7 @@ mod tests {
                 content: format!("Message {i}"),
             });
         }
-        assert!(AnthropicProvider::should_cache_conversation(&messages));
+        assert!(AnthropicModelProvider::should_cache_conversation(&messages));
     }
 
     #[test]
@@ -1509,7 +1519,9 @@ mod tests {
             content: "Hello".to_string(),
         }];
         // Exactly 1 non-system message — should not cache
-        assert!(!AnthropicProvider::should_cache_conversation(&messages));
+        assert!(!AnthropicModelProvider::should_cache_conversation(
+            &messages
+        ));
 
         // Add one more to cross boundary (>1)
         let messages = vec![
@@ -1522,7 +1534,7 @@ mod tests {
                 content: "Hi".to_string(),
             },
         ];
-        assert!(AnthropicProvider::should_cache_conversation(&messages));
+        assert!(AnthropicModelProvider::should_cache_conversation(&messages));
     }
 
     #[test]
@@ -1535,7 +1547,7 @@ mod tests {
             }],
         }];
 
-        AnthropicProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
 
         match &messages[0].content[0] {
             NativeContentOut::Text { cache_control, .. } => {
@@ -1556,7 +1568,7 @@ mod tests {
             }],
         }];
 
-        AnthropicProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
 
         match &messages[0].content[0] {
             NativeContentOut::ToolResult { cache_control, .. } => {
@@ -1578,7 +1590,7 @@ mod tests {
             }],
         }];
 
-        AnthropicProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
 
         // ToolUse should not be affected
         match &messages[0].content[0] {
@@ -1592,7 +1604,7 @@ mod tests {
     #[test]
     fn apply_cache_empty_messages() {
         let mut messages = vec![];
-        AnthropicProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
         // Should not panic
         assert!(messages.is_empty());
     }
@@ -1612,7 +1624,7 @@ mod tests {
             },
         ];
 
-        let native_tools = AnthropicProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
 
         assert_eq!(native_tools.len(), 2);
         assert!(native_tools[0].cache_control.is_none());
@@ -1627,7 +1639,7 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
         }];
 
-        let native_tools = AnthropicProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
 
         assert_eq!(native_tools.len(), 1);
         assert!(native_tools[0].cache_control.is_some());
@@ -1640,7 +1652,7 @@ mod tests {
             content: "Short system prompt".to_string(),
         }];
 
-        let (system_prompt, _) = AnthropicProvider::convert_messages(&messages);
+        let (system_prompt, _) = AnthropicModelProvider::convert_messages(&messages);
 
         match system_prompt.unwrap() {
             SystemPrompt::Blocks(blocks) => {
@@ -1665,7 +1677,7 @@ mod tests {
             content: large_content.clone(),
         }];
 
-        let (system_prompt, _) = AnthropicProvider::convert_messages(&messages);
+        let (system_prompt, _) = AnthropicModelProvider::convert_messages(&messages);
 
         match system_prompt.unwrap() {
             SystemPrompt::Blocks(blocks) => {
@@ -1711,8 +1723,8 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let provider = AnthropicProvider::new(None);
-        let result = provider.warmup().await;
+        let model_provider = AnthropicModelProvider::new(None);
+        let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
 
@@ -1737,7 +1749,7 @@ mod tests {
             },
         ];
 
-        let (system, native_msgs) = AnthropicProvider::convert_messages(&messages);
+        let (system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
 
         // System prompt extracted
         assert!(system.is_some());
@@ -1787,8 +1799,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        // Create provider pointing at mock server
-        let provider = AnthropicProvider {
+        // Create model_provider pointing at mock server
+        let model_provider = AnthropicModelProvider {
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
@@ -1819,7 +1831,7 @@ mod tests {
             }
         })];
 
-        let result = provider
+        let result = model_provider
             .chat_with_tools(&messages, &tools, "claude-opus-4-6", Some(0.7))
             .await;
         assert!(result.is_ok(), "chat_with_tools failed: {:?}", result.err());
@@ -1889,7 +1901,7 @@ mod tests {
             "usage": {"input_tokens": 300, "output_tokens": 75}
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicProvider::parse_native_response(resp);
+        let result = AnthropicModelProvider::parse_native_response(resp);
         let usage = result.usage.unwrap();
         assert_eq!(usage.input_tokens, Some(300));
         assert_eq!(usage.output_tokens, Some(75));
@@ -1899,14 +1911,14 @@ mod tests {
     fn native_response_parses_without_usage() {
         let json = r#"{"content": [{"type": "text", "text": "Hello"}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicProvider::parse_native_response(resp);
+        let result = AnthropicModelProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
     }
 
     #[test]
     fn capabilities_returns_vision_and_native_tools() {
-        let provider = AnthropicProvider::new(Some("test-key"));
-        let caps = provider.capabilities();
+        let model_provider = AnthropicModelProvider::new(Some("test-key"));
+        let caps = model_provider.capabilities();
         assert!(
             caps.native_tool_calling,
             "Anthropic should support native tool calling"
@@ -1922,7 +1934,7 @@ mod tests {
                 .to_string(),
         }];
 
-        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
 
         assert_eq!(native_msgs.len(), 1);
         assert_eq!(native_msgs[0].role, "user");
@@ -1960,7 +1972,7 @@ mod tests {
             content: "[IMAGE:data:image/png;base64,iVBORw0KGgo]".to_string(),
         }];
 
-        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
 
         assert_eq!(native_msgs.len(), 1);
         assert_eq!(native_msgs[0].content.len(), 2);
@@ -1989,7 +2001,7 @@ mod tests {
             content: "Hello, how are you?".to_string(),
         }];
 
-        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
 
         assert_eq!(native_msgs.len(), 1);
         assert_eq!(native_msgs[0].content.len(), 1);
@@ -2065,7 +2077,7 @@ mod tests {
             },
         ];
 
-        let (system, native_msgs) = AnthropicProvider::convert_messages(&messages);
+        let (system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
 
         assert!(system.is_some());
         // Should be: user, assistant, user (merged tool results)
@@ -2121,7 +2133,7 @@ mod tests {
             },
         ];
 
-        let (_system, native_msgs) = AnthropicProvider::convert_messages(&messages);
+        let (_system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
 
         for window in native_msgs.windows(2) {
             assert_ne!(

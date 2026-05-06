@@ -426,16 +426,16 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // LLM task tool — always registered when a provider is configured
+    // LLM task tool — always registered when a model_provider is configured
     {
         let llm_task_provider = root_config
             .providers
-            .first_provider_type()
+            .first_model_provider_type()
             .unwrap_or("openrouter")
             .to_string();
         let llm_task_model = root_config
             .providers
-            .first_provider()
+            .first_model_provider()
             .and_then(|e| e.model.clone())
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
         let llm_task_runtime_options =
@@ -446,12 +446,12 @@ pub fn all_tools_with_runtime(
             llm_task_model,
             root_config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7),
             root_config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.api_key.clone()),
             llm_task_runtime_options,
         )));
@@ -544,7 +544,7 @@ pub fn all_tools_with_runtime(
     // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {
         tool_arcs.push(Arc::new(WebSearchTool::new_with_config(
-            root_config.web_search.provider.clone(),
+            root_config.web_search.model_provider.clone(),
             root_config.web_search.brave_api_key.clone(),
             root_config.web_search.tavily_api_key.clone(),
             root_config.web_search.searxng_instance_url.clone(),

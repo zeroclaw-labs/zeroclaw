@@ -49,7 +49,7 @@ const MARKDOWN_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
 
 const POSTGRES_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "postgres",
-    label: "PostgreSQL — remote durable storage via [storage.provider.config]",
+    label: "PostgreSQL — remote durable storage via [storage.model_provider.config]",
     auto_save_default: true,
     uses_sqlite_hygiene: false,
     sqlite_based: false,

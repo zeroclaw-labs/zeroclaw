@@ -7,7 +7,7 @@ use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// Web search tool for searching the internet.
-/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key),
+/// Supports multiple model_providers: DuckDuckGo (free), Brave (requires API key),
 /// Tavily (requires API key), SearXNG (self-hosted, requires instance URL).
 ///
 /// API keys are resolved lazily at execution time: if the boot-time key
@@ -15,8 +15,8 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 /// corresponding `[web_search]` field, and uses the result. This ensures that
 /// keys set or rotated after boot, and encrypted keys, are correctly picked up.
 pub struct WebSearchTool {
-    /// Provider selector as configured by user. Routed via provider aliases at runtime.
-    provider: String,
+    /// ModelProvider selector as configured by user. Routed via model_provider aliases at runtime.
+    model_provider: String,
     /// Boot-time key snapshot (may be `None` if not yet configured at startup).
     boot_brave_api_key: Option<String>,
     /// Boot-time Tavily key snapshot.
@@ -33,13 +33,13 @@ pub struct WebSearchTool {
 
 impl WebSearchTool {
     pub fn new(
-        provider: String,
+        model_provider: String,
         brave_api_key: Option<String>,
         max_results: usize,
         timeout_secs: u64,
     ) -> Self {
         Self {
-            provider: provider.trim().to_lowercase(),
+            model_provider: model_provider.trim().to_lowercase(),
             boot_brave_api_key: brave_api_key,
             boot_tavily_api_key: None,
             searxng_instance_url: None,
@@ -57,7 +57,7 @@ impl WebSearchTool {
     /// decrypted via `SecretStore`.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_config(
-        provider: String,
+        model_provider: String,
         brave_api_key: Option<String>,
         tavily_api_key: Option<String>,
         searxng_instance_url: Option<String>,
@@ -67,7 +67,7 @@ impl WebSearchTool {
         secrets_encrypt: bool,
     ) -> Self {
         Self {
-            provider: provider.trim().to_lowercase(),
+            model_provider: model_provider.trim().to_lowercase(),
             boot_brave_api_key: brave_api_key,
             boot_tavily_api_key: tavily_api_key,
             searxng_instance_url,
@@ -547,11 +547,11 @@ impl Tool for WebSearchTool {
 
         tracing::info!("Searching web for: {}", query);
 
-        let resolution = resolve_web_search_provider(&self.provider);
+        let resolution = resolve_web_search_provider(&self.model_provider);
         if resolution.used_fallback {
             tracing::warn!(
-                "Unknown web search provider '{}'; falling back to '{}'",
-                self.provider,
+                "Unknown web search model_provider '{}'; falling back to '{}'",
+                self.model_provider,
                 resolution.canonical_provider
             );
         }
@@ -1020,7 +1020,7 @@ mod tests {
     #[test]
     fn test_resolve_searxng_instance_url_from_boot() {
         let tool = WebSearchTool {
-            provider: "searxng".to_string(),
+            model_provider: "searxng".to_string(),
             boot_brave_api_key: None,
             boot_tavily_api_key: None,
             searxng_instance_url: Some("https://searx.example.com".to_string()),

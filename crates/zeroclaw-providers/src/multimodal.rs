@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
 use std::path::Path;
-use zeroclaw_api::provider::ChatMessage;
+use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
@@ -183,7 +183,7 @@ pub async fn prepare_messages_for_provider(
         messages.to_vec()
     };
 
-    let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
+    let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
 
     let mut normalized_messages = Vec::with_capacity(trimmed.len());
     for message in &trimmed {
@@ -910,7 +910,7 @@ mod tests {
     }
 
     /// Stripping `[IMAGE:]` markers from history messages leaves only the text
-    /// portion, which is the behaviour needed for non-vision providers (#3674).
+    /// portion, which is the behaviour needed for non-vision model_providers (#3674).
     #[test]
     fn parse_image_markers_strips_markers_leaving_caption() {
         let input = "[IMAGE:/tmp/photo.jpg]\n\nDescribe this screenshot";

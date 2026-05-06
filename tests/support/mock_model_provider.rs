@@ -1,19 +1,19 @@
-//! Shared mock provider implementations for integration tests.
+//! Shared mock model_provider implementations for integration tests.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use zeroclaw::providers::traits::{ChatMessage, TokenUsage};
-use zeroclaw::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
+use zeroclaw::providers::{ChatRequest, ChatResponse, ModelProvider, ToolCall};
 
 use super::trace::{LlmTrace, TraceResponse};
 
-/// Mock provider that returns scripted responses in FIFO order.
-pub struct MockProvider {
+/// Mock model_provider that returns scripted responses in FIFO order.
+pub struct MockModelProvider {
     responses: Mutex<Vec<ChatResponse>>,
 }
 
-impl MockProvider {
+impl MockModelProvider {
     pub fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
@@ -22,7 +22,7 @@ impl MockProvider {
 }
 
 #[async_trait]
-impl Provider for MockProvider {
+impl ModelProvider for MockModelProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -57,25 +57,25 @@ impl Provider for MockProvider {
     }
 }
 
-/// Mock provider that returns scripted responses AND records every request.
-pub struct RecordingProvider {
+/// Mock model_provider that returns scripted responses AND records every request.
+pub struct RecordingModelProvider {
     responses: Mutex<Vec<ChatResponse>>,
     recorded_requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
 }
 
-impl RecordingProvider {
+impl RecordingModelProvider {
     pub fn new(responses: Vec<ChatResponse>) -> (Self, Arc<Mutex<Vec<Vec<ChatMessage>>>>) {
         let recorded = Arc::new(Mutex::new(Vec::new()));
-        let provider = Self {
+        let model_provider = Self {
             responses: Mutex::new(responses),
             recorded_requests: recorded.clone(),
         };
-        (provider, recorded)
+        (model_provider, recorded)
     }
 }
 
 #[async_trait]
-impl Provider for RecordingProvider {
+impl ModelProvider for RecordingModelProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -110,16 +110,16 @@ impl Provider for RecordingProvider {
     }
 }
 
-/// Provider that replays responses from an `LlmTrace` fixture.
+/// ModelProvider that replays responses from an `LlmTrace` fixture.
 ///
 /// Each call to `chat()` returns the next step from the trace in FIFO order.
-/// If the agent calls the provider more times than there are steps, an error is returned.
-pub struct TraceLlmProvider {
+/// If the agent calls the model_provider more times than there are steps, an error is returned.
+pub struct TraceLlmModelProvider {
     steps: Mutex<Vec<TraceResponse>>,
     trace_name: String,
 }
 
-impl TraceLlmProvider {
+impl TraceLlmModelProvider {
     pub fn from_trace(trace: &LlmTrace) -> Self {
         let mut steps = Vec::new();
         for turn in &trace.turns {
@@ -135,7 +135,7 @@ impl TraceLlmProvider {
 }
 
 #[async_trait]
-impl Provider for TraceLlmProvider {
+impl ModelProvider for TraceLlmModelProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -155,7 +155,7 @@ impl Provider for TraceLlmProvider {
         let mut guard = self.steps.lock().unwrap();
         if guard.is_empty() {
             anyhow::bail!(
-                "TraceLlmProvider({}) exhausted: no more steps in trace",
+                "TraceLlmModelProvider({}) exhausted: no more steps in trace",
                 self.trace_name
             );
         }

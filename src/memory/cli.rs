@@ -30,9 +30,9 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
 /// Unlike `create_cli_memory`, which skips embedding setup for pure
 /// read/delete operations, this factory is used by commands that must
 /// actually compute embeddings (e.g. `reindex`). Mirrors the gateway's
-/// memory construction so the same model-provider / route resolution
-/// applies. V3 dropped `providers.fallback`; the embedder API key falls
-/// back to the first configured model-provider, matching how the gateway
+/// memory construction so the same model-model_provider / route resolution
+/// applies. V3 dropped `model_providers.fallback`; the embedder API key falls
+/// back to the first configured model-model_provider, matching how the gateway
 /// resolves it (`crates/zeroclaw-gateway/src/lib.rs` `fallback`).
 fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
     let backend = backend_kind_from_dotted(&config.memory.backend);
@@ -41,7 +41,7 @@ fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
     }
     let fallback_api_key = config
         .providers
-        .first_provider()
+        .first_model_provider()
         .and_then(|e| e.api_key.as_deref());
     create_memory_with_storage_and_routes(
         &config.memory,
@@ -74,7 +74,7 @@ async fn handle_reindex(config: &Config) -> Result<()> {
 /// Create a lightweight memory backend for CLI management operations.
 ///
 /// CLI commands (list/get/stats/clear) never use vector search, so we skip
-/// embedding provider initialisation for local backends by using the
+/// embedding model_provider initialisation for local backends by using the
 /// migration factory.
 fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
     let backend = backend_kind_from_dotted(&config.memory.backend);

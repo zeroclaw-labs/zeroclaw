@@ -9,19 +9,22 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub enum ObserverEvent {
     /// The agent orchestration loop has started a new session.
-    AgentStart { provider: String, model: String },
-    /// A request is about to be sent to an LLM provider.
+    AgentStart {
+        model_provider: String,
+        model: String,
+    },
+    /// A request is about to be sent to an LLM model_provider.
     ///
-    /// This is emitted immediately before a provider call so observers can print
+    /// This is emitted immediately before a model_provider call so observers can print
     /// user-facing progress without leaking prompt contents.
     LlmRequest {
-        provider: String,
+        model_provider: String,
         model: String,
         messages_count: usize,
     },
-    /// Result of a single LLM provider call.
+    /// Result of a single LLM model_provider call.
     LlmResponse {
-        provider: String,
+        model_provider: String,
         model: String,
         duration: Duration,
         success: bool,
@@ -31,9 +34,9 @@ pub enum ObserverEvent {
     },
     /// The agent session has finished.
     ///
-    /// Carries aggregate usage data (tokens, cost) when the provider reports it.
+    /// Carries aggregate usage data (tokens, cost) when the model_provider reports it.
     AgentEnd {
-        provider: String,
+        model_provider: String,
         model: String,
         duration: Duration,
         tokens_used: Option<u64>,
@@ -75,7 +78,7 @@ pub enum ObserverEvent {
     },
     /// An error occurred in a named component.
     Error {
-        /// Subsystem where the error originated (e.g., `"provider"`, `"gateway"`).
+        /// Subsystem where the error originated (e.g., `"model_provider"`, `"gateway"`).
         component: String,
         /// Human-readable error description. Must not contain secrets or tokens.
         message: String,

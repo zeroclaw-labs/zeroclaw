@@ -1,10 +1,10 @@
-//! Onboard catalog endpoint — exposes the provider + model catalog the CLI
-//! wizard already uses, so the dashboard's "+ Add provider" affordance and
+//! Onboard catalog endpoint — exposes the model_provider + model catalog the CLI
+//! wizard already uses, so the dashboard's "+ Add model_provider" affordance and
 //! model-picker dropdown share the same source of truth as the CLI.
 //!
-//! No catalog data is hand-maintained at this layer. `list_providers()` lives
-//! in `zeroclaw-providers` and is the canonical list; `list_models()` per
-//! provider fetches from models.dev (cached) or the provider's own /models
+//! No catalog data is hand-maintained at this layer. `list_model_providers()` lives
+//! in `zeroclaw-model_providers` and is the canonical list; `list_models()` per
+//! model_provider fetches from models.dev (cached) or the model_provider's own /models
 //! endpoint. Same code paths as the CLI wizard.
 //!
 //! Issue #6175.
@@ -22,25 +22,23 @@ use super::api::require_auth;
 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct CatalogProvider {
-    /// Canonical provider name as used in `[providers.models.<name>]`.
+pub struct CatalogModelProvider {
+    /// Canonical model_provider name as used in `[providers.models.<name>]`.
     pub name: String,
     /// Human-readable display name.
     pub display_name: String,
-    /// Whether the provider is fully local (no API key required).
+    /// Whether the model model_provider is fully local (no API key required).
     pub local: bool,
-    /// Aliases the provider also responds to (informational).
-    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CatalogResponse {
-    pub providers: Vec<CatalogProvider>,
+    pub model_providers: Vec<CatalogModelProvider>,
 }
 
-/// `GET /api/onboard/catalog` — list every provider the CLI wizard knows
-/// about. The dashboard shows these in the "+ Add provider" picker so
+/// `GET /api/onboard/catalog` — list every model provider the CLI wizard knows
+/// about. The dashboard shows these in the "+ Add model provider" picker so
 /// CLI / web stay in sync.
 pub async fn handle_catalog(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
@@ -48,44 +46,43 @@ pub async fn handle_catalog(State(state): State<AppState>, headers: HeaderMap) -
     }
     let _ = state;
 
-    let providers: Vec<CatalogProvider> = zeroclaw_providers::list_providers()
+    let model_providers: Vec<CatalogModelProvider> = zeroclaw_providers::list_model_providers()
         .into_iter()
-        .map(|p| CatalogProvider {
+        .map(|p| CatalogModelProvider {
             name: p.name.to_string(),
             display_name: p.display_name.to_string(),
             local: p.local,
-            aliases: p.aliases.iter().map(|s| s.to_string()).collect(),
         })
         .collect();
 
-    axum::Json(CatalogResponse { providers }).into_response()
+    axum::Json(CatalogResponse { model_providers }).into_response()
 }
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ModelsQuery {
-    /// Provider name (canonical, from CatalogProvider.name).
-    pub provider: String,
+    /// ModelProvider name (canonical, from CatalogModelProvider.name).
+    pub model_provider: String,
 }
 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ModelsResponse {
-    pub provider: String,
+    pub model_provider: String,
     pub models: Vec<String>,
     /// `true` when the catalog was fetched live; `false` if the cache was
-    /// served (or if this provider has no remote catalog and the empty list
+    /// served (or if this model_provider has no remote catalog and the empty list
     /// is the genuine answer).
     pub live: bool,
 }
 
-/// `GET /api/onboard/catalog/models?provider=<name>` — fetch the model list
-/// for one provider. Same code path the CLI wizard uses
-/// (`zeroclaw_providers::create_provider(...).list_models()`), which goes
+/// `GET /api/onboard/catalog/models?model_provider=<name>` — fetch the model list
+/// for one model_provider. Same code path the CLI wizard uses
+/// (`zeroclaw_providers::create_model_provider(...).list_models()`), which goes
 /// through the models.dev cached catalog for OpenAI / Anthropic / Gemini,
 /// the live `/v1/models` endpoint for OpenRouter, etc.
 ///
-/// Lazy: the dashboard hits this only when the user picks a provider, so
+/// Lazy: the dashboard hits this only when the user picks a model_provider, so
 /// initial catalog load stays fast. Fetch failures return an empty list
 /// with `live: false` so the form falls back to a free-text input.
 pub async fn handle_catalog_models(
@@ -98,15 +95,15 @@ pub async fn handle_catalog_models(
     }
     let _ = state;
 
-    let handle = match zeroclaw_providers::create_provider(&q.provider, None) {
+    let handle = match zeroclaw_providers::create_model_provider(&q.model_provider, None) {
         Ok(h) => h,
         Err(e) => {
             return error_response(
                 ConfigApiError::new(
                     ConfigApiCode::PathNotFound,
-                    format!("unknown provider `{}`: {e}", q.provider),
+                    format!("unknown model_provider `{}`: {e}", q.model_provider),
                 )
-                .with_path(&q.provider),
+                .with_path(&q.model_provider),
             );
         }
     };
@@ -114,13 +111,13 @@ pub async fn handle_catalog_models(
     let (models, live) = match handle.list_models().await {
         Ok(m) => (m, true),
         Err(e) => {
-            tracing::debug!(provider = %q.provider, error = ?e, "model catalog fetch failed");
+            tracing::debug!(model_provider = %q.model_provider, error = ?e, "model catalog fetch failed");
             (Vec::new(), false)
         }
     };
 
     axum::Json(ModelsResponse {
-        provider: q.provider,
+        model_provider: q.model_provider,
         models,
         live,
     })
@@ -138,7 +135,7 @@ fn error_response(err: ConfigApiError) -> Response {
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SectionInfo {
-    /// Stable section key — `workspace`, `providers`, `channels`, `memory`,
+    /// Stable section key — `workspace`, `model_providers`, `channels`, `memory`,
     /// `hardware`, `tunnel`. Matches `Section::as_path_prefix` in
     /// zeroclaw-runtime so CLI / web stay aligned.
     pub key: String,
@@ -169,12 +166,12 @@ pub struct SectionsResponse {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct OnboardStatusResponse {
     /// `true` when the user hasn't started onboarding yet — no completed
-    /// section markers AND no usable provider configured. The dashboard
+    /// section markers AND no usable model_provider configured. The dashboard
     /// uses this signal to redirect first-load visits from `/` to
     /// `/onboard`.
     pub needs_onboarding: bool,
     /// Short machine-readable reason for the value of `needs_onboarding`,
-    /// for logs / debugging. Stable: `fresh_install` / `has_provider` /
+    /// for logs / debugging. Stable: `fresh_install` / `has_model_provider` /
     /// `has_completed_sections`.
     pub reason: &'static str,
 }
@@ -194,12 +191,12 @@ pub async fn handle_onboard_status(State(state): State<AppState>, headers: Heade
     let cfg = state.config.lock().clone();
 
     let has_completed = !cfg.onboard_state.completed_sections.is_empty();
-    let has_provider = !cfg.providers.models.is_empty();
+    let has_model_provider = !cfg.providers.models.is_empty();
 
     let (needs_onboarding, reason) = if has_completed {
         (false, "has_completed_sections")
-    } else if has_provider {
-        (false, "has_provider")
+    } else if has_model_provider {
+        (false, "has_model_provider")
     } else {
         (true, "fresh_install")
     };
@@ -212,7 +209,7 @@ pub async fn handle_onboard_status(State(state): State<AppState>, headers: Heade
 }
 
 /// All alias-reference choices an agent form needs, in one round-trip.
-/// Channels and model providers are returned in dotted form
+/// Channels and model model_providers are returned in dotted form
 /// (`telegram.default`, `anthropic.work`); the bundle/profile/namespace
 /// lists are bare HashMap keys.
 #[derive(Debug, Serialize)]
@@ -273,7 +270,7 @@ pub async fn handle_agent_options(State(state): State<AppState>, headers: Header
 ///
 /// Schema-driven: walks `Config::prop_fields()` and collects unique first
 /// segments, then asks `Config::map_key_sections()` for which ones have
-/// pickers. The 4 onboarding sections (`providers`, `channels`, `memory`,
+/// pickers. The 4 onboarding sections (`model_providers`, `channels`, `memory`,
 /// `tunnel`) keep their existing per-section dispatch in
 /// `handle_section_picker`; everything else (`gateway`, `observability`,
 /// `scheduler`, ...) renders as a direct form. Adding a new top-level
@@ -341,9 +338,10 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
 const HIDDEN_TOP_LEVEL: &[&str] = &["schema-version", "onboard-state"];
 
 /// Sections whose picker semantics are non-generic and live in the
-/// per-section dispatch in `handle_section_picker` (catalog of providers,
+/// per-section dispatch in `handle_section_picker` (catalog of model_providers,
 /// memory backend list, tunnel-with-none, channel sub-table walk).
-const SECTIONS_WITH_PICKER: &[&str] = &["providers", "channels", "memory", "tunnel", "agents"];
+const SECTIONS_WITH_PICKER: &[&str] =
+    &["model_providers", "channels", "memory", "tunnel", "agents"];
 
 /// Humanize a section key for display (`google_workspace` → `Google workspace`).
 /// Keeps things simple and predictable; specific wording overrides go in
@@ -368,9 +366,8 @@ fn section_group(key: &str) -> &'static str {
         // The 6 foundation sections (TUI's `Section` enum) — every install
         // touches these. Named for the role they play, not for the wizard
         // that happens to walk them on first run.
-        "workspace" | "providers" | "channels" | "memory" | "hardware" | "tunnel" | "agents" => {
-            "Foundation"
-        }
+        "workspace" | "model_providers" | "channels" | "memory" | "hardware" | "tunnel"
+        | "agents" => "Foundation",
         // Agent loop, scheduling, and orchestration.
         "agent"
         | "autonomy"
@@ -415,9 +412,9 @@ fn section_help(key: &str) -> &'static str {
         "workspace" => {
             "Where ZeroClaw stores its config and runtime data. Defaults work for most setups."
         }
-        "providers" => {
+        "model_providers" => {
             "Paste an API key (e.g. `sk-ant-...` for Anthropic, `sk-...` for OpenAI) when prompted. \
-                        For OAuth-based providers run: zeroclaw auth login --provider <name>"
+                        For OAuth-based model_providers run: zeroclaw auth login --model_provider <name>"
         }
         "channels" => {
             "Pick which chat platforms ZeroClaw should listen on. You can configure multiple."
@@ -431,7 +428,7 @@ fn section_help(key: &str) -> &'static str {
                      Pick `none` to keep it localhost-only."
         }
         "agents" => {
-            "An agent binds a model provider, profiles, bundles, and channels into one \
+            "An agent binds a model model_provider, profiles, bundles, and channels into one \
                      dispatchable unit. Add one per persona; reuse the same alias across channels \
                      to share state."
         }
@@ -454,7 +451,7 @@ pub struct PickerItem {
     /// memory backend label, etc.).
     pub label: String,
     /// Optional secondary line under the label (e.g. memory backend's
-    /// extended description, "(local)" for local-only providers).
+    /// extended description, "(local)" for local-only model_providers).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Optional badge — `"configured"` when an entry already exists for
@@ -477,7 +474,7 @@ pub struct PickerResponse {
 /// `GET /api/onboard/sections/<section>` — picker items for that section.
 ///
 /// Per-section dispatch:
-/// * `providers` → `zeroclaw_providers::list_providers()` (CLI's catalog).
+/// * `providers` → `zeroclaw_providers::list_model_providers()` (CLI's catalog).
 /// * `memory` → `zeroclaw_memory::selectable_memory_backends()`.
 /// * `channels` / `tunnel` → schema-walk: clone config, `init_defaults` the
 ///   section, then strip the section prefix from `prop_fields()` and dedupe
@@ -495,9 +492,9 @@ pub async fn handle_section_picker(
     let cfg = state.config.lock().clone();
 
     let (items, help) = match section.as_str() {
-        "providers" => (
+        "model_providers" => (
             providers_picker(&cfg),
-            section_help("providers").to_string(),
+            section_help("model_providers").to_string(),
         ),
         "memory" => (memory_picker(&cfg), section_help("memory").to_string()),
         "channels" => (
@@ -505,7 +502,7 @@ pub async fn handle_section_picker(
             section_help("channels").to_string(),
         ),
         "tunnel" => (
-            schema_walk_picker_with_none(&cfg, "tunnel", "tunnel.provider"),
+            schema_walk_picker_with_none(&cfg, "tunnel", "tunnel.model_provider"),
             section_help("tunnel").to_string(),
         ),
         "agents" => (agents_picker(&cfg), section_help("agents").to_string()),
@@ -533,10 +530,10 @@ pub async fn handle_section_picker(
 }
 
 fn providers_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
-    zeroclaw_providers::list_providers()
+    zeroclaw_providers::list_model_providers()
         .into_iter()
         .map(|p| {
-            let configured = cfg.providers.models.contains_provider_type(p.name);
+            let configured = cfg.providers.models.contains_model_provider_type(p.name);
             PickerItem {
                 key: p.name.to_string(),
                 label: p.display_name.to_string(),
@@ -643,7 +640,7 @@ fn agents_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
 }
 
 /// `tunnel`-flavored picker: same as `schema_walk_picker` plus a synthetic
-/// `none` entry at the top, marked active when the current `tunnel.provider`
+/// `none` entry at the top, marked active when the current `tunnel.model_provider`
 /// matches. Mirrors the TUI's tunnel section.
 fn schema_walk_picker_with_none(
     cfg: &zeroclaw_config::schema::Config,
@@ -699,7 +696,7 @@ pub struct SectionItemPath {
 ///   then return `providers.models.<key>`.
 /// * `channels` → init_defaults under `channels.<key>`, return `channels.<key>`.
 /// * `memory` → set_prop `memory.backend = <key>`, return `memory`.
-/// * `tunnel` → set_prop `tunnel.provider = <key>` (and init_defaults the
+/// * `tunnel` → set_prop `tunnel.model_provider = <key>` (and init_defaults the
 ///   subsection if `<key>` is not "none"), return `tunnel.<key>` (or `tunnel`
 ///   for the `none` case).
 ///
@@ -730,13 +727,13 @@ pub async fn handle_section_select(
     let mut working = state.config.lock().clone();
 
     let (fields_prefix, created) = match section.as_str() {
-        "providers" => {
+        "model_providers" => {
             // Arm 1: create the outer type bucket if it doesn't exist yet.
             if let Err(msg) = working.create_map_key("providers.models", &key) {
                 return error_response(
                     ConfigApiError::new(
                         ConfigApiCode::PathNotFound,
-                        format!("could not select provider `{key}`: {msg}"),
+                        format!("could not select model_provider `{key}`: {msg}"),
                     )
                     .with_path("providers.models"),
                 );
@@ -748,7 +745,9 @@ pub async fn handle_section_select(
                     error_response(
                         ConfigApiError::new(
                             ConfigApiCode::PathNotFound,
-                            format!("could not select provider `{key}` alias `{alias}`: {msg}"),
+                            format!(
+                                "could not select model_provider `{key}` alias `{alias}`: {msg}"
+                            ),
                         )
                         .with_path(format!("providers.models.{key}")),
                     )
@@ -818,13 +817,13 @@ pub async fn handle_section_select(
             ("memory".to_string(), true)
         }
         "tunnel" => {
-            if let Err(e) = working.set_prop("tunnel.provider", &key) {
+            if let Err(e) = working.set_prop("tunnel.model_provider", &key) {
                 return error_response(
                     ConfigApiError::new(
                         ConfigApiCode::ValidationFailed,
-                        format!("could not set tunnel.provider = `{key}`: {e}"),
+                        format!("could not set tunnel.model_provider = `{key}`: {e}"),
                     )
-                    .with_path("tunnel.provider"),
+                    .with_path("tunnel.model_provider"),
                 );
             }
             let prefix = if key == "none" {
@@ -887,7 +886,7 @@ mod tests {
         // The 6 onboarding sections must still be in the derived set.
         for required in [
             "workspace",
-            "providers",
+            "model_providers",
             "channels",
             "memory",
             "hardware",
@@ -950,7 +949,7 @@ mod tests {
 
     #[test]
     fn providers_picker_sources_from_list_providers() {
-        // Single source of truth: zeroclaw_providers::list_providers().
+        // Single source of truth: zeroclaw_providers::list_model_providers().
         // Anthropic / OpenAI / OpenRouter must surface in the picker.
         let cfg = empty_cfg();
         let items = providers_picker(&cfg);
@@ -969,17 +968,17 @@ mod tests {
         let anthropic = items.iter().find(|i| i.key == "anthropic").unwrap();
         assert_eq!(anthropic.label, "Anthropic");
 
-        // Local-only providers carry a description hint.
+        // Local-only model_providers carry a description hint.
         let local = items.iter().find(|i| i.description.is_some());
         assert!(
             local.is_some(),
-            "at least one provider should be marked local"
+            "at least one model_provider should be marked local"
         );
 
-        // Empty config has no configured providers — no badges yet.
+        // Empty config has no configured model_providers — no badges yet.
         assert!(
             items.iter().all(|i| i.badge.is_none()),
-            "fresh config shouldn't mark any provider as configured"
+            "fresh config shouldn't mark any model_provider as configured"
         );
     }
 
@@ -1056,7 +1055,7 @@ mod tests {
     #[test]
     fn tunnel_picker_includes_synthetic_none() {
         let cfg = empty_cfg();
-        let items = schema_walk_picker_with_none(&cfg, "tunnel", "tunnel.provider");
+        let items = schema_walk_picker_with_none(&cfg, "tunnel", "tunnel.model_provider");
         assert_eq!(
             items[0].key, "none",
             "`none` must be the first entry in the tunnel picker"

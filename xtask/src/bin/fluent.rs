@@ -19,9 +19,9 @@ enum Cmd {
         /// Re-translate all entries (quality pass, costs more)
         #[arg(long)]
         force: bool,
-        /// Provider name from [providers.models.<name>] in config.toml (e.g. my-ollama)
+        /// ModelProvider name from [providers.models.<name>] in config.toml (e.g. my-ollama)
         #[arg(long)]
-        provider: Option<String>,
+        model_provider: Option<String>,
         /// Entries per API call (default: 50). Lower if the model truncates large JSON responses.
         #[arg(long)]
         batch: Option<usize>,
@@ -39,9 +39,9 @@ fn main() -> anyhow::Result<()> {
         Cmd::Fill {
             locale,
             force,
-            provider,
+            model_provider,
             batch,
-        } => cmd::fluent::fill::run(locale.as_deref(), force, provider.as_deref(), batch),
+        } => cmd::fluent::fill::run(locale.as_deref(), force, model_provider.as_deref(), batch),
         Cmd::Stats => cmd::fluent::stats::run(),
         Cmd::Check => cmd::fluent::check::run(),
     }

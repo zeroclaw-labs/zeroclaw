@@ -41,7 +41,7 @@ pub const V1_LEGACY_KEYS: &[&str] = &[
     "api_key",
     "api_url",
     "api_path",
-    "default_provider",
+    "default_model_provider",
     "default_model",
     "model_providers",
     "default_temperature",
@@ -478,7 +478,7 @@ mod tests {
         let dir = setup_temp_config_dir();
         let path = dir.path().join("config.toml");
         // Minimal V1 input (no schema_version) so migration runs.
-        std::fs::write(&path, "default_provider = \"openai\"\nfoo = 1\n").unwrap();
+        std::fs::write(&path, "default_model_provider = \"openai\"\nfoo = 1\n").unwrap();
 
         let report = migrate_file_in_place(&path)
             .expect("migration succeeds")
@@ -487,7 +487,7 @@ mod tests {
         // Backup retains the original content verbatim.
         let backup = std::fs::read_to_string(&report.backup_path).unwrap();
         assert!(
-            backup.contains("default_provider = \"openai\"") && backup.contains("foo = 1"),
+            backup.contains("default_model_provider = \"openai\"") && backup.contains("foo = 1"),
             "backup must contain the original V1 content; got: {backup}"
         );
 

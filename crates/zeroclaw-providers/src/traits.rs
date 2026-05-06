@@ -1,1 +1,1 @@
-pub use zeroclaw_api::provider::*;
+pub use zeroclaw_api::model_provider::*;

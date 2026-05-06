@@ -48,7 +48,7 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
-    /// Provider-specific opaque extension fields that must round-trip
+    /// ModelProvider-specific opaque extension fields that must round-trip
     /// unchanged on follow-up turns (e.g. Gemini 3 `thoughtSignature`
     /// carried as `extra_content.google.thought_signature`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -60,7 +60,7 @@ pub struct ToolCall {
 pub struct TokenUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
-    /// Tokens served from the provider's prompt cache (Anthropic `cache_read_input_tokens`,
+    /// Tokens served from the model_provider's prompt cache (Anthropic `cache_read_input_tokens`,
     /// OpenAI `prompt_tokens_details.cached_tokens`).
     pub cached_input_tokens: Option<u64>,
 }
@@ -72,11 +72,11 @@ pub struct ChatResponse {
     pub text: Option<String>,
     /// Tool calls requested by the LLM.
     pub tool_calls: Vec<ToolCall>,
-    /// Token usage reported by the provider, if available.
+    /// Token usage reported by the model_provider, if available.
     pub usage: Option<TokenUsage>,
     /// Raw reasoning/thinking content from thinking models (e.g. DeepSeek-R1,
     /// Kimi K2.5, GLM-4.7). Preserved as an opaque pass-through so it can be
-    /// sent back in subsequent API requests — some providers reject tool-call
+    /// sent back in subsequent API requests — some model_providers reject tool-call
     /// history that omits this field.
     pub reasoning_content: Option<String>,
 }
@@ -93,7 +93,7 @@ impl ChatResponse {
     }
 }
 
-/// Request payload for provider chat calls.
+/// Request payload for model_provider chat calls.
 #[derive(Debug, Clone, Copy)]
 pub struct ChatRequest<'a> {
     pub messages: &'a [ChatMessage],
@@ -118,7 +118,7 @@ pub enum ConversationMessage {
         text: Option<String>,
         tool_calls: Vec<ToolCall>,
         /// Raw reasoning content from thinking models, preserved for round-trip
-        /// fidelity with provider APIs that require it.
+        /// fidelity with model_provider APIs that require it.
         reasoning_content: Option<String>,
     },
     /// Results of tool executions, fed back to the LLM.
@@ -186,7 +186,7 @@ impl StreamChunk {
     }
 }
 
-/// Structured events emitted by provider streaming APIs.
+/// Structured events emitted by model_provider streaming APIs.
 ///
 /// This extends plain text chunk streaming with explicit tool-call signals so
 /// agent loops can preserve native tool semantics without parsing payload text.
@@ -196,7 +196,7 @@ pub enum StreamEvent {
     TextDelta(StreamChunk),
     /// Structured tool call emitted during streaming.
     ToolCall(ToolCall),
-    /// A tool call that was already executed by the provider (e.g. Claude Code proxy).
+    /// A tool call that was already executed by the model_provider (e.g. Claude Code proxy).
     /// Emitted for observability only — not re-executed by the agent's dispatcher.
     PreExecutedToolCall { name: String, args: String },
     /// The result of a pre-executed tool call.
@@ -255,8 +255,8 @@ pub enum StreamError {
     #[error("Invalid SSE format: {0}")]
     InvalidSse(String),
 
-    #[error("Provider error: {0}")]
-    Provider(String),
+    #[error("ModelProvider error: {0}")]
+    ModelProvider(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -264,28 +264,30 @@ pub enum StreamError {
 
 /// Structured error returned when a requested capability is not supported.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("provider_capability_error provider={provider} capability={capability} message={message}")]
+#[error(
+    "provider_capability_error model_provider={model_provider} capability={capability} message={message}"
+)]
 pub struct ProviderCapabilityError {
-    pub provider: String,
+    pub model_provider: String,
     pub capability: String,
     pub message: String,
 }
 
-/// Provider capabilities declaration.
+/// ModelProvider capabilities declaration.
 ///
-/// Describes what features a provider supports, enabling intelligent
+/// Describes what features a model_provider supports, enabling intelligent
 /// adaptation of tool calling modes and request formatting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderCapabilities {
-    /// Whether the provider supports native tool calling via API primitives.
+    /// Whether the model_provider supports native tool calling via API primitives.
     pub native_tool_calling: bool,
-    /// Whether the provider supports vision / image inputs.
+    /// Whether the model_provider supports vision / image inputs.
     pub vision: bool,
-    /// Whether the provider supports prompt caching.
+    /// Whether the model_provider supports prompt caching.
     pub prompt_caching: bool,
 }
 
-/// Provider-specific tool payload formats.
+/// ModelProvider-specific tool payload formats.
 #[derive(Debug, Clone)]
 pub enum ToolsPayload {
     /// Gemini API format (functionDeclarations).
@@ -310,24 +312,24 @@ pub const BASELINE_TEMPERATURE: f64 = 0.7;
 /// binding constraint.
 pub const BASELINE_MAX_TOKENS: u32 = 4096;
 
-/// HTTP timeout for cloud inference. Local providers (Ollama) override
+/// HTTP timeout for cloud inference. Local model_providers (Ollama) override
 /// upward since CPU/GPU-bound inference runs slower than round-tripping to
 /// a hyperscaler.
 pub const BASELINE_TIMEOUT_SECS: u64 = 120;
 
-/// Wire protocol used when the provider doesn't declare one. Only OpenAI's
+/// Wire protocol used when the model_provider doesn't declare one. Only OpenAI's
 /// Codex stack uses the "responses" protocol; everything else speaks the
 /// classic chat completions shape.
 pub const BASELINE_WIRE_API: &str = "chat_completions";
 
 #[async_trait]
-pub trait Provider: Send + Sync {
-    /// Query provider capabilities.
+pub trait ModelProvider: Send + Sync {
+    /// Query model_provider capabilities.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
     }
 
-    // ── Provider-family defaults ────────────────────────────────────────────
+    // ── ModelProvider-family defaults ────────────────────────────────────────────
     // Called by every chat/stream method's `temperature.unwrap_or(self.default_temperature())`
     // and by `zeroclaw onboard` to prefill prompts with a visible default.
     // Baselines are the industry-neutral fallback; override per family where
@@ -350,9 +352,9 @@ pub trait Provider: Send + Sync {
     }
 
     /// Canonical public API endpoint, when there is one. Returned as a
-    /// string slice so provider impls can serve from `const &'static str`s
-    /// without allocations. `None` = provider has no universal endpoint
-    /// (local providers, auth-less CLIs, user-BYO endpoints).
+    /// string slice so model_provider impls can serve from `const &'static str`s
+    /// without allocations. `None` = model_provider has no universal endpoint
+    /// (local model_providers, auth-less CLIs, user-BYO endpoints).
     fn default_base_url(&self) -> Option<&str> {
         None
     }
@@ -364,7 +366,7 @@ pub trait Provider: Send + Sync {
         BASELINE_WIRE_API
     }
 
-    /// Convert tool specifications to provider-native format.
+    /// Convert tool specifications to model_provider-native format.
     fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
         ToolsPayload::PromptGuided {
             instructions: build_tool_instructions_text(tools),
@@ -374,7 +376,7 @@ pub trait Provider: Send + Sync {
     /// Simple one-shot chat (single user message, no explicit system prompt).
     ///
     /// `temperature == None` means "use `self.default_temperature()`". The
-    /// unwrap lives inside each provider impl, not at every call site.
+    /// unwrap lives inside each model_provider impl, not at every call site.
     async fn simple_chat(
         &self,
         message: &str,
@@ -395,14 +397,14 @@ pub trait Provider: Send + Sync {
         temperature: Option<f64>,
     ) -> anyhow::Result<String>;
 
-    /// Fetch the list of available model IDs for this provider.
+    /// Fetch the list of available model IDs for this model_provider.
     ///
     /// Used by onboard to present a live model picker. Default bails with
-    /// "not supported"; concrete providers override to hit their own public
+    /// "not supported"; concrete model_providers override to hit their own public
     /// endpoint (OpenRouter, Ollama) or delegate to the shared models.dev
     /// catalog (no auth required) in `zeroclaw_providers::models_dev`.
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        anyhow::bail!("live model listing is not supported for this provider")
+        anyhow::bail!("live model listing is not supported for this model_provider")
     }
 
     /// Multi-turn conversation. See `simple_chat` for the `temperature`
@@ -442,7 +444,7 @@ pub trait Provider: Send + Sync {
                 ToolsPayload::PromptGuided { instructions } => instructions,
                 payload => {
                     anyhow::bail!(
-                        "Provider returned non-prompt-guided tools payload ({payload:?}) while supports_native_tools() is false"
+                        "ModelProvider returned non-prompt-guided tools payload ({payload:?}) while supports_native_tools() is false"
                     )
                 }
             };
@@ -480,12 +482,12 @@ pub trait Provider: Send + Sync {
         })
     }
 
-    /// Whether provider supports native tool calls over API.
+    /// Whether model_provider supports native tool calls over API.
     fn supports_native_tools(&self) -> bool {
         self.capabilities().native_tool_calling
     }
 
-    /// Whether provider supports multimodal vision input.
+    /// Whether model_provider supports multimodal vision input.
     fn supports_vision(&self) -> bool {
         self.capabilities().vision
     }
@@ -513,12 +515,12 @@ pub trait Provider: Send + Sync {
         })
     }
 
-    /// Whether provider supports streaming responses.
+    /// Whether model_provider supports streaming responses.
     fn supports_streaming(&self) -> bool {
         false
     }
 
-    /// Whether provider can emit structured tool-call stream events.
+    /// Whether model_provider can emit structured tool-call stream events.
     fn supports_streaming_tool_events(&self) -> bool {
         false
     }
@@ -572,12 +574,12 @@ pub trait Provider: Send + Sync {
     }
 }
 
-/// Blanket implementation: `Arc<T>` delegates all `Provider` methods to `T`.
+/// Blanket implementation: `Arc<T>` delegates all `ModelProvider` methods to `T`.
 ///
-/// This eliminates the need for manual `impl Provider for Arc<MyProvider>`
+/// This eliminates the need for manual `impl ModelProvider for Arc<MyModelProvider>`
 /// boilerplate in test and production code.
 #[async_trait]
-impl<T: Provider + ?Sized> Provider for Arc<T> {
+impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
     fn capabilities(&self) -> ProviderCapabilities {
         self.as_ref().capabilities()
     }

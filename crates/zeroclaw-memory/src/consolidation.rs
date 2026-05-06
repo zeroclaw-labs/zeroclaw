@@ -11,7 +11,7 @@
 use crate::conflict;
 use crate::importance;
 use crate::traits::{Memory, MemoryCategory};
-use zeroclaw_api::provider::Provider;
+use zeroclaw_api::model_provider::ModelProvider;
 
 /// Output of consolidation extraction.
 #[derive(Debug, serde::Deserialize)]
@@ -43,7 +43,7 @@ Do not include any text outside the JSON object."#;
 /// This function is designed to be called fire-and-forget via `tokio::spawn`.
 /// Strip channel media markers (e.g. `[IMAGE:/local/path]`, `[DOCUMENT:...]`)
 /// that contain local filesystem paths.  These must never be forwarded to
-/// upstream provider APIs — they would leak local paths and cause API errors.
+/// upstream model_provider APIs — they would leak local paths and cause API errors.
 fn strip_media_markers(text: &str) -> String {
     // Matches [IMAGE:...], [DOCUMENT:...], [FILE:...], [VIDEO:...], [VOICE:...], [AUDIO:...]
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -53,7 +53,7 @@ fn strip_media_markers(text: &str) -> String {
 }
 
 pub async fn consolidate_turn(
-    provider: &dyn Provider,
+    model_provider: &dyn ModelProvider,
     model: &str,
     memory: &dyn Memory,
     user_message: &str,
@@ -82,7 +82,7 @@ pub async fn consolidate_turn(
     // Low temperature for consolidation — we want deterministic
     // summarization, not creative rewrites.
     const CONSOLIDATION_TEMPERATURE: f64 = 0.1;
-    let raw = provider
+    let raw = model_provider
         .chat_with_system(
             Some(CONSOLIDATION_SYSTEM_PROMPT),
             &truncated,

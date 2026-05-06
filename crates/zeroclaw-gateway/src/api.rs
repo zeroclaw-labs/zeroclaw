@@ -122,7 +122,7 @@ pub async fn handle_api_status(
         .unwrap_or_else(zeroclaw_runtime::i18n::detect_locale);
 
     let body = serde_json::json!({
-        "provider": config.providers.first_provider_type(),
+        "model_provider": config.providers.first_model_provider_type(),
         "model": state.model,
         "temperature": state.temperature,
         "uptime_seconds": health.uptime_seconds,
@@ -1228,7 +1228,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
-    use zeroclaw_providers::Provider;
+    use zeroclaw_providers::ModelProvider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
 
     struct MockMemory;
@@ -1285,10 +1285,10 @@ mod tests {
         }
     }
 
-    struct MockProvider;
+    struct MockModelProvider;
 
     #[async_trait]
-    impl Provider for MockProvider {
+    impl ModelProvider for MockModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -1300,7 +1300,7 @@ mod tests {
         }
     }
 
-    /// Wire a minimal agent + provider + risk_profile into a test config
+    /// Wire a minimal agent + model_provider + risk_profile into a test config
     /// so cron-add API tests have an `agent` reference to bind to.
     fn with_test_agent(
         mut config: zeroclaw_config::schema::Config,
@@ -1327,7 +1327,7 @@ mod tests {
     fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
         AppState {
             config: Arc::new(Mutex::new(config)),
-            provider: Arc::new(MockProvider),
+            model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),

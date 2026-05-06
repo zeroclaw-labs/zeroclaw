@@ -18,13 +18,13 @@ use std::sync::Arc;
 use std::time::Instant;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
-use zeroclaw_providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
+use zeroclaw_providers::{self, ChatMessage, ChatRequest, ConversationMessage, ModelProvider};
 
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
 pub struct Agent {
-    provider: Box<dyn Provider>,
+    model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
     tool_specs: Vec<ToolSpec>,
     memory: Arc<dyn Memory>,
@@ -123,7 +123,7 @@ impl AgentChannelHandles {
 }
 
 pub struct AgentBuilder {
-    provider: Option<Box<dyn Provider>>,
+    model_provider: Option<Box<dyn ModelProvider>>,
     tools: Option<Vec<Box<dyn Tool>>>,
     memory: Option<Arc<dyn Memory>>,
     observer: Option<Arc<dyn Observer>>,
@@ -160,7 +160,7 @@ impl Default for AgentBuilder {
 impl AgentBuilder {
     pub fn new() -> Self {
         Self {
-            provider: None,
+            model_provider: None,
             tools: None,
             memory: None,
             observer: None,
@@ -189,8 +189,8 @@ impl AgentBuilder {
         }
     }
 
-    pub fn provider(mut self, provider: Box<dyn Provider>) -> Self {
-        self.provider = Some(provider);
+    pub fn model_provider(mut self, model_provider: Box<dyn ModelProvider>) -> Self {
+        self.model_provider = Some(model_provider);
         self
     }
 
@@ -345,9 +345,9 @@ impl AgentBuilder {
         let tool_specs = tools.iter().map(|tool| tool.spec()).collect();
 
         Ok(Agent {
-            provider: self
-                .provider
-                .ok_or_else(|| anyhow::anyhow!("provider is required"))?,
+            model_provider: self
+                .model_provider
+                .ok_or_else(|| anyhow::anyhow!("model_provider is required"))?,
             tools,
             tool_specs,
             memory: self
@@ -368,7 +368,7 @@ impl AgentBuilder {
             config: self.config.unwrap_or_default(),
             // No silent vendor-default model. Callers that construct `Agent` via the
             // builder must set `model_name` explicitly (via `.model_name(...)` or via
-            // `Agent::from_config`, which resolves from `[providers]`). The sentinel
+            // `Agent::from_config`, which resolves from `[model_providers]`). The sentinel
             // keeps the field non-empty so accidental dispatch surfaces a clear 4xx
             // rather than misrouting to a real vendor model.
             model_name: self.model_name.unwrap_or_else(|| "<unconfigured>".into()),
@@ -497,14 +497,14 @@ impl Agent {
             session_cwd.unwrap_or(&config.workspace_dir),
         ));
 
-        let primary_provider = config.providers.first_provider();
+        let primary_model_provider = config.providers.first_model_provider();
         let memory: Arc<dyn Memory> =
             Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
                 &config.providers.embedding_routes,
                 config.resolve_active_storage(),
                 &config.workspace_dir,
-                primary_provider.and_then(|e| e.api_key.as_deref()),
+                primary_model_provider.and_then(|e| e.api_key.as_deref()),
             )?);
 
         let composio_key = if config.composio.enabled {
@@ -539,7 +539,7 @@ impl Agent {
             &config.web_fetch,
             &security.workspace_dir,
             &config.agents,
-            primary_provider.and_then(|e| e.api_key.as_deref()),
+            primary_model_provider.and_then(|e| e.api_key.as_deref()),
             config,
             None,
         );
@@ -607,10 +607,10 @@ impl Agent {
 
         let provider_name = config
             .providers
-            .first_provider_type()
+            .first_model_provider_type()
             .unwrap_or("openrouter");
 
-        let model_name = match primary_provider
+        let model_name = match primary_model_provider
             .and_then(|e| e.model.as_deref())
             .map(str::trim)
             .filter(|m| !m.is_empty())
@@ -619,9 +619,9 @@ impl Agent {
             None => match config.providers.resolve_default_model() {
                 Some(m) => {
                     tracing::warn!(
-                        provider = provider_name,
+                        model_provider = provider_name,
                         model = %m,
-                        "fallback provider has no `model` set; using first configured \
+                        "fallback model_provider has no `model` set; using first configured \
                          providers.models entry as default. Set [providers.models.{provider_name}] \
                          model = \"...\" to silence this warning.",
                     );
@@ -640,21 +640,22 @@ impl Agent {
         let provider_runtime_options =
             zeroclaw_providers::provider_runtime_options_from_config(config);
 
-        let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
-            provider_name,
-            primary_provider.and_then(|e| e.api_key.as_deref()),
-            primary_provider.and_then(|e| e.uri.as_deref()),
-            &config.reliability,
-            &config.providers.model_routes,
-            &model_name,
-            &provider_runtime_options,
-        )?;
+        let model_provider: Box<dyn ModelProvider> =
+            zeroclaw_providers::create_routed_model_provider_with_options(
+                provider_name,
+                primary_model_provider.and_then(|e| e.api_key.as_deref()),
+                primary_model_provider.and_then(|e| e.uri.as_deref()),
+                &config.reliability,
+                &config.providers.model_routes,
+                &model_name,
+                &provider_runtime_options,
+            )?;
 
         let dispatcher_choice = agent_cfg.tool_dispatcher.as_str();
         let tool_dispatcher: Box<dyn ToolDispatcher> = match dispatcher_choice {
             "native" => Box::new(NativeToolDispatcher),
             "xml" => Box::new(XmlToolDispatcher),
-            _ if provider.supports_native_tools() => Box::new(NativeToolDispatcher),
+            _ if model_provider.supports_native_tools() => Box::new(NativeToolDispatcher),
             _ => Box::new(XmlToolDispatcher),
         };
 
@@ -693,7 +694,7 @@ impl Agent {
         tools::register_skill_tools(&mut tools, &skills, security.clone());
 
         let mut agent = Agent::builder()
-            .provider(provider)
+            .model_provider(model_provider)
             .tools(tools)
             .memory(memory)
             .observer(observer)
@@ -706,7 +707,11 @@ impl Agent {
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(agent_cfg.clone())
             .model_name(model_name)
-            .temperature(primary_provider.and_then(|e| e.temperature).unwrap_or(0.7))
+            .temperature(
+                primary_model_provider
+                    .and_then(|e| e.temperature)
+                    .unwrap_or(0.7),
+            )
             .workspace_dir(security.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
@@ -772,7 +777,7 @@ impl Agent {
             // after the drop is a ToolResults, its paired AssistantToolCalls was
             // dropped, so the ToolResults must be dropped too. Otherwise the
             // history would start with a tool_result block whose tool_use_id
-            // has no matching tool_use, causing providers (e.g. Anthropic) to
+            // has no matching tool_use, causing model_providers (e.g. Anthropic) to
             // reject the request with "messages.0.content.0: unexpected
             // tool_use_id found in tool_result blocks".
             while drop_count < other_messages.len()
@@ -1165,7 +1170,7 @@ impl Agent {
             }
 
             let response = match self
-                .provider
+                .model_provider
                 .chat(
                     ChatRequest {
                         messages: &messages,
@@ -1345,12 +1350,12 @@ impl Agent {
             }
 
             // ── Streaming LLM call ────────────────────────────────────
-            // Try streaming first; if the provider returns content we
+            // Try streaming first; if the model_provider returns content we
             // forward deltas.  Otherwise fall back to non-streaming chat.
             use futures_util::StreamExt;
 
             let stream_opts = zeroclaw_providers::traits::StreamOptions::new(true);
-            let mut stream = self.provider.stream_chat(
+            let mut stream = self.model_provider.stream_chat(
                 zeroclaw_providers::ChatRequest {
                     messages: &messages,
                     tools: if self.tool_dispatcher.should_send_tool_specs() {
@@ -1373,7 +1378,7 @@ impl Agent {
             // Consume the stream, checking for cancellation between chunks.
             // We use a manual loop with `tokio::select!` so that a cancel
             // signal interrupts even while waiting for the next SSE event
-            // from the provider.
+            // from the model_provider.
             loop {
                 let next_item = stream.next();
 
@@ -1453,7 +1458,7 @@ impl Agent {
                     Err(_) => break,
                 }
             }
-            // Drop the stream so we release the borrow on provider.
+            // Drop the stream so we release the borrow on model_provider.
             drop(stream);
 
             // If cancelled during streaming, return partial content with
@@ -1484,7 +1489,7 @@ impl Agent {
                 }
             } else {
                 // Fall back to non-streaming chat, with cancellation guard
-                let chat_fut = self.provider.chat(
+                let chat_fut = self.model_provider.chat(
                     ChatRequest {
                         messages: &messages,
                         tools: if self.tool_dispatcher.should_send_tool_specs() {
@@ -1647,7 +1652,7 @@ pub async fn run(
 
     let mut effective_config = config;
     if let Some(p) = provider_override {
-        // When a provider override is specified, ensure that provider type exists
+        // When a model_provider override is specified, ensure that model_provider type exists
         // in models and is set as the first (and only) entry for routing purposes.
         if let Some((type_key, alias_key)) = p.split_once('.') {
             effective_config
@@ -1658,7 +1663,7 @@ pub async fn run(
             effective_config.providers.models.ensure(&p, "default");
         }
     }
-    if let Some(entry) = effective_config.providers.first_provider_mut() {
+    if let Some(entry) = effective_config.providers.first_model_provider_mut() {
         if let Some(m) = model_override {
             entry.model = Some(m);
         }
@@ -1669,7 +1674,7 @@ pub async fn run(
 
     let provider_name = effective_config
         .providers
-        .first_provider_type()
+        .first_model_provider_type()
         .unwrap_or("openrouter")
         .to_string();
     // `Agent::from_config` above has already errored if no model could be resolved,
@@ -1678,7 +1683,7 @@ pub async fn run(
     // never silently substitute a hardcoded vendor model.
     let model_name = effective_config
         .providers
-        .first_provider()
+        .first_model_provider()
         .and_then(|e| e.model.as_deref())
         .map(str::trim)
         .filter(|m| !m.is_empty())
@@ -1687,7 +1692,7 @@ pub async fn run(
         .unwrap_or_else(|| "<unresolved>".to_string());
 
     agent.observer.record_event(&ObserverEvent::AgentStart {
-        provider: provider_name.clone(),
+        model_provider: provider_name.clone(),
         model: model_name.clone(),
     });
 
@@ -1699,7 +1704,7 @@ pub async fn run(
     }
 
     agent.observer.record_event(&ObserverEvent::AgentEnd {
-        provider: provider_name,
+        model_provider: provider_name,
         model: model_name,
         duration: start.elapsed(),
         tokens_used: None,
@@ -1717,12 +1722,12 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct MockProvider {
+    struct MockModelProvider {
         responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
     }
 
     #[async_trait]
-    impl Provider for MockProvider {
+    impl ModelProvider for MockModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -1752,13 +1757,13 @@ mod tests {
         }
     }
 
-    struct ModelCaptureProvider {
+    struct ModelCaptureModelProvider {
         responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
         seen_models: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
-    impl Provider for ModelCaptureProvider {
+    impl ModelProvider for ModelCaptureModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -1876,7 +1881,7 @@ mod tests {
 
     #[tokio::test]
     async fn turn_without_tools_returns_text() {
-        let provider = Box::new(MockProvider {
+        let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
                 text: Some("hello".into()),
                 tool_calls: vec![],
@@ -1896,7 +1901,7 @@ mod tests {
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
-            .provider(provider)
+            .model_provider(model_provider)
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
@@ -1911,7 +1916,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_agent_tool_execution_requests_acp_approval() {
-        let provider = Box::new(MockProvider {
+        let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![]),
         });
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
@@ -1930,7 +1935,7 @@ mod tests {
             ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
         let mut agent = Agent::builder()
-            .provider(provider)
+            .model_provider(model_provider)
             .tools(vec![Box::new(CountingTool {
                 calls: Arc::clone(&tool_calls),
             })])
@@ -1968,7 +1973,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_agent_tool_execution_denies_when_acp_rejects() {
-        let provider = Box::new(MockProvider {
+        let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![]),
         });
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
@@ -1987,7 +1992,7 @@ mod tests {
             ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
         let mut agent = Agent::builder()
-            .provider(provider)
+            .model_provider(model_provider)
             .tools(vec![Box::new(CountingTool {
                 calls: Arc::clone(&tool_calls),
             })])
@@ -2025,7 +2030,7 @@ mod tests {
 
     #[tokio::test]
     async fn turn_with_native_dispatcher_handles_tool_results_variant() {
-        let provider = Box::new(MockProvider {
+        let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![
                 zeroclaw_providers::ChatResponse {
                     text: Some(String::new()),
@@ -2058,7 +2063,7 @@ mod tests {
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
-            .provider(provider)
+            .model_provider(model_provider)
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
@@ -2080,7 +2085,7 @@ mod tests {
     #[tokio::test]
     async fn turn_routes_with_hint_when_query_classification_matches() {
         let seen_models = Arc::new(Mutex::new(Vec::new()));
-        let provider = Box::new(ModelCaptureProvider {
+        let model_provider = Box::new(ModelCaptureModelProvider {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
                 text: Some("classified".into()),
                 tool_calls: vec![],
@@ -2103,7 +2108,7 @@ mod tests {
         let mut route_model_by_hint = HashMap::new();
         route_model_by_hint.insert("fast".to_string(), "anthropic/claude-haiku-4-5".to_string());
         let mut agent = Agent::builder()
-            .provider(provider)
+            .model_provider(model_provider)
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
@@ -2186,20 +2191,20 @@ mod tests {
             ..Default::default()
         };
         {
-            // Use the `custom:<url>` provider — it builds an
-            // OpenAiCompatibleProvider routed through the `compat`
+            // Use the `custom:<url>` model_provider — it builds an
+            // OpenAiCompatibleModelProvider routed through the `compat`
             // closure, which is the only path that actually wires
             // `extra_headers` onto outgoing requests. (The native
             // `openai` factory ignores extra_headers; OpenRouter
             // hardcodes the upstream URL.)
-            // Custom-URL provider: type is the canonical `custom` slot,
+            // Custom-URL model_provider: type is the canonical `custom` slot,
             // operator URL goes in the `uri` field (post-Phase 6 — V3
             // operators no longer put URLs in the outer type key).
             let entry = config
                 .providers
                 .models
                 .ensure("custom", "default")
-                .expect("custom provider type slot");
+                .expect("custom model_provider type slot");
             entry.api_key = Some("test-key".to_string());
             entry.model = Some("test-model".to_string());
             entry.uri = Some(format!("http://{mock_addr}"));
@@ -2215,7 +2220,7 @@ mod tests {
         config.memory.auto_save = false;
 
         // V3 requires an explicit agent. Wire up a minimal agent that
-        // points at the synthesized provider entry, then construct
+        // points at the synthesized model_provider entry, then construct
         // Agent::from_config against it.
         config.risk_profiles.insert(
             "test-profile".to_string(),
@@ -2223,8 +2228,8 @@ mod tests {
         );
         let provider_alias = config
             .providers
-            .first_provider_type()
-            .expect("provider configured above")
+            .first_model_provider_type()
+            .expect("model_provider configured above")
             .to_string();
         let agent_cfg = zeroclaw_config::schema::DelegateAgentConfig {
             model_provider: format!("{provider_alias}.default"),
@@ -2259,7 +2264,7 @@ mod tests {
 
     #[test]
     fn builder_allowed_tools_none_keeps_all_tools() {
-        let provider = Box::new(MockProvider {
+        let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![]),
         });
 
@@ -2274,7 +2279,7 @@ mod tests {
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let agent = Agent::builder()
-            .provider(provider)
+            .model_provider(model_provider)
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
@@ -2290,7 +2295,7 @@ mod tests {
 
     #[test]
     fn builder_allowed_tools_some_filters_tools() {
-        let provider = Box::new(MockProvider {
+        let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![]),
         });
 
@@ -2305,7 +2310,7 @@ mod tests {
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let agent = Agent::builder()
-            .provider(provider)
+            .model_provider(model_provider)
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
@@ -2323,7 +2328,7 @@ mod tests {
 
     #[test]
     fn seed_history_prepends_system_and_skips_system_from_seed() {
-        let provider = Box::new(MockProvider {
+        let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![]),
         });
 
@@ -2338,7 +2343,7 @@ mod tests {
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
-            .provider(provider)
+            .model_provider(model_provider)
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
@@ -2367,15 +2372,15 @@ mod tests {
         assert_eq!(history.len(), 3);
     }
 
-    /// Mock provider that captures whether tool specs were passed to `stream_chat`
+    /// Mock model_provider that captures whether tool specs were passed to `stream_chat`
     /// and returns a tool call followed by a text response through the stream.
-    struct StreamToolCaptureProvider {
+    struct StreamToolCaptureModelProvider {
         tools_received: Arc<Mutex<Vec<bool>>>,
         call_count: Arc<Mutex<usize>>,
     }
 
     #[async_trait]
-    impl Provider for StreamToolCaptureProvider {
+    impl ModelProvider for StreamToolCaptureModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2470,7 +2475,7 @@ mod tests {
     #[tokio::test]
     async fn turn_streamed_passes_tool_specs_to_provider() {
         let tools_received = Arc::new(Mutex::new(Vec::new()));
-        let provider = Box::new(StreamToolCaptureProvider {
+        let model_provider = Box::new(StreamToolCaptureModelProvider {
             tools_received: tools_received.clone(),
             call_count: Arc::new(Mutex::new(0)),
         });
@@ -2486,7 +2491,7 @@ mod tests {
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
-            .provider(provider)
+            .model_provider(model_provider)
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
@@ -2574,10 +2579,10 @@ mod tests {
         );
     }
 
-    struct PreExecutedToolProvider;
+    struct PreExecutedToolModelProvider;
 
     #[async_trait]
-    impl Provider for PreExecutedToolProvider {
+    impl ModelProvider for PreExecutedToolModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2647,7 +2652,7 @@ mod tests {
 
     #[tokio::test]
     async fn pre_executed_tool_results_keep_ids_when_calls_overlap() {
-        let provider = Box::new(PreExecutedToolProvider);
+        let model_provider = Box::new(PreExecutedToolModelProvider);
 
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
@@ -2660,7 +2665,7 @@ mod tests {
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
-            .provider(provider)
+            .model_provider(model_provider)
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
@@ -2705,7 +2710,7 @@ mod tests {
     /// the boundary fell in the middle of an `AssistantToolCalls` /
     /// `ToolResults` pair, the call side was dropped while the result side
     /// remained — leaving an orphan `ToolResults` at the head of the
-    /// history. The next provider request then started with a `tool_result`
+    /// history. The next model_provider request then started with a `tool_result`
     /// block that had no matching `tool_use`, which Anthropic rejects with:
     ///
     ///   `messages.0.content.0: unexpected tool_use_id found in tool_result blocks`
@@ -2737,7 +2742,7 @@ mod tests {
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
-            .provider(Box::new(MockProvider {
+            .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![]),
             }))
             .tools(vec![Box::new(MockTool)])
@@ -2808,7 +2813,7 @@ mod tests {
     /// When the model returns narration text alongside tool calls, the agent
     /// must store exactly ONE assistant history entry (AssistantToolCalls) —
     /// not a plain Chat(assistant) followed by AssistantToolCalls. The latter
-    /// pattern causes providers that enforce role-alternation to reject the
+    /// pattern causes model_providers that enforce role-alternation to reject the
     /// next request with a consecutive-assistant-role error.
     #[tokio::test]
     async fn narration_with_tool_calls_produces_no_consecutive_assistant_entries() {
@@ -2821,7 +2826,7 @@ mod tests {
                 .expect("memory creation should succeed with valid config"),
         );
 
-        let provider = Box::new(MockProvider {
+        let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
                 text: Some("I will echo the message.".into()),
                 tool_calls: vec![zeroclaw_providers::ToolCall {
@@ -2837,7 +2842,7 @@ mod tests {
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
-            .provider(provider)
+            .model_provider(model_provider)
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)
@@ -2867,12 +2872,12 @@ mod tests {
     /// Streaming mock that emits narration text + tool call on the first turn,
     /// then a plain text response on the second. Used to verify the streaming
     /// path has the same duplicate-narration guard as the blocking path.
-    struct NarrationStreamProvider {
+    struct NarrationStreamModelProvider {
         call_count: Arc<Mutex<usize>>,
     }
 
     #[async_trait]
-    impl Provider for NarrationStreamProvider {
+    impl ModelProvider for NarrationStreamModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2963,13 +2968,13 @@ mod tests {
                 .expect("memory creation should succeed with valid config"),
         );
 
-        let provider = Box::new(NarrationStreamProvider {
+        let model_provider = Box::new(NarrationStreamModelProvider {
             call_count: Arc::new(Mutex::new(0)),
         });
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
-            .provider(provider)
+            .model_provider(model_provider)
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
             .observer(observer)

@@ -1,4 +1,4 @@
-use zeroclaw_api::provider::ChatMessage;
+use zeroclaw_api::model_provider::ChatMessage;
 
 pub use zeroclaw_config::scattered_types::HistoryPrunerConfig;
 
@@ -188,7 +188,7 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
     // An assistant message followed by one or more consecutive tool messages
     // forms an atomic group (tool_use + tool_result pairing). Collapsing only
     // part of the group would orphan tool_use blocks, causing API 400 errors
-    // from providers that enforce pairing (e.g., Anthropic). See #4810.
+    // from model_providers that enforce pairing (e.g., Anthropic). See #4810.
     //
     // The group is collapsed only when *every* tool in it is unprotected —
     // the same all-or-nothing rule Phase 2 uses. If `keep_recent` protects
@@ -716,7 +716,10 @@ mod tests {
             msg("assistant", "Here are the results."),
             msg("assistant", tool_calls_assistant),
             msg("tool", r#"{"content":"ok","tool_call_id":"toolu_DEAD"}"#),
-            msg("assistant", "The provider returned an empty response."),
+            msg(
+                "assistant",
+                "The model_provider returned an empty response.",
+            ),
         ];
         let removed = remove_orphaned_tool_messages(&mut messages);
         assert_eq!(
@@ -731,7 +734,7 @@ mod tests {
         assert_eq!(messages[3].role, "assistant");
         assert_eq!(
             messages[3].content,
-            "The provider returned an empty response."
+            "The model_provider returned an empty response."
         );
     }
 

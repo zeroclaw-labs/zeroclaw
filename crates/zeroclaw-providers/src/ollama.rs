@@ -1,6 +1,6 @@
 use crate::multimodal;
 use crate::traits::{
-    ChatMessage, ChatResponse, Provider, ProviderCapabilities, TokenUsage, ToolCall,
+    ChatMessage, ChatResponse, ModelProvider, ProviderCapabilities, TokenUsage, ToolCall,
 };
 use async_trait::async_trait;
 use reqwest::Client;
@@ -17,7 +17,7 @@ const TIMEOUT_SECS_DEFAULT: u64 = 600;
 /// `providers.models.<name>.base-url` for remote GPU boxes or non-default ports.
 const BASE_URL: &str = "http://localhost:11434";
 
-pub struct OllamaProvider {
+pub struct OllamaModelProvider {
     base_url: String,
     api_key: Option<String>,
     reasoning_enabled: Option<bool>,
@@ -121,7 +121,7 @@ where
 }
 // ─── Implementation ───────────────────────────────────────────────────────────
 
-impl OllamaProvider {
+impl OllamaModelProvider {
     fn normalize_base_url(raw_url: &str) -> String {
         let trimmed = raw_url.trim().trim_end_matches('/');
         if trimmed.is_empty() {
@@ -166,7 +166,7 @@ impl OllamaProvider {
 
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "provider.ollama",
+            "model_provider.ollama",
             300,
             10,
         )
@@ -634,8 +634,8 @@ impl OllamaProvider {
 }
 
 #[async_trait]
-impl Provider for OllamaProvider {
-    // ── Provider-family defaults ──
+impl ModelProvider for OllamaModelProvider {
+    // ── ModelProvider-family defaults ──
     fn default_temperature(&self) -> f64 {
         TEMPERATURE_DEFAULT
     }
@@ -859,7 +859,7 @@ impl Provider for OllamaProvider {
 
     async fn chat(
         &self,
-        request: zeroclaw_api::provider::ChatRequest<'_>,
+        request: zeroclaw_api::model_provider::ChatRequest<'_>,
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
@@ -933,43 +933,43 @@ mod tests {
 
     #[test]
     fn default_url() {
-        let p = OllamaProvider::new(None, None);
+        let p = OllamaModelProvider::new(None, None);
         assert_eq!(p.base_url, "http://localhost:11434");
     }
 
     #[test]
     fn custom_url_trailing_slash() {
-        let p = OllamaProvider::new(Some("http://192.168.1.100:11434/"), None);
+        let p = OllamaModelProvider::new(Some("http://192.168.1.100:11434/"), None);
         assert_eq!(p.base_url, "http://192.168.1.100:11434");
     }
 
     #[test]
     fn custom_url_no_trailing_slash() {
-        let p = OllamaProvider::new(Some("http://myserver:11434"), None);
+        let p = OllamaModelProvider::new(Some("http://myserver:11434"), None);
         assert_eq!(p.base_url, "http://myserver:11434");
     }
 
     #[test]
     fn custom_url_strips_api_suffix() {
-        let p = OllamaProvider::new(Some("https://ollama.com/api/"), None);
+        let p = OllamaModelProvider::new(Some("https://ollama.com/api/"), None);
         assert_eq!(p.base_url, "https://ollama.com");
     }
 
     #[test]
     fn custom_url_strips_api_chat_suffix() {
-        let p = OllamaProvider::new(Some("http://172.30.30.50:11434/api/chat"), None);
+        let p = OllamaModelProvider::new(Some("http://172.30.30.50:11434/api/chat"), None);
         assert_eq!(p.base_url, "http://172.30.30.50:11434");
     }
 
     #[test]
     fn empty_url_uses_empty() {
-        let p = OllamaProvider::new(Some(""), None);
+        let p = OllamaModelProvider::new(Some(""), None);
         assert_eq!(p.base_url, "");
     }
 
     #[test]
     fn cloud_suffix_strips_model_name() {
-        let p = OllamaProvider::new(Some("https://ollama.com"), Some("ollama-key"));
+        let p = OllamaModelProvider::new(Some("https://ollama.com"), Some("ollama-key"));
         let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
         assert_eq!(model, "qwen3");
         assert!(should_auth);
@@ -977,7 +977,7 @@ mod tests {
 
     #[test]
     fn cloud_suffix_with_local_endpoint_errors() {
-        let p = OllamaProvider::new(None, Some("ollama-key"));
+        let p = OllamaModelProvider::new(None, Some("ollama-key"));
         let error = p
             .resolve_request_details("qwen3:cloud")
             .expect_err("cloud suffix should fail on local endpoint");
@@ -990,7 +990,7 @@ mod tests {
 
     #[test]
     fn cloud_suffix_without_api_key_errors() {
-        let p = OllamaProvider::new(Some("https://ollama.com"), None);
+        let p = OllamaModelProvider::new(Some("https://ollama.com"), None);
         let error = p
             .resolve_request_details("qwen3:cloud")
             .expect_err("cloud suffix should require API key");
@@ -1003,14 +1003,14 @@ mod tests {
 
     #[test]
     fn remote_endpoint_auth_enabled_when_key_present() {
-        let p = OllamaProvider::new(Some("https://ollama.com"), Some("ollama-key"));
+        let p = OllamaModelProvider::new(Some("https://ollama.com"), Some("ollama-key"));
         let (_model, should_auth) = p.resolve_request_details("qwen3").unwrap();
         assert!(should_auth);
     }
 
     #[test]
     fn remote_endpoint_with_api_suffix_still_allows_cloud_models() {
-        let p = OllamaProvider::new(Some("https://ollama.com/api"), Some("ollama-key"));
+        let p = OllamaModelProvider::new(Some("https://ollama.com/api"), Some("ollama-key"));
         let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
         assert_eq!(model, "qwen3");
         assert!(should_auth);
@@ -1018,15 +1018,15 @@ mod tests {
 
     #[test]
     fn local_endpoint_auth_disabled_even_with_key() {
-        let p = OllamaProvider::new(None, Some("ollama-key"));
+        let p = OllamaModelProvider::new(None, Some("ollama-key"));
         let (_model, should_auth) = p.resolve_request_details("llama3").unwrap();
         assert!(!should_auth);
     }
 
     #[test]
     fn request_omits_think_when_reasoning_not_configured() {
-        let provider = OllamaProvider::new(None, None);
-        let request = provider.build_chat_request(
+        let model_provider = OllamaModelProvider::new(None, None);
+        let request = model_provider.build_chat_request(
             vec![Message {
                 role: "user".to_string(),
                 content: Some("hello".to_string()),
@@ -1045,8 +1045,8 @@ mod tests {
 
     #[test]
     fn request_includes_think_when_reasoning_configured() {
-        let provider = OllamaProvider::new_with_reasoning(None, None, Some(false));
-        let request = provider.build_chat_request(
+        let model_provider = OllamaModelProvider::new_with_reasoning(None, None, Some(false));
+        let request = model_provider.build_chat_request(
             vec![Message {
                 role: "user".to_string(),
                 content: Some("hello".to_string()),
@@ -1080,11 +1080,11 @@ mod tests {
     #[test]
     fn normalize_response_text_rejects_whitespace_only_content() {
         assert_eq!(
-            OllamaProvider::normalize_response_text("\n \t".to_string()),
+            OllamaModelProvider::normalize_response_text("\n \t".to_string()),
             None
         );
         assert_eq!(
-            OllamaProvider::normalize_response_text(" hello ".to_string()),
+            OllamaModelProvider::normalize_response_text(" hello ".to_string()),
             Some("hello".to_string())
         );
     }
@@ -1092,7 +1092,9 @@ mod tests {
     #[test]
     fn normalize_response_text_strips_think_tags() {
         assert_eq!(
-            OllamaProvider::normalize_response_text("<think>reasoning</think> hello".to_string()),
+            OllamaModelProvider::normalize_response_text(
+                "<think>reasoning</think> hello".to_string()
+            ),
             Some("hello".to_string())
         );
     }
@@ -1100,7 +1102,7 @@ mod tests {
     #[test]
     fn normalize_response_text_rejects_think_only_content() {
         assert_eq!(
-            OllamaProvider::normalize_response_text(
+            OllamaModelProvider::normalize_response_text(
                 "<think>only thinking here</think>".to_string()
             ),
             None
@@ -1109,7 +1111,7 @@ mod tests {
 
     #[test]
     fn fallback_text_for_empty_content_without_thinking_is_generic() {
-        let text = OllamaProvider::fallback_text_for_empty_content("qwen3-coder", None);
+        let text = OllamaModelProvider::fallback_text_for_empty_content("qwen3-coder", None);
         assert!(text.contains("couldn't get a complete response from Ollama"));
     }
 
@@ -1139,7 +1141,7 @@ mod tests {
 
     #[test]
     fn extract_tool_name_handles_nested_tool_call() {
-        let provider = OllamaProvider::new(None, None);
+        let model_provider = OllamaModelProvider::new(None, None);
         let tc = OllamaToolCall {
             id: Some("call_123".into()),
             function: OllamaFunction {
@@ -1150,14 +1152,14 @@ mod tests {
                 }),
             },
         };
-        let (name, args) = provider.extract_tool_name_and_args(&tc);
+        let (name, args) = model_provider.extract_tool_name_and_args(&tc);
         assert_eq!(name, "shell");
         assert_eq!(args.get("command").unwrap(), "date");
     }
 
     #[test]
     fn extract_tool_name_handles_prefixed_name() {
-        let provider = OllamaProvider::new(None, None);
+        let model_provider = OllamaModelProvider::new(None, None);
         let tc = OllamaToolCall {
             id: Some("call_123".into()),
             function: OllamaFunction {
@@ -1165,14 +1167,14 @@ mod tests {
                 arguments: serde_json::json!({"command": "ls"}),
             },
         };
-        let (name, args) = provider.extract_tool_name_and_args(&tc);
+        let (name, args) = model_provider.extract_tool_name_and_args(&tc);
         assert_eq!(name, "shell");
         assert_eq!(args.get("command").unwrap(), "ls");
     }
 
     #[test]
     fn extract_tool_name_handles_normal_call() {
-        let provider = OllamaProvider::new(None, None);
+        let model_provider = OllamaModelProvider::new(None, None);
         let tc = OllamaToolCall {
             id: Some("call_123".into()),
             function: OllamaFunction {
@@ -1180,14 +1182,14 @@ mod tests {
                 arguments: serde_json::json!({"path": "/tmp/test"}),
             },
         };
-        let (name, args) = provider.extract_tool_name_and_args(&tc);
+        let (name, args) = model_provider.extract_tool_name_and_args(&tc);
         assert_eq!(name, "file_read");
         assert_eq!(args.get("path").unwrap(), "/tmp/test");
     }
 
     #[test]
     fn format_tool_calls_produces_valid_json() {
-        let provider = OllamaProvider::new(None, None);
+        let model_provider = OllamaModelProvider::new(None, None);
         let tool_calls = vec![OllamaToolCall {
             id: Some("call_abc".into()),
             function: OllamaFunction {
@@ -1196,7 +1198,7 @@ mod tests {
             },
         }];
 
-        let formatted = provider.format_tool_calls_for_loop(&tool_calls);
+        let formatted = model_provider.format_tool_calls_for_loop(&tool_calls);
         let parsed: serde_json::Value = serde_json::from_str(&formatted).unwrap();
 
         assert!(parsed.get("tool_calls").is_some());
@@ -1211,13 +1213,13 @@ mod tests {
 
     #[test]
     fn convert_messages_parses_native_assistant_tool_calls() {
-        let provider = OllamaProvider::new(None, None);
+        let model_provider = OllamaModelProvider::new(None, None);
         let messages = vec![ChatMessage {
             role: "assistant".into(),
             content: r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"ls\"}"}]}"#.into(),
         }];
 
-        let converted = provider.convert_messages(&messages);
+        let converted = model_provider.convert_messages(&messages);
 
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "assistant");
@@ -1234,7 +1236,7 @@ mod tests {
 
     #[test]
     fn convert_messages_maps_tool_result_call_id_to_tool_name() {
-        let provider = OllamaProvider::new(None, None);
+        let model_provider = OllamaModelProvider::new(None, None);
         let messages = vec![
             ChatMessage {
                 role: "assistant".into(),
@@ -1246,7 +1248,7 @@ mod tests {
             },
         ];
 
-        let converted = provider.convert_messages(&messages);
+        let converted = model_provider.convert_messages(&messages);
 
         assert_eq!(converted.len(), 2);
         assert_eq!(converted[1].role, "tool");
@@ -1257,13 +1259,13 @@ mod tests {
 
     #[test]
     fn convert_messages_extracts_images_from_user_marker() {
-        let provider = OllamaProvider::new(None, None);
+        let model_provider = OllamaModelProvider::new(None, None);
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "Inspect this screenshot [IMAGE:data:image/png;base64,abcd==]".into(),
         }];
 
-        let converted = provider.convert_messages(&messages);
+        let converted = model_provider.convert_messages(&messages);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "user");
         assert_eq!(
@@ -1279,8 +1281,8 @@ mod tests {
 
     #[test]
     fn capabilities_disable_native_tools_and_enable_vision() {
-        let provider = OllamaProvider::new(None, None);
-        let caps = <OllamaProvider as Provider>::capabilities(&provider);
+        let model_provider = OllamaModelProvider::new(None, None);
+        let caps = <OllamaModelProvider as ModelProvider>::capabilities(&model_provider);
         assert!(
             !caps.native_tool_calling,
             "Ollama should default to prompt-guided tool calling"
@@ -1315,26 +1317,26 @@ mod tests {
     #[test]
     fn strip_think_tags_removes_single_block() {
         let input = "<think>internal reasoning</think>Hello world";
-        assert_eq!(OllamaProvider::strip_think_tags(input), "Hello world");
+        assert_eq!(OllamaModelProvider::strip_think_tags(input), "Hello world");
     }
 
     #[test]
     fn strip_think_tags_removes_multiple_blocks() {
         let input = "<think>first</think>A<think>second</think>B";
-        assert_eq!(OllamaProvider::strip_think_tags(input), "AB");
+        assert_eq!(OllamaModelProvider::strip_think_tags(input), "AB");
     }
 
     #[test]
     fn strip_think_tags_handles_unclosed_block() {
         let input = "visible<think>hidden tail";
-        assert_eq!(OllamaProvider::strip_think_tags(input), "visible");
+        assert_eq!(OllamaModelProvider::strip_think_tags(input), "visible");
     }
 
     #[test]
     fn strip_think_tags_preserves_text_without_tags() {
         let input = "plain text response";
         assert_eq!(
-            OllamaProvider::strip_think_tags(input),
+            OllamaModelProvider::strip_think_tags(input),
             "plain text response"
         );
     }
@@ -1342,7 +1344,7 @@ mod tests {
     #[test]
     fn strip_think_tags_returns_empty_for_think_only() {
         let input = "<think>only thinking</think>";
-        assert_eq!(OllamaProvider::strip_think_tags(input), "");
+        assert_eq!(OllamaModelProvider::strip_think_tags(input), "");
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1351,7 +1353,7 @@ mod tests {
 
     #[test]
     fn effective_content_strips_think_and_returns_rest() {
-        let result = OllamaProvider::effective_content(
+        let result = OllamaModelProvider::effective_content(
             "<think>reasoning</think>\n<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>",
             None,
         );
@@ -1363,7 +1365,7 @@ mod tests {
 
     #[test]
     fn effective_content_falls_back_to_thinking_field() {
-        let result = OllamaProvider::effective_content(
+        let result = OllamaModelProvider::effective_content(
             "",
             Some(
                 "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}</tool_call>",
@@ -1375,10 +1377,10 @@ mod tests {
 
     #[test]
     fn effective_content_returns_none_when_both_empty() {
-        assert!(OllamaProvider::effective_content("", None).is_none());
-        assert!(OllamaProvider::effective_content("", Some("")).is_none());
+        assert!(OllamaModelProvider::effective_content("", None).is_none());
+        assert!(OllamaModelProvider::effective_content("", Some("")).is_none());
         assert!(
-            OllamaProvider::effective_content(
+            OllamaModelProvider::effective_content(
                 "<think>only thinking</think>",
                 Some("<think>also only thinking</think>")
             )
@@ -1388,13 +1390,13 @@ mod tests {
 
     #[test]
     fn effective_content_prefers_content_over_thinking() {
-        let result = OllamaProvider::effective_content("content text", Some("thinking text"));
+        let result = OllamaModelProvider::effective_content("content text", Some("thinking text"));
         assert_eq!(result, Some("content text".to_string()));
     }
 
     #[test]
     fn effective_content_uses_thinking_when_content_is_think_only() {
-        let result = OllamaProvider::effective_content(
+        let result = OllamaModelProvider::effective_content(
             "<think>just reasoning</think>",
             Some("actual useful text from thinking field"),
         );
@@ -1414,7 +1416,7 @@ mod tests {
         // with no structured tool_calls. The <tool_call> tags must survive
         // for downstream parse_tool_calls to extract them.
         let content = "<think>I should list files</think>\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>";
-        let result = OllamaProvider::effective_content(content, None);
+        let result = OllamaModelProvider::effective_content(content, None);
         assert!(result.is_some());
         let text = result.unwrap();
         assert!(text.contains("<tool_call>"));
@@ -1428,7 +1430,7 @@ mod tests {
         // call XML in the thinking field with empty content.
         let content = "";
         let thinking = "I need to check the date\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>";
-        let result = OllamaProvider::effective_content(content, Some(thinking));
+        let result = OllamaModelProvider::effective_content(content, Some(thinking));
         assert!(result.is_some());
         let text = result.unwrap();
         assert!(text.contains("<tool_call>"));

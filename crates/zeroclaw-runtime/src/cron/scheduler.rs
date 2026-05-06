@@ -324,7 +324,7 @@ async fn run_agent_job(
             &config.workspace_dir,
             config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.api_key.as_deref()),
         ) {
             Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
@@ -373,7 +373,7 @@ async fn run_agent_job(
                 model_override,
                 config
                     .providers
-                    .first_provider()
+                    .first_model_provider()
                     .and_then(|e| e.temperature)
                     .unwrap_or(0.7),
                 vec![],
@@ -403,7 +403,7 @@ async fn run_agent_job(
                 &config.workspace_dir,
                 config
                     .providers
-                    .first_provider()
+                    .first_model_provider()
                     .and_then(|e| e.api_key.as_deref()),
             ) {
                 let _ = mem.purge_session(&mem_session_key).await;

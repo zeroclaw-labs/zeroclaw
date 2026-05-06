@@ -72,10 +72,10 @@ fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'stati
 
 // ── TranscriptionProvider trait ─────────────────────────────────
 
-/// Trait for speech-to-text provider implementations.
+/// Trait for speech-to-text transcription_provider implementations.
 #[async_trait]
 pub trait TranscriptionProvider: Send + Sync {
-    /// Human-readable provider name (e.g. "groq", "openai").
+    /// Human-readable transcription_provider name (e.g. "groq", "openai").
     fn name(&self) -> &str;
 
     /// Transcribe raw audio bytes. `file_name` includes the extension for
@@ -95,7 +95,7 @@ pub trait TranscriptionProvider: Send + Sync {
 
 // ── GroqProvider ────────────────────────────────────────────────
 
-/// Groq Whisper API provider (default, backward-compatible with existing config).
+/// Groq Whisper API transcription_provider (default, backward-compatible with existing config).
 pub struct GroqProvider {
     api_url: String,
     model: String,
@@ -174,7 +174,7 @@ impl TranscriptionProvider for GroqProvider {
 
 // ── OpenAiWhisperProvider ───────────────────────────────────────
 
-/// OpenAI Whisper API provider.
+/// OpenAI Whisper API transcription_provider.
 pub struct OpenAiWhisperProvider {
     api_key: String,
     model: String,
@@ -232,7 +232,7 @@ impl TranscriptionProvider for OpenAiWhisperProvider {
 
 // ── DeepgramProvider ────────────────────────────────────────────
 
-/// Deepgram STT API provider.
+/// Deepgram STT API transcription_provider.
 pub struct DeepgramProvider {
     api_key: String,
     model: String,
@@ -306,7 +306,7 @@ impl TranscriptionProvider for DeepgramProvider {
 
 // ── AssemblyAiProvider ──────────────────────────────────────────
 
-/// AssemblyAI STT API provider.
+/// AssemblyAI STT API transcription_provider.
 pub struct AssemblyAiProvider {
     api_key: String,
 }
@@ -449,7 +449,7 @@ impl TranscriptionProvider for AssemblyAiProvider {
 
 // ── GoogleSttProvider ───────────────────────────────────────────
 
-/// Google Cloud Speech-to-Text API provider.
+/// Google Cloud Speech-to-Text API transcription_provider.
 pub struct GoogleSttProvider {
     api_key: String,
     language_code: String,
@@ -554,7 +554,7 @@ impl TranscriptionProvider for GoogleSttProvider {
 
 // ── LocalWhisperProvider ────────────────────────────────────────
 
-/// Self-hosted faster-whisper-compatible STT provider.
+/// Self-hosted faster-whisper-compatible STT transcription_provider.
 ///
 /// POSTs audio as `multipart/form-data` (field name `file`) to a configurable
 /// HTTP endpoint (e.g. `http://localhost:8000` or a private network host). The endpoint
@@ -677,105 +677,112 @@ async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
 
 // ── TranscriptionManager ────────────────────────────────────────
 
-/// Manages multiple STT providers and routes transcription requests.
+/// Manages multiple STT transcription_providers and routes transcription requests.
 pub struct TranscriptionManager {
-    providers: HashMap<String, Box<dyn TranscriptionProvider>>,
-    default_provider: String,
+    transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>>,
+    default_transcription_provider: String,
 }
 
 impl TranscriptionManager {
     /// Build a `TranscriptionManager` from config.
     ///
-    /// Always attempts to register the Groq provider from existing config fields.
-    /// Additional providers are registered when their config sections are present.
+    /// Always attempts to register the Groq transcription_provider from existing config fields.
+    /// Additional transcription_providers are registered when their config sections are present.
     ///
-    /// Provider keys with missing API keys are silently skipped — the error
+    /// TranscriptionProvider keys with missing API keys are silently skipped — the error
     /// surfaces at transcribe-time so callers that target a different default
-    /// provider are not blocked.
+    /// transcription_provider are not blocked.
     pub fn new(config: &TranscriptionConfig) -> Result<Self> {
-        let mut providers: HashMap<String, Box<dyn TranscriptionProvider>> = HashMap::new();
+        let mut transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>> =
+            HashMap::new();
 
         if let Ok(groq) = GroqProvider::from_config(config) {
-            providers.insert("groq".to_string(), Box::new(groq));
+            transcription_providers.insert("groq".to_string(), Box::new(groq));
         }
 
         if let Some(ref openai_cfg) = config.openai
             && let Ok(p) = OpenAiWhisperProvider::from_config(openai_cfg)
         {
-            providers.insert("openai".to_string(), Box::new(p));
+            transcription_providers.insert("openai".to_string(), Box::new(p));
         }
 
         if let Some(ref deepgram_cfg) = config.deepgram
             && let Ok(p) = DeepgramProvider::from_config(deepgram_cfg)
         {
-            providers.insert("deepgram".to_string(), Box::new(p));
+            transcription_providers.insert("deepgram".to_string(), Box::new(p));
         }
 
         if let Some(ref assemblyai_cfg) = config.assemblyai
             && let Ok(p) = AssemblyAiProvider::from_config(assemblyai_cfg)
         {
-            providers.insert("assemblyai".to_string(), Box::new(p));
+            transcription_providers.insert("assemblyai".to_string(), Box::new(p));
         }
 
         if let Some(ref google_cfg) = config.google
             && let Ok(p) = GoogleSttProvider::from_config(google_cfg)
         {
-            providers.insert("google".to_string(), Box::new(p));
+            transcription_providers.insert("google".to_string(), Box::new(p));
         }
 
         if let Some(ref local_cfg) = config.local_whisper {
             match LocalWhisperProvider::from_config(local_cfg) {
                 Ok(p) => {
-                    providers.insert("local_whisper".to_string(), Box::new(p));
+                    transcription_providers.insert("local_whisper".to_string(), Box::new(p));
                 }
                 Err(e) => {
-                    tracing::warn!("local_whisper config invalid, provider skipped: {e}");
+                    tracing::warn!(
+                        "local_whisper config invalid, transcription_provider skipped: {e}"
+                    );
                 }
             }
         }
 
-        let default_provider = config.default_provider.clone();
+        let default_transcription_provider = config.default_transcription_provider.clone();
 
-        if config.enabled && !providers.contains_key(&default_provider) {
-            let available: Vec<&str> = providers.keys().map(|k| k.as_str()).collect();
+        if config.enabled && !transcription_providers.contains_key(&default_transcription_provider)
+        {
+            let available: Vec<&str> = transcription_providers.keys().map(|k| k.as_str()).collect();
             bail!(
-                "Default transcription provider '{}' is not configured. Available: {available:?}",
-                default_provider
+                "Default transcription transcription_provider '{}' is not configured. Available: {available:?}",
+                default_transcription_provider
             );
         }
 
         Ok(Self {
-            providers,
-            default_provider,
+            transcription_providers,
+            default_transcription_provider,
         })
     }
 
-    /// Transcribe audio using the default provider.
+    /// Transcribe audio using the default transcription_provider.
     pub async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
-        self.transcribe_with_provider(audio_data, file_name, &self.default_provider)
+        self.transcribe_with_provider(audio_data, file_name, &self.default_transcription_provider)
             .await
     }
 
-    /// Transcribe audio using a specific named provider.
+    /// Transcribe audio using a specific named transcription_provider.
     pub async fn transcribe_with_provider(
         &self,
         audio_data: &[u8],
         file_name: &str,
-        provider: &str,
+        transcription_provider: &str,
     ) -> Result<String> {
-        let p = self.providers.get(provider).ok_or_else(|| {
-            let available: Vec<&str> = self.providers.keys().map(|k| k.as_str()).collect();
+        let p = self.transcription_providers.get(transcription_provider).ok_or_else(|| {
+            let available: Vec<&str> = self.transcription_providers.keys().map(|k| k.as_str()).collect();
             anyhow::anyhow!(
-                "Transcription provider '{provider}' not configured. Available: {available:?}"
+                "Transcription transcription_provider '{transcription_provider}' not configured. Available: {available:?}"
             )
         })?;
 
         p.transcribe(audio_data, file_name).await
     }
 
-    /// List registered provider names.
+    /// List registered transcription_provider names.
     pub fn available_providers(&self) -> Vec<&str> {
-        self.providers.keys().map(|k| k.as_str()).collect()
+        self.transcription_providers
+            .keys()
+            .map(|k| k.as_str())
+            .collect()
     }
 }
 
@@ -786,8 +793,8 @@ impl TranscriptionManager {
 /// Returns the transcribed text on success.
 ///
 /// This is the backward-compatible entry point that preserves the original
-/// function signature. It uses the Groq provider directly, matching the
-/// original single-provider behavior.
+/// function signature. It uses the Groq transcription_provider directly, matching the
+/// original single-transcription_provider behavior.
 ///
 /// Credential resolution order:
 /// 1. `config.transcription.api_key`
@@ -804,40 +811,40 @@ pub async fn transcribe_audio(
     // are reported before missing-key errors (preserves original behavior).
     validate_audio(&audio_data, file_name)?;
 
-    match config.default_provider.as_str() {
+    match config.default_transcription_provider.as_str() {
         "groq" => {
             let groq = GroqProvider::from_config(config)?;
             groq.transcribe(&audio_data, file_name).await
         }
         "openai" => {
             let openai_cfg = config.openai.as_ref().context(
-                "Default transcription provider 'openai' is not configured. Add [transcription.openai]",
+                "Default transcription transcription_provider 'openai' is not configured. Add [transcription.openai]",
             )?;
             let openai = OpenAiWhisperProvider::from_config(openai_cfg)?;
             openai.transcribe(&audio_data, file_name).await
         }
         "deepgram" => {
             let deepgram_cfg = config.deepgram.as_ref().context(
-                "Default transcription provider 'deepgram' is not configured. Add [transcription.deepgram]",
+                "Default transcription transcription_provider 'deepgram' is not configured. Add [transcription.deepgram]",
             )?;
             let deepgram = DeepgramProvider::from_config(deepgram_cfg)?;
             deepgram.transcribe(&audio_data, file_name).await
         }
         "assemblyai" => {
             let assemblyai_cfg = config.assemblyai.as_ref().context(
-                "Default transcription provider 'assemblyai' is not configured. Add [transcription.assemblyai]",
+                "Default transcription transcription_provider 'assemblyai' is not configured. Add [transcription.assemblyai]",
             )?;
             let assemblyai = AssemblyAiProvider::from_config(assemblyai_cfg)?;
             assemblyai.transcribe(&audio_data, file_name).await
         }
         "google" => {
             let google_cfg = config.google.as_ref().context(
-                "Default transcription provider 'google' is not configured. Add [transcription.google]",
+                "Default transcription transcription_provider 'google' is not configured. Add [transcription.google]",
             )?;
             let google = GoogleSttProvider::from_config(google_cfg)?;
             google.transcribe(&audio_data, file_name).await
         }
-        other => bail!("Unsupported transcription provider '{other}'"),
+        other => bail!("Unsupported transcription transcription_provider '{other}'"),
     }
 }
 
@@ -906,7 +913,7 @@ mod tests {
     async fn openai_default_provider_uses_openai_config() {
         let data = vec![0u8; 100];
         let config = TranscriptionConfig {
-            default_provider: "openai".to_string(),
+            default_transcription_provider: "openai".to_string(),
             openai: Some(zeroclaw_config::schema::OpenAiSttConfig {
                 api_key: None,
                 model: "gpt-4o-mini-transcribe".to_string(),
@@ -1008,9 +1015,9 @@ mod tests {
 
         let config = TranscriptionConfig::default();
         let manager = TranscriptionManager::new(&config).unwrap();
-        assert_eq!(manager.default_provider, "groq");
+        assert_eq!(manager.default_transcription_provider, "groq");
         // Groq won't be registered without a key.
-        assert!(manager.providers.is_empty());
+        assert!(manager.transcription_providers.is_empty());
     }
 
     #[test]
@@ -1024,8 +1031,8 @@ mod tests {
         };
 
         let manager = TranscriptionManager::new(&config).unwrap();
-        assert!(manager.providers.contains_key("groq"));
-        assert_eq!(manager.providers["groq"].name(), "groq");
+        assert!(manager.transcription_providers.contains_key("groq"));
+        assert_eq!(manager.transcription_providers["groq"].name(), "groq");
     }
 
     #[test]
@@ -1047,9 +1054,9 @@ mod tests {
         };
 
         let manager = TranscriptionManager::new(&config).unwrap();
-        assert!(manager.providers.contains_key("groq"));
-        assert!(manager.providers.contains_key("openai"));
-        assert!(manager.providers.contains_key("deepgram"));
+        assert!(manager.transcription_providers.contains_key("groq"));
+        assert!(manager.transcription_providers.contains_key("openai"));
+        assert!(manager.transcription_providers.contains_key("deepgram"));
         assert_eq!(manager.available_providers().len(), 3);
     }
 
@@ -1080,7 +1087,7 @@ mod tests {
         unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let config = TranscriptionConfig {
-            default_provider: "openai".to_string(),
+            default_transcription_provider: "openai".to_string(),
             openai: Some(zeroclaw_config::schema::OpenAiSttConfig {
                 api_key: Some("test-openai-key".to_string()),
                 model: "whisper-1".to_string(),
@@ -1089,7 +1096,7 @@ mod tests {
         };
 
         let manager = TranscriptionManager::new(&config).unwrap();
-        assert_eq!(manager.default_provider, "openai");
+        assert_eq!(manager.default_transcription_provider, "openai");
     }
 
     #[test]
@@ -1129,7 +1136,7 @@ mod tests {
         assert!(config.api_key.is_none());
         assert!(config.api_url.contains("groq.com"));
         assert_eq!(config.model, "whisper-large-v3-turbo");
-        assert_eq!(config.default_provider, "groq");
+        assert_eq!(config.default_transcription_provider, "groq");
         assert!(config.openai.is_none());
         assert!(config.deepgram.is_none());
         assert!(config.assemblyai.is_none());
@@ -1226,7 +1233,7 @@ mod tests {
     fn local_whisper_registered_when_config_present() {
         let config = TranscriptionConfig {
             local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
-            default_provider: "local_whisper".to_string(),
+            default_transcription_provider: "local_whisper".to_string(),
             ..TranscriptionConfig::default()
         };
 
@@ -1241,7 +1248,7 @@ mod tests {
     #[test]
     fn local_whisper_misconfigured_section_fails_manager_construction() {
         // A misconfigured local_whisper section logs a warning and skips
-        // registration. When local_whisper is also the default_provider and
+        // registration. When local_whisper is also the default_transcription_provider and
         // transcription is enabled, the safety net in TranscriptionManager
         // surfaces the error: "not configured".
         let mut bad_cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
@@ -1249,7 +1256,7 @@ mod tests {
         let config = TranscriptionConfig {
             local_whisper: Some(bad_cfg),
             enabled: true,
-            default_provider: "local_whisper".to_string(),
+            default_transcription_provider: "local_whisper".to_string(),
             ..TranscriptionConfig::default()
         };
 
@@ -1273,18 +1280,24 @@ mod tests {
     #[tokio::test]
     async fn local_whisper_rejects_oversized_audio() {
         let cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
-        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+        let transcription_provider = LocalWhisperProvider::from_config(&cfg).unwrap();
         let big = vec![0u8; cfg.max_audio_bytes + 1];
-        let err = provider.transcribe(&big, "voice.ogg").await.unwrap_err();
+        let err = transcription_provider
+            .transcribe(&big, "voice.ogg")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("too large"), "got: {err}");
     }
 
     #[tokio::test]
     async fn local_whisper_rejects_unsupported_format() {
         let cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
-        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+        let transcription_provider = LocalWhisperProvider::from_config(&cfg).unwrap();
         let data = vec![0u8; 100];
-        let err = provider.transcribe(&data, "voice.aiff").await.unwrap_err();
+        let err = transcription_provider
+            .transcribe(&data, "voice.aiff")
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("Unsupported audio format"),
             "got: {err}"
@@ -1311,9 +1324,9 @@ mod tests {
             .await;
 
         let cfg = local_whisper_config(&format!("{}/v1/transcribe", server.uri()));
-        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+        let transcription_provider = LocalWhisperProvider::from_config(&cfg).unwrap();
 
-        let result = provider
+        let result = transcription_provider
             .transcribe(b"fake-audio", "voice.ogg")
             .await
             .unwrap();
@@ -1337,9 +1350,9 @@ mod tests {
             .await;
 
         let cfg = local_whisper_config(&format!("{}/v1/transcribe", server.uri()));
-        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+        let transcription_provider = LocalWhisperProvider::from_config(&cfg).unwrap();
 
-        let result = provider
+        let result = transcription_provider
             .transcribe(b"fake-audio", "voice.ogg")
             .await
             .unwrap();
@@ -1364,9 +1377,9 @@ mod tests {
             .await;
 
         let cfg = local_whisper_config(&format!("{}/v1/transcribe", server.uri()));
-        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+        let transcription_provider = LocalWhisperProvider::from_config(&cfg).unwrap();
 
-        let err = provider
+        let err = transcription_provider
             .transcribe(b"fake-audio", "voice.ogg")
             .await
             .unwrap_err();
@@ -1394,9 +1407,9 @@ mod tests {
             .await;
 
         let cfg = local_whisper_config(&format!("{}/v1/transcribe", server.uri()));
-        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+        let transcription_provider = LocalWhisperProvider::from_config(&cfg).unwrap();
 
-        let err = provider
+        let err = transcription_provider
             .transcribe(b"fake-audio", "voice.ogg")
             .await
             .unwrap_err();

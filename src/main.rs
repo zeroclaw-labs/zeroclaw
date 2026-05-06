@@ -261,7 +261,7 @@ enum Commands {
         #[command(subcommand)]
         section: Option<OnboardSection>,
 
-        /// Skip interactive prompts; read from --api-key/--provider/--model/--memory.
+        /// Skip interactive prompts; read from --api-key/--model-provider/--model/--memory.
         #[arg(long)]
         quick: bool,
 
@@ -281,14 +281,14 @@ enum Commands {
         #[arg(long)]
         reinit: bool,
 
-        /// API key for provider configuration.
+        /// API key for model_provider configuration.
         #[arg(long)]
         api_key: Option<String>,
 
-        /// Provider name. Used as the type key for the synthesized
+        /// ModelProvider name. Used as the type key for the synthesized
         /// `[providers.models.<type>.default]` entry.
         #[arg(long)]
-        provider: Option<String>,
+        model_provider: Option<String>,
 
         /// Model ID override.
         #[arg(long)]
@@ -318,7 +318,7 @@ enum Commands {
     #[command(long_about = "\
 Start the AI agent loop.
 
-Launches an interactive chat session with the configured AI provider. \
+Launches an interactive chat session with the configured AI model_provider. \
 Use --message for single-shot queries without entering interactive mode.
 
 Examples:
@@ -340,9 +340,9 @@ Examples:
         #[arg(long)]
         session_state_file: Option<PathBuf>,
 
-        /// Provider to use (openrouter, anthropic, openai, openai-codex)
-        #[arg(short, long)]
-        provider: Option<String>,
+        /// Model provider to use (openrouter, anthropic, openai, openai-codex)
+        #[arg(short = 'p', long = "model-provider", alias = "provider")]
+        model_provider: Option<String>,
 
         /// Model to use
         #[arg(long)]
@@ -499,13 +499,13 @@ Examples:
         cron_command: CronCommands,
     },
 
-    /// Manage provider model catalogs
+    /// Manage model_provider model catalogs
     Models {
         #[command(subcommand)]
         model_command: ModelCommands,
     },
 
-    /// List supported AI providers
+    /// List supported AI model_providers
     Providers,
 
     /// Manage channels (telegram, discord, slack)
@@ -552,7 +552,7 @@ Examples:
         migrate_command: MigrateCommands,
     },
 
-    /// Manage provider subscription authentication profiles
+    /// Manage model_provider subscription authentication profiles
     Auth {
         #[command(subcommand)]
         auth_command: AuthCommands,
@@ -755,7 +755,7 @@ Examples:
 enum OnboardSection {
     /// Workspace isolation settings.
     Workspace,
-    /// Provider selection, credentials, and live model picker.
+    /// ModelProvider selection, credentials, and live model picker.
     Providers,
     /// Messaging channels (Telegram, Discord, Slack, Matrix, …).
     Channels,
@@ -763,11 +763,11 @@ enum OnboardSection {
     Memory,
     /// Physical hardware transport (native GPIO, serial, probe).
     Hardware,
-    /// Public tunnel provider (cloudflare, ngrok, tailscale, …).
+    /// Public tunnel model_provider (cloudflare, ngrok, tailscale, …).
     Tunnel,
     /// Edit the markdown files that shape your agent (SOUL, IDENTITY, USER, …).
     Personality,
-    /// Define and configure agent aliases (channel bindings, provider, profiles).
+    /// Define and configure agent aliases (channel bindings, model_provider, profiles).
     Agents,
 }
 
@@ -816,8 +816,8 @@ fn resolve_onboard_target(
         (
             providers_only,
             Section::Providers,
-            "--providers-only",
-            "providers",
+            "--model_providers-only",
+            "model_providers",
         ),
         (memory_only, Section::Memory, "--memory-only", "memory"),
         (
@@ -982,9 +982,9 @@ enum EstopSubcommands {
 enum AuthCommands {
     /// Login with OAuth (OpenAI Codex or Gemini)
     Login {
-        /// Provider (`openai-codex` or `gemini`)
+        /// ModelProvider (`openai-codex` or `gemini`)
         #[arg(long)]
-        provider: String,
+        model_provider: String,
         /// Profile name (default: default)
         #[arg(long, default_value = "default")]
         profile: String,
@@ -998,9 +998,9 @@ enum AuthCommands {
     },
     /// Complete OAuth by pasting redirect URL or auth code
     PasteRedirect {
-        /// Provider (`openai-codex`)
+        /// ModelProvider (`openai-codex`)
         #[arg(long)]
-        provider: String,
+        model_provider: String,
         /// Profile name (default: default)
         #[arg(long, default_value = "default")]
         profile: String,
@@ -1010,9 +1010,9 @@ enum AuthCommands {
     },
     /// Paste setup token / auth token (for Anthropic subscription auth)
     PasteToken {
-        /// Provider (`anthropic`)
+        /// ModelProvider (`anthropic`)
         #[arg(long)]
-        provider: String,
+        model_provider: String,
         /// Profile name (default: default)
         #[arg(long, default_value = "default")]
         profile: String,
@@ -1025,36 +1025,36 @@ enum AuthCommands {
     },
     /// Alias for `paste-token` (interactive by default)
     SetupToken {
-        /// Provider (`anthropic`)
+        /// ModelProvider (`anthropic`)
         #[arg(long)]
-        provider: String,
+        model_provider: String,
         /// Profile name (default: default)
         #[arg(long, default_value = "default")]
         profile: String,
     },
     /// Refresh OpenAI Codex access token using refresh token
     Refresh {
-        /// Provider (`openai-codex`)
+        /// ModelProvider (`openai-codex`)
         #[arg(long)]
-        provider: String,
+        model_provider: String,
         /// Profile name or profile id
         #[arg(long)]
         profile: Option<String>,
     },
     /// Remove auth profile
     Logout {
-        /// Provider
+        /// ModelProvider
         #[arg(long)]
-        provider: String,
+        model_provider: String,
         /// Profile name (default: default)
         #[arg(long, default_value = "default")]
         profile: String,
     },
-    /// Set active profile for a provider
+    /// Set active profile for a model_provider
     Use {
-        /// Provider
+        /// ModelProvider
         #[arg(long)]
-        provider: String,
+        model_provider: String,
         /// Profile name or full profile id
         #[arg(long)]
         profile: String,
@@ -1067,13 +1067,13 @@ enum AuthCommands {
 
 #[derive(Subcommand, Debug)]
 enum ModelCommands {
-    /// Refresh and cache provider models
+    /// Refresh and cache model_provider models
     Refresh {
-        /// Provider name (defaults to configured default provider)
+        /// ModelProvider name (defaults to configured default model_provider)
         #[arg(long)]
-        provider: Option<String>,
+        model_provider: Option<String>,
 
-        /// Refresh all providers that support live model discovery
+        /// Refresh all model_providers that support live model discovery
         #[arg(long)]
         all: bool,
 
@@ -1081,11 +1081,11 @@ enum ModelCommands {
         #[arg(long)]
         force: bool,
     },
-    /// List cached models for a provider
+    /// List cached models for a model_provider
     List {
-        /// Provider name (defaults to configured default provider)
+        /// ModelProvider name (defaults to configured default model_provider)
         #[arg(long)]
-        provider: Option<String>,
+        model_provider: Option<String>,
     },
     /// Set the default model in config
     Set {
@@ -1098,11 +1098,11 @@ enum ModelCommands {
 
 #[derive(Subcommand, Debug)]
 enum DoctorCommands {
-    /// Probe model catalogs across providers and report availability
+    /// Probe model catalogs across model_providers and report availability
     Models {
-        /// Probe a specific provider only (default: all known providers)
+        /// Probe a specific model_provider only (default: all known model_providers)
         #[arg(long)]
-        provider: Option<String>,
+        model_provider: Option<String>,
 
         /// Prefer cached catalogs when available (skip forced live refresh)
         #[arg(long)]
@@ -1200,12 +1200,12 @@ fn apply_cmd_translations(cmd: clap::Command, prefix: &str) -> clap::Command {
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
-    // Install default crypto provider for Rustls TLS.
+    // Install default crypto model_provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
     #[cfg(feature = "agent-runtime")]
     if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
-        eprintln!("Warning: Failed to install default crypto provider: {e:?}");
+        eprintln!("Warning: Failed to install default crypto model_provider: {e:?}");
     }
 
     #[cfg(feature = "agent-runtime")]
@@ -1277,7 +1277,7 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
-    // provider flags were given, it runs the full interactive wizard; otherwise
+    // model_provider flags were given, it runs the full interactive wizard; otherwise
     // it runs the quick (scriptable) setup.  Use --quick to force quick setup,
     // or set ZEROCLAW_INTERACTIVE=1 to force interactive mode when TTY
     // detection fails.  This means `curl … | bash` and
@@ -1292,7 +1292,7 @@ async fn main() -> Result<()> {
         force,
         reinit,
         api_key,
-        provider,
+        model_provider,
         model,
         memory,
         channels_only,
@@ -1351,7 +1351,7 @@ async fn main() -> Result<()> {
             force: *force,
             reinit: *reinit,
             api_key: api_key.clone(),
-            provider: provider.clone(),
+            model_provider: model_provider.clone(),
             model: model.clone(),
             memory: memory.clone(),
         };
@@ -1437,7 +1437,7 @@ async fn main() -> Result<()> {
             Commands::Agent {
                 agent: agent_alias,
                 message,
-                provider,
+                model_provider,
                 model,
                 temperature,
                 ..
@@ -1450,12 +1450,12 @@ async fn main() -> Result<()> {
                 let final_temperature = temperature.unwrap_or_else(|| {
                     config
                         .providers
-                        .first_provider()
+                        .first_model_provider()
                         .and_then(|e| e.temperature)
                         .unwrap_or(0.7)
                 });
-                if let Some(p) = &provider {
-                    // Upsert the requested provider type under "default" alias.
+                if let Some(p) = &model_provider {
+                    // Upsert the requested model_provider type under "default" alias.
                     let entry = config
                         .providers
                         .models
@@ -1467,29 +1467,32 @@ async fn main() -> Result<()> {
                         entry.model = Some(m.clone());
                     }
                     entry.temperature = Some(final_temperature);
-                } else if config.providers.first_provider().is_none() {
+                } else if config.providers.first_model_provider().is_none() {
                     anyhow::bail!(
-                        "No model provider configured. Pass --provider <type> or run \
-                         `zeroclaw onboard providers` to configure one."
+                        "No model model_provider configured. Pass --model_provider <type> or run \
+                         `zeroclaw onboard model_providers` to configure one."
                     );
                 }
 
-                let provider_name = config.providers.first_provider_type().unwrap_or("openai");
-                let provider = zeroclaw::providers::create_provider(
+                let provider_name = config
+                    .providers
+                    .first_model_provider_type()
+                    .unwrap_or("openai");
+                let model_provider = zeroclaw::providers::create_model_provider(
                     provider_name,
                     config
                         .providers
-                        .first_provider()
+                        .first_model_provider()
                         .and_then(|e| e.api_key.as_deref()),
                 )?;
                 let model_name = config
                     .providers
-                    .first_provider()
+                    .first_model_provider()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("default");
                 match message {
                     Some(msg) => {
-                        let response = provider
+                        let response = model_provider
                             .simple_chat(&msg, model_name, Some(final_temperature))
                             .await?;
                         println!("{response}");
@@ -1504,7 +1507,7 @@ async fn main() -> Result<()> {
                             if stdin.read_line(&mut line)? == 0 {
                                 break;
                             }
-                            let response = provider
+                            let response = model_provider
                                 .simple_chat(line.trim(), model_name, Some(final_temperature))
                                 .await?;
                             println!("{response}");
@@ -1557,7 +1560,7 @@ async fn main() -> Result<()> {
             agent: agent_alias,
             message,
             session_state_file,
-            provider,
+            model_provider,
             model,
             temperature,
             peripheral,
@@ -1565,7 +1568,7 @@ async fn main() -> Result<()> {
             let final_temperature = temperature.unwrap_or_else(|| {
                 config
                     .providers
-                    .first_provider()
+                    .first_model_provider()
                     .and_then(|e| e.temperature)
                     .unwrap_or(0.7)
             });
@@ -1588,7 +1591,7 @@ async fn main() -> Result<()> {
                 config,
                 &agent_alias,
                 message,
-                provider,
+                model_provider,
                 model,
                 final_temperature,
                 peripheral,
@@ -1918,17 +1921,17 @@ async fn main() -> Result<()> {
             println!("Config:      {}", config.config_path.display());
             println!();
             println!(
-                "🤖 Provider:      {}",
+                "🤖 ModelProvider:      {}",
                 config
                     .providers
-                    .first_provider_type()
+                    .first_model_provider_type()
                     .unwrap_or("openrouter")
             );
             println!(
                 "   Model:         {}",
                 config
                     .providers
-                    .first_provider()
+                    .first_model_provider()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("(default)")
             );
@@ -2075,45 +2078,39 @@ async fn main() -> Result<()> {
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
         Commands::Models { model_command } => {
-            let provider = match &model_command {
-                ModelCommands::Refresh { provider, .. } | ModelCommands::List { provider } => {
-                    provider.as_deref()
-                }
+            let model_provider = match &model_command {
+                ModelCommands::Refresh { model_provider, .. }
+                | ModelCommands::List { model_provider } => model_provider.as_deref(),
                 _ => None,
             };
-            doctor::run_models(&config, provider, false).await
+            doctor::run_models(&config, model_provider, false).await
         }
 
         Commands::Providers => {
-            let providers = providers::list_providers();
+            let model_providers = zeroclaw_providers::list_model_providers();
             let current = config
                 .providers
-                .first_provider_type()
+                .first_model_provider_type()
                 .unwrap_or("openrouter")
                 .trim()
                 .to_ascii_lowercase();
-            println!("Supported providers ({} total):\n", providers.len());
+            println!(
+                "Supported model model_providers ({} total):\n",
+                model_providers.len()
+            );
             println!("  ID (use in config)  DESCRIPTION");
             println!("  ─────────────────── ───────────");
-            for p in &providers {
-                let is_active = p.name.eq_ignore_ascii_case(&current)
-                    || p.aliases
-                        .iter()
-                        .any(|alias| alias.eq_ignore_ascii_case(&current));
+            for p in &model_providers {
+                let is_active = p.name.eq_ignore_ascii_case(&current);
                 let marker = if is_active { " (active)" } else { "" };
                 let local_tag = if p.local { " [local]" } else { "" };
-                let aliases = if p.aliases.is_empty() {
-                    String::new()
-                } else {
-                    format!("  (aliases: {})", p.aliases.join(", "))
-                };
-                println!(
-                    "  {:<19} {}{}{}{}",
-                    p.name, p.display_name, local_tag, marker, aliases
-                );
+                println!("  {:<19} {}{}{}", p.name, p.display_name, local_tag, marker);
             }
-            println!("\n  custom:<URL>   Any OpenAI-compatible endpoint");
-            println!("  anthropic-custom:<URL>  Any Anthropic-compatible endpoint");
+            println!(
+                "\n  Set [providers.models.custom.<alias>] uri = \"<URL>\" for any \
+                 OpenAI-compatible endpoint, or [providers.models.anthropic.<alias>] \
+                 uri = \"<URL>\" for an Anthropic-compatible endpoint."
+            );
             Ok(())
         }
 
@@ -2127,9 +2124,9 @@ async fn main() -> Result<()> {
 
         Commands::Doctor { doctor_command } => match doctor_command {
             Some(DoctorCommands::Models {
-                provider,
+                model_provider,
                 use_cache,
-            }) => doctor::run_models(&config, provider.as_deref(), use_cache).await,
+            }) => doctor::run_models(&config, model_provider.as_deref(), use_cache).await,
             Some(DoctorCommands::Traces {
                 id,
                 event,
@@ -3219,10 +3216,10 @@ fn gateway_admin_url(host: &str, port: u16, path_prefix: Option<&str>, admin_pat
 
 // ─── Generic Pending OAuth Login ────────────────────────────────────────────
 
-/// Generic pending OAuth login state, shared across providers.
+/// Generic pending OAuth login state, shared across model_providers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingOAuthLogin {
-    provider: String,
+    model_provider: String,
     profile: String,
     code_verifier: String,
     state: String,
@@ -3232,7 +3229,7 @@ struct PendingOAuthLogin {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingOAuthLoginFile {
     #[serde(default)]
-    provider: Option<String>,
+    model_provider: Option<String>,
     profile: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     code_verifier: Option<String>,
@@ -3243,8 +3240,8 @@ struct PendingOAuthLoginFile {
 }
 
 #[cfg(feature = "agent-runtime")]
-fn pending_oauth_login_path(config: &Config, provider: &str) -> std::path::PathBuf {
-    let filename = format!("auth-{}-pending.json", provider);
+fn pending_oauth_login_path(config: &Config, model_provider: &str) -> std::path::PathBuf {
+    let filename = format!("auth-{}-pending.json", model_provider);
     auth::state_dir_from_config(config).join(filename)
 }
 
@@ -3270,14 +3267,14 @@ fn set_owner_only_permissions(_path: &std::path::Path) -> Result<()> {
 
 #[cfg(feature = "agent-runtime")]
 fn save_pending_oauth_login(config: &Config, pending: &PendingOAuthLogin) -> Result<()> {
-    let path = pending_oauth_login_path(config, &pending.provider);
+    let path = pending_oauth_login_path(config, &pending.model_provider);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let secret_store = pending_oauth_secret_store(config);
     let encrypted_code_verifier = secret_store.encrypt(&pending.code_verifier)?;
     let persisted = PendingOAuthLoginFile {
-        provider: Some(pending.provider.clone()),
+        model_provider: Some(pending.model_provider.clone()),
         profile: pending.profile.clone(),
         code_verifier: None,
         encrypted_code_verifier: Some(encrypted_code_verifier),
@@ -3298,8 +3295,11 @@ fn save_pending_oauth_login(config: &Config, pending: &PendingOAuthLogin) -> Res
 }
 
 #[cfg(feature = "agent-runtime")]
-fn load_pending_oauth_login(config: &Config, provider: &str) -> Result<Option<PendingOAuthLogin>> {
-    let path = pending_oauth_login_path(config, provider);
+fn load_pending_oauth_login(
+    config: &Config,
+    model_provider: &str,
+) -> Result<Option<PendingOAuthLogin>> {
+    let path = pending_oauth_login_path(config, model_provider);
     if !path.exists() {
         return Ok(None);
     }
@@ -3314,10 +3314,12 @@ fn load_pending_oauth_login(config: &Config, provider: &str) -> Result<Option<Pe
     } else if let Some(plaintext) = persisted.code_verifier {
         plaintext
     } else {
-        bail!("Pending {} login is missing code verifier", provider);
+        bail!("Pending {} login is missing code verifier", model_provider);
     };
     Ok(Some(PendingOAuthLogin {
-        provider: persisted.provider.unwrap_or_else(|| provider.to_string()),
+        model_provider: persisted
+            .model_provider
+            .unwrap_or_else(|| model_provider.to_string()),
         profile: persisted.profile,
         code_verifier,
         state: persisted.state,
@@ -3326,8 +3328,8 @@ fn load_pending_oauth_login(config: &Config, provider: &str) -> Result<Option<Pe
 }
 
 #[cfg(feature = "agent-runtime")]
-fn clear_pending_oauth_login(config: &Config, provider: &str) {
-    let path = pending_oauth_login_path(config, provider);
+fn clear_pending_oauth_login(config: &Config, model_provider: &str) {
+    let path = pending_oauth_login_path(config, model_provider);
     if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
         let _ = file.set_len(0);
         let _ = file.sync_all();
@@ -3440,18 +3442,20 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
     match auth_command {
         AuthCommands::Login {
-            provider,
+            model_provider,
             profile,
             device_code,
             import,
         } => {
-            let provider = auth::normalize_provider(&provider)?;
-            if import.is_some() && provider != "openai-codex" {
-                bail!("`auth login --import` currently supports only --provider openai-codex");
+            let model_provider = auth::normalize_model_provider(&model_provider)?;
+            if import.is_some() && model_provider != "openai-codex" {
+                bail!(
+                    "`auth login --import` currently supports only --model_provider openai-codex"
+                );
             }
             let client = reqwest::Client::new();
 
-            match provider.as_str() {
+            match model_provider.as_str() {
                 "gemini" => {
                     // Gemini OAuth flow
                     if device_code {
@@ -3492,7 +3496,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
                     // Save pending login for paste-redirect fallback
                     let pending = PendingOAuthLogin {
-                        provider: "gemini".to_string(),
+                        model_provider: "gemini".to_string(),
                         profile: profile.clone(),
                         code_verifier: pkce.code_verifier.clone(),
                         state: pkce.state.clone(),
@@ -3517,7 +3521,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         Err(e) => {
                             println!("Callback capture failed: {e}");
                             println!(
-                                "Run `zeroclaw auth paste-redirect --provider gemini --profile {profile}`"
+                                "Run `zeroclaw auth paste-redirect --model_provider gemini --profile {profile}`"
                             );
                             return Ok(());
                         }
@@ -3586,7 +3590,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
                     let pkce = auth::openai_oauth::generate_pkce_state();
                     let pending = PendingOAuthLogin {
-                        provider: "openai".to_string(),
+                        model_provider: "openai".to_string(),
                         profile: profile.clone(),
                         code_verifier: pkce.code_verifier.clone(),
                         state: pkce.state.clone(),
@@ -3610,7 +3614,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         Err(e) => {
                             println!("Callback capture failed: {e}");
                             println!(
-                                "Run `zeroclaw auth paste-redirect --provider openai-codex --profile {profile}`"
+                                "Run `zeroclaw auth paste-redirect --model_provider openai-codex --profile {profile}`"
                             );
                             return Ok(());
                         }
@@ -3631,24 +3635,24 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 }
                 _ => {
                     bail!(
-                        "`auth login` supports --provider openai-codex or gemini, got: {provider}"
+                        "`auth login` supports --model_provider openai-codex or gemini, got: {model_provider}"
                     );
                 }
             }
         }
 
         AuthCommands::PasteRedirect {
-            provider,
+            model_provider,
             profile,
             input,
         } => {
-            let provider = auth::normalize_provider(&provider)?;
+            let model_provider = auth::normalize_model_provider(&model_provider)?;
 
-            match provider.as_str() {
+            match model_provider.as_str() {
                 "openai-codex" => {
                     let pending = load_pending_oauth_login(config, "openai")?.ok_or_else(|| {
                         anyhow::anyhow!(
-                            "No pending OpenAI login found. Run `zeroclaw auth login --provider openai-codex` first."
+                            "No pending OpenAI login found. Run `zeroclaw auth login --model_provider openai-codex` first."
                         )
                     })?;
 
@@ -3692,7 +3696,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 "gemini" => {
                     let pending = load_pending_oauth_login(config, "gemini")?.ok_or_else(|| {
                         anyhow::anyhow!(
-                            "No pending Gemini login found. Run `zeroclaw auth login --provider gemini` first."
+                            "No pending Gemini login found. Run `zeroclaw auth login --model_provider gemini` first."
                         )
                     })?;
 
@@ -3737,19 +3741,19 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                     println!("Active profile for gemini: {profile}");
                 }
                 _ => {
-                    bail!("`auth paste-redirect` supports --provider openai-codex or gemini");
+                    bail!("`auth paste-redirect` supports --model_provider openai-codex or gemini");
                 }
             }
             Ok(())
         }
 
         AuthCommands::PasteToken {
-            provider,
+            model_provider,
             profile,
             token,
             auth_kind,
         } => {
-            let provider = auth::normalize_provider(&provider)?;
+            let model_provider = auth::normalize_model_provider(&model_provider)?;
             let token = match token {
                 Some(token) => token.trim().to_string(),
                 None => read_auth_input("Paste token")?,
@@ -3766,15 +3770,18 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             );
 
             auth_service
-                .store_provider_token(&provider, &profile, &token, metadata, true)
+                .store_model_provider_token(&model_provider, &profile, &token, metadata, true)
                 .await?;
             println!("Saved profile {profile}");
-            println!("Active profile for {provider}: {profile}");
+            println!("Active profile for {model_provider}: {profile}");
             Ok(())
         }
 
-        AuthCommands::SetupToken { provider, profile } => {
-            let provider = auth::normalize_provider(&provider)?;
+        AuthCommands::SetupToken {
+            model_provider,
+            profile,
+        } => {
+            let model_provider = auth::normalize_model_provider(&model_provider)?;
             let token = read_auth_input("Paste token")?;
             if token.is_empty() {
                 bail!("Token cannot be empty");
@@ -3788,17 +3795,20 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             );
 
             auth_service
-                .store_provider_token(&provider, &profile, &token, metadata, true)
+                .store_model_provider_token(&model_provider, &profile, &token, metadata, true)
                 .await?;
             println!("Saved profile {profile}");
-            println!("Active profile for {provider}: {profile}");
+            println!("Active profile for {model_provider}: {profile}");
             Ok(())
         }
 
-        AuthCommands::Refresh { provider, profile } => {
-            let provider = auth::normalize_provider(&provider)?;
+        AuthCommands::Refresh {
+            model_provider,
+            profile,
+        } => {
+            let model_provider = auth::normalize_model_provider(&model_provider)?;
 
-            match provider.as_str() {
+            match model_provider.as_str() {
                 "openai-codex" => {
                     match auth_service
                         .get_valid_openai_access_token(profile.as_deref())
@@ -3810,7 +3820,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         }
                         None => {
                             bail!(
-                                "No OpenAI Codex auth profile found. Run `zeroclaw auth login --provider openai-codex`."
+                                "No OpenAI Codex auth profile found. Run `zeroclaw auth login --model_provider openai-codex`."
                             )
                         }
                     }
@@ -3828,30 +3838,40 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         }
                         None => {
                             bail!(
-                                "No Gemini auth profile found. Run `zeroclaw auth login --provider gemini`."
+                                "No Gemini auth profile found. Run `zeroclaw auth login --model_provider gemini`."
                             )
                         }
                     }
                 }
-                _ => bail!("`auth refresh` supports --provider openai-codex or gemini"),
+                _ => bail!("`auth refresh` supports --model_provider openai-codex or gemini"),
             }
         }
 
-        AuthCommands::Logout { provider, profile } => {
-            let provider = auth::normalize_provider(&provider)?;
-            let removed = auth_service.remove_profile(&provider, &profile).await?;
+        AuthCommands::Logout {
+            model_provider,
+            profile,
+        } => {
+            let model_provider = auth::normalize_model_provider(&model_provider)?;
+            let removed = auth_service
+                .remove_profile(&model_provider, &profile)
+                .await?;
             if removed {
-                println!("Removed auth profile {provider}:{profile}");
+                println!("Removed auth profile {model_provider}:{profile}");
             } else {
-                println!("Auth profile not found: {provider}:{profile}");
+                println!("Auth profile not found: {model_provider}:{profile}");
             }
             Ok(())
         }
 
-        AuthCommands::Use { provider, profile } => {
-            let provider = auth::normalize_provider(&provider)?;
-            auth_service.set_active_profile(&provider, &profile).await?;
-            println!("Active profile for {provider}: {profile}");
+        AuthCommands::Use {
+            model_provider,
+            profile,
+        } => {
+            let model_provider = auth::normalize_model_provider(&model_provider)?;
+            auth_service
+                .set_active_profile(&model_provider, &profile)
+                .await?;
+            println!("Active profile for {model_provider}: {profile}");
             Ok(())
         }
 
@@ -3865,7 +3885,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             for (id, profile) in &data.profiles {
                 let active = data
                     .active_profiles
-                    .get(&profile.provider)
+                    .get(&profile.model_provider)
                     .is_some_and(|active_id| active_id == id);
                 let marker = if active { "*" } else { " " };
                 println!("{marker} {id}");
@@ -3884,7 +3904,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             for (id, profile) in &data.profiles {
                 let active = data
                     .active_profiles
-                    .get(&profile.provider)
+                    .get(&profile.model_provider)
                     .is_some_and(|active_id| active_id == id);
                 let marker = if active { "*" } else { " " };
                 println!(
@@ -3899,8 +3919,8 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             println!();
             println!("Active profiles:");
-            for (provider, profile_id) in &data.active_profiles {
-                println!("  {provider}: {profile_id}");
+            for (model_provider, profile_id) in &data.active_profiles {
+                println!("  {model_provider}: {profile_id}");
             }
 
             Ok(())
@@ -3987,7 +4007,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "zeroclaw",
             "onboard",
-            "--provider",
+            "--model-provider",
             "openrouter",
             "--model",
             "custom-model-946",
@@ -4001,13 +4021,13 @@ mod tests {
                 force,
                 channels_only,
                 api_key,
-                provider,
+                model_provider,
                 model,
                 ..
             } => {
                 assert!(!force);
                 assert!(!channels_only);
-                assert_eq!(provider.as_deref(), Some("openrouter"));
+                assert_eq!(model_provider.as_deref(), Some("openrouter"));
                 assert_eq!(model.as_deref(), Some("custom-model-946"));
                 assert_eq!(api_key.as_deref(), Some("sk-issue946"));
             }
@@ -4156,8 +4176,8 @@ mod tests {
             (
                 [false, true, false, false, false, false],
                 Section::Providers,
-                "--providers-only",
-                "providers",
+                "--model_providers-only",
+                "model_providers",
             ),
             (
                 [false, false, true, false, false, false],
@@ -4184,10 +4204,22 @@ mod tests {
                 "workspace",
             ),
         ] {
-            let [channels, providers, memory, hardware, tunnel, workspace] =
-                std::mem::take(&mut flags);
+            let [
+                channels,
+                model_providers,
+                memory,
+                hardware,
+                tunnel,
+                workspace,
+            ] = std::mem::take(&mut flags);
             let (target, deprecation) = resolve_onboard_target(
-                None, channels, providers, memory, hardware, tunnel, workspace,
+                None,
+                channels,
+                model_providers,
+                memory,
+                hardware,
+                tunnel,
+                workspace,
             );
             assert_eq!(target, expected_section, "{expected_old} target");
             assert_eq!(
@@ -4323,7 +4355,7 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn agent_uses_first_provider_temperature_when_unset() {
         // When the user doesn't pass --temperature, the kernel-only agent
-        // CLI walks `config.providers.first_provider().temperature` before
+        // CLI walks `config.providers.first_model_provider().temperature` before
         // bottoming out at 0.7.
         let mut config = Config::default();
         config
@@ -4337,7 +4369,7 @@ mod tests {
         let final_temperature = user_temperature.unwrap_or_else(|| {
             config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
         });
@@ -4356,7 +4388,7 @@ mod tests {
         let final_temperature = user_temperature.unwrap_or_else(|| {
             config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
         });

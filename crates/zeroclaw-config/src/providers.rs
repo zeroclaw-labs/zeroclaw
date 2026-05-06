@@ -31,10 +31,10 @@ use super::schema::{
     OpenAITtsProviderConfig, PiperTtsProviderConfig, TtsProviderConfig as TtsBaseConfig,
 };
 
-/// Macro that expands to a single source of truth for the per-provider-type
+/// Macro that expands to a single source of truth for the per-model_provider-type
 /// slot list on `ModelProviders`. Every helper that needs to walk every slot
-/// (`first_provider`, `iter_entries`, `is_empty`, etc.) goes through this
-/// macro so adding a new provider type is a one-line addition here, not a
+/// (`first_model_provider`, `iter_entries`, `is_empty`, etc.) goes through this
+/// macro so adding a new model_provider type is a one-line addition here, not a
 /// shotgun edit across multiple helpers.
 ///
 /// Each row is `(field_ident, provider_type_str, FamilyConfigType)`. The
@@ -109,7 +109,7 @@ macro_rules! for_each_model_provider_slot {
 
 macro_rules! emit_model_providers_struct {
     ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
-        /// Typed model-provider container — one slot per canonical provider type.
+        /// Typed model-model_provider container — one slot per canonical model_provider type.
         ///
         /// Replaces the V3 `HashMap<String, HashMap<String, ModelProviderConfig>>`
         /// with a typed struct so each family's per-alias map carries its own
@@ -119,7 +119,7 @@ macro_rules! emit_model_providers_struct {
         /// TOML shape is preserved byte-identical: each named field deserializes
         /// from the same `[providers.models.<type>.<alias>]` block as before.
         ///
-        /// Adding a new provider family means: define the typed config in
+        /// Adding a new model_provider family means: define the typed config in
         /// `schema.rs`, then add one row to `for_each_model_provider_slot!` —
         /// every helper picks up the new slot automatically.
         #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -139,7 +139,7 @@ for_each_model_provider_slot!(emit_model_providers_struct);
 impl ModelProviders {
     /// Iterate every entry across every typed slot, yielding
     /// `(provider_type, alias, &base)` triples. Use this when consumer code
-    /// needs to walk every model provider entry without caring about family.
+    /// needs to walk every model model_provider entry without caring about family.
     ///
     /// Materializes through a `Vec` rather than chaining iterators directly:
     /// with ~60 typed slots the deeply-nested `Chain<Chain<...>>` type blows
@@ -199,7 +199,7 @@ impl ModelProviders {
     /// pair, returning a mutable reference. Used by tools that mutate
     /// generic baseline fields (model, temperature, api_key) without caring
     /// about the family's specific extras. Returns `None` for unknown
-    /// provider types.
+    /// model_provider types.
     pub fn ensure(&mut self, family: &str, alias: &str) -> Option<&mut ModelProviderConfig> {
         macro_rules! emit_ensure {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
@@ -222,7 +222,7 @@ impl ModelProviders {
 
     /// True when `family`'s typed slot has at least one configured
     /// alias entry. Returns `false` for unknown families.
-    pub fn contains_provider_type(&self, family: &str) -> bool {
+    pub fn contains_model_provider_type(&self, family: &str) -> bool {
         macro_rules! emit_contains {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
                 match family {
@@ -234,8 +234,8 @@ impl ModelProviders {
         for_each_model_provider_slot!(emit_contains)
     }
 
-    /// Iterate the alias keys for a given provider type. Returns an empty
-    /// iterator for unknown provider types.
+    /// Iterate the alias keys for a given model_provider type. Returns an empty
+    /// iterator for unknown model_provider types.
     pub fn aliases_of<'a>(&'a self, family: &str) -> Box<dyn Iterator<Item = &'a str> + 'a> {
         macro_rules! emit_aliases {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
@@ -283,7 +283,7 @@ impl ModelProviders {
     }
 }
 
-/// Typed TTS-provider container — one slot per TTS family. Mirrors
+/// Typed TTS-model_provider container — one slot per TTS family. Mirrors
 /// `ModelProviders` but smaller (TTS has a closed set of 5 families:
 /// openai, elevenlabs, google, edge, piper). No catch-all needed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -383,20 +383,20 @@ impl TtsProviders {
     }
 }
 
-/// Top-level `[providers]` section. Wraps model provider profiles and routing rules.
+/// Top-level `[model_providers]` section. Wraps model model_provider profiles and routing rules.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "providers"]
+#[prefix = "model_providers"]
 pub struct ProvidersConfig {
-    /// Named model provider profiles: outer key = provider type, inner key = user alias.
+    /// Named model model_provider profiles: outer key = model_provider type, inner key = user alias.
     /// V3 shape: `[providers.models.<type>.<alias>]` e.g. `[providers.models.anthropic.default]`.
-    /// Typed via `ModelProviders` — every provider type has its own typed slot
+    /// Typed via `ModelProviders` — every model_provider type has its own typed slot
     /// carrying the family's `*Endpoint` enum and family-specific extras.
     #[serde(default)]
     #[nested]
     pub models: ModelProviders,
 
-    /// Named TTS provider profiles: outer key = provider type, inner key = user alias.
+    /// Named TTS model_provider profiles: outer key = model_provider type, inner key = user alias.
     /// V3 shape: `[providers.tts.<type>.<alias>]` e.g. `[providers.tts.openai.default]`.
     /// Mirrors `models` with the typed-family split: each TTS family has its
     /// own slot carrying its `*TtsEndpoint` enum.
@@ -404,11 +404,11 @@ pub struct ProvidersConfig {
     #[nested]
     pub tts: TtsProviders,
 
-    /// Model routing rules — route `hint:<name>` to specific provider+model combos.
+    /// Model routing rules — route `hint:<name>` to specific model_provider+model combos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_routes: Vec<ModelRouteConfig>,
 
-    /// Embedding routing rules — route `hint:<name>` to specific provider+model combos.
+    /// Embedding routing rules — route `hint:<name>` to specific model_provider+model combos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub embedding_routes: Vec<EmbeddingRouteConfig>,
 }
@@ -419,7 +419,7 @@ impl ProvidersConfig {
     /// Scans every typed slot's entries (iteration order is the macro slot
     /// order) for one that has `model` set.
     ///
-    /// Returns `None` only when no provider entry has any model configured at all.
+    /// Returns `None` only when no model_provider entry has any model configured at all.
     pub fn resolve_default_model(&self) -> Option<String> {
         self.models
             .iter_entries()
@@ -430,28 +430,28 @@ impl ProvidersConfig {
 
     /// Return the first `ModelProviderConfig` (the shared base) from `models`,
     /// if any exists.
-    pub fn first_provider(&self) -> Option<&ModelProviderConfig> {
+    pub fn first_model_provider(&self) -> Option<&ModelProviderConfig> {
         self.models.iter_entries().next().map(|(_, _, base)| base)
     }
 
     /// Return a mutable reference to the first `ModelProviderConfig` (the
     /// shared base) from `models`, if any exists.
-    pub fn first_provider_mut(&mut self) -> Option<&mut ModelProviderConfig> {
+    pub fn first_model_provider_mut(&mut self) -> Option<&mut ModelProviderConfig> {
         self.models
             .iter_entries_mut()
             .next()
             .map(|(_, _, base)| base)
     }
 
-    /// Return the provider type key of the first entry in `models`, if any.
-    /// Use this when callers need the bare type name (e.g. provider routing
+    /// Return the model_provider type key of the first entry in `models`, if any.
+    /// Use this when callers need the bare type name (e.g. model_provider routing
     /// factories that take `"openrouter"` not `"openrouter.default"`).
-    pub fn first_provider_type(&self) -> Option<&'static str> {
+    pub fn first_model_provider_type(&self) -> Option<&'static str> {
         self.models.iter_entries().next().map(|(ty, _, _)| ty)
     }
 
     /// Return the V3 dotted `<type>.<alias>` identifier of the first
-    /// configured model provider entry, if any. Use this when callers need
+    /// configured model model_provider entry, if any. Use this when callers need
     /// the V3 alias reference (matches `agents.<x>.model_provider` values).
     pub fn first_provider_alias(&self) -> Option<String> {
         self.models

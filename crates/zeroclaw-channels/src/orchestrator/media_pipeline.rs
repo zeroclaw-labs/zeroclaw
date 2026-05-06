@@ -5,7 +5,7 @@
 //!
 //! - **Audio**: transcribed via the existing [`super::transcription`] infrastructure,
 //!   prepended as `[Audio transcription: ...]`.
-//! - **Images**: when a vision-capable provider is active, described as `[Image: <description>]`.
+//! - **Images**: when a vision-capable model_provider is active, described as `[Image: <description>]`.
 //!   Falls back to `[Image: attached]` when vision is unavailable.
 //! - **Video**: summarised as `[Video summary: ...]` when an API is available,
 //!   otherwise `[Video: attached]`.
@@ -29,7 +29,7 @@ pub struct MediaPipeline<'a> {
 
 impl<'a> MediaPipeline<'a> {
     /// Create a new pipeline. `vision_available` indicates whether the current
-    /// provider supports vision (image description).
+    /// model_provider supports vision (image description).
     pub fn new(
         config: &'a MediaPipelineConfig,
         transcription_config: &'a TranscriptionConfig,
@@ -126,7 +126,7 @@ impl<'a> MediaPipeline<'a> {
     /// Describe an image attachment.
     ///
     /// When vision is available, the image will be passed through to the
-    /// provider as an `[IMAGE:]` marker and described by the model in the
+    /// model_provider as an `[IMAGE:]` marker and described by the model in the
     /// normal flow. Here we only add a placeholder annotation so the agent
     /// knows an image is present.
     fn process_image(&self, attachment: &MediaAttachment) -> String {

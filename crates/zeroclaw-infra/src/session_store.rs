@@ -8,7 +8,7 @@
 use crate::session_backend::SessionBackend;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use zeroclaw_api::provider::ChatMessage;
+use zeroclaw_api::model_provider::ChatMessage;
 
 /// Append-only JSONL session store for channel conversations.
 pub struct SessionStore {

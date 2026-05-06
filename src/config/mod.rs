@@ -42,7 +42,7 @@ pub use schema::{
 };
 
 pub use schema::ModelProviderConfig;
-// Per-family model provider configs (typed split — #6273). Re-exported here
+// Per-family model model_provider configs (typed split — #6273). Re-exported here
 // so tests + downstream binary callers can construct typed family entries
 // without reaching into `zeroclaw_config::schema` directly.
 pub use schema::{

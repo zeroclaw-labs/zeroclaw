@@ -4,7 +4,7 @@
 //! gateway HTTP endpoints (`/api/config/list` for filtering). One source of
 //! truth so the CLI and dashboard can't disagree about which fields apply.
 //!
-//! Per-provider-family field exclusion is GONE as of #6273 — the typed-family
+//! Per-model_provider-family field exclusion is GONE as of #6273 — the typed-family
 //! ModelProviders container only exposes fields that genuinely apply to each
 //! family (every typed `*ModelProviderConfig` carries only its own surface),
 //! so there's nothing to suppress. Memory-backend exclusion stays because the

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 #[derive(Parser)]
-#[command(about = "Fill empty/fuzzy .po entries via a configured provider")]
+#[command(about = "Fill empty/fuzzy .po entries via a configured model_provider")]
 struct Args {
     #[arg(long)]
     po: PathBuf,
@@ -17,9 +17,9 @@ struct Args {
     /// Entries per API call
     #[arg(long, default_value = "50")]
     batch: usize,
-    /// Provider name from [providers.models.<name>] in config.toml
+    /// ModelProvider name from [providers.models.<name>] in config.toml
     #[arg(long)]
-    provider: String,
+    model_provider: String,
     /// Path for appending full input/output on every failure (default: {po}.failures.log)
     #[arg(long)]
     log_failures: Option<PathBuf>,
@@ -66,7 +66,7 @@ struct ProviderConfig {
     model: String,
 }
 
-fn read_provider_config(provider_name: &str) -> anyhow::Result<ProviderConfig> {
+fn read_model_provider_config(provider_name: &str) -> anyhow::Result<ProviderConfig> {
     let home =
         std::env::var("HOME").unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_default());
     let candidates = [
@@ -78,18 +78,18 @@ fn read_provider_config(provider_name: &str) -> anyhow::Result<ProviderConfig> {
         .find_map(|p| std::fs::read_to_string(p).ok())
         .ok_or_else(|| anyhow::anyhow!("config.toml not found (tried ~/.zeroclaw/config.toml)"))?;
     let table: toml::Table = raw.parse()?;
-    let provider = table
-        .get("providers")
+    let model_provider = table
+        .get("model_providers")
         .and_then(|v| v.get("models"))
         .and_then(|v| v.get(provider_name))
         .ok_or_else(|| {
             anyhow::anyhow!("[providers.models.{provider_name}] not found in config.toml")
         })?;
-    let model = provider.get("model").and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("No model set for provider '{provider_name}' — add `model = \"...\"` to [providers.models.{provider_name}]"))?
+    let model = model_provider.get("model").and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("No model set for model_provider '{provider_name}' — add `model = \"...\"` to [providers.models.{provider_name}]"))?
         .to_string();
     Ok(ProviderConfig {
-        base_url: provider
+        base_url: model_provider
             .get("base_url")
             .and_then(|v| v.as_str())
             .unwrap_or("http://localhost:11434")
@@ -372,7 +372,7 @@ fn fail(err: anyhow::Error, raw_response: impl Into<String>) -> BatchFailure {
 /// exact shape we request — no wrapping characters, no JSON leaks, no prose.
 async fn translate_batch(
     client: &reqwest::Client,
-    provider: &ProviderConfig,
+    model_provider: &ProviderConfig,
     locale: &str,
     batch: &[&str],
 ) -> BatchResult {
@@ -394,7 +394,7 @@ async fn translate_batch(
     let mut out = Vec::with_capacity(batch.len());
     for source in batch {
         let body = serde_json::json!({
-            "model": provider.model,
+            "model": model_provider.model,
             "messages": [
                 {"role": "system", "content": &system},
                 {"role": "user", "content": *source},
@@ -406,7 +406,7 @@ async fn translate_batch(
             "reasoning_effort": "none",
             "options": {"temperature": 0},
         });
-        let content = fetch_ollama_content(client, provider, &body).await?;
+        let content = fetch_ollama_content(client, model_provider, &body).await?;
         out.push(content.trim().to_string());
     }
     Ok(out)
@@ -415,11 +415,11 @@ async fn translate_batch(
 /// POST to Ollama's native `/api/chat` and return `message.content` from the response.
 async fn fetch_ollama_content(
     client: &reqwest::Client,
-    provider: &ProviderConfig,
+    model_provider: &ProviderConfig,
     body: &serde_json::Value,
 ) -> Result<String, BatchFailure> {
     let resp = client
-        .post(format!("{}/api/chat", provider.base_url))
+        .post(format!("{}/api/chat", model_provider.base_url))
         .json(body)
         .send()
         .await
@@ -455,7 +455,7 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("--po path does not exist: {}", args.po.display());
     }
 
-    let provider = read_provider_config(&args.provider)?;
+    let model_provider = read_model_provider_config(&args.model_provider)?;
 
     let raw = std::fs::read_to_string(&args.po)?;
     let lines: Vec<String> = raw.lines().map(str::to_owned).collect();
@@ -531,11 +531,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!(
-        "==> {} to translate, {} fuzzy accepted as-is, provider={}, model={}",
+        "==> {} to translate, {} fuzzy accepted as-is, model_provider={}, model={}",
         to_translate.len(),
         to_accept.len(),
-        args.provider,
-        provider.model,
+        args.model_provider,
+        model_provider.model,
     );
 
     let client = reqwest::Client::new();
@@ -557,7 +557,7 @@ async fn main() -> anyhow::Result<()> {
             chunk.len()
         );
 
-        match translate_batch(&client, &provider, &args.locale, &msgids).await {
+        match translate_batch(&client, &model_provider, &args.locale, &msgids).await {
             Ok(translated) => {
                 for (entry, text) in chunk.iter().zip(translated.iter()) {
                     // If msgid ends with \n, msgstr must too — gettext requires it.

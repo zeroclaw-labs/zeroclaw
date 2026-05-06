@@ -22,14 +22,14 @@ use tokio::io::AsyncWriteExt;
 use zeroclaw_macros::Configurable;
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
-    "provider.anthropic",
-    "provider.compatible",
-    "provider.copilot",
-    "provider.gemini",
-    "provider.glm",
-    "provider.ollama",
-    "provider.openai",
-    "provider.openrouter",
+    "model_provider.anthropic",
+    "model_provider.compatible",
+    "model_provider.copilot",
+    "model_provider.gemini",
+    "model_provider.glm",
+    "model_provider.ollama",
+    "model_provider.openai",
+    "model_provider.openrouter",
     "channel.dingtalk",
     "channel.discord",
     "channel.feishu",
@@ -55,7 +55,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
 ];
 
 const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
-    "provider.*",
+    "model_provider.*",
     "channel.*",
     "tool.*",
     "memory.*",
@@ -85,7 +85,7 @@ pub struct Config {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
 
-    /// Provider configuration (`[providers]`).
+    /// ModelProvider configuration (`[model_providers]`).
     #[serde(default)]
     #[nested]
     pub providers: crate::providers::ProvidersConfig,
@@ -194,7 +194,7 @@ pub struct Config {
     #[nested]
     pub memory: MemoryConfig,
 
-    /// Persistent storage provider configuration (`[storage]`).
+    /// Persistent storage model_provider configuration (`[storage]`).
     #[serde(default)]
     #[nested]
     pub storage: StorageConfig,
@@ -509,7 +509,7 @@ pub struct Config {
 pub struct OnboardStateConfig {
     /// Section keys the user has completed at least once via onboard.
     /// Values are the lowercased Section variant names
-    /// (`"workspace"`, `"providers"`, …).
+    /// (`"workspace"`, `"model_providers"`, …).
     #[serde(default)]
     pub completed_sections: Vec<String>,
 }
@@ -530,7 +530,7 @@ pub struct WorkspaceConfig {
     /// Give each profile its own `brain.db` so conversation history, notes, and memories from one engagement don't leak into another. Turn off only if you want all profiles sharing a single memory store.
     #[serde(default = "default_true")]
     pub isolate_memory: bool,
-    /// Scope provider API keys, channel tokens, and other secrets to the active profile — so a key added while on `client-a` isn't visible from `client-b`. Turn off only if you want all profiles sharing one secret namespace.
+    /// Scope model_provider API keys, channel tokens, and other secrets to the active profile — so a key added while on `client-a` isn't visible from `client-b`. Turn off only if you want all profiles sharing one secret namespace.
     #[serde(default = "default_true")]
     pub isolate_secrets: bool,
     /// Give each profile its own tool-call and channel-message audit trail, so you can hand off logs for a single engagement without exposing other work.
@@ -561,8 +561,8 @@ impl Default for WorkspaceConfig {
 
 /// Used by `#[serde(skip_serializing_if)]` on plain `bool` fields to omit
 /// them from TOML output when they carry their struct-level default (`false`).
-/// Keeps fresh provider entries clean — a default-constructed
-/// `ModelProviderConfig` for one provider family shouldn't write flag fields
+/// Keeps fresh model_provider entries clean — a default-constructed
+/// `ModelProviderConfig` for one model_provider family shouldn't write flag fields
 /// that only apply to a different family.
 fn is_false(value: &bool) -> bool {
     !*value
@@ -575,14 +575,14 @@ fn is_false(value: &bool) -> bool {
 /// in the runtime constructor; for non-templated families the return value is
 /// the final URL.
 ///
-/// Resolution order at runtime is uniform across every model provider family:
+/// Resolution order at runtime is uniform across every model model_provider family:
 /// operator's `cfg.uri` first; family endpoint enum's `uri()` second; loud
 /// failure when neither is set.
 pub trait ModelEndpoint {
     fn uri(&self) -> &'static str;
 }
 
-/// Authentication mode for model provider families that support more than one
+/// Authentication mode for model model_provider families that support more than one
 /// (e.g. Qwen, Minimax can use API key OR OAuth). Families that only support a
 /// single auth flow simply omit this field from their config struct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -597,23 +597,23 @@ pub enum AuthMode {
     OAuth,
 }
 
-/// Named provider profile definition.
+/// Named model_provider profile definition.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models"]
 pub struct ModelProviderConfig {
-    /// Secret API token for this provider — grab it from the provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.
+    /// Secret API token for this model_provider — grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    /// Override the provider type label. Rarely needed — only useful when you run two profiles against the same provider type (e.g. two different OpenAI-compatible gateways) and want to tell them apart in logs.
+    /// Override the model_provider type label. Rarely needed — only useful when you run two profiles against the same model_provider type (e.g. two different OpenAI-compatible gateways) and want to tell them apart in logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Endpoint URI the client hits. Override the family's default endpoint when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a custom proxy, or any non-standard URL. Leave unset to use the family's default URI from its `ModelEndpoint` impl. Set this to the FULL endpoint URL — there is no separate path-suffix field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
-    /// Model identifier to send with each request — the ID string from the provider's catalog (e.g. `gpt-4o`, `claude-sonnet-4-5`, `llama-3.3-70b`). Must match a model the provider actually serves on this account.
+    /// Model identifier to send with each request — the ID string from the model_provider's catalog (e.g. `gpt-4o`, `claude-sonnet-4-5`, `llama-3.3-70b`). Must match a model the model_provider actually serves on this account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Sampling temperature passed to the model. Lower values (0.0–0.3) give
@@ -621,28 +621,28 @@ pub struct ModelProviderConfig {
     /// Higher values (0.7–1.2) give more varied output — fits open-ended chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
-    /// HTTP request timeout in seconds. Bump this for slow local providers (Ollama on CPU, big local models) or high-latency networks; leave unset otherwise.
+    /// HTTP request timeout in seconds. Bump this for slow local model_providers (Ollama on CPU, big local models) or high-latency networks; leave unset otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     /// Extra HTTP headers sent with every request. Niche — used for auth bridges, corporate proxies, or custom gateways that demand a tracing header. Most users never touch this; edit `config.toml` directly if you need it.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub extra_headers: HashMap<String, String>,
-    /// Wire protocol flavor: `"responses"` for OpenAI's Codex/Responses API, `"chat_completions"` for everything else (OpenAI chat, Anthropic, OpenRouter, Groq, local gateways). Auto-selected per provider — only override if you're forcing an unusual combination.
+    /// Wire protocol flavor: `"responses"` for OpenAI's Codex/Responses API, `"chat_completions"` for everything else (OpenAI chat, Anthropic, OpenRouter, Groq, local gateways). Auto-selected per model_provider — only override if you're forcing an unusual combination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_api: Option<String>,
-    /// When true, the client pulls credentials from `OPENAI_API_KEY` or `~/.codex/auth.json` instead of the `api_key` field above. Turn on only for the OpenAI Codex provider; leave off for standard API-key providers.
+    /// When true, the client pulls credentials from `OPENAI_API_KEY` or `~/.codex/auth.json` instead of the `api_key` field above. Turn on only for the OpenAI Codex model_provider; leave off for standard API-key model_providers.
     #[serde(default, skip_serializing_if = "is_false")]
     pub requires_openai_auth: bool,
     /// Hard cap on response length in tokens. Most models enforce sensible built-in limits already — leave unset unless you specifically need to clip long outputs for cost or latency reasons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    /// Provider-specific quirk: fold the system prompt into the first user message instead of sending a separate system role. Only needed for models that reject (or mishandle) a standalone system role — e.g. certain older Mistral variants.
+    /// ModelProvider-specific quirk: fold the system prompt into the first user message instead of sending a separate system role. Only needed for models that reject (or mishandle) a standalone system role — e.g. certain older Mistral variants.
     #[serde(default, skip_serializing_if = "is_false")]
     pub merge_system_into_user: bool,
     /// Extra JSON parameters to include in API requests.
-    /// Merged at the top level of the request body, allowing provider-specific
+    /// Merged at the top level of the request body, allowing model_provider-specific
     /// features (routing, transforms, etc.) without code changes.
-    /// Example: `provider_extra = { provider = { only = ["Anthropic"] } }`
+    /// Example: `provider_extra = { model_provider = { only = ["Anthropic"] } }`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_extra: Option<serde_json::Value>,
     /// Per-model pricing for cost tracking, USD per 1M tokens.
@@ -660,7 +660,7 @@ pub struct ModelProviderConfig {
     pub pricing: HashMap<String, f64>,
 }
 
-// ── Per-family model provider configs ────────────────────────────
+// ── Per-family model model_provider configs ────────────────────────────
 //
 // Each family carries its own typed config (composing `ModelProviderConfig`
 // via `#[serde(flatten)]`) plus a per-family `*Endpoint` enum that names the
@@ -673,8 +673,8 @@ pub struct ModelProviderConfig {
 // - Family with computed-endpoint template: see `AzureModelProviderConfig`
 // - Multi-region family with a required `endpoint` field: see `MoonshotModelProviderConfig`
 //
-// The `ModelProviders` container in `crates/zeroclaw-config/src/providers.rs`
-// holds a typed slot per family; the runtime impls in zeroclaw-providers
+// The `ModelProviders` container in `crates/zeroclaw-config/src/model_providers.rs`
+// holds a typed slot per family; the runtime impls in zeroclaw-model_providers
 // consume the typed configs directly.
 
 // ── OpenAI ──
@@ -696,8 +696,11 @@ impl ModelEndpoint for OpenAIEndpoint {
     }
 }
 
-/// OpenAI model provider config. Adds the OpenAI-family extras
-/// (`wire_api`, `requires_openai_auth`) on top of the shared base.
+/// OpenAI model model_provider config. The OpenAI-family extras (`wire_api`,
+/// `requires_openai_auth`) live on the shared `ModelProviderConfig` base
+/// because they're consumed by validation and runtime helpers that operate
+/// on the base struct without family awareness; this wrapper is a thin
+/// typed slot, no extra fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.openai"]
@@ -705,11 +708,6 @@ pub struct OpenAIModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
-    /// Wire protocol flavor: `"responses"` for OpenAI's Responses API,
-    /// `"chat_completions"` for the chat completions endpoint. Auto-selected
-    /// per provider — only override if you're forcing an unusual combination.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wire_api: Option<String>,
 }
 
 // ── Azure OpenAI ──
@@ -736,7 +734,7 @@ impl ModelEndpoint for AzureEndpoint {
     }
 }
 
-/// Azure OpenAI model provider config. Carries the Azure-specific connection
+/// Azure OpenAI model model_provider config. Carries the Azure-specific connection
 /// fields (`resource`, `deployment`, `api_version`) — the URI template
 /// substitutes `{resource}` and `{deployment}` at runtime. Operators can
 /// still override the entire endpoint via `base.uri`.
@@ -793,7 +791,7 @@ impl ModelEndpoint for AnthropicEndpoint {
     }
 }
 
-/// Anthropic model provider config. No family-specific extras yet — typed
+/// Anthropic model model_provider config. No family-specific extras yet — typed
 /// slot reserved for future Anthropic-only knobs (cache_control, beta
 /// headers) so they land cleanly without another schema rework.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -833,7 +831,7 @@ impl ModelEndpoint for MoonshotEndpoint {
     }
 }
 
-/// Moonshot model provider config. The `endpoint` field is required (no
+/// Moonshot model model_provider config. The `endpoint` field is required (no
 /// implicit default) — operators must pick a region explicitly. Migration
 /// fills it in from collapsed `moonshot-cn` / `moonshot-intl` outer keys.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -881,7 +879,7 @@ impl ModelEndpoint for QwenEndpoint {
     }
 }
 
-/// Qwen model provider config. Multi-region (`endpoint` required) and
+/// Qwen model model_provider config. Multi-region (`endpoint` required) and
 /// supports both API key and OAuth flows (`auth_mode` chooses which).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -2065,7 +2063,7 @@ pub struct GeminiModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
-    /// Auth flow. Defaults to `api_key`; `oauth` uses GeminiProvider's
+    /// Auth flow. Defaults to `api_key`; `oauth` uses GeminiModelProvider's
     /// OAuth-cache integration instead of the `api_key` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AuthMode>,
@@ -2396,7 +2394,7 @@ impl ModelEndpoint for BedrockEndpoint {
     }
 }
 
-/// AWS Bedrock model provider config. Carries the AWS region (the URI
+/// AWS Bedrock model model_provider config. Carries the AWS region (the URI
 /// template substitutes `{region}` from this field). Bedrock auth is
 /// SigV4 — credentials come from the standard AWS credential chain
 /// (env vars, instance metadata, profile), not from `api_key`.
@@ -2419,7 +2417,7 @@ pub struct BedrockModelProviderConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "delegate"]
 pub struct DelegateToolConfig {
-    /// Default timeout in seconds for non-agentic sub-agent provider calls.
+    /// Default timeout in seconds for non-agentic sub-agent model_provider calls.
     /// Can be overridden per-agent in `[agents.<name>]` config.
     /// Default: 120 seconds.
     #[serde(default = "default_delegate_timeout_secs")]
@@ -2456,7 +2454,7 @@ pub struct DelegateAgentConfig {
     /// Channel aliases this agent handles (e.g. `["telegram.default", "discord.work"]`).
     #[serde(default)]
     pub channels: Vec<String>,
-    /// Dotted model-provider alias (e.g. `"anthropic.default"`).
+    /// Dotted model-model_provider alias (e.g. `"anthropic.default"`).
     /// Resolves through `providers.models.<type>.<alias>` at runtime.
     #[serde(default)]
     pub model_provider: String,
@@ -2492,7 +2490,8 @@ pub struct DelegateAgentConfig {
     pub cron_jobs: Vec<String>,
     /// TTS provider as a dotted alias reference (`<type>.<alias>`,
     /// e.g. `"openai.default"`). Resolves through `providers.tts.<type>.<alias>`.
-    /// Empty = inherit `[tts].default_provider` (or no TTS if both empty).
+    /// Empty = no TTS for this agent (V3 has no global default-provider concept;
+    /// every agent that wants TTS sets its own `tts_provider`).
     #[serde(default)]
     pub tts_provider: String,
 
@@ -2638,9 +2637,9 @@ impl Config {
     /// `<type>.<alias>` pair doesn't resolve in `providers.models`.
     ///
     /// This is the V3-correct lookup the orchestrator uses to build
-    /// per-agent provider runtime options instead of falling back to
-    /// `first_provider()`, which silently collapses multiple aliases under
-    /// the same provider family to whichever entry happens to be first
+    /// per-agent model_provider runtime options instead of falling back to
+    /// `first_model_provider()`, which silently collapses multiple aliases under
+    /// the same model_provider family to whichever entry happens to be first
     /// (#6266 review). The matching split logic lives in
     /// `crates/zeroclaw-runtime/src/tools/delegate.rs::resolve_brain` for
     /// delegate sub-agents; this helper exposes the same contract for the
@@ -2937,7 +2936,7 @@ fn default_transcription_max_duration_secs() -> u64 {
     120
 }
 
-fn default_transcription_provider() -> String {
+fn default_transcription_provider_legacy() -> String {
     "groq".into()
 }
 
@@ -2953,7 +2952,7 @@ fn default_google_stt_language_code() -> String {
     "en-US".into()
 }
 
-/// Voice transcription configuration with multi-provider support.
+/// Voice transcription configuration with multi-model_provider support.
 ///
 /// The top-level `api_url`, `model`, and `api_key` fields remain for backward
 /// compatibility with existing Groq-based configurations.
@@ -2964,23 +2963,29 @@ pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
-    /// Default STT provider: "groq", "openai", "deepgram", "assemblyai", "google".
-    #[serde(default = "default_transcription_provider")]
-    pub default_provider: String,
-    /// API key used for transcription requests (Groq provider).
+    /// Default STT/transcription provider (legacy V2 field). Will be removed
+    /// once the typed-family split for transcription lands; for now it satisfies
+    /// the existing TranscriptionManager dispatch.
+    #[serde(
+        default = "default_transcription_provider_legacy",
+        alias = "default_provider",
+        alias = "default_model_provider"
+    )]
+    pub default_transcription_provider: String,
+    /// API key used for transcription requests (Groq transcription provider).
     ///
     /// If unset, runtime falls back to `GROQ_API_KEY` for backward compatibility.
     #[serde(default)]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
-    /// Whisper API endpoint URL (Groq provider).
+    /// Whisper API endpoint URL (Groq transcription provider).
     #[serde(default = "default_transcription_api_url")]
     pub api_url: String,
-    /// Whisper model name (Groq provider).
+    /// Whisper model name (Groq transcription provider).
     #[serde(default = "default_transcription_model")]
     pub model: String,
-    /// Optional language hint (ISO-639-1, e.g. "en", "ru") for Groq provider.
+    /// Optional language hint (ISO-639-1, e.g. "en", "ru") for Groq transcription provider.
     #[serde(default)]
     pub language: Option<String>,
     /// Optional initial prompt to bias transcription toward expected vocabulary
@@ -2991,23 +2996,23 @@ pub struct TranscriptionConfig {
     /// Maximum voice duration in seconds (messages longer than this are skipped).
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
-    /// OpenAI Whisper STT provider configuration.
+    /// OpenAI Whisper STT model_provider configuration.
     #[serde(default)]
     #[nested]
     pub openai: Option<OpenAiSttConfig>,
-    /// Deepgram STT provider configuration.
+    /// Deepgram STT model_provider configuration.
     #[serde(default)]
     #[nested]
     pub deepgram: Option<DeepgramSttConfig>,
-    /// AssemblyAI STT provider configuration.
+    /// AssemblyAI STT model_provider configuration.
     #[serde(default)]
     #[nested]
     pub assemblyai: Option<AssemblyAiSttConfig>,
-    /// Google Cloud Speech-to-Text provider configuration.
+    /// Google Cloud Speech-to-Text model_provider configuration.
     #[serde(default)]
     #[nested]
     pub google: Option<GoogleSttConfig>,
-    /// Local/self-hosted Whisper-compatible STT provider.
+    /// Local/self-hosted Whisper-compatible STT model_provider.
     #[serde(default)]
     #[nested]
     pub local_whisper: Option<LocalWhisperConfig>,
@@ -3021,7 +3026,7 @@ impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            default_provider: default_transcription_provider(),
+            default_transcription_provider: default_transcription_provider_legacy(),
             api_key: None,
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
@@ -3208,7 +3213,7 @@ fn default_tts_max_text_length() -> usize {
 ///
 /// V3 promotes per-instance TTS configs to `[providers.tts.<type>.<alias>]`
 /// (parallel to `providers.models`). What remains here are the global
-/// runtime knobs that apply to every provider invocation.
+/// runtime knobs that apply to every model_provider invocation.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tts"]
@@ -3216,12 +3221,11 @@ pub struct TtsConfig {
     /// Enable TTS synthesis.
     #[serde(default)]
     pub enabled: bool,
-    /// Default TTS provider as a dotted alias reference (`<type>.<alias>`,
-    /// e.g. `"openai.default"`). Resolves through `providers.tts.<type>.<alias>`.
-    /// When empty, agents must specify `tts_provider` explicitly.
-    #[serde(default)]
-    pub default_provider: String,
-    /// Default voice ID passed to the selected provider.
+    /// Default TTS provider (legacy V2 field). Will be removed once the
+    /// per-agent tts_provider plumbing lands across all channel TTS paths.
+    #[serde(default, alias = "default_provider", alias = "default_model_provider")]
+    pub default_tts_provider: String,
+    /// Default voice ID passed to the selected tts provider.
     #[serde(default = "default_tts_voice")]
     pub default_voice: String,
     /// Default audio output format (`"mp3"`, `"opus"`, `"wav"`).
@@ -3236,7 +3240,7 @@ impl Default for TtsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            default_provider: String::new(),
+            default_tts_provider: String::new(),
             default_voice: default_tts_voice(),
             default_format: default_tts_format(),
             max_text_length: default_tts_max_text_length(),
@@ -3244,7 +3248,7 @@ impl Default for TtsConfig {
     }
 }
 
-/// Per-instance TTS provider configuration (`[providers.tts.<type>.<alias>]`).
+/// Per-instance TTS model_provider configuration (`[providers.tts.<type>.<alias>]`).
 ///
 /// Mirrors `ModelProviderConfig` in shape — one struct holds the union of
 /// fields across backends. Only the fields relevant to the selected backend
@@ -3252,7 +3256,7 @@ impl Default for TtsConfig {
 /// are quietly ignored.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "tts-provider"]
+#[prefix = "tts-model_provider"]
 #[serde(default)]
 pub struct TtsProviderConfig {
     /// API key (openai, elevenlabs, google).
@@ -3283,7 +3287,7 @@ pub struct TtsProviderConfig {
 
 // ── TTS endpoint trait + per-family typed configs ──────────────────────────
 //
-// Mirrors the model-provider typed-family pattern. Each TTS family carries
+// Mirrors the model-model_provider typed-family pattern. Each TTS family carries
 // its own typed config (composing TtsProviderConfig as the shared base via
 // `#[serde(flatten)]`) and a single-variant `*TtsEndpoint` enum impl'ing
 // `TtsEndpoint`. Edge and Piper skip the base — they're subprocess / local
@@ -3466,7 +3470,7 @@ pub struct ToolFilterGroup {
     pub filter_builtins: bool,
 }
 
-/// OpenAI Whisper STT provider configuration (`[transcription.openai]`).
+/// OpenAI Whisper STT model_provider configuration (`[transcription.openai]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.openai"]
@@ -3481,7 +3485,7 @@ pub struct OpenAiSttConfig {
     pub model: String,
 }
 
-/// Deepgram STT provider configuration (`[transcription.deepgram]`).
+/// Deepgram STT model_provider configuration (`[transcription.deepgram]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.deepgram"]
@@ -3496,7 +3500,7 @@ pub struct DeepgramSttConfig {
     pub model: String,
 }
 
-/// AssemblyAI STT provider configuration (`[transcription.assemblyai]`).
+/// AssemblyAI STT model_provider configuration (`[transcription.assemblyai]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.assemblyai"]
@@ -3508,7 +3512,7 @@ pub struct AssemblyAiSttConfig {
     pub api_key: Option<String>,
 }
 
-/// Google Cloud Speech-to-Text provider configuration (`[transcription.google]`).
+/// Google Cloud Speech-to-Text model_provider configuration (`[transcription.google]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.google"]
@@ -3815,13 +3819,13 @@ pub struct MultimodalConfig {
     /// Allow fetching remote image URLs (http/https). Disabled by default.
     #[serde(default)]
     pub allow_remote_fetch: bool,
-    /// Provider name to use for vision/image messages (e.g. `"ollama"`).
+    /// ModelProvider name to use for vision/image messages (e.g. `"ollama"`).
     /// When set, messages containing `[IMAGE:]` markers are routed to this
-    /// provider instead of the default text provider.
+    /// model_provider instead of the default text model_provider.
     #[serde(default)]
-    pub vision_provider: Option<String>,
-    /// Model to use when routing to the vision provider (e.g. `"llava:7b"`).
-    /// Only used when `vision_provider` is set.
+    pub vision_model_provider: Option<String>,
+    /// Model to use when routing to the vision model_provider (e.g. `"llava:7b"`).
+    /// Only used when `vision_model_provider` is set.
     #[serde(default)]
     pub vision_model: Option<String>,
 }
@@ -3849,7 +3853,7 @@ impl Default for MultimodalConfig {
             max_images: default_multimodal_max_images(),
             max_image_size_mb: default_multimodal_max_image_size_mb(),
             allow_remote_fetch: false,
-            vision_provider: None,
+            vision_model_provider: None,
             vision_model: None,
         }
     }
@@ -3871,7 +3875,7 @@ pub struct MediaPipelineConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Transcribe audio attachments using the configured transcription provider.
+    /// Transcribe audio attachments using the configured transcription model_provider.
     #[serde(default = "default_true")]
     pub transcribe_audio: bool,
 
@@ -4937,20 +4941,20 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), or "searxng" (self-hosted)
+    /// Search model_provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), or "searxng" (self-hosted)
     #[serde(default = "default_web_search_provider")]
-    pub provider: String,
-    /// Brave Search API key (required if provider is "brave")
+    pub model_provider: String,
+    /// Brave Search API key (required if model_provider is "brave")
     #[serde(default)]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub brave_api_key: Option<String>,
-    /// Tavily Search API key (required if provider is "tavily")
+    /// Tavily Search API key (required if model_provider is "tavily")
     #[serde(default)]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub tavily_api_key: Option<String>,
-    /// SearXNG instance URL (required if provider is `"searxng"`), e.g. `"https://searx.example.com"`.
+    /// SearXNG instance URL (required if model_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
     /// Maximum results per search (1-10)
@@ -4977,7 +4981,7 @@ impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            provider: default_web_search_provider(),
+            model_provider: default_web_search_provider(),
             brave_api_key: None,
             tavily_api_key: None,
             searxng_instance_url: None,
@@ -5527,11 +5531,11 @@ pub struct LinkedInImageConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Provider priority order. Tried in sequence; first success wins.
+    /// ModelProvider priority order. Tried in sequence; first success wins.
     #[serde(default = "default_image_providers")]
     pub providers: Vec<String>,
 
-    /// Generate a branded SVG text card when all AI providers fail.
+    /// Generate a branded SVG text card when all AI model_providers fail.
     #[serde(default = "default_true")]
     pub fallback_card: bool,
 
@@ -5543,22 +5547,22 @@ pub struct LinkedInImageConfig {
     #[serde(default = "default_image_temp_dir")]
     pub temp_dir: String,
 
-    /// Stability AI provider settings.
+    /// Stability AI model_provider settings.
     #[serde(default)]
     #[nested]
     pub stability: ImageProviderStabilityConfig,
 
-    /// Google Imagen (Vertex AI) provider settings.
+    /// Google Imagen (Vertex AI) model_provider settings.
     #[serde(default)]
     #[nested]
     pub imagen: ImageProviderImagenConfig,
 
-    /// OpenAI DALL-E provider settings.
+    /// OpenAI DALL-E model_provider settings.
     #[serde(default)]
     #[nested]
     pub dalle: ImageProviderDalleConfig,
 
-    /// Flux (fal.ai) provider settings.
+    /// Flux (fal.ai) model_provider settings.
     #[serde(default)]
     #[nested]
     pub flux: ImageProviderFluxConfig,
@@ -5963,7 +5967,7 @@ impl Default for GeminiCliConfig {
 ///
 /// Delegates coding tasks to the `opencode run` CLI. Authentication uses the
 /// binary's own session by default — no API key needed unless
-/// `env_passthrough` includes provider-specific keys.
+/// `env_passthrough` includes model_provider-specific keys.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "opencode-cli"]
@@ -7060,7 +7064,7 @@ pub struct SqliteStorageConfig {
 /// PostgreSQL storage backend (`[storage.postgres.<alias>]`).
 ///
 /// Holds connection parameters AND pgvector settings — V3 collapses the V2
-/// `[storage.provider.config]` (connection) and `[memory.postgres]`
+/// `[storage.model_provider.config]` (connection) and `[memory.postgres]`
 /// (vector params) into one alias-keyed entry.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -7212,10 +7216,10 @@ pub struct MemoryConfig {
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
-    /// Embedding model identifier — must match a model your chosen embedding provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings; you'll need to re-index.
+    /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings; you'll need to re-index.
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
-    /// Vector width produced by the embedding model — must match the model's native dimension or vectors won't store correctly. Look up the number on the provider's model page.
+    /// Vector width produced by the embedding model — must match the model's native dimension or vectors won't store correctly. Look up the number on the model_provider's model page.
     #[serde(default = "default_embedding_dims")]
     pub embedding_dimensions: usize,
     /// How heavily vector (semantic) similarity counts when `search_mode = hybrid`. Raise toward 1.0 to favor meaning-based matches; lower it to lean on keyword overlap instead.
@@ -7224,7 +7228,7 @@ pub struct MemoryConfig {
     /// How heavily BM25 (keyword) overlap counts when `search_mode = hybrid`. Raise toward 1.0 for exact-term matching; lower it when paraphrases should still score well.
     #[serde(default = "default_keyword_weight")]
     pub keyword_weight: f64,
-    /// How memories are retrieved: `bm25` = keyword-only (no embeddings, cheapest); `embedding` = vector similarity only (needs an embedding provider); `hybrid` = blended keyword + vector score using the weights above (most robust).
+    /// How memories are retrieved: `bm25` = keyword-only (no embeddings, cheapest); `embedding` = vector similarity only (needs an embedding model_provider); `hybrid` = blended keyword + vector score using the weights above (most robust).
     #[serde(default)]
     pub search_mode: SearchMode,
     /// Minimum hybrid score (0.0–1.0) for a memory to be included in context.
@@ -7806,15 +7810,15 @@ impl Default for RiskProfileConfig {
 
 /// Named runtime/LLM execution profile (`[runtime_profiles.<alias>]`).
 ///
-/// Defines a reusable set of LLM provider and execution parameters. Agents
+/// Defines a reusable set of LLM model_provider and execution parameters. Agents
 /// or channels that reference this profile inherit its settings as overrides.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "runtime-profile"]
 #[serde(default)]
 pub struct RuntimeProfileConfig {
-    /// Model provider name (e.g. `"openrouter"`, `"ollama"`).
-    pub provider: Option<String>,
+    /// Model model_provider name (e.g. `"openrouter"`, `"ollama"`).
+    pub model_provider: Option<String>,
     /// Model identifier.
     pub model: Option<String>,
     /// API key override for this profile.
@@ -7825,7 +7829,7 @@ pub struct RuntimeProfileConfig {
     pub temperature: Option<f64>,
     /// Maximum tokens to generate.
     pub max_tokens: Option<u32>,
-    /// Provider call timeout in seconds for non-agentic calls.
+    /// ModelProvider call timeout in seconds for non-agentic calls.
     pub timeout_secs: Option<u64>,
     /// Enable agentic (multi-turn tool-call loop) mode.
     pub agentic: bool,
@@ -7952,13 +7956,13 @@ pub struct RuntimeConfig {
     #[nested]
     pub docker: DockerRuntimeConfig,
 
-    /// Global reasoning override for providers that expose explicit controls.
-    /// - `None`: provider default behavior
+    /// Global reasoning override for model_providers that expose explicit controls.
+    /// - `None`: model_provider default behavior
     /// - `Some(true)`: request reasoning/thinking when supported
     /// - `Some(false)`: disable reasoning/thinking when supported
     #[serde(default)]
     pub reasoning_enabled: Option<bool>,
-    /// Optional reasoning effort for providers that expose a level control.
+    /// Optional reasoning effort for model_providers that expose a level control.
     #[serde(default, deserialize_with = "deserialize_reasoning_effort_opt")]
     pub reasoning_effort: Option<String>,
 }
@@ -8046,15 +8050,15 @@ impl Default for RuntimeConfig {
 
 /// Reliability and supervision configuration (`[reliability]` section).
 ///
-/// Controls provider retries, API key rotation, and channel restart backoff.
+/// Controls model_provider retries, API key rotation, and channel restart backoff.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "reliability"]
 pub struct ReliabilityConfig {
-    /// Retries per provider before bailing.
+    /// Retries per model_provider before bailing.
     #[serde(default = "default_provider_retries")]
     pub provider_retries: u32,
-    /// Base backoff (ms) for provider retry delay.
+    /// Base backoff (ms) for model_provider retry delay.
     #[serde(default = "default_provider_backoff_ms")]
     pub provider_backoff_ms: u64,
     /// Additional API keys for round-robin rotation on rate-limit (429) errors.
@@ -8171,17 +8175,17 @@ impl Default for SchedulerConfig {
 
 // ── Model routing ────────────────────────────────────────────────
 
-/// Route a task hint to a specific provider + model.
+/// Route a task hint to a specific model_provider + model.
 ///
 /// ```toml
 /// [[model_routes]]
 /// hint = "reasoning"
-/// provider = "openrouter"
+/// model_provider = "openrouter"
 /// model = "anthropic/claude-opus-4-20250514"
 ///
 /// [[model_routes]]
 /// hint = "fast"
-/// provider = "groq"
+/// model_provider = "groq"
 /// model = "llama-3.3-70b-versatile"
 /// ```
 ///
@@ -8191,23 +8195,24 @@ impl Default for SchedulerConfig {
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     pub hint: String,
-    /// Provider to route to (must match a known provider name)
-    pub provider: String,
-    /// Model to use with that provider
+    /// Model provider to route to (must match a known model-provider name)
+    #[serde(alias = "provider")]
+    pub model_provider: String,
+    /// Model to use with that model provider
     pub model: String,
-    /// Optional API key override for this route's provider
+    /// Optional API key override for this route's model provider
     #[serde(default)]
     pub api_key: Option<String>,
 }
 
 // ── Embedding routing ───────────────────────────────────────────
 
-/// Route an embedding hint to a specific provider + model.
+/// Route an embedding hint to a specific model_provider + model.
 ///
 /// ```toml
 /// [[embedding_routes]]
 /// hint = "semantic"
-/// provider = "openai"
+/// model_provider = "openai"
 /// model = "text-embedding-3-small"
 /// dimensions = 1536
 ///
@@ -8219,14 +8224,15 @@ pub struct ModelRouteConfig {
 pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
     pub hint: String,
-    /// Embedding provider (`none`, `openai`, or `custom:<url>`)
-    pub provider: String,
-    /// Embedding model to use with that provider
+    /// Embedding-capable model provider (`none`, `openai`, or `custom:<url>`)
+    #[serde(alias = "provider")]
+    pub model_provider: String,
+    /// Embedding model to use with that model provider
     pub model: String,
     /// Optional embedding dimension override for this route
     #[serde(default)]
     pub dimensions: Option<usize>,
-    /// Optional API key override for this route's provider
+    /// Optional API key override for this route's model_provider
     #[serde(default)]
     pub api_key: Option<String>,
 }
@@ -8535,40 +8541,40 @@ fn default_max_run_history() -> u32 {
 
 /// Tunnel configuration for exposing the gateway publicly (`[tunnel]` section).
 ///
-/// Supported providers: `"none"` (default), `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, `"pinggy"`, `"custom"`.
+/// Supported model_providers: `"none"` (default), `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, `"pinggy"`, `"custom"`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel"]
 pub struct TunnelConfig {
     /// How the gateway gets exposed to the public internet so webhooks (Telegram, Slack, etc.) can reach it. `none` = keep it local, no tunnel; `cloudflare` = Cloudflare Tunnel via cloudflared (needs a Zero Trust account and token); `tailscale` = Tailscale Funnel/Serve (tailnet-only or public, no account beyond tailscale); `ngrok` = ngrok agent with auth token; `openvpn` = bring-your-own OpenVPN egress; `pinggy` = Pinggy SSH tunnels (quick one-shot URLs); `custom` = run an arbitrary command you define under `[tunnel.custom]`.
-    pub provider: String,
+    pub model_provider: String,
 
-    /// Cloudflare Tunnel configuration (used when `provider = "cloudflare"`).
+    /// Cloudflare Tunnel configuration (used when `model_provider = "cloudflare"`).
     #[serde(default)]
     #[nested]
     pub cloudflare: Option<CloudflareTunnelConfig>,
 
-    /// Tailscale Funnel/Serve configuration (used when `provider = "tailscale"`).
+    /// Tailscale Funnel/Serve configuration (used when `model_provider = "tailscale"`).
     #[serde(default)]
     #[nested]
     pub tailscale: Option<TailscaleTunnelConfig>,
 
-    /// ngrok tunnel configuration (used when `provider = "ngrok"`).
+    /// ngrok tunnel configuration (used when `model_provider = "ngrok"`).
     #[serde(default)]
     #[nested]
     pub ngrok: Option<NgrokTunnelConfig>,
 
-    /// OpenVPN tunnel configuration (used when `provider = "openvpn"`).
+    /// OpenVPN tunnel configuration (used when `model_provider = "openvpn"`).
     #[serde(default)]
     #[nested]
     pub openvpn: Option<OpenVpnTunnelConfig>,
 
-    /// Custom tunnel command configuration (used when `provider = "custom"`).
+    /// Custom tunnel command configuration (used when `model_provider = "custom"`).
     #[serde(default)]
     #[nested]
     pub custom: Option<CustomTunnelConfig>,
 
-    /// Pinggy tunnel configuration (used when `provider = "pinggy"`).
+    /// Pinggy tunnel configuration (used when `model_provider = "pinggy"`).
     #[serde(default)]
     #[nested]
     pub pinggy: Option<PinggyTunnelConfig>,
@@ -8577,7 +8583,7 @@ pub struct TunnelConfig {
 impl Default for TunnelConfig {
     fn default() -> Self {
         Self {
-            provider: "none".into(),
+            model_provider: "none".into(),
             cloudflare: None,
             tailscale: None,
             ngrok: None,
@@ -8627,8 +8633,8 @@ pub struct NgrokTunnelConfig {
 
 /// OpenVPN tunnel configuration (`[tunnel.openvpn]`).
 ///
-/// Required when `tunnel.provider = "openvpn"`. Omitting this section entirely
-/// preserves previous behavior. Setting `tunnel.provider = "none"` (or removing
+/// Required when `tunnel.model_provider = "openvpn"`. Omitting this section entirely
+/// preserves previous behavior. Setting `tunnel.model_provider = "none"` (or removing
 /// the `[tunnel.openvpn]` block) cleanly reverts to no-tunnel mode.
 ///
 /// Defaults: `connect_timeout_secs = 30`.
@@ -11333,10 +11339,10 @@ pub struct CloudOpsConfig {
     /// Enable cloud operations tools. Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// Default cloud provider for analysis context. Default: "aws".
+    /// Default cloud model_provider for analysis context. Default: "aws".
     #[serde(default = "default_cloud_ops_cloud")]
     pub default_cloud: String,
-    /// Supported cloud providers. Default: [`aws`, `azure`, `gcp`].
+    /// Supported cloud model_providers. Default: [`aws`, `azure`, `gcp`].
     #[serde(default = "default_cloud_ops_supported_clouds")]
     pub supported_clouds: Vec<String>,
     /// Supported IaC tools for review. Default: \[`terraform`\].
@@ -12306,9 +12312,9 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         // Tunnel — OpenVPN
-        if self.tunnel.provider.trim() == "openvpn" {
+        if self.tunnel.model_provider.trim() == "openvpn" {
             let openvpn = self.tunnel.openvpn.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("tunnel.provider='openvpn' requires [tunnel.openvpn]")
+                anyhow::anyhow!("tunnel.model_provider='openvpn' requires [tunnel.openvpn]")
             })?;
 
             if openvpn.config_file.trim().is_empty() {
@@ -12503,11 +12509,11 @@ impl Config {
                     "model_routes[{i}].hint must not be empty"
                 );
             }
-            if route.provider.trim().is_empty() {
+            if route.model_provider.trim().is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
-                    format!("model_routes[{i}].provider"),
-                    "model_routes[{i}].provider must not be empty"
+                    format!("model_routes[{i}].model_provider"),
+                    "model_routes[{i}].model_provider must not be empty"
                 );
             }
             if route.model.trim().is_empty() {
@@ -12528,11 +12534,11 @@ impl Config {
                     "embedding_routes[{i}].hint must not be empty"
                 );
             }
-            if route.provider.trim().is_empty() {
+            if route.model_provider.trim().is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
-                    format!("embedding_routes[{i}].provider"),
-                    "embedding_routes[{i}].provider must not be empty"
+                    format!("embedding_routes[{i}].model_provider"),
+                    "embedding_routes[{i}].model_provider must not be empty"
                 );
             }
             if route.model.trim().is_empty() {
@@ -12558,14 +12564,14 @@ impl Config {
                 .map(str::trim)
                 .is_some_and(|value| !value.is_empty());
 
-            // Entries created by migration from top-level fields use the provider
+            // Entries created by migration from top-level fields use the model_provider
             // name as the map key and may not have explicit `name` or `uri`
-            // (the provider factory resolves the family's default endpoint via
+            // (the model_provider factory resolves the family's default endpoint via
             // `ModelEndpoint`). An entry with no identifying information at
             // all is almost always an in-progress onboarding state — the user
-            // picked the provider but hasn't filled anything in yet. Warn but
+            // picked the model_provider but hasn't filled anything in yet. Warn but
             // don't bail; the runtime falls back to family-default endpoint at
-            // use time, and a chat against the unconfigured provider fails
+            // use time, and a chat against the unconfigured model_provider fails
             // with a clear error then.
             let has_api_key = profile
                 .api_key
@@ -12577,10 +12583,10 @@ impl Config {
                 .is_some_and(|v| !v.trim().is_empty());
             if !has_name && !has_uri && !has_api_key && !has_model {
                 tracing::warn!(
-                    provider = %profile_name,
+                    model_provider = %profile_name,
                     "providers.models.{profile_name} is empty (no name / uri / api_key / model). \
                      Skipping at runtime; finish onboarding via the dashboard or `zeroclaw onboard` \
-                     to make this provider usable.",
+                     to make this model_provider usable.",
                 );
                 continue;
             }
@@ -12650,12 +12656,12 @@ impl Config {
         {
             if is_local_ollama_endpoint(entry.uri.as_deref()) {
                 anyhow::bail!(
-                    "default_model uses ':cloud' with provider 'ollama', but uri is local or unset. Set uri to a remote Ollama endpoint (for example https://ollama.com)."
+                    "default_model uses ':cloud' with model_provider 'ollama', but uri is local or unset. Set uri to a remote Ollama endpoint (for example https://ollama.com)."
                 );
             }
             if !has_ollama_cloud_credential(entry.api_key.as_deref()) {
                 anyhow::bail!(
-                    "default_model uses ':cloud' with provider 'ollama', but no API key is configured. Set api_key or OLLAMA_API_KEY."
+                    "default_model uses ':cloud' with model_provider 'ollama', but no API key is configured. Set api_key or OLLAMA_API_KEY."
                 );
             }
         }
@@ -13021,14 +13027,14 @@ impl Config {
             anyhow::bail!("security.nevis: {msg}");
         }
 
-        // Transcription
+        // Transcription (legacy default — slated for removal with the typed-family split)
         {
-            let dp = self.transcription.default_provider.trim();
+            let dp = self.transcription.default_transcription_provider.trim();
             match dp {
                 "groq" | "openai" | "deepgram" | "assemblyai" | "google" | "local_whisper" => {}
                 other => {
                     anyhow::bail!(
-                        "transcription.default_provider must be one of: groq, openai, deepgram, assemblyai, google, local_whisper (got '{other}')"
+                        "transcription.default_transcription_provider must be one of: groq, openai, deepgram, assemblyai, google, local_whisper (got '{other}')"
                     );
                 }
             }
@@ -13065,8 +13071,8 @@ impl Config {
             if mp.is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
-                    format!("agents.{alias}.model-provider"),
-                    "agents.{alias}.model_provider must reference a configured model provider (e.g. \"anthropic.default\")",
+                    format!("agents.{alias}.model-model_provider"),
+                    "agents.{alias}.model_provider must reference a configured model model_provider (e.g. \"anthropic.default\")",
                 );
             }
             match mp.split_once('.') {
@@ -13077,14 +13083,14 @@ impl Config {
                     if !exists {
                         validation_bail!(
                             DanglingReference,
-                            format!("agents.{alias}.model-provider"),
+                            format!("agents.{alias}.model-model_provider"),
                             "agents.{alias}.model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
                 }
                 _ => validation_bail!(
                     InvalidFormat,
-                    format!("agents.{alias}.model-provider"),
+                    format!("agents.{alias}.model-model_provider"),
                     "agents.{alias}.model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
                 ),
             }
@@ -13664,9 +13670,9 @@ mod tests {
     #[test]
     async fn config_default_has_sane_values() {
         let c = Config::default();
-        // No provider configured by default — set during onboarding.
+        // No model_provider configured by default — set during onboarding.
         assert!(c.providers.models.is_empty());
-        assert!(c.providers.first_provider().is_none());
+        assert!(c.providers.first_model_provider().is_none());
         assert!(!c.skills.open_skills_enabled);
         assert!(!c.skills.allow_scripts);
         assert_eq!(
@@ -13740,7 +13746,7 @@ mod tests {
         assert!(!properties.contains_key("workspace_dir"));
         assert!(!properties.contains_key("config_path"));
         // These fields are now #[serde(skip)] cache fields, not in schema.
-        assert!(!properties.contains_key("default_provider"));
+        assert!(!properties.contains_key("default_model_provider"));
         assert!(!properties.contains_key("api_key"));
         assert!(!properties.contains_key("default_model"));
 
@@ -14211,7 +14217,7 @@ auto_save = true
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
         };
-        // Provider fields are now resolved directly — no cache needed.
+        // ModelProvider fields are now resolved directly — no cache needed.
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed = parse_test_config(&toml_str);
@@ -14249,7 +14255,7 @@ default_temperature = 0.7
         assert!(
             parsed
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.api_key.as_deref())
                 .is_none()
         );
@@ -14274,11 +14280,11 @@ default_temperature = 0.7
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 30);
-        // Temperature migrated onto the primary provider entry
+        // Temperature migrated onto the primary model_provider entry
         assert!(
             (parsed
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
                 - 0.7)
@@ -14288,7 +14294,7 @@ default_temperature = 0.7
         assert_eq!(
             parsed
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.timeout_secs)
                 .unwrap_or(120),
             DEFAULT_DELEGATE_TIMEOUT_SECS
@@ -14415,7 +14421,7 @@ auto_approve = ["weather", "file_read"]
     #[test]
     async fn provider_timeout_secs_parses_from_toml() {
         // V1 top-level `provider_timeout_secs` is folded into the
-        // synthesized provider entry's `timeout_secs` by V1→V2 migration.
+        // synthesized model_provider entry's `timeout_secs` by V1→V2 migration.
         let raw = r#"
 default_temperature = 0.7
 provider_timeout_secs = 300
@@ -14424,7 +14430,7 @@ provider_timeout_secs = 300
         assert_eq!(
             parsed
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.timeout_secs)
                 .unwrap_or(120),
             300
@@ -14501,7 +14507,7 @@ provider_timeout_secs = 300
     #[test]
     async fn extra_headers_parses_from_toml() {
         // V1 top-level `[extra_headers]` is folded into the synthesized
-        // default provider entry's `extra_headers` map by V1→V2 migration.
+        // default model_provider entry's `extra_headers` map by V1→V2 migration.
         let raw = r#"
 default_temperature = 0.7
 
@@ -14512,8 +14518,8 @@ X-Title = "zeroclaw"
         let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
         let headers = &parsed
             .providers
-            .first_provider()
-            .expect("synthesized default provider")
+            .first_model_provider()
+            .expect("synthesized default model_provider")
             .extra_headers;
         assert_eq!(headers.len(), 2);
         assert_eq!(headers.get("User-Agent").unwrap(), "MyApp/1.0");
@@ -14529,7 +14535,7 @@ default_temperature = 0.7
         assert!(
             parsed
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .map(|e| e.extra_headers.is_empty())
                 .unwrap_or(true)
         );
@@ -14785,7 +14791,7 @@ default_temperature = 0.7
             escalation: EscalationConfig::default(),
         };
 
-        // Provider fields are now resolved directly — no cache needed.
+        // ModelProvider fields are now resolved directly — no cache needed.
         config.save().await.unwrap();
         assert!(config_path.exists());
 
@@ -14837,7 +14843,7 @@ default_temperature = 0.7
                 },
             },
         );
-        // Provider fields are now resolved directly — no cache needed.
+        // ModelProvider fields are now resolved directly — no cache needed.
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
@@ -16093,7 +16099,7 @@ default_temperature = 0.7
     #[test]
     #[ignore = "pre-#6273 test asserts on flat-config behavior; rewrite in #6273 follow-up against typed family slots"]
     async fn toml_supports_model_provider_and_model_alias_fields() {
-        // V1 aliases: `model_provider` → `default_provider`,
+        // V1 aliases: `model_provider` → `default_model_provider`,
         // `model` → `default_model`. Both folded into the synthesized
         // `[providers.models.<type>.default]` entry by V1→V2 migration.
         let raw = r#"
@@ -16110,13 +16116,16 @@ requires_openai_auth = true
 
         let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
         assert!(
-            parsed.providers.models.contains_provider_type("sub2api"),
+            parsed
+                .providers
+                .models
+                .contains_model_provider_type("sub2api"),
             "expected sub2api in providers.models"
         );
         assert_eq!(
             parsed
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.model.as_deref()),
             Some("gpt-5.3-codex")
         );
@@ -16156,7 +16165,7 @@ requires_openai_auth = true
                 .and_then(|e| e.uri.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
-        assert!(config.providers.first_provider().is_some());
+        assert!(config.providers.first_model_provider().is_some());
     }
 
     #[test]
@@ -16189,7 +16198,7 @@ requires_openai_auth = true
     }
 
     /// Round-trip test for the config CLI: a TOML file with the user's value
-    /// Round-trip test for the config CLI: a TOML file with a provider model
+    /// Round-trip test for the config CLI: a TOML file with a model_provider model
     /// must deserialize, apply env overrides, and serialize back correctly.
     #[test]
     #[ignore = "pre-#6273 test asserts on flat-config behavior; rewrite in #6273 follow-up against typed family slots"]
@@ -16224,7 +16233,7 @@ model = "primary-model"
     }
 
     /// `resolve_default_model` returns the first available `models.*` entry's
-    /// model. Returning `None` is reserved for "no provider has any model
+    /// model. Returning `None` is reserved for "no model_provider has any model
     /// configured", which callers must surface as a configuration error
     /// rather than silently substituting a vendor default.
     #[test]
@@ -16257,7 +16266,7 @@ model = "primary-model"
             Some("tertiary-model"),
         );
 
-        // Add a provider with a model — resolve_default_model finds it.
+        // Add a model_provider with a model — resolve_default_model finds it.
         config.providers.models.openrouter.insert(
             "default".to_string(),
             OpenRouterModelProviderConfig {
@@ -16267,7 +16276,7 @@ model = "primary-model"
                 },
             },
         );
-        // resolve_default_model returns the first non-empty model across all providers.
+        // resolve_default_model returns the first non-empty model across all model_providers.
         assert!(config.providers.resolve_default_model().is_some());
     }
 
@@ -16299,7 +16308,7 @@ model = "primary-model"
                 },
             },
         );
-        // Provider fields are now resolved directly — no cache needed.
+        // ModelProvider fields are now resolved directly — no cache needed.
         config.save().await.unwrap();
 
         assert!(resolved_config_path.exists());
@@ -16349,7 +16358,7 @@ model = "primary-model"
 
         let error = config.validate().expect_err("expected validation to fail");
         assert!(error.to_string().contains(
-            "default_model uses ':cloud' with provider 'ollama', but uri is local or unset"
+            "default_model uses ':cloud' with model_provider 'ollama', but uri is local or unset"
         ));
     }
 
@@ -16611,7 +16620,7 @@ default_model = "legacy-model"
         assert_eq!(
             config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.model.as_deref()),
             Some("legacy-model")
         );
@@ -16725,7 +16734,7 @@ default_model = "legacy-model"
         assert_eq!(
             config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.model.as_deref()),
             Some("persisted-profile")
         );
@@ -16853,7 +16862,7 @@ default_model = "persisted-profile"
         assert_eq!(
             config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.model.as_deref()),
             Some("persisted-profile")
         );
@@ -16880,7 +16889,7 @@ default_model = "persisted-profile"
             "default".to_string(),
             OpenRouterModelProviderConfig {
                 base: ModelProviderConfig {
-                    name: Some("test-provider".into()),
+                    name: Some("test-model_provider".into()),
                     temperature: Some(99.0),
                     ..Default::default()
                 },
@@ -16900,7 +16909,7 @@ default_model = "persisted-profile"
             "default".to_string(),
             OpenRouterModelProviderConfig {
                 base: ModelProviderConfig {
-                    name: Some("test-provider".into()),
+                    name: Some("test-model_provider".into()),
                     temperature: Some(-0.5),
                     ..Default::default()
                 },
@@ -16920,7 +16929,7 @@ default_model = "persisted-profile"
             "default".to_string(),
             OpenRouterModelProviderConfig {
                 base: ModelProviderConfig {
-                    name: Some("test-provider".into()),
+                    name: Some("test-model_provider".into()),
                     temperature: Some(0.7),
                     ..Default::default()
                 },
@@ -17140,7 +17149,7 @@ api_token = "tok"
     #[test]
     async fn runtime_proxy_client_cache_reuses_default_profile_key() {
         let service_key = format!(
-            "provider.cache_test.{}",
+            "model_provider.cache_test.{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock should be after unix epoch")
@@ -17161,7 +17170,7 @@ api_token = "tok"
     #[test]
     async fn set_runtime_proxy_config_clears_runtime_proxy_client_cache() {
         let service_key = format!(
-            "provider.cache_timeout_test.{}",
+            "model_provider.cache_timeout_test.{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock should be after unix epoch")
@@ -17535,7 +17544,7 @@ group_policy = "disabled"
             "test setup requires world-readable config"
         );
 
-        if let Some(entry) = config.providers.first_provider_mut() {
+        if let Some(entry) = config.providers.first_model_provider_mut() {
             entry.temperature = Some(0.6);
         }
         config.save().await.unwrap();
@@ -17599,7 +17608,7 @@ group_policy = "disabled"
     #[test]
     async fn config_without_transcription_uses_defaults() {
         let toml_str = r#"
-            default_provider = "openrouter"
+            default_model_provider = "openrouter"
             default_model = "test-model"
             default_temperature = 0.7
         "#;
@@ -17612,7 +17621,7 @@ group_policy = "disabled"
     async fn security_defaults_are_backward_compatible() {
         let parsed = parse_test_config(
             r#"
-default_provider = "openrouter"
+default_model_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4.6"
 default_temperature = 0.7
 "#,
@@ -17628,7 +17637,7 @@ default_temperature = 0.7
     async fn security_toml_parses_otp_and_estop_sections() {
         let parsed = parse_test_config(
             r#"
-default_provider = "openrouter"
+default_model_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4.6"
 default_temperature = 0.7
 
@@ -17667,23 +17676,24 @@ require_otp_to_resume = true
     #[test]
     async fn validate_accepts_local_whisper_as_transcription_default_provider() {
         let mut config = Config::default();
-        config.transcription.default_provider = "local_whisper".to_string();
+        config.transcription.default_transcription_provider = "local_whisper".to_string();
 
         config.validate().expect(
-            "local_whisper must be accepted by the transcription.default_provider allowlist",
+            "local_whisper must be accepted by the transcription.default_transcription_provider allowlist",
         );
     }
 
     #[test]
     async fn validate_rejects_unknown_transcription_default_provider() {
         let mut config = Config::default();
-        config.transcription.default_provider = "unknown_stt".to_string();
+        config.transcription.default_transcription_provider = "unknown_stt".to_string();
 
         let err = config
             .validate()
-            .expect_err("expected validation to reject unknown transcription provider");
+            .expect_err("expected validation to reject unknown transcription model_provider");
         assert!(
-            err.to_string().contains("transcription.default_provider"),
+            err.to_string()
+                .contains("transcription.default_transcription_provider"),
             "got: {err}"
         );
     }
@@ -18475,7 +18485,7 @@ schema_version = 3
 workspace_dir = "/zeroclaw-data/workspace"
 config_path = "/zeroclaw-data/.zeroclaw/config.toml"
 api_key = ""
-default_provider = "openrouter"
+default_model_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4-20250514"
 default_temperature = 0.7
 
@@ -18651,7 +18661,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn config_tree_traversal_discovers_nested_secrets() {
         let mut config = Config::default();
-        // Set api_key on first provider entry (or create one)
+        // Set api_key on first model_provider entry (or create one)
         config
             .providers
             .models
@@ -19160,15 +19170,25 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     #[ignore = "pre-#6273 test asserts on flat-config behavior; rewrite in #6273 follow-up against typed family slots"]
     async fn create_map_key_inserts_default_provider() {
-        // Round-trip: `+ Add anthropic provider` from the dashboard.
+        // Round-trip: `+ Add anthropic model_provider` from the dashboard.
         let mut config = Config::default();
-        assert!(!config.providers.models.contains_provider_type("anthropic"));
+        assert!(
+            !config
+                .providers
+                .models
+                .contains_model_provider_type("anthropic")
+        );
 
         let created = config
             .create_map_key("providers.models", "anthropic")
             .expect("providers.models should accept new map keys");
         assert!(created, "first add should report created=true");
-        assert!(config.providers.models.contains_provider_type("anthropic"));
+        assert!(
+            config
+                .providers
+                .models
+                .contains_model_provider_type("anthropic")
+        );
 
         // Idempotent: second add returns false, doesn't error.
         let again = config

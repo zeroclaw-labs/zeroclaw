@@ -48,10 +48,10 @@ impl SkillCreator {
             return Ok(None);
         }
 
-        // Deduplicate via embeddings when an embedding provider is available.
-        if let Some(provider) = embedding_provider
-            && provider.name() != "none"
-            && self.is_duplicate(task_description, provider).await?
+        // Deduplicate via embeddings when an embedding model_provider is available.
+        if let Some(model_provider) = embedding_provider
+            && model_provider.name() != "none"
+            && self.is_duplicate(task_description, model_provider).await?
         {
             return Ok(None);
         }
@@ -551,7 +551,7 @@ version = "0.1.0"
 
     // ── Deduplication ────────────────────────────────────────────
 
-    /// A mock embedding provider that returns deterministic embeddings.
+    /// A mock embedding model_provider that returns deterministic embeddings.
     ///
     /// The "new" description (first text embedded) always gets `[1, 0, 0]`.
     /// The "existing" skill description (second text embedded) gets a vector
@@ -627,17 +627,17 @@ tags = ["auto-generated"]
             similarity_threshold: 0.85,
         };
 
-        // High similarity provider -> should detect as duplicate.
-        let provider = MockEmbeddingProvider::new(0.95);
+        // High similarity model_provider -> should detect as duplicate.
+        let model_provider = MockEmbeddingProvider::new(0.95);
         let creator = SkillCreator::new(dir.path().to_path_buf(), config.clone());
         assert!(
             creator
-                .is_duplicate("Build the project", &provider)
+                .is_duplicate("Build the project", &model_provider)
                 .await
                 .unwrap()
         );
 
-        // Low similarity provider -> not a duplicate.
+        // Low similarity model_provider -> not a duplicate.
         let provider_low = MockEmbeddingProvider::new(0.3);
         let creator2 = SkillCreator::new(dir.path().to_path_buf(), config);
         assert!(
@@ -800,8 +800,8 @@ tags = ["auto-generated"]
         .await
         .unwrap();
 
-        // High similarity provider -> should skip.
-        let provider = MockEmbeddingProvider::new(0.95);
+        // High similarity model_provider -> should skip.
+        let model_provider = MockEmbeddingProvider::new(0.95);
         let creator = SkillCreator::new(dir.path().to_path_buf(), config);
         let calls = vec![
             ToolCallRecord {
@@ -814,7 +814,7 @@ tags = ["auto-generated"]
             },
         ];
         let result = creator
-            .create_from_execution("Build and test", &calls, Some(&provider))
+            .create_from_execution("Build and test", &calls, Some(&model_provider))
             .await
             .unwrap();
         assert!(result.is_none());

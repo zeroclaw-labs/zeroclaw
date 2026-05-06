@@ -14,7 +14,7 @@ use zeroclaw::memory::traits::{Memory, MemoryCategory};
 use zeroclaw::providers::ToolCall;
 
 use crate::support::helpers::{build_agent_with_sqlite_memory, text_response, tool_response};
-use crate::support::{CountingTool, EchoTool, MockProvider};
+use crate::support::{CountingTool, EchoTool, MockModelProvider};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 1. Memory Store + Recall Persistence
@@ -102,7 +102,7 @@ async fn memory_recall_returns_relevant_entries() {
 async fn agent_completes_five_step_tool_chain() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "counter".into(),
@@ -138,7 +138,7 @@ async fn agent_completes_five_step_tool_chain() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(provider, vec![Box::new(counting_tool)], tmp.path());
+        build_agent_with_sqlite_memory(model_provider, vec![Box::new(counting_tool)], tmp.path());
 
     let response = agent.turn("Execute 5 sequential operations").await.unwrap();
     assert!(!response.is_empty());
@@ -152,14 +152,14 @@ async fn agent_completes_five_step_tool_chain() {
 /// Agent handles a multi-turn conversation, maintaining history.
 #[tokio::test]
 async fn agent_maintains_history_across_turns() {
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         text_response("I'll remember that your name is Argenis."),
         text_response("Your name is Argenis, as you told me earlier."),
         text_response("Yes, you are Argenis and you prefer Rust."),
     ]));
 
     let tmp = tempfile::TempDir::new().unwrap();
-    let mut agent = build_agent_with_sqlite_memory(provider, vec![], tmp.path());
+    let mut agent = build_agent_with_sqlite_memory(model_provider, vec![], tmp.path());
 
     let r1 = agent.turn("My name is Argenis").await.unwrap();
     assert!(!r1.is_empty());
@@ -194,11 +194,11 @@ async fn agent_auto_saves_and_recalls_memory() {
     }
 
     // Agent should have access to this via memory recall
-    let provider = Box::new(MockProvider::new(vec![text_response(
+    let model_provider = Box::new(MockModelProvider::new(vec![text_response(
         "Based on memory, the project uses Rust and Tokio.",
     )]));
 
-    let mut agent = build_agent_with_sqlite_memory(provider, vec![], tmp.path());
+    let mut agent = build_agent_with_sqlite_memory(model_provider, vec![], tmp.path());
     let response = agent
         .turn("What tech does this project use?")
         .await
@@ -250,13 +250,13 @@ async fn compressor_with_memory_saves_summary() {
     }
     history.push(ChatMessage::user("Final question".to_string()));
 
-    // Create a mock provider for summarization
-    let mock_provider = MockProvider::new(vec![text_response(
+    // Create a mock model_provider for summarization
+    let mock_model_provider = MockModelProvider::new(vec![text_response(
         "Summary: User asked 20 multiplication questions. All answered correctly.",
     )]);
 
     let result = compressor
-        .compress_if_needed(&mut history, &mock_provider, "test-model")
+        .compress_if_needed(&mut history, &mock_model_provider, "test-model")
         .await;
 
     // Check if compression happened (it should with threshold_ratio=0.01)
@@ -283,7 +283,7 @@ async fn compressor_with_memory_saves_summary() {
 /// Agent handles interleaved tool calls and text responses without stopping.
 #[tokio::test]
 async fn agent_handles_interleaved_tools_and_text() {
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         // Step 1: tool call
         tool_response(vec![ToolCall {
             id: "tc1".into(),
@@ -303,7 +303,8 @@ async fn agent_handles_interleaved_tools_and_text() {
     ]));
 
     let tmp = tempfile::TempDir::new().unwrap();
-    let mut agent = build_agent_with_sqlite_memory(provider, vec![Box::new(EchoTool)], tmp.path());
+    let mut agent =
+        build_agent_with_sqlite_memory(model_provider, vec![Box::new(EchoTool)], tmp.path());
 
     let response = agent.turn("Create a file then read it").await.unwrap();
     assert!(
@@ -342,7 +343,7 @@ async fn agent_survives_large_tool_output() {
         }
     }
 
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "large_output".into(),
@@ -354,7 +355,7 @@ async fn agent_survives_large_tool_output() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(provider, vec![Box::new(LargeOutputTool)], tmp.path());
+        build_agent_with_sqlite_memory(model_provider, vec![Box::new(LargeOutputTool)], tmp.path());
 
     let response = agent.turn("Generate a large output").await.unwrap();
     assert!(
@@ -368,7 +369,7 @@ async fn agent_survives_large_tool_output() {
 async fn agent_handles_parallel_tool_calls() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         tool_response(vec![
             ToolCall {
                 id: "tc1".into(),
@@ -394,7 +395,7 @@ async fn agent_handles_parallel_tool_calls() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(provider, vec![Box::new(counting_tool)], tmp.path());
+        build_agent_with_sqlite_memory(model_provider, vec![Box::new(counting_tool)], tmp.path());
 
     let response = agent.turn("Run 3 tools in parallel").await.unwrap();
     assert!(!response.is_empty());
@@ -410,7 +411,7 @@ async fn agent_handles_parallel_tool_calls() {
 async fn agent_multi_turn_with_tools_builds_context() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         // Turn 1: tool call + response
         tool_response(vec![ToolCall {
             id: "tc1".into(),
@@ -433,7 +434,7 @@ async fn agent_multi_turn_with_tools_builds_context() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(provider, vec![Box::new(counting_tool)], tmp.path());
+        build_agent_with_sqlite_memory(model_provider, vec![Box::new(counting_tool)], tmp.path());
 
     let r1 = agent.turn("Start task: increment counter").await.unwrap();
     assert!(!r1.is_empty());
@@ -461,12 +462,12 @@ async fn consolidation_extracts_facts_to_memory() {
     let tmp = tempfile::TempDir::new().unwrap();
     let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
 
-    let provider = MockProvider::new(vec![text_response(
+    let model_provider = MockModelProvider::new(vec![text_response(
         r#"{"history_entry": "User shared project deadline info", "memory_update": "Project deadline is April 15th 2026"}"#,
     )]);
 
     let result = zeroclaw::memory::consolidation::consolidate_turn(
-        &provider,
+        &model_provider,
         "test-model",
         mem.as_ref(),
         "The project deadline is April 15th 2026",
@@ -492,12 +493,12 @@ async fn memory_survives_rapid_consolidation() {
 
     // Simulate 10 rapid consolidation rounds
     for i in 0..10 {
-        let provider = MockProvider::new(vec![text_response(&format!(
+        let model_provider = MockModelProvider::new(vec![text_response(&format!(
             r#"{{"history_entry": "Turn {i} conversation", "memory_update": null}}"#,
         ))]);
 
         let _ = zeroclaw::memory::consolidation::consolidate_turn(
-            &provider,
+            &model_provider,
             "test-model",
             mem.as_ref(),
             &format!("User message {i}"),

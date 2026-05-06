@@ -130,10 +130,12 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
         // Broadcast to SSE subscribers
         let json = match event {
             zeroclaw_runtime::observability::ObserverEvent::LlmRequest {
-                provider, model, ..
+                model_provider,
+                model,
+                ..
             } => serde_json::json!({
                 "type": "llm_request",
-                "provider": provider,
+                "model_provider": model_provider,
                 "model": model,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             }),
@@ -163,23 +165,26 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 })
             }
-            zeroclaw_runtime::observability::ObserverEvent::AgentStart { provider, model } => {
+            zeroclaw_runtime::observability::ObserverEvent::AgentStart {
+                model_provider,
+                model,
+            } => {
                 serde_json::json!({
                     "type": "agent_start",
-                    "provider": provider,
+                    "model_provider": model_provider,
                     "model": model,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 })
             }
             zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
-                provider,
+                model_provider,
                 model,
                 duration,
                 tokens_used,
                 cost_usd,
             } => serde_json::json!({
                 "type": "agent_end",
-                "provider": provider,
+                "model_provider": model_provider,
                 "model": model,
                 "duration_ms": duration.as_millis(),
                 "tokens_used": tokens_used,

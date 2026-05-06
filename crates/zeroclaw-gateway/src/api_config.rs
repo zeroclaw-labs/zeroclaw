@@ -100,7 +100,7 @@ pub struct PatchResponse {
     /// Non-fatal validation warnings against the post-save config state.
     /// Empty when nothing is flagged. Surfaces what the CLI prints on
     /// stderr so dashboard callers see the same signal — e.g. an
-    /// `agents.<x>.model_provider` referencing an unconfigured provider
+    /// `agents.<x>.model_provider` referencing an unconfigured model_provider
     /// returns HTTP 200 with the save committed, plus a structured
     /// validation warning here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -565,7 +565,7 @@ pub async fn handle_prop_delete(
     }
 }
 
-/// GET /api/config/list?prefix=providers
+/// GET /api/config/list?prefix=model_providers
 ///
 /// Enumerates every property the schema exposes. Secret entries appear as
 /// `{path, populated}` with `value: None`; non-secrets carry the display
@@ -583,7 +583,7 @@ pub async fn handle_list(
     let prefix = q.prefix.as_deref();
 
     // Drop fields that don't apply to the current shape of the config —
-    // azure_* on a non-azure provider, qdrant.* when memory.backend is
+    // azure_* on a non-azure model_provider, qdrant.* when memory.backend is
     // sqlite, etc. Keeps the form scoped to relevant inputs only.
     let excluded = field_visibility::excluded_paths(&config, prefix.unwrap_or(""));
 
@@ -1118,7 +1118,7 @@ fn json_pointer_to_dotted(path: &str) -> String {
 #[derive(Debug, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct InitQuery {
-    /// Optional section prefix to scope the init pass (e.g. `providers`).
+    /// Optional section prefix to scope the init pass (e.g. `model_providers`).
     /// Without it, every uninitialized nested section gets its defaults.
     #[serde(default)]
     pub section: Option<String>,
@@ -1130,7 +1130,7 @@ pub struct InitResponse {
     pub initialized: Vec<String>,
 }
 
-/// POST /api/config/init?section=providers — instantiate `None` nested
+/// POST /api/config/init?section=model_providers — instantiate `None` nested
 /// sections with defaults. Mirrors `zeroclaw config init`. When every
 /// requested section is already configured, returns `{initialized: []}`.
 pub async fn handle_init(
@@ -1600,8 +1600,8 @@ mod tests {
         // test will need updating; that's fine — we just need one float to
         // pin the contract.
         let mut cfg = zeroclaw_config::schema::Config::default();
-        // autonomy doesn't carry floats today; use a provider temperature
-        // by setting a known model-provider entry. The model-providers map
+        // autonomy doesn't carry floats today; use a model_provider temperature
+        // by setting a known model-model_provider entry. The model-model_providers map
         // is set up via map keys, so use a path that's unambiguously float.
         // Fall back to set_prop on a known float location:
         match cfg.set_prop("providers.models.openai.temperature", "0.7") {
@@ -1882,14 +1882,14 @@ mod tests {
     fn list_entry_for_secret_omits_value_field() {
         let entry = ListEntry {
             path: "providers.models.ollama.api-key".into(),
-            category: "providers".into(),
+            category: "model_providers".into(),
             kind: "string",
             type_hint: "Option<String>",
             value: None,
             populated: true,
             is_secret: true,
             enum_variants: vec![],
-            onboard_section: Some("providers"),
+            onboard_section: Some("model_providers"),
         };
         let json = serde_json::to_value(&entry).expect("serialize");
         let obj = json.as_object().expect("object");

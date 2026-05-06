@@ -1,4 +1,4 @@
-//! Telnyx AI inference provider.
+//! Telnyx AI inference model_provider.
 //!
 //! Telnyx provides AI inference through an OpenAI-compatible API at
 //! <https://api.telnyx.com/v2/ai> with access to 53+ models including
@@ -9,11 +9,11 @@
 //! Set the `TELNYX_API_KEY` environment variable or configure in `config.toml`:
 //!
 //! ```toml
-//! default_provider = "telnyx"
+//! default_model_provider = "telnyx"
 //! default_model = "openai/gpt-4o"
 //! ```
 
-use crate::traits::{ChatMessage, Provider};
+use crate::traits::{ChatMessage, ModelProvider};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -21,7 +21,7 @@ use serde::Deserialize;
 /// Telnyx Inference Engine public endpoint.
 const BASE_URL: &str = "https://api.telnyx.com/v2/ai";
 
-/// Telnyx AI inference provider.
+/// Telnyx AI inference model_provider.
 ///
 /// Uses the OpenAI-compatible chat completions API at `/v2/ai/chat/completions`.
 /// Supports 53+ models including OpenAI, Anthropic (via API), Meta Llama,
@@ -30,21 +30,21 @@ const BASE_URL: &str = "https://api.telnyx.com/v2/ai";
 /// # Example
 ///
 /// ```rust,ignore
-/// use zeroclaw::providers::telnyx::TelnyxProvider;
-/// use zeroclaw::providers::Provider;
+/// use zeroclaw::providers::telnyx::TelnyxModelProvider;
+/// use zeroclaw::providers::ModelProvider;
 ///
-/// let provider = TelnyxProvider::new(Some("your-api-key"));
-/// let response = provider.chat("Hello!", "openai/gpt-4o", 0.7).await?;
+/// let model_provider = TelnyxModelProvider::new(Some("your-api-key"));
+/// let response = model_provider.chat("Hello!", "openai/gpt-4o", 0.7).await?;
 /// ```
-pub struct TelnyxProvider {
+pub struct TelnyxModelProvider {
     /// Telnyx API key
     api_key: Option<String>,
     /// HTTP client for API requests
     client: Client,
 }
 
-impl TelnyxProvider {
-    /// Create a new Telnyx AI provider.
+impl TelnyxModelProvider {
+    /// Create a new Telnyx AI model_provider.
     ///
     /// The API key can be provided directly or will be resolved from:
     /// 1. `TELNYX_API_KEY` environment variable
@@ -61,7 +61,7 @@ impl TelnyxProvider {
         }
     }
 
-    /// Create a provider with a custom base URL (for testing or proxies).
+    /// Create a model_provider with a custom base URL (for testing or proxies).
     pub fn with_base_url(api_key: Option<&str>, _base_url: &str) -> Self {
         // Note: custom base URL support for testing
         Self::new(api_key)
@@ -166,8 +166,8 @@ struct ResponseMessage {
 }
 
 #[async_trait]
-impl Provider for TelnyxProvider {
-    // ── Provider-family defaults ──
+impl ModelProvider for TelnyxModelProvider {
+    // ── ModelProvider-family defaults ──
     fn default_base_url(&self) -> Option<&str> {
         Some(BASE_URL)
     }
@@ -318,13 +318,13 @@ mod tests {
 
     #[test]
     fn creates_provider_with_key() {
-        let provider = TelnyxProvider::new(Some("test-key"));
-        assert!(provider.api_key.is_some());
+        let model_provider = TelnyxModelProvider::new(Some("test-key"));
+        assert!(model_provider.api_key.is_some());
     }
 
     #[test]
     fn creates_provider_without_key() {
-        let _provider = TelnyxProvider::new(None);
+        let _provider = TelnyxModelProvider::new(None);
         // Will be None if env vars not set
     }
 

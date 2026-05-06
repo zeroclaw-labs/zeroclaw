@@ -1,29 +1,29 @@
-//! TG1: Provider End-to-End Resolution Tests
+//! TG1: ModelProvider End-to-End Resolution Tests
 //!
-//! Prevents: Pattern 1 — Provider configuration & resolution bugs (27% of user bugs).
+//! Prevents: Pattern 1 — ModelProvider configuration & resolution bugs (27% of user bugs).
 //! Issues: #831, #834, #721, #580, #452, #451, #796, #843
 //!
-//! Tests the full pipeline from config values through `create_provider_with_url()`
-//! to provider construction, verifying factory resolution, URL construction,
+//! Tests the full pipeline from config values through `create_model_provider_with_url()`
+//! to model_provider construction, verifying factory resolution, URL construction,
 //! credential wiring, and auth header format.
 
-use zeroclaw::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
+use zeroclaw::providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
 use zeroclaw::providers::{
-    create_provider, create_provider_with_options, create_provider_with_url,
+    create_model_provider, create_model_provider_with_options, create_model_provider_with_url,
 };
 
-/// Helper: assert provider creation succeeds
+/// Helper: assert model_provider creation succeeds
 fn assert_provider_ok(name: &str, key: Option<&str>, url: Option<&str>) {
-    let result = create_provider_with_url(name, key, url);
+    let result = create_model_provider_with_url(name, key, url);
     assert!(
         result.is_ok(),
-        "{name} provider should resolve: {}",
+        "{name} model_provider should resolve: {}",
         result.err().map(|e| e.to_string()).unwrap_or_default()
     );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Factory resolution: each major provider name resolves without error
+// Factory resolution: each major model_provider name resolves without error
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -77,7 +77,7 @@ fn factory_resolves_perplexity_provider() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Factory resolution: alias variants map to same provider
+// Factory resolution: alias variants map to same model_provider
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -96,7 +96,7 @@ fn factory_zhipu_alias_resolves_to_glm() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Custom URL provider creation
+// Custom URL model_provider creation
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -111,7 +111,7 @@ fn factory_custom_https_url_resolves() {
 
 #[test]
 fn factory_custom_ftp_url_rejected() {
-    let result = create_provider_with_url("custom:ftp://example.com", None, None);
+    let result = create_model_provider_with_url("custom:ftp://example.com", None, None);
     assert!(result.is_err(), "ftp scheme should be rejected");
     let err_msg = result.err().unwrap().to_string();
     assert!(
@@ -122,24 +122,27 @@ fn factory_custom_ftp_url_rejected() {
 
 #[test]
 fn factory_custom_empty_url_rejected() {
-    let result = create_provider_with_url("custom:", None, None);
+    let result = create_model_provider_with_url("custom:", None, None);
     assert!(result.is_err(), "empty custom URL should be rejected");
 }
 
 #[test]
 fn factory_unknown_provider_rejected() {
-    let result = create_provider_with_url("nonexistent_provider_xyz", None, None);
-    assert!(result.is_err(), "unknown provider name should be rejected");
+    let result = create_model_provider_with_url("nonexistent_provider_xyz", None, None);
+    assert!(
+        result.is_err(),
+        "unknown model_provider name should be rejected"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OpenAiCompatibleProvider: credential and auth style wiring
+// OpenAiCompatibleModelProvider: credential and auth style wiring
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn compatible_provider_bearer_auth_style() {
     // Construction with Bearer auth should succeed
-    let _provider = OpenAiCompatibleProvider::new(
+    let _provider = OpenAiCompatibleModelProvider::new(
         "TestProvider",
         "https://api.test.com",
         Some("sk-test-key-12345"),
@@ -150,7 +153,7 @@ fn compatible_provider_bearer_auth_style() {
 #[test]
 fn compatible_provider_xapikey_auth_style() {
     // Construction with XApiKey auth should succeed
-    let _provider = OpenAiCompatibleProvider::new(
+    let _provider = OpenAiCompatibleModelProvider::new(
         "TestProvider",
         "https://api.test.com",
         Some("sk-test-key-12345"),
@@ -161,7 +164,7 @@ fn compatible_provider_xapikey_auth_style() {
 #[test]
 fn compatible_provider_custom_auth_header() {
     // Construction with Custom auth should succeed
-    let _provider = OpenAiCompatibleProvider::new(
+    let _provider = OpenAiCompatibleModelProvider::new(
         "TestProvider",
         "https://api.test.com",
         Some("sk-test-key-12345"),
@@ -171,8 +174,8 @@ fn compatible_provider_custom_auth_header() {
 
 #[test]
 fn compatible_provider_no_credential() {
-    // Construction without credential should succeed (for local providers)
-    let _provider = OpenAiCompatibleProvider::new(
+    // Construction without credential should succeed (for local model_providers)
+    let _provider = OpenAiCompatibleModelProvider::new(
         "TestLocal",
         "http://localhost:11434",
         None,
@@ -183,7 +186,7 @@ fn compatible_provider_no_credential() {
 #[test]
 fn compatible_provider_base_url_trailing_slash_normalized() {
     // Construction with trailing slash URL should succeed
-    let _provider = OpenAiCompatibleProvider::new(
+    let _provider = OpenAiCompatibleModelProvider::new(
         "TestProvider",
         "https://api.test.com/v1/",
         Some("key"),
@@ -192,7 +195,7 @@ fn compatible_provider_base_url_trailing_slash_normalized() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Provider with api_url override (simulates #721 - Ollama api_url config)
+// ModelProvider with api_url override (simulates #721 - Ollama api_url config)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -210,7 +213,7 @@ fn factory_openai_with_custom_api_url() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Provider default convenience factory
+// ModelProvider default convenience factory
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -226,7 +229,7 @@ fn convenience_factory_resolves_major_providers() {
         "fireworks",
         "perplexity",
     ] {
-        let result = create_provider(provider_name, Some("test-key"));
+        let result = create_model_provider(provider_name, Some("test-key"));
         assert!(
             result.is_ok(),
             "convenience factory should resolve {provider_name}: {}",
@@ -237,7 +240,7 @@ fn convenience_factory_resolves_major_providers() {
 
 #[test]
 fn convenience_factory_ollama_no_key() {
-    let result = create_provider("ollama", None);
+    let result = create_model_provider("ollama", None);
     assert!(
         result.is_ok(),
         "ollama should not require api key: {}",
@@ -246,7 +249,7 @@ fn convenience_factory_ollama_no_key() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Primary providers with custom implementations
+// Primary model_providers with custom implementations
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -276,17 +279,17 @@ fn factory_resolves_synthetic_provider() {
 
 #[test]
 fn factory_resolves_openai_codex_provider() {
-    let options = zeroclaw::providers::ProviderRuntimeOptions::default();
-    let result = create_provider_with_options("openai-codex", None, &options);
+    let options = zeroclaw::providers::ModelProviderRuntimeOptions::default();
+    let result = create_model_provider_with_options("openai-codex", None, &options);
     assert!(
         result.is_ok(),
-        "openai-codex provider should resolve: {}",
+        "openai-codex model_provider should resolve: {}",
         result.err().map(|e| e.to_string()).unwrap_or_default()
     );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OpenAI-compatible ecosystem providers
+// OpenAI-compatible ecosystem model_providers
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -315,7 +318,7 @@ fn factory_resolves_astrai_provider() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// China region providers
+// China region model_providers
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -359,7 +362,7 @@ fn factory_resolves_zai_provider() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Local/self-hosted providers
+// Local/self-hosted model_providers
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]

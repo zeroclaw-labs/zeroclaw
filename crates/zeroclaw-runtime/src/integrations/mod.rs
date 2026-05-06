@@ -73,7 +73,7 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
 
     let Some(entry) = entries.iter().find(|e| e.name.to_lowercase() == name_lower) else {
         anyhow::bail!(
-            "Unknown integration: {name}. Check README for supported integrations or run `zeroclaw onboard` to configure channels/providers."
+            "Unknown integration: {name}. Check README for supported integrations or run `zeroclaw onboard` to configure channels/model_providers."
         );
     };
 
@@ -127,7 +127,7 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("  Setup:");
             println!("    1. Install: brew install ollama");
             println!("    2. Pull a model: ollama pull llama3");
-            println!("    3. Set provider to 'ollama' in config.toml");
+            println!("    3. Set model_provider to 'ollama' in config.toml");
         }
         "iMessage" => {
             println!("  Setup (macOS only):");

@@ -165,7 +165,9 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "200+ models, 1 API key",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("openrouter")
+                if c.providers
+                    .models
+                    .contains_model_provider_type("openrouter")
                     && c.providers
                         .models
                         .openrouter
@@ -185,7 +187,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Claude 3.5/4 Sonnet & Opus",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("anthropic") {
+                if c.providers.models.contains_model_provider_type("anthropic") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -197,7 +199,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "GPT-4o, GPT-5, o1",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("openai") {
+                if c.providers.models.contains_model_provider_type("openai") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -210,7 +212,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.providers
-                    .first_provider()
+                    .first_model_provider()
                     .and_then(|e| e.model.as_deref())
                     .is_some_and(|m| m.starts_with("google/"))
                 {
@@ -226,7 +228,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.providers
-                    .first_provider()
+                    .first_model_provider()
                     .and_then(|e| e.model.as_deref())
                     .is_some_and(|m| m.starts_with("deepseek/"))
                 {
@@ -242,7 +244,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.providers
-                    .first_provider()
+                    .first_model_provider()
                     .and_then(|e| e.model.as_deref())
                     .is_some_and(|m| m.starts_with("x-ai/"))
                 {
@@ -258,7 +260,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
                 if c.providers
-                    .first_provider()
+                    .first_model_provider()
                     .and_then(|e| e.model.as_deref())
                     .is_some_and(|m| m.starts_with("mistral"))
                 {
@@ -273,7 +275,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Local models (Llama, etc.)",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("ollama") {
+                if c.providers.models.contains_model_provider_type("ollama") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -285,7 +287,10 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Search-augmented AI",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("perplexity") {
+                if c.providers
+                    .models
+                    .contains_model_provider_type("perplexity")
+                {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -299,7 +304,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             status_fn: |c| {
                 if ["huggingface", "hf"]
                     .iter()
-                    .any(|p| c.providers.models.contains_provider_type(p))
+                    .any(|p| c.providers.models.contains_model_provider_type(p))
                 {
                     IntegrationStatus::Active
                 } else {
@@ -314,7 +319,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             status_fn: |c| {
                 if ["lmstudio", "lm-studio"]
                     .iter()
-                    .any(|p| c.providers.models.contains_provider_type(p))
+                    .any(|p| c.providers.models.contains_model_provider_type(p))
                 {
                     IntegrationStatus::Active
                 } else {
@@ -327,7 +332,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Privacy-first inference (Llama, Opus)",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("venice") {
+                if c.providers.models.contains_model_provider_type("venice") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -339,7 +344,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Vercel AI Gateway",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("vercel") {
+                if c.providers.models.contains_model_provider_type("vercel") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -351,7 +356,10 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Cloudflare AI Gateway",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("cloudflare") {
+                if c.providers
+                    .models
+                    .contains_model_provider_type("cloudflare")
+                {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -379,7 +387,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Synthetic AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("synthetic") {
+                if c.providers.models.contains_model_provider_type("synthetic") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -391,7 +399,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Code-focused AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("opencode") {
+                if c.providers.models.contains_model_provider_type("opencode") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -403,7 +411,10 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Subsidized Code-focused AI models",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("opencode-go") {
+                if c.providers
+                    .models
+                    .contains_model_provider_type("opencode-go")
+                {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -479,7 +490,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "AWS managed model access",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("bedrock") {
+                if c.providers.models.contains_model_provider_type("bedrock") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -507,7 +518,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Ultra-fast LPU inference",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("groq") {
+                if c.providers.models.contains_model_provider_type("groq") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -519,7 +530,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Open-source model hosting",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("together") {
+                if c.providers.models.contains_model_provider_type("together") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -531,7 +542,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Fast open-source inference",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("fireworks") {
+                if c.providers.models.contains_model_provider_type("fireworks") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -543,7 +554,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Affordable open-source inference",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("novita") {
+                if c.providers.models.contains_model_provider_type("novita") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -555,7 +566,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             description: "Command R+ & embeddings",
             category: IntegrationCategory::AiModel,
             status_fn: |c| {
-                if c.providers.models.contains_provider_type("cohere") {
+                if c.providers.models.contains_model_provider_type("cohere") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -1125,7 +1136,7 @@ mod tests {
             .providers
             .models
             .ensure("minimax-cn", "default")
-            .expect("known provider type");
+            .expect("known model_provider type");
 
         let minimax = entries.iter().find(|e| e.name == "MiniMax").unwrap();
         assert!(matches!(
@@ -1138,7 +1149,7 @@ mod tests {
             .providers
             .models
             .ensure("glm-cn", "default")
-            .expect("known provider type");
+            .expect("known model_provider type");
         let glm = entries.iter().find(|e| e.name == "GLM").unwrap();
         assert!(matches!(
             (glm.status_fn)(&config),
@@ -1150,7 +1161,7 @@ mod tests {
             .providers
             .models
             .ensure("moonshot-intl", "default")
-            .expect("known provider type");
+            .expect("known model_provider type");
         let moonshot = entries.iter().find(|e| e.name == "Moonshot").unwrap();
         assert!(matches!(
             (moonshot.status_fn)(&config),
@@ -1162,7 +1173,7 @@ mod tests {
             .providers
             .models
             .ensure("qwen-intl", "default")
-            .expect("known provider type");
+            .expect("known model_provider type");
         let qwen = entries.iter().find(|e| e.name == "Qwen").unwrap();
         assert!(matches!(
             (qwen.status_fn)(&config),
@@ -1174,7 +1185,7 @@ mod tests {
             .providers
             .models
             .ensure("zai-cn", "default")
-            .expect("known provider type");
+            .expect("known model_provider type");
         let zai = entries.iter().find(|e| e.name == "Z.AI").unwrap();
         assert!(matches!(
             (zai.status_fn)(&config),
@@ -1186,7 +1197,7 @@ mod tests {
             .providers
             .models
             .ensure("baidu", "default")
-            .expect("known provider type");
+            .expect("known model_provider type");
         let qianfan = entries.iter().find(|e| e.name == "Qianfan").unwrap();
         assert!(matches!(
             (qianfan.status_fn)(&config),

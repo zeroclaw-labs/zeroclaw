@@ -2,7 +2,7 @@
 //!
 //! Handles inbound/outbound phone calls with real-time STT/TTS streaming,
 //! call transcription logging, and approval workflows for outbound calls.
-//! Webhook endpoints receive call events from the telephony provider and
+//! Webhook endpoints receive call events from the telephony model_provider and
 //! translate them into `ChannelMessage`s for the agent loop.
 
 use std::collections::HashMap;
@@ -62,7 +62,7 @@ pub enum CallDirection {
 /// Tracks an active call's metadata and transcription.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallRecord {
-    /// Unique call identifier (provider-specific SID/UUID).
+    /// Unique call identifier (model_provider-specific SID/UUID).
     pub call_id: String,
     /// Direction: inbound or outbound.
     pub direction: CallDirection,
@@ -111,16 +111,16 @@ impl VoiceCallChannel {
         }
     }
 
-    /// Get the provider-specific API base URL.
+    /// Get the model_provider-specific API base URL.
     fn api_base_url(&self) -> &str {
-        match self.config.provider {
+        match self.config.model_provider {
             VoiceProvider::Twilio => "https://api.twilio.com/2010-04-01",
             VoiceProvider::Telnyx => "https://api.telnyx.com/v2",
             VoiceProvider::Plivo => "https://api.plivo.com/v1",
         }
     }
 
-    /// Place an outbound call via the configured provider.
+    /// Place an outbound call via the configured model_provider.
     pub async fn place_call(&self, to_number: &str) -> Result<String> {
         if self.config.require_outbound_approval {
             info!(to = to_number, "outbound call requires approval");
@@ -132,7 +132,7 @@ impl VoiceCallChannel {
     async fn execute_outbound_call(&self, to_number: &str) -> Result<String> {
         let webhook_url = self.webhook_url("/voice/status");
 
-        match self.config.provider {
+        match self.config.model_provider {
             VoiceProvider::Twilio => {
                 let url = format!(
                     "{}/Accounts/{}/Calls.json",
@@ -379,7 +379,7 @@ impl Channel for VoiceCallChannel {
                     "would TTS message to active call: {}", message.content
                 );
                 // TTS synthesis + streaming would be handled by the
-                // telephony provider's media stream API in production.
+                // telephony model_provider's media stream API in production.
                 return Ok(());
             }
         }
@@ -393,7 +393,7 @@ impl Channel for VoiceCallChannel {
         let active_calls = self.active_calls.clone();
         let _tx = tx.clone();
 
-        info!(port = port, provider = %self.config.provider, "voice call webhook server starting");
+        info!(port = port, model_provider = %self.config.model_provider, "voice call webhook server starting");
 
         // The webhook server runs as an axum HTTP server on the configured port.
         // In production, this handles:
@@ -403,7 +403,7 @@ impl Channel for VoiceCallChannel {
         // - WebSocket /voice/media — Bidirectional audio streaming
         //
         // For now, we set up the server structure. Full endpoint
-        // implementation depends on provider-specific webhook payloads.
+        // implementation depends on model_provider-specific webhook payloads.
 
         let app = axum::Router::new()
             .route("/voice/health", axum::routing::get(|| async { "ok" }))
@@ -421,8 +421,8 @@ impl Channel for VoiceCallChannel {
     }
 
     async fn health_check(&self) -> bool {
-        // Check we can reach the provider API
-        let test_url = match self.config.provider {
+        // Check we can reach the model_provider API
+        let test_url = match self.config.model_provider {
             VoiceProvider::Twilio => {
                 format!(
                     "{}/Accounts/{}.json",
@@ -446,7 +446,7 @@ impl Channel for VoiceCallChannel {
                 resp.status().is_success() || resp.status().as_u16() == 401
             }
             Err(e) => {
-                warn!(provider = %self.config.provider, "voice call health check failed: {e}");
+                warn!(model_provider = %self.config.model_provider, "voice call health check failed: {e}");
                 false
             }
         }
@@ -517,7 +517,7 @@ mod tests {
 
     fn test_config() -> VoiceCallConfig {
         VoiceCallConfig {
-            provider: VoiceProvider::Twilio,
+            model_provider: VoiceProvider::Twilio,
             account_id: "AC_TEST_ACCOUNT".into(),
             auth_token: "test_token".into(),
             from_number: "+15551234567".into(),
@@ -715,7 +715,7 @@ mod tests {
         let config = test_config();
         let json = serde_json::to_string(&config).unwrap();
         let parsed: VoiceCallConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.provider, VoiceProvider::Twilio);
+        assert_eq!(parsed.model_provider, VoiceProvider::Twilio);
         assert_eq!(parsed.from_number, "+15551234567");
         assert_eq!(parsed.webhook_port, 8090);
     }

@@ -117,7 +117,7 @@ pub fn build_spec() -> serde_json::Value {
         "in": "query",
         "required": false,
         "schema": { "type": "string" },
-        "description": "Section prefix to scope the init pass (e.g. `providers`)."
+        "description": "Section prefix to scope the init pass (e.g. `model_providers`)."
     });
 
     let error_responses = serde_json::json!({

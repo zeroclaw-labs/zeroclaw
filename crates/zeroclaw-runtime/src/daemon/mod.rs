@@ -567,7 +567,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 &config.workspace_dir,
                 config
                     .providers
-                    .first_provider()
+                    .first_model_provider()
                     .and_then(|e| e.api_key.as_deref()),
             )
             .ok();
@@ -614,7 +614,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             };
             let temp = config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7);
             let phase2_fut = Box::pin(crate::agent::run(

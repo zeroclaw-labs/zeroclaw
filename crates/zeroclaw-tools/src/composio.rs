@@ -1,4 +1,4 @@
-// Composio Tool Provider — optional managed tool surface with 1000+ OAuth integrations.
+// Composio Tool ModelProvider — optional managed tool surface with 1000+ OAuth integrations.
 //
 // When enabled, ZeroClaw can execute actions on Gmail, Notion, GitHub, Slack, etc.
 // through Composio's API without storing raw OAuth tokens locally.

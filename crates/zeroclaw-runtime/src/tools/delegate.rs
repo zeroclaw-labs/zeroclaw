@@ -17,7 +17,7 @@ use zeroclaw_config::schema::{
     RiskProfileConfig, RuntimeProfileConfig, SkillBundleConfig,
 };
 use zeroclaw_memory::{Memory, NamespacedMemory};
-use zeroclaw_providers::{self, ChatMessage, Provider};
+use zeroclaw_providers::{self, ChatMessage, ModelProvider};
 
 /// Default temperature for sub-agent tool loops when the delegate config
 /// leaves it unset; matches the longstanding agentic default that balances
@@ -47,7 +47,7 @@ pub enum BackgroundTaskStatus {
 }
 
 /// Tool that delegates a subtask to a named agent with a different
-/// provider/model configuration. Enables multi-agent workflows where
+/// model_provider/model configuration. Enables multi-agent workflows where
 /// a primary agent can hand off specialized work (research, coding,
 /// summarization) to purpose-built sub-agents.
 ///
@@ -65,8 +65,8 @@ pub struct DelegateTool {
     security: Arc<SecurityPolicy>,
     /// Global credential (from config.api_key) used when an agent has none set.
     global_credential: Option<String>,
-    /// Provider runtime options inherited from root config.
-    provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions,
+    /// ModelProvider runtime options inherited from root config.
+    provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
     /// Parent tool registry for agentic sub-agents.
@@ -81,7 +81,7 @@ pub struct DelegateTool {
     cancellation_token: CancellationToken,
     /// Optional memory instance for namespace isolation on delegate agents.
     memory: Option<Arc<dyn Memory>>,
-    /// V3: nested model-provider map for brain resolution.
+    /// V3: nested model-model_provider map for brain resolution.
     providers_models: Arc<HashMap<String, HashMap<String, ModelProviderConfig>>>,
     /// V3: named risk profiles for delegation depth and timeout resolution.
     risk_profiles: Arc<HashMap<String, RiskProfileConfig>>,
@@ -103,7 +103,7 @@ impl DelegateTool {
             agents,
             global_credential,
             security,
-            zeroclaw_providers::ProviderRuntimeOptions::default(),
+            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         )
     }
 
@@ -111,7 +111,7 @@ impl DelegateTool {
         agents: HashMap<String, DelegateAgentConfig>,
         global_credential: Option<String>,
         security: Arc<SecurityPolicy>,
-        provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions,
+        provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
     ) -> Self {
         Self {
             agents: Arc::new(agents),
@@ -147,7 +147,7 @@ impl DelegateTool {
             global_credential,
             security,
             depth,
-            zeroclaw_providers::ProviderRuntimeOptions::default(),
+            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         )
     }
 
@@ -156,7 +156,7 @@ impl DelegateTool {
         global_credential: Option<String>,
         security: Arc<SecurityPolicy>,
         depth: u32,
-        provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions,
+        provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
     ) -> Self {
         Self {
             agents: Arc::new(agents),
@@ -229,7 +229,7 @@ impl DelegateTool {
         self
     }
 
-    /// Attach V3 nested model-provider map for brain resolution.
+    /// Attach V3 nested model-model_provider map for brain resolution.
     pub fn with_providers_models(
         mut self,
         m: HashMap<String, HashMap<String, ModelProviderConfig>>,
@@ -615,23 +615,24 @@ impl DelegateTool {
             });
         }
 
-        // Create provider for this agent
-        let provider: Box<dyn Provider> = match zeroclaw_providers::create_provider_with_options(
-            &provider_type,
-            credential.as_deref(),
-            &self.provider_runtime_options,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Failed to create provider '{provider_type}' for agent '{agent_name}': {e}"
-                    )),
-                });
-            }
-        };
+        // Create model_provider for this agent
+        let model_provider: Box<dyn ModelProvider> =
+            match zeroclaw_providers::create_model_provider_with_options(
+                &provider_type,
+                credential.as_deref(),
+                &self.provider_runtime_options,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Failed to create model_provider '{provider_type}' for agent '{agent_name}': {e}"
+                        )),
+                    });
+                }
+            };
 
         // Build the message
         let full_prompt = if context.is_empty() {
@@ -648,7 +649,7 @@ impl DelegateTool {
                     agent_config,
                     &provider_type,
                     &model,
-                    &*provider,
+                    &*model_provider,
                     &full_prompt,
                     temperature.unwrap_or(DELEGATE_AGENTIC_DEFAULT_TEMPERATURE),
                 )
@@ -660,13 +661,13 @@ impl DelegateTool {
             self.build_enriched_system_prompt(agent_config, &model, &[], &self.workspace_dir);
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
-        // Wrap the provider call in a timeout to prevent indefinite blocking
+        // Wrap the model_provider call in a timeout to prevent indefinite blocking
         let timeout_secs = self
             .resolve_delegation_timeout(&agent_config.risk_profile)
             .unwrap_or(self.delegate_config.timeout_secs);
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            provider.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            model_provider.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
         )
         .await;
 
@@ -1286,7 +1287,7 @@ impl DelegateTool {
         agent_config: &DelegateAgentConfig,
         provider_type: &str,
         model: &str,
-        provider: &dyn Provider,
+        model_provider: &dyn ModelProvider,
         full_prompt: &str,
         temperature: f64,
     ) -> anyhow::Result<ToolResult> {
@@ -1350,7 +1351,7 @@ impl DelegateTool {
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(
-                provider,
+                model_provider,
                 &mut history,
                 &sub_tools,
                 &noop_observer,
@@ -1529,10 +1530,10 @@ mod tests {
         }
     }
 
-    struct OneToolThenFinalProvider;
+    struct OneToolThenFinalModelProvider;
 
     #[async_trait]
-    impl Provider for OneToolThenFinalProvider {
+    impl ModelProvider for OneToolThenFinalModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -1573,10 +1574,10 @@ mod tests {
         }
     }
 
-    struct InfiniteToolCallProvider;
+    struct InfiniteToolCallModelProvider;
 
     #[async_trait]
-    impl Provider for InfiniteToolCallProvider {
+    impl ModelProvider for InfiniteToolCallModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -1607,10 +1608,10 @@ mod tests {
         }
     }
 
-    struct FailingProvider;
+    struct FailingModelProvider;
 
     #[async_trait]
-    impl Provider for FailingProvider {
+    impl ModelProvider for FailingModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -1627,7 +1628,7 @@ mod tests {
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
-            Err(anyhow!("provider boom"))
+            Err(anyhow!("model_provider boom"))
         }
     }
 
@@ -1771,7 +1772,7 @@ mod tests {
         agents.insert(
             "broken".to_string(),
             DelegateAgentConfig {
-                model_provider: "totally-invalid-provider.default".to_string(),
+                model_provider: "totally-invalid-model_provider.default".to_string(),
                 ..Default::default()
             },
         );
@@ -1781,7 +1782,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("Failed to create provider"));
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("Failed to create model_provider")
+        );
     }
 
     #[tokio::test]
@@ -1814,7 +1820,7 @@ mod tests {
             .execute(json!({"agent": " researcher ", "prompt": "test"}))
             .await
             .unwrap();
-        // Should find "researcher" after trim — will fail at provider level
+        // Should find "researcher" after trim — will fail at model_provider level
         // since ollama isn't running, but must NOT get "Unknown agent".
         assert!(
             result.error.is_none()
@@ -1894,7 +1900,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("Failed to create provider")
+                .contains("Failed to create model_provider")
         );
     }
 
@@ -1924,7 +1930,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("Failed to create provider")
+                .contains("Failed to create model_provider")
         );
     }
 
@@ -2007,14 +2013,14 @@ mod tests {
                 Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
             ])));
 
-        let provider = OneToolThenFinalProvider;
+        let model_provider = OneToolThenFinalModelProvider;
         let result = tool
             .execute_agentic(
                 "agentic",
                 &config,
                 "openrouter",
                 "model-test",
-                &provider,
+                &model_provider,
                 "run",
                 0.2,
             )
@@ -2037,14 +2043,14 @@ mod tests {
                 test_security(),
             ))])));
 
-        let provider = OneToolThenFinalProvider;
+        let model_provider = OneToolThenFinalModelProvider;
         let result = tool
             .execute_agentic(
                 "agentic",
                 &config,
                 "openrouter",
                 "model-test",
-                &provider,
+                &model_provider,
                 "run",
                 0.2,
             )
@@ -2068,14 +2074,14 @@ mod tests {
             .with_runtime_profiles(agentic_runtime_profiles(vec!["echo_tool".to_string()], 2))
             .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
-        let provider = InfiniteToolCallProvider;
+        let model_provider = InfiniteToolCallModelProvider;
         let result = tool
             .execute_agentic(
                 "agentic",
                 &config,
                 "openrouter",
                 "model-test",
-                &provider,
+                &model_provider,
                 "run",
                 0.2,
             )
@@ -2099,14 +2105,14 @@ mod tests {
             .with_runtime_profiles(agentic_runtime_profiles(vec!["echo_tool".to_string()], 10))
             .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
-        let provider = FailingProvider;
+        let model_provider = FailingModelProvider;
         let result = tool
             .execute_agentic(
                 "agentic",
                 &config,
                 "openrouter",
                 "model-test",
-                &provider,
+                &model_provider,
                 "run",
                 0.2,
             )
@@ -2119,7 +2125,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("provider boom")
+                .contains("model_provider boom")
         );
     }
 
@@ -2151,10 +2157,10 @@ mod tests {
         }
     }
 
-    struct McpToolThenFinalProvider;
+    struct McpToolThenFinalModelProvider;
 
     #[async_trait]
-    impl Provider for McpToolThenFinalProvider {
+    impl ModelProvider for McpToolThenFinalModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2207,14 +2213,14 @@ mod tests {
         let handle = tool.parent_tools_handle();
         handle.write().push(Arc::new(FakeMcpTool));
 
-        let provider = McpToolThenFinalProvider;
+        let model_provider = McpToolThenFinalModelProvider;
         let result = tool
             .execute_agentic(
                 "agentic",
                 &config,
                 "openrouter",
                 "model-test",
-                &provider,
+                &model_provider,
                 "run mcp",
                 0.2,
             )
@@ -2492,7 +2498,7 @@ mod tests {
             .await
             .unwrap();
 
-        // The agent will fail at provider level (ollama not running),
+        // The agent will fail at model_provider level (ollama not running),
         // but the background task should be spawned and return a task_id.
         assert!(result.success);
         assert!(result.output.contains("task_id:"));
@@ -2849,7 +2855,7 @@ mod tests {
             .execute(json!({"agent": "researcher", "prompt": "test"}))
             .await
             .unwrap();
-        // Should proceed to delegation (will fail at provider since ollama isn't running)
+        // Should proceed to delegation (will fail at model_provider since ollama isn't running)
         // but should NOT fail with "Unknown action" error
         assert!(
             result.error.is_none()

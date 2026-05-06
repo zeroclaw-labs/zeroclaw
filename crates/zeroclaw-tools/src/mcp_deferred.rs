@@ -182,7 +182,7 @@ impl ActivatedToolSet {
 
     /// Resolve an activated tool by exact name first, then by unique MCP suffix.
     ///
-    /// Some providers occasionally strip the `<server>__` prefix when calling a
+    /// Some model_providers occasionally strip the `<server>__` prefix when calling a
     /// deferred MCP tool after `tool_search` activation. When the suffix maps to
     /// exactly one activated tool, allow that call to proceed.
     pub fn get_resolved(&self, name: &str) -> Option<Arc<dyn Tool>> {

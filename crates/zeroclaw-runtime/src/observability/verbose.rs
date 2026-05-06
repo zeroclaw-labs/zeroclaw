@@ -23,14 +23,14 @@ impl Observer for VerboseObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {
             ObserverEvent::LlmRequest {
-                provider,
+                model_provider,
                 model,
                 messages_count,
             } => {
                 eprintln!("> Thinking");
                 eprintln!(
-                    "> Send (provider={}, model={}, messages={})",
-                    provider, model, messages_count
+                    "> Send (model_provider={}, model={}, messages={})",
+                    model_provider, model, messages_count
                 );
             }
             ObserverEvent::LlmResponse {
@@ -83,12 +83,12 @@ mod tests {
     fn verbose_events_do_not_panic() {
         let obs = VerboseObserver::new();
         obs.record_event(&ObserverEvent::LlmRequest {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude".into(),
             messages_count: 3,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude".into(),
             duration: Duration::from_millis(12),
             success: true,

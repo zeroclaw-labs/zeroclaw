@@ -20,7 +20,7 @@ fn migrate(toml_str: &str) -> Config {
 #[test]
 fn config_valid_keys_not_flagged_as_unknown() {
     // api_key: Option<T> defaulting to None — TOML omits it.
-    // model_provider: serde alias for default_provider.
+    // model_provider: serde alias for default_model_provider.
     let unknown = Config::unknown_keys("api_key = \"sk-test\"\nmodel_provider = \"ollama\"\n");
     assert!(
         unknown.is_empty(),
@@ -33,7 +33,7 @@ fn config_unknown_keys_parse_without_error() {
     let config = migrate(
         r#"
 default_temperature = 0.7
-default_provider = "openai"
+default_model_provider = "openai"
 totally_unknown_key = "should be ignored"
 another_fake = 42
 "#,
@@ -41,7 +41,7 @@ another_fake = 42
     assert!(
         (config
             .providers
-            .first_provider()
+            .first_model_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)
@@ -67,7 +67,7 @@ default_temperature = "hot"
 "#;
     // V1's `default_temperature` is folded into providers.models.<x>.default
     // by `migrate_to_current`. A non-f64 value should fail at the migration
-    // boundary because the synthesized provider entry can't deserialize
+    // boundary because the synthesized model_provider entry can't deserialize
     // a string into Option<f64>.
     let result = migration::migrate_to_current(toml_str);
     assert!(
@@ -78,7 +78,7 @@ default_temperature = "hot"
 
 #[test]
 fn config_out_of_range_temperature_fails() {
-    // Temperature validation now happens at the provider level.
+    // Temperature validation now happens at the model_provider level.
     let toml_str = r#"
 [providers.models.openai.default]
 temperature = 99.0
@@ -399,7 +399,7 @@ fn config_empty_toml_uses_default_temperature() {
     assert!(
         (config
             .providers
-            .first_provider()
+            .first_model_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)
@@ -426,7 +426,7 @@ fn config_only_temperature_parses() {
     assert!(
         (config
             .providers
-            .first_provider()
+            .first_model_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 1.2)
@@ -444,7 +444,7 @@ fn config_extra_unknown_keys_ignored() {
     let config = migrate(
         r#"
 default_temperature = 0.5
-default_provider = "openai"
+default_model_provider = "openai"
 future_feature = true
 [some_future_section]
 value = 123
@@ -453,7 +453,7 @@ value = 123
     assert!(
         (config
             .providers
-            .first_provider()
+            .first_model_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.5)
@@ -611,7 +611,7 @@ fn config_empty_parses_with_all_defaults() {
     assert!(
         (config
             .providers
-            .first_provider()
+            .first_model_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)

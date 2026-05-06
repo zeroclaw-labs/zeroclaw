@@ -1,7 +1,7 @@
-//! Provider alias functions used by config validation.
+//! ModelProvider alias functions used by config validation.
 //!
-//! These are extracted from the providers module to break the circular
-//! dependency between config and providers.
+//! These are extracted from the model_providers module to break the circular
+//! dependency between config and model_providers.
 
 pub fn is_glm_global_alias(name: &str) -> bool {
     matches!(name, "glm" | "zhipu" | "glm-global" | "zhipu-global")

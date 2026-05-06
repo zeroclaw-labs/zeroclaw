@@ -755,9 +755,9 @@ impl LinkedInClient {
 
 // ── Image Generation ─────────────────────────────────────────────
 
-/// Multi-provider image generator with SVG fallback card.
+/// Multi-model_provider image generator with SVG fallback card.
 ///
-/// Tries AI providers in configured priority order. If all fail (missing keys,
+/// Tries AI model_providers in configured priority order. If all fail (missing keys,
 /// API errors, exhausted credits), falls back to generating a branded SVG card.
 pub struct ImageGenerator {
     config: LinkedInImageConfig,
@@ -783,7 +783,7 @@ impl ImageGenerator {
             .as_secs();
         let base_name = format!("post_{timestamp}");
 
-        // Try each configured provider in order
+        // Try each configured model_provider in order
         for provider_name in &self.config.providers {
             let result = match provider_name.as_str() {
                 "stability" => self.try_stability(prompt, &image_dir, &base_name).await,
@@ -791,7 +791,7 @@ impl ImageGenerator {
                 "dalle" => self.try_dalle(prompt, &image_dir, &base_name).await,
                 "flux" => self.try_flux(prompt, &image_dir, &base_name).await,
                 other => {
-                    tracing::warn!("Unknown image provider '{other}', skipping");
+                    tracing::warn!("Unknown image model_provider '{other}', skipping");
                     continue;
                 }
             };
@@ -802,12 +802,12 @@ impl ImageGenerator {
                     return Ok(path);
                 }
                 Err(e) => {
-                    tracing::warn!("Image provider '{provider_name}' failed: {e}");
+                    tracing::warn!("Image model_provider '{provider_name}' failed: {e}");
                 }
             }
         }
 
-        // All AI providers failed — try SVG fallback
+        // All AI model_providers failed — try SVG fallback
         if self.config.fallback_card {
             let svg_path = image_dir.join(format!("{base_name}.svg"));
             let svg_content = Self::generate_fallback_card(prompt, &self.config.card_accent_color);
@@ -816,7 +816,7 @@ impl ImageGenerator {
             return Ok(svg_path);
         }
 
-        anyhow::bail!("All image generation providers failed and fallback_card is disabled")
+        anyhow::bail!("All image generation model_providers failed and fallback_card is disabled")
     }
 
     /// Read an env var value from the workspace .env file (same format as LinkedInClient).
@@ -1604,7 +1604,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = LinkedInImageConfig {
             enabled: true,
-            providers: vec![], // no AI providers — force fallback
+            providers: vec![], // no AI model_providers — force fallback
             fallback_card: true,
             card_accent_color: "#0A66C2".into(),
             temp_dir: "images".into(),
@@ -1638,7 +1638,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("All image generation providers failed")
+                .contains("All image generation model_providers failed")
         );
     }
 

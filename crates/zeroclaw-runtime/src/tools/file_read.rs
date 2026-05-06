@@ -755,28 +755,28 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use zeroclaw_config::schema::MemoryConfig;
         use zeroclaw_memory::{self, Memory};
-        use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, Provider};
+        use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider};
 
         pub type SharedRequests = Arc<Mutex<Vec<Vec<ChatMessage>>>>;
 
-        pub struct RecordingProvider {
+        pub struct RecordingModelProvider {
             responses: Mutex<Vec<ChatResponse>>,
             pub requests: SharedRequests,
         }
 
-        impl RecordingProvider {
+        impl RecordingModelProvider {
             pub fn new(responses: Vec<ChatResponse>) -> (Self, SharedRequests) {
                 let requests: SharedRequests = Arc::new(Mutex::new(Vec::new()));
-                let provider = Self {
+                let model_provider = Self {
                     responses: Mutex::new(responses),
                     requests: requests.clone(),
                 };
-                (provider, requests)
+                (model_provider, requests)
             }
         }
 
         #[async_trait::async_trait]
-        impl Provider for RecordingProvider {
+        impl ModelProvider for RecordingModelProvider {
             async fn chat_with_system(
                 &self,
                 _system_prompt: Option<&str>,
@@ -824,15 +824,15 @@ mod tests {
         }
     }
 
-    /// End-to-end test: scripted provider calls `file_read` on a real PDF
+    /// End-to-end test: scripted model_provider calls `file_read` on a real PDF
     /// fixture, the tool extracts text via pdf-extract, and the extracted
-    /// content reaches the provider in the tool result message.
+    /// content reaches the model_provider in the tool result message.
     #[tokio::test]
     async fn e2e_agent_file_read_pdf_extraction() {
         use crate::agent::agent::Agent;
         use crate::agent::dispatcher::NativeToolDispatcher;
         use e2e_helpers::*;
-        use zeroclaw_providers::{ChatResponse, Provider, ToolCall};
+        use zeroclaw_providers::{ChatResponse, ModelProvider, ToolCall};
 
         // ── Set up workspace with PDF fixture ──
         let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_file_read_pdf");
@@ -853,9 +853,9 @@ mod tests {
         });
         let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
 
-        // ── Script provider: call file_read → then answer ──
-        let (provider, recorded) = RecordingProvider::new(vec![
-            // Turn 1 response: provider asks to read the PDF
+        // ── Script model_provider: call file_read → then answer ──
+        let (model_provider, recorded) = RecordingModelProvider::new(vec![
+            // Turn 1 response: model_provider asks to read the PDF
             ChatResponse {
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
@@ -867,7 +867,7 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
             },
-            // Turn 1 continued: provider sees tool result and answers
+            // Turn 1 continued: model_provider sees tool result and answers
             ChatResponse {
                 text: Some("The PDF contains a greeting: Hello PDF".into()),
                 tool_calls: vec![],
@@ -877,7 +877,7 @@ mod tests {
         ]);
 
         let mut agent = Agent::builder()
-            .provider(Box::new(provider) as Box<dyn Provider>)
+            .model_provider(Box::new(model_provider) as Box<dyn ModelProvider>)
             .tools(vec![file_read_tool])
             .memory(make_memory())
             .observer(make_observer())
@@ -898,12 +898,12 @@ mod tests {
             "agent response must contain PDF content, got: {response}",
         );
 
-        // ── Verify provider received extracted PDF text in tool result ──
+        // ── Verify model_provider received extracted PDF text in tool result ──
         {
             let all_requests = recorded.lock().unwrap();
             assert!(
                 all_requests.len() >= 2,
-                "expected at least 2 provider requests (initial + after tool), got {}",
+                "expected at least 2 model_provider requests (initial + after tool), got {}",
                 all_requests.len(),
             );
 
@@ -930,7 +930,7 @@ mod tests {
         use crate::agent::agent::Agent;
         use crate::agent::dispatcher::NativeToolDispatcher;
         use e2e_helpers::*;
-        use zeroclaw_providers::{ChatResponse, Provider, ToolCall};
+        use zeroclaw_providers::{ChatResponse, ModelProvider, ToolCall};
 
         // ── Set up workspace with binary file ──
         let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_file_read_lossy");
@@ -949,7 +949,7 @@ mod tests {
         });
         let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
 
-        let (provider, recorded) = RecordingProvider::new(vec![
+        let (model_provider, recorded) = RecordingModelProvider::new(vec![
             ChatResponse {
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
@@ -970,7 +970,7 @@ mod tests {
         ]);
 
         let mut agent = Agent::builder()
-            .provider(Box::new(provider) as Box<dyn Provider>)
+            .model_provider(Box::new(model_provider) as Box<dyn ModelProvider>)
             .tools(vec![file_read_tool])
             .memory(make_memory())
             .observer(make_observer())
@@ -991,7 +991,7 @@ mod tests {
             let all_requests = recorded.lock().unwrap();
             assert!(
                 all_requests.len() >= 2,
-                "expected at least 2 provider requests, got {}",
+                "expected at least 2 model_provider requests, got {}",
                 all_requests.len(),
             );
 
@@ -1015,7 +1015,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&workspace).await;
     }
 
-    /// Live e2e: real OpenAI Codex provider + real FileReadTool + PDF fixture.
+    /// Live e2e: real OpenAI Codex model_provider + real FileReadTool + PDF fixture.
     /// Verifies the model receives extracted PDF text and responds meaningfully.
     ///
     /// Requires valid OAuth credentials in `~/.zeroclaw/`.
@@ -1026,8 +1026,8 @@ mod tests {
         use crate::agent::agent::Agent;
         use crate::agent::dispatcher::XmlToolDispatcher;
         use e2e_helpers::*;
-        use zeroclaw_providers::openai_codex::OpenAiCodexProvider;
-        use zeroclaw_providers::{Provider, ProviderRuntimeOptions};
+        use zeroclaw_providers::openai_codex::OpenAiCodexModelProvider;
+        use zeroclaw_providers::{ModelProvider, ModelProviderRuntimeOptions};
 
         // ── Set up workspace with PDF fixture ──
         let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_live_file_read_pdf");
@@ -1048,12 +1048,13 @@ mod tests {
         });
         let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
 
-        // ── Real provider (OpenAI Codex uses XML tool dispatch) ──
-        let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default(), None)
-            .expect("provider should initialize");
+        // ── Real model_provider (OpenAI Codex uses XML tool dispatch) ──
+        let model_provider =
+            OpenAiCodexModelProvider::new(&ModelProviderRuntimeOptions::default(), None)
+                .expect("model_provider should initialize");
 
         let mut agent = Agent::builder()
-            .provider(Box::new(provider) as Box<dyn Provider>)
+            .model_provider(Box::new(model_provider) as Box<dyn ModelProvider>)
             .tools(vec![file_read_tool])
             .memory(make_memory())
             .observer(make_observer())

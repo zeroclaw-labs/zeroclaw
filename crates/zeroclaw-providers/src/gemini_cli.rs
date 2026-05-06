@@ -1,4 +1,4 @@
-//! Gemini CLI subprocess provider.
+//! Gemini CLI subprocess model_provider.
 //!
 //! Integrates with the Gemini CLI, spawning the `gemini` binary
 //! as a subprocess for each inference request. This allows using Google's
@@ -28,13 +28,13 @@
 //! # Authentication
 //!
 //! Authentication is handled by the Gemini CLI itself (its own credential store).
-//! No explicit API key is required by this provider.
+//! No explicit API key is required by this model_provider.
 //!
 //! # Environment variables
 //!
 //! - `GEMINI_CLI_PATH` — override the path to the `gemini` binary (default: `"gemini"`)
 
-use crate::traits::{ChatRequest, ChatResponse, Provider, TokenUsage};
+use crate::traits::{ChatRequest, ChatResponse, ModelProvider, TokenUsage};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
@@ -47,7 +47,7 @@ pub const GEMINI_CLI_PATH_ENV: &str = "GEMINI_CLI_PATH";
 /// Default `gemini` binary name (resolved via `PATH`).
 const DEFAULT_GEMINI_CLI_BINARY: &str = "gemini";
 
-/// Model name used to signal "use the provider's own default model".
+/// Model name used to signal "use the model_provider's own default model".
 const DEFAULT_MODEL_MARKER: &str = "default";
 /// Gemini CLI requests are bounded to avoid hung subprocesses.
 const GEMINI_CLI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -57,17 +57,17 @@ const MAX_GEMINI_CLI_STDERR_CHARS: usize = 512;
 const GEMINI_CLI_SUPPORTED_TEMPERATURES: [f64; 2] = [0.7, 1.0];
 const TEMP_EPSILON: f64 = 1e-9;
 
-/// Provider that invokes the Gemini CLI as a subprocess.
+/// ModelProvider that invokes the Gemini CLI as a subprocess.
 ///
 /// Each inference request spawns a fresh `gemini` process. This is the
 /// non-interactive approach: the process handles the prompt and exits.
-pub struct GeminiCliProvider {
+pub struct GeminiCliModelProvider {
     /// Path to the `gemini` binary.
     binary_path: PathBuf,
 }
 
-impl GeminiCliProvider {
-    /// Create a new `GeminiCliProvider`.
+impl GeminiCliModelProvider {
+    /// Create a new `GeminiCliModelProvider`.
     ///
     /// The binary path is resolved from `GEMINI_CLI_PATH` env var if set,
     /// otherwise defaults to `"gemini"` (found via `PATH`).
@@ -95,7 +95,7 @@ impl GeminiCliProvider {
 
     fn validate_temperature(temperature: f64) -> anyhow::Result<()> {
         if !temperature.is_finite() {
-            anyhow::bail!("Gemini CLI provider received non-finite temperature value");
+            anyhow::bail!("Gemini CLI model_provider received non-finite temperature value");
         }
         if !Self::supports_temperature(temperature) {
             anyhow::bail!(
@@ -185,14 +185,14 @@ impl GeminiCliProvider {
     }
 }
 
-impl Default for GeminiCliProvider {
+impl Default for GeminiCliModelProvider {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl Provider for GeminiCliProvider {
+impl ModelProvider for GeminiCliModelProvider {
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -243,8 +243,11 @@ mod tests {
         let orig = std::env::var(GEMINI_CLI_PATH_ENV).ok();
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var(GEMINI_CLI_PATH_ENV, "/usr/local/bin/gemini") };
-        let provider = GeminiCliProvider::new();
-        assert_eq!(provider.binary_path, PathBuf::from("/usr/local/bin/gemini"));
+        let model_provider = GeminiCliModelProvider::new();
+        assert_eq!(
+            model_provider.binary_path,
+            PathBuf::from("/usr/local/bin/gemini")
+        );
         match orig {
             // SAFETY: test-only, single-threaded test runner.
             Some(v) => unsafe { std::env::set_var(GEMINI_CLI_PATH_ENV, v) },
@@ -259,8 +262,8 @@ mod tests {
         let orig = std::env::var(GEMINI_CLI_PATH_ENV).ok();
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var(GEMINI_CLI_PATH_ENV) };
-        let provider = GeminiCliProvider::new();
-        assert_eq!(provider.binary_path, PathBuf::from("gemini"));
+        let model_provider = GeminiCliModelProvider::new();
+        assert_eq!(model_provider.binary_path, PathBuf::from("gemini"));
         if let Some(v) = orig {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var(GEMINI_CLI_PATH_ENV, v) };
@@ -273,8 +276,8 @@ mod tests {
         let orig = std::env::var(GEMINI_CLI_PATH_ENV).ok();
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var(GEMINI_CLI_PATH_ENV, "   ") };
-        let provider = GeminiCliProvider::new();
-        assert_eq!(provider.binary_path, PathBuf::from("gemini"));
+        let model_provider = GeminiCliModelProvider::new();
+        assert_eq!(model_provider.binary_path, PathBuf::from("gemini"));
         match orig {
             // SAFETY: test-only, single-threaded test runner.
             Some(v) => unsafe { std::env::set_var(GEMINI_CLI_PATH_ENV, v) },
@@ -285,28 +288,32 @@ mod tests {
 
     #[test]
     fn should_forward_model_standard() {
-        assert!(GeminiCliProvider::should_forward_model("gemini-2.5-pro"));
-        assert!(GeminiCliProvider::should_forward_model("gemini-2.5-flash"));
+        assert!(GeminiCliModelProvider::should_forward_model(
+            "gemini-2.5-pro"
+        ));
+        assert!(GeminiCliModelProvider::should_forward_model(
+            "gemini-2.5-flash"
+        ));
     }
 
     #[test]
     fn should_not_forward_default_model() {
-        assert!(!GeminiCliProvider::should_forward_model(
+        assert!(!GeminiCliModelProvider::should_forward_model(
             DEFAULT_MODEL_MARKER
         ));
-        assert!(!GeminiCliProvider::should_forward_model(""));
-        assert!(!GeminiCliProvider::should_forward_model("   "));
+        assert!(!GeminiCliModelProvider::should_forward_model(""));
+        assert!(!GeminiCliModelProvider::should_forward_model("   "));
     }
 
     #[test]
     fn validate_temperature_allows_defaults() {
-        assert!(GeminiCliProvider::validate_temperature(0.7).is_ok());
-        assert!(GeminiCliProvider::validate_temperature(1.0).is_ok());
+        assert!(GeminiCliModelProvider::validate_temperature(0.7).is_ok());
+        assert!(GeminiCliModelProvider::validate_temperature(1.0).is_ok());
     }
 
     #[test]
     fn validate_temperature_rejects_custom_value() {
-        let err = GeminiCliProvider::validate_temperature(0.2).unwrap_err();
+        let err = GeminiCliModelProvider::validate_temperature(0.2).unwrap_err();
         assert!(
             err.to_string()
                 .contains("temperature unsupported by Gemini CLI")
@@ -315,10 +322,10 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_missing_binary_returns_error() {
-        let provider = GeminiCliProvider {
+        let model_provider = GeminiCliModelProvider {
             binary_path: PathBuf::from("/nonexistent/path/to/gemini"),
         };
-        let result = provider.invoke_cli("hello", "default").await;
+        let result = model_provider.invoke_cli("hello", "default").await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(

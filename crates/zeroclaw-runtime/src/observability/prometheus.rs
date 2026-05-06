@@ -57,19 +57,22 @@ impl PrometheusObserver {
 
         let agent_starts = IntCounterVec::new(
             prometheus::Opts::new("zeroclaw_agent_starts_total", "Total agent invocations"),
-            &["provider", "model"],
+            &["model_provider", "model"],
         )
         .expect("valid metric");
 
         let llm_requests = IntCounterVec::new(
-            prometheus::Opts::new("zeroclaw_llm_requests_total", "Total LLM provider requests"),
-            &["provider", "model", "success"],
+            prometheus::Opts::new(
+                "zeroclaw_llm_requests_total",
+                "Total LLM model_provider requests",
+            ),
+            &["model_provider", "model", "success"],
         )
         .expect("valid metric");
 
         let tokens_input_total = IntCounterVec::new(
             prometheus::Opts::new("zeroclaw_tokens_input_total", "Total input tokens consumed"),
-            &["provider", "model"],
+            &["model_provider", "model"],
         )
         .expect("valid metric");
 
@@ -78,7 +81,7 @@ impl PrometheusObserver {
                 "zeroclaw_tokens_output_total",
                 "Total output tokens consumed",
             ),
-            &["provider", "model"],
+            &["model_provider", "model"],
         )
         .expect("valid metric");
 
@@ -131,7 +134,7 @@ impl PrometheusObserver {
                 "Agent invocation duration in seconds",
             )
             .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
-            &["provider", "model"],
+            &["model_provider", "model"],
         )
         .expect("valid metric");
 
@@ -313,28 +316,31 @@ impl PrometheusObserver {
 impl Observer for PrometheusObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {
-            ObserverEvent::AgentStart { provider, model } => {
+            ObserverEvent::AgentStart {
+                model_provider,
+                model,
+            } => {
                 self.agent_starts
-                    .with_label_values(&[provider, model])
+                    .with_label_values(&[model_provider, model])
                     .inc();
             }
             ObserverEvent::AgentEnd {
-                provider,
+                model_provider,
                 model,
                 duration,
                 tokens_used,
                 cost_usd: _,
             } => {
-                // Agent duration is recorded via the histogram with provider/model labels
+                // Agent duration is recorded via the histogram with model_provider/model labels
                 self.agent_duration
-                    .with_label_values(&[provider, model])
+                    .with_label_values(&[model_provider, model])
                     .observe(duration.as_secs_f64());
                 if let Some(t) = tokens_used {
                     self.tokens_used.set(i64::try_from(*t).unwrap_or(i64::MAX));
                 }
             }
             ObserverEvent::LlmResponse {
-                provider,
+                model_provider,
                 model,
                 success,
                 input_tokens,
@@ -343,16 +349,16 @@ impl Observer for PrometheusObserver {
             } => {
                 let success_str = if *success { "true" } else { "false" };
                 self.llm_requests
-                    .with_label_values(&[provider.as_str(), model.as_str(), success_str])
+                    .with_label_values(&[model_provider.as_str(), model.as_str(), success_str])
                     .inc();
                 if let Some(input) = input_tokens {
                     self.tokens_input_total
-                        .with_label_values(&[provider.as_str(), model.as_str()])
+                        .with_label_values(&[model_provider.as_str(), model.as_str()])
                         .inc_by(*input);
                 }
                 if let Some(output) = output_tokens {
                     self.tokens_output_total
-                        .with_label_values(&[provider.as_str(), model.as_str()])
+                        .with_label_values(&[model_provider.as_str(), model.as_str()])
                         .inc_by(*output);
                 }
             }
@@ -533,18 +539,18 @@ mod tests {
     fn records_all_events_without_panic() {
         let obs = PrometheusObserver::new();
         obs.record_event(&ObserverEvent::AgentStart {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
             cost_usd: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::ZERO,
             tokens_used: None,
@@ -566,7 +572,7 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::Error {
-            component: "provider".into(),
+            component: "model_provider".into(),
             message: "timeout".into(),
         });
     }
@@ -585,7 +591,7 @@ mod tests {
     fn encode_produces_prometheus_text_format() {
         let obs = PrometheusObserver::new();
         obs.record_event(&ObserverEvent::AgentStart {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
         });
         obs.record_event(&ObserverEvent::ToolCall {
@@ -644,11 +650,11 @@ mod tests {
     fn errors_track_by_component() {
         let obs = PrometheusObserver::new();
         obs.record_event(&ObserverEvent::Error {
-            component: "provider".into(),
+            component: "model_provider".into(),
             message: "timeout".into(),
         });
         obs.record_event(&ObserverEvent::Error {
-            component: "provider".into(),
+            component: "model_provider".into(),
             message: "rate limit".into(),
         });
         obs.record_event(&ObserverEvent::Error {
@@ -657,7 +663,7 @@ mod tests {
         });
 
         let output = obs.encode();
-        assert!(output.contains(r#"zeroclaw_errors_total{component="provider"} 2"#));
+        assert!(output.contains(r#"zeroclaw_errors_total{component="model_provider"} 2"#));
         assert!(output.contains(r#"zeroclaw_errors_total{component="channels"} 1"#));
     }
 
@@ -676,7 +682,7 @@ mod tests {
         let obs = PrometheusObserver::new();
 
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(200),
             success: true,
@@ -685,7 +691,7 @@ mod tests {
             output_tokens: Some(50),
         });
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(300),
             success: true,
@@ -696,13 +702,13 @@ mod tests {
 
         let output = obs.encode();
         assert!(output.contains(
-            r#"zeroclaw_llm_requests_total{model="claude-sonnet",provider="openrouter",success="true"} 2"#
+            r#"zeroclaw_llm_requests_total{model="claude-sonnet",model_provider="openrouter",success="true"} 2"#
         ));
         assert!(output.contains(
-            r#"zeroclaw_tokens_input_total{model="claude-sonnet",provider="openrouter"} 300"#
+            r#"zeroclaw_tokens_input_total{model="claude-sonnet",model_provider="openrouter"} 300"#
         ));
         assert!(output.contains(
-            r#"zeroclaw_tokens_output_total{model="claude-sonnet",provider="openrouter"} 130"#
+            r#"zeroclaw_tokens_output_total{model="claude-sonnet",model_provider="openrouter"} 130"#
         ));
     }
 
@@ -766,7 +772,7 @@ mod tests {
         let obs = PrometheusObserver::new();
 
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "ollama".into(),
+            model_provider: "ollama".into(),
             model: "llama3".into(),
             duration: Duration::from_millis(100),
             success: false,
@@ -777,7 +783,7 @@ mod tests {
 
         let output = obs.encode();
         assert!(output.contains(
-            r#"zeroclaw_llm_requests_total{model="llama3",provider="ollama",success="false"} 1"#
+            r#"zeroclaw_llm_requests_total{model="llama3",model_provider="ollama",success="false"} 1"#
         ));
         // Token counters should not appear (no data recorded)
         assert!(!output.contains("zeroclaw_tokens_input_total{"));

@@ -1,4 +1,4 @@
-use super::Provider;
+use super::ModelProvider;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
@@ -27,46 +27,46 @@ fn score_model(pricing: &HashMap<String, f64>, model: &str) -> Option<f64> {
     matched.then_some(total)
 }
 
-/// A single route: maps a task hint to a provider + model combo.
+/// A single route: maps a task hint to a model_provider + model combo.
 #[derive(Debug, Clone)]
 pub struct Route {
     pub provider_name: String,
     pub model: String,
 }
 
-/// Multi-model router — routes requests to different provider+model combos
+/// Multi-model router — routes requests to different model_provider+model combos
 /// based on a task hint encoded in the model parameter.
 ///
 /// The model parameter can be:
-/// - A regular model name (e.g. "anthropic/claude-sonnet-4") → uses default provider
+/// - A regular model name (e.g. "anthropic/claude-sonnet-4") → uses default model_provider
 /// - A hint-prefixed string (e.g. "hint:reasoning") → resolves via route table
 ///
-/// This wraps multiple pre-created providers and selects the right one per request.
-pub struct RouterProvider {
+/// This wraps multiple pre-created model_providers and selects the right one per request.
+pub struct RouterModelProvider {
     routes: HashMap<String, (usize, String)>, // hint → (provider_index, model)
-    providers: Vec<(String, Box<dyn Provider>)>,
+    model_providers: Vec<(String, Box<dyn ModelProvider>)>,
     default_index: usize,
     default_model: String,
 }
 
-impl RouterProvider {
-    /// Create a new router with a default provider and optional routes.
+impl RouterModelProvider {
+    /// Create a new router with a default model_provider and optional routes.
     ///
-    /// `providers` is a list of (name, provider) pairs. The first one is the default.
+    /// `model_providers` is a list of (name, model_provider) pairs. The first one is the default.
     /// `routes` maps hint names to Route structs containing provider_name and model.
     pub fn new(
-        providers: Vec<(String, Box<dyn Provider>)>,
+        model_providers: Vec<(String, Box<dyn ModelProvider>)>,
         routes: Vec<(String, Route)>,
         default_model: String,
     ) -> Self {
-        // Build provider name → index lookup
-        let name_to_index: HashMap<&str, usize> = providers
+        // Build model_provider name → index lookup
+        let name_to_index: HashMap<&str, usize> = model_providers
             .iter()
             .enumerate()
             .map(|(i, (name, _))| (name.as_str(), i))
             .collect();
 
-        // Resolve routes to provider indices
+        // Resolve routes to model_provider indices
         let resolved_routes: HashMap<String, (usize, String)> = routes
             .into_iter()
             .filter_map(|(hint, route)| {
@@ -76,8 +76,8 @@ impl RouterProvider {
                     None => {
                         tracing::warn!(
                             hint = hint,
-                            provider = route.provider_name,
-                            "Route references unknown provider, skipping"
+                            model_provider = route.provider_name,
+                            "Route references unknown model_provider, skipping"
                         );
                         None
                     }
@@ -87,7 +87,7 @@ impl RouterProvider {
 
         Self {
             routes: resolved_routes,
-            providers,
+            model_providers,
             default_index: 0,
             default_model,
         }
@@ -119,16 +119,16 @@ impl RouterProvider {
 
         for (idx, route_model) in self.routes.values() {
             // Capability filtering
-            if let Some((_, provider)) = self.providers.get(*idx) {
-                if required_vision && !provider.supports_vision() {
+            if let Some((_, model_provider)) = self.model_providers.get(*idx) {
+                if required_vision && !model_provider.supports_vision() {
                     continue;
                 }
-                if required_tools && !provider.supports_native_tools() {
+                if required_tools && !model_provider.supports_native_tools() {
                     continue;
                 }
             }
 
-            let Some((model_provider_name, _)) = self.providers.get(*idx) else {
+            let Some((model_provider_name, _)) = self.model_providers.get(*idx) else {
                 continue;
             };
             if let Some(pricing) = model_provider_pricing.get(model_provider_name)
@@ -153,10 +153,10 @@ impl RouterProvider {
         (self.default_index, self.default_model.clone())
     }
 
-    /// Resolve a model parameter to a (provider, actual_model) pair.
+    /// Resolve a model parameter to a (model_provider, actual_model) pair.
     ///
     /// If the model starts with "hint:", look up the hint in the route table.
-    /// Otherwise, use the default provider with the given model name.
+    /// Otherwise, use the default model_provider with the given model name.
     /// Resolve a model parameter to a (provider_index, actual_model) pair.
     fn resolve(&self, model: &str) -> (usize, String) {
         if let Some(hint) = model.strip_prefix("hint:") {
@@ -165,25 +165,25 @@ impl RouterProvider {
             }
             tracing::warn!(
                 hint = hint,
-                "Unknown route hint, falling back to default provider"
+                "Unknown route hint, falling back to default model_provider"
             );
         }
 
-        // Not a hint or hint not found — use default provider with the model as-is
+        // Not a hint or hint not found — use default model_provider with the model as-is
         (self.default_index, model.to_string())
     }
 }
 
 /// A cost-optimized routing strategy that selects the cheapest qualifying
-/// provider from the route table based on per-provider pricing maps.
+/// model_provider from the route table based on per-model_provider pricing maps.
 ///
-/// Pricing is keyed by provider name (the alias under
-/// `[providers.models.<provider>.<alias>]`); each provider's pricing map
+/// Pricing is keyed by model_provider name (the alias under
+/// `[providers.models.<model_provider>.<alias>]`); each model_provider's pricing map
 /// holds user-defined keys (model identifiers, optionally suffixed with
 /// `.input` / `.output`) mapped to USD-per-1M-token rates.
 #[derive(Debug, Clone)]
 pub struct CostOptimizedStrategy {
-    /// Per-provider pricing data (provider name → user-keyed pricing map).
+    /// Per-model_provider pricing data (model_provider name → user-keyed pricing map).
     pub model_provider_pricing: HashMap<String, HashMap<String, f64>>,
     /// Whether the request requires vision support.
     pub required_vision: bool,
@@ -192,7 +192,7 @@ pub struct CostOptimizedStrategy {
 }
 
 impl CostOptimizedStrategy {
-    /// Create a new cost-optimized strategy with the given per-provider
+    /// Create a new cost-optimized strategy with the given per-model_provider
     /// pricing data.
     pub fn new(model_provider_pricing: HashMap<String, HashMap<String, f64>>) -> Self {
         Self {
@@ -223,7 +223,7 @@ impl CostOptimizedStrategy {
 }
 
 #[async_trait]
-impl Provider for RouterProvider {
+impl ModelProvider for RouterModelProvider {
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -233,14 +233,14 @@ impl Provider for RouterProvider {
     ) -> anyhow::Result<String> {
         let (provider_idx, resolved_model) = self.resolve(model);
 
-        let (provider_name, provider) = &self.providers[provider_idx];
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
         tracing::info!(
-            provider = provider_name.as_str(),
+            model_provider = provider_name.as_str(),
             model = resolved_model.as_str(),
             "Router dispatching request"
         );
 
-        provider
+        model_provider
             .chat_with_system(system_prompt, message, &resolved_model, temperature)
             .await
     }
@@ -252,8 +252,8 @@ impl Provider for RouterProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, provider) = &self.providers[provider_idx];
-        provider
+        let (_, model_provider) = &self.model_providers[provider_idx];
+        model_provider
             .chat_with_history(messages, &resolved_model, temperature)
             .await
     }
@@ -265,8 +265,10 @@ impl Provider for RouterProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, provider) = &self.providers[provider_idx];
-        provider.chat(request, &resolved_model, temperature).await
+        let (_, model_provider) = &self.model_providers[provider_idx];
+        model_provider
+            .chat(request, &resolved_model, temperature)
+            .await
     }
 
     async fn chat_with_tools(
@@ -277,29 +279,29 @@ impl Provider for RouterProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, provider) = &self.providers[provider_idx];
-        provider
+        let (_, model_provider) = &self.model_providers[provider_idx];
+        model_provider
             .chat_with_tools(messages, tools, &resolved_model, temperature)
             .await
     }
 
     fn supports_native_tools(&self) -> bool {
-        self.providers
+        self.model_providers
             .get(self.default_index)
             .map(|(_, p)| p.supports_native_tools())
             .unwrap_or(false)
     }
 
     fn supports_streaming(&self) -> bool {
-        self.providers
+        self.model_providers
             .iter()
-            .any(|(_, provider)| provider.supports_streaming())
+            .any(|(_, model_provider)| model_provider.supports_streaming())
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
-        self.providers
+        self.model_providers
             .iter()
-            .any(|(_, provider)| provider.supports_streaming_tool_events())
+            .any(|(_, model_provider)| model_provider.supports_streaming_tool_events())
     }
 
     fn stream_chat_with_history(
@@ -310,8 +312,8 @@ impl Provider for RouterProvider {
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, provider) = &self.providers[provider_idx];
-        provider.stream_chat_with_history(messages, &resolved_model, temperature, options)
+        let (_, model_provider) = &self.model_providers[provider_idx];
+        model_provider.stream_chat_with_history(messages, &resolved_model, temperature, options)
     }
 
     fn stream_chat(
@@ -322,21 +324,21 @@ impl Provider for RouterProvider {
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, provider) = &self.providers[provider_idx];
-        provider.stream_chat(request, &resolved_model, temperature, options)
+        let (_, model_provider) = &self.model_providers[provider_idx];
+        model_provider.stream_chat(request, &resolved_model, temperature, options)
     }
 
     fn supports_vision(&self) -> bool {
-        self.providers
+        self.model_providers
             .iter()
-            .any(|(_, provider)| provider.supports_vision())
+            .any(|(_, model_provider)| model_provider.supports_vision())
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        for (name, provider) in &self.providers {
-            tracing::info!(provider = name, "Warming up routed provider");
-            if let Err(e) = provider.warmup().await {
-                tracing::warn!(provider = name, "Warmup failed (non-fatal): {e}");
+        for (name, model_provider) in &self.model_providers {
+            tracing::info!(model_provider = name, "Warming up routed model_provider");
+            if let Err(e) = model_provider.warmup().await {
+                tracing::warn!(model_provider = name, "Warmup failed (non-fatal): {e}");
             }
         }
         Ok(())
@@ -351,13 +353,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_api::tool::ToolSpec;
 
-    struct MockProvider {
+    struct MockModelProvider {
         calls: Arc<AtomicUsize>,
         response: &'static str,
         last_model: parking_lot::Mutex<String>,
     }
 
-    impl MockProvider {
+    impl MockModelProvider {
         fn new(response: &'static str) -> Self {
             Self {
                 calls: Arc::new(AtomicUsize::new(0)),
@@ -376,7 +378,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for MockProvider {
+    impl ModelProvider for MockModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -391,21 +393,21 @@ mod tests {
     }
 
     fn make_router(
-        providers: Vec<(&'static str, &'static str)>,
+        model_providers: Vec<(&'static str, &'static str)>,
         routes: Vec<(&str, &str, &str)>,
-    ) -> (RouterProvider, Vec<Arc<MockProvider>>) {
-        let mocks: Vec<Arc<MockProvider>> = providers
+    ) -> (RouterModelProvider, Vec<Arc<MockModelProvider>>) {
+        let mocks: Vec<Arc<MockModelProvider>> = model_providers
             .iter()
-            .map(|(_, response)| Arc::new(MockProvider::new(response)))
+            .map(|(_, response)| Arc::new(MockModelProvider::new(response)))
             .collect();
 
-        let provider_list: Vec<(String, Box<dyn Provider>)> = providers
+        let provider_list: Vec<(String, Box<dyn ModelProvider>)> = model_providers
             .iter()
             .zip(mocks.iter())
             .map(|((name, _), mock)| {
                 (
                     (*name).to_string(),
-                    Box::new(Arc::clone(mock)) as Box<dyn Provider>,
+                    Box::new(Arc::clone(mock)) as Box<dyn ModelProvider>,
                 )
             })
             .collect();
@@ -423,20 +425,21 @@ mod tests {
             })
             .collect();
 
-        let router = RouterProvider::new(provider_list, route_list, "default-model".to_string());
+        let router =
+            RouterModelProvider::new(provider_list, route_list, "default-model".to_string());
 
         (router, mocks)
     }
 
-    // Arc<MockProvider> Provider impl provided by blanket impl in zeroclaw-types.
+    // Arc<MockModelProvider> ModelProvider impl provided by blanket impl in zeroclaw-types.
 
-    struct StreamingMockProvider {
+    struct StreamingMockModelProvider {
         stream_calls: Arc<AtomicUsize>,
         last_stream_model: parking_lot::Mutex<String>,
         response: &'static str,
     }
 
-    impl StreamingMockProvider {
+    impl StreamingMockModelProvider {
         fn new(response: &'static str) -> Self {
             Self {
                 stream_calls: Arc::new(AtomicUsize::new(0)),
@@ -447,7 +450,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for StreamingMockProvider {
+    impl ModelProvider for StreamingMockModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -479,15 +482,15 @@ mod tests {
         }
     }
 
-    // Arc<StreamingMockProvider> Provider impl provided by blanket impl in zeroclaw-types.
+    // Arc<StreamingMockModelProvider> ModelProvider impl provided by blanket impl in zeroclaw-types.
 
-    struct ToolEventStreamingMockProvider {
+    struct ToolEventStreamingMockModelProvider {
         stream_calls: Arc<AtomicUsize>,
         tool_event_calls: Arc<AtomicUsize>,
         last_stream_model: parking_lot::Mutex<String>,
     }
 
-    impl ToolEventStreamingMockProvider {
+    impl ToolEventStreamingMockModelProvider {
         fn new() -> Self {
             Self {
                 stream_calls: Arc::new(AtomicUsize::new(0)),
@@ -498,7 +501,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for ToolEventStreamingMockProvider {
+    impl ModelProvider for ToolEventStreamingMockModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -542,7 +545,7 @@ mod tests {
         }
     }
 
-    // Arc<ToolEventStreamingMockProvider> Provider impl provided by blanket impl in zeroclaw-types.
+    // Arc<ToolEventStreamingMockModelProvider> ModelProvider impl provided by blanket impl in zeroclaw-types.
 
     #[tokio::test]
     async fn routes_hint_to_correct_provider() {
@@ -658,11 +661,11 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_system_passes_system_prompt() {
-        let mock = Arc::new(MockProvider::new("response"));
-        let router = RouterProvider::new(
+        let mock = Arc::new(MockModelProvider::new("response"));
+        let router = RouterModelProvider::new(
             vec![(
                 "default".into(),
-                Box::new(Arc::clone(&mock)) as Box<dyn Provider>,
+                Box::new(Arc::clone(&mock)) as Box<dyn ModelProvider>,
             )],
             vec![],
             "model".into(),
@@ -678,11 +681,11 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_delegates_to_resolved_provider() {
-        let mock = Arc::new(MockProvider::new("tool-response"));
-        let router = RouterProvider::new(
+        let mock = Arc::new(MockModelProvider::new("tool-response"));
+        let router = RouterModelProvider::new(
             vec![(
                 "default".into(),
-                Box::new(Arc::clone(&mock)) as Box<dyn Provider>,
+                Box::new(Arc::clone(&mock)) as Box<dyn ModelProvider>,
             )],
             vec![],
             "model".into(),
@@ -702,7 +705,7 @@ mod tests {
         })];
 
         // chat_with_tools should delegate through the router to the mock.
-        // MockProvider's default chat_with_tools calls chat_with_history -> chat_with_system.
+        // MockModelProvider's default chat_with_tools calls chat_with_history -> chat_with_system.
         let result = router
             .chat_with_tools(&messages, &tools, "model", Some(0.7))
             .await
@@ -739,14 +742,14 @@ mod tests {
 
     use crate::traits::ProviderCapabilities;
 
-    /// Mock provider with configurable capability flags.
-    struct CapableMockProvider {
+    /// Mock model_provider with configurable capability flags.
+    struct CapableMockModelProvider {
         response: &'static str,
         vision: bool,
         tools: bool,
     }
 
-    impl CapableMockProvider {
+    impl CapableMockModelProvider {
         fn new(response: &'static str, vision: bool, tools: bool) -> Self {
             Self {
                 response,
@@ -757,7 +760,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for CapableMockProvider {
+    impl ModelProvider for CapableMockModelProvider {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 native_tool_calling: self.tools,
@@ -777,12 +780,12 @@ mod tests {
         }
     }
 
-    /// Build a per-model-provider pricing map for tests. Each tuple is
+    /// Build a per-model-model_provider pricing map for tests. Each tuple is
     /// `(provider_name, model, input_per_mtok, output_per_mtok)`.
     fn make_pricing(entries: Vec<(&str, &str, f64, f64)>) -> HashMap<String, HashMap<String, f64>> {
         let mut map: HashMap<String, HashMap<String, f64>> = HashMap::new();
-        for (provider, model, input, output) in entries {
-            let inner = map.entry(provider.to_string()).or_default();
+        for (model_provider, model, input, output) in entries {
+            let inner = map.entry(model_provider.to_string()).or_default();
             inner.insert(format!("{model}.input"), input);
             inner.insert(format!("{model}.output"), output);
         }
@@ -791,14 +794,14 @@ mod tests {
 
     #[test]
     fn cost_optimized_selects_cheapest_provider() {
-        let providers: Vec<(String, Box<dyn Provider>)> = vec![
+        let model_providers: Vec<(String, Box<dyn ModelProvider>)> = vec![
             (
                 "expensive".into(),
-                Box::new(CapableMockProvider::new("exp", false, false)),
+                Box::new(CapableMockModelProvider::new("exp", false, false)),
             ),
             (
                 "cheap".into(),
-                Box::new(CapableMockProvider::new("chp", false, false)),
+                Box::new(CapableMockModelProvider::new("chp", false, false)),
             ),
         ];
         let routes = vec![
@@ -817,7 +820,7 @@ mod tests {
                 },
             ),
         ];
-        let router = RouterProvider::new(providers, routes, "default-model".into());
+        let router = RouterModelProvider::new(model_providers, routes, "default-model".into());
 
         let prices = make_pricing(vec![
             ("expensive", "big-model", 15.0, 75.0),
@@ -832,14 +835,14 @@ mod tests {
 
     #[test]
     fn cost_optimized_respects_vision_requirement() {
-        let providers: Vec<(String, Box<dyn Provider>)> = vec![
+        let model_providers: Vec<(String, Box<dyn ModelProvider>)> = vec![
             (
                 "no-vision".into(),
-                Box::new(CapableMockProvider::new("nv", false, false)),
+                Box::new(CapableMockModelProvider::new("nv", false, false)),
             ),
             (
                 "has-vision".into(),
-                Box::new(CapableMockProvider::new("hv", true, false)),
+                Box::new(CapableMockModelProvider::new("hv", true, false)),
             ),
         ];
         let routes = vec![
@@ -858,7 +861,7 @@ mod tests {
                 },
             ),
         ];
-        let router = RouterProvider::new(providers, routes, "default-model".into());
+        let router = RouterModelProvider::new(model_providers, routes, "default-model".into());
 
         let prices = make_pricing(vec![
             ("no-vision", "cheap-model", 0.10, 0.40),
@@ -872,14 +875,14 @@ mod tests {
 
     #[test]
     fn cost_optimized_respects_tools_requirement() {
-        let providers: Vec<(String, Box<dyn Provider>)> = vec![
+        let model_providers: Vec<(String, Box<dyn ModelProvider>)> = vec![
             (
                 "no-tools".into(),
-                Box::new(CapableMockProvider::new("nt", false, false)),
+                Box::new(CapableMockModelProvider::new("nt", false, false)),
             ),
             (
                 "has-tools".into(),
-                Box::new(CapableMockProvider::new("ht", false, true)),
+                Box::new(CapableMockModelProvider::new("ht", false, true)),
             ),
         ];
         let routes = vec![
@@ -898,7 +901,7 @@ mod tests {
                 },
             ),
         ];
-        let router = RouterProvider::new(providers, routes, "default-model".into());
+        let router = RouterModelProvider::new(model_providers, routes, "default-model".into());
 
         let prices = make_pricing(vec![
             ("no-tools", "basic-model", 0.10, 0.40),
@@ -927,9 +930,9 @@ mod tests {
 
     #[test]
     fn cost_optimized_with_single_route() {
-        let providers: Vec<(String, Box<dyn Provider>)> = vec![(
+        let model_providers: Vec<(String, Box<dyn ModelProvider>)> = vec![(
             "only".into(),
-            Box::new(CapableMockProvider::new("ok", false, false)),
+            Box::new(CapableMockModelProvider::new("ok", false, false)),
         )];
         let routes = vec![(
             "single".to_string(),
@@ -938,7 +941,7 @@ mod tests {
                 model: "the-model".into(),
             },
         )];
-        let router = RouterProvider::new(providers, routes, "default-model".into());
+        let router = RouterModelProvider::new(model_providers, routes, "default-model".into());
 
         let prices = make_pricing(vec![("only", "the-model", 1.0, 2.0)]);
 
@@ -949,18 +952,18 @@ mod tests {
 
     #[test]
     fn cost_optimized_prefers_lower_total_cost() {
-        let providers: Vec<(String, Box<dyn Provider>)> = vec![
+        let model_providers: Vec<(String, Box<dyn ModelProvider>)> = vec![
             (
                 "p1".into(),
-                Box::new(CapableMockProvider::new("r1", false, false)),
+                Box::new(CapableMockModelProvider::new("r1", false, false)),
             ),
             (
                 "p2".into(),
-                Box::new(CapableMockProvider::new("r2", false, false)),
+                Box::new(CapableMockModelProvider::new("r2", false, false)),
             ),
             (
                 "p3".into(),
-                Box::new(CapableMockProvider::new("r3", false, false)),
+                Box::new(CapableMockModelProvider::new("r3", false, false)),
             ),
         ];
         let routes = vec![
@@ -986,7 +989,7 @@ mod tests {
                 },
             ),
         ];
-        let router = RouterProvider::new(providers, routes, "default-model".into());
+        let router = RouterModelProvider::new(model_providers, routes, "default-model".into());
 
         let prices = make_pricing(vec![
             ("p1", "model-a", 10.0, 50.0), // total: 60
@@ -1003,38 +1006,47 @@ mod tests {
     #[test]
     fn cost_optimized_strategy_score() {
         let prices = make_pricing(vec![
-            ("cheap-provider", "cheap-model", 0.10, 0.40),
-            ("expensive-provider", "expensive-model", 15.0, 75.0),
+            ("cheap-model_provider", "cheap-model", 0.10, 0.40),
+            ("expensive-model_provider", "expensive-model", 15.0, 75.0),
         ]);
         let strategy = CostOptimizedStrategy::new(prices);
 
         assert!(
-            (strategy.score("cheap-provider", "cheap-model").unwrap() - 0.50).abs() < f64::EPSILON
+            (strategy
+                .score("cheap-model_provider", "cheap-model")
+                .unwrap()
+                - 0.50)
+                .abs()
+                < f64::EPSILON
         );
         assert!(
             (strategy
-                .score("expensive-provider", "expensive-model")
+                .score("expensive-model_provider", "expensive-model")
                 .unwrap()
                 - 90.0)
                 .abs()
                 < f64::EPSILON
         );
-        assert!(strategy.score("cheap-provider", "unknown").is_none());
-        assert!(strategy.score("unknown-provider", "cheap-model").is_none());
+        assert!(strategy.score("cheap-model_provider", "unknown").is_none());
+        assert!(
+            strategy
+                .score("unknown-model_provider", "cheap-model")
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn supports_streaming_returns_true_when_any_provider_supports_it() {
-        let streaming = Arc::new(StreamingMockProvider::new("stream"));
-        let router = RouterProvider::new(
+        let streaming = Arc::new(StreamingMockModelProvider::new("stream"));
+        let router = RouterModelProvider::new(
             vec![
                 (
                     "default".into(),
-                    Box::new(MockProvider::new("default")) as Box<dyn Provider>,
+                    Box::new(MockModelProvider::new("default")) as Box<dyn ModelProvider>,
                 ),
                 (
                     "streaming".into(),
-                    Box::new(Arc::clone(&streaming)) as Box<dyn Provider>,
+                    Box::new(Arc::clone(&streaming)) as Box<dyn ModelProvider>,
                 ),
             ],
             vec![(
@@ -1052,16 +1064,16 @@ mod tests {
 
     #[tokio::test]
     async fn stream_chat_with_history_routes_hint_to_correct_provider_and_model() {
-        let streaming = Arc::new(StreamingMockProvider::new("streamed response"));
-        let router = RouterProvider::new(
+        let streaming = Arc::new(StreamingMockModelProvider::new("streamed response"));
+        let router = RouterModelProvider::new(
             vec![
                 (
                     "default".into(),
-                    Box::new(MockProvider::new("default")) as Box<dyn Provider>,
+                    Box::new(MockModelProvider::new("default")) as Box<dyn ModelProvider>,
                 ),
                 (
                     "streaming".into(),
-                    Box::new(Arc::clone(&streaming)) as Box<dyn Provider>,
+                    Box::new(Arc::clone(&streaming)) as Box<dyn ModelProvider>,
                 ),
             ],
             vec![(
@@ -1095,16 +1107,16 @@ mod tests {
 
     #[tokio::test]
     async fn stream_chat_routes_hint_with_structured_tool_events() {
-        let streaming = Arc::new(ToolEventStreamingMockProvider::new());
-        let router = RouterProvider::new(
+        let streaming = Arc::new(ToolEventStreamingMockModelProvider::new());
+        let router = RouterModelProvider::new(
             vec![
                 (
                     "default".into(),
-                    Box::new(MockProvider::new("default")) as Box<dyn Provider>,
+                    Box::new(MockModelProvider::new("default")) as Box<dyn ModelProvider>,
                 ),
                 (
                     "streaming".into(),
-                    Box::new(Arc::clone(&streaming)) as Box<dyn Provider>,
+                    Box::new(Arc::clone(&streaming)) as Box<dyn ModelProvider>,
                 ),
             ],
             vec![(
