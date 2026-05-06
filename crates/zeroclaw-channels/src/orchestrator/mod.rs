@@ -39,6 +39,7 @@ pub use crate::lark::LarkChannel;
 #[cfg(feature = "channel-line")]
 pub use crate::line::LineChannel;
 pub use crate::linq::LinqChannel;
+pub use crate::mastodon::MastodonChannel;
 pub use crate::mattermost::MattermostChannel;
 pub use crate::mochat::MochatChannel;
 pub use crate::nextcloud_talk::NextcloudTalkChannel;
@@ -4538,6 +4539,21 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 mc.poll_interval_secs,
             )))
         }
+        "mastodon" => {
+            let m = config
+                .channels
+                .mastodon
+                .as_ref()
+                .context("Mastodon channel is not configured")?;
+            Ok(Arc::new(MastodonChannel::new(
+                m.instance_url.clone(),
+                m.access_token.clone(),
+                m.allowed_users.clone(),
+                m.mention_only,
+                m.visibility,
+                m.poll_interval_secs,
+            )))
+        }
         "discord_history" | "discord-history" => {
             let dh = config
                 .channels
@@ -5280,6 +5296,22 @@ fn collect_configured_channels(
             channel: Arc::new(BlueskyChannel::new(
                 bs.handle.clone(),
                 bs.app_password.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref m) = config.channels.mastodon
+        && m.enabled
+    {
+        channels.push(ConfiguredChannel {
+            display_name: "Mastodon",
+            channel: Arc::new(MastodonChannel::new(
+                m.instance_url.clone(),
+                m.access_token.clone(),
+                m.allowed_users.clone(),
+                m.mention_only,
+                m.visibility,
+                m.poll_interval_secs,
             )),
         });
     }

@@ -36,6 +36,8 @@ pub mod lark;
 pub mod line;
 #[cfg(feature = "channel-linq")]
 pub mod linq;
+#[cfg(feature = "channel-mastodon")]
+pub mod mastodon;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 #[cfg(feature = "channel-mattermost")]
