@@ -405,11 +405,13 @@ struct AccountData {
     saved_at: Option<String>,
 }
 
-/// Persistent sync cursor.
+/// Persistent sync cursor and context tokens.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct SyncData {
     #[serde(default)]
     get_updates_buf: String,
+    #[serde(default)]
+    context_tokens: HashMap<String, String>,
 }
 
 /// Write bytes to a file with owner-only permissions (0o600) on Unix.
@@ -644,10 +646,18 @@ impl WeChatChannel {
         let sync_path = self.state_dir.join("sync.json");
         if let Ok(data) = std::fs::read_to_string(&sync_path)
             && let Ok(sync) = serde_json::from_str::<SyncData>(&data)
-            && !sync.get_updates_buf.is_empty()
         {
-            *self.cursor.lock() = sync.get_updates_buf;
-            tracing::info!("WeChat: loaded persisted sync cursor");
+            if !sync.get_updates_buf.is_empty() {
+                *self.cursor.lock() = sync.get_updates_buf;
+                tracing::info!("WeChat: loaded persisted sync cursor");
+            }
+            if !sync.context_tokens.is_empty() {
+                *self.context_tokens.lock() = sync.context_tokens;
+                tracing::info!(
+                    "WeChat: loaded {} persisted context tokens",
+                    self.context_tokens.lock().len()
+                );
+            }
         }
     }
 
@@ -681,8 +691,32 @@ impl WeChatChannel {
             tracing::warn!("WeChat: failed to create state dir: {e}");
             return;
         }
+        let context_tokens = self.context_tokens.lock().clone();
         let data = SyncData {
             get_updates_buf: cursor.to_string(),
+            context_tokens,
+        };
+        let path = self.state_dir.join("sync.json");
+        match serde_json::to_string(&data) {
+            Ok(json) => {
+                if let Err(e) = write_private(&path, json.as_bytes()) {
+                    tracing::warn!("WeChat: failed to write sync data: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("WeChat: failed to serialize sync data: {e}"),
+        }
+    }
+
+    fn save_sync_data(&self) {
+        if let Err(e) = std::fs::create_dir_all(&self.state_dir) {
+            tracing::warn!("WeChat: failed to create state dir: {e}");
+            return;
+        }
+        let cursor = self.cursor.lock().clone();
+        let context_tokens = self.context_tokens.lock().clone();
+        let data = SyncData {
+            get_updates_buf: cursor,
+            context_tokens,
         };
         let path = self.state_dir.join("sync.json");
         match serde_json::to_string(&data) {
@@ -707,6 +741,7 @@ impl WeChatChannel {
         self.context_tokens
             .lock()
             .insert(user_id.to_string(), token.to_string());
+        self.save_sync_data();
     }
 
     fn get_context_token(&self, user_id: &str) -> Option<String> {
@@ -1779,10 +1814,12 @@ impl Channel for WeChatChannel {
                         "WeChat: session expired (errcode {SESSION_EXPIRED_ERRCODE}), pausing for {} min",
                         SESSION_PAUSE_DURATION.as_secs() / 60
                     );
-                    // Clear token so we re-login after pause
+                    // Clear token and context_tokens so we re-login after pause
                     if let Ok(mut t) = self.bot_token.write() {
                         *t = None;
                     }
+                    self.context_tokens.lock().clear();
+                    self.save_sync_data();
                     tokio::time::sleep(SESSION_PAUSE_DURATION).await;
                     // Try to re-login
                     if let Err(e) = self.ensure_logged_in().await {
