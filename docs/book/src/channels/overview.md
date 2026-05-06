@@ -6,84 +6,90 @@ Channels are implementations of the `Channel` trait in `zeroclaw-api`. Each one 
 
 ## Categories
 
+> **Feature gating note.** The schema compiles every channel's `*Config` struct unconditionally except `NostrConfig` (`#[cfg(feature = "channel-nostr")]`) and `VoiceWakeConfig` (`#[cfg(feature = "voice-wake")]`). The runtime channel implementations in `zeroclaw-channels` are separately gated by per-channel Cargo features at build time — see that crate's `Cargo.toml` for the canonical list. The tables below describe the schema surface; runtime build flags are a parallel concern.
+
 ### Chat platforms
 
 Real-time messaging where the agent can hold a conversation, get notified of new messages via push or long-poll, and reply as a bot user.
 
-| Channel | Feature flag | Dedicated guide |
-|---|---|---|
-| Matrix | `channel-matrix` | [Matrix](./matrix.md) |
-| Mattermost | `channel-mattermost` | [Mattermost](./mattermost.md) |
-| LINE | `channel-line` | [LINE](./line.md) |
-| Nextcloud Talk | `channel-nextcloud-talk` | [Nextcloud Talk](./nextcloud-talk.md) |
-| Discord, Slack, Telegram, Signal, iMessage, WeCom, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
+| Channel | Dedicated guide |
+|---|---|
+| Matrix | [Matrix](./matrix.md) |
+| Mattermost | [Mattermost](./mattermost.md) |
+| LINE | [LINE](./line.md) |
+| Nextcloud Talk | [Nextcloud Talk](./nextcloud-talk.md) |
+| Discord, Slack, Telegram, Signal, iMessage, WeCom, DingTalk, Lark / Feishu, QQ, IRC, Mochat, Notion | [Other chat platforms](./chat-others.md) |
 
 ### Social & broadcast
 
 One-to-many or public-feed integrations.
 
-| Channel | Feature flag | Protocol / service |
-|---|---|---|
-| Bluesky | `channel-bluesky` | AT Protocol |
-| Nostr | `channel-nostr` | NIP-01 relays |
-| Twitter / X | `channel-twitter` | API v2 |
-| Reddit | `channel-reddit` | JSON API |
+| Channel | Protocol / service |
+|---|---|
+| Bluesky | AT Protocol |
+| Nostr | NIP-01 relays (schema-gated by `channel-nostr`) |
+| Twitter / X | API v2 (OAuth 2.0 Bearer Token) |
+| Reddit | OAuth 2.0 |
 
 See [Social channels](./social.md).
 
 ### Email
 
-| Channel | Feature flag | Notes |
-|---|---|---|
-| IMAP / SMTP | `channel-email` | Classic poll-based inbox |
-| Gmail Push | `channel-gmail-push` | Google Pub/Sub push notifications — real-time, no polling |
+| Channel | Notes |
+|---|---|
+| IMAP / SMTP | IDLE-first delivery, polling fallback when the server doesn't advertise IDLE |
+| Gmail Push | Google Pub/Sub push notifications — real-time, no polling |
 
 See [Email](./email.md).
 
 ### Voice & telephony
 
-| Channel | Feature flag | Service |
-|---|---|---|
-| ClawdTalk | `channel-clawdtalk` | Telnyx SIP real-time voice |
-| Voice Call | `channel-voice-call` | Twilio / Telnyx / Plivo |
-| Voice Wake | `channel-voice-wake` | Local wake-word detection |
-| TTS | `channel-tts` | Outbound speech synthesis (OpenAI, ElevenLabs, Google Cloud, Edge, Piper) |
+| Channel | Service |
+|---|---|
+| ClawdTalk | Telnyx SIP real-time voice |
+| Voice Call | Twilio / Telnyx / Plivo |
+| Voice Wake | Local wake-word detection (schema-gated by `voice-wake`) |
+| TTS | Outbound speech synthesis (OpenAI, ElevenLabs, Google Cloud, Edge, Piper) — top-level `[tts]`, not a `[channels.*]` block |
 
 See [Voice & telephony](./voice.md).
 
 ### Webhooks & programmatic
 
-| Channel | Feature flag | Shape |
-|---|---|---|
-| Webhook | (always on with gateway) | Inbound HTTP → agent |
-| CLI | always on | Local stdin/stdout |
-| Gateway REST/WS | always on | HTTP + WebSocket |
-| ACP (Agent Client Protocol) | (always on with runtime) | JSON-RPC 2.0 over stdio — editor/IDE sessions |
+| Channel | Shape |
+|---|---|
+| Webhook | Inbound HTTP → agent (embedded HTTP server on `port`) |
+| CLI | Local stdin/stdout |
+| Gateway REST/WS | HTTP + WebSocket (the gateway is a separate surface from `[channels.webhook]`) |
+| ACP (Agent Client Protocol) | JSON-RPC 2.0 over stdio — editor/IDE sessions |
 
 See [Webhooks](./webhook.md) and [ACP](./acp.md).
 
 ## Configuration
 
-Every channel is configured under `[channels.<name>]`:
+Every channel is configured under `[channels.<name>]`. The shape is uniform — each `*Config` struct in `crates/zeroclaw-config/src/schema.rs` is mapped to a TOML table:
 
 ```toml
-[channels.discord]
+[channels.<name>]
 enabled = true
-bot_token = "..."
-allowed_users = ["123456789012345678"]
-reply_to_mentions_only = false
+# channel-specific fields follow
 ```
 
-Channel-specific options live under the same block. Common keys across channels:
+For the canonical example for any specific channel, jump to its dedicated page (Matrix, Mattermost, LINE, Nextcloud Talk, Webhook, Email, Voice, Social) or to [Other chat platforms](./chat-others.md) for Discord, Slack, Telegram, Signal, iMessage, WeCom, DingTalk, Lark/Feishu, QQ, IRC, Mochat, and Notion.
 
-| Key | What it does |
-|---|---|
-| `enabled` | On/off without removing the section |
-| `allowed_users` | Whitelist — empty means allow all |
-| `allowed_destinations` | Restrict which rooms/channels/threads the bot answers in |
-| `reply_to_mentions_only` | Ignore messages that don't @-mention the bot |
-| `provider` | Override default model for this channel |
-| `draft_update_interval_ms` | Streaming edit cadence (default 500 ms) |
+Common keys recurring across many (but not all) channel schemas:
+
+| Key | What it does | Channels that have it |
+|---|---|---|
+| `enabled` | On/off without removing the section | All |
+| `allowed_users` | Sender allowlist; empty = deny all (some channels also support `"*"` = allow all) | Most chat channels |
+| `mention_only` | Only respond when the bot is @-mentioned | Discord, Slack, Telegram, Matrix, Mattermost, IRC, Lark, Signal-via-policy |
+| `interrupt_on_new_message` | Cancel an in-flight reply when a newer message arrives | Discord, Slack, Telegram, Matrix, Mattermost |
+| `stream_mode` | `"off"` / `"partial"` / `"multi_message"` for progressive replies | Discord, Telegram, Matrix |
+| `draft_update_interval_ms` | Minimum interval between draft edits when streaming | Discord, Slack (default 1200), Telegram, Matrix |
+| `proxy_url` | Per-channel `[proxy]` override (`http://`, `https://`, `socks5://`, `socks5h://`) | Discord, Telegram, Matrix, Mattermost, Slack, DingTalk, QQ, Lark, Nextcloud Talk, Signal |
+| `approval_timeout_secs` | Seconds to wait for operator approval on `always_ask` tools | Discord, Slack, Matrix, Telegram, Signal, Voice Call |
+
+Beyond these, every channel has its own platform-specific fields (auth, room/channel scoping, mode toggles). Don't assume a key applies to every channel — check the dedicated page or the [Config reference](../reference/config.md).
 
 ## Pairing
 

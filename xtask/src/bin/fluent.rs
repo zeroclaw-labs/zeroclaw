@@ -19,7 +19,7 @@ enum Cmd {
         /// Re-translate all entries (quality pass, costs more)
         #[arg(long)]
         force: bool,
-        /// Provider name from [providers.models.<name>] in config.toml (e.g. my-ollama)
+        /// Provider name from `[providers.models.<name>]` in config.toml (e.g. my-ollama)
         #[arg(long)]
         provider: Option<String>,
         /// Entries per API call (default: 50). Lower if the model truncates large JSON responses.

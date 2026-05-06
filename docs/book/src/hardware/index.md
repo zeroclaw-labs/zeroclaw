@@ -72,12 +72,14 @@ Hardware tools can brick things. Real, expensive things.
 - `i2c_write` / `spi_transfer` to device addresses the agent doesn't know can damage sensors.
 - GPIO writes that conflict with external drivers (voltage fights) damage pins.
 
-For production deployments with untrusted channels exposed, disable hardware tools per channel:
+For production deployments with untrusted channels exposed, keep hardware tools off non-CLI channels via the global autonomy config (the schema has no per-channel `tools_deny` field):
 
 ```toml
-[channels.public-discord]
-tools_deny = ["gpio_write", "i2c_write", "spi_transfer", "peripheral_flash"]
+[autonomy]
+non_cli_excluded_tools = ["gpio_write", "i2c_write", "spi_transfer", "peripheral_flash"]
 ```
+
+Tools listed here are omitted from the tool specs sent to the model on every non-CLI channel (Discord, Telegram, Bluesky, etc.). The local CLI still sees them.
 
 ## Datasheets
 

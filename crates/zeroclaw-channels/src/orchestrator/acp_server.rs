@@ -397,7 +397,7 @@ impl AcpServer {
     ///
     /// This is used by the gateway WebSocket bridge, where inbound WebSocket
     /// text messages are already complete JSON-RPC frames and outbound frames
-    /// are supplied by the writer channel passed to [`new_with_writer`].
+    /// are supplied by the writer channel passed to the constructor.
     pub async fn run_messages(self: Arc<Self>, mut input_rx: mpsc::Receiver<String>) -> Result<()> {
         while let Some(line) = input_rx.recv().await {
             let trimmed = line.trim();

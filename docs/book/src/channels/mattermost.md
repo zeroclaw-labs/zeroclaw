@@ -5,24 +5,25 @@ Mattermost integration speaks the native REST API v4. Self-hosted, air-gapped, a
 ## Prerequisites
 
 - **Mattermost server.** Self-hosted or cloud. Admin access to the target team.
-- **Bot account.** Create via **Main Menu → Integrations → Bot Accounts**. Username like `zeroclaw-bot`. Enable `post:all` and `channel:read` (or whichever scopes you want). Save the **access token**.
-- **Channel IDs** to monitor. Click channel header → **View Info** to get each ID.
+- **Bot account.** Create via **Main Menu → Integrations → Bot Accounts**. Username like `zeroclaw-bot`. Enable `post:all` and `channel:read` (or whichever scopes you want). Save the **bot access token**.
+- **Channel ID** (optional) to restrict the bot to a single channel. Click channel header → **View Info** to get the ID.
 
 ## Configuration
 
 ```toml
 [channels.mattermost]
 enabled = true
-server_url = "https://mattermost.example.com"
-access_token = "..."                          # bot account token
-team_id = "..."                               # required when bot has multi-team access
-allowed_channels = ["7j8k9l..."]              # channel IDs
-allowed_users = ["user-id-1", "user-id-2"]    # empty = allow everyone in allowed_channels
-mention_only = false                          # true = only respond when @-mentioned
+url = "https://mattermost.example.com"
+bot_token = "..."                             # bot account token
+channel_id = "7j8k9l..."                      # optional: restrict bot to a single channel
+allowed_users = ["user-id-1", "user-id-2"]    # empty = deny all
 thread_replies = true                         # reply in thread by default
+mention_only = false                          # true = only respond when @-mentioned
+interrupt_on_new_message = false              # cancel in-flight reply when a newer message arrives
+proxy_url = ""                                # optional per-channel proxy override
 ```
 
-Full field reference: [Config](../reference/config.md#channels-mattermost).
+Full field reference: [Config](../reference/config.md#channelsmattermost).
 
 ## Threading
 
@@ -33,13 +34,17 @@ Threading keeps conversations readable in busy channels.
 
 ## Mention-only mode
 
-`mention_only = true` adds a second-stage filter after `allowed_users`:
+`mention_only = true` adds a second-stage filter after `allowed_users` and `channel_id`:
 
 - Messages without `@bot_username` are ignored
 - Messages with the mention are processed
 - The mention token is stripped before passing content to the model
 
 Useful in high-traffic channels to skip all the "hey does anyone" chatter the bot wasn't meant to see.
+
+## Interrupt on new message
+
+When `interrupt_on_new_message = true`, a newer message from the same sender in the same channel cancels the in-flight reply and starts a fresh response with preserved history. Use it when users tend to amend their request mid-flight.
 
 ## File uploads
 
@@ -51,11 +56,7 @@ Outbound file uploads are not yet supported — the agent replies with links or 
 
 - **TLS**: terminate at your reverse proxy; ZeroClaw makes plain HTTPS requests
 - **Webhook vs. WebSocket**: the integration uses WebSocket for inbound real-time events and REST for outbound posts; only the ZeroClaw → Mattermost direction matters for network configuration
-- **Rate limits**: Mattermost self-hosted defaults are generous; the bot's draft-update cadence is capped by `draft_update_interval_ms` (default 500)
-
-## Streaming
-
-Mattermost supports draft updates (edits in place) on streaming replies. Multi-message streaming is not enabled — long replies come as one message, sent on stream completion.
+- **Per-channel proxy**: set `proxy_url` to override the global `[proxy]` setting for Mattermost only (`http://`, `https://`, `socks5://`, `socks5h://`)
 
 ## Security
 
@@ -63,6 +64,6 @@ A Mattermost bot token grants the scopes you configured. Treat it as privileged:
 
 - Store in the encrypted secrets backend, not inline in the config
 - Rotate if leaked (regenerate in the bot account's settings page)
-- Combine with `allowed_users` / `allowed_channels` to limit blast radius even if the token leaks
+- Combine with `allowed_users` and `channel_id` to limit blast radius even if the token leaks
 
 See [Security → Overview](../security/overview.md) for the broader policy model.

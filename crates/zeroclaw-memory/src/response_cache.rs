@@ -264,7 +264,7 @@ impl ResponseCache {
         Ok((count as usize, hits as u64, tokens_saved as u64))
     }
 
-    /// Wipe the entire cache (useful for `zeroclaw cache clear`).
+    /// Wipe the entire response cache.
     pub fn clear(&self) -> Result<usize> {
         self.hot_cache.lock().clear();
         let conn = self.conn.lock();

@@ -27,7 +27,7 @@ enum Cmd {
         /// Re-translate all entries (quality pass, costs more)
         #[arg(long)]
         force: bool,
-        /// Provider name from [providers.models.<name>] in config.toml
+        /// Provider name from `[providers.models.<name>]` in config.toml
         #[arg(long)]
         provider: Option<String>,
         /// Entries per API call (default: 50)

@@ -81,7 +81,7 @@ A blocked tool call doesn't silently fail:
 2. The runtime wraps it as a `ToolResult::Err` and hands it back to the model
 3. The model sees "Error: Shell command blocked by policy: forbidden pattern `rm -rf /`" and can retry, apologise, or ask the user
 
-If a channel is in a restricted tool set (`tools_allow = [...]`), the tool simply isn't advertised to the model for that channel. Model never sees a tool it can't use.
+If a tool is excluded from the channel via `[autonomy].non_cli_excluded_tools` (which gates non-CLI channels as a group), it simply isn't advertised to the model on those channels. Model never sees a tool it can't use.
 
 ## Default posture
 

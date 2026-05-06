@@ -17,7 +17,7 @@ struct Args {
     /// Entries per API call
     #[arg(long, default_value = "50")]
     batch: usize,
-    /// Provider name from [providers.models.<name>] in config.toml
+    /// Provider name from `[providers.models.<name>]` in config.toml
     #[arg(long)]
     provider: String,
     /// Path for appending full input/output on every failure (default: {po}.failures.log)
