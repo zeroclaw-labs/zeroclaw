@@ -57,7 +57,6 @@ use zeroclaw_channels::{
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
-use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, Provider};
 use zeroclaw_runtime::cost::CostTracker;
@@ -768,17 +767,28 @@ pub async fn run_gateway(
         .map(|gp| Arc::new(GmailPushChannel::new(gp.clone())));
 
     // ── Session persistence for WS chat ─────────────────────
+    // Routes through `make_session_backend` so `[channels].session_backend`
+    // is the single source of truth for which backend stores sessions.
+    // Picking `"jsonl"` would otherwise leave gateway WS sessions writing
+    // to SQLite while channel + tool reads went to JSONL — the original
+    // #5769 split, just on a different backend pairing.
     let session_backend: Option<Arc<dyn SessionBackend>> = if config.gateway.session_persistence {
-        match SqliteSessionBackend::new(&config.workspace_dir) {
-            Ok(b) => {
-                tracing::info!("Gateway session persistence enabled (SQLite)");
+        match zeroclaw_infra::make_session_backend(
+            &config.workspace_dir,
+            &config.channels.session_backend,
+        ) {
+            Ok(backend) => {
+                tracing::info!(
+                    "Gateway session persistence enabled (backend={})",
+                    config.channels.session_backend,
+                );
                 if config.gateway.session_ttl_hours > 0
-                    && let Ok(cleaned) = b.cleanup_stale(config.gateway.session_ttl_hours)
+                    && let Ok(cleaned) = backend.cleanup_stale(config.gateway.session_ttl_hours)
                     && cleaned > 0
                 {
                     tracing::info!("Cleaned up {cleaned} stale gateway sessions");
                 }
-                Some(Arc::new(b))
+                Some(backend)
             }
             Err(e) => {
                 tracing::warn!("Session persistence disabled: {e}");
