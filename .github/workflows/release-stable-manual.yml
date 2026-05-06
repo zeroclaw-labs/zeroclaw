@@ -18,6 +18,7 @@ concurrency:
 permissions:
   contents: write
   packages: write
+  pull-requests: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -486,6 +487,31 @@ jobs:
               --notes-file release-notes.md \
               --latest
           fi
+
+      - name: Open cleanup PR for CHANGELOG-next.md
+        if: hashFiles('CHANGELOG-next.md') != ''
+        continue-on-error: true   # never block announcements
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          BRANCH="chore/post-release-cleanup-${TAG}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Start from master so the PR diff is just the deletion
+          git fetch origin master --depth=1
+          git checkout -B "$BRANCH" origin/master
+          git rm CHANGELOG-next.md
+          git commit -m "chore: remove CHANGELOG-next.md after ${TAG} release"
+          git push -u origin "$BRANCH" --force-with-lease
+          gh pr create \
+            --base master \
+            --head "$BRANCH" \
+            --title "chore: post-release cleanup for ${TAG}" \
+            --body "Removes \`CHANGELOG-next.md\` consumed by the **${TAG}** release notes. Auto-opened by \`release-stable-manual.yml\`. Safe to merge once required checks pass." \
+            --label "ci" \
+            --label "type: chore"
 
   redeploy-website:
     name: Trigger Website Redeploy
