@@ -981,6 +981,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "featherless" => vec!["FEATHERLESS_API_KEY"],
         "arcee" => vec!["ARCEE_API_KEY"],
         "lambda-ai" | "lambda_ai" => vec!["LAMBDA_API_KEY"],
+        "inception" => vec!["INCEPTION_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
@@ -1787,6 +1788,12 @@ fn create_provider_with_url_and_options(
         "lambda-ai" | "lambda_ai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Lambda AI",
             "https://api.lambda.ai/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "inception" => Ok(compat(OpenAiCompatibleProvider::new(
+            "Inception Labs",
+            "https://api.inceptionlabs.ai/v1",
             key,
             AuthStyle::Bearer,
         ))),
@@ -2691,6 +2698,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             activation: ProviderActivation::FallbackKey,
             local: false,
         },
+        ProviderInfo {
+            name: "inception",
+            display_name: "Inception Labs (Mercury)",
+            description: "Mercury diffusion-LLM",
+            aliases: &[],
+            activation: ProviderActivation::FallbackKey,
+            local: false,
+        },
     ]
 }
 
@@ -3590,6 +3605,19 @@ mod tests {
         assert_eq!(resolved, Some("lambda-test".to_string()));
     }
 
+    #[test]
+    fn factory_inception() {
+        assert!(create_provider("inception", Some("inception-test")).is_ok());
+    }
+
+    #[test]
+    fn resolve_provider_credential_inception_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("INCEPTION_API_KEY", Some("inception-test"));
+        let resolved = resolve_provider_credential("inception", None);
+        assert_eq!(resolved, Some("inception-test".to_string()));
+    }
+
     // ── Custom / BYOP provider ─────────────────────────────
 
     #[test]
@@ -3921,6 +3949,7 @@ mod tests {
             "featherless",
             "arcee",
             "lambda-ai",
+            "inception",
             "ovhcloud",
         ];
         for name in providers {
