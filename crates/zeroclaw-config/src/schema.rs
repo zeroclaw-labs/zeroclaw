@@ -10020,9 +10020,13 @@ impl Config {
     /// Combine top-level `[cost.prices.<key>]` entries with any per-provider
     /// `pricing` entries declared on `[providers.models.<id>]`. Per-provider
     /// pricing is keyed as `<provider_id>/<model>` to align with the lookup
-    /// pattern in `record_tool_loop_cost_usage` (direct → `provider/model`
-    /// → suffix-after-last-slash). Top-level entries win on conflict so
-    /// existing operator overrides are never silently shadowed.
+    /// pattern in `record_tool_loop_cost_usage` (qualified `<provider>/<model>`
+    /// → bare `<model>` → suffix-after-last-slash). The qualified-first lookup
+    /// order is what makes per-provider disambiguation actually take effect:
+    /// an operator who sets `[providers.models.openai.pricing]` for `gpt-4o`
+    /// gets that rate even if a generic `[cost.prices.gpt-4o]` is also set.
+    /// Top-level entries still win on exact-key conflict so existing operator
+    /// overrides keyed as `<provider>/<model>` are never silently shadowed.
     pub fn combined_pricing(&self) -> std::collections::HashMap<String, ModelPricing> {
         let mut combined = self.cost.prices.clone();
         for (provider_id, provider) in &self.providers.models {
