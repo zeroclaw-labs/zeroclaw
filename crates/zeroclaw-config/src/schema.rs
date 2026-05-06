@@ -6776,6 +6776,9 @@ pub struct ChannelsConfig {
     /// Reddit channel configuration (OAuth2 bot).
     #[nested]
     pub reddit: Option<RedditConfig>,
+    /// Zulip channel configuration (long-poll Events API).
+    #[nested]
+    pub zulip: Option<ZulipConfig>,
     /// Bluesky channel configuration (AT Protocol).
     #[nested]
     pub bluesky: Option<BlueskyConfig>,
@@ -6952,6 +6955,10 @@ impl ChannelsConfig {
                 self.reddit.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.zulip.as_ref())),
+                self.zulip.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.bluesky.as_ref())),
                 self.bluesky.is_some(),
             ),
@@ -7018,6 +7025,7 @@ impl Default for ChannelsConfig {
             nostr: None,
             clawdtalk: None,
             reddit: None,
+            zulip: None,
             bluesky: None,
             voice_call: None,
             #[cfg(feature = "voice-wake")]
@@ -8937,6 +8945,67 @@ impl ChannelConfig for RedditConfig {
     }
     fn desc() -> &'static str {
         "Reddit bot (OAuth2)"
+    }
+}
+
+fn default_zulip_event_timeout_secs() -> u64 {
+    60
+}
+
+fn default_zulip_topic() -> String {
+    "agent".to_string()
+}
+
+/// Zulip channel configuration (long-poll Events API).
+///
+/// Operator creates a bot in **Personal settings → Bots → Add a new bot**
+/// and copies the bot email + API key into `bot_email` and `api_key`. The
+/// bot must be subscribed to the streams listed in `streams` (do this from
+/// the Zulip web UI — v1 does not auto-subscribe).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.zulip"]
+pub struct ZulipConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Zulip server base URL, e.g. `"https://yourorg.zulipchat.com"` or
+    /// `"https://chat.example.com"`. Trailing slash is optional and stripped
+    /// at load time.
+    pub server_url: String,
+    /// Bot email, e.g. `"agent-bot@yourorg.zulipchat.com"`. Sent as the HTTP
+    /// Basic auth username and used to suppress self-messages on inbound.
+    pub bot_email: String,
+    /// Bot API key — sent as the HTTP Basic auth password.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: String,
+    /// Allowed sender emails. Empty list = deny all. `"*"` allows everyone.
+    /// Comparison is case-insensitive.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Streams to listen on. The bot must be subscribed to each (operator
+    /// handles subscription in the Zulip UI). Empty list narrows to
+    /// private-message events only.
+    #[serde(default)]
+    pub streams: Vec<String>,
+    /// Default topic to use when sending to a stream without an explicit
+    /// topic in the recipient string. Default: `"agent"`.
+    #[serde(default = "default_zulip_topic")]
+    pub default_topic: String,
+    /// Long-poll timeout (seconds) for `GET /api/v1/events`. Zulip holds the
+    /// request open up to this duration before returning empty so we can
+    /// reissue. Default: 60.
+    #[serde(default = "default_zulip_event_timeout_secs")]
+    pub event_timeout_secs: u64,
+}
+
+impl ChannelConfig for ZulipConfig {
+    fn name() -> &'static str {
+        "Zulip"
+    }
+    fn desc() -> &'static str {
+        "Zulip (long-poll Events API)"
     }
 }
 
@@ -12402,6 +12471,7 @@ auto_save = true
                 nostr: None,
                 clawdtalk: None,
                 reddit: None,
+                zulip: None,
                 bluesky: None,
                 voice_call: None,
                 voice_duplex: None,
@@ -13576,6 +13646,7 @@ allowed_users = ["@u:matrix.org"]
             nostr: None,
             clawdtalk: None,
             reddit: None,
+            zulip: None,
             bluesky: None,
             voice_call: None,
             voice_duplex: None,
@@ -13958,6 +14029,7 @@ bot_token = "xoxb-tok"
             nostr: None,
             clawdtalk: None,
             reddit: None,
+            zulip: None,
             bluesky: None,
             voice_call: None,
             voice_duplex: None,

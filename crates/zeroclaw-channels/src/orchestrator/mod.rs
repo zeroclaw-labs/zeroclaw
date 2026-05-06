@@ -62,6 +62,7 @@ pub use crate::webhook::WebhookChannel;
 pub use crate::wechat::WeChatChannel;
 pub use crate::wecom::WeComChannel;
 pub use crate::whatsapp::WhatsAppChannel;
+pub use crate::zulip::ZulipChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
@@ -4476,6 +4477,22 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 lq.allowed_senders.clone(),
             )))
         }
+        "zulip" => {
+            let zu = config
+                .channels
+                .zulip
+                .as_ref()
+                .context("Zulip channel is not configured")?;
+            Ok(Arc::new(ZulipChannel::new(
+                zu.server_url.clone(),
+                zu.bot_email.clone(),
+                zu.api_key.clone(),
+                zu.allowed_users.clone(),
+                zu.streams.clone(),
+                zu.default_topic.clone(),
+                zu.event_timeout_secs,
+            )))
+        }
         #[cfg(feature = "channel-email")]
         "email" => {
             let em = config
@@ -5270,6 +5287,23 @@ fn collect_configured_channels(
                 rd.refresh_token.clone(),
                 rd.username.clone(),
                 rd.subreddit.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref zu) = config.channels.zulip
+        && zu.enabled
+    {
+        channels.push(ConfiguredChannel {
+            display_name: "Zulip",
+            channel: Arc::new(ZulipChannel::new(
+                zu.server_url.clone(),
+                zu.bot_email.clone(),
+                zu.api_key.clone(),
+                zu.allowed_users.clone(),
+                zu.streams.clone(),
+                zu.default_topic.clone(),
+                zu.event_timeout_secs,
             )),
         });
     }
