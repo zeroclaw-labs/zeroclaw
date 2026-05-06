@@ -96,6 +96,7 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `provider:openai` | `openai.rs`, `openai_codex.rs` |
 | `provider:openrouter` | `openrouter.rs` |
 | `provider:telnyx` | `telnyx.rs` |
+| `provider:atomic-chat` | `atomic_chat.rs` |
 
 ### Per-tool-group labels
 
