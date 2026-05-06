@@ -287,6 +287,14 @@ impl V2Config {
         //     dotted alias `"openai.default"` (V3 uses dotted aliases).
         fold_v2_tts_into_providers(&mut passthrough, &mut new_providers);
 
+        // 6c. Transcription: V2 `[transcription.<family>]` sub-blocks +
+        //     the Groq fields on `[transcription]` directly fold into V3
+        //     `[providers.transcription.<family>.default]`. The legacy
+        //     `default_provider` / `default_transcription_provider` keys
+        //     are dropped — V3 has no global default-provider concept;
+        //     per-agent `agent.<X>.transcription_provider` is the join.
+        fold_v2_transcription_into_providers(&mut passthrough, &mut new_providers);
+
         if !new_providers.is_empty() {
             passthrough.insert("providers".to_string(), toml::Value::Table(new_providers));
         }
@@ -1542,6 +1550,100 @@ fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut
         tracing::info!(
             target: "migration",
             "[tts.<type>] sub-blocks promoted to [providers.tts.<type>.default]"
+        );
+    }
+}
+
+/// Fold V2 `[transcription]` flat block + per-family sub-blocks into V3's
+/// typed `[providers.transcription.<family>.<alias>]` shape. The Groq
+/// fields lived directly on `[transcription]` in V2 (api_key, api_url,
+/// model, language, initial_prompt) — they migrate to
+/// `[providers.transcription.groq.default]`. Per-family sub-blocks
+/// (`[transcription.openai]`, etc.) migrate to
+/// `[providers.transcription.<family>.default]`.
+///
+/// Behavior fields (`enabled`, `transcribe_non_ptt_audio`,
+/// `max_duration_secs`) stay on `[transcription]`. Legacy default-provider
+/// keys (`default_provider`, `default_model_provider`,
+/// `default_transcription_provider`) are dropped — V3 has no global
+/// default; per-agent `transcription_provider` is the only selector.
+fn fold_v2_transcription_into_providers(
+    passthrough: &mut toml::Table,
+    new_providers: &mut toml::Table,
+) {
+    let Some(toml::Value::Table(transcription_table)) = passthrough.get_mut("transcription") else {
+        return;
+    };
+
+    let mut transcription_aliased = toml::Table::new();
+
+    // Per-family sub-blocks: move to providers.transcription.<family>.default.
+    const V3_TRANSCRIPTION_FAMILIES: &[&str] = &[
+        "openai",
+        "deepgram",
+        "assemblyai",
+        "google",
+        "local_whisper",
+    ];
+    for family in V3_TRANSCRIPTION_FAMILIES {
+        if let Some(value) = transcription_table.remove(*family) {
+            let mut wrapped = toml::Table::new();
+            wrapped.insert("default".to_string(), value);
+            transcription_aliased.insert((*family).to_string(), toml::Value::Table(wrapped));
+        }
+    }
+
+    // Groq lived directly on [transcription] in V2. Extract its fields into
+    // [providers.transcription.groq.default] so V3 can find it via the typed
+    // family slot. Pulled fields: api_key, api_url, model, language,
+    // initial_prompt. Behavior fields (enabled, transcribe_non_ptt_audio,
+    // max_duration_secs) stay on [transcription].
+    let mut groq_entry = toml::Table::new();
+    for groq_field in &["api_key", "api_url", "model", "language", "initial_prompt"] {
+        if let Some(v) = transcription_table.remove(*groq_field) {
+            groq_entry.insert((*groq_field).to_string(), v);
+        }
+    }
+    if !groq_entry.is_empty() {
+        let mut wrapped = toml::Table::new();
+        wrapped.insert("default".to_string(), toml::Value::Table(groq_entry));
+        transcription_aliased.insert("groq".to_string(), toml::Value::Table(wrapped));
+        tracing::info!(
+            target: "migration",
+            "[transcription] Groq fields promoted to [providers.transcription.groq.default]"
+        );
+    }
+
+    // Drop legacy default-provider keys — V3 has no global default-provider
+    // field. Operators select transcription per agent
+    // (`agent.<X>.transcription_provider`).
+    for legacy_default in &[
+        "default_provider",
+        "default_model_provider",
+        "default_transcription_provider",
+    ] {
+        if transcription_table.remove(*legacy_default).is_some() {
+            tracing::info!(
+                target: "migration",
+                "[transcription].{legacy_default} dropped (V3 has no global default-provider; set agent.<X>.transcription_provider instead)"
+            );
+        }
+    }
+
+    if !transcription_aliased.is_empty() {
+        // Merge into existing providers.transcription if any (operator may
+        // have written V3-style entries already).
+        let providers_transcription = new_providers
+            .entry("transcription".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let Some(existing) = providers_transcription.as_table_mut() {
+            for (family, value) in transcription_aliased {
+                existing.entry(family).or_insert(value);
+            }
+        }
+        tracing::info!(
+            target: "migration",
+            "[transcription.<family>] sub-blocks promoted to [providers.transcription.<family>.default]"
         );
     }
 }
