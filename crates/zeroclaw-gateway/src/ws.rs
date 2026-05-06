@@ -691,11 +691,20 @@ async fn process_chat_message(
     let mut last_partial_save = std::time::Instant::now();
     let partial_save_interval = std::time::Duration::from_millis(500);
 
-    // Routes the three concurrent streams that the running turn cares
-    // about. Without this, the outer `select!` arm that drains
-    // `approval_event_rx` and `receiver.next()` is suspended for the whole
-    // turn, so a pending tool approval can neither be sent to the client
-    // nor answered before the timeout fires.
+    // Aggregate token usage across all LLM calls in this turn.
+    // The agent emits TurnEvent::Usage once per LLM call when the provider
+    // surfaces usage; we sum to produce a single done-frame total.
+    let mut total_input_tokens: Option<u64> = None;
+    let mut total_output_tokens: Option<u64> = None;
+
+    // Routes the three concurrent streams that the running turn cares about:
+    //   1. inbound `approval_response` frames from the WebSocket client,
+    //   2. `TurnEvent::ApprovalRequest` events from `WsApprovalChannel`,
+    //   3. ordinary `TurnEvent`s from the agent loop.
+    // Without the multiplexed select, the loop draining only `event_rx`
+    // would block the approval back-channel for the whole turn, so a pending
+    // tool approval could neither be sent to the client nor answered before
+    // the timeout fired.
     let forward_fut = async {
         loop {
             tokio::select! {
@@ -748,6 +757,19 @@ async fn process_chat_message(
                 event_opt = event_rx.recv() => {
                     let Some(event) = event_opt else { break };
                     let ws_msg = match event {
+                        TurnEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                            cost_usd: _,
+                        } => {
+                            if let Some(it) = input_tokens {
+                                total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
+                            }
+                            if let Some(ot) = output_tokens {
+                                total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
+                            }
+                            continue;
+                        }
                         TurnEvent::Chunk { ref delta } => {
                             accumulated_text.push_str(delta);
                             // Incremental persistence: save partial content so it
@@ -849,6 +871,19 @@ async fn process_chat_message(
             "model": state.model,
         }));
 
+        // Trace the cancelled turn so the doctor / replay tool sees it
+        // alongside successful turns. #6001 follow-through.
+        zeroclaw_runtime::observability::runtime_trace::record_event(
+            "gateway_ws_turn",
+            Some("ws"),
+            Some(&provider_label),
+            Some(&state.model),
+            Some(&turn_id),
+            Some(false),
+            Some("interrupted by user"),
+            serde_json::json!({ "session_key": session_key, "cancelled": true }),
+        );
+
         return;
     }
 
@@ -893,9 +928,32 @@ async fn process_chat_message(
             let reset = serde_json::json!({ "type": "chunk_reset" });
             let _ = sender.send(Message::Text(reset.to_string().into())).await;
 
+            // Compute cost from accumulated tokens + configured pricing,
+            // then write the cost record so /api/cost and costs.jsonl reflect
+            // this turn. Done before the done frame so cost_usd can ride along.
+            let total_tokens = match (total_input_tokens, total_output_tokens) {
+                (Some(i), Some(o)) => Some(i.saturating_add(o)),
+                (Some(i), None) => Some(i),
+                (None, Some(o)) => Some(o),
+                (None, None) => None,
+            };
+            let cost_usd = record_turn_cost(
+                state,
+                &provider_label,
+                &state.model,
+                total_input_tokens,
+                total_output_tokens,
+            );
+
             let done = serde_json::json!({
                 "type": "done",
                 "full_response": response,
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "tokens_used": total_tokens,
+                "cost_usd": cost_usd,
+                "model": state.model,
+                "provider": provider_label,
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
@@ -910,6 +968,26 @@ async fn process_chat_message(
                 "provider": provider_label,
                 "model": state.model,
             }));
+
+            // Append a runtime-trace.jsonl record so a `zeroclaw doctor`
+            // sweep sees gateway WS turns alongside channel and CLI turns.
+            // Closes the gateway-side trace gap from #6001.
+            zeroclaw_runtime::observability::runtime_trace::record_event(
+                "gateway_ws_turn",
+                Some("ws"),
+                Some(&provider_label),
+                Some(&state.model),
+                Some(&turn_id),
+                Some(true),
+                None,
+                serde_json::json!({
+                    "session_key": session_key,
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                    "tokens_used": total_tokens,
+                    "cost_usd": cost_usd,
+                }),
+            );
         }
         Err(e) => {
             // Set session state to error
@@ -944,8 +1022,70 @@ async fn process_chat_message(
                 "component": "ws_chat",
                 "message": sanitized,
             }));
+
+            // Trace the failed turn so the doctor / replay tool sees the
+            // failure mode and the turn_id can be cross-referenced with
+            // costs.jsonl. #6001 follow-through.
+            zeroclaw_runtime::observability::runtime_trace::record_event(
+                "gateway_ws_turn",
+                Some("ws"),
+                Some(&provider_label),
+                Some(&state.model),
+                Some(&turn_id),
+                Some(false),
+                Some(&sanitized),
+                serde_json::json!({ "session_key": session_key, "error_code": error_code }),
+            );
         }
     }
+}
+
+/// Record token usage for the just-completed turn against the gateway's
+/// cost tracker, returning the computed cost in USD (or `None` when no
+/// tracker is configured or no usage was reported).
+fn record_turn_cost(
+    state: &AppState,
+    provider_name: &str,
+    model: &str,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+) -> Option<f64> {
+    let tracker = state.cost_tracker.as_ref()?;
+    if input_tokens.is_none() && output_tokens.is_none() {
+        return None;
+    }
+    let input = input_tokens.unwrap_or(0);
+    let output = output_tokens.unwrap_or(0);
+    if input == 0 && output == 0 {
+        return None;
+    }
+    let prices = state.config.lock().cost.prices.clone();
+    // 3-tier model pricing lookup mirrors record_tool_loop_cost_usage so
+    // streaming and non-streaming paths derive identical costs.
+    let pricing = prices
+        .get(model)
+        .or_else(|| prices.get(&format!("{provider_name}/{model}")))
+        .or_else(|| {
+            model
+                .rsplit_once('/')
+                .and_then(|(_, suffix)| prices.get(suffix))
+        });
+    let usage = zeroclaw_runtime::cost::types::TokenUsage::new(
+        model,
+        input,
+        output,
+        pricing.map_or(0.0, |entry| entry.input),
+        pricing.map_or(0.0, |entry| entry.output),
+    );
+    let cost_usd = usage.cost_usd;
+    if let Err(error) = tracker.record_usage(usage) {
+        tracing::warn!(
+            provider = provider_name,
+            model,
+            "Failed to record gateway turn cost: {error}"
+        );
+    }
+    Some(cost_usd)
 }
 
 #[cfg(test)]

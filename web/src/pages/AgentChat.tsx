@@ -1,5 +1,5 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2 } from 'lucide-react';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, Wrench } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { WsMessage } from '@/types/api';
@@ -50,6 +50,18 @@ export default function AgentChat() {
   const [compact, setCompact] = useState(() => {
     try { return localStorage.getItem('zeroclaw_chat_compact') === '1'; } catch { return false; }
   });
+  // Tool execution is plumbing, not chat. Default off so tool_call /
+  // tool_result frames do not surface inline in the conversation transcript.
+  // Toggleable from the chat toolbar (Wrench button); the same flag persists
+  // to `localStorage.zeroclaw_show_tool_activity` for cross-session memory.
+  const [showToolActivity, setShowToolActivity] = useState(() => {
+    try { return localStorage.getItem('zeroclaw_show_tool_activity') === '1'; } catch { return false; }
+  });
+  // The WebSocket onMessage handler is installed once with `[]` deps so it
+  // can read the latest toggle without a reconnect-per-toggle. Mirror the
+  // state into a ref the handler reads at message time.
+  const showToolActivityRef = useRef(showToolActivity);
+  useEffect(() => { showToolActivityRef.current = showToolActivity; }, [showToolActivity]);
   const pendingContentRef = useRef('');
   const pendingThinkingRef = useRef('');
   // Snapshot of thinking captured at chunk_reset, so it survives the reset.
@@ -180,6 +192,9 @@ export default function AgentChat() {
         }
 
         case 'tool_call': {
+          if (!showToolActivityRef.current) {
+            break;
+          }
           const toolName = msg.name ?? 'unknown';
           const toolArgs = msg.args;
           setMessages((prev) => {
@@ -209,6 +224,9 @@ export default function AgentChat() {
         }
 
         case 'tool_result': {
+          if (!showToolActivityRef.current) {
+            break;
+          }
           setMessages((prev) => {
             // Forward scan: find the FIRST unresolved toolCall (order-guaranteed by backend)
             const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
@@ -380,6 +398,14 @@ export default function AgentChat() {
     });
   }, []);
 
+  const toggleToolActivity = useCallback(() => {
+    setShowToolActivity((prev) => {
+      const next = !prev;
+      try { localStorage.setItem('zeroclaw_show_tool_activity', next ? '1' : '0'); } catch { /* noop */ }
+      return next;
+    });
+  }, []);
+
   /**
    * Fallback copy using a temporary textarea for HTTP contexts
    * where navigator.clipboard is unavailable.
@@ -426,6 +452,17 @@ export default function AgentChat() {
           >
             {compact ? <Maximize2 className="h-3 w-3" /> : <Minimize2 className="h-3 w-3" />}
             {t('agent.compact_mode')}
+          </button>
+          <button
+            type="button"
+            onClick={toggleToolActivity}
+            className="btn-secondary flex items-center gap-1.5 text-xs"
+            style={{ padding: '0.3rem 0.75rem', borderRadius: '0.5rem' }}
+            aria-label={showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
+            aria-pressed={showToolActivity}
+          >
+            <Wrench className="h-3 w-3" />
+            {showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
           </button>
           <button
             type="button"

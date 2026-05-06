@@ -40,4 +40,16 @@ pub enum TurnEvent {
         /// How long the channel will wait before auto-denying.
         timeout_secs: u64,
     },
+    /// Per-LLM-call token usage and cost.
+    ///
+    /// Emitted once per LLM response the agent loop processes; a single turn
+    /// that hops through tools may emit several `Usage` events, one per model
+    /// call. Consumers (e.g. the gateway WS handler) accumulate these into a
+    /// turn total before reporting back to the client. Absence means "usage
+    /// unavailable for this call" rather than zero.
+    Usage {
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cost_usd: Option<f64>,
+    },
 }

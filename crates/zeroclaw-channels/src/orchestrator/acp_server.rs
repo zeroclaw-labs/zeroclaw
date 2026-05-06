@@ -680,6 +680,14 @@ impl AcpServer {
         // Track streamed text so partial content survives cancellation.
         let mut accumulated_text = String::new();
         while let Some(event) = event_rx.recv().await {
+            // ACP has no `session/update` shape for token-usage events; the
+            // task-local cost tracker records them out-of-band. Skip before
+            // dispatching to the notification builder so the helper match
+            // can stay exhaustive on the four UI-relevant variants.
+            if matches!(event, TurnEvent::Usage { .. }) {
+                continue;
+            }
+            // Track streamed text so partial content survives cancellation.
             if let TurnEvent::Chunk { ref delta } = event {
                 accumulated_text.push_str(delta);
             }
@@ -1082,6 +1090,13 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
         // WS is registered to handle them; on ACP-only sessions they should
         // not arrive here.
         TurnEvent::ApprovalRequest { .. } => return None,
+        // Usage events are filtered out at every call site (ACP has no
+        // `session/update` shape for them; the cost tracker records them
+        // out-of-band). Reaching this arm means a caller forgot the filter.
+        TurnEvent::Usage { .. } => unreachable!(
+            "TurnEvent::Usage must be filtered before notification_for_turn_event; \
+             ACP has no session/update notification for token usage"
+        ),
     })
 }
 
