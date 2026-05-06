@@ -124,6 +124,7 @@ pub struct ContextCompressor {
     config: ContextCompressionConfig,
     context_window: usize,
     memory: Option<Arc<dyn Memory>>,
+    hooks: Option<Arc<crate::hooks::HookRunner>>,
 }
 
 impl ContextCompressor {
@@ -132,6 +133,7 @@ impl ContextCompressor {
             config,
             context_window,
             memory: None,
+            hooks: None,
         }
     }
 
@@ -139,6 +141,12 @@ impl ContextCompressor {
     /// old messages are discarded. Without this, compressed facts are lost.
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach a hook runner to fire `on_before_compaction` before compression begins.
+    pub fn with_hooks(mut self, hooks: Arc<crate::hooks::HookRunner>) -> Self {
+        self.hooks = Some(hooks);
         self
     }
 
@@ -217,6 +225,15 @@ impl ContextCompressor {
                 tokens_after: tokens_before,
                 passes_used: 0,
             });
+        }
+
+        // Fire pre-compaction hook so registered handlers can persist state
+        // before older messages are summarized or discarded.
+        if let Some(ref hooks) = self.hooks {
+            let usage_ratio = tokens_before as f64 / self.context_window as f64;
+            hooks
+                .fire_before_compaction(tokens_before, self.context_window, usage_ratio)
+                .await;
         }
 
         // Fast-trim pass — may resolve overflow without an LLM call

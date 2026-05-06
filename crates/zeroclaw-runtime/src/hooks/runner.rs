@@ -122,6 +122,20 @@ impl HookRunner {
         join_all(futs).await;
     }
 
+    pub async fn fire_before_compaction(
+        &self,
+        estimated_tokens: usize,
+        max_tokens: usize,
+        usage_ratio: f64,
+    ) {
+        let futs: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.on_before_compaction(estimated_tokens, max_tokens, usage_ratio))
+            .collect();
+        join_all(futs).await;
+    }
+
     // ---------------------------------------------------------------
     // Modifying dispatchers (sequential by priority, short-circuit on Cancel)
     // ---------------------------------------------------------------
