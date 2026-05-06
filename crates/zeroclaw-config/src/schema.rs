@@ -6779,6 +6779,9 @@ pub struct ChannelsConfig {
     /// Bluesky channel configuration (AT Protocol).
     #[nested]
     pub bluesky: Option<BlueskyConfig>,
+    /// Lemmy channel configuration (private-message polling).
+    #[nested]
+    pub lemmy: Option<LemmyConfig>,
     /// Voice call channel configuration (Twilio/Telnyx/Plivo).
     #[nested]
     pub voice_call: Option<crate::scattered_types::VoiceCallConfig>,
@@ -6955,6 +6958,10 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.bluesky.as_ref())),
                 self.bluesky.is_some(),
             ),
+            (
+                Box::new(ConfigWrapper::new(self.lemmy.as_ref())),
+                self.lemmy.is_some(),
+            ),
             #[cfg(feature = "voice-wake")]
             (
                 Box::new(ConfigWrapper::new(self.voice_wake.as_ref())),
@@ -7019,6 +7026,7 @@ impl Default for ChannelsConfig {
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            lemmy: None,
             voice_call: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
@@ -8962,6 +8970,66 @@ impl ChannelConfig for BlueskyConfig {
     }
     fn desc() -> &'static str {
         "AT Protocol"
+    }
+}
+
+fn default_lemmy_poll_interval_secs() -> u64 {
+    30
+}
+
+/// Lemmy channel configuration (private-message polling).
+///
+/// v1 focuses on private messages only — the simplest and most useful
+/// surface for a personal agent. Operator either provides a pre-minted JWT
+/// (recommended for production; copy from browser cookie or admin UI) or
+/// `username` + `password` for the channel to auto-login at startup. v1
+/// does not support 2FA — operators with 2FA on the bot account must use
+/// the pre-minted JWT path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.lemmy"]
+pub struct LemmyConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Lemmy instance base URL, e.g. `"https://lemmy.world"`. Trailing
+    /// slash is optional and stripped at load time.
+    pub instance_url: String,
+    /// Bot account username. Required when `jwt` is empty and the channel
+    /// must auto-login.
+    #[serde(default)]
+    pub username: String,
+    /// Bot account password. Required when `jwt` is empty. Stored as a
+    /// secret. Prefer the pre-minted JWT path in production.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub password: String,
+    /// Pre-minted JWT. When non-empty, takes precedence over
+    /// username/password — the channel uses it directly and skips the
+    /// login call. Recommended for production deployments and required
+    /// for accounts with 2FA.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub jwt: String,
+    /// Allowed sender Lemmy usernames. Either bare (`"alice"`) or
+    /// instance-qualified (`"alice@lemmy.world"`). Empty list = deny all.
+    /// `"*"` allows everyone. Comparison is case-insensitive.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Polling cadence (seconds) for `GET /api/v3/private_message/list`.
+    /// Default: 30. Lower bound 5.
+    #[serde(default = "default_lemmy_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+}
+
+impl ChannelConfig for LemmyConfig {
+    fn name() -> &'static str {
+        "Lemmy"
+    }
+    fn desc() -> &'static str {
+        "Lemmy (private-message polling)"
     }
 }
 
@@ -12403,6 +12471,7 @@ auto_save = true
                 clawdtalk: None,
                 reddit: None,
                 bluesky: None,
+                lemmy: None,
                 voice_call: None,
                 voice_duplex: None,
                 #[cfg(feature = "voice-wake")]
@@ -13577,6 +13646,7 @@ allowed_users = ["@u:matrix.org"]
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            lemmy: None,
             voice_call: None,
             voice_duplex: None,
             #[cfg(feature = "voice-wake")]
@@ -13959,6 +14029,7 @@ bot_token = "xoxb-tok"
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            lemmy: None,
             voice_call: None,
             voice_duplex: None,
             #[cfg(feature = "voice-wake")]
