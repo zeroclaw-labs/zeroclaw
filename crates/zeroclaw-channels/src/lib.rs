@@ -48,6 +48,8 @@ pub mod nextcloud_talk;
 pub mod nostr;
 #[cfg(feature = "channel-notion")]
 pub mod notion;
+#[cfg(feature = "channel-plivo")]
+pub mod plivo;
 #[cfg(feature = "channel-qq")]
 pub mod qq;
 #[cfg(feature = "channel-reddit")]
