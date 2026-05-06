@@ -17247,6 +17247,16 @@ require_otp_to_resume = true
     }
 
     #[test]
+    async fn telegram_config_reply_min_interval_secs_missing_defaults_to_zero() {
+        let toml_str = r#"
+            bot_token = "123:ABC"
+            allowed_users = ["alice"]
+        "#;
+        let cfg: TelegramConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.reply_min_interval_secs, 0);
+    }
+
+    #[test]
     async fn telegram_config_ack_reactions_channel_overrides_top_level() {
         let tg_toml = r#"
             bot_token = "123:ABC"

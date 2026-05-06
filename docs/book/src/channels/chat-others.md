@@ -46,6 +46,7 @@ use_long_polling = true            # default — no webhook needed
 
 - Long polling is the default; no public URL required. Switch to webhook mode by setting `webhook_url` (then expose the gateway).
 - Streaming draft edits are supported but capped by Telegram's rate limit. Tune `draft_update_interval_ms` if you see "Too Many Requests".
+- `reply_min_interval_secs` (default `0`) sets a per-peer floor on reply cadence. Field is recognised by the schema; the per-channel pacing scheduler that actually delays delivery lands in a follow-up to #6345.
 
 ## Signal
 
