@@ -2,17 +2,21 @@ use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest,
     Provider, ProviderCapabilities, StreamEvent,
 };
+
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use futures_util::StreamExt;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::BufReader;
 
 #[derive(Clone)]
 pub struct AtomicChatProvider {
     client: Client,
     base_url: String,
     api_key: Option<String>,
+    endpoint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -51,20 +55,25 @@ impl AtomicChatProvider {
             .build()
             .expect("failed to build reqwest client");
 
+        let endpoint = format!(
+            "{}/v1/chat/completions",
+            base_url.trim_end_matches('/')
+        );
+
         Self {
             client,
             base_url,
             api_key,
+            endpoint,
         }
     }
 
-    fn endpoint(&self) -> String {
-        format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim_end_matches('/')
-        )
+    #[inline]
+    fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
+    #[inline]
     fn map_messages(messages: &[ChatMessage]) -> Vec<Message<'_>> {
         messages
             .iter()
@@ -73,6 +82,17 @@ impl AtomicChatProvider {
                 content: &m.content,
             })
             .collect()
+    }
+
+    #[inline]
+    fn extract_content(chunk: &str) -> Option<String> {
+        serde_json::from_str::<StreamChunk>(chunk)
+            .ok()?
+            .choices
+            .first()?
+            .delta
+            .content
+            .clone()
     }
 }
 
@@ -84,8 +104,6 @@ impl Provider for AtomicChatProvider {
         mut tx: tokio::sync::mpsc::Sender<StreamEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
-        let url = self.endpoint();
-
         let body = ChatCompletionRequest {
             model: &req.model,
             messages: Self::map_messages(&req.messages),
@@ -93,7 +111,7 @@ impl Provider for AtomicChatProvider {
             stream: true,
         };
 
-        let mut request = self.client.post(url).json(&body);
+        let mut request = self.client.post(self.endpoint()).json(&body);
 
         if let Some(key) = &self.api_key {
             request = request.header("Authorization", format!("Bearer {}", key));
@@ -107,38 +125,49 @@ impl Provider for AtomicChatProvider {
             return Ok(());
         }
 
-        let mut stream = response.bytes_stream();
+        // --- STREAM HANDLING (FIXED) ---
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-                    break;
-                }
-            };
+        let stream = response.bytes_stream();
+        let mut reader = BufReader::new(tokio_util::io::StreamReader::new(
+            stream.map(|res| res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+        ));
 
-            let text = String::from_utf8_lossy(&chunk);
+        let mut line = String::new();
 
-            for line in text.lines() {
-                let line = line.trim();
+        let mut buffer = String::new();
 
-                if !line.starts_with("data:") {
-                    continue;
-                }
+        loop {
+            line.clear();
 
-                let data = line.trim_start_matches("data:").trim();
+            let bytes = reader.read_line(&mut line).await?;
+
+            if bytes == 0 {
+                break;
+            }
+
+            let line = line.trim();
+
+            // ignore SSE comments / keep-alives
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+
+            // only process data lines
+            if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim();
 
                 if data == "[DONE]" {
                     let _ = tx.send(StreamEvent::End).await;
                     return Ok(());
                 }
 
-                if let Ok(parsed) = serde_json::from_str::<StreamChunk>(data) {
-                    if let Some(choice) = parsed.choices.first() {
-                        if let Some(content) = &choice.delta.content {
-                            let _ = tx.send(StreamEvent::Token(content.clone())).await;
-                        }
+                // parse safely
+                match Self::extract_content(data) {
+                    Some(content) if !content.is_empty() => {
+                        let _ = tx.send(StreamEvent::Token(content)).await;
+                    }
+                    _ => {
+                        // ignore malformed chunks silently (or log if you want)
                     }
                 }
             }
