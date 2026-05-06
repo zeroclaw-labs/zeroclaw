@@ -1,5 +1,6 @@
-default_provider = "custom:http://127.0.0.1:6767/v1"
-[providers.models.local]
+[providers.models.atomic]
 kind = "openai-compatible"
 base_url = "http://127.0.0.1:6767/v1"
-model = "unsloth\\Qwen3_5-9B-IQ4_XS"
+model = "unsloth/Qwen3_5-9B-IQ4_XS"
+
+default_provider = "atomic"
