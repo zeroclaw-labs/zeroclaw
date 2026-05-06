@@ -23,6 +23,9 @@ mod tests {
         assert!(cfg.auto_integrate);
         assert_eq!(cfg.scan_interval_hours, 24);
         assert!((cfg.min_score - 0.7).abs() < f64::EPSILON);
-        assert_eq!(cfg.sources, vec!["github", "clawhub"]);
+        assert_eq!(
+            cfg.sources,
+            vec!["github", "clawhub", "agentskills", "skillssh"]
+        );
     }
 }

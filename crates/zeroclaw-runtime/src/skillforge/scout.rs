@@ -15,6 +15,8 @@ pub enum ScoutSource {
     GitHub,
     ClawHub,
     HuggingFace,
+    AgentSkillsIo,
+    SkillsSh,
 }
 
 impl std::str::FromStr for ScoutSource {
@@ -25,6 +27,8 @@ impl std::str::FromStr for ScoutSource {
             "github" => Self::GitHub,
             "clawhub" => Self::ClawHub,
             "huggingface" | "hf" => Self::HuggingFace,
+            "agentskills" | "agentskills.io" => Self::AgentSkillsIo,
+            "skillssh" | "skills.sh" => Self::SkillsSh,
             _ => {
                 warn!(source = s, "Unknown scout source, defaulting to GitHub");
                 Self::GitHub
@@ -212,6 +216,137 @@ impl Scout for GitHubScout {
 }
 
 // ---------------------------------------------------------------------------
+// HttpJsonScout — reusable scout for HTTP JSON search APIs
+// ---------------------------------------------------------------------------
+
+pub struct HttpJsonScout {
+    client: reqwest::Client,
+    search_url: String,
+    source: ScoutSource,
+    source_label: &'static str,
+}
+
+impl HttpJsonScout {
+    pub fn new(search_url: String, source: ScoutSource, source_label: &'static str) -> Self {
+        use std::time::Duration;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build reqwest client");
+
+        Self {
+            client,
+            search_url,
+            source,
+            source_label,
+        }
+    }
+
+    fn parse_items(&self, body: &serde_json::Value) -> Vec<ScoutResult> {
+        let items = body
+            .get("skills")
+            .or_else(|| body.get("results"))
+            .or_else(|| body.get("data"))
+            .and_then(|v| v.as_array());
+
+        let Some(items) = items else {
+            return vec![];
+        };
+
+        items
+            .iter()
+            .filter_map(|item| {
+                let name = item
+                    .get("name")
+                    .or_else(|| item.get("slug"))
+                    .and_then(|v| v.as_str())?
+                    .to_string();
+                let url = item
+                    .get("url")
+                    .or_else(|| item.get("html_url"))
+                    .or_else(|| item.get("source_url"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let description = item
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let stars = item
+                    .get("stars")
+                    .or_else(|| item.get("downloads"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+
+                Some(ScoutResult {
+                    name,
+                    url,
+                    description,
+                    stars,
+                    language: None,
+                    updated_at: None,
+                    source: self.source,
+                    owner: self.source_label.to_string(),
+                    has_license: false,
+                })
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Scout for HttpJsonScout {
+    async fn discover(&self) -> Result<Vec<ScoutResult>> {
+        let query = "agent skill";
+        let url = format!("{}?q={}&limit=30", self.search_url, urlencoding(query));
+        debug!(source = self.source_label, "Searching registry");
+
+        let resp = match self.client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    source = self.source_label,
+                    error = %e,
+                    "Registry search failed, skipping"
+                );
+                return Ok(vec![]);
+            }
+        };
+
+        if !resp.status().is_success() {
+            warn!(
+                status = %resp.status(),
+                source = self.source_label,
+                "Registry search returned non-200"
+            );
+            return Ok(vec![]);
+        }
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    source = self.source_label,
+                    error = %e,
+                    "Failed to parse registry response"
+                );
+                return Ok(vec![]);
+            }
+        };
+
+        let items = self.parse_items(&body);
+        debug!(
+            count = items.len(),
+            source = self.source_label,
+            "Parsed items"
+        );
+        Ok(items)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -255,6 +390,22 @@ mod tests {
         assert_eq!(
             "hf".parse::<ScoutSource>().unwrap(),
             ScoutSource::HuggingFace
+        );
+        assert_eq!(
+            "agentskills".parse::<ScoutSource>().unwrap(),
+            ScoutSource::AgentSkillsIo
+        );
+        assert_eq!(
+            "agentskills.io".parse::<ScoutSource>().unwrap(),
+            ScoutSource::AgentSkillsIo
+        );
+        assert_eq!(
+            "skillssh".parse::<ScoutSource>().unwrap(),
+            ScoutSource::SkillsSh
+        );
+        assert_eq!(
+            "skills.sh".parse::<ScoutSource>().unwrap(),
+            ScoutSource::SkillsSh
         );
         // unknown falls back to GitHub
         assert_eq!(

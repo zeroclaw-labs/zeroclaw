@@ -1,3 +1,4 @@
+pub mod registry;
 pub mod skill_http;
 pub mod skill_tool;
 use anyhow::{Context, Result};
@@ -1120,11 +1121,18 @@ fn clawhub_download_url(source: &str) -> Result<String> {
     anyhow::bail!("unrecognised ClawhHub source format: {source}")
 }
 
+/// Normalize a registry-derived slug into a filesystem-safe skill directory
+/// name.
+///
+/// **Preserves hyphens** so the on-disk directory matches the install slug
+/// the user typed — `skills install clawhub:foo-bar` lands in
+/// `skills/foo-bar/`, not `skills/foo_bar/`. Without this, subsequent
+/// `skills audit foo-bar` and `skills remove foo-bar` invocations couldn't
+/// find the skill the user just installed.
 fn normalize_skill_name(s: &str) -> String {
     s.to_lowercase()
         .chars()
-        .map(|c| if c == '-' { '_' } else { c })
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect()
 }
 
@@ -1239,7 +1247,7 @@ fn detect_newly_installed_directory(
     }
 }
 
-fn enforce_skill_security_audit(
+pub(crate) fn enforce_skill_security_audit(
     skill_path: &Path,
     allow_scripts: bool,
 ) -> Result<audit::SkillAuditReport> {
@@ -1263,7 +1271,7 @@ fn remove_git_metadata(skill_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
     let src_meta = std::fs::symlink_metadata(src)
         .with_context(|| format!("failed to read metadata for {}", src.display()))?;
     if src_meta.file_type().is_symlink() {
