@@ -1,7 +1,8 @@
-default_provider = "ollama"
-default_model = "qwen3.6:35b-a3b"
+[providers]
+fallback = "ollama"
 
-[providers.models.ollama]
-kind = "ollama"
-base_url = "http://localhost:11434"
-model = "qwen3.6:35b-a3b"
+[providers.models.llama]
+kind = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+model = "llama3"
+api_key = "none"
