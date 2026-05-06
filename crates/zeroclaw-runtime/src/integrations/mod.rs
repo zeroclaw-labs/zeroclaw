@@ -84,11 +84,36 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
     println!("  Status:   {label}");
     println!();
 
-    // Setup hints for the runtime built-ins and the channel onboarding
-    // path. Channel-specific hints stay channel-agnostic ("run onboard")
-    // because per-channel walkthroughs live in the docs book; duplicating
-    // them here would rot out of sync.
+    // Setup hints. Channel-specific steps that are not yet covered by a
+    // standalone book walkthrough stay here so `zeroclaw integration info
+    // <name>` keeps producing actionable output. The Chat-category catch-all
+    // handles channels with a stable onboard path and no special prerequisites.
     match entry.name.as_str() {
+        "Telegram" => {
+            println!("  Setup:");
+            println!("    1. Message @BotFather on Telegram");
+            println!("    2. Create a bot and copy the token");
+            println!("    3. Run: zeroclaw onboard --channels-only");
+            println!("    4. Start: zeroclaw channel start");
+        }
+        "Discord" => {
+            println!("  Setup:");
+            println!("    1. Go to https://discord.com/developers/applications");
+            println!("    2. Create app → Bot → Copy token");
+            println!("    3. Enable MESSAGE CONTENT intent");
+            println!("    4. Run: zeroclaw onboard --channels-only");
+        }
+        "Slack" => {
+            println!("  Setup:");
+            println!("    1. Go to https://api.slack.com/apps");
+            println!("    2. Create app → Bot Token Scopes → Install");
+            println!("    3. Run: zeroclaw onboard --channels-only");
+        }
+        "iMessage" => {
+            println!("  Setup (macOS only):");
+            println!("    Uses AppleScript bridge to send/receive iMessages.");
+            println!("    Requires Full Disk Access in System Settings → Privacy.");
+        }
         "OpenRouter" => {
             println!("  Setup:");
             println!("    1. Get API key at https://openrouter.ai/keys");
@@ -100,6 +125,11 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    1. Install: brew install ollama");
             println!("    2. Pull a model: ollama pull llama3");
             println!("    3. Set provider to 'ollama' in config.toml");
+        }
+        "GitHub" => {
+            println!("  Setup:");
+            println!("    1. Create a personal access token at https://github.com/settings/tokens");
+            println!("    2. Add to config: [integrations.github] token = \"ghp_...\"");
         }
         "Browser" => {
             println!("  Built-in:");
