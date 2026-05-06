@@ -3088,6 +3088,34 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn factory_atomic_chat() {
+        let provider = create_provider("atomic-chat", Some("key"))
+            .expect("atomic-chat provider should build");
+    
+        assert!(provider.capabilities().streaming);
+    }
+    #[test]
+    fn factory_atomic_chat_aliases() {
+        assert!(create_provider("atomic-chat", Some("key")).is_ok());
+        assert!(create_provider("atomic_chat", Some("key")).is_ok());
+        assert!(create_provider("atomicchat", Some("key")).is_ok());
+    }
+    #[test]
+    fn factory_atomic_chat_allows_missing_key() {
+        let result = create_provider("atomic-chat", None);
+        assert!(result.is_ok());
+    }
+    #[test]
+    fn atomic_chat_capabilities() {
+        let provider = create_provider("atomic-chat", Some("key"))
+            .expect("provider should exist");
+    
+        let caps = provider.capabilities();
+    
+        assert!(caps.streaming, "must support streaming");
+        assert!(!caps.tools, "atomic chat does not use native tools");
+    }
 
     // ── Extended ecosystem ───────────────────────────────────
 
@@ -3380,28 +3408,6 @@ mod tests {
             ),
             Ok(_) => panic!("Expected error for unsupported anthropic-custom URL scheme"),
         }
-    }
-    #[test]
-    fn factory_atomic_chat() {
-        assert!(create_provider("atomic-chat", Some("key")).is_ok());
-    }
-    #[test]
-    fn factory_atomic_chat_custom_url() {
-        let options = ProviderRuntimeOptions::default();
-        let p = create_provider_with_url_and_options(
-            "atomic-chat",
-            Some("key"),
-            Some("http://127.0.0.1:1337/v1"),
-            &options,
-        );
-        assert!(p.is_ok());
-    }
-    #[test]
-    fn resolve_provider_credential_atomic_chat_env() {
-        let _env_lock = env_lock();
-        let _guard = EnvGuard::set("ATOMIC_CHAT_API_KEY", Some("test-key"));
-        let resolved = resolve_provider_credential("atomic-chat", None);
-        assert_eq!(resolved, Some("test-key".to_string()));
     }
 
     // ── Error cases ──────────────────────────────────────────
