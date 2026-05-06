@@ -37,6 +37,7 @@ pub mod reliable;
 pub mod router;
 pub mod telnyx;
 pub mod traits;
+pub mod atomic_chat;
 
 #[allow(unused_imports)]
 pub use traits::{
@@ -1433,6 +1434,23 @@ fn create_provider_with_url_and_options(
                 true,
             )))
         }
+        "atomic-chat" | "atomic_chat" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .unwrap_or("http://127.0.0.1:1337/v1");
+        
+            Ok(compat(
+                OpenAiCompatibleProvider::new(
+                    "Atomic Chat",
+                    base_url,
+                    key,
+                    AuthStyle::Bearer,
+                )
+                .without_native_tools(),
+            ))
+        }
+
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => {
@@ -2311,6 +2329,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             display_name: "LiteLLM",
             aliases: &["lite-llm"],
             local: false,
+        },
+        ProviderInfo {
+            name: "atomic-chat",
+            display_name: "Atomic Chat",
+            aliases: &["atomic_chat"],
+            local: true,
         },
         // ── Fast inference ────────────────────────────────────
         ProviderInfo {
