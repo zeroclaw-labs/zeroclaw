@@ -99,6 +99,18 @@
 - **WeChat iLink Bot**: channel recovered from the bulk revert in PR #4221 (#6130).
 - **Slack**: `strict_mention_in_thread` option lets you require an @-mention even in
   threads where the agent has previously replied (#5992).
+- **Slack**: thread-context backfill on first agent encounter — when an agent is
+  @-mentioned mid-thread, the parent message and recent replies are now fetched and
+  prepended to the agent payload as a `[Thread context]` block, so the agent answers
+  with full thread context instead of only the triggering message. Allow-list
+  filtering is preserved, with policy-filtered gaps surfaced as
+  `… N messages from non-allow-listed users omitted …` so the agent knows context
+  is missing for a reason. Truncation reuses the existing permalink-renderer caps
+  (`SLACK_PERMALINK_THREAD_MAX_REPLIES` = 20, `SLACK_PERMALINK_TEXT_MAX_CHARS` =
+  8000). Seen-thread entries carry a 10-minute TTL so a follow-up mention re-pulls
+  context after a downstream failure (provider 5xx, exhausted credits, etc.); the
+  polling loop refreshes timestamps for actively-tracked threads each cycle so
+  long-lived conversations do not re-backfill.
 - **IRC**: `mention_only` config option for IRC channels (#5998).
 - **Telegram**: bot command list updated (#5691); `request_approval` now forwards the
   `message_thread_id` (#5970); auto-injected topic-root reply context is skipped in
