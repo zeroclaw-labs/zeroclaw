@@ -15,10 +15,7 @@
 
 use super::{IntegrationCategory, IntegrationEntry, IntegrationStatus};
 use zeroclaw_config::schema::Config;
-use zeroclaw_providers::{
-    is_glm_alias, is_minimax_alias, is_moonshot_alias, is_qianfan_alias, is_qwen_alias,
-    is_zai_alias,
-};
+use zeroclaw_providers::ProviderActivation;
 
 /// Map snake_case schema field names to display names. Anything not in
 /// this table title-cases the snake_case name (e.g. `discord_history`
@@ -61,47 +58,6 @@ fn snake_to_title(s: &str) -> String {
         .join(" ")
 }
 
-/// `status_fn` for an AI-model integration keyed off
-/// `providers.fallback`. Accepts one or more literal provider keys
-/// (e.g. `provider_active!("huggingface", "hf")`).
-macro_rules! provider_active {
-    ($c:expr, $($name:expr),+ $(,)?) => {
-        match $c.providers.fallback.as_deref() {
-            $(Some($name))|+ => IntegrationStatus::Active,
-            _ => IntegrationStatus::Available,
-        }
-    };
-}
-
-/// `status_fn` for an AI-model integration whose provider key is
-/// recognised by an alias predicate (e.g. `is_moonshot_alias`).
-macro_rules! provider_alias_active {
-    ($c:expr, $alias_fn:path) => {
-        if $c.providers.fallback.as_deref().is_some_and($alias_fn) {
-            IntegrationStatus::Active
-        } else {
-            IntegrationStatus::Available
-        }
-    };
-}
-
-/// `status_fn` for an AI-model integration recognised by a model-id
-/// prefix on the resolved fallback provider (e.g. `"google/"`).
-macro_rules! provider_model_prefix_active {
-    ($c:expr, $prefix:expr) => {
-        if $c
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.model.as_deref())
-            .is_some_and(|m| m.starts_with($prefix))
-        {
-            IntegrationStatus::Active
-        } else {
-            IntegrationStatus::Available
-        }
-    };
-}
-
 fn bool_to_status(active: bool) -> IntegrationStatus {
     if active {
         IntegrationStatus::Active
@@ -122,6 +78,37 @@ fn entry(
         category,
         status,
     }
+}
+
+/// Compute an AI-model integration's status from its `ProviderActivation`
+/// strategy. The integrations registry never branches on a provider name —
+/// every per-vendor decision lives on the `ProviderInfo` row in
+/// `zeroclaw_providers::list_providers()`.
+fn evaluate_provider_activation(
+    config: &Config,
+    info: &zeroclaw_providers::ProviderInfo,
+) -> IntegrationStatus {
+    let fallback = config.providers.fallback.as_deref();
+    let active = match info.activation {
+        ProviderActivation::FallbackKey => {
+            fallback == Some(info.name) || info.aliases.iter().any(|a| fallback == Some(*a))
+        }
+        ProviderActivation::FallbackKeyWithApiKey => {
+            (fallback == Some(info.name) || info.aliases.iter().any(|a| fallback == Some(*a)))
+                && config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.api_key.as_ref())
+                    .is_some()
+        }
+        ProviderActivation::ModelPrefix(prefix) => config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.model.as_deref())
+            .is_some_and(|m| m.starts_with(prefix)),
+        ProviderActivation::FallbackKeyMatches(predicate) => fallback.is_some_and(predicate),
+    };
+    bool_to_status(active)
 }
 
 /// Returns the integration catalog computed against `config`.
@@ -146,189 +133,20 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
         ));
     }
 
-    // ── AI Models ──
-    // Provider keys live in the schema (`providers.fallback`); the lookup
-    // macros derive status from there.
-    let openrouter_active = config.providers.fallback.as_deref() == Some("openrouter")
-        && config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.as_ref())
-            .is_some();
-    out.push(entry(
-        "OpenRouter",
-        "200+ models, 1 API key",
-        IntegrationCategory::AiModel,
-        bool_to_status(openrouter_active),
-    ));
-    out.push(entry(
-        "Anthropic",
-        "Claude 3.5/4 Sonnet & Opus",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "anthropic"),
-    ));
-    out.push(entry(
-        "OpenAI",
-        "GPT-4o, GPT-5, o1",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "openai"),
-    ));
-    out.push(entry(
-        "Google",
-        "Gemini 2.5 Pro/Flash",
-        IntegrationCategory::AiModel,
-        provider_model_prefix_active!(config, "google/"),
-    ));
-    out.push(entry(
-        "DeepSeek",
-        "DeepSeek V3 & R1",
-        IntegrationCategory::AiModel,
-        provider_model_prefix_active!(config, "deepseek/"),
-    ));
-    out.push(entry(
-        "xAI",
-        "Grok 3 & 4",
-        IntegrationCategory::AiModel,
-        provider_model_prefix_active!(config, "x-ai/"),
-    ));
-    out.push(entry(
-        "Mistral",
-        "Mistral Large & Codestral",
-        IntegrationCategory::AiModel,
-        provider_model_prefix_active!(config, "mistral"),
-    ));
-    out.push(entry(
-        "Ollama",
-        "Local models (Llama, etc.)",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "ollama"),
-    ));
-    out.push(entry(
-        "Perplexity",
-        "Search-augmented AI",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "perplexity"),
-    ));
-    out.push(entry(
-        "Hugging Face",
-        "Open-source models",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "huggingface", "hf"),
-    ));
-    out.push(entry(
-        "LM Studio",
-        "Local model server",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "lmstudio", "lm-studio"),
-    ));
-    out.push(entry(
-        "Venice",
-        "Privacy-first inference (Llama, Opus)",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "venice"),
-    ));
-    out.push(entry(
-        "Vercel AI",
-        "Vercel AI Gateway",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "vercel"),
-    ));
-    out.push(entry(
-        "Cloudflare AI",
-        "Cloudflare AI Gateway",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "cloudflare"),
-    ));
-    out.push(entry(
-        "Moonshot",
-        "Kimi & Kimi Coding",
-        IntegrationCategory::AiModel,
-        provider_alias_active!(config, is_moonshot_alias),
-    ));
-    out.push(entry(
-        "Synthetic",
-        "Synthetic AI models",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "synthetic"),
-    ));
-    out.push(entry(
-        "OpenCode Zen",
-        "Code-focused AI models",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "opencode"),
-    ));
-    out.push(entry(
-        "OpenCode Go",
-        "Subsidized code-focused AI models",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "opencode-go"),
-    ));
-    out.push(entry(
-        "Z.AI",
-        "Z.AI inference",
-        IntegrationCategory::AiModel,
-        provider_alias_active!(config, is_zai_alias),
-    ));
-    out.push(entry(
-        "GLM",
-        "ChatGLM / Zhipu models",
-        IntegrationCategory::AiModel,
-        provider_alias_active!(config, is_glm_alias),
-    ));
-    out.push(entry(
-        "MiniMax",
-        "MiniMax AI models",
-        IntegrationCategory::AiModel,
-        provider_alias_active!(config, is_minimax_alias),
-    ));
-    out.push(entry(
-        "Qwen",
-        "Alibaba DashScope Qwen models",
-        IntegrationCategory::AiModel,
-        provider_alias_active!(config, is_qwen_alias),
-    ));
-    out.push(entry(
-        "Amazon Bedrock",
-        "AWS managed model access",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "bedrock"),
-    ));
-    out.push(entry(
-        "Qianfan",
-        "Baidu AI models",
-        IntegrationCategory::AiModel,
-        provider_alias_active!(config, is_qianfan_alias),
-    ));
-    out.push(entry(
-        "Groq",
-        "Ultra-fast LPU inference",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "groq"),
-    ));
-    out.push(entry(
-        "Together AI",
-        "Open-source model hosting",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "together"),
-    ));
-    out.push(entry(
-        "Fireworks AI",
-        "Fast open-source inference",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "fireworks"),
-    ));
-    out.push(entry(
-        "Novita AI",
-        "Affordable open-source inference",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "novita"),
-    ));
-    out.push(entry(
-        "Cohere",
-        "Command R+ & embeddings",
-        IntegrationCategory::AiModel,
-        provider_active!(config, "cohere"),
-    ));
+    // ── AI Models (schema-derived) ──
+    // Pure iteration over `zeroclaw_providers::list_providers()`. Every
+    // per-vendor field — display_name, description, activation strategy
+    // — lives on the `ProviderInfo` row at the schema. The registry
+    // never branches on a provider name. Adding a new provider means
+    // adding one row in `list_providers()`; no edit here required.
+    for info in zeroclaw_providers::list_providers() {
+        out.push(entry(
+            info.display_name,
+            info.description,
+            IntegrationCategory::AiModel,
+            evaluate_provider_activation(config, &info),
+        ));
+    }
 
     // ── Tools & Automation (runtime built-ins + a few schema bools) ──
     out.push(entry(
@@ -597,36 +415,43 @@ mod tests {
 
     #[test]
     fn regional_provider_aliases_activate_expected_ai_integrations() {
-        let mut config = Config::default();
-
-        config.providers.fallback = Some("minimax-cn".to_string());
-        let entries = all_integrations(&config);
-        let minimax = entries.iter().find(|e| e.name == "MiniMax").unwrap();
-        assert!(matches!(minimax.status, IntegrationStatus::Active));
-
-        config.providers.fallback = Some("glm-cn".to_string());
-        let entries = all_integrations(&config);
-        let glm = entries.iter().find(|e| e.name == "GLM").unwrap();
-        assert!(matches!(glm.status, IntegrationStatus::Active));
-
-        config.providers.fallback = Some("moonshot-intl".to_string());
-        let entries = all_integrations(&config);
-        let moonshot = entries.iter().find(|e| e.name == "Moonshot").unwrap();
-        assert!(matches!(moonshot.status, IntegrationStatus::Active));
-
-        config.providers.fallback = Some("qwen-intl".to_string());
-        let entries = all_integrations(&config);
-        let qwen = entries.iter().find(|e| e.name == "Qwen").unwrap();
-        assert!(matches!(qwen.status, IntegrationStatus::Active));
-
-        config.providers.fallback = Some("zai-cn".to_string());
-        let entries = all_integrations(&config);
-        let zai = entries.iter().find(|e| e.name == "Z.AI").unwrap();
-        assert!(matches!(zai.status, IntegrationStatus::Active));
-
-        config.providers.fallback = Some("baidu".to_string());
-        let entries = all_integrations(&config);
-        let qianfan = entries.iter().find(|e| e.name == "Qianfan").unwrap();
-        assert!(matches!(qianfan.status, IntegrationStatus::Active));
+        // For each multi-region family that uses
+        // `ProviderActivation::FallbackKeyMatches`, configuring a
+        // regional alias must mark the corresponding
+        // `ProviderInfo`-derived integration entry as Active. Looks the
+        // entry up by canonical name (not display_name) so display
+        // copy can change without breaking the contract.
+        let cases = [
+            ("minimax-cn", "minimax"),
+            ("glm-cn", "glm"),
+            ("moonshot-intl", "moonshot"),
+            ("qwen-intl", "qwen"),
+            ("zai-cn", "zai"),
+            ("baidu", "qianfan"),
+        ];
+        for (fallback_key, canonical) in cases {
+            let mut config = Config::default();
+            config.providers.fallback = Some(fallback_key.to_string());
+            let entries = all_integrations(&config);
+            let info = zeroclaw_providers::list_providers()
+                .into_iter()
+                .find(|p| p.name == canonical)
+                .unwrap_or_else(|| {
+                    panic!("ProviderInfo for canonical name {canonical:?} must exist")
+                });
+            let integration = entries
+                .iter()
+                .find(|e| e.name == info.display_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "integration entry for {canonical:?} (display {:?}) must exist",
+                        info.display_name,
+                    )
+                });
+            assert!(
+                matches!(integration.status, IntegrationStatus::Active),
+                "fallback {fallback_key:?} must activate {canonical:?} integration",
+            );
+        }
     }
 }
