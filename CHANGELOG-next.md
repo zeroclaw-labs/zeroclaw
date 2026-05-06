@@ -116,6 +116,7 @@
 
 - `SessionResetTool` and `SessionDeleteTool` for in-agent session management (#5696).
 - `SessionsCurrentTool` exposes the active session identity (#6033).
+- `sonos` tool — Sonos Control API client driven by a refresh-token OAuth flow. Read-only by default (`list_households`, `list_groups`, `get_playback_status`, `list_favorites`); operators opt into mutations (`play`, `pause`, `set_volume`, `play_favorite`) via `allowed_actions` (#6477).
 
 ### Plugins
 

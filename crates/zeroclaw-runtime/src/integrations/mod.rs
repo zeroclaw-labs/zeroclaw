@@ -148,6 +148,21 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    Supports city names, IATA airport codes, GPS coordinates,");
             println!("    postal/zip codes, and Unicode location names.");
         }
+        "Sonos" => {
+            println!("  Setup:");
+            println!("    1. Register an integration at https://developer.sonos.com/.");
+            println!("    2. Mint a refresh token (one-time external OAuth dance — see");
+            println!("       docs/book/src/tools/sonos.md for the recipe).");
+            println!("    3. Add to config:");
+            println!("       [sonos]");
+            println!("       enabled = true");
+            println!("       client_id = \"...\"");
+            println!("       client_secret = \"...\"  # or SONOS_CLIENT_SECRET");
+            println!("       refresh_token = \"...\" # or SONOS_REFRESH_TOKEN");
+            println!(
+                "    4. Default allowed_actions is read-only; add play/pause/etc to enable mutations."
+            );
+        }
         _ if entry.category == IntegrationCategory::Chat => {
             println!("  Setup:");
             println!("    Run: zeroclaw onboard --channels-only");
