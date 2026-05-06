@@ -385,6 +385,11 @@ pub struct Config {
     #[nested]
     pub jira: JiraConfig,
 
+    /// Spotify integration configuration (`[spotify]`).
+    #[serde(default)]
+    #[nested]
+    pub spotify: SpotifyConfig,
+
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     #[nested]
@@ -9316,6 +9321,99 @@ impl Default for JiraConfig {
     }
 }
 
+/// Spotify integration configuration (`[spotify]`).
+///
+/// When `enabled = true`, registers the `spotify` tool which can read
+/// playback state, list devices and playlists, search the catalogue,
+/// and (when allowed) drive playback (play/pause/skip/volume) via the
+/// Spotify Web API.
+///
+/// ## Defaults
+/// - `enabled`: `false`
+/// - `allowed_actions`: read-only set —
+///   `["get_playback_state", "list_devices", "list_playlists", "search"]`.
+///   Add any of `play`, `pause`, `next`, `previous`, `set_volume` to
+///   enable the matching mutation.
+/// - `request_timeout_secs`: `15`
+///
+/// ## Auth
+/// Refresh-token flow only — no embedded auth dance. The operator
+/// performs the one-time OAuth exchange externally (see the setup guide)
+/// and pastes the resulting `refresh_token` into config (or sets
+/// `SPOTIFY_REFRESH_TOKEN`). The tool exchanges the refresh token for a
+/// short-lived access token at startup and on `401`. `client_secret` and
+/// `refresh_token` are encrypted at rest when `[secrets] encrypt = true`.
+///
+/// Required scopes when minting the refresh token: `user-read-playback-state`,
+/// `user-modify-playback-state`, `playlist-read-private`, `user-read-currently-playing`.
+///
+/// Note: playback control (`play`, `pause`, `next`, `previous`,
+/// `set_volume`) requires Spotify Premium on the controlled account.
+/// The tool surfaces upstream `403`s verbatim when the account is Free.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "spotify"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Spotify",
+    description = "Music playback control",
+    status_field = "enabled"
+)]
+pub struct SpotifyConfig {
+    /// Enable the `spotify` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Spotify developer-portal application client ID.
+    #[serde(default)]
+    pub client_id: String,
+    /// Spotify developer-portal application client secret. Encrypted at
+    /// rest. Falls back to `SPOTIFY_CLIENT_SECRET` env var.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub client_secret: String,
+    /// Refresh token minted via the one-time OAuth flow. Encrypted at
+    /// rest. Falls back to `SPOTIFY_REFRESH_TOKEN` env var.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub refresh_token: String,
+    /// Actions the agent is permitted to invoke. Read actions
+    /// (`get_playback_state`, `list_devices`, `list_playlists`, `search`)
+    /// must be present here too — empty list disables the tool entirely.
+    #[serde(default = "default_spotify_allowed_actions")]
+    pub allowed_actions: Vec<String>,
+    /// Request timeout in seconds. Default: `15`.
+    #[serde(default = "default_spotify_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_spotify_allowed_actions() -> Vec<String> {
+    vec![
+        "get_playback_state".into(),
+        "list_devices".into(),
+        "list_playlists".into(),
+        "search".into(),
+    ]
+}
+
+fn default_spotify_timeout_secs() -> u64 {
+    15
+}
+
+impl Default for SpotifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            client_id: String::new(),
+            client_secret: String::new(),
+            refresh_token: String::new(),
+            allowed_actions: default_spotify_allowed_actions(),
+            request_timeout_secs: default_spotify_timeout_secs(),
+        }
+    }
+}
+
 ///
 /// Controls the read-only cloud transformation analysis tools:
 /// IaC review, migration assessment, cost analysis, and architecture review.
@@ -9634,6 +9732,7 @@ impl Default for Config {
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            spotify: SpotifyConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -12595,6 +12694,7 @@ auto_save = true
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            spotify: SpotifyConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -13166,6 +13266,7 @@ default_temperature = 0.7
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            spotify: SpotifyConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),

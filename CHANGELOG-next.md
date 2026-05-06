@@ -116,6 +116,7 @@
 
 - `SessionResetTool` and `SessionDeleteTool` for in-agent session management (#5696).
 - `SessionsCurrentTool` exposes the active session identity (#6033).
+- `spotify` tool — Spotify Web API client driven by a refresh-token OAuth flow. Read-only by default (`get_playback_state`, `list_devices`, `list_playlists`, `search`); operators opt into mutations (`play`, `pause`, `next`, `previous`, `set_volume`) via `allowed_actions`. Premium required for control (#6475).
 
 ### Plugins
 
