@@ -1146,6 +1146,7 @@ mod tests {
             mention_only: Some(false),
             interrupt_on_new_message: false,
             proxy_url: None,
+            reply_min_interval_secs: 0,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -1189,6 +1190,7 @@ mod tests {
             send_method: None,
             auth_header: None,
             secret: None,
+            reply_min_interval_secs: 0,
         });
         assert!(has_supervised_channels(&config));
     }

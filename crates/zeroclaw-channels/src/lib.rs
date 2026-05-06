@@ -1,6 +1,7 @@
 //! Channel implementations and orchestration for messaging platform integrations.
 
 pub mod orchestrator;
+pub mod paced_channel;
 pub mod util;
 
 // Always-compiled channels and utilities (no feature gate)

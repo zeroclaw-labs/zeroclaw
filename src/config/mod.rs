@@ -98,6 +98,7 @@ mod tests {
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
+            reply_min_interval_secs: 0,
         };
 
         let lark = LarkConfig {

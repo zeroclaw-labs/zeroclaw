@@ -904,6 +904,7 @@ mod tests {
         config.channels.imessage = Some(IMessageConfig {
             enabled: true,
             allowed_contacts: vec!["*".into()],
+            reply_min_interval_secs: 0,
         });
         let entries = all_integrations();
         let im = entries.iter().find(|e| e.name == "iMessage").unwrap();
@@ -942,6 +943,7 @@ mod tests {
             approval_timeout_secs: 300,
             reply_in_thread: true,
             ack_reactions: true,
+            reply_min_interval_secs: 0,
         });
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();
