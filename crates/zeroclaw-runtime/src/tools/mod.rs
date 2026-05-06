@@ -102,6 +102,7 @@ pub use zeroclaw_tools::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
 };
+pub use zeroclaw_tools::sonos::SonosTool;
 pub use zeroclaw_tools::swarm::SwarmTool;
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
@@ -599,6 +600,42 @@ pub fn all_tools_with_runtime(
                 root_config.jira.allowed_actions.clone(),
                 security.clone(),
                 root_config.jira.timeout_secs,
+            )));
+        }
+    }
+
+    // Sonos integration (config-gated)
+    if root_config.sonos.enabled {
+        let client_id = if root_config.sonos.client_id.trim().is_empty() {
+            std::env::var("SONOS_CLIENT_ID").unwrap_or_default()
+        } else {
+            root_config.sonos.client_id.trim().to_string()
+        };
+        let client_secret = if root_config.sonos.client_secret.trim().is_empty() {
+            std::env::var("SONOS_CLIENT_SECRET").unwrap_or_default()
+        } else {
+            root_config.sonos.client_secret.trim().to_string()
+        };
+        let refresh_token = if root_config.sonos.refresh_token.trim().is_empty() {
+            std::env::var("SONOS_REFRESH_TOKEN").unwrap_or_default()
+        } else {
+            root_config.sonos.refresh_token.trim().to_string()
+        };
+        if client_id.trim().is_empty()
+            || client_secret.trim().is_empty()
+            || refresh_token.trim().is_empty()
+        {
+            tracing::warn!(
+                "sonos: enabled but missing one of client_id, client_secret, refresh_token (or their SONOS_* env vars) — skipping registration"
+            );
+        } else {
+            tool_arcs.push(Arc::new(SonosTool::new(
+                client_id,
+                client_secret,
+                refresh_token,
+                root_config.sonos.allowed_actions.clone(),
+                root_config.sonos.request_timeout_secs,
+                security.clone(),
             )));
         }
     }

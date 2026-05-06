@@ -385,6 +385,11 @@ pub struct Config {
     #[nested]
     pub jira: JiraConfig,
 
+    /// Sonos integration configuration (`[sonos]`).
+    #[serde(default)]
+    #[nested]
+    pub sonos: SonosConfig,
+
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     #[nested]
@@ -9316,6 +9321,97 @@ impl Default for JiraConfig {
     }
 }
 
+/// Sonos integration configuration (`[sonos]`).
+///
+/// When `enabled = true`, registers the `sonos` tool which can list
+/// households, groups, and favorites, read playback state, and (when
+/// allowed) drive playback (play/pause/set_volume/play_favorite) via
+/// the official Sonos Control API at `api.ws.sonos.com`.
+///
+/// ## Defaults
+/// - `enabled`: `false`
+/// - `allowed_actions`: read-only set —
+///   `["list_households", "list_groups", "get_playback_status", "list_favorites"]`.
+///   Add any of `play`, `pause`, `set_volume`, `play_favorite` to enable
+///   the matching mutation.
+/// - `request_timeout_secs`: `15`
+///
+/// ## Auth
+/// Refresh-token flow only — no embedded auth dance. The operator
+/// performs the one-time OAuth exchange externally (see the setup guide)
+/// and pastes the resulting `refresh_token` into config (or sets
+/// `SONOS_REFRESH_TOKEN`). The tool exchanges the refresh token for a
+/// short-lived access token via `https://api.sonos.com/login/v3/oauth/access`,
+/// caches it in memory, and refreshes on `401` or when within 60s of
+/// expiry. `client_secret` and `refresh_token` are encrypted at rest
+/// when `[secrets] encrypt = true`.
+///
+/// Required scope when minting the refresh token: `playback-control-all`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "sonos"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Sonos",
+    description = "Multi-room audio control",
+    status_field = "enabled"
+)]
+pub struct SonosConfig {
+    /// Enable the `sonos` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Sonos developer-portal application client ID.
+    #[serde(default)]
+    pub client_id: String,
+    /// Sonos developer-portal application client secret. Encrypted at
+    /// rest. Falls back to `SONOS_CLIENT_SECRET` env var.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub client_secret: String,
+    /// Refresh token minted via the one-time OAuth flow. Encrypted at
+    /// rest. Falls back to `SONOS_REFRESH_TOKEN` env var.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub refresh_token: String,
+    /// Actions the agent is permitted to invoke. Read actions
+    /// (`list_households`, `list_groups`, `get_playback_status`,
+    /// `list_favorites`) must be present here too — empty list disables
+    /// the tool entirely.
+    #[serde(default = "default_sonos_allowed_actions")]
+    pub allowed_actions: Vec<String>,
+    /// Request timeout in seconds. Default: `15`.
+    #[serde(default = "default_sonos_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_sonos_allowed_actions() -> Vec<String> {
+    vec![
+        "list_households".into(),
+        "list_groups".into(),
+        "get_playback_status".into(),
+        "list_favorites".into(),
+    ]
+}
+
+fn default_sonos_timeout_secs() -> u64 {
+    15
+}
+
+impl Default for SonosConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            client_id: String::new(),
+            client_secret: String::new(),
+            refresh_token: String::new(),
+            allowed_actions: default_sonos_allowed_actions(),
+            request_timeout_secs: default_sonos_timeout_secs(),
+        }
+    }
+}
+
 ///
 /// Controls the read-only cloud transformation analysis tools:
 /// IaC review, migration assessment, cost analysis, and architecture review.
@@ -9634,6 +9730,7 @@ impl Default for Config {
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            sonos: SonosConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -12595,6 +12692,7 @@ auto_save = true
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            sonos: SonosConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -13166,6 +13264,7 @@ default_temperature = 0.7
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            sonos: SonosConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
