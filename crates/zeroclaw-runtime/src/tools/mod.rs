@@ -67,6 +67,7 @@ pub use zeroclaw_tools::google_workspace::GoogleWorkspaceTool;
 pub use zeroclaw_tools::hardware_board_info::HardwareBoardInfoTool;
 pub use zeroclaw_tools::hardware_memory_map::HardwareMemoryMapTool;
 pub use zeroclaw_tools::hardware_memory_read::HardwareMemoryReadTool;
+pub use zeroclaw_tools::home_assistant::HomeAssistantTool;
 pub use zeroclaw_tools::http_request::HttpRequestTool;
 pub use zeroclaw_tools::image_gen::ImageGenTool;
 pub use zeroclaw_tools::image_info::ImageInfoTool;
@@ -599,6 +600,32 @@ pub fn all_tools_with_runtime(
                 root_config.jira.allowed_actions.clone(),
                 security.clone(),
                 root_config.jira.timeout_secs,
+            )));
+        }
+    }
+
+    // Home Assistant integration (config-gated)
+    if root_config.home_assistant.enabled {
+        let access_token = if root_config.home_assistant.access_token.trim().is_empty() {
+            std::env::var("HOME_ASSISTANT_TOKEN").unwrap_or_default()
+        } else {
+            root_config.home_assistant.access_token.trim().to_string()
+        };
+        if access_token.trim().is_empty() {
+            tracing::warn!(
+                "home_assistant: enabled but no access token found (set home_assistant.access_token or HOME_ASSISTANT_TOKEN env var) — skipping registration"
+            );
+        } else if root_config.home_assistant.base_url.trim().is_empty() {
+            tracing::warn!(
+                "home_assistant: enabled but home_assistant.base_url is empty — skipping registration"
+            );
+        } else {
+            tool_arcs.push(Arc::new(HomeAssistantTool::new(
+                root_config.home_assistant.base_url.trim().to_string(),
+                access_token,
+                root_config.home_assistant.allowed_domains.clone(),
+                root_config.home_assistant.request_timeout_secs,
+                security.clone(),
             )));
         }
     }
