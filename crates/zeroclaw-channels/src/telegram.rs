@@ -923,6 +923,20 @@ impl TelegramChannel {
         !Self::find_bot_mention_spans(text, bot_username).is_empty()
     }
 
+    fn is_reply_to_bot_message(message: &serde_json::Value, bot_username: &str) -> bool {
+        let reply = match message.get("reply_to_message") {
+            Some(reply) => reply,
+            None => return false,
+        };
+
+        reply
+            .get("from")
+            .and_then(|from| from.get("username"))
+            .and_then(serde_json::Value::as_str)
+            .map(|username| username.eq_ignore_ascii_case(bot_username.trim_start_matches('@')))
+            .unwrap_or(false)
+    }
+
     fn normalize_incoming_content(text: &str, bot_username: &str) -> Option<String> {
         let spans = Self::find_bot_mention_spans(text, bot_username);
         if spans.is_empty() {
@@ -1631,10 +1645,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let is_group = Self::is_group_message(message);
+        let mut has_bot_mention = false;
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             if let Some(ref bot_username) = *bot_username {
-                if !Self::contains_bot_mention(text, bot_username) {
+                has_bot_mention = Self::contains_bot_mention(text, bot_username);
+                if !has_bot_mention && !Self::is_reply_to_bot_message(message, bot_username) {
                     return None;
                 }
             } else {
@@ -1669,7 +1685,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let content = if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
-            Self::normalize_incoming_content(text, bot_username)?
+            if has_bot_mention {
+                Self::normalize_incoming_content(text, bot_username)?
+            } else {
+                text.to_string()
+            }
         } else {
             text.to_string()
         };
@@ -4318,6 +4338,32 @@ mod tests {
     }
 
     #[test]
+    fn telegram_is_reply_to_bot_message_matches_username_case_insensitively() {
+        let message = serde_json::json!({
+            "reply_to_message": {
+                "from": {
+                    "username": "MyBot"
+                }
+            }
+        });
+
+        assert!(TelegramChannel::is_reply_to_bot_message(&message, "mybot"));
+    }
+
+    #[test]
+    fn telegram_is_reply_to_bot_message_rejects_other_senders() {
+        let message = serde_json::json!({
+            "reply_to_message": {
+                "from": {
+                    "username": "otherbot"
+                }
+            }
+        });
+
+        assert!(!TelegramChannel::is_reply_to_bot_message(&message, "mybot"));
+    }
+
+    #[test]
     fn telegram_normalize_incoming_content_strips_mention() {
         let result = TelegramChannel::normalize_incoming_content("@mybot hello", "mybot");
         assert_eq!(result, Some("hello".to_string()));
@@ -4408,6 +4454,162 @@ mod tests {
         });
 
         assert!(ch.parse_update_message(&empty_update).is_none());
+    }
+
+    #[test]
+    fn parse_update_message_mention_only_group_accepts_reply_to_bot_without_mention() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 13,
+            "message": {
+                "message_id": 47,
+                "text": "can you expand on that?",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100_200_300,
+                    "type": "group"
+                },
+                "reply_to_message": {
+                    "message_id": 46,
+                    "from": {
+                        "id": 999,
+                        "username": "mybot"
+                    },
+                    "text": "previous bot reply"
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("reply to bot should parse");
+        assert_eq!(parsed.reply_target, "-100200300");
+        assert!(parsed.content.contains("> @mybot:"));
+        assert!(parsed.content.contains("previous bot reply"));
+        assert!(parsed.content.contains("can you expand on that?"));
+    }
+
+    #[test]
+    fn parse_update_message_mention_only_group_reply_to_bot_keeps_same_topic() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 16,
+            "message": {
+                "message_id": 50,
+                "text": "follow up in topic",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100_200_300,
+                    "type": "supergroup"
+                },
+                "message_thread_id": 789,
+                "reply_to_message": {
+                    "message_id": 49,
+                    "from": {
+                        "id": 999,
+                        "username": "mybot"
+                    },
+                    "text": "bot topic reply"
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("topic reply to bot should parse");
+        assert_eq!(parsed.reply_target, "-100200300:789");
+        assert_eq!(parsed.thread_ts.as_deref(), Some("789"));
+        assert!(parsed.content.contains("bot topic reply"));
+        assert!(parsed.content.contains("follow up in topic"));
+    }
+
+    #[test]
+    fn parse_update_message_mention_only_group_keeps_replied_text_without_mention_stripping() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 14,
+            "message": {
+                "message_id": 48,
+                "text": "status for @otherbot please",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100_200_300,
+                    "type": "group"
+                },
+                "reply_to_message": {
+                    "message_id": 47,
+                    "from": {
+                        "id": 999,
+                        "username": "mybot"
+                    },
+                    "text": "previous bot reply"
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("reply to bot should parse");
+        assert!(parsed.content.contains("status for @otherbot please"));
+    }
+
+    #[test]
+    fn parse_update_message_mention_only_group_drops_reply_to_other_user_without_mention() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 15,
+            "message": {
+                "message_id": 49,
+                "text": "can you help?",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100_200_300,
+                    "type": "group"
+                },
+                "reply_to_message": {
+                    "message_id": 48,
+                    "from": {
+                        "id": 777,
+                        "username": "bob"
+                    },
+                    "text": "other user message"
+                }
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_none());
     }
 
     #[test]
