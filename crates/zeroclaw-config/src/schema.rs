@@ -8610,7 +8610,6 @@ pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     pub hint: String,
     /// Model provider to route to (must match a known model-provider name)
-    #[serde(alias = "provider")]
     pub model_provider: String,
     /// Model to use with that model provider
     pub model: String,
@@ -8639,7 +8638,6 @@ pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
     pub hint: String,
     /// Embedding-capable model provider (`none`, `openai`, or `custom:<url>`)
-    #[serde(alias = "provider")]
     pub model_provider: String,
     /// Embedding model to use with that model provider
     pub model: String,

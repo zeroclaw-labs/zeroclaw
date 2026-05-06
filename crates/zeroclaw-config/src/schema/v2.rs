@@ -281,6 +281,15 @@ impl V2Config {
             new_providers.insert("models".to_string(), toml::Value::Table(aliased_models));
         }
 
+        // 6'. T13: route-array `provider` → `model_provider` field rename.
+        //     V2 spelled the routing target as `provider` on
+        //     [[providers.model_routes]] and [[providers.embedding_routes]];
+        //     V3 spells it `model_provider` so the qualifier disambiguates
+        //     from TTS / transcription providers. The runtime serde alias was
+        //     stripped, so the rename has to land at migration time.
+        rename_route_provider_field(&mut new_providers, "model_routes");
+        rename_route_provider_field(&mut new_providers, "embedding_routes");
+
         // 6a. T8: TTS subsystem promotion — V2 `[tts.<type>]` per-provider
         //     blocks → V3 `[providers.tts.<type>.<alias>]`. The bare
         //     `tts.default_provider = "openai"` scalar gets rewritten as
@@ -1668,6 +1677,42 @@ fn fold_v2_transcription_into_providers(
 ///   maps the fields directly).
 ///
 /// `[memory.sqlite_open_timeout_secs]` is dropped (V3 moved it onto
+/// Rename the `provider` field to `model_provider` in each entry of
+/// `providers.<routes_key>` (used for `model_routes` and `embedding_routes`).
+/// V2 spelled the routing target as `provider`; V3 spells it `model_provider`.
+/// The runtime serde alias was eradicated so this rename has to land at
+/// migration time. If `provider` is missing the entry is left untouched —
+/// it is already V3-shaped, dropped, or invalid in a way validation will
+/// catch.
+fn rename_route_provider_field(new_providers: &mut toml::Table, routes_key: &str) {
+    let Some(toml::Value::Array(routes)) = new_providers.get_mut(routes_key) else {
+        return;
+    };
+    let mut renamed = 0usize;
+    for entry in routes.iter_mut() {
+        let toml::Value::Table(t) = entry else {
+            continue;
+        };
+        if t.contains_key("model_provider") {
+            // Already V3-shaped (operator wrote `model_provider` directly,
+            // or migration ran twice). Drop a stray `provider` if present
+            // so downstream serde doesn't trip on an unknown field.
+            t.remove("provider");
+            continue;
+        }
+        if let Some(value) = t.remove("provider") {
+            t.insert("model_provider".to_string(), value);
+            renamed += 1;
+        }
+    }
+    if renamed > 0 {
+        tracing::info!(
+            target: "migration",
+            "[providers.{routes_key}] {renamed} entry/entries: `provider` field renamed to `model_provider`"
+        );
+    }
+}
+
 /// `SqliteStorageConfig.open_timeout_secs`).
 ///
 /// Existing V3-shaped fields take precedence over the legacy fold (so a

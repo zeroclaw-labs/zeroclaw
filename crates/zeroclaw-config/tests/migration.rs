@@ -1151,3 +1151,111 @@ group_id = "dm"
         "the \"dm\" sentinel must NOT also land in group_ids[]"
     );
 }
+
+// ─────────────────────────────────────────────────────────────
+// model_routes / embedding_routes — V2 spelled the routing target
+// as `provider`, V3 as `model_provider`. The runtime serde alias was
+// removed; the rename has to happen at migration time.
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn v2_model_routes_provider_field_renamed_to_model_provider() {
+    let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "openai"
+default_model = "gpt-4o"
+
+[[providers.model_routes]]
+hint = "vision"
+provider = "openai"
+model = "gpt-4-vision"
+
+[[providers.model_routes]]
+hint = "fast"
+provider = "groq"
+model = "llama-3.1-8b-instant"
+
+[agents.default]
+model_provider = "openai.default"
+"#;
+    let cfg = migrate_to_current(raw).expect("V2 model_routes migrate");
+    let vision = cfg
+        .providers
+        .model_routes
+        .iter()
+        .find(|r| r.hint == "vision")
+        .expect("vision route");
+    assert_eq!(vision.model_provider, "openai");
+    assert_eq!(vision.model, "gpt-4-vision");
+
+    let fast = cfg
+        .providers
+        .model_routes
+        .iter()
+        .find(|r| r.hint == "fast")
+        .expect("fast route");
+    assert_eq!(fast.model_provider, "groq");
+    assert_eq!(fast.model, "llama-3.1-8b-instant");
+}
+
+#[test]
+fn v2_embedding_routes_provider_field_renamed_to_model_provider() {
+    let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "openai"
+default_model = "gpt-4o"
+
+[[providers.embedding_routes]]
+hint = "semantic"
+provider = "openai"
+model = "text-embedding-3-small"
+dimensions = 1536
+
+[agents.default]
+model_provider = "openai.default"
+"#;
+    let cfg = migrate_to_current(raw).expect("V2 embedding_routes migrate");
+    let semantic = cfg
+        .providers
+        .embedding_routes
+        .iter()
+        .find(|r| r.hint == "semantic")
+        .expect("semantic route");
+    assert_eq!(semantic.model_provider, "openai");
+    assert_eq!(semantic.model, "text-embedding-3-small");
+    assert_eq!(semantic.dimensions, Some(1536));
+}
+
+#[test]
+fn v2_route_rename_idempotent_when_already_v3() {
+    // An operator who already wrote `model_provider` directly (or migration
+    // ran twice) must end up with the V3 field unchanged and no stray
+    // `provider` key floating around.
+    let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "openai"
+default_model = "gpt-4o"
+
+[[providers.model_routes]]
+hint = "vision"
+model_provider = "openai"
+model = "gpt-4-vision"
+
+[agents.default]
+model_provider = "openai.default"
+"#;
+    let cfg = migrate_to_current(raw).expect("idempotent V3-shaped routes migrate");
+    let vision = cfg
+        .providers
+        .model_routes
+        .iter()
+        .find(|r| r.hint == "vision")
+        .expect("vision route");
+    assert_eq!(vision.model_provider, "openai");
+}
