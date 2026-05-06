@@ -734,6 +734,8 @@ pub struct ProviderRuntimeOptions {
     /// Enable or disable chain-of-thought thinking. Forwarded as
     /// `enable_thinking` in the request body. `None` lets the model decide.
     pub think: Option<bool>,
+    /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
+    pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -754,6 +756,7 @@ impl Default for ProviderRuntimeOptions {
             native_tools: None,
             wire_api: None,
             think: None,
+            chat_template_kwargs: None,
         }
     }
 }
@@ -800,6 +803,7 @@ pub fn provider_runtime_options_from_config(
         native_tools: fallback.and_then(|e| e.native_tools),
         wire_api: fallback.and_then(|e| e.wire_api.clone()),
         think: fallback.and_then(|e| e.think),
+        chat_template_kwargs: fallback.and_then(|e| e.chat_template_kwargs.clone()),
     }
 }
 
@@ -1547,6 +1551,9 @@ fn create_provider_with_url_and_options(
             }
             if options.think.is_some() {
                 provider = provider.with_think(options.think);
+            }
+            if options.chat_template_kwargs.is_some() {
+                provider = provider.with_chat_template_kwargs(options.chat_template_kwargs.clone());
             }
             Ok(Box::new(provider))
         }

@@ -16,7 +16,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::warn;
+use tracing::{debug, warn};
 
 // ── Request / response structs ──────────────────────────────────────────────
 
@@ -34,6 +34,12 @@ struct ResponsesRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    // Passes enable_thinking into the Jinja chat template — the top-level
+    // enable_thinking field is not read by llama.cpp's responses endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +79,10 @@ pub struct LlamaCppProvider {
     timeout_secs: u64,
     extra_headers: HashMap<String, String>,
     max_tokens: Option<u32>,
+    /// Passed verbatim as `chat_template_kwargs` in the request body.
+    /// Users set model-specific template variables here (e.g. `{"enable_thinking": false}`
+    /// for Qwen3, or whatever the template expects for other model families).
+    chat_template_kwargs: Option<serde_json::Value>,
 }
 
 impl LlamaCppProvider {
@@ -84,6 +94,7 @@ impl LlamaCppProvider {
             timeout_secs: 120,
             extra_headers: HashMap::new(),
             max_tokens: None,
+            chat_template_kwargs: None,
         }
     }
 
@@ -104,6 +115,11 @@ impl LlamaCppProvider {
 
     pub fn with_extra_headers(mut self, headers: HashMap<String, String>) -> Self {
         self.extra_headers = headers;
+        self
+    }
+
+    pub fn with_chat_template_kwargs(mut self, kwargs: Option<serde_json::Value>) -> Self {
+        self.chat_template_kwargs = kwargs;
         self
     }
 
@@ -230,10 +246,15 @@ impl LlamaCppProvider {
         temperature: Option<f64>,
         tools: Option<Vec<serde_json::Value>>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let (instructions, input) = build_prompt(messages);
+        let (raw_instructions, input) = build_prompt(messages);
         if input.is_empty() {
             anyhow::bail!("llama.cpp: at least one non-system message is required");
         }
+        let instructions = if tools.as_ref().is_some_and(|t| !t.is_empty()) {
+            strip_tools_section(raw_instructions)
+        } else {
+            raw_instructions
+        };
         let request = ResponsesRequest {
             model: model.to_string(),
             input,
@@ -242,6 +263,8 @@ impl LlamaCppProvider {
             temperature: Some(temperature.unwrap_or(self.default_temperature())),
             tools,
             enable_thinking: self.think,
+            max_output_tokens: self.max_tokens,
+            chat_template_kwargs: self.chat_template_kwargs.clone(),
         };
         let url = self.responses_url();
         let response = self
@@ -264,7 +287,7 @@ impl LlamaCppProvider {
         tools: Option<Vec<serde_json::Value>>,
         count_tokens: bool,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-        let (instructions, input) = build_prompt(&messages);
+        let (raw_instructions, input) = build_prompt(&messages);
         if input.is_empty() {
             return stream::once(async {
                 Err(StreamError::Provider(
@@ -273,6 +296,11 @@ impl LlamaCppProvider {
             })
             .boxed();
         }
+        let instructions = if tools.as_ref().is_some_and(|t| !t.is_empty()) {
+            strip_tools_section(raw_instructions)
+        } else {
+            raw_instructions
+        };
         let req_body = ResponsesRequest {
             model: model.to_string(),
             input,
@@ -281,11 +309,31 @@ impl LlamaCppProvider {
             temperature: Some(temperature.unwrap_or(self.default_temperature())),
             tools,
             enable_thinking: self.think,
+            max_output_tokens: self.max_tokens,
+            chat_template_kwargs: self.chat_template_kwargs.clone(),
         };
         let payload = match serde_json::to_value(req_body) {
             Ok(p) => p,
             Err(e) => return stream::once(async move { Err(StreamError::Json(e)) }).boxed(),
         };
+        let payload_bytes = payload.to_string().len();
+        let instructions_bytes = payload
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .map(str::len)
+            .unwrap_or(0);
+        let tools_bytes = payload
+            .get("tools")
+            .map(|v| v.to_string().len())
+            .unwrap_or(0);
+        let input_bytes = payload
+            .get("input")
+            .map(|v| v.to_string().len())
+            .unwrap_or(0);
+        debug!(
+            "llama.cpp stream request payload size={payload_bytes} bytes \
+             (instructions={instructions_bytes}, tools={tools_bytes}, input={input_bytes})"
+        );
         let url = self.responses_url();
         let client = self.streaming_http_client();
         let credential = self.credential.clone();
@@ -483,6 +531,35 @@ impl Provider for LlamaCppProvider {
 
 // ── Prompt builder ──────────────────────────────────────────────────────────
 
+/// Remove the `## Tools` section from the system prompt when tools are already
+/// sent as structured data in the request body. The section contains full JSON
+/// schemas for every tool, which can be hundreds of KB and is redundant when
+/// the model receives the same information via the `tools` field.
+fn strip_tools_section(instructions: Option<String>) -> Option<String> {
+    let s = instructions?;
+    // Match "## Tools\n" at start or after a newline.
+    let needle = "## Tools\n";
+    let (prefix, rest) = if let Some(rest) = s.strip_prefix(needle) {
+        ("", rest)
+    } else if let Some(pos) = s.find(&format!("\n{needle}")) {
+        (&s[..pos], &s[pos + 1 + needle.len()..])
+    } else {
+        return Some(s);
+    };
+    // Find the next top-level section header or end of string.
+    let suffix = if let Some(next) = rest.find("\n## ") {
+        &rest[next + 1..]
+    } else {
+        ""
+    };
+    let result = format!("{prefix}\n\n{suffix}").trim().to_string();
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
 fn build_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<serde_json::Value>) {
     let mut sys_parts: Vec<String> = Vec::new();
     let mut input: Vec<serde_json::Value> = Vec::new();
@@ -587,6 +664,7 @@ fn build_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<serde_json::Va
 // ── Response parser ─────────────────────────────────────────────────────────
 
 fn parse_response_body(body: &str) -> anyhow::Result<ProviderChatResponse> {
+    debug!("llama.cpp response body: {body}");
     let resp = serde_json::from_str::<ResponsesResponse>(body).map_err(|e| {
         let snippet: String = body.chars().take(200).collect();
         anyhow::anyhow!("llama.cpp responses API returned unexpected payload: {e}; body={snippet}")
@@ -611,6 +689,8 @@ fn parse_response_body(body: &str) -> anyhow::Result<ProviderChatResponse> {
                     });
                 }
             }
+            // Skip chain-of-thought reasoning items; the answer is in the message item.
+            Some("reasoning") => {}
             _ => {
                 if text.is_none() {
                     for content in &item.content {
@@ -718,23 +798,27 @@ fn parse_sse_responses(
                 };
 
                 let kind = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                debug!("llama.cpp SSE event type={kind:?}");
 
                 match kind {
                     "response.output_text.delta" => {
-                        if let Some(delta) = event
-                            .get("delta")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                        {
-                            let mut chunk = StreamChunk::delta(delta.to_string());
-                            if count_tokens {
-                                chunk = chunk.with_token_estimate();
+                        match event.get("delta").and_then(|v| v.as_str()) {
+                            Some(delta) if !delta.is_empty() => {
+                                let mut chunk = StreamChunk::delta(delta.to_string());
+                                if count_tokens {
+                                    chunk = chunk.with_token_estimate();
+                                }
+                                if tx.send(Ok(StreamEvent::TextDelta(chunk))).await.is_err() {
+                                    return;
+                                }
                             }
-                            if tx.send(Ok(StreamEvent::TextDelta(chunk))).await.is_err() {
-                                return;
-                            }
+                            _ => debug!("llama.cpp output_text.delta had no string delta: {event}"),
                         }
                     }
+                    // Chain-of-thought reasoning content — discard, wait for output_text.delta.
+                    "response.reasoning_text.delta"
+                    | "response.reasoning_summary_text.delta"
+                    | "response.reasoning.delta" => {}
                     "response.output_item.added" => {
                         if let Some(item) = event.get("item")
                             && item.get("type").and_then(|v| v.as_str()) == Some("function_call")
@@ -791,7 +875,7 @@ fn parse_sse_responses(
                         }
                     }
                     "response.completed" => break 'outer,
-                    _ => {}
+                    _ => debug!("llama.cpp unhandled SSE event type={kind:?} full={event}"),
                 }
             }
         }
@@ -848,4 +932,50 @@ fn text_chunks(
         let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
     });
     stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|c| (c, rx)) }).boxed()
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::strip_tools_section;
+
+    #[test]
+    fn strips_middle_section() {
+        let input =
+            "## Identity\n\nFoo.\n\n## Tools\n\n- **shell**: run things\n\n## Safety\n\nBar.";
+        let result = strip_tools_section(Some(input.to_string())).unwrap();
+        assert!(!result.contains("## Tools"), "Tools section should be gone");
+        assert!(
+            result.contains("## Identity"),
+            "Identity section should remain"
+        );
+        assert!(result.contains("## Safety"), "Safety section should remain");
+    }
+
+    #[test]
+    fn strips_leading_section() {
+        let input = "## Tools\n\n- **shell**: run things\n\n## Safety\n\nBar.";
+        let result = strip_tools_section(Some(input.to_string())).unwrap();
+        assert!(!result.contains("## Tools"));
+        assert!(result.contains("## Safety"));
+    }
+
+    #[test]
+    fn strips_trailing_section() {
+        let input = "## Identity\n\nFoo.\n\n## Tools\n\n- **shell**: run things";
+        let result = strip_tools_section(Some(input.to_string())).unwrap();
+        assert!(!result.contains("## Tools"));
+        assert!(result.contains("## Identity"));
+    }
+
+    #[test]
+    fn passthrough_when_no_tools_section() {
+        let input = "## Identity\n\nFoo.\n\n## Safety\n\nBar.";
+        let result = strip_tools_section(Some(input.to_string())).unwrap();
+        assert_eq!(result, input.trim());
+    }
+
+    #[test]
+    fn none_in_none_out() {
+        assert!(strip_tools_section(None).is_none());
+    }
 }

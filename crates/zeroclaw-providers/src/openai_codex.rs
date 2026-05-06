@@ -1146,6 +1146,7 @@ data: [DONE]
             provider_api_url: None,
             zeroclaw_dir: None,
             think: None,
+            chat_template_kwargs: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");

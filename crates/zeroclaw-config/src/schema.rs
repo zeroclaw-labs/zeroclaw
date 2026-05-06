@@ -626,6 +626,13 @@ pub struct ModelProviderConfig {
     /// in the request body; mirrors the Ollama provider's `think` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub think: Option<bool>,
+    /// Arbitrary key/value pairs forwarded verbatim as `chat_template_kwargs`
+    /// in the request body (llama.cpp-specific). Use this to pass model-family
+    /// template variables that control behaviour not exposed by other fields.
+    /// Example (Qwen3 thinking suppression):
+    ///   `chat_template_kwargs = { enable_thinking = false }`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
