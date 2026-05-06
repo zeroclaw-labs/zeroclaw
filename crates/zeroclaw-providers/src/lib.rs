@@ -753,7 +753,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
 /// Resolve `ModelProviderRuntimeOptions` from an agent's `model_provider` alias
 /// (`"<type>.<alias>"`). Falls back to `first_model_provider()` when the agent
 /// alias doesn't exist, doesn't have a `model_provider` set, or names a
-/// non-existent model_provider entry — preserving the conservative pre-V3
+/// non-existent model_provider entry — preserving the conservative legacy
 /// behavior so misconfigured callsites still get *something* instead of
 /// crashing the channel server. The fallback is logged so multi-alias
 /// users can spot misconfiguration.
@@ -992,7 +992,7 @@ fn resolve_model_provider_credential(
         }
     }
 
-    // Canonical family names only — V2 synonyms are collapsed by
+    // Canonical family names only — legacy synonyms are collapsed by
     // `normalize_model_provider_type` in `schema/v2.rs` before reaching the runtime.
     let provider_env_candidates: Vec<&str> = match name {
         "anthropic" => vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
@@ -1123,7 +1123,7 @@ fn check_api_key_prefix(model_provider_name: &str, key: &str) -> Option<&'static
     }
 }
 
-// `parse_custom_provider_url` was deleted in #6273. The V2 colon-URL form
+// `parse_custom_provider_url` was deleted in #6273. The legacy colon-URL form
 // (`custom:https://...` and `anthropic-custom:https://...`) is collapsed
 // at TOML load time by `normalize_model_provider_type` in `schema/v2.rs` into
 // `[providers.models.custom.<alias>] uri = "..."` (or
@@ -1145,7 +1145,7 @@ pub fn create_model_provider(
 /// The codex variant of the OpenAI family is selected by
 /// `options.requires_openai_auth` (set from the typed alias config in
 /// `provider_runtime_options_for_agent`), not by family-name string.
-/// Migration normalizes legacy V2 spellings (`"openai-codex"`,
+/// Migration normalizes legacy legacy spellings (`"openai-codex"`,
 /// `"openai_codex"`, `"codex"`) into `family = "openai"` + `alias = "codex"`
 /// with `requires_openai_auth = true`, so this dispatch is the only place
 /// codex is routed.
@@ -1245,7 +1245,7 @@ fn create_model_provider_with_url_and_options(
     }
 
     // The factory dispatches by canonical model model_provider family name only —
-    // V2 synonyms ("openai-codex", "azure-openai", "google", etc.) are
+    // legacy synonyms ("openai-codex", "azure-openai", "google", etc.) are
     // collapsed at TOML load time by `normalize_model_provider_type` in
     // `crates/zeroclaw-config/src/schema/v2.rs`. Multi-endpoint families
     // (moonshot/qwen/glm/minimax/zai) get their URI pre-resolved into
@@ -1763,7 +1763,7 @@ fn create_model_provider_with_url_and_options(
 
         // ── Bring Your Own ModelProvider (custom URL) ───────────
         // The `custom` family carries the URL on `base.uri`; migration writes
-        // V2's `[providers.models.custom:URL.default]` colon-URL form into
+        // legacy `[providers.models.custom:URL.default]` colon-URL form into
         // `[providers.models.custom.<alias>] uri = "URL"`. Operator must
         // set `uri` for the entry; pre-resolved into `resolved_url`.
         "custom" => {
@@ -1790,7 +1790,7 @@ fn create_model_provider_with_url_and_options(
         }
 
         _ => anyhow::bail!(
-            "Unknown model model_provider family: {name}. After the V2 to V3 typed-family migration, \
+            "Unknown model model_provider family: {name}. After the V2 to typed-family migration, \
              only canonical family names are valid. Run `zeroclaw onboard` to reconfigure, \
              or set `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` for \
              OpenAI-compatible custom endpoints."
@@ -2540,7 +2540,7 @@ mod tests {
     fn factory_openai_codex() {
         // Codex is now selected via the typed `requires_openai_auth` flag on
         // an `[providers.models.openai.codex]` alias entry, not via family
-        // name. Migration normalizes the V2 spellings ("openai-codex",
+        // name. Migration normalizes the legacy spellings ("openai-codex",
         // "openai_codex", "codex") into family = "openai" + alias = "codex"
         // with `requires_openai_auth = true`.
         let options = ModelProviderRuntimeOptions {
@@ -2786,7 +2786,7 @@ mod tests {
 
     #[test]
     fn factory_codex_dispatches_via_requires_openai_auth_flag() {
-        // Migration normalizes the V2 codex spellings ("codex", "openai-codex",
+        // Migration normalizes the legacy codex spellings ("codex", "openai-codex",
         // "openai_codex") into family = "openai" + alias = "codex" with
         // `requires_openai_auth = true`; the runtime selects the codex
         // implementation by inspecting the flag, not by family name.
@@ -2896,15 +2896,15 @@ mod tests {
 
     // ── Custom / BYOP model model_provider ─────────────────────────
     //
-    // The V2 colon-URL form ("custom:https://..." / "anthropic-custom:...")
-    // and its in-process URL parser were deleted in #6273. The V3 surface is
+    // The legacy colon-URL form ("custom:https://..." / "anthropic-custom:...")
+    // and its in-process URL parser were deleted in #6273. The surface is
     // `[providers.models.custom.<alias>] uri = "https://..."` for OpenAI-
     // compatible endpoints (or `[providers.models.anthropic.<alias>] uri = ...`
     // for Anthropic-compatible). URL validation now happens at schema-load
     // time in `crates/zeroclaw-config/src/schema.rs::validate`, not at runtime
     // construction; tests for that validation belong with the schema, not here.
     //
-    // Migration of legacy V2 colon-URL configs is exercised by the integration
+    // Migration of legacy colon-URL configs is exercised by the integration
     // tests in `crates/zeroclaw-config/tests/migration.rs`
     // (`anthropic_custom_colon_url_default_provider_folds_under_anthropic`,
     // `custom_colon_url_default_provider_splits_into_base_url`,
@@ -2979,7 +2979,7 @@ mod tests {
 
     #[test]
     fn factory_all_canonical_model_providers_create_successfully() {
-        // Canonical V3 family names only — V2 synonyms are collapsed by
+        // Canonical V3 family names only — legacy synonyms are collapsed by
         // `normalize_model_provider_type` in `schema/v2.rs` and never reach the
         // runtime. `azure` is excluded (typed-config required, see
         // `listed_model_providers_are_constructible` skip list); `custom` is

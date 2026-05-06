@@ -746,8 +746,8 @@ pub struct AzureModelProviderConfig {
     #[serde(flatten)]
     pub base: ModelProviderConfig,
     /// Azure resource name (the `<resource>` part of `<resource>.openai.azure.com`).
-    /// Accepts the legacy `azure_openai_resource` key on deserialize for V2
-    /// compatibility.
+    /// Accepts the legacy `azure_openai_resource` key on deserialize for
+    /// disk-key compatibility.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -842,7 +842,7 @@ pub struct MoonshotModelProviderConfig {
     #[serde(flatten)]
     pub base: ModelProviderConfig,
     /// Required: pick `cn`, `intl`, or `code`. Defaults to `intl` when omitted
-    /// to ease V3 transition; operators on the China endpoint should set
+    /// to ease transition; operators on the China endpoint should set
     /// `endpoint = "cn"` explicitly.
     #[serde(default)]
     pub endpoint: MoonshotEndpoint,
@@ -2493,7 +2493,7 @@ pub struct DelegateAgentConfig {
     pub cron_jobs: Vec<String>,
     /// TTS provider as a dotted alias reference (`<type>.<alias>`,
     /// e.g. `"openai.<alias>"`). Resolves through `providers.tts.<type>.<alias>`.
-    /// Empty = no TTS for this agent (V3 has no global default-provider concept;
+    /// Empty = no TTS for this agent (there is no global default-provider concept;
     /// every agent that wants TTS sets its own `tts_provider`).
     #[serde(default)]
     pub tts_provider: crate::providers::TtsProviderRef,
@@ -2501,13 +2501,13 @@ pub struct DelegateAgentConfig {
     /// (`<type>.<alias>`, e.g. `"groq.<alias>"`). Resolves through
     /// `providers.transcription.<type>.<alias>`. Empty = agent has no
     /// transcription preference; channels that ingest voice still need a
-    /// resolved provider (V3 has no global default), so an inbound voice
+    /// resolved provider (there is no global default), so an inbound voice
     /// flow into an agent with empty `transcription_provider` errors loudly
     /// at the channel boundary.
     #[serde(default)]
     pub transcription_provider: crate::providers::TranscriptionProviderRef,
 
-    // ── Agent loop / runtime tunables (folded from V2 `[agent]` ──────
+    // ── Agent loop / runtime tunables (folded from `[agent]` ──────
     // V3 makes these per-agent. Defaults preserve V2 behavior so an
     // unconfigured agent runs identically to the old global `[agent]`.
     /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
@@ -2630,7 +2630,7 @@ impl Config {
     ///
     /// Each agent's `risk_profile` field names a `[risk_profiles.<alias>]`
     /// entry that gates its actions. There is no "global" risk profile in
-    /// V3: every callsite must come through an agent. When the agent has
+    /// every callsite must come through an agent. When the agent has
     /// no profile set or names a missing entry, returns `None` and the
     /// caller decides how to handle it (validation rejects this shape at
     /// load time; the runtime treating `None` as a config error).
@@ -2874,7 +2874,7 @@ where
 /// `None`. Used by `JiraConfig::email` so a V2 config that round-tripped
 /// `email = ""` to disk (V2's `email: String` had no
 /// `skip_serializing_if`) doesn't migrate into V3 as `Some("")` and
-/// silently break Basic auth — V3 dropped the email-required validation
+/// silently break Basic auth — Removed the email-required validation
 /// when adding Server/DC Bearer-token support (#6116), so this is the
 /// last line of defense (#6266 review).
 fn deserialize_optional_email_skip_empty<'de, D>(
@@ -7828,7 +7828,7 @@ impl Default for WebhookAuditConfig {
 
 // ── Autonomy / Security ──────────────────────────────────────────
 //
-// V3: V2's global `[autonomy]` table is gone. All policy fields live on
+// V2's global `[autonomy]` table is gone. All policy fields live on
 // per-agent `[risk_profiles.<alias>]` entries (see `RiskProfileConfig`
 // below); the migration synthesizes `risk_profiles.default` from V2's
 // `[autonomy] + [security.sandbox] + [security.resources]` blocks.
@@ -8956,7 +8956,7 @@ impl<T: ChannelConfig> crate::traits::ConfigHandle for ConfigWrapper<T> {
 
 /// Top-level channel configurations (`[channels]` section).
 ///
-/// V3: each channel type is a keyed table of named instances (aliases).
+/// each channel type is a keyed table of named instances (aliases).
 /// `[channels.telegram.default]` is the conventional single-instance key.
 /// Access via `config.channels.telegram.get("default")`.
 #[allow(clippy::struct_excessive_bools)]
@@ -10509,7 +10509,7 @@ impl ChannelConfig for FeishuConfig {
 
 /// Security configuration for audit logging, OTP, e-stop, IAM/SSO, and WebAuthn.
 ///
-/// V3: V2's `[security.sandbox]` and `[security.resources]` subsections are
+/// V2's `[security.sandbox]` and `[security.resources]` subsections are
 /// gone. Sandbox backend and resource limits live on per-agent risk profiles
 /// (see `RiskProfileConfig::sandbox_*` and `RiskProfileConfig::max_*`); the
 /// runtime resolves them via `Config::active_risk_profile(agent_alias)`.
@@ -13344,7 +13344,7 @@ impl Config {
             // STT for this agent), which is valid. Non-empty values must
             // match a configured `[providers.<category>.<type>.<alias>]`
             // entry, fail loud with the dangling ref otherwise.
-            // V3 has no global default-X-provider concept — every consumer
+            // there is no global default-X-provider concept — every consumer
             // either picks a configured alias or opts out entirely.
             let typed_provider_refs: &[(&str, &str, &str)] = &[
                 ("providers.tts", "tts_provider", agent.tts_provider.trim()),
@@ -14558,7 +14558,7 @@ default_temperature = 0.7
         );
     }
 
-    /// V2 `[autonomy]` migrates onto `[risk_profiles.default]` via the V2→V3
+    /// `[autonomy]` migrates onto `[risk_profiles.default]` via the V2→V3
     /// migration. The fields must round-trip without being silently dropped.
     #[test]
     async fn v2_autonomy_section_migrates_onto_risk_profiles_default() {
@@ -14678,7 +14678,7 @@ auto_approve = ["weather", "file_read"]
     #[test]
     async fn provider_timeout_secs_parses_from_toml() {
         // V1 top-level `provider_timeout_secs` is folded into the
-        // synthesized model_provider entry's `timeout_secs` by V1→V2 migration.
+        // synthesized model_provider entry's `timeout_secs`.
         let raw = r#"
 default_temperature = 0.7
 provider_timeout_secs = 300
@@ -14764,7 +14764,7 @@ provider_timeout_secs = 300
     #[test]
     async fn extra_headers_parses_from_toml() {
         // V1 top-level `[extra_headers]` is folded into the synthesized
-        // default model_provider entry's `extra_headers` map by V1→V2 migration.
+        // default model_provider entry's `extra_headers` map.
         let raw = r#"
 default_temperature = 0.7
 
@@ -16356,9 +16356,9 @@ default_temperature = 0.7
     #[test]
     #[ignore = "pre-#6273 test asserts on flat-config behavior; rewrite in #6273 follow-up against typed family slots"]
     async fn toml_supports_model_provider_and_model_alias_fields() {
-        // V1 aliases: `model_provider` → `default_model_provider`,
+        // Serde aliases: `model_provider` → `default_model_provider`,
         // `model` → `default_model`. Both folded into the synthesized
-        // `[providers.models.<type>.default]` entry by V1→V2 migration.
+        // `[providers.models.<type>.default]` entry.
         let raw = r#"
 default_temperature = 0.7
 model_provider = "sub2api"
@@ -17199,7 +17199,7 @@ default_model = "persisted-profile"
     async fn validate_rejects_unpublished_jira_actions() {
         // Restored from upstream's #6116 (Jira API v2 server mode). The
         // validation logic at `Config::validate -> jira.allowed_actions`
-        // exists in V3 unchanged; this test was dropped during the
+        // exists unchanged; this test was dropped during the
         // upstream/master merge resolution alongside the env_override
         // tests that were intentionally deleted with `apply_env_overrides()`.
         // It's V3-compatible — restoring (#6266 review).
@@ -17932,7 +17932,7 @@ require_otp_to_resume = true
 
     // The two `validate_*_transcription_default_provider` tests were removed
     // alongside the deleted `TranscriptionConfig.default_transcription_provider`
-    // field in #6273. V3 has no global default-provider concept; the equivalent
+    // field in #6273. there is no global default-provider concept; the equivalent
     // dangling-reference enforcement now lives on the per-agent
     // `agent.transcription_provider` field (see
     // `Config::validate()` checks for `tts_provider` / `transcription_provider`).

@@ -121,12 +121,11 @@ impl ModelSwitchTool {
             }
         };
 
-        // Validate the model_provider exists.
-        // V2 colon-URL forms ("custom:https://..." and "anthropic-custom:...")
-        // are collapsed at TOML load by `normalize_model_provider_type` in
-        // `schema/v2.rs` into the typed `custom` family slot, so the runtime
-        // only sees canonical model-model_provider names. Validate against the
-        // static catalog directly.
+        // Validate the model_provider exists. Legacy colon-URL forms
+        // ("custom:https://..." and "anthropic-custom:...") are collapsed at
+        // TOML load by `normalize_model_provider_type` in `schema/v2.rs` into
+        // the typed `custom` family slot, so the runtime only sees canonical
+        // model-provider names. Validate against the static catalog directly.
         let known_model_providers = zeroclaw_providers::list_model_providers();
         let model_provider_valid = known_model_providers
             .iter()

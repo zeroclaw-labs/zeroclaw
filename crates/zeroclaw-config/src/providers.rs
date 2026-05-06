@@ -230,7 +230,7 @@ macro_rules! emit_model_providers_struct {
     ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
         /// Typed model-model_provider container — one slot per canonical model_provider type.
         ///
-        /// Replaces the V3 `HashMap<String, HashMap<String, ModelProviderConfig>>`
+        /// Replaces the `HashMap<String, HashMap<String, ModelProviderConfig>>`
         /// with a typed struct so each family's per-alias map carries its own
         /// typed config (with the family's `*Endpoint` enum and family-specific
         /// extras visible at the type level).
@@ -572,7 +572,7 @@ impl TranscriptionProviders {
 #[prefix = "model_providers"]
 pub struct ProvidersConfig {
     /// Named model model_provider profiles: outer key = model_provider type, inner key = user alias.
-    /// V3 shape: `[providers.models.<type>.<alias>]` e.g. `[providers.models.anthropic.default]`.
+    /// Shape: `[providers.models.<type>.<alias>]` e.g. `[providers.models.anthropic.default]`.
     /// Typed via `ModelProviders` — every model_provider type has its own typed slot
     /// carrying the family's `*Endpoint` enum and family-specific extras.
     #[serde(default)]
@@ -580,7 +580,7 @@ pub struct ProvidersConfig {
     pub models: ModelProviders,
 
     /// Named TTS provider profiles: outer key = provider family, inner key = user alias.
-    /// V3 shape: `[providers.tts.<type>.<alias>]` e.g. `[providers.tts.openai.<alias>]`.
+    /// Shape: `[providers.tts.<type>.<alias>]` e.g. `[providers.tts.openai.<alias>]`.
     /// Mirrors `models` with the typed-family split: each TTS family has its
     /// own slot carrying its `*TtsEndpoint` enum.
     #[serde(default)]
@@ -588,7 +588,7 @@ pub struct ProvidersConfig {
     pub tts: TtsProviders,
 
     /// Named transcription / STT provider profiles: outer key = provider family,
-    /// inner key = user alias. V3 shape:
+    /// inner key = user alias. Shape:
     /// `[providers.transcription.<type>.<alias>]` e.g.
     /// `[providers.transcription.groq.<alias>]`. Six family slots: `groq`,
     /// `openai`, `deepgram`, `assemblyai`, `google`, `local_whisper`.
@@ -647,7 +647,7 @@ impl ProvidersConfig {
 
     /// Return the V3 dotted `<type>.<alias>` identifier of the first
     /// configured model model_provider entry, if any. Use this when callers need
-    /// the V3 alias reference (matches `agents.<x>.model_provider` values).
+    /// the alias reference (matches `agents.<x>.model_provider` values).
     pub fn first_provider_alias(&self) -> Option<String> {
         self.models
             .iter_entries()

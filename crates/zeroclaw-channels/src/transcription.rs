@@ -680,7 +680,7 @@ async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
 /// Manages multiple transcription / STT providers and routes transcription
 /// requests. The manager is implicitly per-agent: the runtime-active
 /// agent's `transcription_provider` reference is the resolved alias for
-/// `transcribe()` calls. V3 has no global default-provider concept.
+/// `transcribe()` calls. there is no global default-provider concept.
 pub struct TranscriptionManager {
     transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>>,
     /// Resolved alias for the agent that owns this manager. Empty when
@@ -753,7 +753,7 @@ impl TranscriptionManager {
 
     /// Transcribe audio using the runtime-active agent's resolved
     /// `transcription_provider`. Fails loud when the agent has no
-    /// transcription_provider configured — V3 has no global default.
+    /// transcription_provider configured — there is no global default.
     pub async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
         let provider_alias = self.agent_transcription_provider.as_str();
         if provider_alias.is_empty() {
@@ -794,8 +794,8 @@ impl TranscriptionManager {
 }
 
 // `transcribe_audio` (the legacy free function that dispatched against
-// `config.default_transcription_provider`) was deleted in #6273. V3 has
-// no global default-provider concept; transcription routes through
+// `config.default_transcription_provider`) was deleted in #6273. There is
+// no global default-provider concept anymore; transcription routes through
 // `TranscriptionManager` whose resolved alias comes from the per-agent
 // `transcription_provider` field (`agent.<X>.transcription_provider`).
 
@@ -891,7 +891,7 @@ mod tests {
 
         let config = TranscriptionConfig::default();
         let manager = TranscriptionManager::new(&config).unwrap();
-        // V3: the manager's agent_transcription_provider starts empty
+        // the manager's agent_transcription_provider starts empty
         // until an orchestrator wires it via `with_agent_transcription_provider`.
         // No global default-provider concept.
         assert!(manager.agent_transcription_provider.is_empty());
@@ -1016,7 +1016,7 @@ mod tests {
         assert!(config.api_key.is_none());
         assert!(config.api_url.contains("groq.com"));
         assert_eq!(config.model, "whisper-large-v3-turbo");
-        // V3: TranscriptionConfig has no global default-provider field;
+        // TranscriptionConfig has no global default-provider field;
         // per-agent `transcription_provider` is the only selector.
         assert!(config.openai.is_none());
         assert!(config.deepgram.is_none());

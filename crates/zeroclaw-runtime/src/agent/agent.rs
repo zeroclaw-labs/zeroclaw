@@ -2198,7 +2198,7 @@ mod tests {
             // `openai` factory ignores extra_headers; OpenRouter
             // hardcodes the upstream URL.)
             // Custom-URL model_provider: type is the canonical `custom` slot,
-            // operator URL goes in the `uri` field (post-Phase 6 — V3
+            // operator URL goes in the `uri` field (post-Phase 6
             // operators no longer put URLs in the outer type key).
             let entry = config
                 .providers

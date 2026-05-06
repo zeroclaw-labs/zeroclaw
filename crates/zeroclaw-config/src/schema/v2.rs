@@ -287,12 +287,12 @@ impl V2Config {
         //     dotted alias `"openai.default"` (V3 uses dotted aliases).
         fold_v2_tts_into_providers(&mut passthrough, &mut new_providers);
 
-        // 6c. Transcription: V2 `[transcription.<family>]` sub-blocks +
-        //     the Groq fields on `[transcription]` directly fold into V3
-        //     `[providers.transcription.<family>.default]`. The legacy
-        //     `default_provider` / `default_transcription_provider` keys
-        //     are dropped — V3 has no global default-provider concept;
-        //     per-agent `agent.<X>.transcription_provider` is the join.
+        // Transcription: V2 `[transcription.<family>]` sub-blocks + the Groq
+        // fields on `[transcription]` directly fold into V3
+        // `[providers.transcription.<family>.default]`. The legacy
+        // `default_provider` / `default_transcription_provider` keys are
+        // dropped — there is no global default-provider concept anymore;
+        // per-agent `agent.<X>.transcription_provider` is the join.
         fold_v2_transcription_into_providers(&mut passthrough, &mut new_providers);
 
         if !new_providers.is_empty() {

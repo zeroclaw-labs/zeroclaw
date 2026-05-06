@@ -860,7 +860,7 @@ fn resolved_default_model(config: &Config) -> anyhow::Result<String> {
 /// `model_provider` reference (`"<type>.<alias>"`) — the per-agent
 /// resolution path (#6266 review). Falls back to `first_model_provider()` when
 /// the reference is empty or doesn't resolve, preserving the conservative
-/// pre-V3 behavior so misconfigured callsites still get safe defaults.
+/// legacy behavior so misconfigured callsites still get safe defaults.
 fn runtime_defaults_from_config(
     config: &Config,
     model_provider: &str,
@@ -966,7 +966,7 @@ async fn load_runtime_defaults_from_config_file(
                 "config.providers.models.api_key",
             )?;
         }
-        // Decrypt TTS model_provider API keys for runtime reload (V3 typed slots).
+        // Decrypt TTS model_provider API keys for runtime reload (typed slots).
         for (family, alias, instance) in parsed.providers.tts.iter_entries_mut() {
             let label = format!("config.providers.tts.{family}.{alias}.api_key");
             decrypt_optional_secret_for_runtime_reload(&store, &mut instance.api_key, &label)?;

@@ -3,7 +3,7 @@
 //! Supports OpenAI, ElevenLabs, Google Cloud TTS, Edge TTS (free, subprocess-based),
 //! and Piper TTS (local GPU-accelerated, OpenAI-compatible endpoint).
 //!
-//! V3: per-instance configs live under `[providers.tts.<type>.<alias>]`; agents
+//! per-instance configs live under `[providers.tts.<type>.<alias>]`; agents
 //! pick which instance to use via the `tts_provider` dotted alias reference.
 //! Global runtime knobs (default_voice, max_text_length, etc.) live on `[tts]`.
 
@@ -557,7 +557,7 @@ impl TtsProvider for PiperTtsProvider {
 
 /// Central manager for per-agent TTS synthesis.
 ///
-/// V3: `tts_providers` are keyed by their dotted alias (`<type>.<alias>`).
+/// `tts_providers` are keyed by their dotted alias (`<type>.<alias>`).
 /// Per-instance voice overrides come from the `voice` field on each
 /// `TtsProviderConfig`. The `agent_tts_provider` field carries the
 /// resolved alias for the agent that owns this manager instance — empty
@@ -580,7 +580,7 @@ impl TtsManager {
     /// logged at warn but do not abort the manager.
     /// Build a `TtsManager` from `[providers.tts.<type>.<alias>]` instances.
     /// The manager's resolved alias comes from the runtime-active agent's
-    /// `tts_provider` field — V3 has no global default-provider concept,
+    /// `tts_provider` field — there is no global default-provider concept,
     /// so when no agent-bound resolution is available the manager refuses
     /// to silently pick a provider (`synthesize` fails loud).
     pub fn from_config(config: &Config) -> Result<Self> {
@@ -646,7 +646,7 @@ impl TtsManager {
     /// Synthesize text using the runtime-active agent's resolved
     /// `tts_provider` reference and the per-instance voice override (or
     /// `default_voice` as the per-instance fallback). Fails loud when the
-    /// agent has no `tts_provider` configured — V3 has no global
+    /// agent has no `tts_provider` configured — there is no global
     /// default-provider concept and this manager refuses to silently pick
     /// one.
     pub async fn synthesize(&self, text: &str) -> Result<Vec<u8>> {
@@ -850,7 +850,7 @@ mod tests {
     fn tts_config_defaults() {
         let config = zeroclaw_config::schema::TtsConfig::default();
         assert!(!config.enabled);
-        // V3: TtsConfig has no global default-provider field; per-agent
+        // TtsConfig has no global default-provider field; per-agent
         // `tts_provider` is the only selector.
         assert_eq!(config.default_voice, "alloy");
         assert_eq!(config.default_format, "mp3");

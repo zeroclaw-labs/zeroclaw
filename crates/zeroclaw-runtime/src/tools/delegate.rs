@@ -81,15 +81,15 @@ pub struct DelegateTool {
     cancellation_token: CancellationToken,
     /// Optional memory instance for namespace isolation on delegate agents.
     memory: Option<Arc<dyn Memory>>,
-    /// V3: nested model-model_provider map for brain resolution.
+    /// nested model-model_provider map for brain resolution.
     providers_models: Arc<HashMap<String, HashMap<String, ModelProviderConfig>>>,
-    /// V3: named risk profiles for delegation depth and timeout resolution.
+    /// named risk profiles for delegation depth and timeout resolution.
     risk_profiles: Arc<HashMap<String, RiskProfileConfig>>,
-    /// V3: named runtime profiles for agentic/tools/iteration resolution.
+    /// named runtime profiles for agentic/tools/iteration resolution.
     runtime_profiles: Arc<HashMap<String, RuntimeProfileConfig>>,
-    /// V3: named skill bundles for skills-directory resolution.
+    /// named skill bundles for skills-directory resolution.
     skill_bundles: Arc<HashMap<String, SkillBundleConfig>>,
-    /// V3: named memory namespaces for isolation resolution.
+    /// named memory namespaces for isolation resolution.
     memory_namespaces: Arc<HashMap<String, MemoryNamespaceConfig>>,
 }
 
@@ -229,7 +229,7 @@ impl DelegateTool {
         self
     }
 
-    /// Attach V3 nested model-model_provider map for brain resolution.
+    /// Attach nested model-model_provider map for brain resolution.
     pub fn with_providers_models(
         mut self,
         m: HashMap<String, HashMap<String, ModelProviderConfig>>,

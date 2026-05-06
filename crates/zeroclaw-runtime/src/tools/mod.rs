@@ -920,7 +920,7 @@ pub fn all_tools_with_runtime(
         .with_workspace_dir(workspace_dir.to_path_buf())
         .with_memory(memory.clone())
         .with_providers_models({
-            // DelegateTool's signature still expects the V3 flat HashMap shape;
+            // DelegateTool's signature still expects the flat HashMap shape;
             // collapse the typed ModelProviders container down to base-config
             // entries here. Family-specific extras (wire_api / requires_openai_auth /
             // resource / etc.) aren't needed by DelegateTool — it only resolves

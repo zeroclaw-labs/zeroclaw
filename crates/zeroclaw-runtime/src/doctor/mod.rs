@@ -1050,7 +1050,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    #[ignore = "asserts on V2 colon-URL provider syntax; V3 typed-family split routes custom URLs through `[providers.models.custom.<alias>] uri = ...` (see #6273 follow-up)"]
+    #[ignore = "asserts on V2 colon-URL provider syntax; typed-family split routes custom URLs through `[providers.models.custom.<alias>] uri = ...` (see #6273 follow-up)"]
     fn provider_validation_checks_custom_url_shape() {
         assert!(provider_validation_error("openrouter").is_none());
         assert!(provider_validation_error("custom:https://example.com").is_none());
@@ -1140,11 +1140,11 @@ mod tests {
     }
 
     // The pre-Phase-6 tests `config_validation_catches_malformed_custom_provider`
-    // and `config_validation_accepts_custom_provider` are obsolete: the V3 typed
+    // and `config_validation_accepts_custom_provider` are obsolete: the typed
     // ModelProviders container can't represent malformed `custom:` outer keys at
     // all. Custom-URL model_providers now live under the `custom` typed slot with the
     // operator-supplied URL in `base.uri`. The malformed-custom-key validator
-    // path is unreachable in V3.
+    // path is unreachable.
 
     #[test]
     fn config_validation_warns_empty_model_route() {

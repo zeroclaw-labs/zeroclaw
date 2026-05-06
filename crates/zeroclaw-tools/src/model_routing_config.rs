@@ -744,7 +744,7 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        // V3: synthesize providers.models[model_provider_family][name] from inline brain params.
+        // synthesize providers.models[model_provider_family][name] from inline brain params.
         // The arg is the family name (e.g. "openai"); the agent's `model_provider`
         // reference becomes the dotted form (e.g. "openai.coder").
         let model_provider_family = model_provider;
@@ -777,7 +777,7 @@ impl ModelRoutingConfigTool {
             }
         }
 
-        // V3: synthesize risk_profiles[name] from max_depth.
+        // synthesize risk_profiles[name] from max_depth.
         {
             let risk = cfg.risk_profiles.entry(name.clone()).or_default();
             if let MaybeSet::Set(depth) = max_depth_update {
@@ -790,7 +790,7 @@ impl ModelRoutingConfigTool {
             }
         }
 
-        // V3: synthesize runtime_profiles[name] from agentic/max_iterations/allowed_tools.
+        // synthesize runtime_profiles[name] from agentic/max_iterations/allowed_tools.
         {
             let runtime = cfg.runtime_profiles.entry(name.clone()).or_default();
             if let Some(agentic) = agentic_update {
@@ -812,7 +812,7 @@ impl ModelRoutingConfigTool {
             }
         }
 
-        // Get or create the agent and wire up V3 alias references.
+        // Get or create the agent and wire up alias references.
         let next_agent = cfg.agents.entry(name.clone()).or_default();
         next_agent.model_provider = agent_model_provider_ref.into();
         next_agent.risk_profile = name.clone();

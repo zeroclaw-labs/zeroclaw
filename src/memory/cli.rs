@@ -31,7 +31,7 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
 /// read/delete operations, this factory is used by commands that must
 /// actually compute embeddings (e.g. `reindex`). Mirrors the gateway's
 /// memory construction so the same model-model_provider / route resolution
-/// applies. V3 dropped `model_providers.fallback`; the embedder API key falls
+/// applies. Removed `model_providers.fallback`; the embedder API key falls
 /// back to the first configured model-model_provider, matching how the gateway
 /// resolves it (`crates/zeroclaw-gateway/src/lib.rs` `fallback`).
 fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
