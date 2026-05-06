@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 // ── Embedded firmware ─────────────────────────────────────────────────────────
 
 /// MicroPython UF2 binary — copied to RPI-RP2 to install the base runtime.
-const PICO_UF2: &[u8] = include_bytes!("../firmware/pico/zeroclaw-pico.uf2");
+const PICO_UF2: &[u8] = include_bytes!("../../../firmware/pico/zeroclaw-pico.uf2");
 
 /// UF2 magic word 1 (little-endian bytes at offset 0 of every UF2 block).
 const UF2_MAGIC1: [u8; 4] = [0x55, 0x46, 0x32, 0x0A];
@@ -215,16 +215,16 @@ pub async fn wait_for_serial_port(
     interval: std::time::Duration,
 ) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
-    let patterns = &["/dev/cu.usbmodem*"];
+    let patterns: &[&str] = &["/dev/cu.usbmodem*"];
     #[cfg(target_os = "linux")]
-    let patterns = &["/dev/ttyACM*"];
+    let patterns: &[&str] = &["/dev/ttyACM*"];
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let patterns: &[&str] = &[];
 
     let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
-        for pattern in *patterns {
+        for pattern in patterns {
             if let Ok(mut hits) = glob::glob(pattern)
                 && let Some(Ok(path)) = hits.next()
             {
