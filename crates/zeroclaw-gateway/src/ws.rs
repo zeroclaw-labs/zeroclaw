@@ -652,6 +652,19 @@ async fn process_chat_message(
             "model": state.model,
         }));
 
+        // Trace the cancelled turn so the doctor / replay tool sees it
+        // alongside successful turns. #6001 follow-through.
+        zeroclaw_runtime::observability::runtime_trace::record_event(
+            "gateway_ws_turn",
+            Some("ws"),
+            Some(&provider_label),
+            Some(&state.model),
+            Some(&turn_id),
+            Some(false),
+            Some("interrupted by user"),
+            serde_json::json!({ "session_key": session_key, "cancelled": true }),
+        );
+
         return;
     }
 
@@ -736,6 +749,26 @@ async fn process_chat_message(
                 "provider": provider_label,
                 "model": state.model,
             }));
+
+            // Append a runtime-trace.jsonl record so a `zeroclaw doctor`
+            // sweep sees gateway WS turns alongside channel and CLI turns.
+            // Closes the gateway-side trace gap from #6001.
+            zeroclaw_runtime::observability::runtime_trace::record_event(
+                "gateway_ws_turn",
+                Some("ws"),
+                Some(&provider_label),
+                Some(&state.model),
+                Some(&turn_id),
+                Some(true),
+                None,
+                serde_json::json!({
+                    "session_key": session_key,
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                    "tokens_used": total_tokens,
+                    "cost_usd": cost_usd,
+                }),
+            );
         }
         Err(e) => {
             // Set session state to error
@@ -770,6 +803,20 @@ async fn process_chat_message(
                 "component": "ws_chat",
                 "message": sanitized,
             }));
+
+            // Trace the failed turn so the doctor / replay tool sees the
+            // failure mode and the turn_id can be cross-referenced with
+            // costs.jsonl. #6001 follow-through.
+            zeroclaw_runtime::observability::runtime_trace::record_event(
+                "gateway_ws_turn",
+                Some("ws"),
+                Some(&provider_label),
+                Some(&state.model),
+                Some(&turn_id),
+                Some(false),
+                Some(&sanitized),
+                serde_json::json!({ "session_key": session_key, "error_code": error_code }),
+            );
         }
     }
 }
