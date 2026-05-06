@@ -1,0 +1,73 @@
+name: Factory Foreman
+
+on:
+  schedule:
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "preview"
+        type: choice
+        options:
+          - preview
+          - comment-only
+          - apply-safe
+      allow_apply_safe:
+        description: "Required for apply-safe mode"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      max_mutations:
+        description: "Maximum comments/closures in non-preview modes"
+        required: true
+        default: "25"
+
+concurrency:
+  group: factory-foreman
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  foreman:
+    name: Factory Foreman
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Run factory foreman
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODE: ${{ github.event_name == 'schedule' && 'preview' || inputs.mode }}
+          ALLOW_APPLY_SAFE: ${{ github.event_name == 'schedule' && 'false' || inputs.allow_apply_safe }}
+          MAX_MUTATIONS: ${{ github.event_name == 'schedule' && '25' || inputs.max_mutations }}
+        run: |
+          args=()
+          if [ "$ALLOW_APPLY_SAFE" = "true" ]; then
+            args+=(--allow-apply-safe)
+          fi
+          python3 .claude/skills/factory-foreman/scripts/factory_foreman.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --mode "$MODE" \
+            --max-mutations "$MAX_MUTATIONS" \
+            --summary-file artifacts/factory-foreman/summary.md \
+            "${args[@]}"
+
+      - name: Add job summary
+        run: cat artifacts/factory-foreman/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload foreman artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: factory-foreman-artifacts
+          path: artifacts/factory-foreman/**
+          if-no-files-found: error

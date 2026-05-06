@@ -1,0 +1,54 @@
+name: Factory Testbench
+
+on:
+  schedule:
+    - cron: "15 10 * * *"
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Run command"
+        required: true
+        default: "roundtrip"
+        type: choice
+        options:
+          - fixture-test
+          - roundtrip
+      limit:
+        description: "Maximum issues/PRs to snapshot"
+        required: true
+        default: "1000"
+
+concurrency:
+  group: factory-testbench
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  testbench:
+    name: Factory Testbench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Run factory testbench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMAND: ${{ github.event_name == 'schedule' && 'roundtrip' || inputs.command }}
+          LIMIT: ${{ github.event_name == 'schedule' && '1000' || inputs.limit }}
+        run: |
+          python3 .claude/skills/factory-testbench/scripts/factory_testbench.py "$COMMAND" \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit "$LIMIT" \
+            --output-dir artifacts/factory-testbench
+
+      - name: Upload replay artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: factory-testbench-artifacts
+          path: artifacts/factory-testbench/*.json
+          if-no-files-found: error
