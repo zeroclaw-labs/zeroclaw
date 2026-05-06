@@ -3560,6 +3560,7 @@ mod tests {
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
                 ack_reactions: true,
+                reply_min_interval_secs: 0,
             }
         }
 

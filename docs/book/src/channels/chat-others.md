@@ -2,6 +2,14 @@
 
 Channels with working integrations but not yet pulled out into dedicated guides. Each is feature-gated; enable the matching `channel-<name>` feature at build time.
 
+## Pacing outbound replies (`reply_min_interval_secs`)
+
+Every channel below also accepts an optional `reply_min_interval_secs = N` field (range `0..=3600`, default `0`). When set, the orchestrator wraps the channel in a per-(channel, recipient) pacing layer so consecutive outbound replies to the same peer wait at least `N` seconds apart. `0` (the default) is a passthrough — no wrapper allocated, no overhead.
+
+This is a thin wire-level floor on cadence, not a queue or rate-limiter. Streaming draft updates within a single reply are not paced (they would freeze the live preview); only the final `send` (and the terminal `finalize_draft` write) wait. Different recipients are independent — pacing for `alice` does not block messages to `bob`.
+
+Use case: paired-identity channels where sub-second replies are an AI-tell.
+
 ## Discord
 
 ```toml
@@ -46,6 +54,7 @@ use_long_polling = true            # default — no webhook needed
 
 - Long polling is the default; no public URL required. Switch to webhook mode by setting `webhook_url` (then expose the gateway).
 - Streaming draft edits are supported but capped by Telegram's rate limit. Tune `draft_update_interval_ms` if you see "Too Many Requests".
+- `reply_min_interval_secs` (default `0`) sets a per-peer floor on reply cadence. Pacing is active: the orchestrator wraps the channel in a per-(channel, recipient) layer so consecutive sends to the same peer wait at least `N` seconds apart. `0` is a zero-overhead passthrough. See [Pacing outbound replies](#pacing-outbound-replies-reply_min_interval_secs) above for the full contract.
 
 ## Signal
 

@@ -7111,6 +7111,17 @@ pub struct TelegramConfig {
     /// button on a tool approval prompt before auto-denying. Default: 120.
     #[serde(default = "default_telegram_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// Minimum wall-clock interval (seconds) between consecutive outbound
+    /// agent replies on this channel. `0` (default) preserves the current
+    /// behaviour where replies fire as soon as the LLM completes. The
+    /// intended range is `0..=3600`.
+    ///
+    /// On paired-identity channels under personal accounts, sub-second
+    /// replies are a strong AI-tell and a platform-side anomaly signal;
+    /// raising this value paces the agent so its cadence resembles a
+    /// human operator's.
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -7176,6 +7187,12 @@ pub struct DiscordConfig {
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// Minimum wall-clock interval (seconds) between consecutive outbound
+    /// agent replies on this channel, applied per-(channel, recipient).
+    /// `0` (default) preserves the current behaviour where replies fire as
+    /// soon as the LLM completes. Range: `0..=3600`.
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -7295,6 +7312,12 @@ pub struct SlackConfig {
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// Minimum wall-clock interval (seconds) between consecutive outbound
+    /// agent replies on this channel, applied per-(channel, recipient).
+    /// `0` (default) preserves the current behaviour where replies fire as
+    /// soon as the LLM completes. Range: `0..=3600`.
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
 }
 
 fn default_slack_draft_update_interval_ms() -> u64 {
@@ -7345,6 +7368,12 @@ pub struct MattermostConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Minimum wall-clock interval (seconds) between consecutive outbound
+    /// agent replies on this channel, applied per-(channel, recipient).
+    /// `0` (default) preserves the current behaviour where replies fire as
+    /// soon as the LLM completes. Range: `0..=3600`.
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
 }
 
 impl ChannelConfig for MattermostConfig {
@@ -7385,6 +7414,12 @@ pub struct WebhookConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub secret: Option<String>,
+    /// Minimum wall-clock interval (seconds) between consecutive outbound
+    /// agent replies on this channel, applied per-(channel, recipient).
+    /// `0` (default) preserves the current behaviour where replies fire as
+    /// soon as the LLM completes. Range: `0..=3600`.
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -7406,6 +7441,12 @@ pub struct IMessageConfig {
     pub enabled: bool,
     /// Allowed iMessage contacts (phone numbers or email addresses). Empty = deny all.
     pub allowed_contacts: Vec<String>,
+    /// Minimum wall-clock interval (seconds) between consecutive outbound
+    /// agent replies on this channel, applied per-(channel, recipient).
+    /// `0` (default) preserves the current behaviour where replies fire as
+    /// soon as the LLM completes. Range: `0..=3600`.
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
 }
 
 impl ChannelConfig for IMessageConfig {
@@ -7483,6 +7524,12 @@ pub struct MatrixConfig {
     /// (👀 on receipt, ✅ on completion). Disable to keep rooms reaction-free.
     #[serde(default = "default_true")]
     pub ack_reactions: bool,
+    /// Minimum wall-clock interval (seconds) between consecutive outbound
+    /// agent replies on this channel, applied per-(channel, recipient).
+    /// `0` (default) preserves the current behaviour where replies fire as
+    /// soon as the LLM completes. Range: `0..=3600`.
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -7527,6 +7574,12 @@ pub struct SignalConfig {
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// Minimum wall-clock interval (seconds) between consecutive outbound
+    /// agent replies on this channel, applied per-(channel, recipient).
+    /// `0` (default) preserves the current behaviour where replies fire as
+    /// soon as the LLM completes. Range: `0..=3600`.
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
 }
 
 impl ChannelConfig for SignalConfig {
@@ -7658,6 +7711,12 @@ pub struct WhatsAppConfig {
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// Minimum wall-clock interval (seconds) between consecutive outbound
+    /// agent replies on this channel, applied per-(channel, recipient).
+    /// `0` (default) preserves the current behaviour where replies fire as
+    /// soon as the LLM completes. Range: `0..=3600`.
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -10009,6 +10068,70 @@ async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
 }
 
 impl Config {
+    /// Walk every channel that carries `reply_min_interval_secs` and
+    /// return `(dotted-path, value)` pairs. The validator (and any
+    /// future surface that wants to render the per-channel pacing
+    /// state) consume this so callers don't enumerate channel field
+    /// names by hand.
+    pub fn collect_reply_min_interval_values(&self) -> Vec<(&'static str, u64)> {
+        let mut out: Vec<(&'static str, u64)> = Vec::new();
+        if let Some(ref c) = self.channels.telegram {
+            out.push((
+                "channels.telegram.reply_min_interval_secs",
+                c.reply_min_interval_secs,
+            ));
+        }
+        if let Some(ref c) = self.channels.discord {
+            out.push((
+                "channels.discord.reply_min_interval_secs",
+                c.reply_min_interval_secs,
+            ));
+        }
+        if let Some(ref c) = self.channels.slack {
+            out.push((
+                "channels.slack.reply_min_interval_secs",
+                c.reply_min_interval_secs,
+            ));
+        }
+        if let Some(ref c) = self.channels.mattermost {
+            out.push((
+                "channels.mattermost.reply_min_interval_secs",
+                c.reply_min_interval_secs,
+            ));
+        }
+        if let Some(ref c) = self.channels.webhook {
+            out.push((
+                "channels.webhook.reply_min_interval_secs",
+                c.reply_min_interval_secs,
+            ));
+        }
+        if let Some(ref c) = self.channels.imessage {
+            out.push((
+                "channels.imessage.reply_min_interval_secs",
+                c.reply_min_interval_secs,
+            ));
+        }
+        if let Some(ref c) = self.channels.matrix {
+            out.push((
+                "channels.matrix.reply_min_interval_secs",
+                c.reply_min_interval_secs,
+            ));
+        }
+        if let Some(ref c) = self.channels.signal {
+            out.push((
+                "channels.signal.reply_min_interval_secs",
+                c.reply_min_interval_secs,
+            ));
+        }
+        if let Some(ref c) = self.channels.whatsapp {
+            out.push((
+                "channels.whatsapp.reply_min_interval_secs",
+                c.reply_min_interval_secs,
+            ));
+        }
+        out
+    }
+
     /// Return top-level TOML keys in `raw_toml` that Config does not recognise.
     ///
     /// Keys present in `Config::default()` serialization pass immediately.
@@ -10395,6 +10518,20 @@ impl Config {
                     InvalidNumericRange,
                     "tunnel.openvpn.connect_timeout_secs",
                     "tunnel.openvpn.connect_timeout_secs must be greater than 0"
+                );
+            }
+        }
+
+        // Per-channel reply pacing — enforce 0..=3600 floor on every
+        // outbound channel that exposes `reply_min_interval_secs`. The
+        // upper bound is one hour so a typo (e.g. milliseconds in seconds)
+        // can't silently wedge a channel for days.
+        for (path, value) in self.collect_reply_min_interval_values() {
+            if value > 3600 {
+                validation_bail!(
+                    InvalidNumericRange,
+                    path,
+                    "{path} = {value} is out of range; must be 0..=3600 (zero disables pacing, 3600 = one hour)"
                 );
             }
         }
@@ -12042,6 +12179,55 @@ mod tests {
     }
 
     #[test]
+    async fn validate_rejects_reply_min_interval_above_one_hour() {
+        let mut config = Config::default();
+        config.channels.telegram = Some(TelegramConfig {
+            enabled: true,
+            bot_token: "tok".into(),
+            allowed_users: vec!["alice".into()],
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+            ack_reactions: None,
+            proxy_url: None,
+            approval_timeout_secs: 120,
+            reply_min_interval_secs: 3601,
+        });
+        let err = config.validate().expect_err("3601 must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("channels.telegram.reply_min_interval_secs"),
+            "error must name the offending path; got: {msg}",
+        );
+        assert!(
+            msg.contains("3601"),
+            "error must include the rejected value; got: {msg}",
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_reply_min_interval_at_upper_bound() {
+        let mut config = Config::default();
+        config.channels.telegram = Some(TelegramConfig {
+            enabled: true,
+            bot_token: "tok".into(),
+            allowed_users: vec!["alice".into()],
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+            ack_reactions: None,
+            proxy_url: None,
+            approval_timeout_secs: 120,
+            reply_min_interval_secs: 3600,
+        });
+        config
+            .validate()
+            .expect("3600 (one hour) is the documented upper bound and must pass");
+    }
+
+    #[test]
     async fn observability_config_default() {
         let o = ObservabilityConfig::default();
         assert_eq!(o.backend, "none");
@@ -12373,6 +12559,7 @@ auto_save = true
                     ack_reactions: None,
                     proxy_url: None,
                     approval_timeout_secs: default_telegram_approval_timeout_secs(),
+                    reply_min_interval_secs: 0,
                 }),
                 discord: None,
                 discord_history: None,
@@ -13278,6 +13465,7 @@ default_temperature = 0.7
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
+            reply_min_interval_secs: 0,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -13313,6 +13501,7 @@ default_temperature = 0.7
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
+            reply_min_interval_secs: 0,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -13336,6 +13525,7 @@ default_temperature = 0.7
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
+            reply_min_interval_secs: 0,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -13349,6 +13539,7 @@ default_temperature = 0.7
         let ic = IMessageConfig {
             enabled: true,
             allowed_contacts: vec!["+1234567890".into(), "user@icloud.com".into()],
+            reply_min_interval_secs: 0,
         };
         let json = serde_json::to_string(&ic).unwrap();
         let parsed: IMessageConfig = serde_json::from_str(&json).unwrap();
@@ -13361,6 +13552,7 @@ default_temperature = 0.7
         let ic = IMessageConfig {
             enabled: true,
             allowed_contacts: vec![],
+            reply_min_interval_secs: 0,
         };
         let json = serde_json::to_string(&ic).unwrap();
         let parsed: IMessageConfig = serde_json::from_str(&json).unwrap();
@@ -13372,6 +13564,7 @@ default_temperature = 0.7
         let ic = IMessageConfig {
             enabled: true,
             allowed_contacts: vec!["*".into()],
+            reply_min_interval_secs: 0,
         };
         let toml_str = toml::to_string(&ic).unwrap();
         let parsed: IMessageConfig = toml::from_str(&toml_str).unwrap();
@@ -13398,6 +13591,7 @@ default_temperature = 0.7
             approval_timeout_secs: 300,
             reply_in_thread: true,
             ack_reactions: true,
+            reply_min_interval_secs: 0,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -13432,6 +13626,7 @@ default_temperature = 0.7
             approval_timeout_secs: 300,
             reply_in_thread: true,
             ack_reactions: true,
+            reply_min_interval_secs: 0,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -13480,6 +13675,7 @@ allowed_users = ["@u:matrix.org"]
             ignore_stories: false,
             proxy_url: None,
             approval_timeout_secs: 300,
+            reply_min_interval_secs: 0,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
@@ -13503,6 +13699,7 @@ allowed_users = ["@u:matrix.org"]
             ignore_stories: true,
             proxy_url: None,
             approval_timeout_secs: 300,
+            reply_min_interval_secs: 0,
         };
         let toml_str = toml::to_string(&sc).unwrap();
         let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();
@@ -13535,6 +13732,7 @@ allowed_users = ["@u:matrix.org"]
             imessage: Some(IMessageConfig {
                 enabled: true,
                 allowed_contacts: vec!["+1".into()],
+                reply_min_interval_secs: 0,
             }),
             matrix: Some(MatrixConfig {
                 enabled: true,
@@ -13554,6 +13752,7 @@ allowed_users = ["@u:matrix.org"]
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
                 ack_reactions: true,
+                reply_min_interval_secs: 0,
             }),
             signal: None,
             whatsapp: None,
@@ -13783,6 +13982,7 @@ bot_token = "xoxb-tok"
             group_mention_patterns: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
+            reply_min_interval_secs: 0,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -13813,6 +14013,7 @@ bot_token = "xoxb-tok"
             group_mention_patterns: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
+            reply_min_interval_secs: 0,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -13848,6 +14049,7 @@ bot_token = "xoxb-tok"
             group_mention_patterns: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
+            reply_min_interval_secs: 0,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -13875,6 +14077,7 @@ bot_token = "xoxb-tok"
             group_mention_patterns: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
+            reply_min_interval_secs: 0,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -13901,6 +14104,7 @@ bot_token = "xoxb-tok"
             group_mention_patterns: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
+            reply_min_interval_secs: 0,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -13938,6 +14142,7 @@ bot_token = "xoxb-tok"
                 group_mention_patterns: vec![],
                 proxy_url: None,
                 approval_timeout_secs: 300,
+                reply_min_interval_secs: 0,
             }),
             linq: None,
             wati: None,
@@ -16700,6 +16905,7 @@ require_otp_to_resume = true
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: default_telegram_approval_timeout_secs(),
+            reply_min_interval_secs: 0,
         });
 
         // Save (triggers encryption)
@@ -17279,6 +17485,16 @@ require_otp_to_resume = true
     }
 
     #[test]
+    async fn telegram_config_reply_min_interval_secs_missing_defaults_to_zero() {
+        let toml_str = r#"
+            bot_token = "123:ABC"
+            allowed_users = ["alice"]
+        "#;
+        let cfg: TelegramConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.reply_min_interval_secs, 0);
+    }
+
+    #[test]
     async fn telegram_config_ack_reactions_channel_overrides_top_level() {
         let tg_toml = r#"
             bot_token = "123:ABC"
@@ -17605,6 +17821,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             approval_timeout_secs: 300,
             reply_in_thread: true,
             ack_reactions: true,
+            reply_min_interval_secs: 0,
         };
         let fields = mx.secret_fields();
         assert_eq!(fields.len(), 3);
@@ -17637,6 +17854,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             approval_timeout_secs: 300,
             reply_in_thread: true,
             ack_reactions: true,
+            reply_min_interval_secs: 0,
         };
         let fields = mx.secret_fields();
         assert!(!fields[0].is_set);
@@ -17662,6 +17880,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             approval_timeout_secs: 300,
             reply_in_thread: true,
             ack_reactions: true,
+            reply_min_interval_secs: 0,
         };
         mx.set_secret("channels.matrix.access-token", "new-token".into())
             .unwrap();
@@ -17688,6 +17907,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             approval_timeout_secs: 300,
             reply_in_thread: true,
             ack_reactions: true,
+            reply_min_interval_secs: 0,
         };
         assert!(
             mx.set_secret("channels.matrix.nonexistent", "val".into())
@@ -17731,6 +17951,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             approval_timeout_secs: 300,
             reply_in_thread: true,
             ack_reactions: true,
+            reply_min_interval_secs: 0,
         });
 
         let fields = config.secret_fields();
@@ -17760,6 +17981,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             approval_timeout_secs: 300,
             reply_in_thread: true,
             ack_reactions: true,
+            reply_min_interval_secs: 0,
         });
 
         config
@@ -17789,6 +18011,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             approval_timeout_secs: 300,
             reply_in_thread: true,
             ack_reactions: true,
+            reply_min_interval_secs: 0,
         });
         config
             .set_secret("channels.matrix.access-token", "sk-test".into())
@@ -17832,6 +18055,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             approval_timeout_secs: 300,
             reply_in_thread: true,
             ack_reactions: true,
+            reply_min_interval_secs: 0,
         };
 
         // Encrypt
@@ -17867,6 +18091,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             approval_timeout_secs: 300,
             reply_in_thread: true,
             ack_reactions: true,
+            reply_min_interval_secs: 0,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -17900,6 +18125,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             approval_timeout_secs: 300,
             reply_in_thread: true,
             ack_reactions: true,
+            reply_min_interval_secs: 0,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -17928,6 +18154,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             approval_timeout_secs: 300,
             reply_in_thread: true,
             ack_reactions: true,
+            reply_min_interval_secs: 0,
         }
     }
 
