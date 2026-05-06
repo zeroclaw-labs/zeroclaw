@@ -17,6 +17,36 @@ allowed_mentions = ["@trustedfriend.bsky.social"]
 - **Outbound:** 300-character posts; longer responses auto-thread.
 - **Protocol:** AT Protocol via `atrium-api` crate.
 
+## Mastodon (ActivityPub)
+
+```toml
+[channels.mastodon]
+enabled = true
+instance_url = "https://mastodon.social"   # any compatible instance
+access_token = "xxxxxxxx"                  # see "Token mint" below
+allowed_users = ["alice@mastodon.social"]  # `*` allows anyone
+mention_only = true                        # default; respond only when @-mentioned
+visibility = "direct"                      # default reply visibility
+poll_interval_secs = 60                    # polling fallback cadence
+```
+
+- **Auth:** personal access token minted via instance UI. No OAuth code-grant flow in v1.
+- **Inbound:** subscribes to the user-stream WebSocket at `wss://{instance}/api/v1/streaming?stream=user`. Reconnects with exponential backoff and falls back to polling `/api/v1/notifications` after three consecutive failures.
+- **Outbound:** posts statuses with the configured `visibility`. Bodies over 500 characters are split at sentence boundaries and threaded, with each chunk re-applying the recipient `@mention` so non-public visibility levels keep delivering.
+- **Recipient format:** `user@instance` for new DMs/posts; `user@instance|<status_id>` to reply in-thread. The agent's runtime sets this automatically when responding to inbound notifications — operators rarely have to construct it by hand.
+- **Compatibility:** any Mastodon-API-compatible server (Pleroma, GoToSocial, Akkoma) should work.
+
+### Token mint
+
+1. Log in to your instance and open **Settings → Development → New Application**.
+2. Set the application name (e.g. `zeroclaw-bot`) and grant scopes `read:notifications`, `write:statuses`, `read:accounts`. Leave redirect URIs at the default.
+3. Save and copy `Your access token` into `access_token`.
+4. Restart the daemon; `zeroclaw channel doctor` should now show **Mastodon: ✅**.
+
+### Visibility safety
+
+`visibility` defaults to `direct` so bot replies stay out of public timelines unless the operator explicitly opts in. `private` (followers-only), `unlisted`, and `public` are supported but each successively widens the audience — flip them only after confirming `allowed_users` does what you expect.
+
 ## Nostr
 
 ```toml

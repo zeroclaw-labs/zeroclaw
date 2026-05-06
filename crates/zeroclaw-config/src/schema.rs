@@ -6863,6 +6863,9 @@ pub struct ChannelsConfig {
     #[display_name = "Bluesky"]
     #[description = "Bluesky / AT Protocol"]
     pub bluesky: Option<BlueskyConfig>,
+    /// Mastodon channel configuration (any ActivityPub-compatible instance).
+    #[nested]
+    pub mastodon: Option<MastodonConfig>,
     /// Voice call channel configuration (Twilio/Telnyx/Plivo).
     #[nested]
     #[display_name = "Voice Call"]
@@ -7047,6 +7050,10 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.bluesky.as_ref())),
                 self.bluesky.is_some(),
             ),
+            (
+                Box::new(ConfigWrapper::new(self.mastodon.as_ref())),
+                self.mastodon.is_some(),
+            ),
             #[cfg(feature = "voice-wake")]
             (
                 Box::new(ConfigWrapper::new(self.voice_wake.as_ref())),
@@ -7111,6 +7118,7 @@ impl Default for ChannelsConfig {
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            mastodon: None,
             voice_call: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
@@ -9054,6 +9062,80 @@ impl ChannelConfig for BlueskyConfig {
     }
     fn desc() -> &'static str {
         "AT Protocol"
+    }
+}
+
+/// Default post visibility for outbound Mastodon statuses.
+///
+/// Defaults to `Direct` so that bot replies are not posted to public timelines
+/// unless an operator explicitly opts in. Mirrors Mastodon's own visibility
+/// states verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum MastodonVisibility {
+    /// Direct message — only mentioned users see the status.
+    #[default]
+    Direct,
+    /// Followers-only post.
+    Private,
+    /// Visible everywhere except public/local timelines.
+    Unlisted,
+    /// Public, federated.
+    Public,
+}
+
+fn default_mastodon_poll_interval_secs() -> u64 {
+    60
+}
+
+fn default_mastodon_mention_only() -> bool {
+    true
+}
+
+/// Mastodon channel configuration (any ActivityPub-compatible instance).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.mastodon"]
+pub struct MastodonConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Instance base URL, e.g. `"https://mastodon.social"`. Trailing slash is
+    /// optional and stripped at load time.
+    pub instance_url: String,
+    /// Personal access token minted via instance Settings → Development →
+    /// New Application. Requires the `read` and `write:statuses` scopes;
+    /// `read:notifications` is required for inbound listening.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub access_token: String,
+    /// Allowed Mastodon accounts in `user@instance` form (e.g.
+    /// `"alice@mastodon.social"`). Empty list = deny all. `"*"` allows
+    /// everyone. Local-instance accounts may also be listed without the
+    /// `@instance` suffix.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// When true (default), only respond to statuses that @-mention the bot
+    /// account. Direct messages always count as mentions.
+    #[serde(default = "default_mastodon_mention_only")]
+    pub mention_only: bool,
+    /// Default visibility for outbound replies. See `MastodonVisibility`.
+    #[serde(default)]
+    pub visibility: MastodonVisibility,
+    /// Interval (seconds) for the polling fallback when the streaming WebSocket
+    /// is unavailable (e.g. an instance behind a strict reverse proxy).
+    /// Default: 60.
+    #[serde(default = "default_mastodon_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+}
+
+impl ChannelConfig for MastodonConfig {
+    fn name() -> &'static str {
+        "Mastodon"
+    }
+    fn desc() -> &'static str {
+        "ActivityPub fediverse"
     }
 }
 
@@ -11946,6 +12028,7 @@ impl_enum_prop_kind!(
     SearchMode,
     CronScheduleDecl,
     StreamMode,
+    MastodonVisibility,
     WhatsAppWebMode,
     WhatsAppChatPolicy,
     LineDmPolicy,
@@ -12545,6 +12628,7 @@ auto_save = true
                 clawdtalk: None,
                 reddit: None,
                 bluesky: None,
+                mastodon: None,
                 voice_call: None,
                 voice_duplex: None,
                 #[cfg(feature = "voice-wake")]
@@ -13719,6 +13803,7 @@ allowed_users = ["@u:matrix.org"]
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            mastodon: None,
             voice_call: None,
             voice_duplex: None,
             #[cfg(feature = "voice-wake")]
@@ -14101,6 +14186,7 @@ bot_token = "xoxb-tok"
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            mastodon: None,
             voice_call: None,
             voice_duplex: None,
             #[cfg(feature = "voice-wake")]
