@@ -2003,15 +2003,37 @@ async fn main() -> Result<()> {
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
-        Commands::Models { model_command } => {
-            let provider = match &model_command {
-                ModelCommands::Refresh { provider, .. } | ModelCommands::List { provider } => {
-                    provider.as_deref()
+        Commands::Models { model_command } => match model_command {
+            ModelCommands::Set { model } => {
+                let (provider, bare_model) = match model.split_once('/') {
+                    Some((p, m)) if !p.is_empty() && !m.is_empty() => {
+                        (Some(p.to_string()), m.to_string())
+                    }
+                    _ => (None, model),
+                };
+                if let Some(p) = provider {
+                    config.providers.fallback = Some(p);
+                } else if config.providers.fallback.is_none() {
+                    anyhow::bail!(
+                        "No default provider set. Pass `provider/model` (e.g. ollama/glm-5.1:cloud) or set providers.fallback first."
+                    );
                 }
-                _ => None,
-            };
-            doctor::run_models(&config, provider, false).await
-        }
+                config.ensure_fallback_provider().model = Some(bare_model.clone());
+                config.save().await?;
+                let provider_name = config.providers.fallback.as_deref().unwrap_or("?");
+                println!("Default model set: {provider_name}/{bare_model}");
+                Ok(())
+            }
+            other => {
+                let provider = match &other {
+                    ModelCommands::Refresh { provider, .. } | ModelCommands::List { provider } => {
+                        provider.as_deref()
+                    }
+                    _ => None,
+                };
+                doctor::run_models(&config, provider, false).await
+            }
+        },
 
         Commands::Providers => {
             let providers = providers::list_providers();
