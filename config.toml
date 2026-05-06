@@ -1,3 +1,4 @@
+default_provider = "custom:http://127.0.0.1:6767/v1"
 [providers.models.local]
 kind = "openai-compatible"
 base_url = "http://127.0.0.1:6767/v1"
