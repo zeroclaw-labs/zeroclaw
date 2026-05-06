@@ -90,18 +90,20 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             name: e.display_name.to_string(),
             description: e.description.to_string(),
             category: IntegrationCategory::Chat,
+            category_label: IntegrationCategory::Chat.label().to_string(),
             status: bool_to_status(e.present),
         });
 
-    let toggles = config
-        .integration_descriptors()
-        .into_iter()
-        .map(|d| IntegrationEntry {
+    let toggles = config.integration_descriptors().into_iter().map(|d| {
+        let category = parse_category(d.category);
+        IntegrationEntry {
             name: d.display_name.to_string(),
             description: d.description.to_string(),
-            category: parse_category(d.category),
+            category,
+            category_label: category.label().to_string(),
             status: bool_to_status(d.active),
-        });
+        }
+    });
 
     let providers = zeroclaw_providers::list_providers()
         .into_iter()
@@ -111,6 +113,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
                 name: info.display_name.to_string(),
                 description: info.description.to_string(),
                 category: IntegrationCategory::AiModel,
+                category_label: IntegrationCategory::AiModel.label().to_string(),
                 status,
             }
         });
@@ -121,6 +124,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             name: (*name).to_string(),
             description: (*desc).to_string(),
             category: IntegrationCategory::ToolsAutomation,
+            category_label: IntegrationCategory::ToolsAutomation.label().to_string(),
             status: IntegrationStatus::Active,
         });
 
@@ -128,6 +132,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
         name: (*name).to_string(),
         description: String::new(),
         category: IntegrationCategory::Platform,
+        category_label: IntegrationCategory::Platform.label().to_string(),
         status: bool_to_status(*available),
     });
 
@@ -175,6 +180,24 @@ mod tests {
             assert!(
                 seen.insert(entry.name.clone()),
                 "Duplicate integration name: {}",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_entry_has_category_label_matching_its_category() {
+        // Display contract: `category_label` must always equal
+        // `category.label()` so the `/api/integrations` consumer can
+        // render human-readable headings without a frontend mapping.
+        let config = Config::default();
+        let entries = all_integrations(&config);
+        assert!(!entries.is_empty());
+        for entry in &entries {
+            assert_eq!(
+                entry.category_label,
+                entry.category.label(),
+                "category_label drifted from category.label() for entry {}",
                 entry.name
             );
         }

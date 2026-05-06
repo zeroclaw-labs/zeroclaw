@@ -43,13 +43,20 @@ export default function Integrations() {
       ? integrations
       : integrations.filter((i) => i.category === activeCategory);
 
-  // Group by category for display
+  // Group by category (stable enum key) for display.
   const grouped = filtered.reduce<Record<string, Integration[]>>((acc, item) => {
     const key = item.category;
     if (!acc[key]) acc[key] = [];
     acc[key].push(item);
     return acc;
   }, {});
+
+  // Map enum key -> human label, sourced from the API's `category_label`
+  // field. Falls back to the raw key if the backend hasn't rolled forward.
+  const labelFor = (cat: string): string => {
+    if (cat === 'all') return 'All';
+    return integrations.find((i) => i.category === cat)?.category_label ?? cat;
+  };
 
   if (error) {
     return (
@@ -90,7 +97,7 @@ export default function Integrations() {
               : { color: 'var(--pc-text-muted)', border: '1px solid var(--pc-border)', background: 'transparent' }
             }
           >
-            {cat}
+            {labelFor(cat)}
           </button>
         ))}
       </div>
@@ -104,8 +111,8 @@ export default function Integrations() {
       ) : (
         Object.entries(grouped).sort(([a], [b]) => a.localeCompare(b)).map(([category, items]) => (
           <div key={category}>
-            <h3 className="text-[10px] font-semibold uppercase tracking-wider mb-3 capitalize" style={{ color: 'var(--pc-text-faint)' }}>
-              {category}
+            <h3 className="text-[10px] font-semibold uppercase tracking-wider mb-3" style={{ color: 'var(--pc-text-faint)' }}>
+              {labelFor(category)}
             </h3>
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 stagger-children">
               {items.map((integration) => {

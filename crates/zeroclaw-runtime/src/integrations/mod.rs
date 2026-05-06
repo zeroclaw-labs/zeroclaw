@@ -51,10 +51,16 @@ impl IntegrationCategory {
 /// `registry::all_integrations`). `name` and `description` are owned
 /// strings so the schema-derived path can build them at runtime from
 /// the `ChannelsConfig` field set.
+///
+/// `category_label` is the human-readable form of `category` (e.g.
+/// `"Tools & Automation"` for `IntegrationCategory::ToolsAutomation`)
+/// so callers — including the `/api/integrations` HTTP surface — can
+/// emit display-ready strings without re-implementing the mapping.
 pub struct IntegrationEntry {
     pub name: String,
     pub description: String,
     pub category: IntegrationCategory,
+    pub category_label: String,
     pub status: IntegrationStatus,
 }
 
