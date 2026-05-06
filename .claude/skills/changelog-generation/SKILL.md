@@ -147,5 +147,6 @@ to `master` directly.
 7. **Always confirm before committing.** Show the user the exact commit message
    and ask for an explicit yes. Do not infer consent from prior steps.
 8. **Never push to `master` directly.** Always push to the open release PR branch.
-9. **Never delete `CHANGELOG-next.md` manually.** The release workflow deletes it
-   automatically after a successful stable release.
+9. **Do not delete `CHANGELOG-next.md` manually.** The file is intentionally left on
+   `master` between releases and is overwritten at the start of the next release cycle.
+   No cleanup is needed after a release ships.

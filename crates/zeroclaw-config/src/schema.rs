@@ -611,6 +611,15 @@ pub struct ModelProviderConfig {
     /// this field is purely additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<ModelPricing>,
+    /// Override the provider's default for native tool calling.
+    /// `None` (default) honors the provider's built-in choice. `Some(true)`
+    /// forces native tool calls on, `Some(false)` forces text-fallback.
+    /// Currently consulted only by the Groq factory, which defaults to
+    /// text-fallback because llama-family Groq models reject native tool
+    /// calls with HTTP 400. Setting `native_tools = true` re-enables native
+    /// tool calling for Groq models that support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_tools: Option<bool>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -1481,6 +1490,46 @@ fn default_local_whisper_timeout_secs() -> u64 {
     300
 }
 
+/// HMAC tool execution receipt configuration (`[agent.tool_receipts]`).
+///
+/// Receipts are short HMAC-SHA256 tags appended to tool results so the model
+/// cannot claim it ran a tool that never actually executed. See
+/// `docs/book/src/security/tool-receipts.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent.tool_receipts"]
+pub struct ToolReceiptsConfig {
+    /// Generate HMAC receipts on every tool execution. Default: `false`.
+    /// When false, the entire receipt subsystem is inert (no key, no
+    /// generation, no append, no system-prompt addendum).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Append a trailing `Tool receipts:` block to user-visible replies so
+    /// receipts are auditable from the channel surface, not just the
+    /// internal history. Default: `false`.
+    #[serde(default)]
+    pub show_in_response: bool,
+    /// Inject the receipt-echo instruction into the system prompt so the
+    /// model carries receipts verbatim into its response. Default: `true`.
+    /// No effect when `enabled = false`.
+    #[serde(default = "default_inject_system_prompt")]
+    pub inject_system_prompt: bool,
+}
+
+fn default_inject_system_prompt() -> bool {
+    true
+}
+
+impl Default for ToolReceiptsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            show_in_response: false,
+            inject_system_prompt: default_inject_system_prompt(),
+        }
+    }
+}
+
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -1565,6 +1614,11 @@ pub struct AgentConfig {
     /// behavior). Default: `2`.
     #[serde(default = "default_keep_tool_context_turns")]
     pub keep_tool_context_turns: usize,
+
+    /// HMAC tool execution receipt configuration.
+    #[nested]
+    #[serde(default)]
+    pub tool_receipts: ToolReceiptsConfig,
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1615,6 +1669,7 @@ impl Default for AgentConfig {
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            tool_receipts: ToolReceiptsConfig::default(),
         }
     }
 }
@@ -9124,6 +9179,8 @@ impl Default for NotionConfig {
 ///
 /// ## Auth
 /// Jira Cloud uses HTTP Basic auth: `email` + `api_token`.
+/// Jira Server/Data Center uses Bearer token auth: omit `email` and set
+/// `api_token` to a personal access token.
 /// `api_token` is stored encrypted at rest; set it here or via `JIRA_API_TOKEN`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -9135,9 +9192,10 @@ pub struct JiraConfig {
     /// Atlassian instance base URL, e.g. `https://yourco.atlassian.net`.
     #[serde(default)]
     pub base_url: String,
-    /// Jira account email used for Basic auth.
-    #[serde(default)]
-    pub email: String,
+    /// Jira account email used for Basic auth (Cloud).
+    /// Omit for Server/DC deployments using Bearer token auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
     /// Jira API token. Encrypted at rest. Falls back to `JIRA_API_TOKEN` env var.
     #[serde(default)]
     #[secret]
@@ -9166,7 +9224,7 @@ impl Default for JiraConfig {
         Self {
             enabled: false,
             base_url: String::new(),
-            email: String::new(),
+            email: None,
             api_token: String::new(),
             allowed_actions: default_jira_allowed_actions(),
             timeout_secs: default_jira_timeout_secs(),
@@ -11007,9 +11065,6 @@ impl Config {
         if self.jira.enabled {
             if self.jira.base_url.trim().is_empty() {
                 anyhow::bail!("jira.base_url must not be empty when jira.enabled = true");
-            }
-            if self.jira.email.trim().is_empty() {
-                anyhow::bail!("jira.email must not be empty when jira.enabled = true");
             }
             if self.jira.api_token.trim().is_empty()
                 && std::env::var("JIRA_API_TOKEN")
@@ -15710,6 +15765,26 @@ default_model = "persisted-profile"
     }
 
     #[test]
+    async fn validate_rejects_unpublished_jira_actions() {
+        for action in ["list_projects", "myself"] {
+            let mut config = Config::default();
+            config.jira.enabled = true;
+            config.jira.base_url = "https://jira.example.test".into();
+            config.jira.api_token = "token".into();
+            config.jira.allowed_actions = vec![action.into()];
+
+            let err = config
+                .validate()
+                .expect_err("unpublished Jira action should be rejected")
+                .to_string();
+            assert!(
+                err.contains("jira.allowed_actions contains unknown action"),
+                "expected Jira allowed action error for {action}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
     async fn env_override_reasoning_enabled() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
@@ -18084,6 +18159,95 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert!(!Config::prop_is_secret(
             "providers.models.openrouter.context-window"
         ));
+    }
+
+    #[test]
+    async fn hashmap_property_paths_preserve_url_like_keys() {
+        let dir = TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            workspace_dir: dir.path().join("workspace"),
+            ..Default::default()
+        };
+        let provider_key = "custom:https://api.example.invalid/v1";
+        config
+            .providers
+            .models
+            .insert(provider_key.to_string(), ModelProviderConfig::default());
+
+        let api_key_path = format!("providers.models.{provider_key}.api-key");
+        let base_url_path = format!("providers.models.{provider_key}.base-url");
+        let model_path = format!("providers.models.{provider_key}.model");
+        let temperature_path = format!("providers.models.{provider_key}.temperature");
+
+        assert!(
+            Config::prop_is_secret(&api_key_path),
+            "url-like provider keys must still route secret metadata"
+        );
+
+        config.set_prop(&api_key_path, "sk-test-custom").unwrap();
+        config
+            .set_prop(&base_url_path, "https://api.example.invalid/v1")
+            .unwrap();
+        config.set_prop(&model_path, "local-large").unwrap();
+        config.set_prop(&temperature_path, "0.2").unwrap();
+
+        let provider = config
+            .providers
+            .models
+            .get(provider_key)
+            .expect("custom provider key should be preserved exactly");
+        assert_eq!(provider.api_key.as_deref(), Some("sk-test-custom"));
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://api.example.invalid/v1")
+        );
+        assert_eq!(provider.model.as_deref(), Some("local-large"));
+        assert_eq!(provider.temperature, Some(0.2));
+
+        assert_eq!(config.get_prop(&api_key_path).unwrap(), "**** (encrypted)");
+        assert_eq!(
+            config.get_prop(&base_url_path).unwrap(),
+            "https://api.example.invalid/v1"
+        );
+
+        config.save().await.unwrap();
+        let raw_toml = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(
+            raw_toml.contains(provider_key),
+            "saved TOML should preserve the exact URL-like provider key"
+        );
+        assert!(
+            !raw_toml.contains("sk-test-custom"),
+            "saved TOML must not contain the plaintext custom provider API key"
+        );
+
+        let mut loaded: Config = toml::from_str::<crate::migration::V1Compat>(&raw_toml)
+            .unwrap()
+            .into_config();
+        loaded.config_path = config.config_path.clone();
+        loaded.workspace_dir = config.workspace_dir.clone();
+        let store = crate::secrets::SecretStore::new(dir.path(), loaded.secrets.encrypt);
+        loaded.decrypt_secrets(&store).unwrap();
+        let loaded_provider = loaded
+            .providers
+            .models
+            .get(provider_key)
+            .expect("saved custom provider key should reload exactly");
+        assert_eq!(
+            loaded.providers.fallback.as_deref(),
+            None,
+            "property round-trip should not invent a fallback provider"
+        );
+        assert_eq!(loaded_provider.api_key.as_deref(), Some("sk-test-custom"));
+        assert_eq!(
+            loaded_provider.base_url.as_deref(),
+            Some("https://api.example.invalid/v1")
+        );
+        assert_eq!(loaded_provider.model.as_deref(), Some("local-large"));
+        assert_eq!(loaded_provider.temperature, Some(0.2));
     }
 
     #[test]

@@ -389,6 +389,14 @@ struct ChannelRuntimeContext {
     max_tool_result_chars: usize,
     context_token_budget: usize,
     debouncer: Arc<zeroclaw_infra::debounce::MessageDebouncer>,
+    /// HMAC receipt generator. `Some` when `[agent.tool_receipts] enabled = true`.
+    /// Threaded into `run_tool_call_loop` so `tool_execution::execute_one_tool`
+    /// can sign each result.
+    receipt_generator: Option<zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator>,
+    /// Mirror of `[agent.tool_receipts] show_in_response`. When true,
+    /// `process_channel_message` renders the per-turn collector as a trailing
+    /// `Tool receipts:` block sent after the main reply.
+    show_receipts_in_response: bool,
 }
 
 #[derive(Clone)]
@@ -838,20 +846,38 @@ fn resolved_default_provider(config: &Config) -> String {
         .unwrap_or_else(|| "openrouter".to_string())
 }
 
+/// Three-step model resolution mirroring `agent::Agent::from_config` (#6099):
+/// (1) the fallback provider's `model`, (2) the first configured
+/// `[providers.models.*]` model with a WARN naming what to set,
+/// (3) hard fail with an actionable error. No silent vendor-default.
 fn resolved_default_model(config: &Config) -> anyhow::Result<String> {
-    config
+    let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
+    if let Some(m) = config
         .providers
         .fallback_provider()
-        .and_then(|e| e.model.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no model configured: providers.fallback = {:?} resolves with no model, \
-                 and no [[providers.models.*]] entry has a `model` field set. \
-                 Configure at least one [providers.models.<name>] model = \"...\" \
-                 or define a [[model_routes]] hint.",
-                config.providers.fallback
-            )
-        })
+        .and_then(|e| e.model.as_deref())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        return Ok(m.to_string());
+    }
+    if let Some(m) = config.providers.resolve_default_model() {
+        tracing::warn!(
+            provider = provider_name,
+            model = %m,
+            "fallback provider has no `model` set; using first configured \
+             providers.models entry as default. Set [providers.models.{provider_name}] \
+             model = \"...\" to silence this warning.",
+        );
+        return Ok(m);
+    }
+    anyhow::bail!(
+        "no model configured: providers.fallback = {:?} resolves with no model, \
+         and no [providers.models.*] entry has a `model` field set. \
+         Configure at least one [providers.models.<name>] model = \"...\", \
+         or define a [[model_routes]] hint, before starting channels.",
+        config.providers.fallback,
+    )
 }
 
 fn runtime_defaults_from_config(config: &Config) -> anyhow::Result<ChannelRuntimeDefaults> {
@@ -1898,51 +1924,119 @@ async fn build_memory_context(
     min_relevance_score: f64,
     session_id: Option<&str>,
 ) -> String {
-    let mut context = String::new();
+    build_memory_context_for_sessions(mem, user_msg, min_relevance_score, &[session_id]).await
+}
 
-    if let Ok(entries) = mem.recall(user_msg, 5, session_id, None, None).await {
-        let mut included = 0usize;
-        let mut used_chars = 0usize;
+async fn build_memory_context_for_sessions(
+    mem: &dyn Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+    session_ids: &[Option<&str>],
+) -> String {
+    let mut entries = Vec::new();
+    let mut seen_keys = HashSet::new();
 
-        for entry in entries.iter().filter(|e| match e.score {
-            Some(score) => score >= min_relevance_score,
-            None => true, // keep entries without a score (e.g. non-vector backends)
-        }) {
-            if included >= MEMORY_CONTEXT_MAX_ENTRIES {
-                break;
-            }
-
-            if should_skip_memory_context_entry(&entry.key, &entry.content) {
-                continue;
-            }
-
-            let content = if entry.content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
-                truncate_with_ellipsis(&entry.content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
-            } else {
-                entry.content.clone()
-            };
-
-            let line = format!("- {}: {}\n", entry.key, content);
-            let line_chars = line.chars().count();
-            if used_chars + line_chars > MEMORY_CONTEXT_MAX_CHARS {
-                break;
-            }
-
-            if included == 0 {
-                context.push_str("[Memory context]\n");
-            }
-
-            context.push_str(&line);
-            used_chars += line_chars;
-            included += 1;
+    match session_ids {
+        [] => {}
+        [session_id] => {
+            let recalled = mem.recall(user_msg, 5, *session_id, None, None).await;
+            append_recalled_memory_entries(&mut entries, &mut seen_keys, recalled);
         }
-
-        if included > 0 {
-            context.push_str("[/Memory context]\n\n");
+        [first_session_id, second_session_id] => {
+            let (first_entries, second_entries) = tokio::join!(
+                mem.recall(user_msg, 5, *first_session_id, None, None),
+                mem.recall(user_msg, 5, *second_session_id, None, None)
+            );
+            append_recalled_memory_entries(&mut entries, &mut seen_keys, first_entries);
+            append_recalled_memory_entries(&mut entries, &mut seen_keys, second_entries);
+        }
+        _ => {
+            for session_id in session_ids {
+                let recalled = mem.recall(user_msg, 5, *session_id, None, None).await;
+                append_recalled_memory_entries(&mut entries, &mut seen_keys, recalled);
+            }
         }
     }
 
+    format_memory_context(&entries, min_relevance_score)
+}
+
+fn append_recalled_memory_entries(
+    entries: &mut Vec<zeroclaw_memory::MemoryEntry>,
+    seen_keys: &mut HashSet<String>,
+    recalled: Result<Vec<zeroclaw_memory::MemoryEntry>>,
+) {
+    if let Ok(recalled) = recalled {
+        for entry in recalled {
+            if seen_keys.insert(entry.key.clone()) {
+                entries.push(entry);
+            }
+        }
+    }
+}
+
+fn format_memory_context(
+    entries: &[zeroclaw_memory::MemoryEntry],
+    min_relevance_score: f64,
+) -> String {
+    let mut context = String::new();
+
+    let mut included = 0usize;
+    let mut used_chars = 0usize;
+
+    for entry in entries.iter().filter(|e| match e.score {
+        Some(score) => score >= min_relevance_score,
+        None => true, // keep entries without a score (e.g. non-vector backends)
+    }) {
+        if included >= MEMORY_CONTEXT_MAX_ENTRIES {
+            break;
+        }
+
+        if should_skip_memory_context_entry(&entry.key, &entry.content) {
+            continue;
+        }
+
+        let content = if entry.content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
+            truncate_with_ellipsis(&entry.content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
+        } else {
+            entry.content.clone()
+        };
+
+        let line = format!("- {}: {}\n", entry.key, content);
+        let line_chars = line.chars().count();
+        if used_chars + line_chars > MEMORY_CONTEXT_MAX_CHARS {
+            break;
+        }
+
+        if included == 0 {
+            context.push_str("[Memory context]\n");
+        }
+
+        context.push_str(&line);
+        used_chars += line_chars;
+        included += 1;
+    }
+
+    if included > 0 {
+        context.push_str("[/Memory context]\n\n");
+    }
+
     context
+}
+
+fn is_group_reply_target(reply_target: &str) -> bool {
+    reply_target.contains("@g.us") || reply_target.starts_with("group:")
+}
+
+fn sender_memory_session_ids<'a>(
+    msg: &'a zeroclaw_api::channel::ChannelMessage,
+    history_key: &'a str,
+) -> Vec<Option<&'a str>> {
+    if is_group_reply_target(&msg.reply_target) {
+        vec![Some(&msg.sender)]
+    } else {
+        vec![Some(history_key), Some(&msg.sender)]
+    }
 }
 
 /// Extract a compact summary of tool interactions from history messages added
@@ -2812,16 +2906,16 @@ async fn process_channel_message(
     // ── Dual-scope memory recall ──────────────────────────────────
     // Always recall before each LLM call (not just first turn).
     // For group chats: merge sender-scope + group-scope memories.
-    // For DMs: sender-scope only.
-    let is_group_chat =
-        msg.reply_target.contains("@g.us") || msg.reply_target.starts_with("group:");
+    // For DMs: recall from the current conversation scope plus sender scope.
+    let is_group_chat = is_group_reply_target(&msg.reply_target);
 
     let mem_recall_start = Instant::now();
-    let sender_memory_fut = build_memory_context(
+    let sender_session_ids = sender_memory_session_ids(&msg, &history_key);
+    let sender_memory_fut = build_memory_context_for_sessions(
         ctx.memory.as_ref(),
         &msg.content,
         ctx.min_relevance_score,
-        Some(&msg.sender),
+        sender_session_ids.as_slice(),
     );
 
     let (sender_memory, group_memory) = if is_group_chat {
@@ -2844,7 +2938,7 @@ async fn process_channel_message(
         "⏱ Memory recall completed"
     );
 
-    // Merge sender + group memories, avoiding duplicates
+    // Merge sender and group memory context blocks.
     let memory_context = if group_memory.is_empty() {
         sender_memory
     } else if sender_memory.is_empty() {
@@ -3141,6 +3235,20 @@ async fn process_channel_message(
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
     tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
+    // Per-turn collector. `tool_execution::execute_one_tool` pushes
+    // `<tool_name>: <receipt>` here whenever a receipt is generated, so the
+    // orchestrator can render the trailing `Tool receipts:` block after the
+    // loop returns. Wrapped in `Arc` so the same handle can be shared into
+    // `TOOL_LOOP_RECEIPT_CONTEXT` for subagent forwarding (#6182). Inert when
+    // `receipt_generator` is `None`.
+    let tool_receipts_collector: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let receipt_scope = ctx.receipt_generator.as_ref().map(|generator| {
+        zeroclaw_runtime::agent::tool_receipts::ReceiptScope {
+            generator: generator.clone(),
+            collector: std::sync::Arc::clone(&tool_receipts_collector),
+        }
+    });
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let loop_result = tokio::select! {
@@ -3153,6 +3261,8 @@ async fn process_channel_message(
                             .or_else(|| Some(msg.id.clone())),
                         zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
+                        zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
+                            receipt_scope.clone(),
                         run_tool_call_loop(
                         active_provider.as_ref(),
                         &mut history,
@@ -3185,8 +3295,14 @@ async fn process_channel_message(
                         ctx.context_token_budget,
                         None, // shared_budget
                         target_channel.as_deref(),
-                        None, // receipt_generator
-                        None, // collected_receipts
+                        ctx.receipt_generator.as_ref(),
+                        // Collector is meaningful only when the generator is
+                        // active. Pass None when receipts are disabled so the
+                        // call site reflects that coupling explicitly.
+                        ctx.receipt_generator
+                            .as_ref()
+                            .map(|_| tool_receipts_collector.as_ref()),
+                    ),
                     ),
                     ),
                     ),
@@ -3468,6 +3584,29 @@ async fn process_channel_message(
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&delivered_response, 80)
             );
+            // Build the trailing `Tool receipts:` block from the per-turn
+            // collector. Empty when receipts are disabled or no tool ran.
+            // Includes receipts from delegate sub-agents because the same
+            // `Arc<Mutex<Vec<String>>>` is forwarded via
+            // `TOOL_LOOP_RECEIPT_CONTEXT` into sub-loops (see #6182).
+            let receipts_block = if ctx.show_receipts_in_response {
+                let receipts = tool_receipts_collector
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if receipts.is_empty() {
+                    None
+                } else {
+                    use std::fmt::Write as _;
+                    let mut block = String::from("---\nTool receipts:");
+                    for r in receipts.iter() {
+                        write!(block, "\n  {r}").ok();
+                    }
+                    Some(block)
+                }
+            } else {
+                None
+            };
+
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
@@ -3491,6 +3630,24 @@ async fn process_channel_message(
                     .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                }
+                // Send tool receipts as a separate message in the same thread.
+                // The block is the operator-facing audit surface for the feature,
+                // so a dropped send must leave a log signal rather than silently
+                // disappear.
+                if let Some(ref block) = receipts_block
+                    && let Err(e) = channel
+                        .send(
+                            &SendMessage::new(block, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        channel = channel.name(),
+                        error = %e,
+                        "failed to send tool receipts block"
+                    );
                 }
             }
         }
@@ -4067,6 +4224,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     dc.listen_to_bots,
                     dc.mention_only,
                 )
+                .with_workspace_dir(config.workspace_dir.clone())
                 .with_streaming(
                     dc.stream_mode,
                     dc.draft_update_interval_ms,
@@ -4532,6 +4690,7 @@ fn collect_configured_channels(
                         dc.listen_to_bots,
                         dc.mention_only,
                     )
+                    .with_workspace_dir(config.workspace_dir.clone())
                     .with_streaming(
                         dc.stream_mode,
                         dc.draft_update_interval_ms,
@@ -5536,6 +5695,18 @@ pub async fn start_channels(
         system_prompt.push_str(&deferred_section);
     }
 
+    // Append the receipt-echo instruction so the model carries
+    // `[receipt: zc-receipt-...]` markers verbatim into its response.
+    if config.agent.tool_receipts.enabled && config.agent.tool_receipts.inject_system_prompt {
+        system_prompt.push_str(
+            "\n## Tool Execution Receipts\n\n\
+             Every tool result includes a `[receipt: ...]` field. This is a cryptographic \
+             signature proving the tool actually executed. You must include the receipt \
+             verbatim when referencing tool results. Do not modify, omit, or fabricate receipts. \
+             A missing or invalid receipt indicates a fabricated tool call.\n\n",
+        );
+    }
+
     if !skills.is_empty() {
         println!(
             "  🧩 Skills:   {}",
@@ -5778,6 +5949,12 @@ pub async fn start_channels(
         debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
             Duration::from_millis(config.channels.debounce_ms),
         )),
+        receipt_generator: if config.agent.tool_receipts.enabled {
+            Some(zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new())
+        } else {
+            None
+        },
+        show_receipts_in_response: config.agent.tool_receipts.show_in_response,
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
@@ -5913,7 +6090,8 @@ pub async fn deliver_announcement(
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
-            );
+            )
+            .with_workspace_dir(config.workspace_dir.clone());
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
                 .await?;
         }
@@ -6354,6 +6532,8 @@ mod tests {
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -6480,6 +6660,8 @@ mod tests {
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -6563,6 +6745,8 @@ mod tests {
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -6663,6 +6847,8 @@ mod tests {
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -7264,6 +7450,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7290,6 +7478,382 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(reply.contains("BTC is currently around"));
         assert!(!reply.contains("\"tool_calls\""));
         assert!(!reply.contains("mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_renders_trailing_tool_receipts_block_when_enabled() {
+        // Activated path: a real ReceiptGenerator + show_receipts_in_response=true
+        // must produce a second send carrying the "Tool receipts:" block with a
+        // valid zc-receipt-* token. Pre-#6214 this was dead code from the test
+        // suite because every ChannelRuntimeContext literal pinned the feature
+        // off; this test guards the integration so a regression in the block
+        // render or send call surfaces in CI rather than in production.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            // Full autonomy + auto-approve mock_price so the loop actually
+            // reaches execute_one_tool. The other tests in this file pass
+            // under Supervised because ToolCallingProvider returns the BTC
+            // reply regardless of whether the tool ran (the LLM only needs
+            // to see a `[Tool results]` user message — even a "denied"
+            // payload triggers the deterministic response). Receipts only
+            // generate on the actual execute path, so we need the gate
+            // open here.
+            autonomy_level: AutonomyLevel::Full,
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            hooks: None,
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&{
+                let mut autonomy = zeroclaw_config::schema::AutonomyConfig::default();
+                autonomy.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+                autonomy.auto_approve.push("mock_price".to_string());
+                autonomy
+            })),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: Some(
+                zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new(),
+            ),
+            show_receipts_in_response: true,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-42".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        // Two sends: the model's reply and the trailing receipts block.
+        assert!(
+            sent_messages.len() >= 2,
+            "expected at least 2 sends (reply + receipts block), got {}: {:?}",
+            sent_messages.len(),
+            sent_messages
+        );
+
+        let receipts_message = sent_messages
+            .iter()
+            .find(|m| m.contains("Tool receipts:"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `Tool receipts:` send found; got {:?}",
+                    sent_messages.as_slice()
+                )
+            });
+        assert!(
+            receipts_message.starts_with("chat-42:"),
+            "receipts block must be sent to the same reply target as the agent reply, got {receipts_message}"
+        );
+        assert!(
+            receipts_message.contains("---\nTool receipts:"),
+            "receipts block must be prefixed with the documented `---\\nTool receipts:` separator, got {receipts_message}"
+        );
+        assert!(
+            receipts_message.contains("zc-receipt-"),
+            "receipts block must carry at least one zc-receipt-* HMAC token (proves the generator actually ran), got {receipts_message}"
+        );
+        assert!(
+            receipts_message.contains("mock_price"),
+            "receipts block should name the tool that produced the receipt, got {receipts_message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_omits_receipts_block_when_disabled() {
+        // Backward-compat: with show_receipts_in_response=false (default), no
+        // trailing receipts message is sent — even when a generator is active
+        // and the loop ran tools. This is the path every other test relies on
+        // implicitly; assert it once explicitly.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            // Match the enabled-test setup so the tool actually runs; the
+            // assertion below proves the receipt-block send is gated on
+            // `show_receipts_in_response` and not on whether the loop saw
+            // any receipts.
+            autonomy_level: AutonomyLevel::Full,
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            hooks: None,
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&{
+                let mut autonomy = zeroclaw_config::schema::AutonomyConfig::default();
+                autonomy.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+                autonomy.auto_approve.push("mock_price".to_string());
+                autonomy
+            })),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: Some(
+                zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new(),
+            ),
+            show_receipts_in_response: false,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-42".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            !sent_messages.iter().any(|m| m.contains("Tool receipts:")),
+            "no receipts block must be sent when show_receipts_in_response=false; got {:?}",
+            sent_messages.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_disabled_receipt_generator_emits_no_receipts_anywhere() {
+        // Strict #6182 acceptance criterion: enabled=false must emit no
+        // receipt anywhere — not in any sent message, not in the model's
+        // view of conversation history. `receipt_generator: None` is the
+        // wire-level reflection of `[agent.tool_receipts] enabled = false`.
+        // Distinct from the show_in_response=false test above (which keeps
+        // the generator on but suppresses the trailing block); this one
+        // proves nothing is signed in the first place.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::Full,
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            hooks: None,
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&{
+                let mut autonomy = zeroclaw_config::schema::AutonomyConfig::default();
+                autonomy.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+                autonomy.auto_approve.push("mock_price".to_string());
+                autonomy
+            })),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-42".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            !sent_messages.is_empty(),
+            "agent must still respond when receipts are disabled"
+        );
+        assert!(
+            !sent_messages.iter().any(|m| m.contains("zc-receipt-")),
+            "no zc-receipt- token must appear in any sent message when receipts are disabled, got {:?}",
+            sent_messages.as_slice()
+        );
+        assert!(
+            !sent_messages.iter().any(|m| m.contains("Tool receipts:")),
+            "no `Tool receipts:` block must be sent when receipts are disabled, got {:?}",
+            sent_messages.as_slice()
+        );
+
+        // Strict surface check: the model's view of conversation history must
+        // not carry a `[receipt: ` trailer either, otherwise an LLM trained
+        // on echoing receipts could leak signed-looking output even though
+        // nothing was actually signed.
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (_key, turns) in histories.iter() {
+            for msg in turns.iter() {
+                assert!(
+                    !msg.content.contains("[receipt: "),
+                    "no `[receipt: ` trailer must appear in conversation history when receipts are disabled, got: {}",
+                    msg.content
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -7356,6 +7920,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7462,6 +8028,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7553,6 +8121,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7654,6 +8224,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7776,6 +8348,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7879,6 +8453,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7997,6 +8573,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -8103,6 +8681,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -8199,6 +8779,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -8418,6 +9000,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
@@ -8532,6 +9116,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -8665,6 +9251,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -8795,6 +9383,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -8903,6 +9493,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -8992,6 +9584,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -9081,6 +9675,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -9769,6 +10365,105 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(context.contains("Age is 45"));
     }
 
+    #[tokio::test]
+    async fn autosaved_conversation_memory_is_recalled_by_sender_scope() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg_1".into(),
+            sender: "U123".into(),
+            reply_target: "C456".into(),
+            content: "Project codename is quartz".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let history_key = conversation_history_key(&msg);
+
+        mem.store(
+            &conversation_memory_key(&msg),
+            &msg.content,
+            MemoryCategory::Conversation,
+            Some(&history_key),
+        )
+        .await
+        .unwrap();
+
+        let session_ids = sender_memory_session_ids(&msg, &history_key);
+        let context = build_memory_context_for_sessions(&mem, "quartz", 0.0, &session_ids).await;
+
+        assert!(
+            context.contains("Project codename is quartz"),
+            "sender recall should include autosaved memories stored under the current session key, got: {context}"
+        );
+    }
+
+    #[tokio::test]
+    async fn autosaved_group_conversation_memory_stays_session_scoped() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let group_a_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg_1".into(),
+            sender: "U123".into(),
+            reply_target: "group:alpha".into(),
+            content: "Group alpha codename is quartz".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let group_b_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg_2".into(),
+            sender: "U123".into(),
+            reply_target: "group:beta".into(),
+            content: "What was the codename?".into(),
+            channel: "slack".into(),
+            timestamp: 2,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let group_a_history_key = conversation_history_key(&group_a_msg);
+        let group_b_history_key = conversation_history_key(&group_b_msg);
+
+        mem.store(
+            &conversation_memory_key(&group_a_msg),
+            &group_a_msg.content,
+            MemoryCategory::Conversation,
+            Some(&group_a_history_key),
+        )
+        .await
+        .unwrap();
+
+        let group_b_sender_session_ids =
+            sender_memory_session_ids(&group_b_msg, &group_b_history_key);
+        assert_eq!(group_b_sender_session_ids, vec![Some("U123")]);
+
+        let sender_context =
+            build_memory_context_for_sessions(&mem, "quartz", 0.0, &group_b_sender_session_ids)
+                .await;
+        let group_context =
+            build_memory_context(&mem, "quartz", 0.0, Some(&group_b_history_key)).await;
+        let source_group_context =
+            build_memory_context(&mem, "quartz", 0.0, Some(&group_a_history_key)).await;
+
+        assert!(
+            sender_context.is_empty(),
+            "sender scope must not leak autosaved group memory from another group, got: {sender_context}"
+        );
+        assert!(
+            group_context.is_empty(),
+            "target group scope must not include another group's autosaved memory, got: {group_context}"
+        );
+        assert!(
+            source_group_context.contains("Group alpha codename is quartz"),
+            "source group scope should still recall its own autosaved memory, got: {source_group_context}"
+        );
+    }
+
     /// Auto-saved photo messages must not surface through memory context,
     /// otherwise the image marker gets duplicated in the provider request (#2403).
     #[tokio::test]
@@ -9876,6 +10571,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -10022,6 +10719,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -10209,6 +10908,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -10327,6 +11028,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -10951,6 +11654,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -11049,6 +11754,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -11179,6 +11886,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 std::time::Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
         });
@@ -11357,6 +12066,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -11479,6 +12190,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -11593,6 +12306,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -11727,6 +12442,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -12043,6 +12760,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);

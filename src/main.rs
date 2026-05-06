@@ -1143,6 +1143,12 @@ enum MemoryCommands {
         #[arg(long)]
         yes: bool,
     },
+    /// Rebuild backend indexes: FTS tables + any missing embedding vectors.
+    ///
+    /// Run after `zeroclaw migrate openclaw` or other bulk writes that land
+    /// rows with `embedding = NULL`. Safe to re-run; only touches entries
+    /// whose vector is missing. No-op for backends without a vector index.
+    Reindex,
 }
 
 fn apply_i18n_to_command(cmd: clap::Command) -> clap::Command {
