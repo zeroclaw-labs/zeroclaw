@@ -58,6 +58,21 @@ impl WatiChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
+                // V3 routes per-agent `transcription_provider` through the
+                // orchestrator's resolved-runtime path. For the
+                // `try_transcribe_audio` direct path (gateway WS handler /
+                // channel-side ingest), bind to the sole registered provider
+                // when only one is configured so the single-provider case
+                // dispatches without an agent context. Multi-provider setups
+                // still require explicit `agent.<alias>.transcription_provider`
+                // routing through the orchestrator.
+                let names = m.available_providers();
+                let m = if names.len() == 1 {
+                    let only = names[0].to_string();
+                    m.with_agent_transcription_provider(only)
+                } else {
+                    m
+                };
                 self.transcription_manager = Some(std::sync::Arc::new(m));
             }
             Err(e) => {
@@ -743,7 +758,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "tested default-using TranscriptionManager.transcribe path which V3 retired in #6273; channel-side rewiring to thread agent.transcription_provider through with_transcription is deferred to a follow-up PR"]
     fn wati_manager_none_and_warn_on_init_failure() {
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
@@ -905,7 +919,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "tested default-using TranscriptionManager.transcribe path which V3 retired in #6273; channel-side rewiring to thread agent.transcription_provider through with_transcription is deferred to a follow-up PR"]
     async fn wati_transcribes_audio_via_local_whisper() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};

@@ -1154,14 +1154,151 @@ pub fn create_model_provider_with_url(
     )
 }
 
+/// Map a V2 model-provider family name (synonyms, regional variants, OAuth
+/// suffixes) to its V3 canonical family. Production configs are normalised at
+/// TOML load time by `normalize_provider_type` in
+/// `zeroclaw-config/src/schema/v2.rs`. This helper duplicates the same table
+/// at the runtime factory boundary so callers that bypass the schema
+/// migration (programmatic factory invocations, tests, the
+/// `create_model_provider_with_url` colon-URL legacy entry point) still
+/// resolve. Inputs that are already canonical or unknown pass through
+/// unchanged.
+#[must_use]
+pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
+    match name {
+        // Vendor-canonical synonyms.
+        "azure_openai" | "azure-openai" => "azure",
+        "grok" => "xai",
+        "google" | "google-gemini" => "gemini",
+        "together-ai" => "together",
+        "fireworks-ai" => "fireworks",
+        "vercel-ai" => "vercel",
+        "cloudflare-ai" => "cloudflare",
+        "nvidia-nim" | "build.nvidia.com" => "nvidia",
+        "aws-bedrock" => "bedrock",
+        "lm-studio" => "lmstudio",
+        "lite-llm" => "litellm",
+        "hf" => "huggingface",
+        "01ai" | "lingyiwanwu" => "yi",
+        "tencent" => "hunyuan",
+        "baidu" => "qianfan",
+        "github-copilot" => "copilot",
+        "ovhcloud" => "ovh",
+        "opencode-zen" => "opencode",
+        "llama.cpp" => "llamacpp",
+        "deep-myst" => "deepmyst",
+        "silicon-flow" => "siliconflow",
+        "deep-infra" => "deepinfra",
+        "ai21-labs" => "ai21",
+        "friendliai" => "friendli",
+        "lepton-ai" => "lepton",
+        "step" => "stepfun",
+        "kilo" => "kilocli",
+        // Moonshot / Kimi (regional + code variants fold to one family).
+        "kimi" | "kimi-cn" | "kimi-intl" | "kimi-global" | "kimi-code" | "kimi_coding"
+        | "kimi_for_coding" | "moonshot-cn" | "moonshot-intl" | "moonshot-global" => "moonshot",
+        // Qwen / DashScope / Bailian.
+        "qwen-cn"
+        | "qwen-intl"
+        | "qwen-us"
+        | "qwen-international"
+        | "qwen-code"
+        | "qwen-oauth"
+        | "qwen_oauth"
+        | "dashscope"
+        | "dashscope-cn"
+        | "dashscope-intl"
+        | "dashscope-us"
+        | "dashscope-international"
+        | "bailian"
+        | "aliyun-bailian"
+        | "aliyun" => "qwen",
+        // GLM / Zhipu.
+        "zhipu" | "glm-global" | "zhipu-global" | "glm-cn" | "zhipu-cn" | "bigmodel" => "glm",
+        // Z.AI.
+        "z.ai" | "zai-global" | "z.ai-global" | "zai-cn" | "z.ai-cn" => "zai",
+        // Minimax (cn/intl + oauth).
+        "minimax-intl"
+        | "minimax-io"
+        | "minimax-global"
+        | "minimax-portal"
+        | "minimax-portal-global"
+        | "minimax-cn"
+        | "minimaxi"
+        | "minimax-portal-cn"
+        | "minimax-oauth"
+        | "minimax-oauth-global"
+        | "minimax-oauth-cn" => "minimax",
+        // Doubao / Volcengine.
+        "volcengine" | "ark" | "doubao-cn" => "doubao",
+        // Gemini CLI is its own typed slot (subprocess runtime).
+        "gemini-cli" => "gemini_cli",
+        // Stepfun-intl folds with a different uri at the schema layer.
+        "stepfun-intl" | "step-intl" => "stepfun",
+        // Anthropic special folds.
+        "claude-code" | "anthropic-custom" => "anthropic",
+        // OpenCode regional fold (alias differs at the schema layer).
+        "opencode-go" => "opencode",
+        // Already canonical, or a name the factory's match arms can reject
+        // with a useful error.
+        _ => name,
+    }
+}
+
+/// Split a V2 colon-URL family name (`custom:https://...`,
+/// `anthropic-custom:https://...`) into a `(name, url)` pair. The V3 typed
+/// schema stores custom endpoints as `[providers.models.<family>.<alias>]
+/// uri = "..."`; this helper preserves runtime-factory compatibility for
+/// callers that still pass the legacy single-token form.
+fn split_v2_colon_url(name: &str) -> (&str, Option<&str>) {
+    if let Some(idx) = name.find(':') {
+        let (prefix, rest) = name.split_at(idx);
+        let url = &rest[1..];
+        if url.starts_with("http://") || url.starts_with("https://") {
+            return (prefix, Some(url));
+        }
+    }
+    (name, None)
+}
+
 /// Factory: create model_provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
 fn create_model_provider_with_url_and_options(
-    name: &str,
+    raw_name: &str,
     api_key: Option<&str>,
     api_url: Option<&str>,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
+    // Pre-normalise the family name for callers that bypass the schema
+    // migration (tests, programmatic factory calls, V2 colon-URL form).
+    // Detect the bare `custom:` and `anthropic-custom:` forms (colon present,
+    // URL missing or malformed) and surface a useful error before falling
+    // into the unknown-family arm.
+    if let Some(idx) = raw_name.find(':') {
+        let prefix = &raw_name[..idx];
+        let url = raw_name[idx + 1..].trim();
+        if matches!(prefix, "custom" | "anthropic-custom")
+            && (url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")))
+        {
+            anyhow::bail!(
+                "Custom model_provider `{prefix}:<url>` requires a URL beginning with http:// or https://. \
+                 Set `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` or pass a valid URL."
+            );
+        }
+    }
+    let (split_name, split_url) = split_v2_colon_url(raw_name);
+    let api_url = api_url.or(split_url);
+    let name = canonicalize_v2_model_provider_name(split_name);
+
+    // V2 spelled OpenAI Codex as `openai-codex` / `openai_codex` / `codex`.
+    // V3 dispatches via `requires_openai_auth = true` on the typed alias, but
+    // factory callers that pass the legacy spelling expect a working
+    // construction here.
+    if matches!(name, "openai-codex" | "openai_codex" | "codex") {
+        return Ok(Box::new(openai_codex::OpenAiCodexModelProvider::new(
+            options, api_key,
+        )?));
+    }
     // Closure to optionally apply the configured model_provider timeout and extra
     // headers to OpenAI-compatible model_providers before boxing them as trait objects.
     let compat = {
@@ -1775,7 +1912,7 @@ fn create_model_provider_with_url_and_options(
         }
 
         _ => anyhow::bail!(
-            "Unknown model model_provider family: {name}. After the V2 to typed-family migration, \
+            "Unknown model_provider family: {name}. After the V2 to typed-family migration, \
              only canonical family names are valid. Run `zeroclaw onboard` to reconfigure, \
              or set `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` for \
              OpenAI-compatible custom endpoints."
@@ -3000,7 +3137,7 @@ mod tests {
         let p = create_model_provider("nonexistent", None);
         assert!(p.is_err());
         let msg = p.err().unwrap().to_string();
-        assert!(msg.contains("Unknown model model_provider family"));
+        assert!(msg.contains("Unknown model_provider family"));
         assert!(msg.contains("nonexistent"));
     }
 

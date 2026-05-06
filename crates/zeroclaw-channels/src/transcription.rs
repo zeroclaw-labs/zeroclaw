@@ -736,6 +736,15 @@ impl TranscriptionManager {
             }
         }
 
+        if config.enabled && transcription_providers.is_empty() {
+            bail!(
+                "Transcription is enabled but no transcription provider registered \
+                 successfully. Configure at least one of: [transcription] (Groq) \
+                 with api_key + api_url; [transcription.openai]; [transcription.deepgram]; \
+                 [transcription.assemblyai]; [transcription.google]; [transcription.local_whisper]."
+            );
+        }
+
         Ok(Self {
             transcription_providers,
             agent_transcription_provider: String::new(),
@@ -1126,12 +1135,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "tested default-using TranscriptionManager.transcribe path which V3 retired in #6273; channel-side rewiring to thread agent.transcription_provider through with_transcription is deferred to a follow-up PR"]
     fn local_whisper_misconfigured_section_fails_manager_construction() {
         // A misconfigured local_whisper section logs a warning and skips
-        // registration. When local_whisper is also the default_transcription_provider and
-        // transcription is enabled, the safety net in TranscriptionManager
-        // surfaces the error: "not configured".
+        // registration. When transcription is enabled and no other provider
+        // section is set, the safety net in TranscriptionManager surfaces
+        // the error rather than returning a useless empty manager.
         let mut bad_cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
         bad_cfg.bearer_token = Some(String::new());
         let config = TranscriptionConfig {
@@ -1142,8 +1150,9 @@ mod tests {
 
         let err = TranscriptionManager::new(&config).err().unwrap();
         assert!(
-            err.to_string().contains("not configured"),
-            "expected 'not configured' from manager safety net, got: {err}"
+            err.to_string()
+                .contains("no transcription provider registered"),
+            "expected 'no transcription provider registered' from manager safety net, got: {err}"
         );
     }
 

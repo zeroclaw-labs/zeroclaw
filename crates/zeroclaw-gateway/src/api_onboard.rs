@@ -983,17 +983,20 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "create_map_key dispatch through the typed ModelProviders container needs Phase 11 macro work; currently the typed slots are accessed directly, not through the map-keyed-section dispatch"]
     fn providers_picker_marks_configured_after_create_map_key() {
+        // V3 typed-family layout: each canonical family is a map-keyed
+        // sub-section at `providers.models.<family>` whose entries are
+        // operator-named aliases. Adding an alias on any family flips the
+        // picker badge to "configured" for that family.
         let mut cfg = empty_cfg();
-        cfg.create_map_key("providers.models", "anthropic")
+        cfg.create_map_key("providers.models.anthropic", "default")
             .expect("create_map_key");
         let items = providers_picker(&cfg);
         let anthropic = items.iter().find(|i| i.key == "anthropic").unwrap();
         assert_eq!(
             anthropic.badge.as_deref(),
             Some("configured"),
-            "anthropic should be marked configured after add"
+            "anthropic should be marked configured after adding an alias"
         );
     }
 

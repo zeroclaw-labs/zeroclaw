@@ -138,6 +138,18 @@ impl MattermostChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
+                // Bind the sole registered provider as the agent transcription
+                // provider for the channel-direct ingest path. Multi-provider
+                // setups still resolve via the orchestrator's per-agent
+                // routing (see orchestrator/mod.rs). See wati.rs for full
+                // rationale.
+                let names = m.available_providers();
+                let m = if names.len() == 1 {
+                    let only = names[0].to_string();
+                    m.with_agent_transcription_provider(only)
+                } else {
+                    m
+                };
                 self.transcription_manager = Some(Arc::new(m));
                 self.transcription = Some(config);
             }
@@ -1325,7 +1337,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "tested default-using TranscriptionManager.transcribe path which V3 retired in #6273; channel-side rewiring to thread agent.transcription_provider through with_transcription is deferred to a follow-up PR"]
     fn mattermost_manager_none_and_warn_on_init_failure() {
         let ch = make_channel(vec!["*".into()], false).with_transcription(
             zeroclaw_config::schema::TranscriptionConfig {
@@ -1511,7 +1522,6 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         #[tokio::test]
-        #[ignore = "tested default-using TranscriptionManager.transcribe path which V3 retired in #6273; channel-side rewiring to thread agent.transcription_provider through with_transcription is deferred to a follow-up PR"]
         async fn mattermost_audio_routes_through_local_whisper() {
             let mock_server = MockServer::start().await;
 

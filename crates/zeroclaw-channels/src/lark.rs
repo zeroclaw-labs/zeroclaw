@@ -520,6 +520,18 @@ impl LarkChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
+                // Bind the sole registered provider as the agent transcription
+                // provider for the channel-direct ingest path. Multi-provider
+                // setups still resolve via the orchestrator's per-agent
+                // routing (see orchestrator/mod.rs). See wati.rs for full
+                // rationale.
+                let names = m.available_providers();
+                let m = if names.len() == 1 {
+                    let only = names[0].to_string();
+                    m.with_agent_transcription_provider(only)
+                } else {
+                    m
+                };
                 self.transcription_manager = Some(Arc::new(m));
             }
             Err(e) => {
@@ -3579,7 +3591,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "tested default-using TranscriptionManager.transcribe path which V3 retired in #6273; channel-side rewiring to thread agent.transcription_provider through with_transcription is deferred to a follow-up PR"]
     fn lark_manager_none_and_warn_on_init_failure() {
         let tc = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
@@ -3758,7 +3769,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "tested default-using TranscriptionManager.transcribe path which V3 retired in #6273; channel-side rewiring to thread agent.transcription_provider through with_transcription is deferred to a follow-up PR"]
     async fn lark_audio_routes_through_transcription_manager() {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
