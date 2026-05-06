@@ -1,8 +1,5 @@
-[providers]
-fallback = "atomic-chat"
-
 [providers.models.atomic-chat]
 kind = "openai-compatible"
-base_url = "http://host.docker.internal:1337/v1"
-model = "atomic-chat"
+base_url = "http://127.0.0.1:1337/v1"
+model = "unsloth/Qwen3_5-9B-IQ4_XS"
 api_key = "none"
