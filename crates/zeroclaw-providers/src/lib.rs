@@ -1434,7 +1434,7 @@ fn create_provider_with_url_and_options(
                 true,
             )))
         }
-        "atomic-chat" | "atomic_chat" => {
+        "atomic-chat" | "atomic_chat" | "atomic" => {
             let base_url = api_url
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
