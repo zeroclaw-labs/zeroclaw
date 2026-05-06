@@ -68,6 +68,15 @@ struct NativeChatRequest<'a> {
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<NativeThinkingConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeThinkingConfig {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    budget_tokens: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,6 +118,15 @@ enum NativeContentOut {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
+    },
+    /// Thinking block for round-tripping extended thinking in conversation
+    /// history. Required when thinking is enabled and assistant messages
+    /// contain tool_use blocks.
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
 }
 
@@ -178,6 +196,11 @@ struct NativeContentIn {
     kind: String,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
+    /// Signature for integrity verification of thinking blocks.
+    #[serde(default)]
+    signature: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -280,7 +303,9 @@ impl AnthropicProvider {
                 | NativeContentOut::ToolResult { cache_control, .. } => {
                     *cache_control = Some(CacheControl::ephemeral());
                 }
-                NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
+                NativeContentOut::ToolUse { .. }
+                | NativeContentOut::Image { .. }
+                | NativeContentOut::Thinking { .. } => {}
             }
         }
     }
@@ -315,6 +340,36 @@ impl AnthropicProvider {
             .and_then(|v| serde_json::from_value::<Vec<ProviderToolCall>>(v.clone()).ok())?;
 
         let mut blocks = Vec::new();
+
+        // When extended thinking is enabled, assistant messages must start
+        // with thinking blocks (including signatures) before any tool_use
+        // blocks. The reasoning_content field stores JSON-encoded thinking
+        // blocks from the original response.
+        if let Some(reasoning) = value
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .filter(|r| !r.is_empty())
+        {
+            for part in reasoning.split('\n') {
+                if let Ok(block) = serde_json::from_str::<serde_json::Value>(part) {
+                    let thinking = block
+                        .get("thinking")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let signature = block
+                        .get("signature")
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+                    blocks.push(NativeContentOut::Thinking {
+                        thinking,
+                        signature,
+                    });
+                }
+            }
+        }
+
         if let Some(text) = value
             .get("content")
             .and_then(serde_json::Value::as_str)
@@ -515,6 +570,7 @@ impl AnthropicProvider {
 
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
         let mut text_parts = Vec::new();
+        let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
         let usage = response.usage.map(|u| TokenUsage {
@@ -530,6 +586,19 @@ impl AnthropicProvider {
                         && !text.is_empty()
                     {
                         text_parts.push(text);
+                    }
+                }
+                "thinking" => {
+                    if let Some(thinking) = block.thinking.as_deref().or(block.text.as_deref()) {
+                        let trimmed = thinking.trim();
+                        if !trimmed.is_empty() {
+                            // Store as JSON with signature for round-tripping.
+                            let json_block = serde_json::json!({
+                                "thinking": trimmed,
+                                "signature": block.signature.as_deref().unwrap_or(""),
+                            });
+                            thinking_parts.push(json_block.to_string());
+                        }
                     }
                 }
                 "tool_use" => {
@@ -551,6 +620,12 @@ impl AnthropicProvider {
             }
         }
 
+        let reasoning_content = if thinking_parts.is_empty() {
+            None
+        } else {
+            Some(thinking_parts.join("\n"))
+        };
+
         ProviderChatResponse {
             text: if text_parts.is_empty() {
                 None
@@ -559,7 +634,38 @@ impl AnthropicProvider {
             },
             tool_calls,
             usage,
-            reasoning_content: None,
+            reasoning_content,
+        }
+    }
+
+    /// Resolve thinking parameters for an API request. Returns the effective
+    /// temperature (forced to 1.0 when thinking is active), the thinking
+    /// config for the request body, and the effective max_tokens (raised to
+    /// meet budget_tokens minimum when needed).
+    fn resolve_thinking(
+        &self,
+        thinking: Option<zeroclaw_api::provider::NativeThinkingParams>,
+        temperature: f64,
+    ) -> (f64, Option<NativeThinkingConfig>, u32) {
+        match thinking {
+            Some(params) => {
+                tracing::info!(
+                    budget_tokens = params.budget_tokens,
+                    "Native extended thinking enabled; forcing temperature=1.0"
+                );
+                // API requires max_tokens > budget_tokens (strictly greater).
+                let min_required = params.budget_tokens + 1;
+                let max_tokens = self.max_tokens.max(min_required);
+                (
+                    1.0,
+                    Some(NativeThinkingConfig {
+                        kind: "enabled",
+                        budget_tokens: params.budget_tokens,
+                    }),
+                    max_tokens,
+                )
+            }
+            None => (temperature, None, self.max_tokens),
         }
     }
 
@@ -722,6 +828,9 @@ impl AnthropicProvider {
                                     tool_input_json.push_str(json);
                                 }
                             }
+                            // TODO: handle "thinking_delta" events for streaming
+                            // extended thinking content. Currently thinking blocks
+                            // are only captured in non-streaming parse_native_response().
                             _ => {}
                         }
                     }
@@ -847,6 +956,7 @@ impl Provider for AnthropicProvider {
             tools: None,
             tool_choice: None,
             stream: None,
+            thinking: None,
         };
 
         let mut request = self
@@ -910,16 +1020,21 @@ impl Provider for AnthropicProvider {
         } else {
             system_prompt
         };
-        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic streaming API request");
+
+        let (effective_temperature, thinking_config, effective_max_tokens) =
+            self.resolve_thinking(request.thinking, temperature);
+
+        tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic non-streaming API request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: self.max_tokens,
+            max_tokens: effective_max_tokens,
             system: system_prompt,
             messages,
-            temperature,
+            temperature: effective_temperature,
             tools: native_tools,
             tool_choice,
             stream: None,
+            thinking: thinking_config,
         };
 
         let req = self
@@ -943,6 +1058,7 @@ impl Provider for AnthropicProvider {
             native_tool_calling: true,
             vision: true,
             prompt_caching: true,
+            extended_thinking: true,
         }
     }
 
@@ -993,6 +1109,7 @@ impl Provider for AnthropicProvider {
             } else {
                 Some(&tool_specs)
             },
+            thinking: None,
         };
         self.chat(request, model, temperature).await
     }
@@ -1071,16 +1188,28 @@ impl Provider for AnthropicProvider {
             system_prompt
         };
 
-        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic stream_chat request");
+        let (effective_temperature, thinking_config, effective_max_tokens) =
+            self.resolve_thinking(request.thinking, temperature);
+
+        if thinking_config.is_some() {
+            tracing::warn!(
+                "Streaming with native thinking enabled: thinking_delta events \
+                 are not yet handled. Thinking blocks will be captured in \
+                 non-streaming fallback responses only."
+            );
+        }
+
+        tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic stream_chat request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: self.max_tokens,
+            max_tokens: effective_max_tokens,
             system: system_prompt,
             messages,
-            temperature,
+            temperature: effective_temperature,
             tools: native_tools,
             tool_choice,
             stream: Some(true),
+            thinking: thinking_config,
         };
 
         let body = Self::build_streaming_request(&native_request);
@@ -1867,6 +1996,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tools: None,
             tool_choice: None,
             stream: None,
+            thinking: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();

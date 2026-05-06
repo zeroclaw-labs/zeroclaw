@@ -1814,6 +1814,7 @@ impl Provider for OpenAiCompatibleProvider {
             native_tool_calling: self.native_tool_calling,
             vision: self.supports_vision,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 
