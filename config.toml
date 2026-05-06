@@ -1,4 +1,5 @@
 [providers.models.local]
 kind = "openai-compatible"
 base_url = "http://127.0.0.1:1337/v1"
+default_model = "unsloth\\Qwen3_5-9B-IQ4_XS"
 model = "unsloth\\Qwen3_5-9B-IQ4_XS"
