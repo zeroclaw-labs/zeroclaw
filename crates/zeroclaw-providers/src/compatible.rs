@@ -1617,6 +1617,36 @@ impl OpenAiCompatibleProvider {
                     };
                 }
 
+                // Plain-text assistant turns from thinking-mode providers carry
+                // `reasoning_content` in a JSON-encoded `content` field with no
+                // `tool_calls` key. Without this branch the message would fall
+                // through to the plain-text fallback below and lose
+                // `reasoning_content`, so the next request to providers that
+                // require reasoning round-trip (e.g. DeepSeek V4 thinking) is
+                // rejected with a 400. See #6233.
+                if message.role == "assistant"
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    && value.get("tool_calls").is_none()
+                    && (value.get("content").is_some() || value.get("reasoning_content").is_some())
+                {
+                    let content = value
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|value| MessageContent::Text(value.to_string()));
+                    let reasoning_content = value
+                        .get("reasoning_content")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string);
+
+                    return NativeMessage {
+                        role: "assistant".to_string(),
+                        content,
+                        tool_call_id: None,
+                        tool_calls: None,
+                        reasoning_content,
+                    };
+                }
+
                 if message.role == "tool"
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
                 {
@@ -4315,6 +4345,60 @@ mod tests {
         let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
+    }
+
+    /// Regression test for #6233 — plain-text assistant turns from thinking-mode
+    /// providers (DeepSeek V4) carry `reasoning_content` in JSON-encoded
+    /// `content` with no `tool_calls`. The original tool-call-only branch
+    /// missed this shape and the message fell through to the plain-text
+    /// fallback, dropping `reasoning_content` and breaking the next request
+    /// with "reasoning_content in the thinking mode must be passed back".
+    #[test]
+    fn convert_messages_for_native_round_trips_reasoning_content_without_tool_calls() {
+        let history_json = serde_json::json!({
+            "content": "Direct answer.",
+            "reasoning_content": "Let me think step by step..."
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].role, "assistant");
+        assert!(
+            native[0].tool_calls.is_none(),
+            "no tool_calls on a plain-text turn"
+        );
+        assert_eq!(
+            native[0].reasoning_content.as_deref(),
+            Some("Let me think step by step...")
+        );
+        match &native[0].content {
+            Some(MessageContent::Text(t)) => assert_eq!(t, "Direct answer."),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// A JSON-shaped assistant message that lacks both `content` and
+    /// `reasoning_content` is not a thinking-mode replay payload and must
+    /// fall through to the plain-text path so the JSON survives verbatim
+    /// to the wire (rather than collapsing to an empty content).
+    #[test]
+    fn convert_messages_for_native_unrelated_json_falls_through() {
+        let unrelated = serde_json::json!({"foo": "bar"});
+        let messages = vec![ChatMessage::assistant(unrelated.to_string())];
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+        assert_eq!(native.len(), 1);
+        assert!(native[0].reasoning_content.is_none());
+        assert!(native[0].tool_calls.is_none());
+        match &native[0].content {
+            Some(MessageContent::Text(t)) => {
+                assert!(
+                    t.contains("\"foo\""),
+                    "expected raw JSON in fallback content, got {t:?}"
+                );
+            }
+            other => panic!("expected text content from fallback, got {other:?}"),
+        }
     }
 
     #[test]
