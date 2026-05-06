@@ -53,6 +53,7 @@ pub mod node_capabilities;
 pub mod notion_tool;
 pub mod opencode_cli;
 pub mod pdf_read;
+pub mod philips_hue;
 pub mod pipeline;
 pub mod poll;
 pub mod project_intel;

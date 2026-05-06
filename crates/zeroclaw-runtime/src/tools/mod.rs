@@ -90,6 +90,7 @@ pub use zeroclaw_tools::notion_tool::NotionTool;
 pub use zeroclaw_tools::opencode_cli::OpenCodeCliTool;
 #[cfg(feature = "rag-pdf")]
 pub use zeroclaw_tools::pdf_read::PdfReadTool;
+pub use zeroclaw_tools::philips_hue::PhilipsHueTool;
 pub use zeroclaw_tools::pipeline::PipelineTool;
 pub use zeroclaw_tools::poll::PollTool;
 pub use zeroclaw_tools::project_intel::ProjectIntelTool;
@@ -600,6 +601,38 @@ pub fn all_tools_with_runtime(
                 security.clone(),
                 root_config.jira.timeout_secs,
             )));
+        }
+    }
+
+    // Philips Hue integration (config-gated)
+    if root_config.philips_hue.enabled {
+        let application_key = if root_config.philips_hue.application_key.trim().is_empty() {
+            std::env::var("PHILIPS_HUE_APPLICATION_KEY").unwrap_or_default()
+        } else {
+            root_config.philips_hue.application_key.trim().to_string()
+        };
+        if application_key.trim().is_empty() {
+            tracing::warn!(
+                "philips_hue: enabled but no application key found (set philips_hue.application_key or PHILIPS_HUE_APPLICATION_KEY env var) — skipping registration"
+            );
+        } else if root_config.philips_hue.bridge_address.trim().is_empty() {
+            tracing::warn!(
+                "philips_hue: enabled but philips_hue.bridge_address is empty — skipping registration"
+            );
+        } else {
+            match PhilipsHueTool::new(
+                root_config.philips_hue.bridge_address.trim().to_string(),
+                application_key,
+                root_config.philips_hue.allowed_resource_types.clone(),
+                root_config.philips_hue.verify_tls,
+                root_config.philips_hue.request_timeout_secs,
+                security.clone(),
+            ) {
+                Ok(tool) => tool_arcs.push(Arc::new(tool)),
+                Err(e) => tracing::warn!(
+                    "philips_hue: failed to construct HTTP client: {e} — skipping registration"
+                ),
+            }
         }
     }
 

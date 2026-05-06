@@ -148,6 +148,21 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    Supports city names, IATA airport codes, GPS coordinates,");
             println!("    postal/zip codes, and Unicode location names.");
         }
+        "Philips Hue" => {
+            println!("  Setup:");
+            println!("    1. Discover bridge IP via https://discovery.meethue.com or mDNS.");
+            println!("    2. Press the round button on top of the bridge.");
+            println!("    3. Within 30 seconds, mint an application key:");
+            println!(
+                "       curl -k -X POST -d '{{\"devicetype\":\"zeroclaw#host\",\"generateclientkey\":true}}' \\"
+            );
+            println!("            https://<bridge-ip>/api");
+            println!("    4. Add to config:");
+            println!("       [philips_hue]");
+            println!("       enabled = true");
+            println!("       bridge_address = \"192.168.1.42\"");
+            println!("       application_key = \"...\"  # or set PHILIPS_HUE_APPLICATION_KEY");
+        }
         _ if entry.category == IntegrationCategory::Chat => {
             println!("  Setup:");
             println!("    Run: zeroclaw onboard --channels-only");

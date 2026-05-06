@@ -116,6 +116,7 @@
 
 - `SessionResetTool` and `SessionDeleteTool` for in-agent session management (#5696).
 - `SessionsCurrentTool` exposes the active session identity (#6033).
+- `philips_hue` tool — local Hue Bridge v2 CLIP API client, gated by application key and `allowed_resource_types` allowlist; `verify_tls` defaults to `false` for self-signed bridge certs (#6449).
 
 ### Plugins
 
