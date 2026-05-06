@@ -19,7 +19,14 @@ enum LevelOfDetails {
     Changelog,
 }
 
-/// Tool for interacting with the Jira REST API v3.
+/// Tool for interacting with the Jira REST API.
+///
+/// When `email` is provided, uses **API v3** with HTTP Basic auth
+/// (`email:api_token`) — the standard Jira Cloud authentication model.
+///
+/// When `email` is `None`, uses **API v2** with Bearer token auth
+/// (`Authorization: Bearer <api_token>`) — the standard Jira Server /
+/// Data Center (self-hosted) authentication model.
 ///
 /// Supports five actions gated by `[jira].allowed_actions` in config:
 /// - `get_ticket`     — always in the default allowlist; read-only.
@@ -29,7 +36,7 @@ enum LevelOfDetails {
 /// - `myself`         — requires explicit opt-in; read-only. Verifies credentials.
 pub struct JiraTool {
     base_url: String,
-    email: String,
+    email: Option<String>,
     api_token: String,
     allowed_actions: Vec<String>,
     http: Client,
@@ -40,7 +47,7 @@ pub struct JiraTool {
 impl JiraTool {
     pub fn new(
         base_url: String,
-        email: String,
+        email: Option<String>,
         api_token: String,
         allowed_actions: Vec<String>,
         security: Arc<SecurityPolicy>,
@@ -57,6 +64,25 @@ impl JiraTool {
         }
     }
 
+    /// `"3"` for Jira Cloud (email present), `"2"` for Server/DC (no email).
+    fn api_version(&self) -> &str {
+        if self.email.is_some() { "3" } else { "2" }
+    }
+
+    /// Returns an authenticated request builder.
+    /// Cloud: HTTP Basic (`email:token`). Server/DC: Bearer token.
+    fn authenticated(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.email {
+            Some(email) => req.basic_auth(email, Some(&self.api_token)),
+            None => req.bearer_auth(&self.api_token),
+        }
+    }
+
+    /// `true` when connected to Jira Cloud (API v3, email present).
+    fn is_cloud(&self) -> bool {
+        self.email.is_some()
+    }
+
     fn is_action_allowed(&self, action: &str) -> bool {
         self.allowed_actions.iter().any(|a| a == action)
     }
@@ -67,7 +93,8 @@ impl JiraTool {
         level: LevelOfDetails,
     ) -> anyhow::Result<ToolResult> {
         validate_issue_key(issue_key)?;
-        let url = format!("{}/rest/api/3/issue/{}", self.base_url, issue_key);
+        let ver = self.api_version();
+        let url = format!("{}/rest/api/{}/issue/{}", self.base_url, ver, issue_key);
 
         let query: Vec<(&str, &str)> = match &level {
             LevelOfDetails::Basic => vec![
@@ -93,12 +120,13 @@ impl JiraTool {
             LevelOfDetails::Changelog => vec![("expand", "changelog")],
         };
 
-        let resp = self
+        let req = self
             .http
             .get(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
             .query(&query)
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let resp = self
+            .authenticated(req)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Jira get_ticket request failed: {e}"))?;
@@ -137,15 +165,31 @@ impl JiraTool {
         jql: &str,
         max_results: Option<u32>,
     ) -> anyhow::Result<ToolResult> {
-        let url = format!("{}/rest/api/3/search/jql", self.base_url);
         let max_results = max_results.unwrap_or(25).clamp(1, 999);
 
+        let issues = if self.is_cloud() {
+            self.search_tickets_v3(jql, max_results).await?
+        } else {
+            self.search_tickets_v2(jql, max_results).await?
+        };
+
+        let output = json!(issues);
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
+            error: None,
+        })
+    }
+
+    /// Cloud (v3): `POST /rest/api/3/search/jql` with `nextPageToken` pagination.
+    #[allow(clippy::cast_possible_truncation)]
+    async fn search_tickets_v3(&self, jql: &str, max_results: u32) -> anyhow::Result<Vec<Value>> {
+        let url = format!("{}/rest/api/3/search/jql", self.base_url);
         let mut issues: Vec<Value> = Vec::new();
         let mut next_page_token: Option<String> = None;
 
         loop {
             let remaining = max_results.saturating_sub(issues.len() as u32);
-
             let page_size = remaining.min(JIRA_SEARCH_PAGE_SIZE);
 
             let mut body = json!({
@@ -158,12 +202,13 @@ impl JiraTool {
                 body["nextPageToken"] = json!(token);
             }
 
-            let resp = self
+            let req = self
                 .http
                 .post(&url)
-                .basic_auth(&self.email, Some(&self.api_token))
                 .json(&body)
-                .timeout(std::time::Duration::from_secs(self.timeout_secs))
+                .timeout(std::time::Duration::from_secs(self.timeout_secs));
+            let resp = self
+                .authenticated(req)
                 .send()
                 .await
                 .map_err(|e| anyhow::anyhow!("Jira search_tickets request failed: {e}"))?;
@@ -197,12 +242,66 @@ impl JiraTool {
             }
         }
 
-        let output = json!(issues);
-        Ok(ToolResult {
-            success: true,
-            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
-            error: None,
-        })
+        Ok(issues)
+    }
+
+    /// Server/DC (v2): `POST /rest/api/2/search` with `startAt` offset pagination.
+    #[allow(clippy::cast_possible_truncation)]
+    async fn search_tickets_v2(&self, jql: &str, max_results: u32) -> anyhow::Result<Vec<Value>> {
+        let url = format!("{}/rest/api/2/search", self.base_url);
+        let mut issues: Vec<Value> = Vec::new();
+        let mut start_at: u32 = 0;
+
+        loop {
+            let remaining = max_results.saturating_sub(issues.len() as u32);
+            let page_size = remaining.min(JIRA_SEARCH_PAGE_SIZE);
+
+            let body = json!({
+                "jql": jql,
+                "startAt": start_at,
+                "maxResults": page_size,
+                "fields": ["summary", "priority", "status", "assignee", "created", "updated"]
+            });
+
+            let req = self
+                .http
+                .post(&url)
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(self.timeout_secs));
+            let resp = self
+                .authenticated(req)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("Jira search_tickets request failed: {e}"))?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "Jira search_tickets failed ({status}): {}",
+                    crate::util_helpers::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS)
+                );
+            }
+
+            let raw: Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to parse Jira search response: {e}"))?;
+
+            let page = raw["issues"].as_array();
+            let page_len = page.map_or(0, |p| p.len());
+            if let Some(page) = page {
+                issues.extend(page.iter().map(shape_basic_search));
+            }
+
+            let total = raw["total"].as_u64().unwrap_or(0) as u32;
+            start_at += page_len as u32;
+            if page_len == 0 || start_at >= total || issues.len() as u32 >= max_results {
+                break;
+            }
+        }
+
+        Ok(issues)
     }
 
     async fn comment_ticket(
@@ -212,23 +311,33 @@ impl JiraTool {
     ) -> anyhow::Result<ToolResult> {
         validate_issue_key(issue_key)?;
 
-        let emails = extract_emails(comment_text);
-        let mut mentions: HashMap<String, (String, String)> = HashMap::new();
-        for email in emails {
-            if let Some(info) = self.resolve_email(&email).await {
-                mentions.insert(email, info);
+        let ver = self.api_version();
+        let url = format!(
+            "{}/rest/api/{}/issue/{}/comment",
+            self.base_url, ver, issue_key
+        );
+
+        let body = if self.is_cloud() {
+            let emails = extract_emails(comment_text);
+            let mut mentions: HashMap<String, (String, String)> = HashMap::new();
+            for email in emails {
+                if let Some(info) = self.resolve_email(&email).await {
+                    mentions.insert(email, info);
+                }
             }
-        }
+            let adf = build_adf(comment_text, &mentions);
+            json!({ "body": adf })
+        } else {
+            json!({ "body": comment_text })
+        };
 
-        let adf = build_adf(comment_text, &mentions);
-
-        let url = format!("{}/rest/api/3/issue/{}/comment", self.base_url, issue_key);
-        let resp = self
+        let req = self
             .http
             .post(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
-            .json(&json!({ "body": adf }))
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let resp = self
+            .authenticated(req)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Jira comment_ticket request failed: {e}"))?;
@@ -256,13 +365,15 @@ impl JiraTool {
     }
 
     async fn list_projects(&self) -> anyhow::Result<ToolResult> {
-        let url = format!("{}/rest/api/3/project", self.base_url);
+        let ver = self.api_version();
+        let url = format!("{}/rest/api/{}/project", self.base_url, ver);
 
-        let resp = self
+        let req = self
             .http
             .get(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let resp = self
+            .authenticated(req)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Jira list_projects request failed: {e}"))?;
@@ -289,19 +400,20 @@ impl JiraTool {
         const STATUS_CONCURRENCY: usize = 5;
 
         let users_url = format!(
-            "{}/rest/api/3/user/assignable/multiProjectSearch",
-            self.base_url
+            "{}/rest/api/{}/user/assignable/multiProjectSearch",
+            self.base_url, ver
         );
 
-        let users_resp = self
+        let users_req = self
             .http
             .get(&users_url)
-            .basic_auth(&self.email, Some(&self.api_token))
             .query(&[
                 ("projectKeys", keys.join(",").as_str()),
                 ("maxResults", "50"),
             ])
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let users_resp = self
+            .authenticated(users_req)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Jira list_projects users request failed: {e}"))?;
@@ -324,9 +436,10 @@ impl JiraTool {
         let mut statuses_results = vec![json!([]); keys.len()];
 
         for (i, key) in keys.iter().enumerate() {
-            if set.len() >= STATUS_CONCURRENCY
-                && let Some(Ok((idx, result))) = set.join_next().await
-            {
+            if set.len() >= STATUS_CONCURRENCY {
+                let Some(Ok((idx, result))) = set.join_next().await else {
+                    continue;
+                };
                 statuses_results[idx] =
                     result.map_err(|e| anyhow::anyhow!("Jira statuses failed: {e}"))?;
             }
@@ -339,10 +452,14 @@ impl JiraTool {
 
             set.spawn(async move {
                 let result = async {
-                    let resp = client
+                    let req = client
                         .get(&request_url)
-                        .basic_auth(&email, Some(&token))
-                        .timeout(std::time::Duration::from_secs(timeout))
+                        .timeout(std::time::Duration::from_secs(timeout));
+                    let req = match &email {
+                        Some(e) => req.basic_auth(e, Some(&token)),
+                        None => req.bearer_auth(&token),
+                    };
+                    let resp = req
                         .send()
                         .await
                         .map_err(|e| anyhow::anyhow!("statuses request failed: {e}"))?;
@@ -384,13 +501,15 @@ impl JiraTool {
     }
 
     async fn get_myself(&self) -> anyhow::Result<ToolResult> {
-        let url = format!("{}/rest/api/3/myself", self.base_url);
+        let ver = self.api_version();
+        let url = format!("{}/rest/api/{}/myself", self.base_url, ver);
 
-        let resp = self
+        let req = self
             .http
             .get(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let resp = self
+            .authenticated(req)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Jira myself request failed: {e}"))?;
@@ -424,13 +543,15 @@ impl JiraTool {
     }
 
     async fn resolve_email(&self, email: &str) -> Option<(String, String)> {
-        let url = format!("{}/rest/api/3/user/search", self.base_url);
-        let result = self
+        let ver = self.api_version();
+        let url = format!("{}/rest/api/{}/user/search", self.base_url, ver);
+        let req = self
             .http
             .get(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
             .query(&[("query", email)])
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let result = self
+            .authenticated(req)
             .send()
             .await
             .ok()?
@@ -491,7 +612,7 @@ impl Tool for JiraTool {
                 },
                 "comment": {
                     "type": "string",
-                    "description": "Comment body for comment_ticket. Supports a limited markdown-like syntax converted to Atlassian Document Format (ADF). Mention a user with @user@domain.com — the leading @ is required (a bare email without @ prefix is treated as plain text). Bold with **text**. Bullet list items with a leading '- '. Newlines become line breaks. Everything else is plain text. Example: 'Hi @john@company.com, this is **important**.\n- Check the logs\n- Rerun the pipeline'"
+                    "description": "Comment body for comment_ticket. In Jira Cloud mode, supports a limited markdown-like syntax converted to Atlassian Document Format (ADF): mention a user with @user@domain.com (the leading @ is required; a bare email without @ prefix is treated as plain text), bold with **text**, bullet list items with a leading '- ', and newlines as line breaks. In Jira Server/Data Center mode, comments are posted as plain text with no ADF conversion or mention resolution. Example: 'Hi @john@company.com, this is **important**.\n- Check the logs\n- Rerun the pipeline'"
                 }
             },
             "required": ["action"]
@@ -958,24 +1079,301 @@ mod tests {
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
-    fn test_tool(allowed_actions: Vec<&str>) -> JiraTool {
-        let security = Arc::new(SecurityPolicy {
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
-        });
+        })
+    }
+
+    fn test_tool_with_base_url(
+        base_url: String,
+        email: Option<String>,
+        api_token: &str,
+        allowed_actions: Vec<&str>,
+    ) -> JiraTool {
         JiraTool::new(
-            "https://test.atlassian.net".into(),
-            "test@example.com".into(),
-            "test-token".into(),
+            base_url,
+            email,
+            api_token.into(),
             allowed_actions.into_iter().map(String::from).collect(),
-            security,
+            test_security(),
             30,
         )
+    }
+
+    /// Cloud mode helper (email present → API v3 + Basic auth).
+    fn test_tool(allowed_actions: Vec<&str>) -> JiraTool {
+        test_tool_with_base_url(
+            "https://test.atlassian.net".into(),
+            Some("test@example.com".into()),
+            "test-token",
+            allowed_actions,
+        )
+    }
+
+    /// Server/DC mode helper (no email → API v2 + Bearer auth).
+    fn test_tool_server(allowed_actions: Vec<&str>) -> JiraTool {
+        test_tool_with_base_url(
+            "https://internal-jira.company.com".into(),
+            None,
+            "pat-token-abc",
+            allowed_actions,
+        )
+    }
+
+    fn basic_auth_header(email: &str, token: &str) -> String {
+        use base64::Engine as _;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{email}:{token}"));
+        format!("Basic {encoded}")
+    }
+
+    fn basic_search_issue(key: &str) -> Value {
+        json!({
+            "key": key,
+            "fields": {
+                "summary": "Fix bug",
+                "status": { "name": "In Progress" },
+                "priority": { "name": "High" },
+                "assignee": { "displayName": "Jane" },
+                "created": "2024-01-15T10:00:00.000Z",
+                "updated": "2024-03-01T12:00:00.000Z"
+            }
+        })
+    }
+
+    // ── API version / auth mode tests ───────────────────────────────────────
+
+    #[test]
+    fn cloud_tool_uses_api_v3() {
+        let tool = test_tool(vec!["get_ticket"]);
+        assert_eq!(tool.api_version(), "3");
+        assert!(tool.is_cloud());
+    }
+
+    #[test]
+    fn server_tool_uses_api_v2() {
+        let tool = test_tool_server(vec!["get_ticket"]);
+        assert_eq!(tool.api_version(), "2");
+        assert!(!tool.is_cloud());
     }
 
     #[test]
     fn tool_name_is_jira() {
         assert_eq!(test_tool(vec!["get_ticket"]).name(), "jira");
+    }
+
+    // ── Request shape tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cloud_search_uses_basic_auth_v3_endpoint_and_next_page_token() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let auth = basic_auth_header("test@example.com", "test-token");
+        let fields = json!([
+            "summary", "priority", "status", "assignee", "created", "updated"
+        ]);
+
+        let first_body = json!({
+            "jql": "project = PROJ",
+            "maxResults": 2,
+            "fields": fields
+        });
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/search/jql"))
+            .and(header("authorization", auth.as_str()))
+            .and(body_json(&first_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issues": [basic_search_issue("PROJ-1")],
+                "isLast": false,
+                "nextPageToken": "page-2"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let second_body = json!({
+            "jql": "project = PROJ",
+            "maxResults": 1,
+            "fields": fields,
+            "nextPageToken": "page-2"
+        });
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/search/jql"))
+            .and(header("authorization", auth.as_str()))
+            .and(body_json(&second_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issues": [basic_search_issue("PROJ-2")],
+                "isLast": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_base_url(
+            server.uri(),
+            Some("test@example.com".into()),
+            "test-token",
+            vec!["search_tickets"],
+        );
+        let result = tool
+            .execute(json!({
+                "action": "search_tickets",
+                "jql": "project = PROJ",
+                "max_results": 2
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output.as_array().unwrap().len(), 2);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn server_search_uses_bearer_auth_v2_endpoint_and_start_at() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let fields = json!([
+            "summary", "priority", "status", "assignee", "created", "updated"
+        ]);
+
+        let first_body = json!({
+            "jql": "project = PROJ",
+            "startAt": 0,
+            "maxResults": 2,
+            "fields": fields
+        });
+        Mock::given(method("POST"))
+            .and(path("/rest/api/2/search"))
+            .and(header("authorization", "Bearer pat-token-abc"))
+            .and(body_json(&first_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issues": [basic_search_issue("PROJ-1")],
+                "total": 2
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let second_body = json!({
+            "jql": "project = PROJ",
+            "startAt": 1,
+            "maxResults": 1,
+            "fields": fields
+        });
+        Mock::given(method("POST"))
+            .and(path("/rest/api/2/search"))
+            .and(header("authorization", "Bearer pat-token-abc"))
+            .and(body_json(&second_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issues": [basic_search_issue("PROJ-2")],
+                "total": 2
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool =
+            test_tool_with_base_url(server.uri(), None, "pat-token-abc", vec!["search_tickets"]);
+        let result = tool
+            .execute(json!({
+                "action": "search_tickets",
+                "jql": "project = PROJ",
+                "max_results": 2
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output.as_array().unwrap().len(), 2);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cloud_comment_posts_adf_body_to_v3_endpoint() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let comment = "This is **important**.\n- Check the logs";
+        let expected_body = json!({ "body": build_adf(comment, &HashMap::new()) });
+        let auth = basic_auth_header("test@example.com", "test-token");
+
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/comment"))
+            .and(header("authorization", auth.as_str()))
+            .and(body_json(&expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "10000",
+                "author": { "displayName": "Jane" },
+                "created": "2024-01-15T10:00:00.000Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_base_url(
+            server.uri(),
+            Some("test@example.com".into()),
+            "test-token",
+            vec!["comment_ticket"],
+        );
+        let result = tool
+            .execute(json!({
+                "action": "comment_ticket",
+                "issue_key": "PROJ-1",
+                "comment": comment
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn server_comment_posts_plain_text_body_to_v2_endpoint() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let comment = "Hi @john@company.com, this is **important**.\n- Check the logs";
+        let expected_body = json!({ "body": comment });
+
+        Mock::given(method("POST"))
+            .and(path("/rest/api/2/issue/PROJ-1/comment"))
+            .and(header("authorization", "Bearer pat-token-abc"))
+            .and(body_json(&expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "10001",
+                "author": { "displayName": "Jane" },
+                "created": "2024-01-15T10:00:00.000Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool =
+            test_tool_with_base_url(server.uri(), None, "pat-token-abc", vec!["comment_ticket"]);
+        let result = tool
+            .execute(json!({
+                "action": "comment_ticket",
+                "issue_key": "PROJ-1",
+                "comment": comment
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        server.verify().await;
     }
 
     #[test]
@@ -993,6 +1391,19 @@ mod tests {
         assert!(action_strs.contains(&"get_ticket"));
         assert!(action_strs.contains(&"search_tickets"));
         assert!(action_strs.contains(&"comment_ticket"));
+    }
+
+    #[test]
+    fn parameters_schema_describes_cloud_and_server_comment_modes() {
+        let schema = test_tool(vec!["comment_ticket"]).parameters_schema();
+        let description = schema["properties"]["comment"]["description"]
+            .as_str()
+            .unwrap();
+
+        assert!(description.contains("Jira Cloud mode"));
+        assert!(description.contains("Atlassian Document Format"));
+        assert!(description.contains("Jira Server/Data Center mode"));
+        assert!(description.contains("plain text"));
     }
 
     #[tokio::test]
@@ -1085,7 +1496,7 @@ mod tests {
         });
         let tool = JiraTool::new(
             "https://test.atlassian.net".into(),
-            "test@example.com".into(),
+            Some("test@example.com".into()),
             "token".into(),
             vec!["get_ticket".into(), "comment_ticket".into()],
             security,
@@ -1136,7 +1547,7 @@ mod tests {
         });
         let tool = JiraTool::new(
             "https://test.atlassian.net".into(),
-            "test@example.com".into(),
+            Some("test@example.com".into()),
             "token".into(),
             vec!["myself".into()],
             security,
@@ -1405,7 +1816,7 @@ mod tests {
         });
         let tool = JiraTool::new(
             "https://127.0.0.1:1".into(),
-            "test@example.com".into(),
+            Some("test@example.com".into()),
             "token".into(),
             vec!["list_projects".into()],
             security,

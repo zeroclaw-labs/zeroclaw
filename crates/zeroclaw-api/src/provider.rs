@@ -48,6 +48,11 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// Provider-specific opaque extension fields that must round-trip
+    /// unchanged on follow-up turns (e.g. Gemini 3 `thoughtSignature`
+    /// carried as `extra_content.google.thought_signature`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 /// Raw token counts from a single LLM API response.
@@ -196,6 +201,9 @@ pub enum StreamEvent {
     PreExecutedToolCall { name: String, args: String },
     /// The result of a pre-executed tool call.
     PreExecutedToolResult { name: String, output: String },
+    /// Token usage reported by the provider, typically just before [`StreamEvent::Final`].
+    /// Providers that do not surface usage in streaming responses simply omit this event.
+    Usage(TokenUsage),
     /// Stream has completed.
     Final,
 }

@@ -7,6 +7,11 @@ use crate::traits::{PropFieldInfo, PropKind};
 /// return the HashMap key + the fully-qualified inner name that the value
 /// type's own `get_prop` / `set_prop` expects.
 ///
+/// HashMap keys are user-controlled and may contain dots, URLs, or hostnames
+/// (for example `providers.models.custom:https://example.invalid/v1.api-key`).
+/// Current map-keyed config sections expose leaf fields, so split from the
+/// right and preserve any dots inside the runtime key.
+///
 /// Returns `None` when the path doesn't match, letting the derive's
 /// generated code fall through to the next nested field.
 pub fn route_hashmap_path<'a>(
@@ -21,7 +26,7 @@ pub fn route_hashmap_path<'a>(
         format!("{my_prefix}.{field_name}")
     };
     let rest = name.strip_prefix(&key_prefix)?.strip_prefix('.')?;
-    let (hm_key, inner_suffix) = rest.split_once('.')?;
+    let (hm_key, inner_suffix) = rest.rsplit_once('.')?;
     let inner_name = if inner_prefix.is_empty() {
         inner_suffix.to_string()
     } else {
@@ -79,8 +84,9 @@ pub fn make_prop_field(
     is_secret: bool,
     enum_variants: Option<fn() -> Vec<String>>,
     description: &'static str,
+    derived_from_secret: bool,
 ) -> PropFieldInfo {
-    let display_value = if is_secret {
+    let display_value = if is_secret || derived_from_secret {
         match table.and_then(|t| t.get(serde_name)) {
             Some(toml::Value::String(s)) if !s.is_empty() => "****".to_string(),
             Some(toml::Value::Array(arr)) if !arr.is_empty() => {
@@ -100,6 +106,7 @@ pub fn make_prop_field(
         is_secret,
         enum_variants,
         description,
+        derived_from_secret,
     }
 }
 
@@ -193,6 +200,63 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
                 .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
                 .collect();
             Ok(toml::Value::Array(items))
+        }
+        // `Vec<T>` of structs: round-trip a JSON array of objects to a
+        // TOML array. JSON `null` (used by serde for `Option::None`) is
+        // dropped because TOML has no null — the absent key conveys the
+        // same meaning when the field deserializes back into `Option<T>`.
+        PropKind::ObjectArray => {
+            let v: serde_json::Value = serde_json::from_str(value_str)
+                .map_err(|e| anyhow::anyhow!("invalid JSON array of objects: {e}"))?;
+            json_to_toml(v).ok_or_else(|| {
+                anyhow::anyhow!("JSON value contained only nulls — nothing to write")
+            })
+        }
+        // Struct-shaped scalar: parse the JSON object into a TOML table so
+        // the parent serde round-trip deserializes into the typed struct
+        // (e.g. `Option<ModelPricing>`). Inserting a raw String here would
+        // fail serde because the field is typed, not free-form text.
+        PropKind::Object => {
+            let v: serde_json::Value = serde_json::from_str(value_str)
+                .map_err(|e| anyhow::anyhow!("invalid JSON object: {e}"))?;
+            if !matches!(v, serde_json::Value::Object(_)) {
+                anyhow::bail!("Object field requires a JSON object; got {v}");
+            }
+            json_to_toml(v).ok_or_else(|| {
+                anyhow::anyhow!("JSON object contained only nulls — nothing to write")
+            })
+        }
+    }
+}
+
+/// Walk a `serde_json::Value` into a `toml::Value`, dropping any `null`s
+/// (TOML has no null; absence of a key conveys `Option::None`).
+fn json_to_toml(v: serde_json::Value) -> Option<toml::Value> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(b) => Some(toml::Value::Boolean(b)),
+        serde_json::Value::String(s) => Some(toml::Value::String(s)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(toml::Value::Integer(i))
+            } else if let Some(u) = n.as_u64() {
+                // TOML integers are i64; clamp pathological u64 values.
+                Some(toml::Value::Integer(i64::try_from(u).unwrap_or(i64::MAX)))
+            } else {
+                n.as_f64().map(toml::Value::Float)
+            }
+        }
+        serde_json::Value::Array(items) => Some(toml::Value::Array(
+            items.into_iter().filter_map(json_to_toml).collect(),
+        )),
+        serde_json::Value::Object(map) => {
+            let mut table = toml::map::Map::new();
+            for (k, val) in map {
+                if let Some(tv) = json_to_toml(val) {
+                    table.insert(k, tv);
+                }
+            }
+            Some(toml::Value::Table(table))
         }
     }
 }

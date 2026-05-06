@@ -48,6 +48,9 @@ pub struct OpenAiCompatibleProvider {
     api_path: Option<String>,
     /// Maximum output tokens to include in API requests.
     max_tokens: Option<u32>,
+    /// models.dev catalog key for this provider (e.g. "xai").
+    /// When set, `list_models` fetches from the models.dev catalog.
+    models_dev_key: Option<String>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -119,6 +122,27 @@ fn apply_auth_to_request(
             Err(_) => req.header("Authorization", format!("Bearer {credential}")),
         },
     }
+}
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
+    let mut ids: Vec<String> = body
+        .data
+        .into_iter()
+        .map(|e| e.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort();
+    ids
 }
 
 impl OpenAiCompatibleProvider {
@@ -246,6 +270,7 @@ impl OpenAiCompatibleProvider {
             reasoning_effort: None,
             api_path: None,
             max_tokens: None,
+            models_dev_key: None,
         }
     }
 
@@ -293,6 +318,13 @@ impl OpenAiCompatibleProvider {
     /// Set the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Set the models.dev catalog key for this provider.
+    /// When set, `list_models` returns the catalog's model list for that key.
+    pub fn with_models_dev_key(mut self, key: &str) -> Self {
+        self.models_dev_key = Some(key.to_string());
         self
     }
 
@@ -521,6 +553,8 @@ struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptionsBody>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_stream: Option<bool>,
@@ -530,6 +564,15 @@ struct ApiChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+}
+
+/// OpenAI-compatible `stream_options.include_usage` toggle.
+/// When set with streaming, providers emit a final SSE chunk carrying usage
+/// counts (prompt_tokens / completion_tokens) so the agent can populate cost
+/// records and the WebSocket done frame for streaming responses.
+#[derive(Debug, Serialize, Clone, Copy)]
+struct StreamOptionsBody {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -672,6 +715,10 @@ struct ToolCall {
         skip_serializing_if = "Option::is_none"
     )]
     parameters: Option<serde_json::Value>,
+
+    /// See [`zeroclaw_api::ToolCall::extra_content`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra_content: Option<serde_json::Value>,
 }
 
 impl ToolCall {
@@ -722,6 +769,13 @@ struct NativeChatRequest {
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    /// Mirrors `ApiChatRequest::stream_options`. Without this, tool-enabled
+    /// streaming requests omit `stream_options.include_usage` and OpenAI-
+    /// compatible providers never send the final `usage` SSE event — leaving
+    /// `/ws/chat` with no token-usage signal whenever native tools are active
+    /// (which is the normal gateway path). See #6001 / #6159.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptionsBody>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -832,6 +886,10 @@ struct ResponsesContent {
 struct StreamChunkResponse {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    /// Final-chunk usage counts. Populated only when the request includes
+    /// `stream_options.include_usage: true` and the provider supports it.
+    #[serde(default)]
+    usage: Option<UsageInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -867,6 +925,8 @@ struct StreamToolCallDelta {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+    #[serde(default)]
+    extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -882,6 +942,7 @@ struct StreamToolCallAccumulator {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    extra_content: Option<serde_json::Value>,
 }
 
 impl StreamToolCallAccumulator {
@@ -909,6 +970,11 @@ impl StreamToolCallAccumulator {
         {
             self.arguments.push_str(arguments_delta);
         }
+
+        // Last-write-wins: signature is opaque and delivered once per call.
+        if let Some(extra) = delta.extra_content.as_ref() {
+            self.extra_content = Some(extra.clone());
+        }
     }
 
     fn into_provider_tool_call(self) -> Option<ProviderToolCall> {
@@ -934,6 +1000,7 @@ impl StreamToolCallAccumulator {
             id: self.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             name,
             arguments: normalized_arguments,
+            extra_content: self.extra_content,
         })
     }
 }
@@ -1249,6 +1316,17 @@ pub(crate) fn sse_bytes_to_events(
                             }
                         }
 
+                        if let Some(usage) = chunk.usage.as_ref() {
+                            let token_usage = zeroclaw_api::provider::TokenUsage {
+                                input_tokens: usage.prompt_tokens,
+                                output_tokens: usage.completion_tokens,
+                                cached_input_tokens: None,
+                            };
+                            if tx.send(Ok(StreamEvent::Usage(token_usage))).await.is_err() {
+                                return;
+                            }
+                        }
+
                         if should_emit_tool_calls && !emitted_tool_calls {
                             emitted_tool_calls = true;
                             for tool_call in tool_calls
@@ -1514,6 +1592,9 @@ impl OpenAiCompatibleProvider {
                             name: None,
                             arguments: None,
                             parameters: None,
+                            // Round-trip extra_content (e.g. Gemini
+                            // thoughtSignature) — dropping it here was the bug.
+                            extra_content: tc.extra_content,
                         })
                         .collect::<Vec<_>>();
 
@@ -1689,6 +1770,7 @@ impl OpenAiCompatibleProvider {
                     id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     name,
                     arguments: normalized_arguments,
+                    extra_content: tc.extra_content,
                 })
             })
             .collect::<Vec<_>>();
@@ -1735,6 +1817,34 @@ impl Provider for OpenAiCompatibleProvider {
         }
     }
 
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // When a credential is present, hit the provider's native /models endpoint
+        // (OpenAI-compatible: GET {base_url}/models).
+        if let Some(credential) = self.credential.as_deref() {
+            let url = format!("{}/models", self.base_url);
+            let response = self
+                .apply_auth_header(self.http_client().get(&url), Some(credential))
+                .send()
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("{} model list request failed: {url}: {e}", self.name)
+                })?;
+            if !response.status().is_success() {
+                let status = response.status();
+                anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);
+            }
+            let body: ModelsResponse = response.json().await.map_err(|e| {
+                anyhow::anyhow!("{} model list returned invalid JSON: {e}", self.name)
+            })?;
+            return Ok(normalize_model_ids(body));
+        }
+        // No credential — fall back to the models.dev catalog when available.
+        match &self.models_dev_key {
+            Some(key) => crate::models_dev::list_models_for(key).await,
+            None => anyhow::bail!("live model listing is not supported for this provider"),
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -1775,6 +1885,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages,
             temperature,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: None,
             tools: None,
@@ -1884,6 +1995,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages: api_messages,
             temperature,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: None,
             tools: None,
@@ -1984,6 +2096,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages: api_messages,
             temperature,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: self.tool_stream_for_tools(!tools.is_empty()),
             tools: if tools.is_empty() {
@@ -2055,6 +2168,7 @@ impl Provider for OpenAiCompatibleProvider {
                     id: uuid::Uuid::new_v4().to_string(),
                     name,
                     arguments,
+                    extra_content: tc.extra_content,
                 })
             })
             .collect::<Vec<_>>();
@@ -2085,6 +2199,9 @@ impl Provider for OpenAiCompatibleProvider {
             messages: Self::convert_messages_for_native(&effective_messages, !merge),
             temperature,
             stream: Some(false),
+            // Non-streaming path; `usage` is on the final response body, not
+            // gated on `stream_options.include_usage`.
+            stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: self
                 .tool_stream_for_tools(tools.as_ref().is_some_and(|tools| !tools.is_empty())),
@@ -2229,6 +2346,12 @@ impl Provider for OpenAiCompatibleProvider {
                     None
                 },
                 stream: Some(options.enabled),
+                // Mirror the no-tools path: opt the streaming response into a
+                // final `usage` event so `/ws/chat` can record token usage
+                // even when native tools are active.
+                stream_options: options.enabled.then_some(StreamOptionsBody {
+                    include_usage: true,
+                }),
                 tools: tools.clone(),
                 tool_choice: tools.as_ref().map(|_| "auto".to_string()),
                 max_tokens: self.max_tokens,
@@ -2253,6 +2376,9 @@ impl Provider for OpenAiCompatibleProvider {
                     None
                 },
                 stream: Some(options.enabled),
+                stream_options: options.enabled.then_some(StreamOptionsBody {
+                    include_usage: true,
+                }),
                 tools: None,
                 tool_choice: None,
                 max_tokens: self.max_tokens,
@@ -2353,6 +2479,9 @@ impl Provider for OpenAiCompatibleProvider {
             messages,
             temperature,
             stream: Some(options.enabled),
+            stream_options: options.enabled.then_some(StreamOptionsBody {
+                include_usage: true,
+            }),
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: None,
             tools: None,
@@ -2441,6 +2570,9 @@ impl Provider for OpenAiCompatibleProvider {
             messages: api_messages,
             temperature,
             stream: Some(options.enabled),
+            stream_options: options.enabled.then_some(StreamOptionsBody {
+                include_usage: true,
+            }),
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: None,
             tools: None,
@@ -2553,6 +2685,82 @@ mod tests {
     }
 
     #[test]
+    fn native_chat_request_with_tools_includes_stream_options() {
+        // Regression: tool-enabled streaming requests must opt the response
+        // into a final `usage` SSE event, otherwise OpenAI-compatible providers
+        // never report token counts on the `/ws/chat` path (the gateway's
+        // primary path uses native tools). See Audacity88's #6159 review.
+        let req = NativeChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![NativeMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("hello".to_string())),
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+            }],
+            temperature: 0.7,
+            stream: Some(true),
+            stream_options: Some(StreamOptionsBody {
+                include_usage: true,
+            }),
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: Some(vec![serde_json::json!({"name": "echo"})]),
+            tool_choice: Some("auto".to_string()),
+            max_tokens: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value
+                .get("stream_options")
+                .and_then(|v| v.get("include_usage"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "tool-enabled streaming request must serialize stream_options.include_usage=true; \
+             without it OpenAI-compatible providers omit the final usage event"
+        );
+    }
+
+    #[test]
+    fn native_chat_request_omits_stream_options_when_none() {
+        // Non-streaming path (e.g. classic `chat()` call) does not need
+        // `stream_options.include_usage` because the final response carries
+        // `usage` directly. The field must be skipped in serialization.
+        let req = NativeChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![],
+            temperature: 0.7,
+            stream: Some(false),
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("stream_options").is_none(),
+            "non-streaming NativeChatRequest must not emit a stream_options key"
+        );
+    }
+
+    #[test]
+    fn normalize_model_ids_trims_filters_and_sorts() {
+        let body = serde_json::from_value(serde_json::json!({
+            "data": [
+                {"id": " zeta-model "},
+                {"id": ""},
+                {"id": "alpha-model"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(normalize_model_ids(body), vec!["alpha-model", "zeta-model"]);
+    }
+
+    #[test]
     fn request_serializes_correctly() {
         let req = ApiChatRequest {
             model: "llama-3.3-70b".to_string(),
@@ -2568,6 +2776,7 @@ mod tests {
             ],
             temperature: 0.4,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: None,
             tool_stream: None,
             tools: None,
@@ -3109,6 +3318,7 @@ mod tests {
                 name: None,
                 arguments: None,
                 parameters: None,
+                extra_content: None,
             }]),
             reasoning_content: None,
         };
@@ -3569,6 +3779,7 @@ mod tests {
             }],
             temperature: 0.7,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: None,
             tool_stream: None,
             tools: Some(tools),
@@ -3592,6 +3803,7 @@ mod tests {
             }],
             temperature: 0.7,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: None,
             tool_stream: provider.tool_stream_for_tools(true),
             tools: Some(vec![serde_json::json!({
@@ -3626,6 +3838,7 @@ mod tests {
             }],
             temperature: 0.7,
             stream: Some(false),
+            stream_options: None,
             reasoning_effort: None,
             tool_stream: provider.tool_stream_for_tools(true),
             tools: Some(vec![serde_json::json!({
@@ -3979,6 +4192,7 @@ mod tests {
             }),
             name: None,
             arguments: None,
+            extra_content: None,
         });
         acc.apply_delta(&StreamToolCallDelta {
             index: Some(0),
@@ -3989,6 +4203,7 @@ mod tests {
             }),
             name: None,
             arguments: None,
+            extra_content: None,
         });
 
         let tool_call = acc
@@ -4037,6 +4252,7 @@ mod tests {
                 name: None,
                 arguments: None,
                 parameters: None,
+                extra_content: None,
             }]),
         };
 
@@ -4216,6 +4432,7 @@ mod tests {
             name: None,
             arguments: None,
             parameters: None,
+            extra_content: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert!(!json.as_object().unwrap().contains_key("name"));
@@ -4237,6 +4454,7 @@ mod tests {
             name: Some("shell".to_string()),
             arguments: Some("{\"command\":\"ls\"}".to_string()),
             parameters: None,
+            extra_content: None,
         };
         let json = serde_json::to_value(&tc).unwrap();
         assert_eq!(json["name"], "shell");

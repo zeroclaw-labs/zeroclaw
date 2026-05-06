@@ -99,7 +99,8 @@ pub use zeroclaw_tools::reaction::ReactionTool;
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
 pub use zeroclaw_tools::sessions::{
-    SessionDeleteTool, SessionResetTool, SessionsHistoryTool, SessionsListTool, SessionsSendTool,
+    SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
+    SessionsListTool, SessionsSendTool,
 };
 pub use zeroclaw_tools::swarm::SwarmTool;
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
@@ -225,8 +226,14 @@ pub fn default_tools_with_runtime(
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
         Box::new(FileEditTool::new(security.clone())),
-        Box::new(GlobSearchTool::new(security.clone())),
-        Box::new(ContentSearchTool::new(security)),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
+            security,
+        )),
     ]
 }
 
@@ -334,7 +341,11 @@ pub fn all_tools_with_runtime(
 ) {
     let has_shell_access = runtime.has_shell_access();
     let runtime_kind = root_config.runtime.kind.as_str();
-    let sandbox = create_sandbox(&root_config.security, runtime_kind);
+    let sandbox = create_sandbox(
+        &root_config.security,
+        runtime_kind,
+        Some(&security.workspace_dir),
+    );
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
@@ -347,8 +358,14 @@ pub fn all_tools_with_runtime(
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
-        Arc::new(GlobSearchTool::new(security.clone())),
-        Arc::new(ContentSearchTool::new(security.clone())),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
         Arc::new(CronAddTool::new(config.clone(), security.clone())),
         Arc::new(CronListTool::new(config.clone())),
         Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
@@ -431,6 +448,7 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
             root_config.skills.open_skills_enabled,
             root_config.skills.open_skills_dir.clone(),
+            root_config.skills.allow_scripts,
         )));
     }
 
@@ -511,6 +529,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(WebSearchTool::new_with_config(
             root_config.web_search.provider.clone(),
             root_config.web_search.brave_api_key.clone(),
+            root_config.web_search.tavily_api_key.clone(),
             root_config.web_search.searxng_instance_url.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
@@ -548,12 +567,22 @@ pub fn all_tools_with_runtime(
             );
         } else if root_config.jira.base_url.trim().is_empty() {
             tracing::warn!("Jira tool enabled but jira.base_url is empty — skipping registration");
-        } else if root_config.jira.email.trim().is_empty() {
-            tracing::warn!("Jira tool enabled but jira.email is empty — skipping registration");
         } else {
+            let email = root_config
+                .jira
+                .email
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            if email.is_some() {
+                tracing::info!("Jira tool: Cloud mode (API v3, Basic auth)");
+            } else {
+                tracing::info!("Jira tool: Server/DC mode (API v2, Bearer auth)");
+            }
             tool_arcs.push(Arc::new(JiraTool::new(
                 root_config.jira.base_url.trim().to_string(),
-                root_config.jira.email.trim().to_string(),
+                email,
                 api_token,
                 root_config.jira.allowed_actions.clone(),
                 security.clone(),
@@ -673,10 +702,17 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
-    // Session-to-session messaging tools (always available when sessions dir exists)
-    if let Ok(session_store) = zeroclaw_infra::session_store::SessionStore::new(workspace_dir) {
-        let backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
-            Arc::new(session_store);
+    // Session tools share the channel orchestrator's backend via the
+    // `make_session_backend` factory, keyed off `[channels].session_backend`.
+    // Previously the tools opened the JSONL `SessionStore` while the
+    // gateway WS path opened `SqliteSessionBackend`, so any session
+    // created via /ws/chat was invisible to `sessions_list` /
+    // `sessions_history`. Routing both call sites through the factory
+    // closes that gap and honors the operator's configured backend.
+    if let Ok(backend) =
+        zeroclaw_infra::make_session_backend(workspace_dir, &config.channels.session_backend)
+    {
+        tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsHistoryTool::new(
             backend.clone(),
@@ -753,7 +789,10 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ask_user_tool));
 
     // Human escalation tool — always registered; channel map populated later by start_channels.
-    let escalate_tool = EscalateToHumanTool::new(security.clone(), workspace_dir.to_path_buf());
+    let escalate_tool = EscalateToHumanTool::new(
+        security.clone(),
+        root_config.escalation.alert_channels.clone(),
+    );
     let escalate_handle = escalate_tool.channel_map_handle();
     tool_arcs.push(Arc::new(escalate_tool));
 

@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2 } from 'lucide-react';
+import { memo, useState, useEffect, useRef, useCallback } from 'react';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, Wrench } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { WsMessage } from '@/types/api';
@@ -7,7 +7,7 @@ import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
-import { getSessionMessages } from '@/lib/api';
+import { abortSession, getSessionMessages } from '@/lib/api';
 import ToolCallCard from '@/components/ToolCallCard';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import {
@@ -50,6 +50,18 @@ export default function AgentChat() {
   const [compact, setCompact] = useState(() => {
     try { return localStorage.getItem('zeroclaw_chat_compact') === '1'; } catch { return false; }
   });
+  // Tool execution is plumbing, not chat. Default off so tool_call /
+  // tool_result frames do not surface inline in the conversation transcript.
+  // Toggleable from the chat toolbar (Wrench button); the same flag persists
+  // to `localStorage.zeroclaw_show_tool_activity` for cross-session memory.
+  const [showToolActivity, setShowToolActivity] = useState(() => {
+    try { return localStorage.getItem('zeroclaw_show_tool_activity') === '1'; } catch { return false; }
+  });
+  // The WebSocket onMessage handler is installed once with `[]` deps so it
+  // can read the latest toggle without a reconnect-per-toggle. Mirror the
+  // state into a ref the handler reads at message time.
+  const showToolActivityRef = useRef(showToolActivity);
+  useEffect(() => { showToolActivityRef.current = showToolActivity; }, [showToolActivity]);
   const pendingContentRef = useRef('');
   const pendingThinkingRef = useRef('');
   // Snapshot of thinking captured at chunk_reset, so it survives the reset.
@@ -180,6 +192,9 @@ export default function AgentChat() {
         }
 
         case 'tool_call': {
+          if (!showToolActivityRef.current) {
+            break;
+          }
           const toolName = msg.name ?? 'unknown';
           const toolArgs = msg.args;
           setMessages((prev) => {
@@ -209,6 +224,9 @@ export default function AgentChat() {
         }
 
         case 'tool_result': {
+          if (!showToolActivityRef.current) {
+            break;
+          }
           setMessages((prev) => {
             // Forward scan: find the FIRST unresolved toolCall (order-guaranteed by backend)
             const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
@@ -320,8 +338,10 @@ export default function AgentChat() {
     }
   };
 
+  const isComposingRef = useRef(false);
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !isComposingRef.current) {
       e.preventDefault();
       handleSend();
     }
@@ -357,10 +377,31 @@ export default function AgentChat() {
     setMessages([]);
   }, []);
 
+  // Stop button: POST /api/sessions/{id}/abort. The gateway cancels the
+  // in-flight turn, the WS handler sends an `error` frame which our
+  // onMessage handler already maps to typing=false.
+  const handleAbort = useCallback(async () => {
+    try {
+      await abortSession(sessionIdRef.current);
+    } catch {
+      // Best-effort: surface nothing if the abort itself fails. The
+      // user can retry, and any leaked typing state clears on the next
+      // server frame.
+    }
+  }, []);
+
   const toggleCompact = useCallback(() => {
     setCompact((prev) => {
       const next = !prev;
       try { localStorage.setItem('zeroclaw_chat_compact', next ? '1' : '0'); } catch { /* noop */ }
+      return next;
+    });
+  }, []);
+
+  const toggleToolActivity = useCallback(() => {
+    setShowToolActivity((prev) => {
+      const next = !prev;
+      try { localStorage.setItem('zeroclaw_show_tool_activity', next ? '1' : '0'); } catch { /* noop */ }
       return next;
     });
   }, []);
@@ -390,7 +431,7 @@ export default function AgentChat() {
     <div className="flex flex-col h-[calc(100vh-3.5rem)]">
       {/* Connection status bar */}
       {error && (
-        <div className="px-4 py-2 border-b flex items-center gap-2 text-sm animate-fade-in" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171', }}>
+        <div className="px-4 py-2 border-b flex items-center gap-2 text-sm animate-fade-in" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
           <AlertCircle className="h-4 w-4 shrink-0" />
           {error}
         </div>
@@ -411,6 +452,17 @@ export default function AgentChat() {
           >
             {compact ? <Maximize2 className="h-3 w-3" /> : <Minimize2 className="h-3 w-3" />}
             {t('agent.compact_mode')}
+          </button>
+          <button
+            type="button"
+            onClick={toggleToolActivity}
+            className="btn-secondary flex items-center gap-1.5 text-xs"
+            style={{ padding: '0.3rem 0.75rem', borderRadius: '0.5rem' }}
+            aria-label={showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
+            aria-pressed={showToolActivity}
+          >
+            <Wrench className="h-3 w-3" />
+            {showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
           </button>
           <button
             type="button"
@@ -438,86 +490,15 @@ export default function AgentChat() {
         )}
 
         {messages.map((msg, idx) => (
-          <div
+          <MessageItem
             key={msg.id}
-            className={`group flex items-start ${compact ? 'gap-2' : 'gap-3'} ${
-              msg.role === 'user' ? 'flex-row-reverse animate-slide-in-right' : 'animate-slide-in-left'
-            }`}
-            style={{ animationDelay: `${Math.min(idx * 30, 200)}ms` }}
-          >
-            {!compact && (
-              <div
-                className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border"
-                style={{
-                  background: msg.role === 'user' ? 'var(--pc-accent)' : 'var(--pc-bg-elevated)',
-                  borderColor: msg.role === 'user' ? 'var(--pc-accent)' : 'var(--pc-border)',
-                }}
-              >
-                {msg.role === 'user' ? (
-                  <User className="h-4 w-4 text-white" />
-                ) : (
-                  <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
-                )}
-              </div>
-            )}
-            <div className="relative max-w-[75%]">
-              <div
-                className={compact ? 'rounded-xl px-3 py-1.5 border' : 'rounded-2xl px-4 py-3 border'}
-                style={
-                  msg.role === 'user'
-                    ? { background: 'var(--pc-accent-glow)', borderColor: 'var(--pc-accent-dim)', color: 'var(--pc-text-primary)', }
-                    : { background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)', }
-                }
-              >
-                {msg.thinking && (
-                  <details className="mb-2">
-                    <summary className="text-xs cursor-pointer select-none" style={{ color: 'var(--pc-text-muted)' }}>Thinking</summary>
-                    <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-lg" style={{ color: 'var(--pc-text-muted)', background: 'var(--pc-bg-surface)' }}>{msg.thinking}</pre>
-                  </details>
-                )}
-                {msg.toolCall ? (
-                  <ToolCallCard toolCall={msg.toolCall} />
-                ) : msg.markdown ? (
-                  <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown></div>
-                ) : (
-                  <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{msg.content}</p>
-                )}
-                {!compact && (
-                  <p
-                    className="text-[10px] mt-1.5" style={{ color: msg.role === 'user' ? 'var(--pc-accent-light)' : 'var(--pc-text-faint)' }}>
-                    {msg.timestamp.toLocaleTimeString()}
-                  </p>
-                )}
-              </div>
-              {/* Hover action buttons — below the bubble, right-aligned */}
-              <div className="flex items-center justify-end gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                <button
-                  onClick={() => handleCopy(msg.id, msg.content)}
-                  aria-label={t('agent.copy_message')}
-                  className="p-1 rounded-lg"
-                  style={{ color: 'var(--pc-text-muted)' }}
-                  onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; }}
-                >
-                  {copiedId === msg.id ? (
-                    <Check className="h-3.5 w-3.5" style={{ color: '#34d399' }} />
-                  ) : (
-                    <Copy className="h-3.5 w-3.5" />
-                  )}
-                </button>
-                <button
-                  onClick={() => handleDeleteMessage(msg.id)}
-                  aria-label={t('agent.delete_message')}
-                  className="p-1 rounded-lg"
-                  style={{ color: 'var(--pc-text-muted)' }}
-                  onMouseEnter={(e) => { e.currentTarget.style.color = '#f87171'; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; }}
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            </div>
-          </div>
+            msg={msg}
+            idx={idx}
+            compact={compact}
+            isCopied={copiedId === msg.id}
+            onCopy={handleCopy}
+            onDelete={handleDeleteMessage}
+          />
         ))}
 
         {typing && (
@@ -557,34 +538,163 @@ export default function AgentChat() {
             value={input}
             onChange={handleTextareaChange}
             onKeyDown={handleKeyDown}
-            placeholder={connected ? t('agent.type_message') : t('agent.connecting')}
-            disabled={!connected}
+            onCompositionStart={() => { isComposingRef.current = true; }}
+            onCompositionEnd={() => { isComposingRef.current = false; }}
+            placeholder={!connected
+              ? t('agent.connecting')
+              : typing
+                ? t('agent.running')
+                : t('agent.type_message')}
+            disabled={!connected || typing}
             className="input-electric flex-1 px-4 text-sm resize-none disabled:opacity-40"
             style={{ minHeight: '44px', maxHeight: '200px', paddingTop: '10px', paddingBottom: '10px' }}
           />
-          <button
-            type='button'
-            onClick={handleSend}
-            disabled={!connected || !input.trim()}
-            className="btn-electric flex-shrink-0 rounded-2xl flex items-center justify-center"
-            style={{ color: 'white', width: '40px', height: '40px' }}
-          >
-            <Send className="h-5 w-5" />
-          </button>
+          {typing ? (
+            <button
+              type="button"
+              onClick={handleAbort}
+              className="btn-danger flex-shrink-0 rounded-2xl flex items-center justify-center"
+              style={{ color: 'white', width: '40px', height: '40px' }}
+              aria-label={t('agent.stop')}
+              title={t('agent.stop')}
+            >
+              <Square className="h-4 w-4" fill="currentColor" />
+            </button>
+          ) : (
+            <button
+              type='button'
+              onClick={handleSend}
+              disabled={!connected || !input.trim()}
+              className="btn-electric flex-shrink-0 rounded-2xl flex items-center justify-center"
+              style={{ color: 'white', width: '40px', height: '40px' }}
+            >
+              <Send className="h-5 w-5" />
+            </button>
+          )}
         </div>
         <div className="flex items-center justify-center mt-2 gap-2">
           <span
             className="status-dot"
-            style={connected
-              ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' }
-              : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
+            style={typing
+              ? { background: 'var(--pc-accent)', boxShadow: '0 0 6px var(--pc-accent)' }
+              : connected
+                ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' }
+                : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
             }
           />
           <span className="text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
-            {connected ? t('agent.connected_status') : t('agent.disconnected_status')}
+            {typing
+              ? t('agent.running')
+              : connected
+                ? t('agent.connected_status')
+                : t('agent.disconnected_status')}
           </span>
         </div>
       </div>
     </div>
   );
 }
+
+// Each chat message is rendered through this memoized component so that
+// typing into the input does not re-render every existing message (and
+// re-run ReactMarkdown on each one). Keep the prop surface small and pass
+// `isCopied` rather than the parent's full copiedId so only the affected
+// row re-renders when the copy indicator flips. See #5125.
+interface MessageItemProps {
+  msg: ChatMessage;
+  idx: number;
+  compact: boolean;
+  isCopied: boolean;
+  onCopy: (id: string, content: string) => void;
+  onDelete: (id: string) => void;
+}
+
+const MessageItem = memo(function MessageItem({
+  msg,
+  idx,
+  compact,
+  isCopied,
+  onCopy,
+  onDelete,
+}: MessageItemProps) {
+  return (
+    <div
+      className={`group flex items-start ${compact ? 'gap-2' : 'gap-3'} ${
+        msg.role === 'user' ? 'flex-row-reverse animate-slide-in-right' : 'animate-slide-in-left'
+      }`}
+      style={{ animationDelay: `${Math.min(idx * 30, 200)}ms` }}
+    >
+      {!compact && (
+        <div
+          className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border"
+          style={{
+            background: msg.role === 'user' ? 'var(--pc-accent)' : 'var(--pc-bg-elevated)',
+            borderColor: msg.role === 'user' ? 'var(--pc-accent)' : 'var(--pc-border)',
+          }}
+        >
+          {msg.role === 'user' ? (
+            <User className="h-4 w-4 text-white" />
+          ) : (
+            <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
+          )}
+        </div>
+      )}
+      <div className="relative max-w-[75%]">
+        <div
+          className={compact ? 'rounded-xl px-3 py-1.5 border' : 'rounded-2xl px-4 py-3 border'}
+          style={
+            msg.role === 'user'
+              ? { background: 'var(--pc-accent-glow)', borderColor: 'var(--pc-accent-dim)', color: 'var(--pc-text-primary)' }
+              : { background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)' }
+          }
+        >
+          {msg.thinking && (
+            <details className="mb-2">
+              <summary className="text-xs cursor-pointer select-none" style={{ color: 'var(--pc-text-muted)' }}>Thinking</summary>
+              <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-lg" style={{ color: 'var(--pc-text-muted)', background: 'var(--pc-bg-surface)' }}>{msg.thinking}</pre>
+            </details>
+          )}
+          {msg.toolCall ? (
+            <ToolCallCard toolCall={msg.toolCall} />
+          ) : msg.markdown ? (
+            <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown></div>
+          ) : (
+            <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{msg.content}</p>
+          )}
+          {!compact && (
+            <p
+              className="text-[10px] mt-1.5" style={{ color: msg.role === 'user' ? 'var(--pc-accent-light)' : 'var(--pc-text-faint)' }}>
+              {msg.timestamp.toLocaleTimeString()}
+            </p>
+          )}
+        </div>
+        <div className="flex items-center justify-end gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button
+            onClick={() => onCopy(msg.id, msg.content)}
+            aria-label={t('agent.copy_message')}
+            className="p-1 rounded-lg"
+            style={{ color: 'var(--pc-text-muted)' }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; }}
+          >
+            {isCopied ? (
+              <Check className="h-3.5 w-3.5" style={{ color: '#34d399' }} />
+            ) : (
+              <Copy className="h-3.5 w-3.5" />
+            )}
+          </button>
+          <button
+            onClick={() => onDelete(msg.id)}
+            aria-label={t('agent.delete_message')}
+            className="p-1 rounded-lg"
+            style={{ color: 'var(--pc-text-muted)' }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = '#f87171'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; }}
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+});

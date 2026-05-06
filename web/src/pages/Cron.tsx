@@ -11,6 +11,7 @@ import {
   ChevronRight,
   RefreshCw,
   Pencil,
+  Play,
 } from 'lucide-react';
 import type { CronJob, CronRun } from '@/types/api';
 import {
@@ -21,6 +22,7 @@ import {
   getCronSettings,
   patchCronSettings,
   patchCronJob,
+  triggerCronJob,
 } from '@/lib/api';
 import type { CronSettings } from '@/lib/api';
 import { t } from '@/lib/i18n';
@@ -39,7 +41,7 @@ function formatDuration(ms: number | null): string {
   return `${(secs / 60).toFixed(1)}m`;
 }
 
-function RunHistoryPanel({ jobId }: { jobId: string }) {
+function RunHistoryPanel({ jobId, refreshKey = 0 }: { jobId: string; refreshKey?: number }) {
   const [runs, setRuns] = useState<CronRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -53,7 +55,7 @@ function RunHistoryPanel({ jobId }: { jobId: string }) {
       .finally(() => setLoading(false));
   }, [jobId]);
 
-  useEffect(() => { fetchRuns(); }, [fetchRuns]);
+  useEffect(() => { fetchRuns(); }, [fetchRuns, refreshKey]);
 
   if (loading) {
     return (
@@ -149,6 +151,9 @@ export default function Cron() {
   const [error, setError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
+  const [triggering, setTriggering] = useState<string | null>(null);
+  const [triggerError, setTriggerError] = useState<string | null>(null);
+  const [runHistoryRefresh, setRunHistoryRefresh] = useState<Record<string, number>>({});
   const [settings, setSettings] = useState<CronSettings | null>(null);
   const [togglingCatchUp, setTogglingCatchUp] = useState(false);
 
@@ -319,6 +324,33 @@ export default function Cron() {
     }
   };
 
+  const handleTrigger = async (id: string) => {
+    setTriggering(id);
+    setTriggerError(null);
+    try {
+      const result = await triggerCronJob(id);
+      // Refresh job list so last_run / last_status reflect the manual run.
+      try {
+        const refreshed = await getCronJobs();
+        setJobs(refreshed);
+      } catch {
+        // If list refresh fails, leave the existing rows; the user can reload.
+      }
+      // Auto-expand the run history so the user can see the result they just triggered,
+      // and bump its refresh key so an already-expanded panel reloads.
+      setExpandedJob(id);
+      setRunHistoryRefresh((prev) => ({ ...prev, [id]: (prev[id] ?? 0) + 1 }));
+      if (!result.success) {
+        const detail = result.output?.trim();
+        setTriggerError(detail ? `${t('cron.trigger_error')}: ${detail}` : t('cron.trigger_error'));
+      }
+    } catch (err: unknown) {
+      setTriggerError(err instanceof Error ? err.message : t('cron.trigger_error'));
+    } finally {
+      setTriggering(null);
+    }
+  };
+
   const statusIcon = (status: string | null) => {
     if (!status) return null;
     switch (status.toLowerCase()) {
@@ -336,7 +368,7 @@ export default function Cron() {
   if (error) {
     return (
       <div className="p-6 animate-fade-in">
-        <div className="rounded-2xl border p-4" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
+        <div className="rounded-2xl border p-4" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
           {t('cron.load_error')}: {error}
         </div>
       </div>
@@ -383,11 +415,11 @@ export default function Cron() {
           <button
             onClick={toggleCatchUp}
             disabled={togglingCatchUp}
-            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-300 focus:outline-none ${
-              settings.catch_up_on_startup
-                ? 'bg-[#0080ff]'
-                : 'bg-[#1a1a3e]'
-            }`}
+            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-300 focus:outline-none`}
+            style={settings.catch_up_on_startup
+              ? { background: 'var(--color-status-info)' }
+              : { background: 'var(--pc-bg-elevated)', border: '1px solid var(--pc-border)' }
+            }
           >
             <span
               className={`inline-block h-4 w-4 rounded-full bg-white transition-transform duration-300 ${
@@ -416,7 +448,7 @@ export default function Cron() {
               </button>
             </div>
             {formError && (
-              <div className="mb-4 rounded-xl border p-3 text-sm animate-fade-in" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
+              <div className="mb-4 rounded-xl border p-3 text-sm animate-fade-in" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
                 {formError}
               </div>
             )}
@@ -588,6 +620,23 @@ export default function Cron() {
         </div>
       )}
 
+      {/* Inline trigger-error banner — keeps the cron table mounted on failed manual runs */}
+      {triggerError && (
+        <div
+          className="rounded-2xl border p-3 text-sm flex items-start justify-between gap-3 animate-fade-in"
+          style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}
+        >
+          <span className="whitespace-pre-wrap break-words">{triggerError}</span>
+          <button
+            onClick={() => setTriggerError(null)}
+            className="btn-icon shrink-0"
+            title={t('cron.dismiss')}
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+
       {/* Jobs Table */}
       {jobs.length === 0 ? (
         <div className="card p-8 text-center">
@@ -628,7 +677,7 @@ export default function Cron() {
                         ) : (
                           <ChevronRight className="h-3.5 w-3.5" />
                         )}
-                        {job.id.slice(0, 8)}
+                        {job.id?.slice(0, 8) ?? job.id}
                       </button>
                     </td>
                     <td className="font-medium text-sm" style={{ color: 'var(--pc-text-primary)' }}>
@@ -665,6 +714,18 @@ export default function Cron() {
                     </td>
                     <td className="text-right">
                       <div className="flex items-center justify-end gap-2">
+                        <button
+                          onClick={() => handleTrigger(job.id)}
+                          className="btn-icon"
+                          title={t('cron.trigger')}
+                          disabled={triggering === job.id}
+                        >
+                          {triggering === job.id ? (
+                            <RefreshCw className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Play className="h-4 w-4" />
+                          )}
+                        </button>
                         <button
                           onClick={() => openEditModal(job)}
                           className="btn-icon"
@@ -706,7 +767,7 @@ export default function Cron() {
                   {expandedJob === job.id && (
                     <tr>
                       <td colSpan={8} style={{ background: 'var(--pc-bg-elevated)' }}>
-                        <RunHistoryPanel jobId={job.id} />
+                        <RunHistoryPanel jobId={job.id} refreshKey={runHistoryRefresh[job.id] ?? 0} />
                       </td>
                     </tr>
                   )}
