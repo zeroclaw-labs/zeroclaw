@@ -2489,11 +2489,18 @@ pub struct DelegateAgentConfig {
     #[serde(default)]
     pub cron_jobs: Vec<String>,
     /// TTS provider as a dotted alias reference (`<type>.<alias>`,
-    /// e.g. `"openai.default"`). Resolves through `providers.tts.<type>.<alias>`.
+    /// e.g. `"openai.<alias>"`). Resolves through `providers.tts.<type>.<alias>`.
     /// Empty = no TTS for this agent (V3 has no global default-provider concept;
     /// every agent that wants TTS sets its own `tts_provider`).
     #[serde(default)]
     pub tts_provider: String,
+    /// Transcription / STT provider as a dotted alias reference
+    /// (`<type>.<alias>`, e.g. `"groq.<alias>"`). Resolves through
+    /// `providers.transcription.<type>.<alias>`. Empty = no per-agent
+    /// transcription preference (channels that ingest voice fall back to
+    /// their own `transcription_provider` setting; V3 has no global default).
+    #[serde(default)]
+    pub transcription_provider: String,
 
     // ── Agent loop / runtime tunables (folded from V2 `[agent]` ──────
     // V3 makes these per-agent. Defaults preserve V2 behavior so an
@@ -2591,6 +2598,7 @@ impl Default for DelegateAgentConfig {
             memory_namespace: String::new(),
             cron_jobs: Vec::new(),
             tts_provider: String::new(),
+            transcription_provider: String::new(),
             compact_context: default_agent_compact_context(),
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
