@@ -443,12 +443,18 @@ fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> Strin
 pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
     // channels) and thread_ts for per-topic isolation in forum groups.
+    //
+    // Sanitize ':' in reply_target to "__" so the composite key survives
+    // session_store::session_path's filename sanitizer unchanged.  That function
+    // maps every char that is not alphanumeric, '_', or '-' to '_'; "__" is
+    // already in the allow-list and cannot collide with the single-underscore
+    // field separators used in the format! strings below.  Both the JSONL
+    // write path (via session_path) and the in-memory read path (histories.get)
+    // must agree on the same key form — deriving it once here ensures they do.
+    let safe_target = msg.reply_target.replace(':', "__");
     match &msg.thread_ts {
-        Some(tid) => format!(
-            "{}_{}_{}_{}",
-            msg.channel, msg.reply_target, tid, msg.sender
-        ),
-        None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
+        Some(tid) => format!("{}_{}_{}_{}", msg.channel, safe_target, tid, msg.sender),
+        None => format!("{}_{}_{}", msg.channel, safe_target, msg.sender),
     }
 }
 
@@ -6257,6 +6263,73 @@ mod tests {
                 CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
             ),
             300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
+        );
+    }
+
+    fn channel_message_for_history_key(
+        channel: &str,
+        reply_target: &str,
+        thread_ts: Option<&str>,
+        sender: &str,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: "msg-1".to_string(),
+            sender: sender.to_string(),
+            reply_target: reply_target.to_string(),
+            content: String::new(),
+            channel: channel.to_string(),
+            timestamp: 0,
+            thread_ts: thread_ts.map(str::to_string),
+            interruption_scope_id: None,
+            attachments: vec![],
+        }
+    }
+
+    #[test]
+    fn conversation_history_key_sanitizes_colon_in_forum_topic_reply_target() {
+        // Telegram forum-topic case: reply_target is `<chat_id>:<thread_id>`.
+        // Without sanitization, session_store::session_path would map ':' to
+        // '_' on the write path while the in-memory read path kept ':',
+        // producing a key mismatch on restart-hydration. See PR #6091.
+        let msg =
+            channel_message_for_history_key("telegram", "-1003813552641:42", Some("42"), "alice");
+        assert_eq!(
+            conversation_history_key(&msg),
+            "telegram_-1003813552641__42_42_alice"
+        );
+    }
+
+    #[test]
+    fn conversation_history_key_unchanged_when_reply_target_has_no_colon() {
+        // Slack/Discord and any non-forum-topic Telegram traffic don't put
+        // ':' in reply_target — sanitization is a no-op and the key is
+        // byte-identical to the pre-fix behaviour.
+        let with_thread =
+            channel_message_for_history_key("slack", "C12345", Some("1234.5"), "alice");
+        assert_eq!(
+            conversation_history_key(&with_thread),
+            "slack_C12345_1234.5_alice"
+        );
+
+        let without_thread =
+            channel_message_for_history_key("telegram", "-1003813552641", None, "alice");
+        assert_eq!(
+            conversation_history_key(&without_thread),
+            "telegram_-1003813552641_alice"
+        );
+    }
+
+    #[test]
+    fn conversation_history_key_distinguishes_topics_in_same_chat() {
+        // Two different forum topics under the same chat must produce
+        // distinct history keys; otherwise topic context would cross-pollinate.
+        let topic_42 =
+            channel_message_for_history_key("telegram", "-1003813552641:42", Some("42"), "alice");
+        let topic_99 =
+            channel_message_for_history_key("telegram", "-1003813552641:99", Some("99"), "alice");
+        assert_ne!(
+            conversation_history_key(&topic_42),
+            conversation_history_key(&topic_99)
         );
     }
 
