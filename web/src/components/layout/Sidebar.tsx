@@ -8,6 +8,7 @@ import {
   LayoutDashboard,
   MessageSquare,
   Monitor,
+  Network,
   Puzzle,
   Settings,
   Stethoscope,
@@ -32,6 +33,7 @@ const navItems: NavItem[] = [
   { to: '/cost', icon: DollarSign, labelKey: 'nav.cost' },
   { to: '/logs', icon: Activity, labelKey: 'nav.logs' },
   { to: '/doctor', icon: Stethoscope, labelKey: 'nav.doctor' },
+  { to: '/nodes', icon: Network, labelKey: 'nav.nodes' },
   { to: '/canvas', icon: Monitor, labelKey: 'nav.canvas' },
 ];
 

@@ -1142,7 +1142,11 @@ pub async fn run_gateway(
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
         .route("/api/devices", get(api_pairing::list_devices))
-        .route("/api/devices/{id}", delete(api_pairing::revoke_device))
+        .route("/api/nodes", get(nodes::list_nodes))
+        .route(
+            "/api/devices/{id}",
+            delete(api_pairing::revoke_device).patch(api_pairing::patch_device),
+        )
         .route(
             "/api/devices/{id}/token/rotate",
             post(api_pairing::rotate_token),
@@ -1430,6 +1434,48 @@ async fn handle_pair(
     match state.pairing.try_pair(code, &rate_key).await {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
+
+            // Register the new device in the persistent DeviceRegistry so it
+            // shows up in /api/devices (and the dashboard's Nodes page).
+            // Pulls best-effort identification from request headers — the
+            // dashboard can pass `X-Device-Name` / `X-Device-Type` for
+            // explicit values; otherwise we infer from User-Agent.
+            if let Some(ref registry) = state.device_registry {
+                let token_hash = {
+                    use sha2::{Digest, Sha256};
+                    hex::encode(Sha256::digest(token.as_bytes()))
+                };
+                let user_agent = headers
+                    .get(header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let read_header = |name: &str| {
+                    headers
+                        .get(name)
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from)
+                };
+                let device_name = read_header("X-Device-Name");
+                let device_type =
+                    read_header("X-Device-Type").or_else(|| infer_device_type_from_ua(user_agent));
+                let (ua_os_name, ua_os_version) = infer_os_from_ua(user_agent);
+                registry.register(
+                    token_hash,
+                    api_pairing::DeviceInfo {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: device_name,
+                        device_type,
+                        paired_at: chrono::Utc::now(),
+                        last_seen: chrono::Utc::now(),
+                        ip_address: Some(peer_addr.ip().to_string()),
+                        hostname: read_header("X-Hostname"),
+                        os_name: read_header("X-OS-Name").or(ua_os_name),
+                        os_version: read_header("X-OS-Version").or(ua_os_version),
+                        agent_version: read_header("X-Agent-Version"),
+                    },
+                );
+            }
+
             if let Err(err) =
                 Box::pin(persist_pairing_tokens(state.config.clone(), &state.pairing)).await
             {
@@ -1467,6 +1513,86 @@ async fn handle_pair(
             });
             (StatusCode::TOO_MANY_REQUESTS, Json(err))
         }
+    }
+}
+
+/// Best-effort `(os_name, os_version)` inference from a User-Agent header.
+/// Browsers reliably include OS info in the UA; CLIs typically don't, in
+/// which case both components return `None` and the caller should rely on
+/// explicit `X-OS-Name` / `X-OS-Version` headers.
+fn infer_os_from_ua(ua: &str) -> (Option<String>, Option<String>) {
+    if ua.is_empty() {
+        return (None, None);
+    }
+
+    // macOS: "Macintosh; Intel Mac OS X 10_15_7" → name="macOS", version="10.15.7"
+    if let Some(start) = ua.find("Mac OS X ") {
+        let rest = &ua[start + 9..];
+        let end = rest.find([')', ';']).unwrap_or(rest.len());
+        let version = rest[..end].replace('_', ".");
+        return (Some("macOS".into()), Some(version));
+    }
+    // iOS: "iPhone; CPU iPhone OS 17_5_1 like Mac OS X" or "iPad OS 17_5_1"
+    //
+    // Skip the literal prefix length per match (the two prefixes have
+    // different lengths: "iPhone OS " is 10, "iPad OS " is 8). Earlier code
+    // tried to share a single skip via `find(' ')` and landed on the space
+    // between "iPhone" and "OS" instead of the one before the version, which
+    // produced empty version strings on every iOS UA.
+    let ios_match = ua
+        .find("iPhone OS ")
+        .map(|i| i + "iPhone OS ".len())
+        .or_else(|| ua.find("iPad OS ").map(|i| i + "iPad OS ".len()));
+    if let Some(version_start) = ios_match {
+        let rest = &ua[version_start..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '_'))
+            .unwrap_or(rest.len());
+        let version = rest[..end].replace('_', ".");
+        return (Some("iOS".into()), Some(version));
+    }
+    // Android: "Android 14;"
+    if let Some(start) = ua.find("Android ") {
+        let rest = &ua[start + 8..];
+        let end = rest.find([';', ')']).unwrap_or(rest.len());
+        return (Some("Android".into()), Some(rest[..end].trim().into()));
+    }
+    // Windows: "Windows NT 10.0" — map NT 10 → 10/11, NT 6.3 → 8.1, etc.
+    if let Some(start) = ua.find("Windows NT ") {
+        let rest = &ua[start + 11..];
+        let end = rest.find([';', ')']).unwrap_or(rest.len());
+        return (Some("Windows".into()), Some(rest[..end].trim().into()));
+    }
+    // Linux distributions: "Linux x86_64" / "X11; Linux"
+    if ua.contains("Linux") {
+        return (Some("Linux".into()), None);
+    }
+
+    (None, None)
+}
+
+/// Best-effort device type inference from a User-Agent header. Returns
+/// `None` if the UA is empty or unrecognised, which lets callers fall back
+/// to whatever metadata they already have.
+fn infer_device_type_from_ua(ua: &str) -> Option<String> {
+    let ua = ua.to_lowercase();
+    if ua.is_empty() {
+        return None;
+    }
+    if ua.contains("iphone") || ua.contains("ipad") {
+        Some("ios".into())
+    } else if ua.contains("android") {
+        Some("android".into())
+    } else if ua.contains("macintosh") || ua.contains("mac os x") {
+        Some("macos".into())
+    } else if ua.contains("windows") {
+        Some("windows".into())
+    } else if ua.contains("linux") {
+        Some("linux".into())
+    } else if ua.starts_with("zeroclaw/") || ua.starts_with("curl/") {
+        Some("cli".into())
+    } else {
+        Some("browser".into())
     }
 }
 
@@ -2599,6 +2725,110 @@ mod tests {
     fn generate_test_secret() -> String {
         let bytes: [u8; 32] = rand::random();
         hex::encode(bytes)
+    }
+
+    // ── User-Agent parsers ──────────────────────────────────────────
+    //
+    // One test per branch of `infer_os_from_ua` and `infer_device_type_from_ua`.
+    // The iOS case in particular caught a bug where the previous parser walked
+    // off the wrong space and produced `Some("iOS")` / `Some("")`.
+
+    #[test]
+    fn infer_os_from_ua_macos() {
+        let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15";
+        assert_eq!(
+            infer_os_from_ua(ua),
+            (Some("macOS".into()), Some("10.15.7".into()))
+        );
+    }
+
+    #[test]
+    fn infer_os_from_ua_iphone_returns_version() {
+        let ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15";
+        // Regression: previously this returned `Some("")` because the parser
+        // walked the space between "iPhone" and "OS" instead of the one
+        // before the version.
+        assert_eq!(
+            infer_os_from_ua(ua),
+            (Some("iOS".into()), Some("17.5.1".into()))
+        );
+    }
+
+    #[test]
+    fn infer_os_from_ua_ipad_returns_version() {
+        let ua = "Mozilla/5.0 (iPad; CPU iPad OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15";
+        // Same bug class as iPhone but with a 2-char-shorter prefix; verifies
+        // the per-prefix length skip handles both correctly.
+        assert_eq!(
+            infer_os_from_ua(ua),
+            (Some("iOS".into()), Some("17.5.1".into()))
+        );
+    }
+
+    #[test]
+    fn infer_os_from_ua_android() {
+        let ua = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36";
+        // The "Android " prefix appears before the bare "Linux" word, so the
+        // Android branch should win. Without that ordering the result would
+        // be Linux/None.
+        assert_eq!(
+            infer_os_from_ua(ua),
+            (Some("Android".into()), Some("14".into()))
+        );
+    }
+
+    #[test]
+    fn infer_os_from_ua_windows() {
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+        assert_eq!(
+            infer_os_from_ua(ua),
+            (Some("Windows".into()), Some("10.0".into()))
+        );
+    }
+
+    #[test]
+    fn infer_os_from_ua_linux_no_version() {
+        let ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36";
+        assert_eq!(infer_os_from_ua(ua), (Some("Linux".into()), None));
+    }
+
+    #[test]
+    fn infer_os_from_ua_empty_returns_none() {
+        assert_eq!(infer_os_from_ua(""), (None, None));
+    }
+
+    #[test]
+    fn infer_os_from_ua_unrecognised_returns_none() {
+        assert_eq!(
+            infer_os_from_ua("zeroclaw/0.7.4 some-weird-runtime"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn infer_device_type_from_ua_branches() {
+        assert_eq!(
+            infer_device_type_from_ua("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X)"),
+            Some("ios".into())
+        );
+        assert_eq!(
+            infer_device_type_from_ua("Mozilla/5.0 (Linux; Android 14)"),
+            Some("android".into())
+        );
+        assert_eq!(
+            infer_device_type_from_ua("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"),
+            Some("macos".into())
+        );
+        assert_eq!(
+            infer_device_type_from_ua("Mozilla/5.0 (Windows NT 10.0)"),
+            Some("windows".into())
+        );
+        assert_eq!(
+            infer_device_type_from_ua("zeroclaw/0.7.4"),
+            Some("cli".into())
+        );
+        assert_eq!(infer_device_type_from_ua("curl/8.4.0"), Some("cli".into()));
+        assert_eq!(infer_device_type_from_ua(""), None);
     }
 
     #[test]

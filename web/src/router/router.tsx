@@ -11,6 +11,7 @@ import {
   Integrations,
   Logs,
   Memory,
+  Nodes,
   Onboard,
   Pairing,
   Tools,
@@ -43,6 +44,7 @@ export const Router = () => (
         <Route path="/cost" element={<Cost />} />
         <Route path="/logs" element={<Logs />} />
         <Route path="/doctor" element={<Doctor />} />
+        <Route path="/nodes" element={<Nodes />} />
         <Route path="/pairing" element={<Pairing />} />
         <Route path="/canvas" element={<Canvas />} />
         <Route path="/onboard" element={<Onboard />} />

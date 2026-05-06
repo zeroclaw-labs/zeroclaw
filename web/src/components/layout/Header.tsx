@@ -17,6 +17,7 @@ const routeTitles: Record<string, string> = {
   '/cost': 'nav.cost',
   '/logs': 'nav.logs',
   '/doctor': 'nav.doctor',
+  '/nodes': 'nav.nodes',
   '/onboard': 'nav.onboard',
 };
 
