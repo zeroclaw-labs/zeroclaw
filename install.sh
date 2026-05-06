@@ -334,6 +334,118 @@ do_uninstall() {
   exit 0
 }
 
+# ── Onboarding-needed status check ───────────────────────────────
+#
+# Detect whether the operator already has a completed onboarding so the
+# 3-way "how would you like to onboard?" prompt can skip silently on a
+# re-install. We treat onboarding as complete when a config file exists at
+# the expected path AND it contains at least one `[providers.models.*]` or
+# `[providers.fallback]` line — i.e. some provider is configured. Empty or
+# default config files still trigger the prompt.
+onboarding_needed() {
+  cfg="$PREFIX/.zeroclaw/config.toml"
+  [ -f "$cfg" ] || return 0   # no config → onboard
+  # Already-configured signal: any of these patterns means a provider was set.
+  if grep -qE '^\[providers\.models\.|^fallback *=|^default_provider *=' "$cfg" 2>/dev/null; then
+    return 1   # configured → skip
+  fi
+  return 0     # config exists but empty → onboard
+}
+
+# ── Interactive feature picker ───────────────────────────────────
+#
+# POSIX-sh number-toggle picker over the OPTIONAL feature set (channel-*,
+# observability-*, hardware/peripheral/sandbox/browser flavours). Default
+# features are always on; this only surfaces the opt-in extras. The output
+# is a comma-separated list of selected features written to stdout.
+#
+# Invoked from the interactive flow when the operator runs install.sh in a
+# TTY without `--minimal`, `--preset`, or `--features`. Skipped in
+# non-interactive runs (curl | bash) and in CI.
+interactive_feature_picker() {
+  toml="$1"
+  parse_cargo_toml "$toml"
+
+  picker_features=""
+  for feat in $ALL_FEATURES; do
+    case "$feat" in
+      default|ci-all|fantoccini|landlock|metrics) continue ;;
+      channel-*|observability-*|hardware|peripheral-*|sandbox-*|browser-*|probe|rag-pdf|webauthn)
+        picker_features="${picker_features:+$picker_features }$feat" ;;
+    esac
+  done
+
+  selected=""
+  echo
+  printf "  %s\n" "$(bold "Optional features (off by default):")"
+  printf "  %s\n" "Type the numbers to toggle, blank line to confirm."
+  printf "  %s\n" "Default features (agent runtime, gateway, …) are always on."
+  echo
+
+  while :; do
+    i=1
+    for feat in $picker_features; do
+      mark=" "
+      case " $selected " in *" $feat "*) mark="✓" ;; esac
+      printf "    [%2d] %s %s\n" "$i" "$mark" "$feat"
+      i=$((i + 1))
+    done
+    echo
+    printf "  toggle (e.g. \"1 3 5\"), %s confirm: " "$(bold "Enter to")"
+    read -r choices
+    [ -z "$choices" ] && break
+    for n in $choices; do
+      case "$n" in
+        ''|*[!0-9]*) continue ;;
+      esac
+      idx=1
+      for feat in $picker_features; do
+        if [ "$idx" -eq "$n" ]; then
+          case " $selected " in
+            *" $feat "*) selected=$(printf '%s' "$selected" | tr ' ' '\n' | grep -vx "$feat" | paste -sd' ' -) ;;
+            *)            selected="${selected:+$selected }$feat" ;;
+          esac
+          break
+        fi
+        idx=$((idx + 1))
+      done
+    done
+  done
+
+  printf '%s' "$selected" | tr ' ' ','
+}
+
+# ── Web dashboard build for source installs ──────────────────────
+#
+# When a source build includes the `gateway` feature, the dashboard
+# (`web/dist`) needs to be built so the gateway can serve it. If Node.js
+# is on PATH we run `npm install && npm run build` in `web/`. Without
+# Node.js we warn — the gateway still starts but the dashboard route
+# returns 404 until `web/dist` is populated.
+build_web_dashboard() {
+  src_dir="$1"
+  if [ ! -d "$src_dir/web" ]; then
+    warn "Source has no web/ directory; skipping dashboard build."
+    return 0
+  fi
+  if [ -f "$src_dir/web/dist/index.html" ]; then
+    info "Web dashboard already built at $src_dir/web/dist"
+    return 0
+  fi
+  if ! command -v npm >/dev/null 2>&1; then
+    warn "npm not found — skipping dashboard build. The gateway will run"
+    warn "  in API-only mode until you build the dashboard:"
+    warn "  cd $src_dir/web && npm install && npm run build"
+    return 0
+  fi
+  info "Building web dashboard (npm install + npm run build)..."
+  (cd "$src_dir/web" && npm install --silent && npm run build --silent) || {
+    warn "Dashboard build failed — gateway will run in API-only mode."
+    return 0
+  }
+  info "Web dashboard built at $src_dir/web/dist"
+}
+
 # ── Parse arguments ───────────────────────────────────────────────
 
 MINIMAL=false
@@ -586,6 +698,23 @@ if [ "$WITH_GATEWAY" = "true" ]; then
   esac
 fi
 
+# Interactive feature picker — only when the operator did not pin
+# features via the CLI and is running under a TTY. Skipped on
+# `--minimal`, `--preset`, `--features`, `--with-gateway` /
+# `--without-gateway`, and any non-interactive run (curl | bash).
+if [ -t 0 ] \
+    && [ "$MINIMAL" != true ] \
+    && [ -z "$USER_FEATURES" ] \
+    && [ -z "$PRESET" ] \
+    && [ -z "$WITH_GATEWAY" ] \
+    && [ "$DRY_RUN" != true ]; then
+  PICKED=$(interactive_feature_picker "Cargo.toml")
+  if [ -n "$PICKED" ]; then
+    USER_FEATURES="$PICKED"
+    info "Picked features: $USER_FEATURES"
+  fi
+fi
+
 if [ -n "$USER_FEATURES" ]; then
   # Normalize: treat commas, spaces, tabs as delimiters; deduplicate; trim empty
   USER_FEATURES=$(printf '%s' "$USER_FEATURES" | tr ',[:space:]' '\n' | grep -v '^$' | sort -u | paste -sd, - || true)
@@ -669,6 +798,23 @@ echo
 # shellcheck disable=SC2086
 cargo install --path . --locked --force $CARGO_FLAGS
 
+# ── Web dashboard (gateway feature only) ──────────────────────────
+# When the install includes the `gateway` feature, build `web/dist` so
+# the dashboard route serves something. Skips silently when the build
+# excluded gateway (`--without-gateway`, `--minimal` without explicit
+# gateway in --features, etc).
+WANT_GATEWAY=true
+case "$CARGO_FLAGS" in
+  *--no-default-features*)
+    case ",$USER_FEATURES," in
+      *,gateway,*) ;;
+      *) WANT_GATEWAY=false ;;
+    esac ;;
+esac
+if [ "$WANT_GATEWAY" = true ]; then
+  build_web_dashboard "$INSTALL_DIR"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────
 
 BIN="$CARGO_HOME/bin/zeroclaw"
@@ -723,7 +869,12 @@ fi
 # ── Onboard ───────────────────────────────────────────────────────
 
 if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
-  if [ -t 0 ]; then
+  # Skip the prompt entirely when the operator already has a configured
+  # ZeroClaw — re-installs should not re-prompt.
+  if ! onboarding_needed; then
+    info "Existing ZeroClaw config detected at $PREFIX/.zeroclaw/config.toml — skipping onboard prompt."
+    info "Run 'zeroclaw onboard' to reconfigure."
+  elif [ -t 0 ]; then
     # 3-way onboarding choice. Bare Enter accepts the [1] CLI default;
     # option [2] foregrounds the daemon so the operator can finish in the
     # browser and Ctrl+C to return; [3] skips and prints a follow-up hint.
