@@ -57,6 +57,7 @@ pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
+pub use zeroclaw_tools::eight_sleep::EightSleepTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
 pub use zeroclaw_tools::file_edit::FileEditTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
@@ -599,6 +600,33 @@ pub fn all_tools_with_runtime(
                 root_config.jira.allowed_actions.clone(),
                 security.clone(),
                 root_config.jira.timeout_secs,
+            )));
+        }
+    }
+
+    // 8Sleep integration (config-gated, unofficial cloud API)
+    if root_config.eight_sleep.enabled {
+        let password = if root_config.eight_sleep.password.trim().is_empty() {
+            std::env::var("EIGHT_SLEEP_PASSWORD").unwrap_or_default()
+        } else {
+            root_config.eight_sleep.password.trim().to_string()
+        };
+        if password.trim().is_empty() {
+            tracing::warn!(
+                "eight_sleep: enabled but no password found (set eight_sleep.password or EIGHT_SLEEP_PASSWORD env var) — skipping registration"
+            );
+        } else if root_config.eight_sleep.email.trim().is_empty() {
+            tracing::warn!(
+                "eight_sleep: enabled but eight_sleep.email is empty — skipping registration"
+            );
+        } else {
+            tool_arcs.push(Arc::new(EightSleepTool::new(
+                root_config.eight_sleep.email.trim().to_string(),
+                password,
+                root_config.eight_sleep.api_base_url.trim().to_string(),
+                root_config.eight_sleep.allowed_sides.clone(),
+                root_config.eight_sleep.request_timeout_secs,
+                security.clone(),
             )));
         }
     }

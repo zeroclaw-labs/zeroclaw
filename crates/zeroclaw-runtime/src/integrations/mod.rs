@@ -148,6 +148,16 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    Supports city names, IATA airport codes, GPS coordinates,");
             println!("    postal/zip codes, and Unicode location names.");
         }
+        "8Sleep" => {
+            println!("  Setup (unofficial API — may break without notice):");
+            println!("    1. Add to config:");
+            println!("       [eight_sleep]");
+            println!("       enabled = true");
+            println!("       email = \"you@example.com\"");
+            println!("       password = \"...\"  # or set EIGHT_SLEEP_PASSWORD");
+            println!("    2. Optionally narrow `allowed_sides` to one side of a shared bed.");
+            println!("    3. v1 supports get_bed_state, get_metrics, set_temperature only.");
+        }
         _ if entry.category == IntegrationCategory::Chat => {
             println!("  Setup:");
             println!("    Run: zeroclaw onboard --channels-only");

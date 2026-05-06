@@ -385,6 +385,11 @@ pub struct Config {
     #[nested]
     pub jira: JiraConfig,
 
+    /// 8Sleep integration configuration (`[eight_sleep]`).
+    #[serde(default)]
+    #[nested]
+    pub eight_sleep: EightSleepConfig,
+
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     #[nested]
@@ -9316,6 +9321,92 @@ impl Default for JiraConfig {
     }
 }
 
+/// 8Sleep integration configuration (`[eight_sleep]`).
+///
+/// **Unofficial API.** 8Sleep does not publish a stable public API; this
+/// integration uses the same HTTPS endpoints the official mobile app
+/// reaches and the auth flow popularized by the open-source `pyEight`
+/// library. Endpoints can change at any time without notice.
+///
+/// When `enabled = true`, registers the `eight_sleep` tool which can
+/// read bed state and last-night metrics, and adjust per-side heating
+/// level on a Pod. Requires `email` and `password` (or the
+/// `EIGHT_SLEEP_PASSWORD` env var).
+///
+/// ## Defaults
+/// - `enabled`: `false`
+/// - `api_base_url`: `https://client-api.8slp.net/v1` — override only if
+///   8Sleep moves endpoints.
+/// - `allowed_sides`: `["left", "right"]` — set to `["left"]` or
+///   `["right"]` to lock the tool to one side of a shared bed.
+/// - `request_timeout_secs`: `15`
+///
+/// ## Auth
+/// Login posts `{email, password}` to `<api_base_url>/login`. The returned
+/// session token is cached in memory only (no on-disk persistence) and
+/// refreshed automatically on `401`. Newer accounts that mandate the
+/// AWS Cognito OAuth flow are not supported in v1.
+///
+/// `password` is `#[secret]`-encrypted at rest when `[secrets] encrypt = true`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "eight-sleep"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "8Sleep",
+    description = "Smart mattress (unofficial API)",
+    status_field = "enabled"
+)]
+pub struct EightSleepConfig {
+    /// Enable the `eight_sleep` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Account email.
+    #[serde(default)]
+    pub email: String,
+    /// Account password. Encrypted at rest. Falls back to
+    /// `EIGHT_SLEEP_PASSWORD` env var.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub password: String,
+    /// API base URL. Default: `https://client-api.8slp.net/v1`.
+    #[serde(default = "default_eight_sleep_api_base_url")]
+    pub api_base_url: String,
+    /// Sides the agent is permitted to mutate (`set_temperature`).
+    /// Empty disables all mutations while leaving reads available.
+    #[serde(default = "default_eight_sleep_allowed_sides")]
+    pub allowed_sides: Vec<String>,
+    /// Request timeout in seconds. Default: `15`.
+    #[serde(default = "default_eight_sleep_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_eight_sleep_api_base_url() -> String {
+    "https://client-api.8slp.net/v1".into()
+}
+
+fn default_eight_sleep_allowed_sides() -> Vec<String> {
+    vec!["left".into(), "right".into()]
+}
+
+fn default_eight_sleep_timeout_secs() -> u64 {
+    15
+}
+
+impl Default for EightSleepConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            email: String::new(),
+            password: String::new(),
+            api_base_url: default_eight_sleep_api_base_url(),
+            allowed_sides: default_eight_sleep_allowed_sides(),
+            request_timeout_secs: default_eight_sleep_timeout_secs(),
+        }
+    }
+}
+
 ///
 /// Controls the read-only cloud transformation analysis tools:
 /// IaC review, migration assessment, cost analysis, and architecture review.
@@ -9634,6 +9725,7 @@ impl Default for Config {
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            eight_sleep: EightSleepConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -12595,6 +12687,7 @@ auto_save = true
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            eight_sleep: EightSleepConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -13166,6 +13259,7 @@ default_temperature = 0.7
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            eight_sleep: EightSleepConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
