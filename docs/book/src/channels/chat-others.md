@@ -148,6 +148,39 @@ databases = ["..."]                # DB IDs the agent can write to
 
 Treats a Notion database as a message surface. Useful for asynchronous workflows where the "channel" is a task inbox.
 
+## Sinch (SMS)
+
+```toml
+[channels.sinch]
+enabled = false                    # disabled by default — opt in explicitly
+service_plan_id = "..."            # public Sinch project ID
+api_token = "..."                  # Bearer token for outbound (xms/v1/.../batches)
+region = "us"                      # "us" or "eu" (data residency)
+from_number = "+15555550100"       # E.164, provisioned in your Sinch console
+allowed_numbers = ["+15555550199"] # exact match; "*" allows all
+callback_secret = "..."            # HMAC-SHA256 secret for inbound webhooks
+```
+
+Sinch is a Twilio-sibling SMS gateway popular in the Nordics and APAC. Mirrors the [Twilio](#) gateway-registered pattern: this is a webhook-driven channel, not a polling one.
+
+**Auth model.** Outbound requests use Bearer auth on `https://{region}.sms.api.sinch.com/xms/v1/{service_plan_id}/batches`. The `service_plan_id` identifies your Sinch project (public) and the `api_token` is the secret credential. Inbound webhooks are signed separately with `callback_secret` — do not reuse the API token.
+
+**Inbound webhook.** Configure your Sinch service plan's "Callback URL" to point at:
+
+```
+https://{public-gateway-url}/sinch/sms
+```
+
+This must be reachable from the public internet, so you'll typically run one of the configured `[tunnel]` providers (Cloudflare Tunnel, Tailscale Funnel, ngrok, Pinggy, or a custom command). The gateway hosts `POST /sinch/sms` directly — there is no webhook subscription dance.
+
+**Signature scheme.** Sinch sends an `x-sinch-webhook-signature` header in the format `v1,{nonce},{base64-sig}`. The signature is HMAC-SHA256 over `nonce_bytes || raw_body` keyed by `callback_secret`. The gateway verifies this header on every inbound request and returns `401` on mismatch — there is no fail-open path. The signature covers the body only, not the URL, so reverse-proxy host rewrites are harmless.
+
+**Region selection.** `region = "us"` targets `us.sms.api.sinch.com`; `region = "eu"` targets `eu.sms.api.sinch.com`. Pick whichever matches the data residency configured for your Sinch project — the wrong region will return 401/404 even with valid credentials.
+
+**Trial accounts.** Sinch trial credentials can only send to numbers you've verified in the Sinch dashboard. Add your own test number to the allowed list and verify it before expecting messages to land.
+
+**Cost.** SMS pricing is per-segment and varies by destination country — long bodies are split into ≤1600-char chunks with a `(i/N)` continuation marker, and each chunk is billed separately. See Sinch's pricing page for current rates.
+
 ---
 
 ## When to prefer a dedicated guide

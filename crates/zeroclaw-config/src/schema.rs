@@ -6773,6 +6773,11 @@ pub struct ChannelsConfig {
     #[display_name = "Linq"]
     #[description = "Linq Partner API for iMessage/RCS/SMS"]
     pub linq: Option<LinqConfig>,
+    /// Sinch SMS channel configuration.
+    #[nested]
+    #[display_name = "Sinch"]
+    #[description = "Sinch programmable SMS"]
+    pub sinch: Option<SinchConfig>,
     /// WATI WhatsApp Business API channel configuration.
     #[nested]
     #[display_name = "WATI"]
@@ -6987,6 +6992,10 @@ impl ChannelsConfig {
                 self.linq.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.sinch.as_ref())),
+                self.sinch.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.wati.as_ref())),
                 self.wati.is_some(),
             ),
@@ -7092,6 +7101,7 @@ impl Default for ChannelsConfig {
             signal: None,
             whatsapp: None,
             linq: None,
+            sinch: None,
             wati: None,
             nextcloud_talk: None,
             email: None,
@@ -7790,6 +7800,67 @@ impl ChannelConfig for LinqConfig {
     }
     fn desc() -> &'static str {
         "iMessage/RCS/SMS via Linq API"
+    }
+}
+
+/// Sinch SMS channel configuration.
+///
+/// Inbound SMS arrives via the gateway at the hardcoded path `/sinch/sms`.
+/// The operator must point Sinch's "Callback URL" setting at
+/// `https://{public-gateway-url}/sinch/sms` — usually behind one of the
+/// configured `[tunnel]` providers (Cloudflare Tunnel, Tailscale Funnel,
+/// ngrok, Pinggy, or a custom command).
+///
+/// Outbound calls are region-scoped: `region = "us"` targets
+/// `us.sms.api.sinch.com`, `region = "eu"` targets `eu.sms.api.sinch.com`.
+/// Pick the region that matches the data residency of your Sinch project.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.sinch"]
+pub struct SinchConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Sinch service plan ID (project identifier, public). Used as a path
+    /// component on the Batches API endpoint.
+    pub service_plan_id: String,
+    /// Sinch API token used as the HTTP `Bearer` credential for outbound
+    /// `POST /xms/v1/{service_plan_id}/batches` requests. Distinct from
+    /// `callback_secret`.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_token: String,
+    /// Sinch SMS region. `"us"` (default) targets `us.sms.api.sinch.com`,
+    /// `"eu"` targets `eu.sms.api.sinch.com`. Other values are passed through
+    /// verbatim to the URL host but only `us`/`eu` are documented.
+    #[serde(default = "default_sinch_region")]
+    pub region: String,
+    /// Phone number to send from, in E.164 format (e.g. `"+15555550100"`).
+    /// Must be a number provisioned for your Sinch service plan.
+    pub from_number: String,
+    /// Allowed sender numbers in E.164 format (e.g. `"+15555550199"`). Empty
+    /// list = deny all. `"*"` allows everyone (use with care; this is a
+    /// public PSTN endpoint).
+    #[serde(default)]
+    pub allowed_numbers: Vec<String>,
+    /// HMAC-SHA256 secret used to verify the `x-sinch-webhook-signature`
+    /// header (`v1,nonce,base64(sig)` over `nonce_bytes || raw_body`).
+    /// Distinct from `api_token`.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub callback_secret: String,
+}
+
+fn default_sinch_region() -> String {
+    "us".into()
+}
+
+impl ChannelConfig for SinchConfig {
+    fn name() -> &'static str {
+        "Sinch"
+    }
+    fn desc() -> &'static str {
+        "SMS via Sinch (US/EU regions)"
     }
 }
 
@@ -12526,6 +12597,7 @@ auto_save = true
                 signal: None,
                 whatsapp: None,
                 linq: None,
+                sinch: None,
                 wati: None,
                 nextcloud_talk: None,
                 email: None,
@@ -13700,6 +13772,7 @@ allowed_users = ["@u:matrix.org"]
             signal: None,
             whatsapp: None,
             linq: None,
+            sinch: None,
             wati: None,
             nextcloud_talk: None,
             email: None,
@@ -14082,6 +14155,7 @@ bot_token = "xoxb-tok"
                 approval_timeout_secs: 300,
             }),
             linq: None,
+            sinch: None,
             wati: None,
             nextcloud_talk: None,
             email: None,

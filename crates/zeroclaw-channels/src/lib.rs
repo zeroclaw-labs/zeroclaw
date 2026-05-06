@@ -54,6 +54,8 @@ pub mod qq;
 pub mod reddit;
 #[cfg(feature = "channel-signal")]
 pub mod signal;
+#[cfg(feature = "channel-sinch")]
+pub mod sinch;
 #[cfg(feature = "channel-slack")]
 pub mod slack;
 #[cfg(feature = "channel-telegram")]
