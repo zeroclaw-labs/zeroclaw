@@ -148,6 +148,22 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    Supports city names, IATA airport codes, GPS coordinates,");
             println!("    postal/zip codes, and Unicode location names.");
         }
+        "Spotify" => {
+            println!("  Setup:");
+            println!("    1. Register an app at https://developer.spotify.com/dashboard.");
+            println!("    2. Mint a refresh token (one-time external OAuth dance — see");
+            println!("       docs/book/src/tools/spotify.md for the recipe).");
+            println!("    3. Add to config:");
+            println!("       [spotify]");
+            println!("       enabled = true");
+            println!("       client_id = \"...\"");
+            println!("       client_secret = \"...\"  # or SPOTIFY_CLIENT_SECRET");
+            println!("       refresh_token = \"...\" # or SPOTIFY_REFRESH_TOKEN");
+            println!(
+                "    4. Default allowed_actions is read-only; add play/pause/etc to enable mutations."
+            );
+            println!("    Note: playback control requires Spotify Premium.");
+        }
         _ if entry.category == IntegrationCategory::Chat => {
             println!("  Setup:");
             println!("    Run: zeroclaw onboard --channels-only");
