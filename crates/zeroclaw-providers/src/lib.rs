@@ -980,6 +980,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "upstage" => vec!["UPSTAGE_API_KEY"],
         "featherless" => vec!["FEATHERLESS_API_KEY"],
         "arcee" => vec!["ARCEE_API_KEY"],
+        "lambda-ai" | "lambda_ai" => vec!["LAMBDA_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
@@ -1780,6 +1781,12 @@ fn create_provider_with_url_and_options(
         "arcee" => Ok(compat(OpenAiCompatibleProvider::new(
             "Arcee AI",
             "https://api.arcee.ai/api/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "lambda-ai" | "lambda_ai" => Ok(compat(OpenAiCompatibleProvider::new(
+            "Lambda AI",
+            "https://api.lambda.ai/v1",
             key,
             AuthStyle::Bearer,
         ))),
@@ -2676,6 +2683,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             activation: ProviderActivation::FallbackKey,
             local: false,
         },
+        ProviderInfo {
+            name: "lambda-ai",
+            display_name: "Lambda AI",
+            description: "Lambda Labs hosted inference",
+            aliases: &["lambda_ai"],
+            activation: ProviderActivation::FallbackKey,
+            local: false,
+        },
     ]
 }
 
@@ -3561,6 +3576,20 @@ mod tests {
         assert_eq!(resolved, Some("arcee-test".to_string()));
     }
 
+    #[test]
+    fn factory_lambda_ai() {
+        assert!(create_provider("lambda-ai", Some("lambda-test")).is_ok());
+        assert!(create_provider("lambda_ai", Some("lambda-test")).is_ok());
+    }
+
+    #[test]
+    fn resolve_provider_credential_lambda_ai_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("LAMBDA_API_KEY", Some("lambda-test"));
+        let resolved = resolve_provider_credential("lambda-ai", None);
+        assert_eq!(resolved, Some("lambda-test".to_string()));
+    }
+
     // ── Custom / BYOP provider ─────────────────────────────
 
     #[test]
@@ -3891,6 +3920,7 @@ mod tests {
             "upstage",
             "featherless",
             "arcee",
+            "lambda-ai",
             "ovhcloud",
         ];
         for name in providers {
