@@ -6748,6 +6748,9 @@ pub struct ChannelsConfig {
     /// IRC channel configuration.
     #[nested]
     pub irc: Option<IrcConfig>,
+    /// Twitch chat channel configuration (thin IRC adapter).
+    #[nested]
+    pub twitch: Option<TwitchConfig>,
     /// Lark channel configuration.
     #[nested]
     pub lark: Option<LarkConfig>,
@@ -6923,6 +6926,10 @@ impl ChannelsConfig {
                 self.irc.is_some()
             ),
             (
+                Box::new(ConfigWrapper::new(self.twitch.as_ref())),
+                self.twitch.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.lark.as_ref())),
                 self.lark.is_some(),
             ),
@@ -7013,6 +7020,7 @@ impl Default for ChannelsConfig {
             email: None,
             gmail_push: None,
             irc: None,
+            twitch: None,
             lark: None,
             line: None,
             feishu: None,
@@ -7990,6 +7998,52 @@ impl ChannelConfig for IrcConfig {
 
 fn default_irc_port() -> u16 {
     6697
+}
+
+/// Twitch chat channel configuration (thin wrapper over the IRC channel).
+///
+/// Twitch chat is IRC-compatible: the channel internally constructs an
+/// `IrcChannel` against `irc.chat.twitch.tv:6697` with TLS, sending the
+/// OAuth token as `PASS oauth:{token}`. Operator mints the token via
+/// <https://twitchapps.com/tmi/> (one-click) or the Twitch CLI Device
+/// Flow.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.twitch"]
+pub struct TwitchConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Twitch login name of the bot account (case-insensitive — lowercased
+    /// before send).
+    pub bot_username: String,
+    /// OAuth token. The `oauth:` prefix is added automatically if missing,
+    /// so both `"oauth:abcdef"` and `"abcdef"` work.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub oauth_token: String,
+    /// Twitch channels to join. Each entry receives a `#` prefix if missing
+    /// and is lowercased before send (Twitch channel names are
+    /// case-insensitive). E.g. `["mychannel", "#anotherchannel"]`.
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// Allowed sender Twitch logins. Empty = deny all. `"*"` allows
+    /// anyone. Comparison is case-insensitive.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// When true, only respond to messages that mention the bot's login
+    /// name. Default: false.
+    #[serde(default)]
+    pub mention_only: bool,
+}
+
+impl ChannelConfig for TwitchConfig {
+    fn name() -> &'static str {
+        "Twitch"
+    }
+    fn desc() -> &'static str {
+        "Twitch chat (IRC adapter)"
+    }
 }
 
 /// How ZeroClaw receives events from Feishu / Lark.
@@ -12434,6 +12488,7 @@ auto_save = true
                 email: None,
                 gmail_push: None,
                 irc: None,
+                twitch: None,
                 lark: None,
                 line: None,
                 feishu: None,
@@ -13608,6 +13663,7 @@ allowed_users = ["@u:matrix.org"]
             email: None,
             gmail_push: None,
             irc: None,
+            twitch: None,
             lark: None,
             line: None,
             feishu: None,
@@ -13990,6 +14046,7 @@ bot_token = "xoxb-tok"
             email: None,
             gmail_push: None,
             irc: None,
+            twitch: None,
             lark: None,
             line: None,
             feishu: None,
