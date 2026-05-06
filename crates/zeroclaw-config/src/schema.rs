@@ -6773,6 +6773,11 @@ pub struct ChannelsConfig {
     #[display_name = "Linq"]
     #[description = "Linq Partner API for iMessage/RCS/SMS"]
     pub linq: Option<LinqConfig>,
+    /// Plivo SMS channel configuration.
+    #[nested]
+    #[display_name = "Plivo"]
+    #[description = "Plivo programmable SMS"]
+    pub plivo: Option<PlivoConfig>,
     /// WATI WhatsApp Business API channel configuration.
     #[nested]
     #[display_name = "WATI"]
@@ -6987,6 +6992,10 @@ impl ChannelsConfig {
                 self.linq.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.plivo.as_ref())),
+                self.plivo.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.wati.as_ref())),
                 self.wati.is_some(),
             ),
@@ -7092,6 +7101,7 @@ impl Default for ChannelsConfig {
             signal: None,
             whatsapp: None,
             linq: None,
+            plivo: None,
             wati: None,
             nextcloud_talk: None,
             email: None,
@@ -7790,6 +7800,45 @@ impl ChannelConfig for LinqConfig {
     }
     fn desc() -> &'static str {
         "iMessage/RCS/SMS via Linq API"
+    }
+}
+
+/// Plivo SMS channel configuration.
+///
+/// Plivo is a CPaaS provider (Twilio sibling) that delivers SMS via a REST
+/// API plus inbound webhooks. The gateway hosts `POST /plivo/sms` for
+/// receive and this channel's `send` posts to Plivo's `Message` resource.
+///
+/// Inbound auth is HMAC-SHA256 over `URL || nonce || raw_body` keyed by the
+/// Auth Token, base64-encoded, compared to `X-Plivo-Signature-V3` (with the
+/// nonce delivered in `X-Plivo-Signature-V3-Nonce`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.plivo"]
+pub struct PlivoConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Plivo Auth ID (the public account identifier; not secret).
+    pub account_id: String,
+    /// Plivo Auth Token. Used as the HTTP Basic password for outbound calls
+    /// and as the HMAC key for inbound webhook signature verification.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub auth_token: String,
+    /// Phone number to send from (E.164 format, e.g. `+15555550100`).
+    pub from_number: String,
+    /// Allowed inbound sender numbers (E.164 format) or `"*"` for all.
+    #[serde(default)]
+    pub allowed_numbers: Vec<String>,
+}
+
+impl ChannelConfig for PlivoConfig {
+    fn name() -> &'static str {
+        "Plivo"
+    }
+    fn desc() -> &'static str {
+        "SMS via Plivo Programmable Messaging"
     }
 }
 
@@ -12526,6 +12575,7 @@ auto_save = true
                 signal: None,
                 whatsapp: None,
                 linq: None,
+                plivo: None,
                 wati: None,
                 nextcloud_talk: None,
                 email: None,
@@ -13700,6 +13750,7 @@ allowed_users = ["@u:matrix.org"]
             signal: None,
             whatsapp: None,
             linq: None,
+            plivo: None,
             wati: None,
             nextcloud_talk: None,
             email: None,
@@ -14082,6 +14133,7 @@ bot_token = "xoxb-tok"
                 approval_timeout_secs: 300,
             }),
             linq: None,
+            plivo: None,
             wati: None,
             nextcloud_talk: None,
             email: None,

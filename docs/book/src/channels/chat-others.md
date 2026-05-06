@@ -150,6 +150,35 @@ Treats a Notion database as a message surface. Useful for asynchronous workflows
 
 ---
 
+## Plivo (SMS)
+
+```toml
+[channels.plivo]
+enabled = false                    # default; flip to true once configured
+account_id = "MAxxxxxxxxxxxxxxxx"   # Plivo Auth ID (public; not secret)
+auth_token = "..."                  # Plivo Auth Token (secret — keeps both
+                                    # outbound Basic auth and the inbound
+                                    # webhook HMAC key)
+from_number = "+15555550100"        # E.164 number leased from Plivo
+allowed_numbers = ["+15555550199"]  # E.164 inbound allowlist; "*" allows all
+```
+
+**Auth model.** Plivo issues an Auth ID + Auth Token pair per account. The Auth ID is public and goes in the URL; the Auth Token is secret and is reused as both the HTTP Basic password (outbound `Message` POST) and the HMAC-SHA256 key for inbound webhook signature verification.
+
+**Inbound webhook.** The gateway hosts `POST /plivo/sms`. Configure your Plivo Application's "Message URL" to your gateway's public URL — for example `https://your-tunnel.example.com/plivo/sms`. The gateway needs to be reachable from the public internet; the existing options are [Cloudflare Tunnel](../tunnels/cloudflare.md), ngrok, or Tailscale Funnel. Localhost-only deployments cannot receive Plivo webhooks.
+
+**Signature scheme.** Plivo uses signature version 3 (V3): the gateway computes `HMAC-SHA256(URL || nonce || raw_body)` keyed by the Auth Token, base64-encodes the digest, and constant-time compares against the `X-Plivo-Signature-V3` header. The nonce is delivered in `X-Plivo-Signature-V3-Nonce` and ties each request to a specific signature so replays cannot be reused. Failed verification returns `401` and the message never reaches the agent.
+
+**Allowlist.** `allowed_numbers` is an exact-match E.164 allowlist (whitespace stripped, case-insensitive). Use `"*"` to accept every inbound sender — only set this if the number receives traffic exclusively from people you trust to talk to the agent.
+
+**Trial accounts.** Plivo trial accounts can only send to numbers verified in the Plivo console. To agent-reply during trial, verify the inbound numbers you expect first; otherwise the outbound `Message` POST will fail with a 4xx and the gateway will log the error.
+
+**Cost.** Plivo charges per outbound message segment (typically `$0.0035–$0.0085` US, varies by destination country) and per inbound message. Outbound replies that exceed 1600 characters are split into `(i/N)`-prefixed chunks before send and each chunk is billed as a separate segment.
+
+**Default `enabled = false`.** As with every webhook-driven channel, Plivo stays inert until you set `enabled = true` and the gateway is reachable. The `[channels.plivo]` section can be present in config without affecting runtime as long as `enabled` stays false.
+
+---
+
 ## When to prefer a dedicated guide
 
 Channels with more intricate setup (OAuth flows, end-to-end encryption, multi-device considerations) live in their own pages:

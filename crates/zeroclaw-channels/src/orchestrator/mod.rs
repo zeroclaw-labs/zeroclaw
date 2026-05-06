@@ -45,6 +45,8 @@ pub use crate::nextcloud_talk::NextcloudTalkChannel;
 #[cfg(feature = "channel-nostr")]
 pub use crate::nostr::NostrChannel;
 pub use crate::notion::NotionChannel;
+#[cfg(feature = "channel-plivo")]
+pub use crate::plivo::PlivoChannel;
 pub use crate::qq::QQChannel;
 pub use crate::reddit::RedditChannel;
 pub use crate::signal::SignalChannel;
@@ -4476,6 +4478,20 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 lq.allowed_senders.clone(),
             )))
         }
+        #[cfg(feature = "channel-plivo")]
+        "plivo" => {
+            let pl = config
+                .channels
+                .plivo
+                .as_ref()
+                .context("Plivo channel is not configured")?;
+            Ok(Arc::new(PlivoChannel::new(
+                pl.account_id.clone(),
+                pl.auth_token.clone(),
+                pl.from_number.clone(),
+                pl.allowed_numbers.clone(),
+            )))
+        }
         #[cfg(feature = "channel-email")]
         "email" => {
             let em = config
@@ -4598,7 +4614,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, voice-call"
+            plivo, email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, \
+            voice-call"
         ),
     }
 }
@@ -4948,6 +4965,23 @@ fn collect_configured_channels(
             });
         } else {
             tracing::info!("Linq channel configured but disabled (enabled = false)");
+        }
+    }
+
+    #[cfg(feature = "channel-plivo")]
+    if let Some(ref pl) = config.channels.plivo {
+        if pl.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Plivo",
+                channel: Arc::new(PlivoChannel::new(
+                    pl.account_id.clone(),
+                    pl.auth_token.clone(),
+                    pl.from_number.clone(),
+                    pl.allowed_numbers.clone(),
+                )),
+            });
+        } else {
+            tracing::info!("Plivo channel configured but disabled (enabled = false)");
         }
     }
 

@@ -53,7 +53,7 @@ use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_api::tool::ToolSpec;
 use zeroclaw_channels::{
     gmail_push::GmailPushChannel, linq::LinqChannel, nextcloud_talk::NextcloudTalkChannel,
-    wati::WatiChannel, whatsapp::WhatsAppChannel,
+    plivo::PlivoChannel, wati::WatiChannel, whatsapp::WhatsAppChannel,
 };
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
@@ -122,6 +122,10 @@ fn whatsapp_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
 
 fn linq_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("linq_{}_{}", msg.sender, msg.id)
+}
+
+fn plivo_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    format!("plivo_{}_{}", msg.sender, msg.id)
 }
 
 fn wati_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
@@ -382,6 +386,7 @@ pub struct AppState {
     pub linq: Option<Arc<LinqChannel>>,
     /// Linq webhook signing secret for signature verification
     pub linq_signing_secret: Option<Arc<str>>,
+    pub plivo: Option<Arc<PlivoChannel>>,
     pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
     /// Nextcloud Talk webhook secret for signature verification
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
@@ -715,6 +720,21 @@ pub async fn run_gateway(
         })
         .map(Arc::from);
 
+    // Plivo channel (if configured AND enabled)
+    let plivo_channel: Option<Arc<PlivoChannel>> = config
+        .channels
+        .plivo
+        .as_ref()
+        .filter(|pl| pl.enabled)
+        .map(|pl| {
+            Arc::new(PlivoChannel::new(
+                pl.account_id.clone(),
+                pl.auth_token.clone(),
+                pl.from_number.clone(),
+                pl.allowed_numbers.clone(),
+            ))
+        });
+
     // WATI channel (if configured)
     let wati_channel: Option<Arc<WatiChannel>> = config.channels.wati.as_ref().map(|wati_cfg| {
         Arc::new(
@@ -916,6 +936,9 @@ pub async fn run_gateway(
     if linq_channel.is_some() {
         println!("  POST {pfx}/linq      — Linq message webhook (iMessage/RCS/SMS)");
     }
+    if plivo_channel.is_some() {
+        println!("  POST {pfx}/plivo/sms — Plivo SMS webhook");
+    }
     if wati_channel.is_some() {
         println!("  GET  {pfx}/wati      — WATI webhook verification");
         println!("  POST {pfx}/wati      — WATI message webhook");
@@ -985,6 +1008,7 @@ pub async fn run_gateway(
         whatsapp_app_secret,
         linq: linq_channel,
         linq_signing_secret,
+        plivo: plivo_channel,
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
         wati: wati_channel,
@@ -1047,6 +1071,7 @@ pub async fn run_gateway(
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
+        .route("/plivo/sms", post(handle_plivo_sms_webhook))
         .route("/wati", get(handle_wati_verify))
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
@@ -2091,6 +2116,165 @@ async fn handle_linq_webhook(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// POST /plivo/sms — incoming SMS webhook from Plivo Programmable Messaging.
+///
+/// Plivo sends `application/x-www-form-urlencoded` POSTs with `From`, `To`,
+/// `Text`, `MessageUUID`, `Type` (`sms` for normal SMS), and other metadata.
+/// The handler:
+///
+/// 1. Reconstructs the full request URL using `X-Forwarded-Proto`/
+///    `X-Forwarded-Host` (set by tunnels and reverse proxies); falls back to
+///    `Host` and HTTPS. Path is `/plivo/sms` (Plivo never includes a query
+///    string on the webhook).
+/// 2. Verifies the `X-Plivo-Signature-V3` header against
+///    `PlivoChannel::verify_signature` using the V3 nonce header
+///    (`X-Plivo-Signature-V3-Nonce`) and the raw request body. Failure
+///    returns 401 — the SMS is dropped before reaching the agent.
+/// 3. Parses the form payload via `PlivoChannel::parse_webhook_payload`,
+///    which applies the `allowed_numbers` allowlist.
+/// 4. Forwards the resulting `ChannelMessage` to the agent loop and replies
+///    via `PlivoChannel::send`.
+///
+/// Successful runs return `200 OK` with an empty body.
+async fn handle_plivo_sms_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    use std::collections::BTreeMap;
+    let Some(ref plivo) = state.plivo else {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(serde_json::json!({"error": "Plivo not configured"})).to_string(),
+        );
+    };
+
+    // Parse the form-urlencoded body into a sorted map (BTreeMap so map
+    // iteration is deterministic when downstream code walks keys).
+    let parsed: Vec<(String, String)> = match serde_urlencoded::from_bytes(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "application/json")],
+                Json(serde_json::json!({"error": "Invalid form body"})).to_string(),
+            );
+        }
+    };
+    let form_params: BTreeMap<String, String> = parsed.into_iter().collect();
+
+    // Reconstruct the URL Plivo signed. Trust X-Forwarded-Host/
+    // X-Forwarded-Proto when present (tunnels and reverse proxies set them);
+    // otherwise fall back to the Host header and assume HTTPS (Plivo always
+    // sends webhooks over HTTPS in production).
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("https");
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if host.is_empty() {
+        tracing::warn!("Plivo webhook missing Host/X-Forwarded-Host header");
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(serde_json::json!({"error": "Missing Host header"})).to_string(),
+        );
+    }
+    let full_url = format!("{scheme}://{host}/plivo/sms");
+
+    let signature = headers
+        .get("x-plivo-signature-v3")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let nonce = headers
+        .get("x-plivo-signature-v3-nonce")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !plivo.verify_signature(&full_url, nonce, &body, signature) {
+        tracing::warn!(
+            "Plivo webhook signature verification failed (signature: {})",
+            if signature.is_empty() {
+                "missing"
+            } else {
+                "invalid"
+            }
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(serde_json::json!({"error": "Invalid signature"})).to_string(),
+        );
+    }
+
+    let Some(msg) = plivo.parse_webhook_payload(&form_params) else {
+        // Either the sender wasn't on the allowlist, the body was empty, or
+        // the payload is missing required fields. Plivo expects a 200 back
+        // either way so it doesn't retry.
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain")],
+            String::new(),
+        );
+    };
+
+    tracing::info!(
+        "Plivo SMS from {}: {}",
+        msg.sender,
+        truncate_with_ellipsis(&msg.content, 50)
+    );
+    let session_id = sender_session_id("plivo", &msg);
+
+    if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
+        let key = plivo_memory_key(&msg);
+        let _ = state
+            .mem
+            .store(
+                &key,
+                &msg.content,
+                MemoryCategory::Conversation,
+                Some(&session_id),
+            )
+            .await;
+    }
+
+    match Box::pin(run_gateway_chat_with_tools(
+        &state,
+        &msg.content,
+        Some(&session_id),
+    ))
+    .await
+    {
+        Ok(GatewayChatOutcome { response, .. }) => {
+            if let Err(e) = plivo
+                .send(&SendMessage::new(response, &msg.reply_target))
+                .await
+            {
+                tracing::error!("Failed to send Plivo reply: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::error!("LLM error for Plivo message: {e:#}");
+            let _ = plivo
+                .send(&SendMessage::new(
+                    "Sorry, I couldn't process your message right now.",
+                    &msg.reply_target,
+                ))
+                .await;
+        }
+    }
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain")],
+        String::new(),
+    )
+}
+
 /// GET /wati — WATI webhook verification (echoes hub.challenge)
 async fn handle_wati_verify(
     State(state): State<AppState>,
@@ -2678,6 +2862,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            plivo: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -2752,6 +2937,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            plivo: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3211,6 +3397,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            plivo: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3293,6 +3480,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            plivo: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3387,6 +3575,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            plivo: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3453,6 +3642,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            plivo: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3524,6 +3714,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            plivo: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3600,6 +3791,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            plivo: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3673,6 +3865,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            plivo: None,
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             wati: None,
