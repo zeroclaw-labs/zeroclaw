@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: "web/.nvmrc"
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Build web dashboard
@@ -355,7 +355,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: "web/.nvmrc"
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --locked

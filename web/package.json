@@ -37,5 +37,8 @@
     "tailwindcss": "^4.0.0",
     "typescript": "~5.7.2",
     "vite": "^6.4.2"
+  },
+  "engines": {
+    "node": "24.x"
   }
 }
