@@ -71,6 +71,29 @@ subreddits = ["rust", "commandline"]
 - **Outbound:** posts, comments, private messages.
 - **User-agent convention:** Reddit's API requires a descriptive user-agent string. Non-compliance → rate limits.
 
+## Lemmy
+
+```toml
+[channels.lemmy]
+enabled = true
+instance_url = "https://lemmy.world"        # any Lemmy-compatible instance
+# Two auth paths — pick one:
+#   1) Pre-minted JWT (recommended, required for 2FA accounts)
+jwt = "eyJhbGciOiJIUzI1Ni..."               # SECRET — copy from browser cookie or admin UI
+#   2) Username + password (channel auto-logs in at startup)
+# username = "agent-bot"
+# password = "..."                          # SECRET — stored via the same redaction pipeline as Reddit
+allowed_users = ["alice", "bob@beehaw.org"] # bare or instance-qualified; `*` allows anyone
+poll_interval_secs = 30                     # default 30s; lower bound 5s
+```
+
+- **Auth model:** Lemmy v3 REST. Two paths: pre-minted JWT (recommended for production) or username + password — the channel will call `POST /api/v3/user/login` once at startup and cache the token. v1 does **not** support 2FA on the bot account; use the JWT path if that applies.
+- **Scope:** v1 handles **private messages only**. The bot polls `GET /api/v3/private_message/list?unread_only=true` every `poll_interval_secs`, dispatches each PM as a `ChannelMessage`, and `PUT /api/v3/private_message/mark_as_read` so the next poll doesn't re-deliver. Comment / post listening is deferred to v2.
+- **Outbound:** `POST /api/v3/private_message` with `recipient_id` + `content`. Bodies over 10000 chars are split at sentence/word boundaries with `(i/N) ` continuation markers.
+- **Recipient grammar:** `pm:{user_id}` (canonical) or bare numeric (shorthand). Set automatically when the agent replies to inbound PMs.
+- **Allowlist forms:** bare usernames (`alice`) match both local and federated senders; instance-qualified (`alice@beehaw.org`) require an exact match. Comparison is case-insensitive. Empty list denies all; `*` wildcard allows anyone.
+- **Self-hosted TLS:** common in self-hosted installs. Default `reqwest` client honours system trust roots; private CAs need OS-level install.
+
 ---
 
 ## Operating social channels safely

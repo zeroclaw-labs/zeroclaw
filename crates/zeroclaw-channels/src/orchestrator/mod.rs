@@ -36,6 +36,8 @@ pub use crate::imessage::IMessageChannel;
 pub use crate::irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
 pub use crate::lark::LarkChannel;
+#[cfg(feature = "channel-lemmy")]
+pub use crate::lemmy::LemmyChannel;
 #[cfg(feature = "channel-line")]
 pub use crate::line::LineChannel;
 pub use crate::linq::LinqChannel;
@@ -4476,6 +4478,21 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 lq.allowed_senders.clone(),
             )))
         }
+        "lemmy" => {
+            let lm = config
+                .channels
+                .lemmy
+                .as_ref()
+                .context("Lemmy channel is not configured")?;
+            Ok(Arc::new(LemmyChannel::new(
+                lm.instance_url.clone(),
+                lm.username.clone(),
+                lm.password.clone(),
+                lm.jwt.clone(),
+                lm.allowed_users.clone(),
+                lm.poll_interval_secs,
+            )))
+        }
         #[cfg(feature = "channel-email")]
         "email" => {
             let em = config
@@ -5280,6 +5297,22 @@ fn collect_configured_channels(
             channel: Arc::new(BlueskyChannel::new(
                 bs.handle.clone(),
                 bs.app_password.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref lm) = config.channels.lemmy
+        && lm.enabled
+    {
+        channels.push(ConfiguredChannel {
+            display_name: "Lemmy",
+            channel: Arc::new(LemmyChannel::new(
+                lm.instance_url.clone(),
+                lm.username.clone(),
+                lm.password.clone(),
+                lm.jwt.clone(),
+                lm.allowed_users.clone(),
+                lm.poll_interval_secs,
             )),
         });
     }
