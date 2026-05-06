@@ -11,7 +11,6 @@ use tokio_util::sync::CancellationToken;
 use crate::approval::ApprovalManager;
 use crate::observability::{Observer, ObserverEvent};
 use crate::tools::Tool;
-use crate::util::truncate_with_ellipsis;
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, scrub_credentials};
@@ -40,16 +39,25 @@ pub struct ToolExecutionOutcome {
 pub async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
+    tool_call_id: Option<&str>,
     tools_registry: &[Box<dyn Tool>],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
 ) -> Result<ToolExecutionOutcome> {
-    let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
+    // Serialize arguments once and carry the full JSON into both observer
+    // events. Previously the start event received a 300-char summary and the
+    // completion event received no arguments at all, which made tool spans
+    // opaque in OTel backends (see upstream issue #5980 — "Otel Traces Should
+    // Include More Details About Why A Tool Call Failed"). Size is bounded
+    // downstream by the tracing exporter, so we don't need to clip here.
+    let full_args = call_arguments.to_string();
+    let tool_call_id_owned = tool_call_id.map(str::to_string);
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
-        arguments: Some(args_summary),
+        tool_call_id: tool_call_id_owned.clone(),
+        arguments: Some(full_args.clone()),
     });
     let start = Instant::now();
 
@@ -62,15 +70,19 @@ pub async fn execute_one_tool(
     let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
         let reason = format!("Unknown tool: {call_name}");
         let duration = start.elapsed();
+        let scrubbed_reason = scrub_credentials(&reason);
         observer.record_event(&ObserverEvent::ToolCall {
             tool: call_name.to_string(),
+            tool_call_id: tool_call_id_owned.clone(),
             duration,
             success: false,
+            arguments: Some(full_args.clone()),
+            result: Some(scrubbed_reason.clone()),
         });
         return Ok(ToolExecutionOutcome {
-            output: reason.clone(),
+            output: reason,
             success: false,
-            error_reason: Some(scrub_credentials(&reason)),
+            error_reason: Some(scrubbed_reason),
             duration,
             receipt: None,
         });
@@ -89,11 +101,6 @@ pub async fn execute_one_tool(
     match tool_result {
         Ok(r) => {
             let duration = start.elapsed();
-            observer.record_event(&ObserverEvent::ToolCall {
-                tool: call_name.to_string(),
-                duration,
-                success: r.success,
-            });
             if r.success {
                 let normalized_output = if r.output.is_empty() {
                     "(no output)"
@@ -104,6 +111,14 @@ pub async fn execute_one_tool(
                 let receipt = receipt_generator.map(|receipt_gen| {
                     receipt_gen.generate_now(call_name, &call_arguments, &output)
                 });
+                observer.record_event(&ObserverEvent::ToolCall {
+                    tool: call_name.to_string(),
+                    tool_call_id: tool_call_id_owned.clone(),
+                    duration,
+                    success: true,
+                    arguments: Some(full_args.clone()),
+                    result: Some(output.clone()),
+                });
                 Ok(ToolExecutionOutcome {
                     output,
                     success: true,
@@ -113,10 +128,19 @@ pub async fn execute_one_tool(
                 })
             } else {
                 let reason = r.error.unwrap_or(r.output);
+                let scrubbed_reason = scrub_credentials(&reason);
+                observer.record_event(&ObserverEvent::ToolCall {
+                    tool: call_name.to_string(),
+                    tool_call_id: tool_call_id_owned.clone(),
+                    duration,
+                    success: false,
+                    arguments: Some(full_args.clone()),
+                    result: Some(scrubbed_reason.clone()),
+                });
                 Ok(ToolExecutionOutcome {
                     output: format!("Error: {reason}"),
                     success: false,
-                    error_reason: Some(scrub_credentials(&reason)),
+                    error_reason: Some(scrubbed_reason),
                     duration,
                     receipt: None,
                 })
@@ -124,16 +148,20 @@ pub async fn execute_one_tool(
         }
         Err(e) => {
             let duration = start.elapsed();
+            let reason = format!("Error executing {call_name}: {e}");
+            let scrubbed_reason = scrub_credentials(&reason);
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
+                tool_call_id: tool_call_id_owned.clone(),
                 duration,
                 success: false,
+                arguments: Some(full_args.clone()),
+                result: Some(scrubbed_reason.clone()),
             });
-            let reason = format!("Error executing {call_name}: {e}");
             Ok(ToolExecutionOutcome {
-                output: reason.clone(),
+                output: reason,
                 success: false,
-                error_reason: Some(scrub_credentials(&reason)),
+                error_reason: Some(scrubbed_reason),
                 duration,
                 receipt: None,
             })
@@ -186,6 +214,7 @@ pub async fn execute_tools_parallel(
             execute_one_tool(
                 &call.name,
                 call.arguments.clone(),
+                call.tool_call_id.as_deref(),
                 tools_registry,
                 activated_tools,
                 observer,
@@ -216,6 +245,7 @@ pub async fn execute_tools_sequential(
             execute_one_tool(
                 &call.name,
                 call.arguments.clone(),
+                call.tool_call_id.as_deref(),
                 tools_registry,
                 activated_tools,
                 observer,
