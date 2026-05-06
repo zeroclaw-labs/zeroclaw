@@ -53,7 +53,7 @@ use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_api::tool::ToolSpec;
 use zeroclaw_channels::{
     gmail_push::GmailPushChannel, linq::LinqChannel, nextcloud_talk::NextcloudTalkChannel,
-    wati::WatiChannel, whatsapp::WhatsAppChannel,
+    sinch::SinchChannel, wati::WatiChannel, whatsapp::WhatsAppChannel,
 };
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
@@ -122,6 +122,10 @@ fn whatsapp_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
 
 fn linq_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("linq_{}_{}", msg.sender, msg.id)
+}
+
+fn sinch_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    format!("sinch_{}_{}", msg.sender, msg.id)
 }
 
 fn wati_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
@@ -382,6 +386,10 @@ pub struct AppState {
     pub linq: Option<Arc<LinqChannel>>,
     /// Linq webhook signing secret for signature verification
     pub linq_signing_secret: Option<Arc<str>>,
+    /// Sinch SMS channel (US/EU regions). Inbound webhooks land at
+    /// `POST /sinch/sms` and are HMAC-verified via
+    /// `SinchChannel::verify_signature`.
+    pub sinch: Option<Arc<SinchChannel>>,
     pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
     /// Nextcloud Talk webhook secret for signature verification
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
@@ -696,6 +704,25 @@ pub async fn run_gateway(
         ))
     });
 
+    // Sinch channel (if configured AND enabled). Outbound goes to the
+    // region-scoped Batches API; inbound is HMAC-verified by the gateway
+    // handler at POST /sinch/sms.
+    let sinch_channel: Option<Arc<SinchChannel>> = config
+        .channels
+        .sinch
+        .as_ref()
+        .filter(|sn| sn.enabled)
+        .map(|sn| {
+            Arc::new(SinchChannel::new(
+                sn.service_plan_id.clone(),
+                sn.api_token.clone(),
+                sn.region.clone(),
+                sn.from_number.clone(),
+                sn.allowed_numbers.clone(),
+                sn.callback_secret.clone(),
+            ))
+        });
+
     // Linq signing secret for webhook signature verification
     // Priority: environment variable > config file
     let linq_signing_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_LINQ_SIGNING_SECRET")
@@ -985,6 +1012,7 @@ pub async fn run_gateway(
         whatsapp_app_secret,
         linq: linq_channel,
         linq_signing_secret,
+        sinch: sinch_channel,
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
         wati: wati_channel,
@@ -1047,6 +1075,7 @@ pub async fn run_gateway(
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
+        .route("/sinch/sms", post(handle_sinch_sms_webhook))
         .route("/wati", get(handle_wati_verify))
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
@@ -2091,6 +2120,131 @@ async fn handle_linq_webhook(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// POST /sinch/sms — incoming SMS webhook from Sinch.
+///
+/// Sinch sends `application/json` POSTs with at least `from`, `to`, `body`,
+/// `id`, and `type` (we only act on `mo_text`). The handler:
+///
+/// 1. Reads the `x-sinch-webhook-signature` header (`v1,nonce,base64-sig`)
+///    and verifies it via `SinchChannel::verify_signature` over the raw body
+///    bytes. A failure returns 401 and the SMS is dropped — no message ever
+///    reaches the agent. (Unlike Twilio, Sinch's signature is over the body
+///    only, not the URL — no host reconstruction needed.)
+/// 2. Parses the body as JSON. Malformed JSON returns 400.
+/// 3. Calls `SinchChannel::parse_webhook_payload`, which checks
+///    `type == "mo_text"` and applies the `allowed_numbers` allowlist.
+///    Filtered/non-text payloads return 200 with an empty body so Sinch
+///    doesn't retry.
+/// 4. Forwards the resulting `ChannelMessage` to the agent loop and replies
+///    via `SinchChannel::send`.
+async fn handle_sinch_sms_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref sinch) = state.sinch else {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(serde_json::json!({"error": "Sinch not configured"})).to_string(),
+        );
+    };
+
+    let signature = headers
+        .get("x-sinch-webhook-signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !sinch.verify_signature(&body, signature) {
+        tracing::warn!(
+            "Sinch webhook signature verification failed (signature: {})",
+            if signature.is_empty() {
+                "missing"
+            } else {
+                "invalid"
+            }
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(serde_json::json!({"error": "Invalid signature"})).to_string(),
+        );
+    }
+
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "application/json")],
+                Json(serde_json::json!({"error": "Invalid JSON body"})).to_string(),
+            );
+        }
+    };
+
+    let Some(msg) = sinch.parse_webhook_payload(&payload) else {
+        // Either the type wasn't `mo_text`, the sender wasn't on the
+        // allowlist, or the body was empty. ACK with 200 so Sinch doesn't
+        // retry.
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            String::new(),
+        );
+    };
+
+    tracing::info!(
+        "Sinch SMS from {}: {}",
+        msg.sender,
+        truncate_with_ellipsis(&msg.content, 50)
+    );
+    let session_id = sender_session_id("sinch", &msg);
+
+    if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
+        let key = sinch_memory_key(&msg);
+        let _ = state
+            .mem
+            .store(
+                &key,
+                &msg.content,
+                MemoryCategory::Conversation,
+                Some(&session_id),
+            )
+            .await;
+    }
+
+    match Box::pin(run_gateway_chat_with_tools(
+        &state,
+        &msg.content,
+        Some(&session_id),
+    ))
+    .await
+    {
+        Ok(GatewayChatOutcome { response, .. }) => {
+            if let Err(e) = sinch
+                .send(&SendMessage::new(response, &msg.reply_target))
+                .await
+            {
+                tracing::error!("Failed to send Sinch reply: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::error!("LLM error for Sinch message: {e:#}");
+            let _ = sinch
+                .send(&SendMessage::new(
+                    "Sorry, I couldn't process your message right now.",
+                    &msg.reply_target,
+                ))
+                .await;
+        }
+    }
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        String::new(),
+    )
+}
+
 /// GET /wati — WATI webhook verification (echoes hub.challenge)
 async fn handle_wati_verify(
     State(state): State<AppState>,
@@ -2678,6 +2832,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            sinch: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -2752,6 +2907,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            sinch: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3211,6 +3367,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            sinch: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3293,6 +3450,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            sinch: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3387,6 +3545,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            sinch: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3453,6 +3612,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            sinch: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3524,6 +3684,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            sinch: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3600,6 +3761,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            sinch: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3673,6 +3835,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            sinch: None,
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             wati: None,

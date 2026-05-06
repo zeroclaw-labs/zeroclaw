@@ -81,8 +81,8 @@ default = [
     "channel-discord", "channel-slack", "channel-signal", "channel-mattermost",
     "channel-irc", "channel-imessage", "channel-dingtalk", "channel-qq",
     "channel-bluesky", "channel-twitter", "channel-reddit", "channel-notion",
-    "channel-linq", "channel-wati", "channel-nextcloud", "channel-mochat",
-    "channel-wecom", "channel-clawdtalk", "channel-webhook",
+    "channel-linq", "channel-sinch", "channel-wati", "channel-nextcloud",
+    "channel-mochat", "channel-wecom", "channel-clawdtalk", "channel-webhook",
     "channel-whatsapp-cloud", "channel-voice-call",
 ]
 # Channels with optional deps
@@ -106,6 +106,7 @@ channel-twitter = []
 channel-reddit = []
 channel-notion = []
 channel-linq = []
+channel-sinch = []
 channel-wati = []
 channel-nextcloud = []
 channel-mochat = []

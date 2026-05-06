@@ -48,6 +48,8 @@ pub use crate::notion::NotionChannel;
 pub use crate::qq::QQChannel;
 pub use crate::reddit::RedditChannel;
 pub use crate::signal::SignalChannel;
+#[cfg(feature = "channel-sinch")]
+pub use crate::sinch::SinchChannel;
 pub use crate::slack::SlackChannel;
 pub use crate::transcription;
 pub use crate::tts::{TtsManager, TtsProvider};
@@ -4476,6 +4478,22 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 lq.allowed_senders.clone(),
             )))
         }
+        #[cfg(feature = "channel-sinch")]
+        "sinch" => {
+            let sn = config
+                .channels
+                .sinch
+                .as_ref()
+                .context("Sinch channel is not configured")?;
+            Ok(Arc::new(SinchChannel::new(
+                sn.service_plan_id.clone(),
+                sn.api_token.clone(),
+                sn.region.clone(),
+                sn.from_number.clone(),
+                sn.allowed_numbers.clone(),
+                sn.callback_secret.clone(),
+            )))
+        }
         #[cfg(feature = "channel-email")]
         "email" => {
             let em = config
@@ -4598,7 +4616,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, voice-call"
+            sinch, email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, \
+            voice-call"
         ),
     }
 }
@@ -4948,6 +4967,25 @@ fn collect_configured_channels(
             });
         } else {
             tracing::info!("Linq channel configured but disabled (enabled = false)");
+        }
+    }
+
+    #[cfg(feature = "channel-sinch")]
+    if let Some(ref sn) = config.channels.sinch {
+        if sn.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Sinch",
+                channel: Arc::new(SinchChannel::new(
+                    sn.service_plan_id.clone(),
+                    sn.api_token.clone(),
+                    sn.region.clone(),
+                    sn.from_number.clone(),
+                    sn.allowed_numbers.clone(),
+                    sn.callback_secret.clone(),
+                )),
+            });
+        } else {
+            tracing::info!("Sinch channel configured but disabled (enabled = false)");
         }
     }
 
