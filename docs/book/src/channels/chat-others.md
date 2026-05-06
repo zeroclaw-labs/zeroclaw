@@ -148,6 +148,31 @@ databases = ["..."]                # DB IDs the agent can write to
 
 Treats a Notion database as a message surface. Useful for asynchronous workflows where the "channel" is a task inbox.
 
+## Zulip
+
+```toml
+[channels.zulip]
+enabled = true
+server_url = "https://yourorg.zulipchat.com"   # or self-hosted https://chat.example.com
+bot_email = "agent-bot@yourorg.zulipchat.com"  # bot account email
+api_key = "xxxxxxxxxxxxxxxxxxxxxxxx"           # SECRET — bot API key from PSelf settings
+allowed_users = ["alice@example.com"]          # `*` allows anyone; case-insensitive
+streams = ["Engineering", "general"]           # streams the bot is subscribed to
+default_topic = "agent"                         # used when sending to a stream without explicit topic
+event_timeout_secs = 60                         # long-poll timeout (default 60s)
+```
+
+- **Auth model:** bot account email + API key, sent as HTTP Basic auth on every request. Mint via **Personal settings → Bots → Add a new bot**, then copy both the bot email and the API key shown in the dialog.
+- **Bot subscription:** the bot **must be subscribed** to each stream listed in `streams`. v1 does not auto-subscribe — handle it once in the Zulip web UI when you add the bot. If `streams` is empty, the channel narrows to private-message events only.
+- **Inbound (long-poll Events API):** `POST {server}/api/v1/register` mints a queue, then `GET {server}/api/v1/events?queue_id=…&last_event_id=…` blocks for up to `event_timeout_secs`. The cursor advances on every successful poll; `BAD_EVENT_QUEUE_ID` triggers a re-register. Filters drop the bot's own posts, anything outside `allowed_users`, edits, and unsupported message types.
+- **Outbound recipient encoding:** the agent's runtime sets this automatically when responding, but for manual `zeroclaw channel send zulip <recipient> "hi"`:
+  - `stream:Stream Name` — sends to a stream. Topic comes from `--thread` if set, otherwise `default_topic`.
+  - `stream:Stream Name/Topic` — explicit topic in the recipient.
+  - `private:user@example.com,user2@example.com` — DM (multi-party supported).
+  - Bare email — DM shorthand.
+- **Self-hosted TLS:** common in self-hosted installs. The default `reqwest` client honours system trust roots; private CAs need to be installed at the OS level.
+- **Out of scope (v1):** rich Zulip markdown features (mentions parsing, code-block hints, custom emoji, math), reactions, message edits, file uploads, polls, scheduled messages, automatic stream subscription management, mention-only gating beyond the `allowed_users` allowlist, `request_approval()` integration.
+
 ---
 
 ## When to prefer a dedicated guide
