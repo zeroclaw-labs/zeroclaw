@@ -23,6 +23,7 @@ async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 directories = "6.0"
+ed25519-dalek = { version = "2", default-features = false, optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hmac = "0.12"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
@@ -81,8 +82,8 @@ default = [
     "channel-discord", "channel-slack", "channel-signal", "channel-mattermost",
     "channel-irc", "channel-imessage", "channel-dingtalk", "channel-qq",
     "channel-bluesky", "channel-twitter", "channel-reddit", "channel-notion",
-    "channel-linq", "channel-wati", "channel-nextcloud", "channel-mochat",
-    "channel-wecom", "channel-clawdtalk", "channel-webhook",
+    "channel-linq", "channel-telnyx", "channel-wati", "channel-nextcloud",
+    "channel-mochat", "channel-wecom", "channel-clawdtalk", "channel-webhook",
     "channel-whatsapp-cloud", "channel-voice-call",
 ]
 # Channels with optional deps
@@ -106,6 +107,7 @@ channel-twitter = []
 channel-reddit = []
 channel-notion = []
 channel-linq = []
+channel-telnyx = ["dep:ed25519-dalek"]
 channel-wati = []
 channel-nextcloud = []
 channel-mochat = []

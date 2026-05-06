@@ -70,6 +70,8 @@ pub use crate::link_enricher;
 pub use crate::matrix::MatrixChannel;
 #[cfg(feature = "channel-telegram")]
 pub use crate::telegram::TelegramChannel;
+#[cfg(feature = "channel-telnyx")]
+pub use crate::telnyx::TelnyxChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use crate::whatsapp_web::WhatsAppWebChannel;
 pub use zeroclaw_infra::debounce::MessageDebouncer;
@@ -4476,6 +4478,24 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 lq.allowed_senders.clone(),
             )))
         }
+        #[cfg(feature = "channel-telnyx")]
+        "telnyx" => {
+            let tx = config
+                .channels
+                .telnyx
+                .as_ref()
+                .context("Telnyx channel is not configured")?;
+            Ok(Arc::new(
+                TelnyxChannel::new(
+                    tx.api_key.clone(),
+                    tx.from_number.clone(),
+                    tx.messaging_profile_id.clone(),
+                    tx.allowed_numbers.clone(),
+                    &tx.public_key,
+                )
+                .context("Failed to construct Telnyx channel (check public_key)")?,
+            ))
+        }
         #[cfg(feature = "channel-email")]
         "email" => {
             let em = config
@@ -4598,7 +4618,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, voice-call"
+            telnyx, email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, \
+            voice-call"
         ),
     }
 }
@@ -4948,6 +4969,34 @@ fn collect_configured_channels(
             });
         } else {
             tracing::info!("Linq channel configured but disabled (enabled = false)");
+        }
+    }
+
+    #[cfg(feature = "channel-telnyx")]
+    if let Some(ref tx) = config.channels.telnyx {
+        if tx.enabled {
+            match TelnyxChannel::new(
+                tx.api_key.clone(),
+                tx.from_number.clone(),
+                tx.messaging_profile_id.clone(),
+                tx.allowed_numbers.clone(),
+                &tx.public_key,
+            ) {
+                Ok(telnyx) => {
+                    channels.push(ConfiguredChannel {
+                        display_name: "Telnyx",
+                        channel: Arc::new(telnyx),
+                    });
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Telnyx channel construction failed (check public_key): {e:#}. \
+                         Skipping Telnyx — fix the config and reload."
+                    );
+                }
+            }
+        } else {
+            tracing::info!("Telnyx channel configured but disabled (enabled = false)");
         }
     }
 

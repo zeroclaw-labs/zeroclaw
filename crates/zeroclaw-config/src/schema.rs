@@ -6773,6 +6773,11 @@ pub struct ChannelsConfig {
     #[display_name = "Linq"]
     #[description = "Linq Partner API for iMessage/RCS/SMS"]
     pub linq: Option<LinqConfig>,
+    /// Telnyx SMS channel configuration.
+    #[nested]
+    #[display_name = "Telnyx SMS"]
+    #[description = "Telnyx programmable SMS (Ed25519 signed)"]
+    pub telnyx: Option<TelnyxConfig>,
     /// WATI WhatsApp Business API channel configuration.
     #[nested]
     #[display_name = "WATI"]
@@ -6987,6 +6992,10 @@ impl ChannelsConfig {
                 self.linq.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.telnyx.as_ref())),
+                self.telnyx.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.wati.as_ref())),
                 self.wati.is_some(),
             ),
@@ -7092,6 +7101,7 @@ impl Default for ChannelsConfig {
             signal: None,
             whatsapp: None,
             linq: None,
+            telnyx: None,
             wati: None,
             nextcloud_talk: None,
             email: None,
@@ -7790,6 +7800,66 @@ impl ChannelConfig for LinqConfig {
     }
     fn desc() -> &'static str {
         "iMessage/RCS/SMS via Linq API"
+    }
+}
+
+/// Telnyx SMS channel configuration.
+///
+/// Inbound SMS arrives via the gateway at the hardcoded path `/telnyx/sms`.
+/// The operator must point Telnyx's webhook URL at
+/// `https://{public-gateway-url}/telnyx/sms` — usually behind one of the
+/// configured `[tunnel]` providers (Cloudflare Tunnel, Tailscale Funnel,
+/// ngrok, Pinggy, or a custom command).
+///
+/// Telnyx uses **two distinct credentials**, copied separately from the
+/// portal:
+/// * `api_key` — V2 API key sent as `Authorization: Bearer ...` for outbound
+///   calls. Treated as a secret.
+/// * `public_key` — base64-encoded Ed25519 public key, used to verify the
+///   `telnyx-signature-ed25519` header on inbound webhooks. Public; rotated
+///   in the Telnyx portal — operators must update this value here whenever
+///   Telnyx rotates the key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.telnyx"]
+pub struct TelnyxConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Telnyx V2 API key. Sent as the HTTP `Authorization: Bearer ...`
+    /// credential on every outbound REST call.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: String,
+    /// Phone number to send from, in E.164 format (e.g. `"+15555550100"`).
+    /// Must be a number provisioned in your Telnyx account.
+    pub from_number: String,
+    /// Optional Telnyx Messaging Profile ID. When set, outbound messages
+    /// are sent through the named profile instead of the bare `from_number`.
+    /// Useful for organisations that use Messaging Profiles for routing,
+    /// rate-limit, or compliance settings.
+    #[serde(default)]
+    pub messaging_profile_id: Option<String>,
+    /// Allowed sender numbers in E.164 format (e.g. `"+15555550199"`). Empty
+    /// list = deny all. `"*"` allows everyone (use with care; this is a
+    /// public PSTN endpoint).
+    #[serde(default)]
+    pub allowed_numbers: Vec<String>,
+    /// Base64-encoded Ed25519 public key used to verify inbound webhook
+    /// signatures. Distinct from `api_key` — copied from a different page
+    /// in the Telnyx portal. **Update this whenever Telnyx rotates the
+    /// signing key**, otherwise inbound webhooks will start failing
+    /// signature verification.
+    #[serde(default)]
+    pub public_key: String,
+}
+
+impl ChannelConfig for TelnyxConfig {
+    fn name() -> &'static str {
+        "Telnyx"
+    }
+    fn desc() -> &'static str {
+        "SMS via Telnyx Programmable Messaging"
     }
 }
 
@@ -12526,6 +12596,7 @@ auto_save = true
                 signal: None,
                 whatsapp: None,
                 linq: None,
+                telnyx: None,
                 wati: None,
                 nextcloud_talk: None,
                 email: None,
@@ -13700,6 +13771,7 @@ allowed_users = ["@u:matrix.org"]
             signal: None,
             whatsapp: None,
             linq: None,
+            telnyx: None,
             wati: None,
             nextcloud_talk: None,
             email: None,
@@ -14082,6 +14154,7 @@ bot_token = "xoxb-tok"
                 approval_timeout_secs: 300,
             }),
             linq: None,
+            telnyx: None,
             wati: None,
             nextcloud_talk: None,
             email: None,
