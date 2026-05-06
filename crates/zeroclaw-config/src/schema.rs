@@ -3428,6 +3428,217 @@ pub struct PiperTtsProviderConfig {
     pub base: TtsProviderConfig,
 }
 
+// ── Transcription providers (typed-family split, mirrors models/tts) ────
+//
+// Six family slots: `groq`, `openai`, `deepgram`, `assemblyai`, `google`,
+// `local_whisper`. Each is a `HashMap<String, *TranscriptionProviderConfig>`
+// keyed by operator-chosen alias. The shared `TranscriptionProviderConfig`
+// base carries `api_key` + `language` since every cloud STT family takes
+// both; `local_whisper` skips the base because it's a self-hosted endpoint
+// with its own auth token, not a vendor API key.
+
+/// Shared base for cloud transcription providers. Each cloud family
+/// composes this via `#[serde(flatten)] base: TranscriptionProviderConfig`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription"]
+pub struct TranscriptionProviderConfig {
+    /// API key for the transcription provider.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: Option<String>,
+    /// Optional language hint passed to the provider (ISO-639-1 like `"en"` /
+    /// `"ru"`, or BCP-47 like `"en-US"` for Google). Most providers auto-detect
+    /// when this is unset.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Whisper-style initial prompt to bias the model toward expected
+    /// vocabulary (proper nouns, technical terms). Provider-specific support;
+    /// silently ignored where not applicable.
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
+}
+
+/// Trait that every transcription endpoint enum implements. Mirrors
+/// `ModelEndpoint` / `TtsEndpoint` for parity.
+pub trait TranscriptionEndpoint {
+    fn uri(&self) -> &'static str;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GroqTranscriptionEndpoint {
+    #[default]
+    Default,
+}
+impl TranscriptionEndpoint for GroqTranscriptionEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.groq.com/openai/v1/audio/transcriptions",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription.groq"]
+pub struct GroqTranscriptionProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TranscriptionProviderConfig,
+    /// Whisper model name (default: `"whisper-large-v3-turbo"`).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiTranscriptionEndpoint {
+    #[default]
+    Default,
+}
+impl TranscriptionEndpoint for OpenAiTranscriptionEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.openai.com/v1/audio/transcriptions",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription.openai"]
+pub struct OpenAiTranscriptionProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TranscriptionProviderConfig,
+    /// Whisper model name (default: `"whisper-1"`).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DeepgramTranscriptionEndpoint {
+    #[default]
+    Default,
+}
+impl TranscriptionEndpoint for DeepgramTranscriptionEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.deepgram.com/v1/listen",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription.deepgram"]
+pub struct DeepgramTranscriptionProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TranscriptionProviderConfig,
+    /// Deepgram model name (default: `"nova-2"`).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AssemblyAiTranscriptionEndpoint {
+    #[default]
+    Default,
+}
+impl TranscriptionEndpoint for AssemblyAiTranscriptionEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.assemblyai.com/v2/transcript",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription.assemblyai"]
+pub struct AssemblyAiTranscriptionProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TranscriptionProviderConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GoogleTranscriptionEndpoint {
+    #[default]
+    Default,
+}
+impl TranscriptionEndpoint for GoogleTranscriptionEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://speech.googleapis.com/v1/speech:recognize",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription.google"]
+pub struct GoogleTranscriptionProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TranscriptionProviderConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LocalWhisperTranscriptionEndpoint {
+    /// Self-hosted endpoint — no remote URL. Sentinel for trait conformity.
+    /// The actual URL lives on `LocalWhisperTranscriptionProviderConfig.uri`.
+    #[default]
+    SelfHosted,
+}
+impl TranscriptionEndpoint for LocalWhisperTranscriptionEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::SelfHosted => "self-hosted",
+        }
+    }
+}
+
+/// Local / self-hosted Whisper-compatible transcription endpoint. Skips the
+/// shared `TranscriptionProviderConfig` base because it uses a bearer-token
+/// scheme and a per-instance URL rather than a vendor API key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription.local_whisper"]
+pub struct LocalWhisperTranscriptionProviderConfig {
+    /// Endpoint URL, e.g. `"http://10.10.0.1:8001/v1/transcribe"`.
+    pub uri: String,
+    /// Bearer token for endpoint authentication. Omit for unauthenticated
+    /// local endpoints.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub bearer_token: Option<String>,
+    /// Optional language hint (passed through to the local endpoint).
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Maximum audio file size in bytes accepted by this endpoint.
+    /// Defaults to 25 MB to match the cloud cap; raise as needed.
+    #[serde(default = "default_local_whisper_max_audio_bytes")]
+    pub max_audio_bytes: usize,
+    /// Request timeout in seconds.
+    #[serde(default = "default_local_whisper_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
 /// Determines when a `ToolFilterGroup` is active.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]

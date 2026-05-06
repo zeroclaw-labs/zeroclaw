@@ -27,6 +27,11 @@ use super::schema::{
     YiModelProviderConfig, ZaiModelProviderConfig,
 };
 use super::schema::{
+    AssemblyAiTranscriptionProviderConfig, DeepgramTranscriptionProviderConfig,
+    GoogleTranscriptionProviderConfig, GroqTranscriptionProviderConfig,
+    LocalWhisperTranscriptionProviderConfig, OpenAiTranscriptionProviderConfig,
+};
+use super::schema::{
     EdgeTtsProviderConfig, ElevenLabsTtsProviderConfig, GoogleTtsProviderConfig,
     OpenAITtsProviderConfig, PiperTtsProviderConfig, TtsProviderConfig as TtsBaseConfig,
 };
@@ -383,7 +388,71 @@ impl TtsProviders {
     }
 }
 
-/// Top-level `[model_providers]` section. Wraps model model_provider profiles and routing rules.
+/// Typed transcription-provider container — one slot per STT family.
+/// Mirrors `ModelProviders` / `TtsProviders`. Closed set of 6 families:
+/// groq, openai, deepgram, assemblyai, google, local_whisper.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription"]
+pub struct TranscriptionProviders {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub groq: HashMap<String, GroqTranscriptionProviderConfig>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub openai: HashMap<String, OpenAiTranscriptionProviderConfig>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub deepgram: HashMap<String, DeepgramTranscriptionProviderConfig>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub assemblyai: HashMap<String, AssemblyAiTranscriptionProviderConfig>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub google: HashMap<String, GoogleTranscriptionProviderConfig>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub local_whisper: HashMap<String, LocalWhisperTranscriptionProviderConfig>,
+}
+
+impl TranscriptionProviders {
+    /// True when no slot has any entry.
+    pub fn is_empty(&self) -> bool {
+        self.groq.is_empty()
+            && self.openai.is_empty()
+            && self.deepgram.is_empty()
+            && self.assemblyai.is_empty()
+            && self.google.is_empty()
+            && self.local_whisper.is_empty()
+    }
+
+    /// Iterate every configured (family, alias) pair across all six slots.
+    pub fn iter_aliases(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        let mut out: Vec<(&'static str, &str)> = Vec::new();
+        for k in self.groq.keys() {
+            out.push(("groq", k.as_str()));
+        }
+        for k in self.openai.keys() {
+            out.push(("openai", k.as_str()));
+        }
+        for k in self.deepgram.keys() {
+            out.push(("deepgram", k.as_str()));
+        }
+        for k in self.assemblyai.keys() {
+            out.push(("assemblyai", k.as_str()));
+        }
+        for k in self.google.keys() {
+            out.push(("google", k.as_str()));
+        }
+        for k in self.local_whisper.keys() {
+            out.push(("local_whisper", k.as_str()));
+        }
+        out.into_iter()
+    }
+}
+
+/// Top-level `[providers]` section. Wraps model provider, TTS provider,
+/// transcription provider profiles and routing rules.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "model_providers"]
@@ -396,15 +465,27 @@ pub struct ProvidersConfig {
     #[nested]
     pub models: ModelProviders,
 
-    /// Named TTS model_provider profiles: outer key = model_provider type, inner key = user alias.
-    /// V3 shape: `[providers.tts.<type>.<alias>]` e.g. `[providers.tts.openai.default]`.
+    /// Named TTS provider profiles: outer key = provider family, inner key = user alias.
+    /// V3 shape: `[providers.tts.<type>.<alias>]` e.g. `[providers.tts.openai.<alias>]`.
     /// Mirrors `models` with the typed-family split: each TTS family has its
     /// own slot carrying its `*TtsEndpoint` enum.
     #[serde(default)]
     #[nested]
     pub tts: TtsProviders,
 
-    /// Model routing rules — route `hint:<name>` to specific model_provider+model combos.
+    /// Named transcription / STT provider profiles: outer key = provider family,
+    /// inner key = user alias. V3 shape:
+    /// `[providers.transcription.<type>.<alias>]` e.g.
+    /// `[providers.transcription.groq.<alias>]`. Six family slots: `groq`,
+    /// `openai`, `deepgram`, `assemblyai`, `google`, `local_whisper`.
+    /// Mirrors `models` and `tts`. Per-agent reference via
+    /// `agent.transcription_provider = "groq.<alias>"` (resolved at validation
+    /// time against this section's configured aliases).
+    #[serde(default)]
+    #[nested]
+    pub transcription: TranscriptionProviders,
+
+    /// Model routing rules — route `hint:<name>` to specific model provider + model combos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_routes: Vec<ModelRouteConfig>,
 
