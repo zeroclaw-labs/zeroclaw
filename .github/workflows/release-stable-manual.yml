@@ -258,7 +258,7 @@ jobs:
         with:
           prefix-key: ${{ matrix.os }}-${{ matrix.target }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: web-dist
           path: web/dist/
@@ -271,7 +271,7 @@ jobs:
 
       - name: Install cross (MUSL targets)
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+        run: cargo install cross --version 0.2.5 --locked
 
       - name: Setup Android NDK
         if: matrix.ndk
