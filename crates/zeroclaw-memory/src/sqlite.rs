@@ -158,7 +158,76 @@ impl SqliteMemory {
 
     /// Initialize all tables: memories, FTS5, `embedding_cache`
     fn init_schema(conn: &Connection) -> anyhow::Result<()> {
-        conn.execute_batch(
+        fn is_db_locked_error(e: &rusqlite::Error) -> bool {
+            use rusqlite::ffi::ErrorCode;
+            matches!(
+                e,
+                rusqlite::Error::SqliteFailure(err, _)
+                    if matches!(err.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            )
+        }
+
+        fn execute_batch_retry(conn: &Connection, sql: &str) -> Result<(), rusqlite::Error> {
+            // SQLite can return "database is locked" during concurrent schema
+            // initialization even though the operations are safe/idempotent.
+            // Retry briefly instead of failing startup.
+            let mut backoff = Duration::from_millis(10);
+            let max_backoff = Duration::from_millis(250);
+            let max_attempts: usize = 24; // Worst-case sleep is ~4.8s.
+
+            for attempt in 1..=max_attempts {
+                match conn.execute_batch(sql) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if is_db_locked_error(&e) && attempt < max_attempts => {
+                        std::thread::sleep(backoff);
+                        backoff = (backoff * 2).min(max_backoff);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // Unreachable due to early-return above, but keep control-flow explicit.
+            Ok(())
+        }
+
+        fn memories_has_column(conn: &Connection, name: &str) -> anyhow::Result<bool> {
+            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let col_name: String = row.get(1)?;
+                if col_name == name {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        fn is_duplicate_column_error(e: &rusqlite::Error) -> bool {
+            matches!(
+                e,
+                rusqlite::Error::SqliteFailure(_, Some(msg)) if msg.contains("duplicate column name")
+            )
+        }
+
+        fn add_memories_column_if_missing(
+            conn: &Connection,
+            name: &str,
+            alter_sql: &str,
+        ) -> anyhow::Result<()> {
+            if memories_has_column(conn, name)? {
+                return Ok(());
+            }
+
+            match execute_batch_retry(conn, alter_sql) {
+                Ok(()) => Ok(()),
+                Err(e) if is_duplicate_column_error(&e) => Ok(()),
+                Err(e) => Err(e)
+                    .with_context(|| format!("SQLite migration failed adding memories.{name}")),
+            }
+        }
+
+        execute_batch_retry(
+            conn,
             "-- Core memories table
             CREATE TABLE IF NOT EXISTS memories (
                 id          TEXT PRIMARY KEY,
@@ -201,37 +270,46 @@ impl SqliteMemory {
                 accessed_at  TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE base schema")?;
+
+        add_memories_column_if_missing(
+            conn,
+            "session_id",
+            "ALTER TABLE memories ADD COLUMN session_id TEXT;",
+        )?;
+        if memories_has_column(conn, "session_id")? {
+            execute_batch_retry(
+                conn,
+                "CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);",
+            )
+            .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_session")?;
+        }
+
+        add_memories_column_if_missing(
+            conn,
+            "namespace",
+            "ALTER TABLE memories ADD COLUMN namespace TEXT DEFAULT 'default';",
+        )?;
+        if memories_has_column(conn, "namespace")? {
+            execute_batch_retry(
+                conn,
+                "CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);",
+            )
+            .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_namespace")?;
+        }
+
+        add_memories_column_if_missing(
+            conn,
+            "importance",
+            "ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 0.5;",
         )?;
 
-        // Migration: add session_id column if not present (safe to run repeatedly)
-        let schema_sql: String = conn
-            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'")?
-            .query_row([], |row| row.get::<_, String>(0))?;
-
-        if !schema_sql.contains("session_id") {
-            conn.execute_batch(
-                "ALTER TABLE memories ADD COLUMN session_id TEXT;
-                 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);",
-            )?;
-        }
-
-        // Migration: add namespace column
-        if !schema_sql.contains("namespace") {
-            conn.execute_batch(
-                "ALTER TABLE memories ADD COLUMN namespace TEXT DEFAULT 'default';
-                 CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);",
-            )?;
-        }
-
-        // Migration: add importance column
-        if !schema_sql.contains("importance") {
-            conn.execute_batch("ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 0.5;")?;
-        }
-
-        // Migration: add superseded_by column
-        if !schema_sql.contains("superseded_by") {
-            conn.execute_batch("ALTER TABLE memories ADD COLUMN superseded_by TEXT;")?;
-        }
+        add_memories_column_if_missing(
+            conn,
+            "superseded_by",
+            "ALTER TABLE memories ADD COLUMN superseded_by TEXT;",
+        )?;
 
         Ok(())
     }
@@ -2522,6 +2600,61 @@ mod tests {
             assert_eq!(results[0].key, "k1");
             assert_eq!(results[0].session_id.as_deref(), Some("sess-x"));
         }
+    }
+
+    #[tokio::test]
+    async fn schema_migration_tolerates_concurrent_initialization() {
+        let tmp = TempDir::new().unwrap();
+
+        // Seed an "old" DB that is missing the newer columns, so migrations have
+        // real work to do when multiple initializers race.
+        let db_path = tmp.path().join("memory").join("brain.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS memories (
+                    id          TEXT PRIMARY KEY,
+                    key         TEXT NOT NULL UNIQUE,
+                    content     TEXT NOT NULL,
+                    category    TEXT NOT NULL DEFAULT 'core',
+                    embedding   BLOB,
+                    created_at  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        }
+
+        let workers = 12usize;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let dir = tmp.path().to_path_buf();
+            let barrier = barrier.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                SqliteMemory::new(&dir)
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        // Ensure all expected columns exist after the concurrent migration.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(memories)").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut cols = std::collections::HashSet::<String>::new();
+        while let Some(row) = rows.next().unwrap() {
+            cols.insert(row.get::<_, String>(1).unwrap());
+        }
+
+        assert!(cols.contains("session_id"));
+        assert!(cols.contains("namespace"));
+        assert!(cols.contains("importance"));
+        assert!(cols.contains("superseded_by"));
     }
 
     // ── §4.1 Concurrent write contention tests ──────────────
