@@ -51,6 +51,8 @@ pub use crate::signal::SignalChannel;
 pub use crate::slack::SlackChannel;
 pub use crate::transcription;
 pub use crate::tts::{TtsManager, TtsProvider};
+#[cfg(feature = "channel-twitch")]
+pub use crate::twitch::TwitchChannel;
 pub use crate::twitter::TwitterChannel;
 #[cfg(feature = "channel-voice-call")]
 pub use crate::voice_call::VoiceCallChannel;
@@ -4514,6 +4516,21 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 mention_only: irc_cfg.mention_only,
             })))
         }
+        #[cfg(feature = "channel-twitch")]
+        "twitch" => {
+            let tw = config
+                .channels
+                .twitch
+                .as_ref()
+                .context("Twitch channel is not configured")?;
+            Ok(Arc::new(TwitchChannel::new(
+                tw.bot_username.clone(),
+                tw.oauth_token.clone(),
+                tw.channels.clone(),
+                tw.allowed_users.clone(),
+                tw.mention_only,
+            )))
+        }
         "twitter" => {
             let tw = config
                 .channels
@@ -5031,6 +5048,22 @@ fn collect_configured_channels(
         } else {
             tracing::info!("IRC channel configured but disabled (enabled = false)");
         }
+    }
+
+    #[cfg(feature = "channel-twitch")]
+    if let Some(ref tw) = config.channels.twitch
+        && tw.enabled
+    {
+        channels.push(ConfiguredChannel {
+            display_name: "Twitch",
+            channel: Arc::new(TwitchChannel::new(
+                tw.bot_username.clone(),
+                tw.oauth_token.clone(),
+                tw.channels.clone(),
+                tw.allowed_users.clone(),
+                tw.mention_only,
+            )),
+        });
     }
 
     #[cfg(feature = "channel-lark")]

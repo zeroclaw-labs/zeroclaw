@@ -128,6 +128,25 @@ nickserv_password = "..."          # optional
 
 Classic IRC. Supports SASL, NickServ auth, and multiple channels.
 
+## Twitch chat
+
+```toml
+[channels.twitch]
+enabled = true
+bot_username = "mybot"                # Twitch login of the bot account
+oauth_token = "oauth:xxxxxxxxxxxx"    # SECRET — `oauth:` prefix added automatically if missing
+channels = ["#mychannel", "anotherchannel"]   # `#` prefix added if missing; entries are lowercased
+allowed_users = ["streamer", "moderator"]      # `*` allows anyone
+mention_only = false                  # respond only when @-mentioned
+```
+
+- **Auth model:** Twitch chat is IRC-compatible. The OAuth token is sent as `PASS oauth:{token}` against `irc.chat.twitch.tv:6697` (TLS). Mint the token at <https://twitchapps.com/tmi/> for one-click setup, or via the Twitch CLI Device Code Flow if you need scope control.
+- **Internals:** thin wrapper over the existing IRC channel (`channel-twitch` feature depends on `channel-irc`). All IRC-side logic — connect/reconnect, message splitting, nick collision handling — is shared with the plain IRC channel. The only differences are Twitch-specific defaults (server host, port, OAuth-style PASS, no SASL).
+- **Channel name normalization:** Twitch channel names are case-insensitive Twitch logins; the adapter auto-prefixes `#` and lowercases each entry. Empty entries (e.g. trailing commas) are dropped.
+- **Inbound:** every message in a joined channel arrives with `channel = "twitch"` so routing/auditing distinguishes it from plain IRC. The standard `allowed_users` allowlist applies (case-insensitive Twitch logins; `"*"` wildcard).
+- **Outbound:** plain `PRIVMSG #channel :body`. Long messages are split by the IRC channel's existing chunker.
+- **Out of scope (v1):** IRCv3 message tags (badges, color, msg-id, sub status), whispers (deprecated by Twitch over IRC; modern whispers use the Helix API), Twitch-specific commands (`/timeout`, `/ban`, `/announce`, `/raid`), subscription/bits/channel-points event handling, `request_approval()`. Defer to follow-up issues once we know what operators actually need.
+
 ## Mochat
 
 ```toml
