@@ -116,6 +116,7 @@
 
 - `SessionResetTool` and `SessionDeleteTool` for in-agent session management (#5696).
 - `SessionsCurrentTool` exposes the active session identity (#6033).
+- `eight_sleep` tool — unofficial 8Sleep cloud API client (auth + read bed state, read sleep metrics, set per-side heating level), gated by `allowed_sides` allowlist; alarms and prime-cycle deferred to follow-ups (#6450).
 
 ### Plugins
 
