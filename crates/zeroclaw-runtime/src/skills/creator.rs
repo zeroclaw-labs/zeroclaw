@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use zeroclaw_config::schema::SkillCreationConfig;
 use zeroclaw_memory::embeddings::EmbeddingProvider;
 use zeroclaw_memory::vector::cosine_similarity;
+use zeroclaw_providers::Provider;
 
 /// A record of a single tool call executed during a task.
 #[derive(Debug, Clone)]
@@ -32,6 +33,11 @@ impl SkillCreator {
     }
 
     /// Attempt to create a skill from a successful multi-step task execution.
+    ///
+    /// When `reflection_enabled` is set and `reflection_llm` is `Some(provider, model, final_answer)`,
+    /// runs an LLM to produce Hermes-style `SKILL.md` (optional **evolver** pass), then optionally
+    /// still writes serialized `SKILL.toml` for tool compatibility.
+    ///
     /// Returns `Ok(Some(slug))` if a skill was created, `Ok(None)` if skipped
     /// (disabled, duplicate, or insufficient tool calls).
     pub async fn create_from_execution(
@@ -39,12 +45,13 @@ impl SkillCreator {
         task_description: &str,
         tool_calls: &[ToolCallRecord],
         embedding_provider: Option<&dyn EmbeddingProvider>,
+        reflection_llm: Option<(&dyn Provider, &str, &str)>,
     ) -> Result<Option<String>> {
         if !self.config.enabled {
             return Ok(None);
         }
 
-        if tool_calls.len() < 2 {
+        if tool_calls.len() < self.config.min_tool_calls {
             return Ok(None);
         }
 
@@ -65,6 +72,53 @@ impl SkillCreator {
         self.enforce_lru_limit().await?;
 
         let skill_dir = self.skills_dir().join(&slug);
+
+        if self.config.reflection_enabled {
+            if let Some((provider, model, final_answer)) = reflection_llm {
+                match crate::skills::skill_reflection::reflect_skill_markdown(
+                    provider,
+                    model,
+                    self.config.reflection_temperature,
+                    self.config.evolver_enabled,
+                    &slug,
+                    task_description,
+                    tool_calls,
+                    final_answer,
+                )
+                .await
+                {
+                    Ok(md) => {
+                        crate::skills::skill_reflection::write_skill_md_atomic(&skill_dir, &md)
+                            .await
+                            .with_context(|| {
+                                format!("write reflective SKILL.md under {}", skill_dir.display())
+                            })?;
+                        if self.config.also_write_serialized_toml {
+                            let toml_content =
+                                Self::generate_skill_toml(&slug, task_description, tool_calls);
+                            let toml_path = skill_dir.join("SKILL.toml");
+                            tokio::fs::write(&toml_path, toml_content.as_bytes())
+                                .await
+                                .with_context(|| {
+                                    format!("Failed to write {}", toml_path.display())
+                                })?;
+                        }
+                        tracing::info!(slug, "Auto-created reflective SKILL.md from execution");
+                        return Ok(Some(slug));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Skill reflection failed, falling back to serialized SKILL.toml: {e:#}"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    "skill_creation.reflection_enabled but no LLM context in this path — using serialized TOML only"
+                );
+            }
+        }
+
         tokio::fs::create_dir_all(&skill_dir)
             .await
             .with_context(|| {
@@ -187,13 +241,18 @@ impl SkillCreator {
         let mut entries = tokio::fs::read_dir(&skills_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let toml_path = entry.path().join("SKILL.toml");
-            if !toml_path.exists() {
-                continue;
-            }
+            let md_path = entry.path().join("SKILL.md");
+            let desc_opt = if toml_path.exists() {
+                let content = tokio::fs::read_to_string(&toml_path).await?;
+                extract_description_from_toml(&content)
+            } else if md_path.exists() {
+                let content = tokio::fs::read_to_string(&md_path).await?;
+                extract_description_from_skill_md(&content)
+            } else {
+                None
+            };
 
-            let content = tokio::fs::read_to_string(&toml_path).await?;
-            // Extract description from the TOML to compare.
-            if let Some(desc) = extract_description_from_toml(&content) {
+            if let Some(desc) = desc_opt {
                 let existing_embedding = embedding_provider.embed_one(&desc).await?;
                 if !existing_embedding.is_empty() {
                     #[allow(clippy::cast_possible_truncation)]
@@ -221,13 +280,24 @@ impl SkillCreator {
         let mut entries = tokio::fs::read_dir(&skills_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let toml_path = entry.path().join("SKILL.toml");
-            if !toml_path.exists() {
+            let md_path = entry.path().join("SKILL.md");
+            let (path_for_mtime, is_auto) = if toml_path.exists() {
+                let content = tokio::fs::read_to_string(&toml_path).await?;
+                let auto =
+                    content.contains("\"zeroclaw-auto\"") || content.contains("\"auto-generated\"");
+                (toml_path, auto)
+            } else if md_path.exists() {
+                let content = tokio::fs::read_to_string(&md_path).await?;
+                let auto = content.contains("zeroclaw-auto")
+                    && (content.contains("zeroclaw-reflection")
+                        || content.contains("auto-generated"));
+                (md_path, auto)
+            } else {
                 continue;
-            }
+            };
 
-            let content = tokio::fs::read_to_string(&toml_path).await?;
-            if content.contains("\"zeroclaw-auto\"") || content.contains("\"auto-generated\"") {
-                let modified = tokio::fs::metadata(&toml_path)
+            if is_auto {
+                let modified = tokio::fs::metadata(&path_for_mtime)
                     .await?
                     .modified()
                     .unwrap_or(std::time::UNIX_EPOCH);
@@ -282,6 +352,32 @@ fn extract_description_from_toml(content: &str) -> Option<String> {
     toml::from_str::<Partial>(content)
         .ok()
         .and_then(|p| p.skill.description)
+}
+
+/// Best-effort `description` from YAML frontmatter in `SKILL.md`.
+fn extract_description_from_skill_md(content: &str) -> Option<String> {
+    let rest = content.trim_start().strip_prefix("---")?;
+    let end = rest.find("\n---")?;
+    let fm = &rest[..end];
+    for line in fm.lines() {
+        let line = line.trim();
+        let Some(desc) = line.strip_prefix("description:") else {
+            continue;
+        };
+        let d = desc.trim();
+        let d = d
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(d);
+        let d = d
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+            .unwrap_or(d);
+        if !d.is_empty() {
+            return Some(d.to_string());
+        }
+    }
+    None
 }
 
 /// Extract `ToolCallRecord`s from the agent conversation history.
@@ -373,7 +469,10 @@ pub fn extract_tool_calls_from_history(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_memory::embeddings::{EmbeddingProvider, NoopEmbedding};
+    use zeroclaw_providers::Provider;
 
     // ── Slug generation ──────────────────────────────────────────
 
@@ -549,6 +648,21 @@ version = "0.1.0"
         assert_eq!(extract_description_from_toml("not valid toml {{"), None);
     }
 
+    #[test]
+    fn extract_description_from_skill_md_frontmatter() {
+        let md = r#"---
+name: x
+description: "Hello skill"
+author: zeroclaw-auto
+---
+# Body
+"#;
+        assert_eq!(
+            super::extract_description_from_skill_md(md),
+            Some("Hello skill".into())
+        );
+    }
+
     // ── Deduplication ────────────────────────────────────────────
 
     /// A mock embedding provider that returns deterministic embeddings.
@@ -625,6 +739,7 @@ tags = ["auto-generated"]
             enabled: true,
             max_skills: 500,
             similarity_threshold: 0.85,
+            ..Default::default()
         };
 
         // High similarity provider -> should detect as duplicate.
@@ -657,6 +772,7 @@ tags = ["auto-generated"]
             enabled: true,
             max_skills: 2,
             similarity_threshold: 0.85,
+            ..Default::default()
         };
 
         let skills_dir = dir.path().join("skills");
@@ -712,7 +828,7 @@ tags = ["auto-generated"]
             },
         ];
         let result = creator
-            .create_from_execution("List files", &calls, None)
+            .create_from_execution("List files", &calls, None, None)
             .await
             .unwrap();
         assert!(result.is_none());
@@ -731,7 +847,7 @@ tags = ["auto-generated"]
             args: serde_json::json!({"command": "ls"}),
         }];
         let result = creator
-            .create_from_execution("List files", &calls, None)
+            .create_from_execution("List files", &calls, None, None)
             .await
             .unwrap();
         assert!(result.is_none());
@@ -744,6 +860,7 @@ tags = ["auto-generated"]
             enabled: true,
             max_skills: 500,
             similarity_threshold: 0.85,
+            ..Default::default()
         };
         let creator = SkillCreator::new(dir.path().to_path_buf(), config);
         let calls = vec![
@@ -760,7 +877,7 @@ tags = ["auto-generated"]
         // Use noop embedding (no deduplication).
         let noop = NoopEmbedding;
         let result = creator
-            .create_from_execution("Build and test", &calls, Some(&noop))
+            .create_from_execution("Build and test", &calls, Some(&noop), None)
             .await
             .unwrap();
         assert_eq!(result, Some("build-and-test".into()));
@@ -782,6 +899,7 @@ tags = ["auto-generated"]
             enabled: true,
             max_skills: 500,
             similarity_threshold: 0.85,
+            ..Default::default()
         };
 
         // First, create an existing skill.
@@ -814,7 +932,7 @@ tags = ["auto-generated"]
             },
         ];
         let result = creator
-            .create_from_execution("Build and test", &calls, Some(&provider))
+            .create_from_execution("Build and test", &calls, Some(&provider), None)
             .await
             .unwrap();
         assert!(result.is_none());
@@ -904,5 +1022,144 @@ tags = ["auto-generated"]
                     .unwrap_or_else(|e| panic!("Invalid TOML for desc '{desc}': {e}\n{toml_str}"));
             }
         }
+    }
+
+    // ── Hermes-style reflection (mock LLM) ─────────────────────────
+
+    /// Counts LLM calls; returns reflection draft then optional evolver output.
+    #[derive(Clone)]
+    struct MockReflectProvider(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Provider for MockReflectProvider {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let n = self.0.fetch_add(1, Ordering::SeqCst);
+            let evolver = system_prompt.is_some_and(|s| s.contains("You refine"));
+            if evolver {
+                return Ok(r#"---
+name: build-and-test
+description: Evolved description
+author: zeroclaw-auto
+tags: [auto-generated, zeroclaw-reflection]
+version: "0.1.0"
+---
+## Evolved
+Refined procedure.
+"#
+                .to_string());
+            }
+            assert_eq!(n, 0, "unexpected extra reflection call");
+            Ok(r#"---
+name: build-and-test
+description: Reflective skill from mock LLM
+author: zeroclaw-auto
+tags: [auto-generated, zeroclaw-reflection]
+version: "0.1.0"
+---
+## When to use
+When testing reflection.
+
+## Procedure
+1. Run shell commands.
+"#
+            .to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn create_from_execution_reflective_writes_skill_md_and_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = SkillCreationConfig {
+            enabled: true,
+            reflection_enabled: true,
+            evolver_enabled: false,
+            also_write_serialized_toml: true,
+            ..Default::default()
+        };
+        let calls = vec![
+            ToolCallRecord {
+                name: "shell".into(),
+                args: serde_json::json!({"command": "cargo build"}),
+            },
+            ToolCallRecord {
+                name: "shell".into(),
+                args: serde_json::json!({"command": "cargo test"}),
+            },
+        ];
+        let mock = MockReflectProvider(Arc::new(AtomicUsize::new(0)));
+        let creator = SkillCreator::new(dir.path().to_path_buf(), config);
+        let noop = NoopEmbedding;
+        let out = creator
+            .create_from_execution(
+                "Build and test",
+                &calls,
+                Some(&noop),
+                Some((&mock as &dyn Provider, "mock-model", "All tests passed.")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, Some("build-and-test".into()));
+        assert_eq!(mock.0.load(Ordering::SeqCst), 1);
+
+        let skill_dir = dir.path().join("skills/build-and-test");
+        let md = tokio::fs::read_to_string(skill_dir.join("SKILL.md"))
+            .await
+            .unwrap();
+        assert!(md.contains("Reflective skill from mock LLM"));
+        assert!(md.contains("zeroclaw-reflection"));
+
+        let toml = tokio::fs::read_to_string(skill_dir.join("SKILL.toml"))
+            .await
+            .unwrap();
+        assert!(toml.contains("cargo build"));
+        assert!(toml.contains("zeroclaw-auto"));
+    }
+
+    #[tokio::test]
+    async fn create_from_execution_reflective_with_evolver_second_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = SkillCreationConfig {
+            enabled: true,
+            reflection_enabled: true,
+            evolver_enabled: true,
+            also_write_serialized_toml: false,
+            ..Default::default()
+        };
+        let calls = vec![
+            ToolCallRecord {
+                name: "shell".into(),
+                args: serde_json::json!({"command": "echo hi"}),
+            },
+            ToolCallRecord {
+                name: "shell".into(),
+                args: serde_json::json!({"command": "echo bye"}),
+            },
+        ];
+        let mock = MockReflectProvider(Arc::new(AtomicUsize::new(0)));
+        let creator = SkillCreator::new(dir.path().to_path_buf(), config);
+        let noop = NoopEmbedding;
+        let out = creator
+            .create_from_execution(
+                "Build and test",
+                &calls,
+                Some(&noop),
+                Some((&mock as &dyn Provider, "mock-model", "ok")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, Some("build-and-test".into()));
+        assert_eq!(mock.0.load(Ordering::SeqCst), 2);
+
+        let md = tokio::fs::read_to_string(dir.path().join("skills/build-and-test/SKILL.md"))
+            .await
+            .unwrap();
+        assert!(md.contains("Evolved"));
+        assert!(!dir.path().join("skills/build-and-test/SKILL.toml").exists());
     }
 }

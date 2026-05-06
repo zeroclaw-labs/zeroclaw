@@ -2678,7 +2678,15 @@ pub async fn run(
                     config.workspace_dir.clone(),
                     config.skills.skill_creation.clone(),
                 );
-                match creator.create_from_execution(&msg, &tool_calls, None).await {
+                match creator
+                    .create_from_execution(
+                        &msg,
+                        &tool_calls,
+                        None,
+                        Some((&*provider, model_name.as_str(), response.as_str())),
+                    )
+                    .await
+                {
                     Ok(Some(slug)) => {
                         tracing::info!(slug, "Auto-created skill from execution");
                     }
