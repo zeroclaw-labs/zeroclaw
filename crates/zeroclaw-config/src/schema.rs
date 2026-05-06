@@ -582,6 +582,17 @@ pub trait ModelEndpoint {
     fn uri(&self) -> &'static str;
 }
 
+/// Implemented by every `*ModelProviderConfig`. Multi-region families
+/// override to return `Some(self.endpoint.uri())`; single-endpoint families
+/// inherit the `None` default. Drives `ModelProviders::resolved_endpoint_uri`,
+/// which is itself driven by the `for_each_model_provider_slot!` macro — so
+/// adding a new family without an impl is a compile error.
+pub trait FamilyEndpoint {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        None
+    }
+}
+
 /// Authentication mode for model model_provider families that support more than one
 /// (e.g. Qwen, Minimax can use API key OR OAuth). Families that only support a
 /// single auth flow simply omit this field from their config struct.
@@ -658,6 +669,15 @@ pub struct ModelProviderConfig {
     /// Or split: `pricing = { "opus.input" = 15.0, "opus.output" = 75.0 }`
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pricing: HashMap<String, f64>,
+    /// Override the provider's default for native tool calling.
+    /// `None` (default) honors the provider's built-in choice. `Some(true)`
+    /// forces native tool calls on, `Some(false)` forces text-fallback.
+    /// Currently consulted only by the Groq factory, which defaults to
+    /// text-fallback because llama-family Groq models reject native tool
+    /// calls with HTTP 400 (#5848). Setting `native_tools = true` re-enables
+    /// native tool calling for Groq models that support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_tools: Option<bool>,
 }
 
 // ── Per-family model model_provider configs ────────────────────────────
@@ -848,6 +868,12 @@ pub struct MoonshotModelProviderConfig {
     pub endpoint: MoonshotEndpoint,
 }
 
+impl FamilyEndpoint for MoonshotModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
 // ── Qwen (multi-region + auth_mode exemplar) ──
 
 /// Qwen endpoint variants. Operators pick the region matching their account.
@@ -894,6 +920,12 @@ pub struct QwenModelProviderConfig {
     /// OAuth-cache integration instead of the `api_key` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AuthMode>,
+}
+
+impl FamilyEndpoint for QwenModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
 }
 
 // ── OpenRouter ──
@@ -1482,13 +1514,17 @@ pub struct FriendliModelProviderConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum StepfunEndpoint {
+    /// Mainland China endpoint.
+    Cn,
+    /// International endpoint.
     #[default]
-    Default,
+    Intl,
 }
 impl ModelEndpoint for StepfunEndpoint {
     fn uri(&self) -> &'static str {
         match self {
-            Self::Default => "https://api.stepfun.com/v1",
+            Self::Cn => "https://api.stepfun.com/v1",
+            Self::Intl => "https://api.stepfun.ai/v1",
         }
     }
 }
@@ -1499,6 +1535,14 @@ pub struct StepfunModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    #[serde(default)]
+    pub endpoint: StepfunEndpoint,
+}
+
+impl FamilyEndpoint for StepfunModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
 }
 
 // ── AIHubMix ──
@@ -1855,6 +1899,12 @@ pub struct GlmModelProviderConfig {
     pub endpoint: GlmEndpoint,
 }
 
+impl FamilyEndpoint for GlmModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
 // ── Minimax (multi-region + auth_mode) ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1886,6 +1936,12 @@ pub struct MinimaxModelProviderConfig {
     pub auth_mode: Option<AuthMode>,
 }
 
+impl FamilyEndpoint for MinimaxModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
 // ── Z.AI (multi-region) ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1913,6 +1969,12 @@ pub struct ZaiModelProviderConfig {
     pub base: ModelProviderConfig,
     #[serde(default)]
     pub endpoint: ZaiEndpoint,
+}
+
+impl FamilyEndpoint for ZaiModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
 }
 
 // ── Doubao (Volcengine; single canonical endpoint) ──
@@ -2410,6 +2472,81 @@ pub struct BedrockModelProviderConfig {
     pub region: Option<String>,
 }
 
+// ── FamilyEndpoint default impls (single-endpoint families) ─────
+//
+// Multi-endpoint families (Moonshot, Qwen, Glm, Minimax, Zai, Stepfun) define
+// their own `impl FamilyEndpoint` next to the struct. Every other family
+// gets the `None` default via this list. The list is exhaustive: a new
+// family with no impl here AND no manual impl elsewhere will fail to
+// compile against `ModelProviders::resolved_endpoint_uri`, which expands
+// `endpoint_uri()` per slot through `for_each_model_provider_slot!`.
+
+macro_rules! impl_default_family_endpoint {
+    ($($t:ty),+ $(,)?) => {
+        $( impl FamilyEndpoint for $t {} )+
+    };
+}
+
+impl_default_family_endpoint! {
+    OpenAIModelProviderConfig,
+    AzureModelProviderConfig,
+    AnthropicModelProviderConfig,
+    OpenRouterModelProviderConfig,
+    OllamaModelProviderConfig,
+    TogetherModelProviderConfig,
+    FireworksModelProviderConfig,
+    GroqModelProviderConfig,
+    MistralModelProviderConfig,
+    DeepseekModelProviderConfig,
+    CohereModelProviderConfig,
+    PerplexityModelProviderConfig,
+    XaiModelProviderConfig,
+    CerebrasModelProviderConfig,
+    SambanovaModelProviderConfig,
+    HyperbolicModelProviderConfig,
+    DeepinfraModelProviderConfig,
+    HuggingfaceModelProviderConfig,
+    Ai21ModelProviderConfig,
+    RekaModelProviderConfig,
+    BasetenModelProviderConfig,
+    NscaleModelProviderConfig,
+    AnyscaleModelProviderConfig,
+    NebiusModelProviderConfig,
+    FriendliModelProviderConfig,
+    AihubmixModelProviderConfig,
+    SiliconflowModelProviderConfig,
+    AstraiModelProviderConfig,
+    AvianModelProviderConfig,
+    DeepmystModelProviderConfig,
+    VeniceModelProviderConfig,
+    NovitaModelProviderConfig,
+    NvidiaModelProviderConfig,
+    TelnyxModelProviderConfig,
+    VercelModelProviderConfig,
+    CloudflareModelProviderConfig,
+    OvhModelProviderConfig,
+    CopilotModelProviderConfig,
+    DoubaoModelProviderConfig,
+    YiModelProviderConfig,
+    HunyuanModelProviderConfig,
+    QianfanModelProviderConfig,
+    BaichuanModelProviderConfig,
+    GeminiModelProviderConfig,
+    GeminiCliModelProviderConfig,
+    LmstudioModelProviderConfig,
+    LlamacppModelProviderConfig,
+    SglangModelProviderConfig,
+    VllmModelProviderConfig,
+    OsaurusModelProviderConfig,
+    LitellmModelProviderConfig,
+    LeptonModelProviderConfig,
+    SyntheticModelProviderConfig,
+    OpencodeModelProviderConfig,
+    KiloCliModelProviderConfig,
+    CustomModelProviderConfig,
+    BedrockModelProviderConfig,
+}
+
 // ── Delegate Tool Configuration ─────────────────────────────────
 
 /// Global delegate tool configuration for default timeout values.
@@ -2582,6 +2719,11 @@ pub struct DelegateAgentConfig {
     /// behavior). Default: `2`.
     #[serde(default = "default_keep_tool_context_turns")]
     pub keep_tool_context_turns: usize,
+
+    /// HMAC tool execution receipt configuration.
+    #[nested]
+    #[serde(default)]
+    pub tool_receipts: ToolReceiptsConfig,
 }
 
 fn default_agent_compact_context() -> bool {
@@ -2621,6 +2763,7 @@ impl Default for DelegateAgentConfig {
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            tool_receipts: ToolReceiptsConfig::default(),
         }
     }
 }
@@ -3790,6 +3933,47 @@ fn default_local_whisper_max_audio_bytes() -> usize {
 
 fn default_local_whisper_timeout_secs() -> u64 {
     300
+}
+
+/// HMAC tool execution receipt configuration, per agent
+/// (`[agents.<alias>.tool_receipts]`).
+///
+/// Receipts are short HMAC-SHA256 tags appended to tool results so the model
+/// cannot claim it ran a tool that never actually executed. See
+/// `docs/book/src/security/tool-receipts.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "delegate-agent.tool_receipts"]
+pub struct ToolReceiptsConfig {
+    /// Generate HMAC receipts on every tool execution. Default: `false`.
+    /// When false, the entire receipt subsystem is inert (no key, no
+    /// generation, no append, no system-prompt addendum).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Append a trailing `Tool receipts:` block to user-visible replies so
+    /// receipts are auditable from the channel surface, not just the
+    /// internal history. Default: `false`.
+    #[serde(default)]
+    pub show_in_response: bool,
+    /// Inject the receipt-echo instruction into the system prompt so the
+    /// model carries receipts verbatim into its response. Default: `true`.
+    /// No effect when `enabled = false`.
+    #[serde(default = "default_inject_system_prompt")]
+    pub inject_system_prompt: bool,
+}
+
+fn default_inject_system_prompt() -> bool {
+    true
+}
+
+impl Default for ToolReceiptsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            show_in_response: false,
+            inject_system_prompt: default_inject_system_prompt(),
+        }
+    }
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -15250,7 +15434,6 @@ default_temperature = 0.7
     }
 
     #[tokio::test]
-    #[ignore = "pre-#6273 test asserts on flat-config behavior; rewrite in #6273 follow-up against typed family slots"]
     async fn config_save_atomic_cleanup() {
         let dir =
             std::env::temp_dir().join(format!("zeroclaw_test_config_{}", uuid::Uuid::new_v4()));
@@ -15277,7 +15460,7 @@ default_temperature = 0.7
         config
             .providers
             .models
-            .ensure("test", "default")
+            .ensure("openrouter", "default")
             .unwrap()
             .model = Some("model-b".into());
         config.save().await.unwrap();
@@ -16354,19 +16537,23 @@ default_temperature = 0.7
     }
 
     #[test]
-    #[ignore = "pre-#6273 test asserts on flat-config behavior; rewrite in #6273 follow-up against typed family slots"]
-    async fn toml_supports_model_provider_and_model_alias_fields() {
-        // Serde aliases: `model_provider` → `default_model_provider`,
-        // `model` → `default_model`. Both folded into the synthesized
-        // `[providers.models.<type>.default]` entry.
+    async fn v1_known_provider_migrates_with_globals_folded_onto_typed_slot() {
+        // Top-level `model_provider` + `model` + `default_temperature` flow
+        // onto the migrated typed-slot entry. Vendor-canonical names like
+        // `openai` map straight to their typed slot; `wire_api` and
+        // `requires_openai_auth` survive the move.
+        //
+        // (Unknown V1 names like `sub2api` are intentionally silent-dropped
+        // by the V2→V3 migration — see the `Unknown/passthrough` arm of
+        // `normalize_provider_type` in schema/v2.rs.)
         let raw = r#"
 default_temperature = 0.7
-model_provider = "sub2api"
+model_provider = "openai"
 model = "gpt-5.3-codex"
 
-[model_providers.sub2api]
-name = "sub2api"
-base_url = "https://api.tonsof.blue/v1"
+[model_providers.openai]
+api_key = "sk-test"
+uri = "https://api.openai.com/v1"
 wire_api = "responses"
 requires_openai_auth = true
 "#;
@@ -16376,39 +16563,30 @@ requires_openai_auth = true
             parsed
                 .providers
                 .models
-                .contains_model_provider_type("sub2api"),
-            "expected sub2api in providers.models"
-        );
-        assert_eq!(
-            parsed
-                .providers
-                .first_model_provider()
-                .and_then(|e| e.model.as_deref()),
-            Some("gpt-5.3-codex")
+                .contains_model_provider_type("openai"),
+            "vendor-canonical V1 provider should land in its typed slot",
         );
         let profile = parsed
             .providers
             .models
-            .find("sub2api", "default")
-            .expect("profile should exist");
+            .find("openai", "default")
+            .expect("openai.default entry");
+        assert_eq!(profile.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(profile.uri.as_deref(), Some("https://api.openai.com/v1"));
+        assert_eq!(profile.model.as_deref(), Some("gpt-5.3-codex"));
         assert_eq!(profile.wire_api.as_deref(), Some("responses"));
         assert!(profile.requires_openai_auth);
     }
 
     #[test]
-    #[ignore = "pre-#6273 test asserts on flat-config behavior; rewrite in #6273 follow-up against typed family slots"]
-    async fn model_provider_profile_maps_to_custom_endpoint() {
+    async fn typed_custom_slot_routes_uri_through_find() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.providers.models.openrouter.insert(
+        config.providers.models.custom.insert(
             "default".to_string(),
-            OpenRouterModelProviderConfig {
+            CustomModelProviderConfig {
                 base: ModelProviderConfig {
-                    name: Some("sub2api".to_string()),
                     uri: Some("https://api.tonsof.blue/v1".to_string()),
-                    wire_api: None,
-                    requires_openai_auth: false,
-                    max_tokens: None,
                     ..Default::default()
                 },
             },
@@ -16418,7 +16596,7 @@ requires_openai_auth = true
             config
                 .providers
                 .models
-                .find("sub2api", "default")
+                .find("custom", "default")
                 .and_then(|e| e.uri.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
@@ -16426,19 +16604,16 @@ requires_openai_auth = true
     }
 
     #[test]
-    #[ignore = "pre-#6273 test asserts on flat-config behavior; rewrite in #6273 follow-up against typed family slots"]
-    async fn model_provider_profile_responses_uses_openai_codex_and_openai_key() {
+    async fn openai_codex_alias_carries_responses_wire_api_and_requires_openai_auth() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config.providers.models.openrouter.insert(
-            "default".to_string(),
-            OpenRouterModelProviderConfig {
+        config.providers.models.openai.insert(
+            "codex".to_string(),
+            OpenAIModelProviderConfig {
                 base: ModelProviderConfig {
-                    name: Some("sub2api".to_string()),
                     uri: Some("https://api.tonsof.blue".to_string()),
                     wire_api: Some("responses".to_string()),
                     requires_openai_auth: true,
-                    max_tokens: None,
                     ..Default::default()
                 },
             },
@@ -16447,26 +16622,24 @@ requires_openai_auth = true
         let entry = config
             .providers
             .models
-            .find("sub2api", "default")
-            .expect("sub2api.default entry");
+            .find("openai", "codex")
+            .expect("openai.codex entry");
         assert_eq!(entry.uri.as_deref(), Some("https://api.tonsof.blue"));
         assert_eq!(entry.wire_api.as_deref(), Some("responses"));
         assert!(entry.requires_openai_auth);
     }
 
-    /// Round-trip test for the config CLI: a TOML file with the user's value
-    /// Round-trip test for the config CLI: a TOML file with a model_provider model
-    /// must deserialize, apply env overrides, and serialize back correctly.
+    /// Round-trip test for the config CLI: a TOML file with a typed-family
+    /// model entry must deserialize, find via the typed accessor, and
+    /// re-serialize without losing any field.
     #[test]
-    #[ignore = "pre-#6273 test asserts on flat-config behavior; rewrite in #6273 follow-up against typed family slots"]
     async fn provider_models_round_trips_through_load_apply_serialize() {
         let _env_guard = env_override_lock().await;
         let toml_in = r#"
 schema_version = 3
 
-[providers.models.primary.default]
-name = "alias-name"
-base_url = "https://example.invalid/v1"
+[providers.models.openrouter.default]
+uri = "https://example.invalid/v1"
 model = "primary-model"
 "#;
 
@@ -16476,7 +16649,7 @@ model = "primary-model"
             config
                 .providers
                 .models
-                .find("primary", "default")
+                .find("openrouter", "default")
                 .and_then(|e| e.model.as_deref()),
             Some("primary-model"),
         );
@@ -19339,6 +19512,94 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
+    async fn typed_custom_slot_round_trips_uri_through_save_and_load() {
+        // V2 colon-URL keys (`custom:https://...`) are gone — `custom`
+        // is a typed slot whose `uri` field carries the operator URL.
+        // This pins: secret routing, save/encrypt, and round-trip reload
+        // for the typed `custom` slot.
+        let dir = TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            workspace_dir: dir.path().join("workspace"),
+            ..Default::default()
+        };
+        let alias = "default";
+        config
+            .providers
+            .models
+            .ensure("custom", alias)
+            .expect("custom typed slot");
+
+        let prefix = format!("providers.models.custom.{alias}");
+        let api_key_path = format!("{prefix}.api-key");
+        let uri_path = format!("{prefix}.uri");
+        let model_path = format!("{prefix}.model");
+        let temperature_path = format!("{prefix}.temperature");
+
+        assert!(
+            Config::prop_is_secret(&api_key_path),
+            "typed custom-slot api-key must route through the secret marker",
+        );
+
+        config.set_prop(&api_key_path, "sk-test-custom").unwrap();
+        config
+            .set_prop(&uri_path, "https://api.example.invalid/v1")
+            .unwrap();
+        config.set_prop(&model_path, "local-large").unwrap();
+        config.set_prop(&temperature_path, "0.2").unwrap();
+
+        let provider = config
+            .providers
+            .models
+            .find("custom", alias)
+            .expect("custom typed slot entry must be present");
+        assert_eq!(provider.api_key.as_deref(), Some("sk-test-custom"));
+        assert_eq!(
+            provider.uri.as_deref(),
+            Some("https://api.example.invalid/v1")
+        );
+        assert_eq!(provider.model.as_deref(), Some("local-large"));
+        assert_eq!(provider.temperature, Some(0.2));
+
+        assert_eq!(config.get_prop(&api_key_path).unwrap(), "**** (encrypted)");
+        assert_eq!(
+            config.get_prop(&uri_path).unwrap(),
+            "https://api.example.invalid/v1"
+        );
+
+        config.save().await.unwrap();
+        let raw_toml = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(
+            raw_toml.contains("[providers.models.custom.default]"),
+            "saved TOML should write under the typed custom slot",
+        );
+        assert!(
+            !raw_toml.contains("sk-test-custom"),
+            "saved TOML must not contain the plaintext custom provider API key",
+        );
+
+        let mut loaded: Config = crate::migration::migrate_to_current(&raw_toml).unwrap();
+        loaded.config_path = config.config_path.clone();
+        loaded.workspace_dir = config.workspace_dir.clone();
+        let store = crate::secrets::SecretStore::new(dir.path(), loaded.secrets.encrypt);
+        loaded.decrypt_secrets(&store).unwrap();
+        let loaded_provider = loaded
+            .providers
+            .models
+            .find("custom", alias)
+            .expect("typed custom slot entry must round-trip through save/load");
+        assert_eq!(loaded_provider.api_key.as_deref(), Some("sk-test-custom"));
+        assert_eq!(
+            loaded_provider.uri.as_deref(),
+            Some("https://api.example.invalid/v1")
+        );
+        assert_eq!(loaded_provider.model.as_deref(), Some("local-large"));
+        assert_eq!(loaded_provider.temperature, Some(0.2));
+    }
+
+    #[test]
     async fn enum_variants_callback_returns_values() {
         let mx = test_matrix_config();
         let fields = mx.prop_fields();
@@ -19353,19 +19614,18 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
-    #[ignore = "pre-#6273 test asserts on flat-config behavior; rewrite in #6273 follow-up against typed family slots"]
-    async fn map_key_sections_discovers_providers_models() {
-        // The Configurable derive walks #[nested] HashMap<String, T> fields
-        // and exposes them via map_key_sections(). Without this enumeration,
-        // the dashboard has no way to know `providers.models.<name>` is an
-        // addable shape — it only sees fields that already exist.
+    async fn map_key_sections_discovers_per_family_provider_slots() {
+        // V3 typed-family split: `providers.models` is a struct of typed
+        // family maps, not a single open HashMap. Each family slot
+        // (`providers.models.<family>`) is its own Map-kind section; the
+        // dashboard's "+ Add alias" affordance hangs off the family path.
         let sections = Config::map_key_sections();
-        let providers_models = sections
+        let anthropic = sections
             .iter()
-            .find(|s| s.path == "providers.models")
-            .expect("providers.models must be discoverable as a map-keyed section");
-        assert_eq!(providers_models.kind, crate::traits::MapKeyKind::Map);
-        assert_eq!(providers_models.value_type, "ModelProviderConfig");
+            .find(|s| s.path == "providers.models.anthropic")
+            .expect("providers.models.anthropic must be discoverable as a map-keyed section");
+        assert_eq!(anthropic.kind, crate::traits::MapKeyKind::Map);
+        assert_eq!(anthropic.value_type, "AnthropicModelProviderConfig");
 
         // agents is also #[nested] HashMap on root Config.
         assert!(
@@ -19407,9 +19667,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
-    #[ignore = "pre-#6273 test asserts on flat-config behavior; rewrite in #6273 follow-up against typed family slots"]
-    async fn create_map_key_inserts_default_provider() {
-        // Round-trip: `+ Add anthropic model_provider` from the dashboard.
+    async fn create_map_key_inserts_default_alias_under_typed_family() {
+        // V3 dashboard "+ Add alias" target is the typed family slot,
+        // not a free-form provider key under `providers.models`.
         let mut config = Config::default();
         assert!(
             !config
@@ -19419,19 +19679,21 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         );
 
         let created = config
-            .create_map_key("providers.models", "anthropic")
-            .expect("providers.models should accept new map keys");
+            .create_map_key("providers.models.anthropic", "default")
+            .expect("typed family slot should accept a new alias");
         assert!(created, "first add should report created=true");
         assert!(
             config
                 .providers
                 .models
-                .contains_model_provider_type("anthropic")
+                .find("anthropic", "default")
+                .is_some(),
+            "the new alias must show up under the typed family slot",
         );
 
         // Idempotent: second add returns false, doesn't error.
         let again = config
-            .create_map_key("providers.models", "anthropic")
+            .create_map_key("providers.models.anthropic", "default")
             .expect("second add still resolves the section");
         assert!(!again, "duplicate add should report created=false");
     }

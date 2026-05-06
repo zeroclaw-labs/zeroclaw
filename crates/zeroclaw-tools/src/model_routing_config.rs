@@ -1050,7 +1050,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "uses pre-#6273 'kimi' synonym which is consolidated to 'moonshot' in Phase 8 migration; rewrite against canonical name in #6273 follow-up"]
     async fn set_default_updates_provider_model_and_temperature() {
         let tmp = TempDir::new().unwrap();
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -1058,7 +1057,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "model_provider": "kimi",
+                "model_provider": "moonshot",
                 "model": "moonshot-v1-8k",
                 "temperature": 0.2
             }))
@@ -1069,7 +1068,7 @@ mod tests {
         let output: Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(
             output["config"]["default"]["model_provider"].as_str(),
-            Some("kimi")
+            Some("moonshot")
         );
         assert_eq!(
             output["config"]["default"]["model"].as_str(),

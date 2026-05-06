@@ -1071,7 +1071,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pre-#6273 test asserts on flat-config / synonym behavior; rewrite against typed family slots in #6273 follow-up"]
     fn config_validation_catches_bad_temperature() {
         // Single model_provider entry with an out-of-range temperature so the
         // doctor's `first_model_provider()` lookup deterministically picks it
@@ -1082,7 +1081,7 @@ mod tests {
         config
             .providers
             .models
-            .ensure("default", "default")
+            .ensure("openrouter", "default")
             .expect("known model_provider type")
             .temperature = Some(5.0);
         let mut items = Vec::new();
@@ -1120,23 +1119,31 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pre-#6273 test asserts on flat-config / synonym behavior; rewrite against typed family slots in #6273 follow-up"]
     fn config_validation_catches_unknown_provider() {
+        // Typed slots can only hold canonical family names, so an unknown
+        // family can no longer reach `first_model_provider_type()`. The
+        // remaining reachable path is `agent.model_provider`, which is a
+        // free-form `String` an operator can set to any dotted ref.
         let mut config = Config::default();
-        config.providers.models = Default::default();
-        config
-            .providers
-            .models
-            .ensure("totally-fake", "default")
-            .expect("known model_provider type");
+        config.agents.insert(
+            "broken".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "totally-fake.default".into(),
+                risk_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let prov_item = items.iter().find(|i| {
             i.message
-                .contains("model_provider \"totally-fake\" is invalid")
+                .contains("agent \"broken\" uses invalid model_provider \"totally-fake\"")
         });
-        assert!(prov_item.is_some());
-        assert_eq!(prov_item.unwrap().severity, Severity::Error);
+        assert!(
+            prov_item.is_some(),
+            "doctor should flag unknown agent model_provider"
+        );
+        assert_eq!(prov_item.unwrap().severity, Severity::Warn);
     }
 
     // The pre-Phase-6 tests `config_validation_catches_malformed_custom_provider`

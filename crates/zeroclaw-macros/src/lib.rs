@@ -341,6 +341,74 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 let field_doc = extract_doc(&field.attrs);
                 let value_ty_name = value_ty.to_token_stream().to_string();
 
+                if double_value_ty.is_none() {
+                    // Single-level `HashMap<String, T: Configurable>` only.
+                    // The double-nested branch below emits its own
+                    // `route_double_hashmap_path` based dispatch and does
+                    // not need the single-level `route_hashmap_path` ops
+                    // (they wouldn't typecheck against the inner HashMap).
+                    nested_set.push(quote! {
+                        for inner in self.#field_ident.values_mut() {
+                            if let Ok(()) = inner.set_secret(name, value.clone()) {
+                                return Ok(());
+                            }
+                        }
+                    });
+                    nested_encrypt.push(quote! {
+                        for inner in self.#field_ident.values_mut() {
+                            inner.encrypt_secrets(store)?;
+                        }
+                    });
+                    nested_decrypt.push(quote! {
+                        for inner in self.#field_ident.values_mut() {
+                            inner.decrypt_secrets(store)?;
+                        }
+                    });
+                    // Path routing through HashMap<String, T>: the one parser
+                    // lives in `crate::config::route_hashmap_path` so get/set
+                    // don't duplicate it. Paths look like
+                    // `<my_prefix>.<field>.<key>.<inner_suffix>`; keys may contain
+                    // dots/URLs, so the shared parser preserves the runtime key and
+                    // splits on the final field separator. On a hit the dispatch is
+                    // forwarded to the value type's own get_prop / set_prop via its
+                    // `configurable_prefix()`.
+                    nested_prop_is_secret.push(quote! {
+                        if let Some((_hm_key, inner_name)) = crate::config::route_hashmap_path(
+                            name,
+                            Self::configurable_prefix(),
+                            #field_name_lit,
+                            <#value_ty>::configurable_prefix(),
+                        ) && <#value_ty>::prop_is_secret(&inner_name)
+                        {
+                            return true;
+                        }
+                    });
+                    nested_get_prop.push(quote! {
+                        if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
+                            name,
+                            Self::configurable_prefix(),
+                            #field_name_lit,
+                            <#value_ty>::configurable_prefix(),
+                        ) && let Some(inner) = self.#field_ident.get(hm_key)
+                            && let Ok(val) = inner.get_prop(&inner_name)
+                        {
+                            return Ok(val);
+                        }
+                    });
+                    nested_set_prop.push(quote! {
+                        if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
+                            name,
+                            Self::configurable_prefix(),
+                            #field_name_lit,
+                            <#value_ty>::configurable_prefix(),
+                        ) && let Some(inner) = self.#field_ident.get_mut(hm_key)
+                            && let Ok(()) = inner.set_prop(&inner_name, value_str)
+                        {
+                            return Ok(());
+                        }
+                    });
+                }
+
                 if let Some(inner_ty) = double_value_ty {
                     // ── HashMap<String, HashMap<String, T: Configurable>> ──
                     // Two-level alias map: outer key = type (e.g. "anthropic"),
@@ -379,41 +447,136 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     });
 
+                    // Outer-key disambiguation for double-nested HashMaps:
+                    // outer keys may legitimately contain dots (URL-keyed
+                    // custom provider types like `custom:https://example/v1`),
+                    // so a left-to-right `split_once('.')` would mis-route.
+                    // For instance-aware paths (get/set), match against the
+                    // actual map keys present and pick the longest match.
+                    // For prop_is_secret (type-only, no instance), iterate
+                    // every plausible `<outer>.<alias>.<suffix>` split where
+                    // `<alias>` passes alias validation, and OR the
+                    // T::prop_is_secret answers — false negatives here mean
+                    // a secret leak through encryption-skip.
                     nested_prop_is_secret.push(quote! {
-                        if let Some((_ok, _ik, inner_name)) = crate::config::route_double_hashmap_path(
-                            name,
-                            Self::configurable_prefix(),
-                            #field_name_lit,
-                            <#inner_ty>::configurable_prefix(),
-                        ) && <#inner_ty>::prop_is_secret(&inner_name)
                         {
-                            return true;
+                            let path_prefix = if Self::configurable_prefix().is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{}.{}", Self::configurable_prefix(), #field_name_lit)
+                            };
+                            if let Some(rest) = name
+                                .strip_prefix(&path_prefix)
+                                .and_then(|s| s.strip_prefix('.'))
+                            {
+                                let dots: Vec<usize> = rest
+                                    .match_indices('.')
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                for window in dots.windows(2) {
+                                    let outer_end = window[0];
+                                    let inner_end = window[1];
+                                    let inner_key = &rest[outer_end + 1..inner_end];
+                                    if crate::config::validate_alias_key(inner_key).is_err() {
+                                        continue;
+                                    }
+                                    let inner_suffix = &rest[inner_end + 1..];
+                                    let inner_prefix = <#inner_ty>::configurable_prefix();
+                                    let inner_name = if inner_prefix.is_empty() {
+                                        inner_suffix.to_string()
+                                    } else {
+                                        format!("{inner_prefix}.{inner_suffix}")
+                                    };
+                                    if <#inner_ty>::prop_is_secret(&inner_name) {
+                                        return true;
+                                    }
+                                }
+                            }
                         }
                     });
                     nested_get_prop.push(quote! {
-                        if let Some((outer_key, inner_key, inner_name)) = crate::config::route_double_hashmap_path(
-                            name,
-                            Self::configurable_prefix(),
-                            #field_name_lit,
-                            <#inner_ty>::configurable_prefix(),
-                        ) && let Some(inner_map) = self.#field_ident.get(outer_key)
-                            && let Some(inner) = inner_map.get(inner_key)
-                            && let Ok(val) = inner.get_prop(&inner_name)
                         {
-                            return Ok(val);
+                            let path_prefix = if Self::configurable_prefix().is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{}.{}", Self::configurable_prefix(), #field_name_lit)
+                            };
+                            if let Some(rest) = name
+                                .strip_prefix(&path_prefix)
+                                .and_then(|s| s.strip_prefix('.'))
+                            {
+                                let mut matches: Vec<(String, String)> = self.#field_ident
+                                    .keys()
+                                    .filter_map(|k| {
+                                        let needle = format!("{k}.");
+                                        rest.strip_prefix(&needle)
+                                            .map(|after| (k.clone(), after.to_string()))
+                                    })
+                                    .collect();
+                                matches.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                                for (outer_key, after_outer) in matches {
+                                    let Some((inner_key, inner_suffix)) =
+                                        after_outer.split_once('.')
+                                    else {
+                                        continue;
+                                    };
+                                    let inner_prefix = <#inner_ty>::configurable_prefix();
+                                    let inner_name = if inner_prefix.is_empty() {
+                                        inner_suffix.to_string()
+                                    } else {
+                                        format!("{inner_prefix}.{inner_suffix}")
+                                    };
+                                    if let Some(inner_map) = self.#field_ident.get(&outer_key)
+                                        && let Some(inner) = inner_map.get(inner_key)
+                                        && let Ok(val) = inner.get_prop(&inner_name)
+                                    {
+                                        return Ok(val);
+                                    }
+                                }
+                            }
                         }
                     });
                     nested_set_prop.push(quote! {
-                        if let Some((outer_key, inner_key, inner_name)) = crate::config::route_double_hashmap_path(
-                            name,
-                            Self::configurable_prefix(),
-                            #field_name_lit,
-                            <#inner_ty>::configurable_prefix(),
-                        ) && let Some(inner_map) = self.#field_ident.get_mut(outer_key)
-                            && let Some(inner) = inner_map.get_mut(inner_key)
-                            && let Ok(()) = inner.set_prop(&inner_name, value_str)
                         {
-                            return Ok(());
+                            let path_prefix = if Self::configurable_prefix().is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{}.{}", Self::configurable_prefix(), #field_name_lit)
+                            };
+                            if let Some(rest) = name
+                                .strip_prefix(&path_prefix)
+                                .and_then(|s| s.strip_prefix('.'))
+                            {
+                                let mut matches: Vec<(String, String)> = self.#field_ident
+                                    .keys()
+                                    .filter_map(|k| {
+                                        let needle = format!("{k}.");
+                                        rest.strip_prefix(&needle)
+                                            .map(|after| (k.clone(), after.to_string()))
+                                    })
+                                    .collect();
+                                matches.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                                for (outer_key, after_outer) in matches {
+                                    let Some((inner_key, inner_suffix)) =
+                                        after_outer.split_once('.')
+                                    else {
+                                        continue;
+                                    };
+                                    let inner_key = inner_key.to_string();
+                                    let inner_prefix = <#inner_ty>::configurable_prefix();
+                                    let inner_name = if inner_prefix.is_empty() {
+                                        inner_suffix.to_string()
+                                    } else {
+                                        format!("{inner_prefix}.{inner_suffix}")
+                                    };
+                                    if let Some(inner_map) = self.#field_ident.get_mut(&outer_key)
+                                        && let Some(inner) = inner_map.get_mut(&inner_key)
+                                        && inner.set_prop(&inner_name, value_str).is_ok()
+                                    {
+                                        return Ok(());
+                                    }
+                                }
+                            }
                         }
                     });
 

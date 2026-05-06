@@ -488,9 +488,18 @@ pub async fn run_gateway(
             &zeroclaw_providers::provider_runtime_options_from_config(&config),
         )?,
     );
-    let model = fallback
-        .and_then(|e| e.model.clone())
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
+    let model = match fallback
+        .and_then(|e| e.model.as_deref())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        Some(m) => m.to_string(),
+        None => anyhow::bail!(
+            "no model configured: no [providers.models.<type>.<alias>] entry has a \
+             `model` field set. Configure at least one [providers.models.<type>.<alias>] \
+             model = \"...\" before starting the gateway.",
+        ),
+    };
     let temperature = fallback.and_then(|e| e.temperature).unwrap_or(0.7);
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,

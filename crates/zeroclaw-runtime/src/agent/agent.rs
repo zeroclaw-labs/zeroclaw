@@ -2137,7 +2137,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "pre-#6273 test asserts on flat-config / synonym behavior; rewrite against typed family slots in #6273 follow-up"]
     async fn from_config_passes_extra_headers_to_custom_provider() {
         use axum::{Json, Router, http::HeaderMap, routing::post};
         use tempfile::TempDir;

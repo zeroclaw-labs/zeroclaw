@@ -793,7 +793,7 @@ async fn model_providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags
                     let Some(base_url) = prompt_custom_openai_base_url(ui).await? else {
                         continue;
                     };
-                    (format!("custom:{base_url}"), Some(base_url))
+                    ("custom".to_string(), Some(base_url))
                 } else {
                     (entries[idx].name.to_string(), None)
                 }
@@ -860,7 +860,7 @@ async fn model_providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags
             .find(|p| p.name == picked)
             .map(|p| p.display_name)
             .unwrap_or_else(|| {
-                if picked.starts_with("custom:") {
+                if picked == "custom" {
                     CUSTOM_OPENAI_COMPAT_LABEL
                 } else {
                     picked.as_str()
@@ -994,8 +994,8 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, prefix: &str) ->
     let api_key = profile.and_then(|entry| entry.api_key.as_deref());
     let configured_uri = profile.and_then(|entry| entry.uri.as_deref());
     let discovery_base_url = openai_compat_discovery_base_url(&model_provider, configured_uri);
-    let should_try_openai_compat = model_provider.trim().starts_with("custom:")
-        || !is_known_model_provider_name(&model_provider);
+    let should_try_openai_compat =
+        model_provider.trim() == "custom" || !is_known_model_provider_name(&model_provider);
 
     let catalog_models = match zeroclaw_providers::create_model_provider(&model_provider, None) {
         Ok(handle) => {
@@ -1809,7 +1809,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        format!("http://localhost:{port}")
+        format!("http://127.0.0.1:{port}")
     }
 
     #[tokio::test]
@@ -2056,7 +2056,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "pre-#6273 test asserts on flat-config / synonym behavior; rewrite against typed family slots in #6273 follow-up"]
     async fn providers_custom_openai_endpoint_discovers_models() {
         let temp = TempDir::new().unwrap();
         let mut cfg = test_cfg(&temp);
@@ -2066,14 +2065,14 @@ mod tests {
             None,
         )
         .await;
-        let model_provider = format!("custom:{base_url}");
 
-        let flags = Flags {
-            model_provider: Some(model_provider.clone()),
-            api_key: Some("sk-custom-test".into()),
-            ..Default::default()
-        };
-        let mut ui = QuickUi::new().with("Model", "qwen-local");
+        let flags = Flags::default();
+        let mut ui = QuickUi::new()
+            .with("ModelProvider", CUSTOM_OPENAI_COMPAT_LABEL)
+            .with("OpenAI-compatible base URL", &base_url)
+            .with("alias", "default")
+            .with("api-key", "sk-custom-test")
+            .with("Model", "qwen-local");
 
         run(&mut cfg, &mut ui, Section::Providers, &flags)
             .await
@@ -2082,14 +2081,14 @@ mod tests {
         let model_cfg = cfg
             .providers
             .models
-            .find(&model_provider, "default")
+            .find("custom", "default")
             .expect("custom model_provider entry should be seeded");
         assert_eq!(model_cfg.api_key.as_deref(), Some("sk-custom-test"));
+        assert_eq!(model_cfg.uri.as_deref(), Some(base_url.as_str()));
         assert_eq!(model_cfg.model.as_deref(), Some("qwen-local"));
     }
 
     #[tokio::test]
-    #[ignore = "pre-#6273 test asserts on flat-config / synonym behavior; rewrite against typed family slots in #6273 follow-up"]
     async fn prompt_model_unknown_provider_with_base_url_discovers_models() {
         let temp = TempDir::new().unwrap();
         let mut cfg = test_cfg(&temp);
@@ -2115,8 +2114,8 @@ mod tests {
         let model_cfg = cfg
             .providers
             .models
-            .find("my-gateway", "default")
-            .expect("unknown model_provider entry should remain configured");
+            .find("custom", "default")
+            .expect("custom model_provider entry should remain configured");
         assert_eq!(model_cfg.model.as_deref(), Some("gateway-large"));
     }
 

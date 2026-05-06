@@ -661,6 +661,12 @@ pub struct ModelProviderRuntimeOptions {
     /// `OpenAiCodexModelProvider` when this is true (the codex variant is selected
     /// by the alias's typed config, not by family name).
     pub requires_openai_auth: bool,
+    /// Override the model_provider's default for native tool calling. `None`
+    /// honors the per-family built-in choice. `Some(true)` forces native tool
+    /// calls on; `Some(false)` forces text-fallback. Propagated from
+    /// `ModelProviderConfig::native_tools`. Currently consulted only by the
+    /// Groq factory branch.
+    pub native_tools: Option<bool>,
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -682,6 +688,7 @@ impl Default for ModelProviderRuntimeOptions {
             azure_deployment: None,
             azure_api_version: None,
             requires_openai_auth: false,
+            native_tools: None,
         }
     }
 }
@@ -747,6 +754,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         azure_deployment: None,
         azure_api_version: None,
         requires_openai_auth: false,
+        native_tools: entry.and_then(|e| e.native_tools),
     }
 }
 
@@ -778,8 +786,19 @@ pub fn provider_runtime_options_for_agent(
     if let Some(agent) = config.agents.get(agent_alias)
         && let Some((family, alias)) = agent.model_provider.split_once('.')
     {
-        use zeroclaw_config::schema::ModelEndpoint;
+        // Multi-endpoint families: pre-resolve the URI via the centralized
+        // `resolved_endpoint_uri` dispatch (driven by
+        // `for_each_model_provider_slot!`). Operator-set `base.uri` (already
+        // populated into `options.provider_api_url` by
+        // `model_provider_runtime_options_from_model_provider_entry`) wins
+        // over the family-default endpoint URI.
+        if options.provider_api_url.is_none()
+            && let Some(uri) = config.providers.models.resolved_endpoint_uri(family, alias)
+        {
+            options.provider_api_url = Some(uri.to_string());
+        }
 
+        // Family-specific extras that don't fit the endpoint-URI shape.
         match family {
             // Azure: typed resource / deployment / api_version flow through
             // for runtime URI templating.
@@ -792,52 +811,11 @@ pub fn provider_runtime_options_for_agent(
             }
             // OpenAI: codex variant marker. The codex alias lives under
             // `[providers.models.openai.codex]` with `requires_openai_auth =
-            // true`; the factory dispatches to OpenAiCodexModelProvider when this
-            // flag is set, regardless of family name being `openai`.
+            // true`; the factory dispatches to OpenAiCodexModelProvider when
+            // this flag is set, regardless of family name being `openai`.
             "openai" => {
                 if let Some(cfg) = config.providers.models.openai.get(alias) {
                     options.requires_openai_auth = cfg.base.requires_openai_auth;
-                }
-            }
-            // Multi-endpoint families: pre-resolve the URI from the typed
-            // endpoint enum so the factory doesn't need to know about
-            // regional variants. Operator-set `base.uri` (already populated
-            // into `options.provider_api_url` by
-            // `model_provider_runtime_options_from_model_provider_entry`) wins over the
-            // family-default endpoint URI.
-            "moonshot" => {
-                if options.provider_api_url.is_none()
-                    && let Some(cfg) = config.providers.models.moonshot.get(alias)
-                {
-                    options.provider_api_url = Some(cfg.endpoint.uri().to_string());
-                }
-            }
-            "qwen" => {
-                if options.provider_api_url.is_none()
-                    && let Some(cfg) = config.providers.models.qwen.get(alias)
-                {
-                    options.provider_api_url = Some(cfg.endpoint.uri().to_string());
-                }
-            }
-            "glm" => {
-                if options.provider_api_url.is_none()
-                    && let Some(cfg) = config.providers.models.glm.get(alias)
-                {
-                    options.provider_api_url = Some(cfg.endpoint.uri().to_string());
-                }
-            }
-            "minimax" => {
-                if options.provider_api_url.is_none()
-                    && let Some(cfg) = config.providers.models.minimax.get(alias)
-                {
-                    options.provider_api_url = Some(cfg.endpoint.uri().to_string());
-                }
-            }
-            "zai" => {
-                if options.provider_api_url.is_none()
-                    && let Some(cfg) = config.providers.models.zai.get(alias)
-                {
-                    options.provider_api_url = Some(cfg.endpoint.uri().to_string());
                 }
             }
             _ => {}
@@ -1481,15 +1459,22 @@ fn create_model_provider_with_url_and_options(
         }
 
         // ── Extended ecosystem (community favorites) ─────────
-        "groq" => Ok(compat(
-            OpenAiCompatibleModelProvider::new(
+        "groq" => {
+            let mut model_provider = OpenAiCompatibleModelProvider::new(
                 "Groq",
                 "https://api.groq.com/openai/v1",
                 key,
                 AuthStyle::Bearer,
-            )
-            .without_native_tools(),
-        )),
+            );
+            // Default to text-fallback because Groq's llama-family models
+            // reject native tool calls with HTTP 400. Operators can override
+            // per-profile via `[providers.models.groq.<alias>] native_tools = true`
+            // to enable native tool calling for Groq models that support it.
+            if options.native_tools != Some(true) {
+                model_provider = model_provider.without_native_tools();
+            }
+            Ok(compat(model_provider))
+        }
         "mistral" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Mistral",
             "https://api.mistral.ai/v1",
@@ -1710,7 +1695,7 @@ fn create_model_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        "lepton" => Ok(compat(OpenAiCompatibleModelProvider::new(
+        "lepton" | "lepton-ai" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Lepton AI",
             resolved_url.unwrap_or("https://llama3-1-405b.lepton.run/api/v1"),
             key,
@@ -2802,6 +2787,84 @@ mod tests {
     #[test]
     fn factory_groq() {
         assert!(create_model_provider("groq", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_groq_disables_native_tools_by_default() {
+        // Default behavior preserves the blanket disable: llama-family
+        // Groq models reject native tool calls with HTTP 400.
+        let model_provider = create_model_provider_with_options(
+            "groq",
+            Some("key"),
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("groq factory must succeed");
+        assert!(
+            !model_provider.supports_native_tools(),
+            "Groq must default to text-fallback for llama-family compatibility"
+        );
+    }
+
+    #[test]
+    fn factory_groq_honors_native_tools_override_true() {
+        // Operator opt-in via `[providers.models.groq.<alias>] native_tools = true`
+        // skips the default disable so non-llama Groq models can use native
+        // tool calling.
+        let options = ModelProviderRuntimeOptions {
+            native_tools: Some(true),
+            ..Default::default()
+        };
+        let model_provider = create_model_provider_with_options("groq", Some("key"), &options)
+            .expect("groq factory must succeed");
+        assert!(
+            model_provider.supports_native_tools(),
+            "Groq with `native_tools = true` must enable native tool calling"
+        );
+    }
+
+    #[test]
+    fn factory_groq_native_tools_override_false_keeps_disable() {
+        // Explicit `native_tools = false` matches the default behavior; this
+        // documents that the option is tri-state and `Some(false)` is not a
+        // no-op surprise.
+        let options = ModelProviderRuntimeOptions {
+            native_tools: Some(false),
+            ..Default::default()
+        };
+        let model_provider = create_model_provider_with_options("groq", Some("key"), &options)
+            .expect("groq factory must succeed");
+        assert!(
+            !model_provider.supports_native_tools(),
+            "Groq with explicit `native_tools = false` must remain text-fallback"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_from_config_propagates_native_tools() {
+        // End-to-end path: setting `native_tools` on the first configured
+        // model_provider entry must reach `ModelProviderRuntimeOptions` so the
+        // Groq factory branch sees it. V3 has no global fallback; the
+        // orchestrator resolves per-agent and falls back to
+        // `first_model_provider()`.
+        use zeroclaw_config::schema::{GroqModelProviderConfig, ModelProviderConfig};
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.groq.insert(
+            "default".to_string(),
+            GroqModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("https://api.groq.com/openai/v1".to_string()),
+                    native_tools: Some(true),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let options = provider_runtime_options_from_config(&config);
+        assert_eq!(
+            options.native_tools,
+            Some(true),
+            "native_tools must propagate from the active model_provider entry to runtime options"
+        );
     }
 
     #[test]

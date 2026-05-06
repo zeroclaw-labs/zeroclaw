@@ -58,12 +58,38 @@ impl IntegrationCategory {
     }
 }
 
-/// A registered integration
+/// A registered integration.
+///
+/// Activation is data-driven via `model_provider_family`: when set, the entry
+/// is `Active` iff the named typed family slot has any configured alias.
+/// Entries that need richer logic (channels, custom config flags, coming-soon
+/// stubs, multi-family fallbacks) leave `model_provider_family = None` and
+/// supply `status_fn` instead. Setting both is invalid.
 pub struct IntegrationEntry {
     pub name: &'static str,
     pub description: &'static str,
     pub category: IntegrationCategory,
+    /// Typed model_provider family slot whose presence activates this entry.
+    /// `Some("X")` ⇒ `c.providers.models.contains_model_provider_type("X")`.
+    /// AiModel-category entries with a 1:1 family mapping must set this so
+    /// the registry-vs-schema invariant test catches drift.
+    pub model_provider_family: Option<&'static str>,
+    /// Used iff `model_provider_family` is `None`. A no-op stub is fine when
+    /// `model_provider_family` is `Some`.
     pub status_fn: fn(&Config) -> IntegrationStatus,
+}
+
+impl IntegrationEntry {
+    pub fn status(&self, config: &Config) -> IntegrationStatus {
+        if let Some(family) = self.model_provider_family {
+            return if config.providers.models.contains_model_provider_type(family) {
+                IntegrationStatus::Active
+            } else {
+                IntegrationStatus::Available
+            };
+        }
+        (self.status_fn)(config)
+    }
 }
 
 /// Handle the `integrations` CLI command
@@ -77,7 +103,7 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
         );
     };
 
-    let status = (entry.status_fn)(config);
+    let status = entry.status(config);
     let (icon, label) = match status {
         IntegrationStatus::Active => ("✅", "Active"),
         IntegrationStatus::Available => ("⚪", "Available"),
