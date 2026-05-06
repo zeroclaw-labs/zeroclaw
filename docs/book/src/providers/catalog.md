@@ -158,6 +158,7 @@ Verified endpoints:
 | Vercel AI Gateway | `https://gateway.ai.vercel.app` | per model |
 | Cloudflare Gateway | `https://gateway.ai.cloudflare.com/v1/.../.../chat/completions` | per model |
 | OpenCode | `https://api.opencode.ai` | per model |
+| Manifest | `https://app.manifest.build/v1` | `auto` |
 | Synthetic | `https://api.synthetic.ai` | per model |
 
 Any endpoint that claims OpenAI chat-completions compatibility should work — if it doesn't, file an issue with a minimal reproducer.
@@ -176,6 +177,17 @@ api_key = "sk-or-..."
 ```
 
 Routes through OpenRouter's fan-out layer. Use when you want one billing relationship across many models.
+
+### Manifest
+
+```toml
+[providers.models.manifest]
+kind = "manifest"
+model = "auto"
+api_key = "mnfst_..."
+```
+
+[Manifest](https://manifest.build) is an open-source LLM router that cuts inference costs through smart routing across 16+ providers. You get full control over which model handles each request. Route by complexity tier, task-specificity (coding, web browsing, etc.) and custom tiers. Manifest can also be self-hosted with Docker for fully private inference, override `base_url` to point to your local instance (e.g. `http://localhost:2099/v1`).
 
 ### Reliable (fallback chain)
 

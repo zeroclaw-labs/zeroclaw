@@ -966,6 +966,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         name if is_bailian_alias(name) => vec!["BAILIAN_API_KEY", "DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
+        "manifest" => vec!["MANIFEST_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
         "opencode-go" => vec!["OPENCODE_GO_API_KEY"],
@@ -1036,6 +1037,8 @@ fn check_api_key_prefix(provider_name: &str, key: &str) -> Option<&'static str> 
         Some("perplexity")
     } else if key.starts_with("xai-") {
         Some("xai")
+    } else if key.starts_with("mnfst_") {
+        Some("manifest")
     } else if key.starts_with("nvapi-") {
         Some("nvidia")
     } else if key.starts_with("KEY-") {
@@ -1054,6 +1057,7 @@ fn check_api_key_prefix(provider_name: &str, key: &str) -> Option<&'static str> 
         "groq" => expected == "groq",
         "perplexity" => expected == "perplexity",
         "xai" | "grok" => expected == "xai",
+        "manifest" => expected == "manifest",
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => expected == "nvidia",
         "telnyx" => expected == "telnyx",
         _ => return None, // Unknown format provider — skip
@@ -1311,6 +1315,12 @@ fn create_provider_with_url_and_options(
                 "KimiCLI/0.77",
             )))
         }
+        "manifest" => Ok(compat(OpenAiCompatibleProvider::new(
+            "Manifest",
+            "https://app.manifest.build/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
         "synthetic" => Ok(compat(OpenAiCompatibleProvider::new(
             "Synthetic",
             "https://api.synthetic.new/openai/v1",
