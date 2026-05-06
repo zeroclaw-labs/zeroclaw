@@ -127,11 +127,19 @@ impl LlamaCppProvider {
 
     fn responses_url(&self) -> String {
         let base = &self.base_url;
+        // Already pointing at the responses endpoint.
         if base.ends_with("/responses") {
             return base.clone();
         }
+        // Derive sibling /responses from /chat/completions.
         if let Some(prefix) = base.strip_suffix("/chat/completions") {
             return format!("{prefix}/responses");
+        }
+        // If the base is a bare host (http://host or http://host:port with no
+        // path), add the standard /v1 prefix that llama-server uses.
+        let after_scheme = base.split_once("://").map(|(_, r)| r).unwrap_or(base);
+        if !after_scheme.contains('/') {
+            return format!("{base}/v1/responses");
         }
         format!("{base}/responses")
     }
@@ -977,5 +985,54 @@ mod strip_tests {
     #[test]
     fn none_in_none_out() {
         assert!(strip_tools_section(None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::LlamaCppProvider;
+
+    fn provider(base: &str) -> LlamaCppProvider {
+        LlamaCppProvider::new(base, None)
+    }
+
+    #[test]
+    fn bare_host_gets_v1_prefix() {
+        assert_eq!(
+            provider("http://localhost:8080").responses_url(),
+            "http://localhost:8080/v1/responses"
+        );
+    }
+
+    #[test]
+    fn v1_path_appends_responses() {
+        assert_eq!(
+            provider("http://localhost:8080/v1").responses_url(),
+            "http://localhost:8080/v1/responses"
+        );
+    }
+
+    #[test]
+    fn chat_completions_derives_sibling() {
+        assert_eq!(
+            provider("http://localhost:8080/v1/chat/completions").responses_url(),
+            "http://localhost:8080/v1/responses"
+        );
+    }
+
+    #[test]
+    fn explicit_responses_url_passthrough() {
+        assert_eq!(
+            provider("http://localhost:8080/v1/responses").responses_url(),
+            "http://localhost:8080/v1/responses"
+        );
+    }
+
+    #[test]
+    fn custom_path_appends_responses() {
+        assert_eq!(
+            provider("http://localhost:8080/openai/v1").responses_url(),
+            "http://localhost:8080/openai/v1/responses"
+        );
     }
 }
