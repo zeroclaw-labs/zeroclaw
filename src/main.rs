@@ -3001,7 +3001,9 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
                 r#"
 # Dynamic completion for zeroclaw config get/set paths
 if type _zeroclaw &>/dev/null; then
-    _zeroclaw_clap_orig() {{ _zeroclaw "$@"; }}
+    # Capture the original clap-generated function body so the wrapper
+    # can fall back to it without entering an infinite recursion loop.
+    eval "$(declare -f _zeroclaw | sed '1s/_zeroclaw/_zeroclaw_clap_orig/')"
     _zeroclaw() {{
         local cur="${{COMP_WORDS[COMP_CWORD]}}"
         if [[ "${{COMP_WORDS[*]}}" =~ "config "(get|set)" " ]]; then
@@ -3973,6 +3975,26 @@ mod tests {
         assert!(
             script.contains("zeroclaw"),
             "completion script should reference binary name"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn bash_completion_avoids_infinite_recursion() {
+        let mut output = Vec::new();
+        write_shell_completion(CompletionShell::Bash, &mut output)
+            .expect("completion generation should succeed");
+        let script = String::from_utf8(output).expect("completion output should be valid utf-8");
+        // The wrapper must capture the original clap-generated function body
+        // (via declare -f) rather than calling _zeroclaw by name, which would
+        // create an infinite recursion loop after _zeroclaw is redefined.
+        assert!(
+            script.contains("declare -f _zeroclaw"),
+            "bash completion should use declare -f to capture the original _zeroclaw function body"
+        );
+        assert!(
+            !script.contains("_zeroclaw_clap_orig() { _zeroclaw \"$@\"; }"),
+            "bash completion must not define _zeroclaw_clap_orig as a simple forwarder to _zeroclaw"
         );
     }
 
