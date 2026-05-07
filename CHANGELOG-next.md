@@ -192,8 +192,16 @@
 
 - **Tool-approval back-channel** via `WsApprovalChannel` so approvals don't
   fight the main message stream (#6387).
-- **Fail-loud model resolution** mirrored across gateway and channels (#6215,
-  follow-up to #6099).
+- **Fail-loud model resolution** at request time across gateway and channels
+  (#6215, refined in #6493 to keep `/onboard` reachable on fresh installs).
+  Misconfigured providers surface a clear error on the first chat call rather
+  than silently substituting a vendor default.
+- **Daemon boots without a configured model** so the browser onboarding flow
+  at `/onboard` is reachable on fresh installs and partially-configured
+  states. The gateway logs a `WARN` pointing at `/onboard` and chat dispatch
+  refuses with a structured `needs_onboarding` marker until at least one
+  `[providers.models.<name>] model = "..."` is set; the channels supervisor
+  exits cleanly instead of restart-looping (#6493).
 - **Connect-time `cwd` parameter** on the WebSocket pins the per-session
   security sandbox root (#6179, follow-on to #6167).
 
@@ -260,7 +268,7 @@
 | CI / docs build | Track `lang-switcher.js.tpl`, generate `.js` at build time (#6395); set workspace `default-run` to unblock docs CI (46235824e); remove the obsolete `CHANGELOG-next.md` cleanup step (#6265). |
 | Config | Preserve dotted provider map keys (#6317); surface `.secret_key` mismatch on enc2 decrypt (#6379). |
 | Docker | Unbreak workspace-member resolution in `Dockerfile` and `Dockerfile.debian` (#6305). |
-| Gateway | Record cost and token usage on every turn (#6159); evict `cancel_tokens` when a session is deleted mid-turn (#6216); fail-loud model resolution mirrored across gateway and channels (#6215). |
+| Gateway | Record cost and token usage on every turn (#6159); evict `cancel_tokens` when a session is deleted mid-turn (#6216); fail-loud model resolution mirrored across gateway and channels (#6215); daemon boots without a configured model so `/onboard` stays reachable on fresh installs and partially-configured states (#6493). |
 | Installation | Use platform-correct web data directory on macOS and Windows (78d2cd6c0); restore web-dashboard extraction in prebuilt install (821fbfcfc, a2c1e2bb2). |
 | Providers (Anthropic) | Respect `base_url` config for the default provider (#6314). |
 | Providers (compatible) | Preserve `tool_call` `extra_content` so Gemini `thoughtSignature` round-trips cleanly (#6264). |
