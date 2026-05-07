@@ -50,6 +50,13 @@ fn protected_indices(messages: &[ChatMessage], keep_recent: usize) -> Vec<bool> 
     protected
 }
 
+/// Returns true when `content` is the collapse placeholder emitted by Phase 1,
+/// i.e. `"[Tool exchange: N tool call(s) — results collapsed]"`. Only these
+/// summaries are candidates for Phase 4 merging — not arbitrary assistant text.
+fn is_tool_exchange_summary(content: &str) -> bool {
+    content.starts_with("[Tool exchange:") && content.contains("results collapsed]")
+}
+
 // ---------------------------------------------------------------------------
 // Orphaned tool-message sanitiser
 // ---------------------------------------------------------------------------
@@ -66,6 +73,11 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
     // Pass 1: Remove assistant(tool_calls) + their tool_results when the
     // assistant is preceded by another assistant. Normalization would merge
     // them, destroying structured tool_use blocks and orphaning the results.
+    //
+    // Exception: collapse summaries produced by Phase 1 also carry the
+    // "assistant" role, but they are not real concurrent responses. Treat them
+    // as transparent so the tool group that follows is preserved rather than
+    // incorrectly stripped (issue #5636 follow-up).
     let mut removed = 0usize;
     let mut i = 0;
     while i < messages.len() {
@@ -73,6 +85,7 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
             && extract_assistant_tool_call_ids(&messages[i].content).is_some()
             && i > 0
             && messages[i - 1].role == "assistant"
+            && !is_tool_exchange_summary(&messages[i - 1].content)
         {
             let doomed_ids =
                 extract_assistant_tool_call_ids(&messages[i].content).unwrap_or_default();
@@ -289,9 +302,70 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
         }
     }
 
-    // Phase 3 – remove orphaned tool messages left behind by phases 1-2.
+    // Phase 3 – merge consecutive collapse-summary assistant messages.
+    //
+    // Phase 1 collapse replaces each `assistant + N tools` group with a
+    // "[Tool exchange: N tool call(s) — results collapsed]" summary. When tool
+    // groups follow each other without an intervening user turn (common in
+    // agent loops that call tools repeatedly), this produces adjacent summary
+    // messages. Providers that enforce strict role alternation (e.g. GLM-5 /
+    // Z.AI coding endpoint, issue #5636) reject these with error 1214.
+    //
+    // This phase runs BEFORE the orphan sweep so that the orphan sweep does not
+    // misidentify the next real assistant(tool_calls) as "preceded by another
+    // assistant" and incorrectly strip its paired tool_result messages.
+    //
+    // Only collapse summaries are merged — not arbitrary plain-text assistant
+    // replies — to avoid concatenating meaningful recent responses into history.
+    let mut i = 0;
+    while i + 1 < messages.len() {
+        let cur_is_summary =
+            messages[i].role == "assistant" && is_tool_exchange_summary(&messages[i].content);
+        let next_is_summary = messages[i + 1].role == "assistant"
+            && is_tool_exchange_summary(&messages[i + 1].content);
+        if cur_is_summary && next_is_summary {
+            let next_content = messages.remove(i + 1).content;
+            messages[i].content.push_str("\n\n");
+            messages[i].content.push_str(&next_content);
+            dropped_messages += 1;
+            // Re-check index i — the new neighbour may also be a summary.
+        } else {
+            i += 1;
+        }
+    }
+
+    // Phase 4 – remove orphaned tool messages left behind by phases 1-3.
     let orphans_removed = remove_orphaned_tool_messages(messages);
     dropped_messages += orphans_removed;
+
+    // Phase 5 – safety valve: insert placeholder user turns between any
+    // remaining consecutive assistant messages.
+    //
+    // Phases 1-4 eliminate most consecutive-assistant sequences, but one case
+    // is structurally unresolvable without insertion: when a collapse summary
+    // ends up adjacent to a real assistant(tool_calls) whose tool_result is
+    // protected by `keep_recent` (the "straddle" scenario). The assistant
+    // cannot be collapsed (tool protected) or merged (JSON structure must be
+    // preserved), yet it still produces adjacent assistant messages.
+    //
+    // Inserting a lightweight placeholder user message is the standard adapter
+    // technique for satisfying strict role-alternation requirements (GLM-5,
+    // issue #5636) without discarding any content.
+    let mut i = 0;
+    while i + 1 < messages.len() {
+        if messages[i].role == "assistant" && messages[i + 1].role == "assistant" {
+            messages.insert(
+                i + 1,
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: "[context continues]".to_string(),
+                },
+            );
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
 
     PruneStats {
         messages_before,
@@ -892,5 +966,84 @@ mod tests {
              got roles {:?}",
             messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
         );
+    }
+
+    /// Regression test for issue #5636: GLM-5 / Z.AI error 1214 after preemptive trim.
+    ///
+    /// An agent loop calls tools repeatedly with no user turns between iterations.
+    /// Phase 1 collapse produces one summary assistant message per group, leaving
+    /// adjacent assistant messages. Phase 4 must merge them.
+    #[test]
+    fn prune_merges_consecutive_collapsed_assistant_messages() {
+        let tool_json = |id: &str| {
+            format!(
+                r#"{{"content":null,"tool_calls":[{{"id":"{id}","name":"web_search","arguments":"{{}}"}}]}}"#
+            )
+        };
+        let tool_result = |id: &str| format!(r#"{{"tool_call_id":"{id}","content":"result"}}"#);
+
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("user", "run science digest"),
+            msg("assistant", &tool_json("t1")),
+            msg("tool", &tool_result("t1")),
+            msg("assistant", &tool_json("t2")),
+            msg("tool", &tool_result("t2")),
+            msg("assistant", &tool_json("t3")),
+            msg("tool", &tool_result("t3")),
+            // protected by keep_recent=2
+            msg("assistant", "final answer"),
+        ];
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 100_000,
+            keep_recent: 2,
+            collapse_tool_results: true,
+        };
+
+        prune_history(&mut messages, &config);
+
+        // No two consecutive assistant messages anywhere in the result
+        for i in 0..messages.len().saturating_sub(1) {
+            assert!(
+                !(messages[i].role == "assistant" && messages[i + 1].role == "assistant"),
+                "consecutive assistant messages at {i}/{}: {:?}",
+                i + 1,
+                messages
+                    .iter()
+                    .map(|m| (&m.role, &m.content))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(messages.iter().any(|m| m.content == "final answer"));
+        assert!(messages.iter().any(|m| m.role == "system"));
+        assert!(messages.iter().any(|m| m.role == "user"));
+    }
+
+    /// Phase 4 must not merge JSON assistant messages (those with tool_calls).
+    #[test]
+    fn prune_does_not_merge_json_tool_calls_assistant() {
+        let tool_json =
+            r#"{"content":null,"tool_calls":[{"id":"t1","name":"shell","arguments":"{}"}]}"#;
+        let tool_result = r#"{"tool_call_id":"t1","content":"ok"}"#;
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("user", "do it"),
+            msg("assistant", tool_json),
+            msg("tool", tool_result),
+            msg("assistant", "done"),
+        ];
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 100_000,
+            keep_recent: 5,
+            collapse_tool_results: false,
+        };
+        let stats = prune_history(&mut messages, &config);
+        // Nothing should be merged or dropped
+        assert_eq!(stats.collapsed_pairs, 0);
+        assert_eq!(stats.dropped_messages, 0);
+        assert_eq!(messages.len(), 5);
     }
 }

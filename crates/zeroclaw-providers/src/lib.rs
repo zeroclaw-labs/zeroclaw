@@ -1387,21 +1387,31 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
-            "Z.AI",
-            zai_base_url(name).expect("checked in guard"),
-            key,
-            AuthStyle::ZhipuJwt,
-        ))),
+        name if zai_base_url(name).is_some() => {
+            let url = api_url
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| zai_base_url(name).expect("checked in guard"));
+            Ok(compat(OpenAiCompatibleProvider::new(
+                "Z.AI",
+                url,
+                key,
+                AuthStyle::ZhipuJwt,
+            )))
+        }
         name if glm_base_url(name).is_some() => {
             // GLM offers vision-capable models (e.g. `glm-4.5v`). Mark the
             // provider as vision-capable so multimodal routing accepts it.
             // The specific model still has to be a vision-capable one;
             // text-only models will return an API error if given an image,
             // matching the behaviour of other multi-modal providers.
+            let url = api_url
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| glm_base_url(name).expect("checked in guard"));
             Ok(compat(OpenAiCompatibleProvider::new_with_vision(
                 "GLM",
-                glm_base_url(name).expect("checked in guard"),
+                url,
                 key,
                 AuthStyle::ZhipuJwt,
                 true,
