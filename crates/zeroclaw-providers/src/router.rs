@@ -27,6 +27,7 @@ pub struct RouterProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
     default_index: usize,
     default_model: String,
+    temperature_overrides: HashMap<String, f64>, // hint → per-route temperature
 }
 
 impl RouterProvider {
@@ -38,6 +39,17 @@ impl RouterProvider {
         providers: Vec<(String, Box<dyn Provider>)>,
         routes: Vec<(String, Route)>,
         default_model: String,
+    ) -> Self {
+        Self::new_with_overrides(providers, routes, default_model, HashMap::new())
+    }
+
+    /// Like `new`, but also accepts per-hint temperature overrides built from
+    /// `[[providers.model_routes]]` entries that carry a `temperature` field.
+    pub fn new_with_overrides(
+        providers: Vec<(String, Box<dyn Provider>)>,
+        routes: Vec<(String, Route)>,
+        default_model: String,
+        temperature_overrides: HashMap<String, f64>,
     ) -> Self {
         // Build provider name → index lookup
         let name_to_index: HashMap<&str, usize> = providers
@@ -70,7 +82,19 @@ impl RouterProvider {
             providers,
             default_index: 0,
             default_model,
+            temperature_overrides,
         }
+    }
+
+    /// Return the effective temperature for a request: use the per-route override
+    /// when the model string is a matching hint, otherwise fall back to the caller value.
+    fn effective_temperature(&self, model: &str, temperature: Option<f64>) -> Option<f64> {
+        if let Some(hint) = model.strip_prefix("hint:") {
+            if let Some(&t) = self.temperature_overrides.get(hint) {
+                return Some(t);
+            }
+        }
+        temperature
     }
 
     /// Resolve a model parameter to the cheapest qualifying route based on pricing.
@@ -204,7 +228,7 @@ impl Provider for RouterProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let (provider_idx, resolved_model) = self.resolve(model);
-
+        let temperature = self.effective_temperature(model, temperature);
         let (provider_name, provider) = &self.providers[provider_idx];
         tracing::info!(
             provider = provider_name.as_str(),
@@ -224,6 +248,7 @@ impl Provider for RouterProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let (provider_idx, resolved_model) = self.resolve(model);
+        let temperature = self.effective_temperature(model, temperature);
         let (_, provider) = &self.providers[provider_idx];
         provider
             .chat_with_history(messages, &resolved_model, temperature)
@@ -237,6 +262,7 @@ impl Provider for RouterProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
+        let temperature = self.effective_temperature(model, temperature);
         let (_, provider) = &self.providers[provider_idx];
         provider.chat(request, &resolved_model, temperature).await
     }
@@ -249,6 +275,7 @@ impl Provider for RouterProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
+        let temperature = self.effective_temperature(model, temperature);
         let (_, provider) = &self.providers[provider_idx];
         provider
             .chat_with_tools(messages, tools, &resolved_model, temperature)
@@ -282,6 +309,7 @@ impl Provider for RouterProvider {
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
         let (provider_idx, resolved_model) = self.resolve(model);
+        let temperature = self.effective_temperature(model, temperature);
         let (_, provider) = &self.providers[provider_idx];
         provider.stream_chat_with_history(messages, &resolved_model, temperature, options)
     }
@@ -294,6 +322,7 @@ impl Provider for RouterProvider {
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
         let (provider_idx, resolved_model) = self.resolve(model);
+        let temperature = self.effective_temperature(model, temperature);
         let (_, provider) = &self.providers[provider_idx];
         provider.stream_chat(request, &resolved_model, temperature, options)
     }

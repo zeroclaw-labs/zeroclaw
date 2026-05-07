@@ -1939,20 +1939,35 @@ pub fn create_routed_provider_with_options(
         );
     }
 
-    // Collect unique provider names needed
-    let mut needed: Vec<String> = vec![primary_name.to_string()];
+    // Collect needed provider instances.
+    //
+    // Routes with a `max_tokens` override get a dedicated provider instance so
+    // they don't share the output-token budget with other routes.  These
+    // instances are identified by a synthetic name of the form
+    // `"{provider}::max_tokens::{n}"`.  Routes without an override share the
+    // provider instance keyed by the raw provider name.
+    //
+    // Each entry: (synthetic_name, actual_provider_type, max_tokens_override)
+    let mut needed: Vec<(String, String, Option<u32>)> =
+        vec![(primary_name.to_string(), primary_name.to_string(), None)];
+
     for route in model_routes {
-        if !needed.iter().any(|n| n == &route.provider) {
-            needed.push(route.provider.clone());
+        if let Some(mt) = route.max_tokens {
+            let synthetic = format!("{}::max_tokens::{}", route.provider, mt);
+            if !needed.iter().any(|(n, _, _)| n == &synthetic) {
+                needed.push((synthetic, route.provider.clone(), Some(mt)));
+            }
+        } else if !needed.iter().any(|(n, _, _)| n == &route.provider) {
+            needed.push((route.provider.clone(), route.provider.clone(), None));
         }
     }
 
     // Create each provider (with its own resilience wrapper)
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
-    for name in &needed {
+    for (synthetic_name, actual_name, max_tokens_override) in &needed {
         let routed_credential = model_routes
             .iter()
-            .find(|r| &r.provider == name)
+            .find(|r| &r.provider == actual_name)
             .and_then(|r| {
                 r.api_key.as_ref().and_then(|raw_key| {
                     let trimmed_key = raw_key.trim();
@@ -1961,39 +1976,62 @@ pub fn create_routed_provider_with_options(
             });
         let key = routed_credential.or(api_key);
         // Only use api_url for the primary provider
-        let url = if name == primary_name { api_url } else { None };
-        match create_resilient_provider_with_options(name, key, url, reliability, options) {
-            Ok(provider) => providers.push((name.clone(), provider)),
+        let url = if actual_name == primary_name { api_url } else { None };
+        // Clone options so per-route max_tokens doesn't bleed into other instances
+        let mut route_options = options.clone();
+        if let Some(mt) = max_tokens_override {
+            route_options.provider_max_tokens = Some(*mt);
+        }
+        match create_resilient_provider_with_options(
+            actual_name,
+            key,
+            url,
+            reliability,
+            &route_options,
+        ) {
+            Ok(provider) => providers.push((synthetic_name.clone(), provider)),
             Err(e) => {
-                if name == primary_name {
+                if synthetic_name == primary_name {
                     return Err(e);
                 }
                 tracing::warn!(
-                    provider = name.as_str(),
+                    provider = synthetic_name.as_str(),
                     "Ignoring routed provider that failed to initialize"
                 );
             }
         }
     }
 
-    // Build route table
+    // Build route table — routes with max_tokens point to their synthetic instance
     let routes: Vec<(String, router::Route)> = model_routes
         .iter()
         .map(|r| {
+            let provider_name = if r.max_tokens.is_some() {
+                format!("{}::max_tokens::{}", r.provider, r.max_tokens.unwrap())
+            } else {
+                r.provider.clone()
+            };
             (
                 r.hint.clone(),
                 router::Route {
-                    provider_name: r.provider.clone(),
+                    provider_name,
                     model: r.model.clone(),
                 },
             )
         })
         .collect();
 
-    Ok(Box::new(router::RouterProvider::new(
+    // Per-route temperature overrides
+    let temperature_overrides: std::collections::HashMap<String, f64> = model_routes
+        .iter()
+        .filter_map(|r| r.temperature.map(|t| (r.hint.clone(), t)))
+        .collect();
+
+    Ok(Box::new(router::RouterProvider::new_with_overrides(
         providers,
         routes,
         default_model.to_string(),
+        temperature_overrides,
     )))
 }
 

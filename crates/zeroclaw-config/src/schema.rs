@@ -6195,6 +6195,14 @@ pub struct ModelRouteConfig {
     /// Optional API key override for this route's provider
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Override the maximum output tokens for this route. When set, a dedicated
+    /// provider instance is created so other routes are not affected.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Override the sampling temperature for this route. Takes precedence over
+    /// the caller-supplied temperature when the hint matches.
+    #[serde(default)]
+    pub temperature: Option<f64>,
 }
 
 // ── Embedding routing ───────────────────────────────────────────
