@@ -15,7 +15,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, warn};
 
 // ── Request / response structs ──────────────────────────────────────────────
@@ -746,6 +746,10 @@ fn parse_sse_responses(
         }
 
         let mut pending: HashMap<String, (String, String)> = HashMap::new();
+        // Track item_ids that have already emitted at least one delta (text or reasoning),
+        // so the corresponding *done events can serve as fallbacks for non-streaming models.
+        let mut text_delta_seen: HashSet<String> = HashSet::new();
+        let mut reasoning_delta_seen: HashSet<String> = HashSet::new();
         let mut buffer = String::new();
         let mut utf8_buf: Vec<u8> = Vec::new();
         let mut bytes_stream = response.bytes_stream();
@@ -809,7 +813,14 @@ fn parse_sse_responses(
                 debug!("llama.cpp SSE event type={kind:?}");
 
                 match kind {
+                    // Response lifecycle bookkeeping — no action needed.
+                    "response.created" | "response.in_progress" => {}
+                    // A new output_text part is starting; actual content follows via delta/done.
+                    "response.content_part.added" => {}
                     "response.output_text.delta" => {
+                        if let Some(item_id) = event.get("item_id").and_then(|v| v.as_str()) {
+                            text_delta_seen.insert(item_id.to_string());
+                        }
                         match event.get("delta").and_then(|v| v.as_str()) {
                             Some(delta) if !delta.is_empty() => {
                                 let mut chunk = StreamChunk::delta(delta.to_string());
@@ -823,10 +834,65 @@ fn parse_sse_responses(
                             _ => debug!("llama.cpp output_text.delta had no string delta: {event}"),
                         }
                     }
-                    // Chain-of-thought reasoning content — discard, wait for output_text.delta.
+                    // Emitted when a text part is complete.  Fallback for models that don't
+                    // stream character-by-character deltas.
+                    "response.output_text.done" => {
+                        let item_id = event.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+                        if !text_delta_seen.contains(item_id) {
+                            if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
+                                if !text.is_empty() {
+                                    let mut chunk = StreamChunk::delta(text.to_string());
+                                    if count_tokens {
+                                        chunk = chunk.with_token_estimate();
+                                    }
+                                    if tx.send(Ok(StreamEvent::TextDelta(chunk))).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // content_part.done duplicates output_text.done for text parts; discard.
+                    "response.content_part.done" => {}
+                    // Chain-of-thought reasoning/thinking content from the model.
                     "response.reasoning_text.delta"
                     | "response.reasoning_summary_text.delta"
-                    | "response.reasoning.delta" => {}
+                    | "response.reasoning.delta" => {
+                        if let Some(item_id) = event.get("item_id").and_then(|v| v.as_str()) {
+                            reasoning_delta_seen.insert(item_id.to_string());
+                        }
+                        if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                            if !delta.is_empty() {
+                                if tx
+                                    .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
+                                        delta.to_string(),
+                                    ))))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    // Fallback for non-streaming reasoning output.
+                    "response.reasoning_text.done" | "response.reasoning.done" => {
+                        let item_id = event.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+                        if !reasoning_delta_seen.contains(item_id) {
+                            if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
+                                if !text.is_empty()
+                                    && tx
+                                        .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
+                                            text.to_string(),
+                                        ))))
+                                        .await
+                                        .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     "response.output_item.added" => {
                         if let Some(item) = event.get("item")
                             && item.get("type").and_then(|v| v.as_str()) == Some("function_call")
