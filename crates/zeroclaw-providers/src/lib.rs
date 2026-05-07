@@ -106,7 +106,6 @@ pub fn is_minimax_cn_alias(name: &str) -> bool {
         "minimax-cn" | "minimaxi" | "minimax-oauth-cn" | "minimax-portal-cn"
     )
 }
-
 pub fn is_minimax_alias(name: &str) -> bool {
     is_minimax_intl_alias(name) || is_minimax_cn_alias(name)
 }
