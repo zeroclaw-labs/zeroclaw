@@ -376,22 +376,27 @@ interactive_feature_picker() {
   done
 
   selected=""
-  echo
-  printf "  %s\n" "$(bold "Optional features (off by default):")"
-  printf "  %s\n" "Type the numbers to toggle, blank line to confirm."
-  printf "  %s\n" "Default features (agent runtime, gateway, …) are always on."
-  echo
+  # Prompt-side output goes to stderr so the picker's stdout — captured
+  # by the caller's `PICKED=$(interactive_feature_picker …)` — only
+  # carries the final selection. Without this redirect every prompt
+  # silently disappears into the variable and the user sees a frozen
+  # terminal.
+  echo >&2
+  printf "  %s\n" "$(bold "Optional features (off by default):")" >&2
+  printf "  %s\n" "Type the numbers to toggle, blank line to confirm." >&2
+  printf "  %s\n" "Default features (agent runtime, gateway, …) are always on." >&2
+  echo >&2
 
   while :; do
     i=1
     for feat in $picker_features; do
       mark=" "
       case " $selected " in *" $feat "*) mark="✓" ;; esac
-      printf "    [%2d] %s %s\n" "$i" "$mark" "$feat"
+      printf "    [%2d] %s %s\n" "$i" "$mark" "$feat" >&2
       i=$((i + 1))
     done
-    echo
-    printf "  toggle (e.g. \"1 3 5\"), %s confirm: " "$(bold "Enter to")"
+    echo >&2
+    printf "  toggle (e.g. \"1 3 5\"), %s confirm: " "$(bold "Enter to")" >&2
     read -r choices
     [ -z "$choices" ] && break
     for n in $choices; do
