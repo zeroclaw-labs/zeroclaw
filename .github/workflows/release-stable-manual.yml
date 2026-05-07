@@ -79,16 +79,28 @@ jobs:
   web:
     name: Build Web Dashboard
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Build web dashboard
-        run: cd web && npm ci && npm run build
+        # `cargo web build` is the xtask wrapper that:
+        # 1. renders the gateway's OpenAPI 3.1 spec in-process,
+        # 2. runs `npx openapi-typescript` to produce
+        #    `web/src/lib/api-generated.ts` (gitignored — never
+        #    committed since #4f60f4405),
+        # 3. runs `npm ci` + `npm run build` (tsc + vite).
+        # Plain `cd web && npm run build` skips step 1+2 and tsc
+        # fails on the missing import.
+        run: cargo web build
       - uses: actions/upload-artifact@v4
         with:
           name: web-dist
