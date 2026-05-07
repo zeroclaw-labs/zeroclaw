@@ -726,11 +726,17 @@ pub fn all_tools_with_runtime(
 
     // PDF extraction (feature-gated at compile time via rag-pdf)
     #[cfg(feature = "rag-pdf")]
-    tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
+    tool_arcs.push(Arc::new(RateLimitedTool::new(
+        PathGuardedTool::new(PdfReadTool::new(security.clone()), security.clone()),
+        security.clone(),
+    )));
 
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
-    tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+    tool_arcs.push(Arc::new(RateLimitedTool::new(
+        PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
+        security.clone(),
+    )));
 
     // Session tools share the channel orchestrator's backend via the
     // `make_session_backend` factory, keyed off `[channels].session_backend`.

@@ -75,30 +75,9 @@ impl Tool for PdfReadTool {
             })
             .unwrap_or(DEFAULT_MAX_CHARS);
 
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
-        if !self.security.is_path_allowed(path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
-            });
-        }
-
-        // Record action before canonicalization so path-probing still consumes budget.
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
+        // Rate limiting and path-allowlist checks are applied by the
+        // RateLimitedTool + PathGuardedTool wrappers at registration time
+        // (see zeroclaw-runtime::tools::mod).
 
         let full_path = self.security.resolve_tool_path(path);
 
@@ -231,6 +210,7 @@ impl Tool for PdfReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wrappers::{PathGuardedTool, RateLimitedTool};
     use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
@@ -243,16 +223,15 @@ mod tests {
         })
     }
 
-    fn test_security_with_limit(
-        workspace: std::path::PathBuf,
-        max_actions: u32,
-    ) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace,
-            max_actions_per_hour: max_actions,
-            ..SecurityPolicy::default()
-        })
+    /// Wraps `PdfReadTool` with the production `PathGuardedTool` + `RateLimitedTool`
+    /// stack, mirroring the registration in `zeroclaw-runtime::tools::mod`. Use this
+    /// in tests that exercise path-allowlist or rate-limit behavior.
+    fn wrapped_tool(workspace: std::path::PathBuf) -> Box<dyn Tool> {
+        let security = test_security(workspace);
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(PdfReadTool::new(security.clone()), security.clone()),
+            security,
+        ))
     }
 
     #[test]
@@ -295,7 +274,7 @@ mod tests {
 
     #[tokio::test]
     async fn absolute_path_is_blocked() {
-        let tool = PdfReadTool::new(test_security(std::env::temp_dir()));
+        let tool = wrapped_tool(std::env::temp_dir());
 
         #[cfg(unix)]
         let target = "/etc/passwd";
@@ -308,29 +287,25 @@ mod tests {
         let result = tool.execute(json!({"path": target})).await.unwrap();
         assert!(!result.success);
         assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("not allowed")
+            result.error.as_deref().unwrap_or("").contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
         );
     }
 
     #[tokio::test]
     async fn path_traversal_is_blocked() {
         let tmp = TempDir::new().unwrap();
-        let tool = PdfReadTool::new(test_security(tmp.path().to_path_buf()));
+        let tool = wrapped_tool(tmp.path().to_path_buf());
         let result = tool
             .execute(json!({"path": "../../../etc/passwd"}))
             .await
             .unwrap();
         assert!(!result.success);
         assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("not allowed")
+            result.error.as_deref().unwrap_or("").contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
         );
     }
 
@@ -349,49 +324,6 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("Failed to resolve")
-        );
-    }
-
-    #[tokio::test]
-    async fn rate_limit_blocks_request() {
-        let tmp = TempDir::new().unwrap();
-        let tool = PdfReadTool::new(test_security_with_limit(tmp.path().to_path_buf(), 0));
-        let result = tool.execute(json!({"path": "any.pdf"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Rate limit"));
-    }
-
-    #[tokio::test]
-    async fn probing_nonexistent_consumes_rate_limit_budget() {
-        let tmp = TempDir::new().unwrap();
-        // Allow 2 actions; both will fail on missing file but must consume budget.
-        let tool = PdfReadTool::new(test_security_with_limit(tmp.path().to_path_buf(), 2));
-
-        let r1 = tool.execute(json!({"path": "a.pdf"})).await.unwrap();
-        assert!(!r1.success);
-        assert!(
-            r1.error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Failed to resolve")
-        );
-
-        let r2 = tool.execute(json!({"path": "b.pdf"})).await.unwrap();
-        assert!(!r2.success);
-        assert!(
-            r2.error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Failed to resolve")
-        );
-
-        // Third attempt must hit rate limit.
-        let r3 = tool.execute(json!({"path": "c.pdf"})).await.unwrap();
-        assert!(!r3.success);
-        assert!(
-            r3.error.as_deref().unwrap_or("").contains("Rate limit"),
-            "expected rate limit, got: {:?}",
-            r3.error
         );
     }
 

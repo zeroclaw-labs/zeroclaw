@@ -15,6 +15,11 @@ const MAX_IMAGE_BYTES: u64 = 5_242_880;
 /// (file size, format, dimensions from header bytes) and provides base64
 /// data for future multimodal provider support.
 pub struct ImageInfoTool {
+    // Held for API symmetry with other tools and to keep room for future
+    // tool-specific checks (e.g. post-canonicalization is_resolved_path_allowed).
+    // Pre-canonicalization path-allowlist enforcement now lives in the
+    // PathGuardedTool wrapper applied at registration time.
+    #[allow(dead_code)]
     security: Arc<SecurityPolicy>,
 }
 
@@ -158,16 +163,9 @@ impl Tool for ImageInfoTool {
 
         let path = Path::new(path_str);
 
-        // Restrict reads to workspace directory to prevent arbitrary file exfiltration
-        if !self.security.is_path_allowed(path_str) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Path not allowed: {path_str} (must be within workspace)"
-                )),
-            });
-        }
+        // Path-allowlist checks are applied by the PathGuardedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod). Rate limiting
+        // for this tool is also wrapper-driven via RateLimitedTool.
 
         if !path.exists() {
             return Ok(ToolResult {
