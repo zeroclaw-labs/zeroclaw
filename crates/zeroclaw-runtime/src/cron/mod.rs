@@ -62,7 +62,8 @@ pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()>
         bail!("delivery.channel is required for announce mode");
     };
     match channel.to_ascii_lowercase().as_str() {
-        "telegram" | "discord" | "slack" | "mattermost" | "signal" | "matrix" | "qq" => {}
+        "telegram" | "discord" | "slack" | "mattermost" | "signal" | "matrix" | "qq"
+        | "whatsapp" => {}
         other => bail!("unsupported delivery channel: {other}"),
     }
 
@@ -742,5 +743,59 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].job_type, JobType::Shell);
         assert_eq!(jobs[0].command, "echo ok");
+    }
+}
+
+#[cfg(test)]
+mod delivery_validation_tests {
+    use super::*;
+
+    #[test]
+    fn validate_delivery_config_accepts_all_supported_channels() {
+        for channel in [
+            "telegram",
+            "discord",
+            "slack",
+            "mattermost",
+            "signal",
+            "matrix",
+            "qq",
+            "whatsapp",
+        ] {
+            let delivery = DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some(channel.into()),
+                to: Some("dest-1".into()),
+                best_effort: true,
+            };
+            validate_delivery_config(Some(&delivery))
+                .unwrap_or_else(|err| panic!("channel {channel} should be accepted: {err}"));
+        }
+    }
+
+    #[test]
+    fn validate_delivery_config_accepts_whatsapp_case_insensitive() {
+        for variant in ["whatsapp", "WhatsApp", "WHATSAPP"] {
+            let delivery = DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some(variant.into()),
+                to: Some("+15551234567".into()),
+                best_effort: true,
+            };
+            validate_delivery_config(Some(&delivery))
+                .unwrap_or_else(|err| panic!("variant {variant} should be accepted: {err}"));
+        }
+    }
+
+    #[test]
+    fn validate_delivery_config_rejects_unsupported_channel() {
+        let delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("notarealchannel".into()),
+            to: Some("dest".into()),
+            best_effort: true,
+        };
+        let err = validate_delivery_config(Some(&delivery)).unwrap_err();
+        assert!(err.to_string().contains("unsupported delivery channel"));
     }
 }

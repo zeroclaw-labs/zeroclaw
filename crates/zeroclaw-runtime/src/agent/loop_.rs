@@ -749,7 +749,7 @@ fn maybe_inject_channel_delivery_defaults(
 
     if !matches!(
         channel_name,
-        "telegram" | "discord" | "slack" | "mattermost" | "matrix"
+        "telegram" | "discord" | "slack" | "mattermost" | "matrix" | "qq" | "whatsapp"
     ) {
         return;
     }
@@ -5327,6 +5327,78 @@ mod tests {
                 "mode": "announce",
                 "channel": "telegram",
                 "to": "chat-42",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_whatsapp_delivery_defaults_for_cron_add() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"job_type":"agent","prompt":"daily news brief","schedule":{"kind":"every","every_ms":60000}}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "cron_add",
+            Arc::clone(&recorded_args),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("send me news every minute on whatsapp"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "whatsapp",
+            Some("+15551234567"),
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("cron_add delivery defaults should be injected for whatsapp");
+
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
+
+        let recorded = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        let delivery = recorded[0]["delivery"].clone();
+        assert_eq!(
+            delivery,
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "whatsapp",
+                "to": "+15551234567",
             })
         );
     }

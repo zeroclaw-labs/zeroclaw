@@ -6164,6 +6164,92 @@ pub async fn deliver_announcement(
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
+        "mattermost" => {
+            let mm = config
+                .channels
+                .mattermost
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("mattermost channel not configured"))?;
+            let ch = MattermostChannel::new(
+                mm.url.clone(),
+                mm.bot_token.clone(),
+                mm.channel_id.clone(),
+                mm.allowed_users.clone(),
+                mm.thread_replies.unwrap_or(true),
+                mm.mention_only.unwrap_or(false),
+            );
+            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
+                .await?;
+        }
+        "matrix" => {
+            #[cfg(feature = "channel-matrix")]
+            {
+                let mx = config
+                    .channels
+                    .matrix
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("matrix channel not configured"))?;
+                let state_dir = config
+                    .config_path
+                    .parent()
+                    .map(|p| p.join("state").join("matrix"))
+                    .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix"));
+                let ch = MatrixChannel::new(mx.clone(), state_dir)?
+                    .with_workspace_dir(config.workspace_dir.clone());
+                zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
+                    .await?;
+            }
+            #[cfg(not(feature = "channel-matrix"))]
+            {
+                anyhow::bail!("Matrix channel requires the `channel-matrix` feature");
+            }
+        }
+        "qq" => {
+            let qq = config
+                .channels
+                .qq
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("qq channel not configured"))?;
+            let ch = QQChannel::new(
+                qq.app_id.clone(),
+                qq.app_secret.clone(),
+                qq.allowed_users.clone(),
+            );
+            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
+                .await?;
+        }
+        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
+            #[cfg(feature = "whatsapp-web")]
+            {
+                let wa = config
+                    .channels
+                    .whatsapp
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("whatsapp channel not configured"))?;
+                if !wa.is_web_config() {
+                    anyhow::bail!(
+                        "WhatsApp channel send requires Web mode (session_path must be set)"
+                    );
+                }
+                let ch = WhatsAppWebChannel::new(
+                    wa.session_path.clone().unwrap_or_default(),
+                    wa.pair_phone.clone(),
+                    wa.pair_code.clone(),
+                    wa.allowed_numbers.clone(),
+                    wa.mention_only,
+                    wa.mode.clone(),
+                    wa.dm_policy.clone(),
+                    wa.group_policy.clone(),
+                    wa.self_chat_mode,
+                );
+                zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
+                    .await?;
+            }
+            #[cfg(not(feature = "whatsapp-web"))]
+            {
+                anyhow::bail!("WhatsApp channel requires the `whatsapp-web` feature");
+            }
+        }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
     Ok(())

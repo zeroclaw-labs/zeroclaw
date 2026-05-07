@@ -146,7 +146,7 @@ impl Tool for CronAddTool {
                         },
                         "channel": {
                             "type": "string",
-                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq"],
+                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "whatsapp"],
                             "description": "Channel type to deliver output to"
                         },
                         "to": {
@@ -475,6 +475,60 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn shell_job_persists_whatsapp_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok",
+                "delivery": {
+                    "mode": "announce",
+                    "channel": "whatsapp",
+                    "to": "+15551234567",
+                    "best_effort": true
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].delivery.mode, "announce");
+        assert_eq!(jobs[0].delivery.channel.as_deref(), Some("whatsapp"));
+        assert_eq!(jobs[0].delivery.to.as_deref(), Some("+15551234567"));
+        assert!(jobs[0].delivery.best_effort);
+    }
+
+    #[tokio::test]
+    async fn schema_delivery_channel_enum_includes_whatsapp() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let schema = tool.parameters_schema();
+
+        let channel_enum = schema["properties"]["delivery"]["properties"]["channel"]["enum"]
+            .as_array()
+            .expect("delivery.channel must have an enum");
+        let channel_strs: Vec<&str> = channel_enum.iter().filter_map(|v| v.as_str()).collect();
+        for ch in &[
+            "telegram",
+            "discord",
+            "slack",
+            "mattermost",
+            "matrix",
+            "qq",
+            "whatsapp",
+        ] {
+            assert!(channel_strs.contains(ch), "delivery.channel missing: {ch}");
+        }
     }
 
     #[tokio::test]
