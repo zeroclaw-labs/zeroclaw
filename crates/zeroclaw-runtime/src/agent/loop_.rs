@@ -57,8 +57,8 @@ use zeroclaw_providers::{
 
 // Cost tracking moved to `super::cost`.
 pub use super::cost::{
-    TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, check_tool_loop_budget,
-    record_tool_loop_cost_usage,
+    TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, TurnUsage,
+    check_tool_loop_budget, record_tool_loop_cost_usage,
 };
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -568,6 +568,7 @@ struct StreamedChatOutcome {
     reasoning_content: String,
     tool_calls: Vec<ToolCall>,
     forwarded_live_deltas: bool,
+    usage: Option<zeroclaw_providers::traits::TokenUsage>,
 }
 
 async fn consume_provider_streaming_response(
@@ -610,6 +611,9 @@ async fn consume_provider_streaming_response(
         let event = event_result.map_err(|err| anyhow::anyhow!("provider stream error: {err}"))?;
         match event {
             StreamEvent::Final => break,
+            StreamEvent::Usage(usage) => {
+                outcome.usage = Some(usage);
+            }
             StreamEvent::ToolCall(tool_call) => {
                 outcome.tool_calls.push(tool_call);
                 suppress_forwarding = true;
@@ -1141,7 +1145,7 @@ pub async fn run_tool_call_loop(
                     Ok(zeroclaw_providers::ChatResponse {
                         text: Some(streamed.response_text),
                         tool_calls: streamed.tool_calls,
-                        usage: None,
+                        usage: streamed.usage,
                         reasoning_content,
                     })
                 }
@@ -2493,7 +2497,7 @@ pub async fn run(
     let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
         crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.workspace_dir)
             .map(|tracker| {
-                ToolLoopCostTrackingContext::new(tracker, Arc::new(config.cost.prices.clone()))
+                ToolLoopCostTrackingContext::new(tracker, Arc::new(config.combined_pricing()))
             });
 
     // ── Execute ──────────────────────────────────────────────────

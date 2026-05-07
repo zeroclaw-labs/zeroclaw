@@ -1354,6 +1354,7 @@ impl Agent {
 
             let mut streamed_text = String::new();
             let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
+            let mut streamed_usage: Option<zeroclaw_providers::traits::TokenUsage> = None;
             let mut got_stream = false;
             let mut pre_executed_call_ids: HashMap<String, VecDeque<String>> = HashMap::new();
             let mut was_cancelled = false;
@@ -1436,6 +1437,9 @@ impl Agent {
                                 })
                                 .await;
                         }
+                        zeroclaw_providers::traits::StreamEvent::Usage(usage) => {
+                            streamed_usage = Some(usage);
+                        }
                         zeroclaw_providers::traits::StreamEvent::Final => break,
                     },
                     Err(_) => break,
@@ -1467,7 +1471,7 @@ impl Agent {
                 zeroclaw_providers::ChatResponse {
                     text: Some(streamed_text),
                     tool_calls: streamed_tool_calls,
-                    usage: None,
+                    usage: streamed_usage.clone(),
                     reasoning_content: None,
                 }
             } else {
@@ -1500,6 +1504,20 @@ impl Agent {
                     Err(err) => return Err(err),
                 }
             };
+
+            // Forward per-call token usage so the WS gateway (and any other
+            // consumer) can include aggregated usage in the final done frame
+            // and write costs.jsonl. Absent when the provider does not surface
+            // usage in streaming responses.
+            if let Some(ref usage) = response.usage {
+                let _ = event_tx
+                    .send(TurnEvent::Usage {
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        cost_usd: None,
+                    })
+                    .await;
+            }
 
             let (text, mut calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {

@@ -295,3 +295,8 @@ cli-desktop-long-about =
     Examples:
       zeroclaw desktop              # launch the companion app
       zeroclaw desktop --install    # download and install it
+
+# Channel-side reply emitted when chat dispatch refuses because the
+# gateway has no model configured. Used by the gateway crate channel
+# webhook handlers (WhatsApp, Linq, WATI, Nextcloud Talk).
+channel-needs-onboarding-reply = This agent isn't fully set up yet. The operator needs to complete onboarding before I can reply.

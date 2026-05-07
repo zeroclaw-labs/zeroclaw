@@ -2527,8 +2527,8 @@ msgid "`zeroclawlabs/zeroclaw:latest` — latest stable"
 msgstr "`zeroclawlabs/zeroclaw:latest` — 最新の安定版"
 
 #: src/setup/container.md:10
-msgid "`zeroclawlabs/zeroclaw:v0.7.4` — pinned"
-msgstr "`zeroclawlabs/zeroclaw:v0.7.4` — ピン留め済み"
+msgid "`zeroclawlabs/zeroclaw:v0.7.5` — pinned"
+msgstr "`zeroclawlabs/zeroclaw:v0.7.5` — ピン留め済み"
 
 #: src/setup/container.md:11
 msgid ""
@@ -2748,8 +2748,8 @@ msgid "containers"
 msgstr "コンテナ"
 
 #: src/setup/container.md:94
-msgid "zeroclawlabs/zeroclaw:v0.7.4"
-msgstr "zeroclawlabs/zeroclaw:v0.7.4"
+msgid "zeroclawlabs/zeroclaw:v0.7.5"
+msgstr "zeroclawlabs/zeroclaw:v0.7.5"
 
 #: src/setup/container.md:96
 msgid "containerPort"
@@ -25115,8 +25115,8 @@ msgid "The gateway exposes three health views:"
 msgstr "ゲートウェイは3つのヘルスビューを公開しています："
 
 #: src/ops/observability.md:151
-msgid "# { \"status\": \"ok\", \"version\": \"0.7.4\" }\n"
-msgstr "# { \"status\": \"ok\", \"version\": \"0.7.4\" }\n"
+msgid "# { \"status\": \"ok\", \"version\": \"0.7.5\" }\n"
+msgstr "# { \"status\": \"ok\", \"version\": \"0.7.5\" }\n"
 
 #: src/ops/observability.md:152
 msgid "# per-channel status\n"

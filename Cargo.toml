@@ -4,27 +4,27 @@ resolver = "2"
 exclude = ["plugins/image-gen-fal"]
 
 [workspace.package]
-version = "0.7.4"
+version = "0.7.5"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
 rust-version = "1.87"
 
 [workspace.dependencies]
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.7.4" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.7.4" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.7.4", default-features = false }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.7.4" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.7.4" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.7.4", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.7.4" }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.7.4", default-features = false }
-zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.7.4" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.7.4" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.7.4" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.7.4" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.7.4" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.7.4" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.7.5" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.7.5" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.7.5", default-features = false }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.7.5" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.7.5" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.7.5", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.7.5" }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.7.5", default-features = false }
+zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.7.5" }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.7.5" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.7.5" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.7.5" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.7.5" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.7.5" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 
 [package]

@@ -46,12 +46,22 @@ pub fn build_locales(root: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Render `theme/lang-switcher.js.tpl` into `theme/lang-switcher.js` with the
+/// `LOCALES` array filled from `locales.toml`. The `.js` output is gitignored
+/// (every locale add/remove rewrites it); the `.tpl` source is the tracked
+/// truth. Errors loudly when the template is missing — silently skipping
+/// would let mdBook fail later with a confusing "missing additional-js"
+/// message.
 pub fn inject_lang_switcher_locales(book: &Path, entries: &[LocaleEntry]) -> anyhow::Result<()> {
+    let tpl_path = book.join("theme/lang-switcher.js.tpl");
     let js_path = book.join("theme/lang-switcher.js");
-    if !js_path.exists() {
-        return Ok(());
-    }
-    let src = std::fs::read_to_string(&js_path)?;
+    let src = std::fs::read_to_string(&tpl_path).map_err(|e| {
+        anyhow::anyhow!(
+            "lang-switcher.js.tpl missing at {}: {e}. The template is the tracked source of \
+             truth for the locale switcher; do not delete it.",
+            tpl_path.display(),
+        )
+    })?;
     let locale_lines: String = entries
         .iter()
         .map(|e| format!("    {{ code: {:?}, label: {:?} }},", e.code, e.label))
@@ -59,13 +69,12 @@ pub fn inject_lang_switcher_locales(book: &Path, entries: &[LocaleEntry]) -> any
         .join("\n");
     let new_block = format!("const LOCALES = [\n{locale_lines}\n  ];");
 
-    // Replace the existing `const LOCALES = [...];` block
     let start = src
         .find("const LOCALES = [")
-        .ok_or_else(|| anyhow::anyhow!("lang-switcher.js: LOCALES array not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("lang-switcher.js.tpl: LOCALES array not found"))?;
     let end = src[start..]
         .find("];")
-        .ok_or_else(|| anyhow::anyhow!("lang-switcher.js: LOCALES closing ]; not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("lang-switcher.js.tpl: LOCALES closing ]; not found"))?;
     let updated = format!("{}{}{}", &src[..start], new_block, &src[start + end + 2..]);
     std::fs::write(&js_path, updated)?;
     Ok(())

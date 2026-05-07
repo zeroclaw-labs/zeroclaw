@@ -101,6 +101,7 @@ const INTERNAL_ERROR: i32 = -32603;
 // Custom error codes
 const SESSION_NOT_FOUND: i32 = -32000;
 const SESSION_LIMIT_REACHED: i32 = -32001;
+const SESSION_BUSY: i32 = -32002;
 const ACP_PROTOCOL_VERSION: u64 = 1;
 
 // ── Outbound JSON-RPC plumbing ───────────────────────────────────
@@ -282,12 +283,9 @@ pub struct AcpServer {
     /// **Single-turn-per-session invariant:** this map holds at most one token
     /// per `session_id` because the ACP protocol does not pipeline multiple
     /// `session/prompt` calls on the same session — each prompt must complete
-    /// (or be cancelled) before the next one is sent. A second `session/prompt`
-    /// arriving while the first is in flight would overwrite turn 1's token in
-    /// this map, so a `session/cancel` fired between the overwrite and turn 1's
-    /// completion would silently target turn 2 instead. The worst-case outcome
-    /// is "cancel doesn't take" rather than data corruption. If pipelining is
-    /// needed in the future, the key should become `(session_id, turn_id)`.
+    /// (or be cancelled) before the next one is sent. A second prompt is
+    /// rejected before it can overwrite the active turn's token. If pipelining
+    /// is needed in the future, the key should become `(session_id, turn_id)`.
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
 }
 
@@ -642,8 +640,6 @@ impl AcpServer {
             })?
         };
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
-
         // Create a cancellation token for this turn and register it so that a
         // concurrent `session/cancel` notification can fire it without waiting
         // for the inner session lock (which is held for the full turn duration).
@@ -651,12 +647,8 @@ impl AcpServer {
         // mutex are short, infallible HashMap operations (insert/remove/get)
         // that never call user code, panic, or block on I/O.
         let cancel_token = tokio_util::sync::CancellationToken::new();
-        {
-            self.cancel_tokens
-                .lock()
-                .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
-                .insert(session_id.clone(), cancel_token.clone());
-        }
+        self.register_cancel_token(&session_id, cancel_token.clone())?;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
 
         // Move the Arc into the spawned task and lock inside it.  The inner
         // Mutex stays locked for the duration of the turn, preventing
@@ -680,21 +672,25 @@ impl AcpServer {
         // Track streamed text so partial content survives cancellation.
         let mut accumulated_text = String::new();
         while let Some(event) = event_rx.recv().await {
+            // ACP has no `session/update` shape for token-usage events; the
+            // task-local cost tracker records them out-of-band. Skip before
+            // dispatching to the notification builder so the helper match
+            // can stay exhaustive on the four UI-relevant variants.
+            if matches!(event, TurnEvent::Usage { .. }) {
+                continue;
+            }
+            // Track streamed text so partial content survives cancellation.
             if let TurnEvent::Chunk { ref delta } = event {
                 accumulated_text.push_str(delta);
             }
-            let notification = notification_for_turn_event(&session_id, &event);
-            self.write_notification(&notification).await;
+            if let Some(notification) = notification_for_turn_event(&session_id, &event) {
+                self.write_notification(&notification).await;
+            }
         }
 
         // Remove the cancel token regardless of outcome — the turn is over.
         // Lock poisoned invariant: same as the insert site above.
-        {
-            self.cancel_tokens
-                .lock()
-                .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
-                .remove(&session_id);
-        }
+        self.remove_cancel_token(&session_id);
 
         let turn_result = turn_handle.await.map_err(|e| RpcError {
             code: INTERNAL_ERROR,
@@ -710,16 +706,7 @@ impl AcpServer {
         };
 
         if was_cancelled {
-            let content = if accumulated_text.is_empty() {
-                "[interrupted by user]".to_string()
-            } else {
-                format!("{accumulated_text}\n\n[interrupted by user]")
-            };
-            return Ok(serde_json::json!({
-                "sessionId": session_id,
-                "stopReason": "cancelled",
-                "content": content,
-            }));
+            return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
         }
 
         let result = turn_result.map_err(|e| RpcError {
@@ -728,11 +715,51 @@ impl AcpServer {
             data: None,
         })?;
 
-        Ok(serde_json::json!({
+        Ok(Self::prompt_result(session_id, "end_turn", result))
+    }
+
+    fn register_cancel_token(
+        &self,
+        session_id: &str,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> std::result::Result<(), RpcError> {
+        let mut tokens = self
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops");
+        if tokens.contains_key(session_id) {
+            return Err(RpcError {
+                code: SESSION_BUSY,
+                message: format!("Session already has an active prompt turn: {session_id}"),
+                data: None,
+            });
+        }
+        tokens.insert(session_id.to_string(), cancel_token);
+        Ok(())
+    }
+
+    fn remove_cancel_token(&self, session_id: &str) {
+        self.cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
+            .remove(session_id);
+    }
+
+    fn prompt_result(session_id: String, stop_reason: &'static str, text: String) -> Value {
+        serde_json::json!({
             "sessionId": session_id,
-            "stopReason": "end_turn",
-            "content": result,  // full assembled response for clients that expect it
-        }))
+            "stopReason": stop_reason,
+            "content": text,
+        })
+    }
+
+    fn cancelled_prompt_result(session_id: String, accumulated_text: &str) -> Value {
+        let content = if accumulated_text.is_empty() {
+            "[interrupted by user]".to_string()
+        } else {
+            format!("{accumulated_text}\n\n[interrupted by user]")
+        };
+        Self::prompt_result(session_id, "cancelled", content)
     }
 
     fn parse_prompt(params: &Value) -> std::result::Result<String, RpcError> {
@@ -815,6 +842,7 @@ impl AcpServer {
     async fn handle_session_cancel(&self, params: &Value) -> RpcResult {
         let session_id = params
             .get("sessionId")
+            .or_else(|| params.get("session_id"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
@@ -1005,8 +1033,8 @@ fn map_tool_kind(name: &str) -> &'static str {
     }
 }
 
-fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> JsonRpcNotification {
-    match event {
+fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<JsonRpcNotification> {
+    Some(match event {
         TurnEvent::Chunk { delta } => JsonRpcNotification {
             jsonrpc: "2.0",
             method: "session/update",
@@ -1075,7 +1103,20 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> JsonRpcNo
                 }
             }),
         },
-    }
+        // ACP has its own approval mechanism via `session/request_permission`
+        // routed through the channel's `request_choice` impl. The agent only
+        // emits ApprovalRequest events when a back-channel like the gateway
+        // WS is registered to handle them; on ACP-only sessions they should
+        // not arrive here.
+        TurnEvent::ApprovalRequest { .. } => return None,
+        // Usage events are filtered out at every call site (ACP has no
+        // `session/update` shape for them; the cost tracker records them
+        // out-of-band). Reaching this arm means a caller forgot the filter.
+        TurnEvent::Usage { .. } => unreachable!(
+            "TurnEvent::Usage must be filtered before notification_for_turn_event; \
+             ACP has no session/update notification for token usage"
+        ),
+    })
 }
 
 // ── Error helper ─────────────────────────────────────────────────
@@ -1372,6 +1413,29 @@ mod tests {
     }
 
     #[test]
+    fn prompt_result_preserves_content_string_shape() {
+        let result = AcpServer::prompt_result("test-sid".to_string(), "end_turn", "hello".into());
+        assert_eq!(result["sessionId"], "test-sid");
+        assert_eq!(result["stopReason"], "end_turn");
+        assert_eq!(result["content"], "hello");
+    }
+
+    #[test]
+    fn cancelled_prompt_result_preserves_content_string_shape() {
+        let with_partial =
+            AcpServer::cancelled_prompt_result("test-sid".to_string(), "partial text");
+        assert_eq!(with_partial["sessionId"], "test-sid");
+        assert_eq!(with_partial["stopReason"], "cancelled");
+        assert_eq!(
+            with_partial["content"],
+            "partial text\n\n[interrupted by user]"
+        );
+
+        let marker_only = AcpServer::cancelled_prompt_result("test-sid".to_string(), "");
+        assert_eq!(marker_only["content"], "[interrupted by user]");
+    }
+
+    #[test]
     fn test_tool_call_and_update_serialization() {
         // Test tool_call (initial pending event)
         let tool_call_notif = JsonRpcNotification {
@@ -1460,7 +1524,8 @@ mod tests {
                 args: serde_json::json!({"command": "ls -la"}),
             },
         );
-        let call_value = serde_json::to_value(call).unwrap();
+        let call_value =
+            serde_json::to_value(call.expect("ToolCall maps to a notification")).unwrap();
         assert_eq!(call_value["method"], "session/update");
         assert_eq!(call_value["params"]["update"]["sessionUpdate"], "tool_call");
         assert_eq!(call_value["params"]["update"]["toolCallId"], "tc-12345");
@@ -1480,7 +1545,8 @@ mod tests {
                 output: "file1.txt\nfile2.txt".to_string(),
             },
         );
-        let result_value = serde_json::to_value(result).unwrap();
+        let result_value =
+            serde_json::to_value(result.expect("ToolResult maps to a notification")).unwrap();
         assert_eq!(
             result_value["params"]["update"]["sessionUpdate"],
             "tool_call_update"
@@ -1630,6 +1696,107 @@ mod tests {
             result.is_ok(),
             "unknown-session cancel must succeed: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn session_cancel_accepts_snake_case_session_id() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+        ));
+
+        let session_id = "sess_snake_case_cancel";
+        let active_token = tokio_util::sync::CancellationToken::new();
+        server
+            .register_cancel_token(session_id, active_token.clone())
+            .expect("active turn should register token");
+
+        server
+            .handle_session_cancel(&serde_json::json!({ "session_id": session_id }))
+            .await
+            .expect("snake_case session_id should cancel the active turn");
+
+        assert!(active_token.is_cancelled());
+    }
+
+    /// A second prompt for the same session must fail before it can overwrite
+    /// the active turn's cancellation token.
+    #[tokio::test]
+    async fn register_cancel_token_rejects_concurrent_prompt_for_session() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+        ));
+
+        let session_id = "sess_active_turn";
+        let active_token = tokio_util::sync::CancellationToken::new();
+        let queued_token = tokio_util::sync::CancellationToken::new();
+
+        server
+            .register_cancel_token(session_id, active_token.clone())
+            .expect("first prompt should register its token");
+        let err = server
+            .register_cancel_token(session_id, queued_token.clone())
+            .expect_err("second prompt must not overwrite active token");
+
+        assert_eq!(err.code, SESSION_BUSY);
+        assert!(
+            err.message.contains("active prompt turn"),
+            "error should explain why prompt was rejected: {}",
+            err.message
+        );
+
+        server
+            .handle_session_cancel(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("cancel should still target active token");
+
+        assert!(active_token.is_cancelled());
+        assert!(
+            !queued_token.is_cancelled(),
+            "rejected prompt's token must not become the active cancel target"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_rejects_concurrent_turn_before_agent_starts() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+        ));
+
+        let new_result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = new_result["sessionId"].as_str().unwrap().to_string();
+        let active_token = tokio_util::sync::CancellationToken::new();
+        server
+            .register_cancel_token(&session_id, active_token.clone())
+            .expect("simulated active turn should register token");
+
+        let err = server
+            .handle_session_prompt(
+                &serde_json::json!({
+                    "sessionId": session_id.clone(),
+                    "prompt": "queued prompt"
+                }),
+                &serde_json::json!(2),
+            )
+            .await
+            .expect_err("concurrent prompt must be rejected before provider work starts");
+
+        assert_eq!(err.code, SESSION_BUSY);
+        server
+            .handle_session_cancel(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("cancel should still target the original active token");
+        assert!(active_token.is_cancelled());
     }
 
     /// Verify that inserting and removing a cancel token from the map works

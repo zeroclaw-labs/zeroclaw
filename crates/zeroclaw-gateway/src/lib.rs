@@ -30,6 +30,7 @@ pub mod tls;
 #[cfg(feature = "gateway-voice-duplex")]
 pub mod voice_duplex;
 pub mod ws;
+pub mod ws_approval;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -57,10 +58,10 @@ use zeroclaw_channels::{
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
-use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, Provider};
 use zeroclaw_runtime::cost::CostTracker;
+use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use zeroclaw_runtime::tools;
@@ -485,8 +486,13 @@ pub async fn run_gateway(
         )?);
     // Three-step model resolution mirroring agent::Agent::from_config (#6099):
     // (1) the fallback provider's `model`, (2) the first configured
-    // `[providers.models.*]` model with a WARN naming what to set, (3) hard
-    // fail with an actionable error. No silent vendor-default substitution.
+    // `[providers.models.*]` model with a WARN naming what to set, (3) leave
+    // the model empty so the gateway boots and the dashboard can complete
+    // browser-based onboarding at /onboard. The chat-dispatch path checks
+    // `state.model.is_empty()` and returns a structured needs-onboarding
+    // error before any provider call, so the original "no silent vendor-
+    // default substitution" guarantee from #6099 is preserved at request-
+    // time rather than at boot.
     let model = match fallback
         .and_then(|e| e.model.as_deref())
         .map(str::trim)
@@ -505,13 +511,14 @@ pub async fn run_gateway(
                 m
             }
             None => {
-                anyhow::bail!(
-                    "no model configured: providers.fallback = {:?} resolves with no model, \
-                     and no [providers.models.*] entry has a `model` field set. \
-                     Configure at least one [providers.models.<name>] model = \"...\" \
-                     before starting the gateway.",
-                    config.providers.fallback,
-                )
+                tracing::warn!(
+                    "Gateway booting without a configured model. Visit \
+                     http://{display_addr}/onboard to complete browser \
+                     onboarding. Chat endpoints will return 503 \
+                     needs_onboarding until at least one \
+                     [providers.models.<name>] model = \"...\" is set."
+                );
+                String::new()
             }
         },
     };
@@ -768,17 +775,28 @@ pub async fn run_gateway(
         .map(|gp| Arc::new(GmailPushChannel::new(gp.clone())));
 
     // ── Session persistence for WS chat ─────────────────────
+    // Routes through `make_session_backend` so `[channels].session_backend`
+    // is the single source of truth for which backend stores sessions.
+    // Picking `"jsonl"` would otherwise leave gateway WS sessions writing
+    // to SQLite while channel + tool reads went to JSONL — the original
+    // #5769 split, just on a different backend pairing.
     let session_backend: Option<Arc<dyn SessionBackend>> = if config.gateway.session_persistence {
-        match SqliteSessionBackend::new(&config.workspace_dir) {
-            Ok(b) => {
-                tracing::info!("Gateway session persistence enabled (SQLite)");
+        match zeroclaw_infra::make_session_backend(
+            &config.workspace_dir,
+            &config.channels.session_backend,
+        ) {
+            Ok(backend) => {
+                tracing::info!(
+                    "Gateway session persistence enabled (backend={})",
+                    config.channels.session_backend,
+                );
                 if config.gateway.session_ttl_hours > 0
-                    && let Ok(cleaned) = b.cleanup_stale(config.gateway.session_ttl_hours)
+                    && let Ok(cleaned) = backend.cleanup_stale(config.gateway.session_ttl_hours)
                     && cleaned > 0
                 {
                     tracing::info!("Cleaned up {cleaned} stale gateway sessions");
                 }
-                Some(Arc::new(b))
+                Some(backend)
             }
             Err(e) => {
                 tracing::warn!("Session persistence disabled: {e}");
@@ -1475,31 +1493,124 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     Ok(())
 }
 
+/// Result of a gateway chat turn. Carries the response text plus per-turn
+/// token / cost totals captured from the cost-tracking scope (when present)
+/// so callers can populate observer-event annotations without racing
+/// concurrent webhook traffic that shares the same `CostTracker`.
+struct GatewayChatOutcome {
+    response: String,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cost_usd: Option<f64>,
+}
+
+/// Returns a structured `needs_onboarding` error when `model` is empty
+/// or whitespace-only, otherwise `None`. Empty model means the gateway
+/// booted with nothing configured (fresh install). Callers refuse the
+/// dispatch with this marker instead of calling the provider with an
+/// empty model id. Mirrors `agent::Agent::from_config` (#6099) at
+/// request-time so `/onboard` stays reachable.
+fn needs_onboarding_for(model: &str) -> Option<anyhow::Error> {
+    if model.trim().is_empty() {
+        Some(anyhow::anyhow!(
+            "needs_onboarding: gateway has no model configured. Complete \
+             browser onboarding at /onboard, or set [providers.models.<name>] \
+             model = \"...\" before sending messages."
+        ))
+    } else {
+        None
+    }
+}
+
+/// True when `e` carries the marker produced by `needs_onboarding_for`.
+/// Used by chat-dispatch error paths to map the marker to a 503
+/// `needs_onboarding` HTTP response or a more accurate channel-side
+/// reply, instead of the generic 500 / "sorry" catch-all.
+fn is_needs_onboarding_err(e: &anyhow::Error) -> bool {
+    e.to_string().contains("needs_onboarding")
+}
+
+/// Reply text sent over a channel SDK when chat dispatch refuses
+/// because the gateway has no model configured. Resolved through the
+/// shared Fluent catalog (`channel-needs-onboarding-reply` in
+/// `crates/zeroclaw-runtime/locales/<locale>/cli.ftl`) so non-English
+/// operators see localized text instead of a Rust-side English literal.
+fn needs_onboarding_channel_reply() -> String {
+    i18n::get_required_cli_string("channel-needs-onboarding-reply")
+}
+
 /// Full-featured chat with tools for channel and webhook handlers.
 async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<GatewayChatOutcome> {
+    if let Some(err) = needs_onboarding_for(&state.model) {
+        return Err(err);
+    }
+
     // Tests exercise webhook infrastructure (idempotency, auth, autosave)
     // through handle_webhook, so dispatch to the mock provider directly
-    // instead of bootstrapping the full agent runtime.
+    // instead of bootstrapping the full agent runtime. The mock path
+    // doesn't go through the cost-tracking scope, so usage stays None.
     #[cfg(test)]
     {
         let _ = session_id;
-        return state
+        let response = state
             .provider
             .chat_with_system(None, message, &state.model, Some(state.temperature))
-            .await;
+            .await?;
+        Ok(GatewayChatOutcome {
+            response,
+            input_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
+        })
     }
 
     #[cfg(not(test))]
     {
         let config = state.config.lock().clone();
-        Box::pin(zeroclaw_runtime::agent::process_message(
-            config, message, session_id,
-        ))
-        .await
+        // Scope the cost tracking context so per-LLM-call usage flows into the
+        // gateway's cost tracker and costs.jsonl. Without this scope, the
+        // tracker exists on AppState but never receives any records from the
+        // runtime tool loop. The context's per-scope `turn_usage` accumulator
+        // also lets us read out this turn's tokens / cost after the scope
+        // exits without racing concurrent webhook traffic that shares the
+        // same tracker.
+        let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
+            zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
+                tracker.clone(),
+                std::sync::Arc::new(state.config.lock().cost.prices.clone()),
+            )
+        });
+        let captured_usage = cost_tracking_context
+            .as_ref()
+            .map(|ctx| ctx.turn_usage.clone());
+        let response = Box::pin(
+            zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                cost_tracking_context,
+                zeroclaw_runtime::agent::process_message(config, message, session_id),
+            ),
+        )
+        .await?;
+        let usage = captured_usage
+            .map(|cell| *cell.lock())
+            .filter(|u| u.input_tokens > 0 || u.output_tokens > 0);
+        let (input_tokens, output_tokens, cost_usd) = match usage {
+            Some(u) => (
+                Some(u.input_tokens),
+                Some(u.output_tokens),
+                Some(u.cost_usd),
+            ),
+            None => (None, None, None),
+        };
+        Ok(GatewayChatOutcome {
+            response,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+        })
     }
 }
 
@@ -1640,8 +1751,22 @@ async fn handle_webhook(
     );
 
     match run_gateway_chat_with_tools(&state, message, session_id.as_deref()).await {
-        Ok(response) => {
+        Ok(GatewayChatOutcome {
+            response,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+        }) => {
             let duration = started_at.elapsed();
+            // Per-turn token / cost annotation captured from the cost-tracking
+            // scope inside `run_gateway_chat_with_tools` (None outside of test
+            // / when no LLM call recorded). Cost is also persisted to
+            // /api/cost and costs.jsonl via the same scope.
+            let tokens_used = input_tokens
+                .zip(output_tokens)
+                .map(|(i, o)| i + o)
+                .or(input_tokens)
+                .or(output_tokens);
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
                     provider: provider_label.clone(),
@@ -1661,8 +1786,8 @@ async fn handle_webhook(
                     provider: provider_label,
                     model: model_label,
                     duration,
-                    tokens_used: None,
-                    cost_usd: None,
+                    tokens_used,
+                    cost_usd,
                 },
             );
 
@@ -1703,9 +1828,21 @@ async fn handle_webhook(
                 },
             );
 
-            tracing::error!("Webhook provider error: {}", sanitized);
-            let err = serde_json::json!({"error": "LLM request failed"});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+            if is_needs_onboarding_err(&e) {
+                tracing::warn!(
+                    "Webhook chat refused: gateway has no model configured; \
+                     visit /onboard"
+                );
+                let body = serde_json::json!({
+                    "error": "needs_onboarding",
+                    "url": "/onboard"
+                });
+                (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+            } else {
+                tracing::error!("Webhook provider error: {}", sanitized);
+                let err = serde_json::json!({"error": "LLM request failed"});
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+            }
         }
     }
 }
@@ -1867,7 +2004,7 @@ async fn handle_whatsapp_message(
         ))
         .await
         {
-            Ok(response) => {
+            Ok(GatewayChatOutcome { response, .. }) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -1877,13 +2014,17 @@ async fn handle_whatsapp_message(
                 }
             }
             Err(e) => {
-                tracing::error!("LLM error for WhatsApp message: {e:#}");
-                let _ = wa
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
+                let reply = if is_needs_onboarding_err(&e) {
+                    tracing::warn!(
+                        "WhatsApp chat refused: gateway has no model configured; \
+                         visit /onboard"
+                    );
+                    needs_onboarding_channel_reply()
+                } else {
+                    tracing::error!("LLM error for WhatsApp message: {e:#}");
+                    "Sorry, I couldn't process your message right now.".to_string()
+                };
+                let _ = wa.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
         }
     }
@@ -1987,7 +2128,7 @@ async fn handle_linq_webhook(
         ))
         .await
         {
-            Ok(response) => {
+            Ok(GatewayChatOutcome { response, .. }) => {
                 // Send reply via Linq
                 if let Err(e) = linq
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -1997,13 +2138,17 @@ async fn handle_linq_webhook(
                 }
             }
             Err(e) => {
-                tracing::error!("LLM error for Linq message: {e:#}");
-                let _ = linq
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
+                let reply = if is_needs_onboarding_err(&e) {
+                    tracing::warn!(
+                        "Linq chat refused: gateway has no model configured; \
+                         visit /onboard"
+                    );
+                    needs_onboarding_channel_reply()
+                } else {
+                    tracing::error!("LLM error for Linq message: {e:#}");
+                    "Sorry, I couldn't process your message right now.".to_string()
+                };
+                let _ = linq.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
         }
     }
@@ -2102,7 +2247,7 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         ))
         .await
         {
-            Ok(response) => {
+            Ok(GatewayChatOutcome { response, .. }) => {
                 // Send reply via WATI
                 if let Err(e) = wati
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -2112,13 +2257,17 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
                 }
             }
             Err(e) => {
-                tracing::error!("LLM error for WATI message: {e:#}");
-                let _ = wati
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
+                let reply = if is_needs_onboarding_err(&e) {
+                    tracing::warn!(
+                        "WATI chat refused: gateway has no model configured; \
+                         visit /onboard"
+                    );
+                    needs_onboarding_channel_reply()
+                } else {
+                    tracing::error!("LLM error for WATI message: {e:#}");
+                    "Sorry, I couldn't process your message right now.".to_string()
+                };
+                let _ = wati.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
         }
     }
@@ -2218,7 +2367,7 @@ async fn handle_nextcloud_talk_webhook(
         ))
         .await
         {
-            Ok(response) => {
+            Ok(GatewayChatOutcome { response, .. }) => {
                 if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(response, &msg.reply_target))
                     .await
@@ -2227,12 +2376,18 @@ async fn handle_nextcloud_talk_webhook(
                 }
             }
             Err(e) => {
-                tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
+                let reply = if is_needs_onboarding_err(&e) {
+                    tracing::warn!(
+                        "Nextcloud Talk chat refused: gateway has no model configured; \
+                         visit /onboard"
+                    );
+                    needs_onboarding_channel_reply()
+                } else {
+                    tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
+                    "Sorry, I couldn't process your message right now.".to_string()
+                };
                 let _ = nextcloud_talk
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
+                    .send(&SendMessage::new(reply, &msg.reply_target))
                     .await;
             }
         }
@@ -4056,5 +4211,92 @@ mod tests {
         ));
         let err = require_localhost(&peer).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn needs_onboarding_for_flags_empty_model() {
+        let err =
+            needs_onboarding_for("").expect("empty model must produce a needs_onboarding error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("needs_onboarding"),
+            "error must carry the needs_onboarding marker for callers to map to 503; got: {msg}"
+        );
+        assert!(
+            msg.contains("/onboard"),
+            "error must point the user at /onboard; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn needs_onboarding_for_flags_whitespace_only_model() {
+        assert!(
+            needs_onboarding_for("   ").is_some(),
+            "whitespace-only model must be treated as empty"
+        );
+        assert!(
+            needs_onboarding_for("\n\t ").is_some(),
+            "tabs and newlines count as empty too"
+        );
+    }
+
+    #[test]
+    fn needs_onboarding_for_passes_real_model() {
+        assert!(
+            needs_onboarding_for("anthropic/claude-sonnet-4").is_none(),
+            "a real model id must not be flagged"
+        );
+        assert!(
+            needs_onboarding_for("  gpt-4  ").is_none(),
+            "leading/trailing whitespace around a real model id must not be flagged"
+        );
+    }
+
+    #[test]
+    fn is_needs_onboarding_err_detects_marker_from_helper() {
+        let err = needs_onboarding_for("").expect("empty model produces marker");
+        assert!(
+            is_needs_onboarding_err(&err),
+            "the marker emitted by needs_onboarding_for must be detected"
+        );
+    }
+
+    #[test]
+    fn is_needs_onboarding_err_ignores_unrelated_errors() {
+        let err = anyhow::anyhow!("upstream timeout: provider returned 504");
+        assert!(
+            !is_needs_onboarding_err(&err),
+            "unrelated errors must not be misclassified as needs_onboarding"
+        );
+        let err = anyhow::anyhow!("invalid api key");
+        assert!(!is_needs_onboarding_err(&err));
+    }
+
+    #[test]
+    fn is_needs_onboarding_err_detects_via_substring() {
+        // Defends the contract that the substring marker is the
+        // detection key — not the exact string. Wrappers (e.g.
+        // anyhow::Error::context) must not break the check.
+        let err = anyhow::anyhow!("provider call failed").context("needs_onboarding: empty model");
+        assert!(is_needs_onboarding_err(&err));
+    }
+
+    #[test]
+    fn needs_onboarding_channel_reply_resolves_via_fluent() {
+        // The Fluent key channel-needs-onboarding-reply must resolve
+        // to real text from the embedded en/cli.ftl, not the missing-
+        // key fallback `{channel-needs-onboarding-reply}` that
+        // `missing_cli_string` produces. Guarding this in a test
+        // keeps the i18n contract from quietly drifting if the key
+        // gets renamed in lib.rs without a matching ftl edit.
+        let reply = needs_onboarding_channel_reply();
+        assert!(
+            !reply.starts_with('{') && !reply.ends_with('}'),
+            "fluent missing-key fallback leaked into channel reply: {reply:?}"
+        );
+        assert!(
+            reply.to_lowercase().contains("onboarding"),
+            "channel reply must mention onboarding so users know what's missing: {reply:?}"
+        );
     }
 }
