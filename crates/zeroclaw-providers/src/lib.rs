@@ -26,7 +26,6 @@ pub mod copilot;
 pub mod gemini;
 pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
-pub mod atomic_chat;
 pub mod kilocli;
 pub mod models_dev;
 pub mod multimodal;
@@ -1445,7 +1444,6 @@ fn create_provider_with_url_and_options(
                     .without_native_tools(),
             ))
         }
-
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => {
             let mut p = OpenAiCompatibleProvider::new(
@@ -3084,26 +3082,10 @@ mod tests {
     }
 
     #[test]
-    fn factory_atomic_chat() {
-        let provider = create_provider("atomic-chat", Some("test-key")).unwrap();
-        assert!(provider.capabilities().streaming);
-        let caps = provider.capabilities();
-        assert!(caps.streaming, "AtomicChat should support streaming");
-    }
-
-    #[test]
-    fn factory_atomic_chat() {
-        let provider =
-            create_provider("atomic-chat", Some("key")).expect("atomic-chat provider should build");
-
-        assert!(provider.capabilities().streaming);
-    }
-
-    #[test]
     fn factory_atomic_chat_aliases() {
         assert!(create_provider("atomic-chat", Some("key")).is_ok());
         assert!(create_provider("atomic_chat", Some("key")).is_ok());
-        assert!(create_provider("atomicchat", Some("key")).is_ok());
+        assert!(create_provider("atomic", Some("key")).is_ok());
     }
 
     #[test]
@@ -3115,11 +3097,20 @@ mod tests {
     #[test]
     fn atomic_chat_capabilities() {
         let provider = create_provider("atomic-chat", Some("key")).expect("provider should exist");
+        assert!(
+            !provider.supports_native_tools(),
+            "atomic chat does not use native tools"
+        );
+    }
 
-        let caps = provider.capabilities();
-
-        assert!(caps.streaming, "must support streaming");
-        assert!(!caps.tools, "atomic chat does not use native tools");
+    #[test]
+    fn atomic_chat_is_listed_as_local_provider() {
+        let providers = list_providers();
+        let provider = providers
+            .iter()
+            .find(|p| p.name == "atomic-chat")
+            .expect("atomic-chat must be listed");
+        assert!(provider.local, "atomic-chat must be local provider");
     }
 
     // ── Extended ecosystem ───────────────────────────────────
