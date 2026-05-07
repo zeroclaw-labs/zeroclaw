@@ -223,9 +223,18 @@ pub fn default_tools_with_runtime(
             PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
             security.clone(),
         )),
-        Box::new(FileReadTool::new(security.clone())),
-        Box::new(FileWriteTool::new(security.clone())),
-        Box::new(FileEditTool::new(security.clone())),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileReadTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileWriteTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileEditTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
         Box::new(RateLimitedTool::new(
             PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
             security.clone(),
@@ -367,9 +376,18 @@ pub fn all_tools_with_runtime(
             ),
             security.clone(),
         )),
-        Arc::new(FileReadTool::new(security.clone())),
-        Arc::new(FileWriteTool::new(security.clone())),
-        Arc::new(FileEditTool::new(security.clone())),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileReadTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileWriteTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileEditTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
             security.clone(),

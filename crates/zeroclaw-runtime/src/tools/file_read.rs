@@ -110,13 +110,9 @@ impl Tool for FileReadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
 
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        // Rate limiting and path-allowlist checks are applied by the
+        // RateLimitedTool + PathGuardedTool wrappers at registration time
+        // (see zeroclaw-runtime::tools::mod).
 
         // Validate and build candidate path using workspace_dir directly.
         let full_path = match self.resolve_candidate(path) {
@@ -129,17 +125,6 @@ impl Tool for FileReadTool {
                 });
             }
         };
-
-        // Record action BEFORE canonicalization so that every non-trivially-rejected
-        // request consumes rate limit budget. This prevents attackers from probing
-        // path existence (via canonicalize errors) without rate limit cost.
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
 
         // Canonicalize to resolve symlinks, then enforce workspace boundary.
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
@@ -411,30 +396,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_read_blocks_when_rate_limited() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_rate_limited");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("test.txt"), "hello world")
-            .await
-            .unwrap();
-
-        let tool = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 0);
-        let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
-
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Rate limit exceeded")
-        );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
     async fn file_read_allows_readonly_mode() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_readonly");
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -553,36 +514,6 @@ mod tests {
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test]
-    async fn file_read_nonexistent_consumes_rate_limit_budget() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_probe");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-
-        // Allow only 2 actions total
-        let tool = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 2);
-
-        // Both reads fail (file doesn't exist) but should consume budget
-        let r1 = tool.execute(json!({"path": "nope1.txt"})).await.unwrap();
-        assert!(!r1.success);
-        assert!(r1.error.as_ref().unwrap().contains("Failed to resolve"));
-
-        let r2 = tool.execute(json!({"path": "nope2.txt"})).await.unwrap();
-        assert!(!r2.success);
-        assert!(r2.error.as_ref().unwrap().contains("Failed to resolve"));
-
-        // Third attempt should be rate limited even though file doesn't exist
-        let r3 = tool.execute(json!({"path": "nope3.txt"})).await.unwrap();
-        assert!(!r3.success);
-        assert!(
-            r3.error.as_ref().unwrap().contains("Rate limit"),
-            "Expected rate limit error, got: {:?}",
-            r3.error
-        );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
