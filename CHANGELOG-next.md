@@ -46,6 +46,18 @@
 
 ---
 
+## Breaking changes
+
+### zeroclaw-runtime (Beta)
+
+- `IntegrationStatus::ComingSoon` removed. Callers that match on it must drop that arm. Hand-written "planned" entries are gone; if a channel or tool is not in the schema or not a real runtime built-in, it does not appear in the integrations registry.
+- `IntegrationCategory` variants `Productivity`, `MusicAudio`, `SmartHome`, `MediaCreative`, `Social` removed. Downstream `match` exhaustiveness will break at compile time. These categories had no live entries (only the now-removed `ComingSoon` placeholders).
+- `Google Workspace` recategorised from `Productivity` (removed) to `ToolsAutomation`.
+- `IntegrationEntry.status_fn: fn(&Config) -> IntegrationStatus` replaced by `IntegrationEntry.status: IntegrationStatus`. The catalog is now evaluated eagerly inside `all_integrations(&Config)` rather than carrying a per-entry closure.
+- `all_integrations()` signature changed from `() -> Vec<IntegrationEntry>` to `(&Config) -> Vec<IntegrationEntry>`. Callers must thread a `Config` reference.
+
+---
+
 ## What's New
 
 ### Architecture & Workspace

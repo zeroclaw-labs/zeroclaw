@@ -179,6 +179,7 @@ fn prop_kind_wire(kind: zeroclaw_config::traits::PropKind) -> &'static str {
         PropKind::Enum => "enum",
         PropKind::StringArray => "string-array",
         PropKind::ObjectArray => "object-array",
+        PropKind::Object => "object",
     }
 }
 
