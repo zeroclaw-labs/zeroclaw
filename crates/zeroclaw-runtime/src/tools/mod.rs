@@ -690,9 +690,9 @@ pub fn all_tools_with_runtime(
 
     // Claude Code delegation tool
     if root_config.claude_code.enabled {
-        tool_arcs.push(Arc::new(ClaudeCodeTool::new(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            ClaudeCodeTool::new(security.clone(), root_config.claude_code.clone()),
             security.clone(),
-            root_config.claude_code.clone(),
         )));
     }
 
@@ -702,34 +702,37 @@ pub fn all_tools_with_runtime(
             "http://{}:{}",
             root_config.gateway.host, root_config.gateway.port
         );
-        tool_arcs.push(Arc::new(ClaudeCodeRunnerTool::new(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            ClaudeCodeRunnerTool::new(
+                security.clone(),
+                root_config.claude_code_runner.clone(),
+                gateway_url,
+            ),
             security.clone(),
-            root_config.claude_code_runner.clone(),
-            gateway_url,
         )));
     }
 
     // Codex CLI delegation tool
     if root_config.codex_cli.enabled {
-        tool_arcs.push(Arc::new(CodexCliTool::new(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            CodexCliTool::new(security.clone(), root_config.codex_cli.clone()),
             security.clone(),
-            root_config.codex_cli.clone(),
         )));
     }
 
     // Gemini CLI delegation tool
     if root_config.gemini_cli.enabled {
-        tool_arcs.push(Arc::new(GeminiCliTool::new(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            GeminiCliTool::new(security.clone(), root_config.gemini_cli.clone()),
             security.clone(),
-            root_config.gemini_cli.clone(),
         )));
     }
 
     // OpenCode CLI delegation tool
     if root_config.opencode_cli.enabled {
-        tool_arcs.push(Arc::new(OpenCodeCliTool::new(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            OpenCodeCliTool::new(security.clone(), root_config.opencode_cli.clone()),
             security.clone(),
-            root_config.opencode_cli.clone(),
         )));
     }
 
