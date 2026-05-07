@@ -3107,7 +3107,7 @@ dependencies = [
 
 [[package]]
 name = "fill-translations"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -13069,7 +13069,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -13208,7 +13208,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-api"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13224,7 +13224,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-channels"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "aes",
  "anyhow",
@@ -13294,7 +13294,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-config"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13353,7 +13353,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-gateway"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13403,7 +13403,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-hardware"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "aardvark-sys",
  "anyhow",
@@ -13433,7 +13433,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-infra"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -13450,7 +13450,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-macros"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -13459,7 +13459,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-memory"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13482,7 +13482,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-plugins"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13502,7 +13502,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-providers"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13559,7 +13559,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-runtime"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "aardvark-sys",
  "anyhow",
@@ -13639,7 +13639,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-tool-call-parser"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "regex",
  "serde",
@@ -13649,7 +13649,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-tools"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13692,7 +13692,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-tui"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13708,7 +13708,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclawlabs"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "aardvark-sys",
  "anyhow",
