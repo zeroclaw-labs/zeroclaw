@@ -485,8 +485,13 @@ pub async fn run_gateway(
         )?);
     // Three-step model resolution mirroring agent::Agent::from_config (#6099):
     // (1) the fallback provider's `model`, (2) the first configured
-    // `[providers.models.*]` model with a WARN naming what to set, (3) hard
-    // fail with an actionable error. No silent vendor-default substitution.
+    // `[providers.models.*]` model with a WARN naming what to set, (3) leave
+    // the model empty so the gateway boots and the dashboard can complete
+    // browser-based onboarding at /onboard. The chat-dispatch path checks
+    // `state.model.is_empty()` and returns a structured needs-onboarding
+    // error before any provider call, so the original "no silent vendor-
+    // default substitution" guarantee from #6099 is preserved at request-
+    // time rather than at boot.
     let model = match fallback
         .and_then(|e| e.model.as_deref())
         .map(str::trim)
@@ -505,13 +510,14 @@ pub async fn run_gateway(
                 m
             }
             None => {
-                anyhow::bail!(
-                    "no model configured: providers.fallback = {:?} resolves with no model, \
-                     and no [providers.models.*] entry has a `model` field set. \
-                     Configure at least one [providers.models.<name>] model = \"...\" \
-                     before starting the gateway.",
-                    config.providers.fallback,
-                )
+                tracing::warn!(
+                    "Gateway booting without a configured model. Visit \
+                     http://{display_addr}/onboard to complete browser \
+                     onboarding. Chat endpoints will return 503 \
+                     needs_onboarding until at least one \
+                     [providers.models.<name>] model = \"...\" is set."
+                );
+                String::new()
             }
         },
     };
@@ -1497,12 +1503,34 @@ struct GatewayChatOutcome {
     cost_usd: Option<f64>,
 }
 
+/// Returns a structured `needs_onboarding` error when `model` is empty
+/// or whitespace-only, otherwise `None`. Empty model means the gateway
+/// booted with nothing configured (fresh install). Callers refuse the
+/// dispatch with this marker instead of calling the provider with an
+/// empty model id. Mirrors `agent::Agent::from_config` (#6099) at
+/// request-time so `/onboard` stays reachable.
+fn needs_onboarding_for(model: &str) -> Option<anyhow::Error> {
+    if model.trim().is_empty() {
+        Some(anyhow::anyhow!(
+            "needs_onboarding: gateway has no model configured. Complete \
+             browser onboarding at /onboard, or set [providers.models.<name>] \
+             model = \"...\" before sending messages."
+        ))
+    } else {
+        None
+    }
+}
+
 /// Full-featured chat with tools for channel and webhook handlers.
 async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<GatewayChatOutcome> {
+    if let Some(err) = needs_onboarding_for(&state.model) {
+        return Err(err);
+    }
+
     // Tests exercise webhook infrastructure (idempotency, auth, autosave)
     // through handle_webhook, so dispatch to the mock provider directly
     // instead of bootstrapping the full agent runtime. The mock path
@@ -4135,5 +4163,44 @@ mod tests {
         ));
         let err = require_localhost(&peer).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn needs_onboarding_for_flags_empty_model() {
+        let err =
+            needs_onboarding_for("").expect("empty model must produce a needs_onboarding error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("needs_onboarding"),
+            "error must carry the needs_onboarding marker for callers to map to 503; got: {msg}"
+        );
+        assert!(
+            msg.contains("/onboard"),
+            "error must point the user at /onboard; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn needs_onboarding_for_flags_whitespace_only_model() {
+        assert!(
+            needs_onboarding_for("   ").is_some(),
+            "whitespace-only model must be treated as empty"
+        );
+        assert!(
+            needs_onboarding_for("\n\t ").is_some(),
+            "tabs and newlines count as empty too"
+        );
+    }
+
+    #[test]
+    fn needs_onboarding_for_passes_real_model() {
+        assert!(
+            needs_onboarding_for("anthropic/claude-sonnet-4").is_none(),
+            "a real model id must not be flagged"
+        );
+        assert!(
+            needs_onboarding_for("  gpt-4  ").is_none(),
+            "leading/trailing whitespace around a real model id must not be flagged"
+        );
     }
 }

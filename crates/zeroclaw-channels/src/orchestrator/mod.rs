@@ -5394,6 +5394,22 @@ pub async fn start_channels(
     config: Config,
     canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
 ) -> Result<()> {
+    // No model resolves yet — the user has channels configured but hasn't
+    // finished onboarding their provider. Returning Ok() here lets the
+    // daemon supervisor mark the channels component "done" instead of
+    // restart-looping on the bail in `resolved_default_model`. The user
+    // completes onboarding at /onboard and reloads via /admin/reload to
+    // bring channels up.
+    if resolved_default_model(&config).is_err() {
+        tracing::warn!(
+            "Channels supervisor exiting: no model configured but \
+             channels are present. Complete browser onboarding at \
+             /onboard (or set [providers.models.<name>] model = \"...\" \
+             and reload the daemon) before channels can route messages."
+        );
+        return Ok(());
+    }
+
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_from_config(&config);
