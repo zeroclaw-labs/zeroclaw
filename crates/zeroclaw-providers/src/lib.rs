@@ -27,6 +27,7 @@ pub mod gemini;
 pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
+pub mod llamacpp;
 pub mod models_dev;
 pub mod multimodal;
 pub mod ollama;
@@ -725,6 +726,16 @@ pub struct ProviderRuntimeOptions {
     /// `ModelProviderConfig::native_tools`. Currently consulted only by the
     /// Groq factory branch (#5932).
     pub native_tools: Option<bool>,
+    /// Wire protocol to use for this provider.
+    /// `Some("responses")` routes the provider through the OpenResponses
+    /// `/v1/responses` API instead of chat_completions.  `None` uses the
+    /// provider's built-in default (chat_completions for most providers).
+    pub wire_api: Option<String>,
+    /// Enable or disable chain-of-thought thinking. Forwarded as
+    /// `enable_thinking` in the request body. `None` lets the model decide.
+    pub think: Option<bool>,
+    /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
+    pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -743,6 +754,9 @@ impl Default for ProviderRuntimeOptions {
             merge_system_into_user: false,
             provider_extra: None,
             native_tools: None,
+            wire_api: None,
+            think: None,
+            chat_template_kwargs: None,
         }
     }
 }
@@ -787,6 +801,9 @@ pub fn provider_runtime_options_from_config(
         merge_system_into_user,
         provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
         native_tools: fallback.and_then(|e| e.native_tools),
+        wire_api: fallback.and_then(|e| e.wire_api.clone()),
+        think: fallback.and_then(|e| e.think),
+        chat_template_kwargs: fallback.and_then(|e| e.chat_template_kwargs.clone()),
     }
 }
 
@@ -1518,23 +1535,27 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("http://localhost:8080/v1");
-            let llama_cpp_key = key
+            let credential = key
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("llama.cpp");
-            let provider = OpenAiCompatibleProvider::new_with_vision(
-                "llama.cpp",
-                base_url,
-                Some(llama_cpp_key),
-                AuthStyle::Bearer,
-                true,
-            );
-            let provider = if options.merge_system_into_user {
-                provider.with_merge_system_into_user()
-            } else {
-                provider
-            };
-            Ok(compat(provider))
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let mut provider = llamacpp::LlamaCppProvider::new(base_url, credential.as_deref());
+            if let Some(t) = options.provider_timeout_secs {
+                provider = provider.with_timeout_secs(t);
+            }
+            if !options.extra_headers.is_empty() {
+                provider = provider.with_extra_headers(options.extra_headers.clone());
+            }
+            if let Some(mt) = options.provider_max_tokens {
+                provider = provider.with_max_tokens(Some(mt));
+            }
+            if options.think.is_some() {
+                provider = provider.with_think(options.think);
+            }
+            if options.chat_template_kwargs.is_some() {
+                provider = provider.with_chat_template_kwargs(options.chat_template_kwargs.clone());
+            }
+            Ok(Box::new(provider))
         }
         "sglang" => {
             let base_url = api_url

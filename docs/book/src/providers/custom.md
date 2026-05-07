@@ -3,7 +3,7 @@
 Three ways to add a provider ZeroClaw doesn't ship with:
 
 1. **Point `openai-compatible` at the endpoint.** Works for ~80% of cases.
-2. **Use a first-class local-server adapter** (`llamacpp`, `sglang`, `vllm`). Thin wrappers with sensible defaults.
+2. **Use a first-class local-server adapter** (`llamacpp`, `sglang`, `vllm`). Dedicated provider kinds with sensible defaults and server-specific behaviour.
 3. **Implement the `Provider` trait** in Rust. For anything that's not OpenAI-compatible.
 
 ## OpenAI-compatible endpoint (easiest)
@@ -28,9 +28,19 @@ This is the same implementation used for Groq, Mistral, xAI, and every other Ope
 
 ## First-class local-inference servers
 
-ZeroClaw ships tight adapters for three popular local-inference stacks. They're `openai-compatible` under the hood but with defaults and quality-of-life tuning pre-applied.
+ZeroClaw ships dedicated provider kinds for three popular local-inference stacks.
+Unlike `openai-compatible`, these are purpose-built adapters — not thin wrappers.
+`llamacpp` in particular routes all traffic through the OpenAI Responses API
+(`/v1/responses`) rather than chat-completions, which is the only path that
+supports streaming tool events correctly for local models.
 
-### llama.cpp
+### llama.cpp (`kind = "llamacpp"`)
+
+`llamacpp` is a **dedicated provider kind**, not a variant of `openai-compatible`.
+It routes all calls through llama-server's `/v1/responses` endpoint and handles
+SSE streaming, chain-of-thought suppression, and tool calls natively.
+`openai-compatible` pointed at a llama-server will work for basic prompts but
+lacks correct tool-call streaming.
 
 ```bash
 llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --port 8033
@@ -43,6 +53,32 @@ base_url = "http://127.0.0.1:8033/v1"      # omit to use default http://localhos
 model = "ggml-org/gpt-oss-20b-GGUF"
 # api_key only required if llama-server was started with --api-key
 ```
+
+**Optional fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `think` | `bool` | — | Sets `enable_thinking` in the request body. `false` signals thinking-capable models to skip chain-of-thought. |
+| `chat_template_kwargs` | table | — | Passed verbatim as `chat_template_kwargs` to the Jinja chat template. Use for model-family-specific template variables. |
+| `max_tokens` | `u32` | — | Maximum output tokens per response. |
+| `timeout_secs` | `u64` | 120 | Request timeout for non-streaming calls. |
+
+**Controlling thinking mode** varies by model family. `think = false` sets the
+top-level `enable_thinking` field in the request. Some models (e.g. Qwen3) read
+this flag from the Jinja template via `chat_template_kwargs` instead:
+
+```toml
+[providers.models.llama]
+kind = "llamacpp"
+base_url = "http://127.0.0.1:8033/v1"
+model = "Qwen/Qwen3-30B-A3B-GGUF"
+think = false
+# Qwen3 reads enable_thinking from the Jinja template, not the top-level field:
+chat_template_kwargs = { enable_thinking = false }
+```
+
+Other model families use different template variable names — check your model's
+chat template and set the appropriate key under `chat_template_kwargs`.
 
 ### SGLang
 
