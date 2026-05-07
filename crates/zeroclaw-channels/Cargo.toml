@@ -83,7 +83,7 @@ default = [
     "channel-bluesky", "channel-twitter", "channel-reddit", "channel-notion",
     "channel-linq", "channel-wati", "channel-nextcloud", "channel-mochat",
     "channel-wecom", "channel-clawdtalk", "channel-webhook",
-    "channel-whatsapp-cloud", "channel-voice-call",
+    "channel-whatsapp-cloud", "channel-voice-call", "channel-vonage",
 ]
 # Channels with optional deps
 channel-email = ["dep:lettre", "dep:mail-parser", "dep:async-imap"]
@@ -115,6 +115,7 @@ channel-clawdtalk = []
 channel-webhook = []
 channel-whatsapp-cloud = []
 channel-voice-call = []
+channel-vonage = []
 channel-acp-server = []
 channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
 voice-wake = ["dep:cpal", "zeroclaw-config/voice-wake"]

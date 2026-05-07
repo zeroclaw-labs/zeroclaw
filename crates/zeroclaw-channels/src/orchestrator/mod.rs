@@ -56,6 +56,8 @@ pub use crate::twitter::TwitterChannel;
 pub use crate::voice_call::VoiceCallChannel;
 #[cfg(feature = "voice-wake")]
 pub use crate::voice_wake::VoiceWakeChannel;
+#[cfg(feature = "channel-vonage")]
+pub use crate::vonage::VonageChannel;
 pub use crate::wati::WatiChannel;
 pub use crate::webhook::WebhookChannel;
 #[cfg(feature = "channel-wechat")]
@@ -4476,6 +4478,21 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 lq.allowed_senders.clone(),
             )))
         }
+        #[cfg(feature = "channel-vonage")]
+        "vonage" => {
+            let vg = config
+                .channels
+                .vonage
+                .as_ref()
+                .context("Vonage channel is not configured")?;
+            Ok(Arc::new(VonageChannel::new(
+                vg.api_key.clone(),
+                vg.api_secret.clone(),
+                vg.from_number_or_sender_id.clone(),
+                vg.allowed_numbers.clone(),
+                vg.signature_secret.clone(),
+            )))
+        }
         #[cfg(feature = "channel-email")]
         "email" => {
             let em = config
@@ -4949,6 +4966,22 @@ fn collect_configured_channels(
         } else {
             tracing::info!("Linq channel configured but disabled (enabled = false)");
         }
+    }
+
+    #[cfg(feature = "channel-vonage")]
+    if let Some(ref vg) = config.channels.vonage
+        && vg.enabled
+    {
+        channels.push(ConfiguredChannel {
+            display_name: "Vonage SMS",
+            channel: Arc::new(VonageChannel::new(
+                vg.api_key.clone(),
+                vg.api_secret.clone(),
+                vg.from_number_or_sender_id.clone(),
+                vg.allowed_numbers.clone(),
+                vg.signature_secret.clone(),
+            )),
+        });
     }
 
     if let Some(ref wati_cfg) = config.channels.wati {

@@ -53,7 +53,7 @@ use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_api::tool::ToolSpec;
 use zeroclaw_channels::{
     gmail_push::GmailPushChannel, linq::LinqChannel, nextcloud_talk::NextcloudTalkChannel,
-    wati::WatiChannel, whatsapp::WhatsAppChannel,
+    vonage::VonageChannel, wati::WatiChannel, whatsapp::WhatsAppChannel,
 };
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
@@ -382,6 +382,7 @@ pub struct AppState {
     pub linq: Option<Arc<LinqChannel>>,
     /// Linq webhook signing secret for signature verification
     pub linq_signing_secret: Option<Arc<str>>,
+    pub vonage: Option<Arc<VonageChannel>>,
     pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
     /// Nextcloud Talk webhook secret for signature verification
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
@@ -715,6 +716,22 @@ pub async fn run_gateway(
         })
         .map(Arc::from);
 
+    // Vonage channel (if configured AND enabled)
+    let vonage_channel: Option<Arc<VonageChannel>> = config
+        .channels
+        .vonage
+        .as_ref()
+        .filter(|vg| vg.enabled)
+        .map(|vg| {
+            Arc::new(VonageChannel::new(
+                vg.api_key.clone(),
+                vg.api_secret.clone(),
+                vg.from_number_or_sender_id.clone(),
+                vg.allowed_numbers.clone(),
+                vg.signature_secret.clone(),
+            ))
+        });
+
     // WATI channel (if configured)
     let wati_channel: Option<Arc<WatiChannel>> = config.channels.wati.as_ref().map(|wati_cfg| {
         Arc::new(
@@ -985,6 +1002,7 @@ pub async fn run_gateway(
         whatsapp_app_secret,
         linq: linq_channel,
         linq_signing_secret,
+        vonage: vonage_channel,
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
         wati: wati_channel,
@@ -1047,6 +1065,7 @@ pub async fn run_gateway(
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
+        .route("/vonage/sms", post(handle_vonage_sms_webhook))
         .route("/wati", get(handle_wati_verify))
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
@@ -2091,6 +2110,119 @@ async fn handle_linq_webhook(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// POST /vonage/sms — incoming SMS webhook from Vonage (Nexmo) Programmable
+/// Messaging.
+///
+/// Vonage sends `application/x-www-form-urlencoded` POSTs with `msisdn`,
+/// `to`, `text`, `messageId`, `type`, and a `sig` parameter computed as
+/// HMAC-SHA256 over alphabetically-sorted params + `signature_secret`,
+/// hex-encoded. The handler:
+///
+/// 1. Parses the form body into a `BTreeMap` so signature recomputation
+///    walks keys in the same order Vonage signed.
+/// 2. Verifies `sig` via `VonageChannel::verify_signature`. A failure
+///    returns 401 and the SMS is dropped — no message ever reaches the
+///    agent.
+/// 3. Parses the form payload via `VonageChannel::parse_webhook_payload`,
+///    which applies the `allowed_numbers` allowlist.
+/// 4. Forwards the resulting `ChannelMessage` to the agent loop and
+///    replies via `VonageChannel::send`.
+///
+/// Successful runs return `200 OK` with `{"status":"ok"}` — Vonage just
+/// needs a 200 to consider the inbound delivered.
+async fn handle_vonage_sms_webhook(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> impl IntoResponse {
+    use std::collections::BTreeMap;
+    let Some(ref vonage) = state.vonage else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Vonage not configured"})),
+        );
+    };
+
+    let parsed: Vec<(String, String)> = match serde_urlencoded::from_bytes(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid form body"})),
+            );
+        }
+    };
+    let form_params: BTreeMap<String, String> = parsed.into_iter().collect();
+
+    if !vonage.verify_signature(&form_params) {
+        tracing::warn!(
+            "Vonage webhook signature verification failed (sig param: {})",
+            if form_params.contains_key("sig") {
+                "invalid"
+            } else {
+                "missing"
+            }
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid signature"})),
+        );
+    }
+
+    let Some(msg) = vonage.parse_webhook_payload(&form_params) else {
+        // Sender wasn't on the allowlist or the body was empty. Still
+        // return 200 so Vonage doesn't retry.
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    };
+
+    tracing::info!(
+        "Vonage SMS from {}: {}",
+        msg.sender,
+        truncate_with_ellipsis(&msg.content, 50)
+    );
+    let session_id = sender_session_id("vonage", &msg);
+
+    if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
+        let key = format!("vonage:{}:{}", msg.sender, msg.id);
+        let _ = state
+            .mem
+            .store(
+                &key,
+                &msg.content,
+                MemoryCategory::Conversation,
+                Some(&session_id),
+            )
+            .await;
+    }
+
+    match Box::pin(run_gateway_chat_with_tools(
+        &state,
+        &msg.content,
+        Some(&session_id),
+    ))
+    .await
+    {
+        Ok(GatewayChatOutcome { response, .. }) => {
+            if let Err(e) = vonage
+                .send(&SendMessage::new(response, &msg.reply_target))
+                .await
+            {
+                tracing::error!("Failed to send Vonage reply: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::error!("LLM error for Vonage message: {e:#}");
+            let _ = vonage
+                .send(&SendMessage::new(
+                    "Sorry, I couldn't process your message right now.",
+                    &msg.reply_target,
+                ))
+                .await;
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
 /// GET /wati — WATI webhook verification (echoes hub.challenge)
 async fn handle_wati_verify(
     State(state): State<AppState>,
@@ -2678,6 +2810,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            vonage: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -2752,6 +2885,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            vonage: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3211,6 +3345,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            vonage: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3293,6 +3428,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            vonage: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3387,6 +3523,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            vonage: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3453,6 +3590,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            vonage: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3524,6 +3662,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            vonage: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3600,6 +3739,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            vonage: None,
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
@@ -3673,6 +3813,7 @@ mod tests {
             whatsapp_app_secret: None,
             linq: None,
             linq_signing_secret: None,
+            vonage: None,
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             wati: None,
