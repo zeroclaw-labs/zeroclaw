@@ -1,0 +1,462 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `crates/zeroclaw-runtime/src/security/playbook.rs`."><title>playbook.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-b7b9f40b.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="zeroclaw_runtime" data-themes="" data-resource-suffix="" data-rustdoc-version="1.95.0 (59807616e 2026-04-14)" data-channel="1.95.0" data-search-js="search-63369b7b.js" data-stringdex-js="stringdex-b897f86f.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../static.files/src-script-813739b1.js"></script><script defer src="../../../src-files.js"></script><script defer src="../../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">zeroclaw_runtime/security/</div>playbook.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! Incident response playbook definitions and execution engine.
+<a href=#2 id=2 data-nosnippet>2</a>//!
+<a href=#3 id=3 data-nosnippet>3</a>//! Playbooks define structured response procedures for security incidents.
+<a href=#4 id=4 data-nosnippet>4</a>//! Each playbook has named steps, some of which require human approval before
+<a href=#5 id=5 data-nosnippet>5</a>//! execution. Playbooks are loaded from JSON files in the configured directory.
+<a href=#6 id=6 data-nosnippet>6</a>
+<a href=#7 id=7 data-nosnippet>7</a></span><span class="kw">use </span>serde::{Deserialize, Serialize};
+<a href=#8 id=8 data-nosnippet>8</a><span class="kw">use </span>std::path::Path;
+<a href=#9 id=9 data-nosnippet>9</a>
+<a href=#10 id=10 data-nosnippet>10</a><span class="doccomment">/// A single step in an incident response playbook.
+<a href=#11 id=11 data-nosnippet>11</a></span><span class="attr">#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+<a href=#12 id=12 data-nosnippet>12</a></span><span class="kw">pub struct </span>PlaybookStep {
+<a href=#13 id=13 data-nosnippet>13</a>    <span class="doccomment">/// Machine-readable action identifier (e.g. "isolate_host", "block_ip").
+<a href=#14 id=14 data-nosnippet>14</a>    </span><span class="kw">pub </span>action: String,
+<a href=#15 id=15 data-nosnippet>15</a>    <span class="doccomment">/// Human-readable description of what this step does.
+<a href=#16 id=16 data-nosnippet>16</a>    </span><span class="kw">pub </span>description: String,
+<a href=#17 id=17 data-nosnippet>17</a>    <span class="doccomment">/// Whether this step requires explicit human approval before execution.
+<a href=#18 id=18 data-nosnippet>18</a>    </span><span class="attr">#[serde(default)]
+<a href=#19 id=19 data-nosnippet>19</a>    </span><span class="kw">pub </span>requires_approval: bool,
+<a href=#20 id=20 data-nosnippet>20</a>    <span class="doccomment">/// Timeout in seconds for this step. Default: 300 (5 minutes).
+<a href=#21 id=21 data-nosnippet>21</a>    </span><span class="attr">#[serde(default = <span class="string">"default_timeout_secs"</span>)]
+<a href=#22 id=22 data-nosnippet>22</a>    </span><span class="kw">pub </span>timeout_secs: u64,
+<a href=#23 id=23 data-nosnippet>23</a>}
+<a href=#24 id=24 data-nosnippet>24</a>
+<a href=#25 id=25 data-nosnippet>25</a><span class="kw">fn </span>default_timeout_secs() -&gt; u64 {
+<a href=#26 id=26 data-nosnippet>26</a>    <span class="number">300
+<a href=#27 id=27 data-nosnippet>27</a></span>}
+<a href=#28 id=28 data-nosnippet>28</a>
+<a href=#29 id=29 data-nosnippet>29</a><span class="doccomment">/// An incident response playbook.
+<a href=#30 id=30 data-nosnippet>30</a></span><span class="attr">#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+<a href=#31 id=31 data-nosnippet>31</a></span><span class="kw">pub struct </span>Playbook {
+<a href=#32 id=32 data-nosnippet>32</a>    <span class="doccomment">/// Unique playbook name (e.g. "suspicious_login").
+<a href=#33 id=33 data-nosnippet>33</a>    </span><span class="kw">pub </span>name: String,
+<a href=#34 id=34 data-nosnippet>34</a>    <span class="doccomment">/// Human-readable description.
+<a href=#35 id=35 data-nosnippet>35</a>    </span><span class="kw">pub </span>description: String,
+<a href=#36 id=36 data-nosnippet>36</a>    <span class="doccomment">/// Ordered list of response steps.
+<a href=#37 id=37 data-nosnippet>37</a>    </span><span class="kw">pub </span>steps: Vec&lt;PlaybookStep&gt;,
+<a href=#38 id=38 data-nosnippet>38</a>    <span class="doccomment">/// Minimum alert severity that triggers this playbook (low/medium/high/critical).
+<a href=#39 id=39 data-nosnippet>39</a>    </span><span class="attr">#[serde(default = <span class="string">"default_severity_filter"</span>)]
+<a href=#40 id=40 data-nosnippet>40</a>    </span><span class="kw">pub </span>severity_filter: String,
+<a href=#41 id=41 data-nosnippet>41</a>    <span class="doccomment">/// Step indices (0-based) that can be auto-approved when below max_auto_severity.
+<a href=#42 id=42 data-nosnippet>42</a>    </span><span class="attr">#[serde(default)]
+<a href=#43 id=43 data-nosnippet>43</a>    </span><span class="kw">pub </span>auto_approve_steps: Vec&lt;usize&gt;,
+<a href=#44 id=44 data-nosnippet>44</a>}
+<a href=#45 id=45 data-nosnippet>45</a>
+<a href=#46 id=46 data-nosnippet>46</a><span class="kw">fn </span>default_severity_filter() -&gt; String {
+<a href=#47 id=47 data-nosnippet>47</a>    <span class="string">"medium"</span>.into()
+<a href=#48 id=48 data-nosnippet>48</a>}
+<a href=#49 id=49 data-nosnippet>49</a>
+<a href=#50 id=50 data-nosnippet>50</a><span class="doccomment">/// Result of executing a single playbook step.
+<a href=#51 id=51 data-nosnippet>51</a></span><span class="attr">#[derive(Debug, Clone, Serialize, Deserialize)]
+<a href=#52 id=52 data-nosnippet>52</a></span><span class="kw">pub struct </span>StepExecutionResult {
+<a href=#53 id=53 data-nosnippet>53</a>    <span class="kw">pub </span>step_index: usize,
+<a href=#54 id=54 data-nosnippet>54</a>    <span class="kw">pub </span>action: String,
+<a href=#55 id=55 data-nosnippet>55</a>    <span class="kw">pub </span>status: StepStatus,
+<a href=#56 id=56 data-nosnippet>56</a>    <span class="kw">pub </span>message: String,
+<a href=#57 id=57 data-nosnippet>57</a>}
+<a href=#58 id=58 data-nosnippet>58</a>
+<a href=#59 id=59 data-nosnippet>59</a><span class="doccomment">/// Status of a playbook step.
+<a href=#60 id=60 data-nosnippet>60</a></span><span class="attr">#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+<a href=#61 id=61 data-nosnippet>61</a></span><span class="kw">pub enum </span>StepStatus {
+<a href=#62 id=62 data-nosnippet>62</a>    <span class="doccomment">/// Step completed successfully.
+<a href=#63 id=63 data-nosnippet>63</a>    </span>Completed,
+<a href=#64 id=64 data-nosnippet>64</a>    <span class="doccomment">/// Step is waiting for human approval.
+<a href=#65 id=65 data-nosnippet>65</a>    </span>PendingApproval,
+<a href=#66 id=66 data-nosnippet>66</a>    <span class="doccomment">/// Step was skipped (e.g. not applicable).
+<a href=#67 id=67 data-nosnippet>67</a>    </span>Skipped,
+<a href=#68 id=68 data-nosnippet>68</a>    <span class="doccomment">/// Step failed with an error.
+<a href=#69 id=69 data-nosnippet>69</a>    </span>Failed,
+<a href=#70 id=70 data-nosnippet>70</a>}
+<a href=#71 id=71 data-nosnippet>71</a>
+<a href=#72 id=72 data-nosnippet>72</a><span class="kw">impl </span>std::fmt::Display <span class="kw">for </span>StepStatus {
+<a href=#73 id=73 data-nosnippet>73</a>    <span class="kw">fn </span>fmt(<span class="kw-2">&amp;</span><span class="self">self</span>, f: <span class="kw-2">&amp;mut </span>std::fmt::Formatter&lt;<span class="lifetime">'_</span>&gt;) -&gt; std::fmt::Result {
+<a href=#74 id=74 data-nosnippet>74</a>        <span class="kw">match </span><span class="self">self </span>{
+<a href=#75 id=75 data-nosnippet>75</a>            <span class="self">Self</span>::Completed =&gt; <span class="macro">write!</span>(f, <span class="string">"completed"</span>),
+<a href=#76 id=76 data-nosnippet>76</a>            <span class="self">Self</span>::PendingApproval =&gt; <span class="macro">write!</span>(f, <span class="string">"pending_approval"</span>),
+<a href=#77 id=77 data-nosnippet>77</a>            <span class="self">Self</span>::Skipped =&gt; <span class="macro">write!</span>(f, <span class="string">"skipped"</span>),
+<a href=#78 id=78 data-nosnippet>78</a>            <span class="self">Self</span>::Failed =&gt; <span class="macro">write!</span>(f, <span class="string">"failed"</span>),
+<a href=#79 id=79 data-nosnippet>79</a>        }
+<a href=#80 id=80 data-nosnippet>80</a>    }
+<a href=#81 id=81 data-nosnippet>81</a>}
+<a href=#82 id=82 data-nosnippet>82</a>
+<a href=#83 id=83 data-nosnippet>83</a><span class="doccomment">/// Load all playbook definitions from a directory of JSON files.
+<a href=#84 id=84 data-nosnippet>84</a></span><span class="kw">pub fn </span>load_playbooks(dir: <span class="kw-2">&amp;</span>Path) -&gt; Vec&lt;Playbook&gt; {
+<a href=#85 id=85 data-nosnippet>85</a>    <span class="kw">let </span><span class="kw-2">mut </span>playbooks = Vec::new();
+<a href=#86 id=86 data-nosnippet>86</a>
+<a href=#87 id=87 data-nosnippet>87</a>    <span class="kw">if </span>!dir.exists() || !dir.is_dir() {
+<a href=#88 id=88 data-nosnippet>88</a>        <span class="kw">return </span>builtin_playbooks();
+<a href=#89 id=89 data-nosnippet>89</a>    }
+<a href=#90 id=90 data-nosnippet>90</a>
+<a href=#91 id=91 data-nosnippet>91</a>    <span class="kw">if let </span><span class="prelude-val">Ok</span>(entries) = std::fs::read_dir(dir) {
+<a href=#92 id=92 data-nosnippet>92</a>        <span class="kw">for </span>entry <span class="kw">in </span>entries.flatten() {
+<a href=#93 id=93 data-nosnippet>93</a>            <span class="kw">let </span>path = entry.path();
+<a href=#94 id=94 data-nosnippet>94</a>            <span class="kw">if </span>path.extension().is_some_and(|ext| ext == <span class="string">"json"</span>) {
+<a href=#95 id=95 data-nosnippet>95</a>                <span class="kw">match </span>std::fs::read_to_string(<span class="kw-2">&amp;</span>path) {
+<a href=#96 id=96 data-nosnippet>96</a>                    <span class="prelude-val">Ok</span>(contents) =&gt; <span class="kw">match </span>serde_json::from_str::&lt;Playbook&gt;(<span class="kw-2">&amp;</span>contents) {
+<a href=#97 id=97 data-nosnippet>97</a>                        <span class="prelude-val">Ok</span>(pb) =&gt; playbooks.push(pb),
+<a href=#98 id=98 data-nosnippet>98</a>                        <span class="prelude-val">Err</span>(e) =&gt; {
+<a href=#99 id=99 data-nosnippet>99</a>                            <span class="macro">tracing::warn!</span>(<span class="string">"Failed to parse playbook {}: {e}"</span>, path.display());
+<a href=#100 id=100 data-nosnippet>100</a>                        }
+<a href=#101 id=101 data-nosnippet>101</a>                    },
+<a href=#102 id=102 data-nosnippet>102</a>                    <span class="prelude-val">Err</span>(e) =&gt; {
+<a href=#103 id=103 data-nosnippet>103</a>                        <span class="macro">tracing::warn!</span>(<span class="string">"Failed to read playbook {}: {e}"</span>, path.display());
+<a href=#104 id=104 data-nosnippet>104</a>                    }
+<a href=#105 id=105 data-nosnippet>105</a>                }
+<a href=#106 id=106 data-nosnippet>106</a>            }
+<a href=#107 id=107 data-nosnippet>107</a>        }
+<a href=#108 id=108 data-nosnippet>108</a>    }
+<a href=#109 id=109 data-nosnippet>109</a>
+<a href=#110 id=110 data-nosnippet>110</a>    <span class="comment">// Merge built-in playbooks that aren't overridden by user-defined ones
+<a href=#111 id=111 data-nosnippet>111</a>    </span><span class="kw">for </span>builtin <span class="kw">in </span>builtin_playbooks() {
+<a href=#112 id=112 data-nosnippet>112</a>        <span class="kw">if </span>!playbooks.iter().any(|p| p.name == builtin.name) {
+<a href=#113 id=113 data-nosnippet>113</a>            playbooks.push(builtin);
+<a href=#114 id=114 data-nosnippet>114</a>        }
+<a href=#115 id=115 data-nosnippet>115</a>    }
+<a href=#116 id=116 data-nosnippet>116</a>
+<a href=#117 id=117 data-nosnippet>117</a>    playbooks
+<a href=#118 id=118 data-nosnippet>118</a>}
+<a href=#119 id=119 data-nosnippet>119</a>
+<a href=#120 id=120 data-nosnippet>120</a><span class="doccomment">/// Severity ordering for comparison: low &lt; medium &lt; high &lt; critical.
+<a href=#121 id=121 data-nosnippet>121</a></span><span class="kw">pub fn </span>severity_level(severity: <span class="kw-2">&amp;</span>str) -&gt; u8 {
+<a href=#122 id=122 data-nosnippet>122</a>    <span class="kw">match </span>severity.to_lowercase().as_str() {
+<a href=#123 id=123 data-nosnippet>123</a>        <span class="string">"low" </span>=&gt; <span class="number">1</span>,
+<a href=#124 id=124 data-nosnippet>124</a>        <span class="string">"medium" </span>=&gt; <span class="number">2</span>,
+<a href=#125 id=125 data-nosnippet>125</a>        <span class="string">"high" </span>=&gt; <span class="number">3</span>,
+<a href=#126 id=126 data-nosnippet>126</a>        <span class="string">"critical" </span>=&gt; <span class="number">4</span>,
+<a href=#127 id=127 data-nosnippet>127</a>        <span class="comment">// Deny-by-default: unknown severities get the highest level to prevent
+<a href=#128 id=128 data-nosnippet>128</a>        // auto-approval of unrecognized severity labels.
+<a href=#129 id=129 data-nosnippet>129</a>        </span><span class="kw">_ </span>=&gt; u8::MAX,
+<a href=#130 id=130 data-nosnippet>130</a>    }
+<a href=#131 id=131 data-nosnippet>131</a>}
+<a href=#132 id=132 data-nosnippet>132</a>
+<a href=#133 id=133 data-nosnippet>133</a><span class="doccomment">/// Check whether a step can be auto-approved given config constraints.
+<a href=#134 id=134 data-nosnippet>134</a></span><span class="kw">pub fn </span>can_auto_approve(
+<a href=#135 id=135 data-nosnippet>135</a>    playbook: <span class="kw-2">&amp;</span>Playbook,
+<a href=#136 id=136 data-nosnippet>136</a>    step_index: usize,
+<a href=#137 id=137 data-nosnippet>137</a>    alert_severity: <span class="kw-2">&amp;</span>str,
+<a href=#138 id=138 data-nosnippet>138</a>    max_auto_severity: <span class="kw-2">&amp;</span>str,
+<a href=#139 id=139 data-nosnippet>139</a>) -&gt; bool {
+<a href=#140 id=140 data-nosnippet>140</a>    <span class="comment">// Never auto-approve if alert severity exceeds the configured max
+<a href=#141 id=141 data-nosnippet>141</a>    </span><span class="kw">if </span>severity_level(alert_severity) &gt; severity_level(max_auto_severity) {
+<a href=#142 id=142 data-nosnippet>142</a>        <span class="kw">return </span><span class="bool-val">false</span>;
+<a href=#143 id=143 data-nosnippet>143</a>    }
+<a href=#144 id=144 data-nosnippet>144</a>
+<a href=#145 id=145 data-nosnippet>145</a>    <span class="comment">// Only auto-approve steps explicitly listed in auto_approve_steps
+<a href=#146 id=146 data-nosnippet>146</a>    </span>playbook.auto_approve_steps.contains(<span class="kw-2">&amp;</span>step_index)
+<a href=#147 id=147 data-nosnippet>147</a>}
+<a href=#148 id=148 data-nosnippet>148</a>
+<a href=#149 id=149 data-nosnippet>149</a><span class="doccomment">/// Evaluate a playbook step. Returns the result with approval gating.
+<a href=#150 id=150 data-nosnippet>150</a>///
+<a href=#151 id=151 data-nosnippet>151</a>/// Steps that require approval and cannot be auto-approved will return
+<a href=#152 id=152 data-nosnippet>152</a>/// `StepStatus::PendingApproval` without executing.
+<a href=#153 id=153 data-nosnippet>153</a></span><span class="kw">pub fn </span>evaluate_step(
+<a href=#154 id=154 data-nosnippet>154</a>    playbook: <span class="kw-2">&amp;</span>Playbook,
+<a href=#155 id=155 data-nosnippet>155</a>    step_index: usize,
+<a href=#156 id=156 data-nosnippet>156</a>    alert_severity: <span class="kw-2">&amp;</span>str,
+<a href=#157 id=157 data-nosnippet>157</a>    max_auto_severity: <span class="kw-2">&amp;</span>str,
+<a href=#158 id=158 data-nosnippet>158</a>    require_approval: bool,
+<a href=#159 id=159 data-nosnippet>159</a>) -&gt; StepExecutionResult {
+<a href=#160 id=160 data-nosnippet>160</a>    <span class="kw">let </span>step = <span class="kw">match </span>playbook.steps.get(step_index) {
+<a href=#161 id=161 data-nosnippet>161</a>        <span class="prelude-val">Some</span>(s) =&gt; s,
+<a href=#162 id=162 data-nosnippet>162</a>        <span class="prelude-val">None </span>=&gt; {
+<a href=#163 id=163 data-nosnippet>163</a>            <span class="kw">return </span>StepExecutionResult {
+<a href=#164 id=164 data-nosnippet>164</a>                step_index,
+<a href=#165 id=165 data-nosnippet>165</a>                action: <span class="string">"unknown"</span>.into(),
+<a href=#166 id=166 data-nosnippet>166</a>                status: StepStatus::Failed,
+<a href=#167 id=167 data-nosnippet>167</a>                message: <span class="macro">format!</span>(<span class="string">"Step index {step_index} out of range"</span>),
+<a href=#168 id=168 data-nosnippet>168</a>            };
+<a href=#169 id=169 data-nosnippet>169</a>        }
+<a href=#170 id=170 data-nosnippet>170</a>    };
+<a href=#171 id=171 data-nosnippet>171</a>
+<a href=#172 id=172 data-nosnippet>172</a>    <span class="comment">// Enforce approval gates: steps that require approval must either be
+<a href=#173 id=173 data-nosnippet>173</a>    // auto-approved or wait for human approval. Never mark an unexecuted
+<a href=#174 id=174 data-nosnippet>174</a>    // approval-gated step as Completed.
+<a href=#175 id=175 data-nosnippet>175</a>    </span><span class="kw">if </span>step.requires_approval
+<a href=#176 id=176 data-nosnippet>176</a>        &amp;&amp; (!require_approval
+<a href=#177 id=177 data-nosnippet>177</a>            || !can_auto_approve(playbook, step_index, alert_severity, max_auto_severity))
+<a href=#178 id=178 data-nosnippet>178</a>    {
+<a href=#179 id=179 data-nosnippet>179</a>        <span class="kw">return </span>StepExecutionResult {
+<a href=#180 id=180 data-nosnippet>180</a>            step_index,
+<a href=#181 id=181 data-nosnippet>181</a>            action: step.action.clone(),
+<a href=#182 id=182 data-nosnippet>182</a>            status: StepStatus::PendingApproval,
+<a href=#183 id=183 data-nosnippet>183</a>            message: <span class="macro">format!</span>(
+<a href=#184 id=184 data-nosnippet>184</a>                <span class="string">"Step '{}' requires human approval (severity: {alert_severity})"</span>,
+<a href=#185 id=185 data-nosnippet>185</a>                step.description
+<a href=#186 id=186 data-nosnippet>186</a>            ),
+<a href=#187 id=187 data-nosnippet>187</a>        };
+<a href=#188 id=188 data-nosnippet>188</a>    }
+<a href=#189 id=189 data-nosnippet>189</a>
+<a href=#190 id=190 data-nosnippet>190</a>    <span class="comment">// Step is approved (either doesn't require approval, or was auto-approved)
+<a href=#191 id=191 data-nosnippet>191</a>    // Actual execution would be delegated to the appropriate tool/system
+<a href=#192 id=192 data-nosnippet>192</a>    </span>StepExecutionResult {
+<a href=#193 id=193 data-nosnippet>193</a>        step_index,
+<a href=#194 id=194 data-nosnippet>194</a>        action: step.action.clone(),
+<a href=#195 id=195 data-nosnippet>195</a>        status: StepStatus::Completed,
+<a href=#196 id=196 data-nosnippet>196</a>        message: <span class="macro">format!</span>(<span class="string">"Executed: {}"</span>, step.description),
+<a href=#197 id=197 data-nosnippet>197</a>    }
+<a href=#198 id=198 data-nosnippet>198</a>}
+<a href=#199 id=199 data-nosnippet>199</a>
+<a href=#200 id=200 data-nosnippet>200</a><span class="doccomment">/// Built-in playbook definitions for common incident types.
+<a href=#201 id=201 data-nosnippet>201</a></span><span class="kw">pub fn </span>builtin_playbooks() -&gt; Vec&lt;Playbook&gt; {
+<a href=#202 id=202 data-nosnippet>202</a>    <span class="macro">vec!</span>[
+<a href=#203 id=203 data-nosnippet>203</a>        Playbook {
+<a href=#204 id=204 data-nosnippet>204</a>            name: <span class="string">"suspicious_login"</span>.into(),
+<a href=#205 id=205 data-nosnippet>205</a>            description: <span class="string">"Respond to suspicious login activity detected by SIEM"</span>.into(),
+<a href=#206 id=206 data-nosnippet>206</a>            steps: <span class="macro">vec!</span>[
+<a href=#207 id=207 data-nosnippet>207</a>                PlaybookStep {
+<a href=#208 id=208 data-nosnippet>208</a>                    action: <span class="string">"gather_login_context"</span>.into(),
+<a href=#209 id=209 data-nosnippet>209</a>                    description: <span class="string">"Collect login metadata: IP, geo, device fingerprint, time"</span>.into(),
+<a href=#210 id=210 data-nosnippet>210</a>                    requires_approval: <span class="bool-val">false</span>,
+<a href=#211 id=211 data-nosnippet>211</a>                    timeout_secs: <span class="number">60</span>,
+<a href=#212 id=212 data-nosnippet>212</a>                },
+<a href=#213 id=213 data-nosnippet>213</a>                PlaybookStep {
+<a href=#214 id=214 data-nosnippet>214</a>                    action: <span class="string">"check_threat_intel"</span>.into(),
+<a href=#215 id=215 data-nosnippet>215</a>                    description: <span class="string">"Query threat intelligence for source IP reputation"</span>.into(),
+<a href=#216 id=216 data-nosnippet>216</a>                    requires_approval: <span class="bool-val">false</span>,
+<a href=#217 id=217 data-nosnippet>217</a>                    timeout_secs: <span class="number">30</span>,
+<a href=#218 id=218 data-nosnippet>218</a>                },
+<a href=#219 id=219 data-nosnippet>219</a>                PlaybookStep {
+<a href=#220 id=220 data-nosnippet>220</a>                    action: <span class="string">"notify_user"</span>.into(),
+<a href=#221 id=221 data-nosnippet>221</a>                    description: <span class="string">"Send verification notification to account owner"</span>.into(),
+<a href=#222 id=222 data-nosnippet>222</a>                    requires_approval: <span class="bool-val">true</span>,
+<a href=#223 id=223 data-nosnippet>223</a>                    timeout_secs: <span class="number">300</span>,
+<a href=#224 id=224 data-nosnippet>224</a>                },
+<a href=#225 id=225 data-nosnippet>225</a>                PlaybookStep {
+<a href=#226 id=226 data-nosnippet>226</a>                    action: <span class="string">"force_password_reset"</span>.into(),
+<a href=#227 id=227 data-nosnippet>227</a>                    description: <span class="string">"Force password reset if login confirmed unauthorized"</span>.into(),
+<a href=#228 id=228 data-nosnippet>228</a>                    requires_approval: <span class="bool-val">true</span>,
+<a href=#229 id=229 data-nosnippet>229</a>                    timeout_secs: <span class="number">120</span>,
+<a href=#230 id=230 data-nosnippet>230</a>                },
+<a href=#231 id=231 data-nosnippet>231</a>            ],
+<a href=#232 id=232 data-nosnippet>232</a>            severity_filter: <span class="string">"medium"</span>.into(),
+<a href=#233 id=233 data-nosnippet>233</a>            auto_approve_steps: <span class="macro">vec!</span>[<span class="number">0</span>, <span class="number">1</span>],
+<a href=#234 id=234 data-nosnippet>234</a>        },
+<a href=#235 id=235 data-nosnippet>235</a>        Playbook {
+<a href=#236 id=236 data-nosnippet>236</a>            name: <span class="string">"malware_detected"</span>.into(),
+<a href=#237 id=237 data-nosnippet>237</a>            description: <span class="string">"Respond to malware detection on endpoint"</span>.into(),
+<a href=#238 id=238 data-nosnippet>238</a>            steps: <span class="macro">vec!</span>[
+<a href=#239 id=239 data-nosnippet>239</a>                PlaybookStep {
+<a href=#240 id=240 data-nosnippet>240</a>                    action: <span class="string">"isolate_endpoint"</span>.into(),
+<a href=#241 id=241 data-nosnippet>241</a>                    description: <span class="string">"Network-isolate the affected endpoint"</span>.into(),
+<a href=#242 id=242 data-nosnippet>242</a>                    requires_approval: <span class="bool-val">true</span>,
+<a href=#243 id=243 data-nosnippet>243</a>                    timeout_secs: <span class="number">60</span>,
+<a href=#244 id=244 data-nosnippet>244</a>                },
+<a href=#245 id=245 data-nosnippet>245</a>                PlaybookStep {
+<a href=#246 id=246 data-nosnippet>246</a>                    action: <span class="string">"collect_forensics"</span>.into(),
+<a href=#247 id=247 data-nosnippet>247</a>                    description: <span class="string">"Capture memory dump and disk image for analysis"</span>.into(),
+<a href=#248 id=248 data-nosnippet>248</a>                    requires_approval: <span class="bool-val">false</span>,
+<a href=#249 id=249 data-nosnippet>249</a>                    timeout_secs: <span class="number">600</span>,
+<a href=#250 id=250 data-nosnippet>250</a>                },
+<a href=#251 id=251 data-nosnippet>251</a>                PlaybookStep {
+<a href=#252 id=252 data-nosnippet>252</a>                    action: <span class="string">"scan_lateral_movement"</span>.into(),
+<a href=#253 id=253 data-nosnippet>253</a>                    description: <span class="string">"Check for lateral movement indicators on adjacent hosts"</span>.into(),
+<a href=#254 id=254 data-nosnippet>254</a>                    requires_approval: <span class="bool-val">false</span>,
+<a href=#255 id=255 data-nosnippet>255</a>                    timeout_secs: <span class="number">300</span>,
+<a href=#256 id=256 data-nosnippet>256</a>                },
+<a href=#257 id=257 data-nosnippet>257</a>                PlaybookStep {
+<a href=#258 id=258 data-nosnippet>258</a>                    action: <span class="string">"remediate_endpoint"</span>.into(),
+<a href=#259 id=259 data-nosnippet>259</a>                    description: <span class="string">"Remove malware and restore endpoint to clean state"</span>.into(),
+<a href=#260 id=260 data-nosnippet>260</a>                    requires_approval: <span class="bool-val">true</span>,
+<a href=#261 id=261 data-nosnippet>261</a>                    timeout_secs: <span class="number">600</span>,
+<a href=#262 id=262 data-nosnippet>262</a>                },
+<a href=#263 id=263 data-nosnippet>263</a>            ],
+<a href=#264 id=264 data-nosnippet>264</a>            severity_filter: <span class="string">"high"</span>.into(),
+<a href=#265 id=265 data-nosnippet>265</a>            auto_approve_steps: <span class="macro">vec!</span>[<span class="number">1</span>, <span class="number">2</span>],
+<a href=#266 id=266 data-nosnippet>266</a>        },
+<a href=#267 id=267 data-nosnippet>267</a>        Playbook {
+<a href=#268 id=268 data-nosnippet>268</a>            name: <span class="string">"data_exfiltration_attempt"</span>.into(),
+<a href=#269 id=269 data-nosnippet>269</a>            description: <span class="string">"Respond to suspected data exfiltration"</span>.into(),
+<a href=#270 id=270 data-nosnippet>270</a>            steps: <span class="macro">vec!</span>[
+<a href=#271 id=271 data-nosnippet>271</a>                PlaybookStep {
+<a href=#272 id=272 data-nosnippet>272</a>                    action: <span class="string">"block_egress"</span>.into(),
+<a href=#273 id=273 data-nosnippet>273</a>                    description: <span class="string">"Block suspicious outbound connections"</span>.into(),
+<a href=#274 id=274 data-nosnippet>274</a>                    requires_approval: <span class="bool-val">true</span>,
+<a href=#275 id=275 data-nosnippet>275</a>                    timeout_secs: <span class="number">30</span>,
+<a href=#276 id=276 data-nosnippet>276</a>                },
+<a href=#277 id=277 data-nosnippet>277</a>                PlaybookStep {
+<a href=#278 id=278 data-nosnippet>278</a>                    action: <span class="string">"identify_data_scope"</span>.into(),
+<a href=#279 id=279 data-nosnippet>279</a>                    description: <span class="string">"Determine what data may have been accessed or transferred"</span>.into(),
+<a href=#280 id=280 data-nosnippet>280</a>                    requires_approval: <span class="bool-val">false</span>,
+<a href=#281 id=281 data-nosnippet>281</a>                    timeout_secs: <span class="number">300</span>,
+<a href=#282 id=282 data-nosnippet>282</a>                },
+<a href=#283 id=283 data-nosnippet>283</a>                PlaybookStep {
+<a href=#284 id=284 data-nosnippet>284</a>                    action: <span class="string">"preserve_evidence"</span>.into(),
+<a href=#285 id=285 data-nosnippet>285</a>                    description: <span class="string">"Preserve network logs and access records"</span>.into(),
+<a href=#286 id=286 data-nosnippet>286</a>                    requires_approval: <span class="bool-val">false</span>,
+<a href=#287 id=287 data-nosnippet>287</a>                    timeout_secs: <span class="number">120</span>,
+<a href=#288 id=288 data-nosnippet>288</a>                },
+<a href=#289 id=289 data-nosnippet>289</a>                PlaybookStep {
+<a href=#290 id=290 data-nosnippet>290</a>                    action: <span class="string">"escalate_to_legal"</span>.into(),
+<a href=#291 id=291 data-nosnippet>291</a>                    description: <span class="string">"Notify legal and compliance teams"</span>.into(),
+<a href=#292 id=292 data-nosnippet>292</a>                    requires_approval: <span class="bool-val">true</span>,
+<a href=#293 id=293 data-nosnippet>293</a>                    timeout_secs: <span class="number">60</span>,
+<a href=#294 id=294 data-nosnippet>294</a>                },
+<a href=#295 id=295 data-nosnippet>295</a>            ],
+<a href=#296 id=296 data-nosnippet>296</a>            severity_filter: <span class="string">"critical"</span>.into(),
+<a href=#297 id=297 data-nosnippet>297</a>            auto_approve_steps: <span class="macro">vec!</span>[<span class="number">1</span>, <span class="number">2</span>],
+<a href=#298 id=298 data-nosnippet>298</a>        },
+<a href=#299 id=299 data-nosnippet>299</a>        Playbook {
+<a href=#300 id=300 data-nosnippet>300</a>            name: <span class="string">"brute_force"</span>.into(),
+<a href=#301 id=301 data-nosnippet>301</a>            description: <span class="string">"Respond to brute force authentication attempts"</span>.into(),
+<a href=#302 id=302 data-nosnippet>302</a>            steps: <span class="macro">vec!</span>[
+<a href=#303 id=303 data-nosnippet>303</a>                PlaybookStep {
+<a href=#304 id=304 data-nosnippet>304</a>                    action: <span class="string">"block_source_ip"</span>.into(),
+<a href=#305 id=305 data-nosnippet>305</a>                    description: <span class="string">"Block the attacking source IP at firewall"</span>.into(),
+<a href=#306 id=306 data-nosnippet>306</a>                    requires_approval: <span class="bool-val">true</span>,
+<a href=#307 id=307 data-nosnippet>307</a>                    timeout_secs: <span class="number">30</span>,
+<a href=#308 id=308 data-nosnippet>308</a>                },
+<a href=#309 id=309 data-nosnippet>309</a>                PlaybookStep {
+<a href=#310 id=310 data-nosnippet>310</a>                    action: <span class="string">"check_compromised_accounts"</span>.into(),
+<a href=#311 id=311 data-nosnippet>311</a>                    description: <span class="string">"Check if any accounts were successfully compromised"</span>.into(),
+<a href=#312 id=312 data-nosnippet>312</a>                    requires_approval: <span class="bool-val">false</span>,
+<a href=#313 id=313 data-nosnippet>313</a>                    timeout_secs: <span class="number">120</span>,
+<a href=#314 id=314 data-nosnippet>314</a>                },
+<a href=#315 id=315 data-nosnippet>315</a>                PlaybookStep {
+<a href=#316 id=316 data-nosnippet>316</a>                    action: <span class="string">"enable_rate_limiting"</span>.into(),
+<a href=#317 id=317 data-nosnippet>317</a>                    description: <span class="string">"Enable enhanced rate limiting on auth endpoints"</span>.into(),
+<a href=#318 id=318 data-nosnippet>318</a>                    requires_approval: <span class="bool-val">true</span>,
+<a href=#319 id=319 data-nosnippet>319</a>                    timeout_secs: <span class="number">60</span>,
+<a href=#320 id=320 data-nosnippet>320</a>                },
+<a href=#321 id=321 data-nosnippet>321</a>            ],
+<a href=#322 id=322 data-nosnippet>322</a>            severity_filter: <span class="string">"medium"</span>.into(),
+<a href=#323 id=323 data-nosnippet>323</a>            auto_approve_steps: <span class="macro">vec!</span>[<span class="number">1</span>],
+<a href=#324 id=324 data-nosnippet>324</a>        },
+<a href=#325 id=325 data-nosnippet>325</a>    ]
+<a href=#326 id=326 data-nosnippet>326</a>}
+<a href=#327 id=327 data-nosnippet>327</a>
+<a href=#328 id=328 data-nosnippet>328</a><span class="attr">#[cfg(test)]
+<a href=#329 id=329 data-nosnippet>329</a></span><span class="kw">mod </span>tests {
+<a href=#330 id=330 data-nosnippet>330</a>    <span class="kw">use </span>super::<span class="kw-2">*</span>;
+<a href=#331 id=331 data-nosnippet>331</a>
+<a href=#332 id=332 data-nosnippet>332</a>    <span class="attr">#[test]
+<a href=#333 id=333 data-nosnippet>333</a>    </span><span class="kw">fn </span>builtin_playbooks_are_valid() {
+<a href=#334 id=334 data-nosnippet>334</a>        <span class="kw">let </span>playbooks = builtin_playbooks();
+<a href=#335 id=335 data-nosnippet>335</a>        <span class="macro">assert_eq!</span>(playbooks.len(), <span class="number">4</span>);
+<a href=#336 id=336 data-nosnippet>336</a>
+<a href=#337 id=337 data-nosnippet>337</a>        <span class="kw">let </span>names: Vec&lt;<span class="kw-2">&amp;</span>str&gt; = playbooks.iter().map(|p| p.name.as_str()).collect();
+<a href=#338 id=338 data-nosnippet>338</a>        <span class="macro">assert!</span>(names.contains(<span class="kw-2">&amp;</span><span class="string">"suspicious_login"</span>));
+<a href=#339 id=339 data-nosnippet>339</a>        <span class="macro">assert!</span>(names.contains(<span class="kw-2">&amp;</span><span class="string">"malware_detected"</span>));
+<a href=#340 id=340 data-nosnippet>340</a>        <span class="macro">assert!</span>(names.contains(<span class="kw-2">&amp;</span><span class="string">"data_exfiltration_attempt"</span>));
+<a href=#341 id=341 data-nosnippet>341</a>        <span class="macro">assert!</span>(names.contains(<span class="kw-2">&amp;</span><span class="string">"brute_force"</span>));
+<a href=#342 id=342 data-nosnippet>342</a>
+<a href=#343 id=343 data-nosnippet>343</a>        <span class="kw">for </span>pb <span class="kw">in </span><span class="kw-2">&amp;</span>playbooks {
+<a href=#344 id=344 data-nosnippet>344</a>            <span class="macro">assert!</span>(!pb.steps.is_empty(), <span class="string">"Playbook {} has no steps"</span>, pb.name);
+<a href=#345 id=345 data-nosnippet>345</a>            <span class="macro">assert!</span>(!pb.description.is_empty());
+<a href=#346 id=346 data-nosnippet>346</a>        }
+<a href=#347 id=347 data-nosnippet>347</a>    }
+<a href=#348 id=348 data-nosnippet>348</a>
+<a href=#349 id=349 data-nosnippet>349</a>    <span class="attr">#[test]
+<a href=#350 id=350 data-nosnippet>350</a>    </span><span class="kw">fn </span>severity_level_ordering() {
+<a href=#351 id=351 data-nosnippet>351</a>        <span class="macro">assert!</span>(severity_level(<span class="string">"low"</span>) &lt; severity_level(<span class="string">"medium"</span>));
+<a href=#352 id=352 data-nosnippet>352</a>        <span class="macro">assert!</span>(severity_level(<span class="string">"medium"</span>) &lt; severity_level(<span class="string">"high"</span>));
+<a href=#353 id=353 data-nosnippet>353</a>        <span class="macro">assert!</span>(severity_level(<span class="string">"high"</span>) &lt; severity_level(<span class="string">"critical"</span>));
+<a href=#354 id=354 data-nosnippet>354</a>        <span class="macro">assert_eq!</span>(severity_level(<span class="string">"unknown"</span>), u8::MAX);
+<a href=#355 id=355 data-nosnippet>355</a>    }
+<a href=#356 id=356 data-nosnippet>356</a>
+<a href=#357 id=357 data-nosnippet>357</a>    <span class="attr">#[test]
+<a href=#358 id=358 data-nosnippet>358</a>    </span><span class="kw">fn </span>auto_approve_respects_severity_cap() {
+<a href=#359 id=359 data-nosnippet>359</a>        <span class="kw">let </span>pb = <span class="kw-2">&amp;</span>builtin_playbooks()[<span class="number">0</span>]; <span class="comment">// suspicious_login
+<a href=#360 id=360 data-nosnippet>360</a>
+<a href=#361 id=361 data-nosnippet>361</a>        // Step 0 is in auto_approve_steps
+<a href=#362 id=362 data-nosnippet>362</a>        </span><span class="macro">assert!</span>(can_auto_approve(pb, <span class="number">0</span>, <span class="string">"low"</span>, <span class="string">"low"</span>));
+<a href=#363 id=363 data-nosnippet>363</a>        <span class="macro">assert!</span>(can_auto_approve(pb, <span class="number">0</span>, <span class="string">"low"</span>, <span class="string">"medium"</span>));
+<a href=#364 id=364 data-nosnippet>364</a>
+<a href=#365 id=365 data-nosnippet>365</a>        <span class="comment">// Alert severity exceeds max -&gt; cannot auto-approve
+<a href=#366 id=366 data-nosnippet>366</a>        </span><span class="macro">assert!</span>(!can_auto_approve(pb, <span class="number">0</span>, <span class="string">"high"</span>, <span class="string">"low"</span>));
+<a href=#367 id=367 data-nosnippet>367</a>        <span class="macro">assert!</span>(!can_auto_approve(pb, <span class="number">0</span>, <span class="string">"critical"</span>, <span class="string">"medium"</span>));
+<a href=#368 id=368 data-nosnippet>368</a>
+<a href=#369 id=369 data-nosnippet>369</a>        <span class="comment">// Step 2 is NOT in auto_approve_steps
+<a href=#370 id=370 data-nosnippet>370</a>        </span><span class="macro">assert!</span>(!can_auto_approve(pb, <span class="number">2</span>, <span class="string">"low"</span>, <span class="string">"critical"</span>));
+<a href=#371 id=371 data-nosnippet>371</a>    }
+<a href=#372 id=372 data-nosnippet>372</a>
+<a href=#373 id=373 data-nosnippet>373</a>    <span class="attr">#[test]
+<a href=#374 id=374 data-nosnippet>374</a>    </span><span class="kw">fn </span>evaluate_step_requires_approval() {
+<a href=#375 id=375 data-nosnippet>375</a>        <span class="kw">let </span>pb = <span class="kw-2">&amp;</span>builtin_playbooks()[<span class="number">0</span>]; <span class="comment">// suspicious_login
+<a href=#376 id=376 data-nosnippet>376</a>
+<a href=#377 id=377 data-nosnippet>377</a>        // Step 2 (notify_user) requires approval, high severity, max=low -&gt; pending
+<a href=#378 id=378 data-nosnippet>378</a>        </span><span class="kw">let </span>result = evaluate_step(pb, <span class="number">2</span>, <span class="string">"high"</span>, <span class="string">"low"</span>, <span class="bool-val">true</span>);
+<a href=#379 id=379 data-nosnippet>379</a>        <span class="macro">assert_eq!</span>(result.status, StepStatus::PendingApproval);
+<a href=#380 id=380 data-nosnippet>380</a>        <span class="macro">assert_eq!</span>(result.action, <span class="string">"notify_user"</span>);
+<a href=#381 id=381 data-nosnippet>381</a>
+<a href=#382 id=382 data-nosnippet>382</a>        <span class="comment">// Step 0 (gather_login_context) does NOT require approval -&gt; completed
+<a href=#383 id=383 data-nosnippet>383</a>        </span><span class="kw">let </span>result = evaluate_step(pb, <span class="number">0</span>, <span class="string">"high"</span>, <span class="string">"low"</span>, <span class="bool-val">true</span>);
+<a href=#384 id=384 data-nosnippet>384</a>        <span class="macro">assert_eq!</span>(result.status, StepStatus::Completed);
+<a href=#385 id=385 data-nosnippet>385</a>    }
+<a href=#386 id=386 data-nosnippet>386</a>
+<a href=#387 id=387 data-nosnippet>387</a>    <span class="attr">#[test]
+<a href=#388 id=388 data-nosnippet>388</a>    </span><span class="kw">fn </span>evaluate_step_out_of_range() {
+<a href=#389 id=389 data-nosnippet>389</a>        <span class="kw">let </span>pb = <span class="kw-2">&amp;</span>builtin_playbooks()[<span class="number">0</span>];
+<a href=#390 id=390 data-nosnippet>390</a>        <span class="kw">let </span>result = evaluate_step(pb, <span class="number">99</span>, <span class="string">"low"</span>, <span class="string">"low"</span>, <span class="bool-val">true</span>);
+<a href=#391 id=391 data-nosnippet>391</a>        <span class="macro">assert_eq!</span>(result.status, StepStatus::Failed);
+<a href=#392 id=392 data-nosnippet>392</a>    }
+<a href=#393 id=393 data-nosnippet>393</a>
+<a href=#394 id=394 data-nosnippet>394</a>    <span class="attr">#[test]
+<a href=#395 id=395 data-nosnippet>395</a>    </span><span class="kw">fn </span>playbook_json_roundtrip() {
+<a href=#396 id=396 data-nosnippet>396</a>        <span class="kw">let </span>pb = <span class="kw-2">&amp;</span>builtin_playbooks()[<span class="number">0</span>];
+<a href=#397 id=397 data-nosnippet>397</a>        <span class="kw">let </span>json = serde_json::to_string(pb).unwrap();
+<a href=#398 id=398 data-nosnippet>398</a>        <span class="kw">let </span>parsed: Playbook = serde_json::from_str(<span class="kw-2">&amp;</span>json).unwrap();
+<a href=#399 id=399 data-nosnippet>399</a>        <span class="macro">assert_eq!</span>(parsed, <span class="kw-2">*</span>pb);
+<a href=#400 id=400 data-nosnippet>400</a>    }
+<a href=#401 id=401 data-nosnippet>401</a>
+<a href=#402 id=402 data-nosnippet>402</a>    <span class="attr">#[test]
+<a href=#403 id=403 data-nosnippet>403</a>    </span><span class="kw">fn </span>load_playbooks_from_nonexistent_dir_returns_builtins() {
+<a href=#404 id=404 data-nosnippet>404</a>        <span class="kw">let </span>playbooks = load_playbooks(Path::new(<span class="string">"/nonexistent/dir"</span>));
+<a href=#405 id=405 data-nosnippet>405</a>        <span class="macro">assert_eq!</span>(playbooks.len(), <span class="number">4</span>);
+<a href=#406 id=406 data-nosnippet>406</a>    }
+<a href=#407 id=407 data-nosnippet>407</a>
+<a href=#408 id=408 data-nosnippet>408</a>    <span class="attr">#[test]
+<a href=#409 id=409 data-nosnippet>409</a>    </span><span class="kw">fn </span>load_playbooks_merges_custom_and_builtin() {
+<a href=#410 id=410 data-nosnippet>410</a>        <span class="kw">let </span>dir = tempfile::tempdir().unwrap();
+<a href=#411 id=411 data-nosnippet>411</a>        <span class="kw">let </span>custom = Playbook {
+<a href=#412 id=412 data-nosnippet>412</a>            name: <span class="string">"custom_playbook"</span>.into(),
+<a href=#413 id=413 data-nosnippet>413</a>            description: <span class="string">"A custom playbook"</span>.into(),
+<a href=#414 id=414 data-nosnippet>414</a>            steps: <span class="macro">vec!</span>[PlaybookStep {
+<a href=#415 id=415 data-nosnippet>415</a>                action: <span class="string">"custom_action"</span>.into(),
+<a href=#416 id=416 data-nosnippet>416</a>                description: <span class="string">"Do something custom"</span>.into(),
+<a href=#417 id=417 data-nosnippet>417</a>                requires_approval: <span class="bool-val">true</span>,
+<a href=#418 id=418 data-nosnippet>418</a>                timeout_secs: <span class="number">60</span>,
+<a href=#419 id=419 data-nosnippet>419</a>            }],
+<a href=#420 id=420 data-nosnippet>420</a>            severity_filter: <span class="string">"low"</span>.into(),
+<a href=#421 id=421 data-nosnippet>421</a>            auto_approve_steps: <span class="macro">vec!</span>[],
+<a href=#422 id=422 data-nosnippet>422</a>        };
+<a href=#423 id=423 data-nosnippet>423</a>        <span class="kw">let </span>json = serde_json::to_string(<span class="kw-2">&amp;</span>custom).unwrap();
+<a href=#424 id=424 data-nosnippet>424</a>        std::fs::write(dir.path().join(<span class="string">"custom.json"</span>), json).unwrap();
+<a href=#425 id=425 data-nosnippet>425</a>
+<a href=#426 id=426 data-nosnippet>426</a>        <span class="kw">let </span>playbooks = load_playbooks(dir.path());
+<a href=#427 id=427 data-nosnippet>427</a>        <span class="comment">// 4 builtins + 1 custom
+<a href=#428 id=428 data-nosnippet>428</a>        </span><span class="macro">assert_eq!</span>(playbooks.len(), <span class="number">5</span>);
+<a href=#429 id=429 data-nosnippet>429</a>        <span class="macro">assert!</span>(playbooks.iter().any(|p| p.name == <span class="string">"custom_playbook"</span>));
+<a href=#430 id=430 data-nosnippet>430</a>    }
+<a href=#431 id=431 data-nosnippet>431</a>
+<a href=#432 id=432 data-nosnippet>432</a>    <span class="attr">#[test]
+<a href=#433 id=433 data-nosnippet>433</a>    </span><span class="kw">fn </span>load_playbooks_custom_overrides_builtin() {
+<a href=#434 id=434 data-nosnippet>434</a>        <span class="kw">let </span>dir = tempfile::tempdir().unwrap();
+<a href=#435 id=435 data-nosnippet>435</a>        <span class="kw">let </span>override_pb = Playbook {
+<a href=#436 id=436 data-nosnippet>436</a>            name: <span class="string">"suspicious_login"</span>.into(),
+<a href=#437 id=437 data-nosnippet>437</a>            description: <span class="string">"Custom override"</span>.into(),
+<a href=#438 id=438 data-nosnippet>438</a>            steps: <span class="macro">vec!</span>[PlaybookStep {
+<a href=#439 id=439 data-nosnippet>439</a>                action: <span class="string">"custom_step"</span>.into(),
+<a href=#440 id=440 data-nosnippet>440</a>                description: <span class="string">"Overridden step"</span>.into(),
+<a href=#441 id=441 data-nosnippet>441</a>                requires_approval: <span class="bool-val">false</span>,
+<a href=#442 id=442 data-nosnippet>442</a>                timeout_secs: <span class="number">30</span>,
+<a href=#443 id=443 data-nosnippet>443</a>            }],
+<a href=#444 id=444 data-nosnippet>444</a>            severity_filter: <span class="string">"low"</span>.into(),
+<a href=#445 id=445 data-nosnippet>445</a>            auto_approve_steps: <span class="macro">vec!</span>[<span class="number">0</span>],
+<a href=#446 id=446 data-nosnippet>446</a>        };
+<a href=#447 id=447 data-nosnippet>447</a>        <span class="kw">let </span>json = serde_json::to_string(<span class="kw-2">&amp;</span>override_pb).unwrap();
+<a href=#448 id=448 data-nosnippet>448</a>        std::fs::write(dir.path().join(<span class="string">"suspicious_login.json"</span>), json).unwrap();
+<a href=#449 id=449 data-nosnippet>449</a>
+<a href=#450 id=450 data-nosnippet>450</a>        <span class="kw">let </span>playbooks = load_playbooks(dir.path());
+<a href=#451 id=451 data-nosnippet>451</a>        <span class="comment">// 3 remaining builtins + 1 overridden = 4
+<a href=#452 id=452 data-nosnippet>452</a>        </span><span class="macro">assert_eq!</span>(playbooks.len(), <span class="number">4</span>);
+<a href=#453 id=453 data-nosnippet>453</a>        <span class="kw">let </span>sl = playbooks
+<a href=#454 id=454 data-nosnippet>454</a>            .iter()
+<a href=#455 id=455 data-nosnippet>455</a>            .find(|p| p.name == <span class="string">"suspicious_login"</span>)
+<a href=#456 id=456 data-nosnippet>456</a>            .unwrap();
+<a href=#457 id=457 data-nosnippet>457</a>        <span class="macro">assert_eq!</span>(sl.description, <span class="string">"Custom override"</span>);
+<a href=#458 id=458 data-nosnippet>458</a>    }
+<a href=#459 id=459 data-nosnippet>459</a>}
+</code></pre></div></section></main></body></html>

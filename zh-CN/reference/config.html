@@ -1,0 +1,2950 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>配置 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-53bbdbb2.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-088a9fdb.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/reference/config.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="配置参考"><a class="header" href="#配置参考">配置参考</a></h1>
+<p>ZeroClaw 通过 TOML 文件进行配置。除非另有说明，所有字段均为可选。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>章节</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>agent</code></td><td>代理编排配置（<code>[agent]</code> 部分）。</td></tr>
+<tr><td><code>agents</code></td><td>多智能体工作流的委托智能体配置。</td></tr>
+<tr><td><code>autonomy</code></td><td>自主性和安全策略配置（<code>[autonomy]</code> 部分）。</td></tr>
+<tr><td><code>备份</code></td><td>备份工具配置（<code>[backup]</code> 部分）。</td></tr>
+<tr><td><code>浏览器</code></td><td>浏览器自动化配置（<code>[browser]</code> 部分）。</td></tr>
+<tr><td><code>browser_delegate</code></td><td></td></tr>
+<tr><td><code>channels</code></td><td>顶级通道配置（<code>[channels]</code> 部分）。</td></tr>
+<tr><td><code>claude_code</code></td><td>Claude Code CLI 工具配置（<code>[claude_code]</code> 部分）。</td></tr>
+<tr><td><code>claude_code_runner</code></td><td>Claude Code 任务运行器配置（<code>[claude_code_runner]</code> 部分）。</td></tr>
+<tr><td><code>cloud_ops</code></td><td>控制只读云转换分析工具：</td></tr>
+<tr><td><code>codex_cli</code></td><td>Codex CLI 工具配置（<code>[codex_cli]</code> 部分）。</td></tr>
+<tr><td><code>composio</code></td><td>Composio 托管的 OAuth 工具集成（<code>[composio]</code> 部分）。</td></tr>
+<tr><td><code>conversational_ai</code></td><td>对话式 AI 代理构建器配置（<code>[conversational_ai]</code> 部分）。</td></tr>
+<tr><td><code>cost</code></td><td>成本跟踪和预算强制执行配置（<code>[cost]</code> 部分）。</td></tr>
+<tr><td><code>cron</code></td><td>Cron 任务配置（<code>[cron]</code> 部分）。</td></tr>
+<tr><td><code>data_retention</code></td><td>数据保留和清理配置（<code>[data_retention]</code> 部分）。</td></tr>
+<tr><td><code>delegate</code></td><td>全局委托工具配置，用于设置默认超时值。</td></tr>
+<tr><td><code>escalation</code></td><td>Escalation routing configuration (<code>[escalation]</code> section).</td></tr>
+<tr><td><code>网关</code></td><td>网关服务器配置（<code>[gateway]</code> 部分）。</td></tr>
+<tr><td><code>gemini_cli</code></td><td>Gemini CLI 工具配置（<code>[gemini_cli]</code> 部分）。</td></tr>
+<tr><td><code>google_workspace</code></td><td>Google Workspace CLI (<code>gws</code>) 工具配置（<code>[google_workspace]</code> 部分）。</td></tr>
+<tr><td><code>硬件</code></td><td>用于物理世界交互的向导驱动硬件配置。</td></tr>
+<tr><td>心跳</td><td>用于定期健康检查的 <code>heartbeat</code> 配置（<code>[heartbeat]</code> 部分）。</td></tr>
+<tr><td><code>hooks</code></td><td></td></tr>
+<tr><td><code>http_request</code></td><td>HTTP 请求工具配置（<code>[http_request]</code> 部分）。</td></tr>
+<tr><td><code>identity</code></td><td>身份格式配置（<code>[identity]</code> 部分）。</td></tr>
+<tr><td><code>image_gen</code></td><td>独立图像生成工具配置（<code>[image_gen]</code>）。</td></tr>
+<tr><td><code>jira</code></td><td>Jira 集成配置（<code>[jira]</code>）。</td></tr>
+<tr><td><code>知识</code></td><td>用于捕获和复用专业知识的知识图谱配置。</td></tr>
+<tr><td><code>link_enricher</code></td><td>自动理解入站频道消息中的链接（<code>[link_enricher]</code>）。</td></tr>
+<tr><td><code>linkedin</code></td><td>LinkedIn 集成配置（<code>[linkedin]</code> 部分）。</td></tr>
+<tr><td><code>locale</code></td><td>工具描述的语言环境（例如 <code>"en"</code>、<code>"zh-CN"</code>）。</td></tr>
+<tr><td><code>mcp</code></td><td>外部 MCP 客户端配置（<code>[mcp]</code> 部分）。</td></tr>
+<tr><td><code>media_pipeline</code></td><td>自动媒体理解流水线配置（<code>[media_pipeline]</code>）。</td></tr>
+<tr><td><code>memory</code></td><td>内存后端配置（<code>[memory]</code> 部分）。</td></tr>
+<tr><td><code>microsoft365</code></td><td>通过 Microsoft Graph API（<code>[microsoft365]</code> 部分）集成 Microsoft 365。</td></tr>
+<tr><td><code>多模态</code></td><td>多模态（图像）处理配置（<code>[multimodal]</code> 部分）。</td></tr>
+<tr><td><code>node_transport</code></td><td>节点间通信的安全传输配置（<code>[node_transport]</code>）。</td></tr>
+<tr><td><code>节点</code></td><td>动态节点发现系统的配置（<code>[nodes]</code>）。</td></tr>
+<tr><td><code>notion</code></td><td>Notion 集成配置（<code>[notion]</code>）。</td></tr>
+<tr><td>可观测性</td><td>可观测性后端配置（<code>[observability]</code> 部分）。</td></tr>
+<tr><td><code>onboard_state</code></td><td>多客户端工作区隔离配置。</td></tr>
+<tr><td><code>opencode_cli</code></td><td>OpenCode CLI 工具配置（<code>[opencode_cli]</code> 部分）。</td></tr>
+<tr><td><code>pacing</code></td><td>用于慢速/本地 LLM 工作负载的速率控制（<code>[pacing]</code> 部分）。</td></tr>
+<tr><td>外围设备</td><td>外围板集成配置（<code>[peripherals]</code> 部分）。</td></tr>
+<tr><td><code>pipeline</code></td><td>流水线工具配置（<code>[pipeline]</code> 部分）。</td></tr>
+<tr><td><code>插件</code></td><td>插件系统配置。</td></tr>
+<tr><td><code>project_intel</code></td><td>项目交付智能配置（<code>[project_intel]</code> 部分）。</td></tr>
+<tr><td><code>providers</code></td><td>顶层 <code>[providers]</code> 部分。封装模型提供程序配置文件、路由规则，</td></tr>
+<tr><td><code>代理</code></td><td>出站 HTTP/HTTPS/SOCKS5 流量的代理配置（<code>[proxy]</code> 部分）。</td></tr>
+<tr><td><code>query_classification</code></td><td>自动查询分类——通过关键词/模式对用户消息进行分类</td></tr>
+<tr><td><code>可靠性</code></td><td>可靠性和监控配置（<code>[reliability]</code> 部分）。</td></tr>
+<tr><td><code>运行时</code></td><td>运行时适配器配置（<code>[runtime]</code> 部分）。</td></tr>
+<tr><td><code>scheduler</code></td><td>用于周期性任务执行的调度器配置（<code>[scheduler]</code> 部分）。</td></tr>
+<tr><td><code>schema_version</code></td><td>配置文件模式版本。</td></tr>
+<tr><td><code>secrets</code></td><td>加密配置（<code>[secrets]</code> 部分）。</td></tr>
+<tr><td><code>security</code></td><td>用于沙箱隔离、资源限制和审计日志记录的安全配置</td></tr>
+<tr><td><code>security_ops</code></td><td>托管式网络安全服务 (MCSS) 仪表板代理配置 (<code>[security_ops]</code>)。</td></tr>
+<tr><td><code>shell_tool</code></td><td>Shell 工具配置（<code>[shell_tool]</code> 部分）。</td></tr>
+<tr><td><code>技能</code></td><td>技能加载配置（<code>[skills]</code> 部分）。</td></tr>
+<tr><td><code>sop</code></td><td>标准操作程序引擎配置（<code>[sop]</code>）。</td></tr>
+<tr><td><code>存储</code></td><td>持久化存储配置（<code>[storage]</code> 部分）。</td></tr>
+<tr><td><code>swarms</code></td><td>用于多智能体编排的集群配置。</td></tr>
+<tr><td><code>text_browser</code></td><td>文本浏览器工具配置（<code>[text_browser]</code> 部分）。</td></tr>
+<tr><td><code>转录</code></td><td>支持多提供商的语音转录配置。</td></tr>
+<tr><td>信任</td><td></td></tr>
+<tr><td><code>tts</code></td><td>文本转语音配置（<code>[tts]</code>）。</td></tr>
+<tr><td>隧道</td><td>用于将网关公开暴露的隧道配置（<code>[tunnel]</code> 部分）。</td></tr>
+<tr><td><code>verifiable_intent</code></td><td>可验证意图（VI）凭证的验证与签发（<code>[verifiable_intent]</code> 部分）。</td></tr>
+<tr><td><code>web_fetch</code></td><td>Web 获取工具配置（<code>[web_fetch]</code> 部分）。</td></tr>
+<tr><td><code>web_search</code></td><td>Web 搜索工具配置（<code>[web_search]</code> 部分）。</td></tr>
+<tr><td><code>工作区</code></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="agent"><a class="header" href="#agent"><code>agent</code></a></h2>
+<p>代理编排配置（<code>[agent]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>auto_classify</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>compact_context</code></td><td>布尔</td><td><code>false</code></td><td>当为 true 时：bootstrap_max_chars=6000，rag_chunk_limit=2。适用于 13B 或更小的模型。</td></tr>
+<tr><td><code>context_aware_tools</code></td><td>布尔</td><td><code>false</code></td><td>启用上下文感知的工具过滤（仅在每次迭代中显示相关的工具）。</td></tr>
+<tr><td><code>context_compression</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>eval</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>history_pruning</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>keep_tool_context_turns</code></td><td>整数</td><td><code>2</code></td><td>最近对话轮次中完整工具调用/结果的</td></tr>
+<tr><td><code>max_context_tokens</code></td><td>整数</td><td><code>32000</code></td><td>在触发压缩之前，对话历史的最大估计令牌数。</td></tr>
+<tr><td><code>max_history_messages</code></td><td>整数</td><td><code>50</code></td><td>每个会话保留的最大对话历史消息数。默认值：<code>50</code>。</td></tr>
+<tr><td><code>max_system_prompt_chars</code></td><td>整数</td><td><code>0</code></td><td>组装后的系统提示的最大字符数。当 <code>&gt; 0</code> 时，提示</td></tr>
+<tr><td><code>max_tool_iterations</code></td><td>整数</td><td><code>10</code></td><td>每个用户消息的最大工具调用循环轮数。默认值：<code>10</code>。</td></tr>
+<tr><td><code>max_tool_result_chars</code></td><td>整数</td><td><code>50000</code></td><td>单个工具结果在截断前的最大字符数。</td></tr>
+<tr><td><code>parallel_tools</code></td><td>布尔</td><td><code>false</code></td><td>在单次迭代中启用并行工具执行。默认值：<code>false</code>。</td></tr>
+<tr><td><code>thinking</code></td><td>对象</td><td>—</td><td>用于控制思考/推理级别的配置。</td></tr>
+<tr><td><code>tool_call_dedup_exempt</code></td><td>字符串数组</td><td><code>[]</code></td><td>免于在单次调用中重复调用去重检查的工具。默认值：<code>[]</code>。</td></tr>
+<tr><td><code>tool_dispatcher</code></td><td>字符串</td><td><code>"auto"</code></td><td>工具调度策略（例如 <code>"auto"</code>）。默认值：<code>"auto"</code>。</td></tr>
+<tr><td><code>tool_filter_groups</code></td><td>对象[]</td><td><code>[]</code></td><td>每轮 MCP 工具模式过滤组。</td></tr>
+<tr><td><code>tool_receipts</code></td><td>对象</td><td>—</td><td>HMAC tool execution receipt configuration (<code>[agent.tool_receipts]</code>).</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="agentauto_classify"><a class="header" href="#agentauto_classify"><code>agent.auto_classify</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>complex_hint</code></td><td>任何</td><td><code>null</code></td><td></td></tr>
+<tr><td><code>cost_optimized_hint</code></td><td>字符串</td><td><code>"成本优化"</code></td><td></td></tr>
+<tr><td><code>简单提示</code></td><td>任何</td><td><code>null</code></td><td></td></tr>
+<tr><td><code>standard_hint</code></td><td>任何</td><td><code>null</code></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="agentcontext_compression"><a class="header" href="#agentcontext_compression"><code>agent.context_compression</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>true</code></td><td></td></tr>
+<tr><td><code>identifier_policy</code></td><td>字符串</td><td><code>"strict"</code></td><td></td></tr>
+<tr><td><code>max_passes</code></td><td>整数</td><td><code>3</code></td><td></td></tr>
+<tr><td><code>protect_first_n</code></td><td>整数</td><td><code>3</code></td><td></td></tr>
+<tr><td><code>protect_last_n</code></td><td>整数</td><td><code>4</code></td><td></td></tr>
+<tr><td><code>source_max_chars</code></td><td>整数</td><td><code>50000</code></td><td></td></tr>
+<tr><td><code>summary_max_chars</code></td><td>整数</td><td><code>4000</code></td><td></td></tr>
+<tr><td><code>summary_model</code></td><td>任何</td><td><code>null</code></td><td></td></tr>
+<tr><td><code>threshold_ratio</code></td><td>数字</td><td><code>0.5</code></td><td></td></tr>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>60</code></td><td></td></tr>
+<tr><td><code>tool_result_retrim_chars</code></td><td>整数</td><td><code>2000</code></td><td></td></tr>
+<tr><td><code>tool_result_trim_exempt</code></td><td>字符串数组</td><td><code>[]</code></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="agenteval"><a class="header" href="#agenteval"><code>agent.eval</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td></td></tr>
+<tr><td><code>max_retries</code></td><td>整数</td><td><code>1</code></td><td></td></tr>
+<tr><td><code>min_quality_score</code></td><td>数字</td><td><code>0.5</code></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="agenthistory_pruning"><a class="header" href="#agenthistory_pruning"><code>agent.history_pruning</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>collapse_tool_results</code></td><td>布尔</td><td><code>true</code></td><td></td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td></td></tr>
+<tr><td><code>keep_recent</code></td><td>整数</td><td><code>4</code></td><td></td></tr>
+<tr><td><code>max_tokens</code></td><td>整数</td><td><code>8192</code></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="agentthinking"><a class="header" href="#agentthinking"><code>agent.thinking</code></a></h3>
+<p>用于控制思考/推理级别的配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>default_level</code></td><td><code>off</code> | <code>minimal</code> | <code>low</code> | <code>medium</code> | <code>high</code> | <code>max</code></td><td>—</td><td>模型应对给定消息进行推理的深度。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="agenttool_receipts"><a class="header" href="#agenttool_receipts"><code>agent.tool_receipts</code></a></h3>
+<p>HMAC tool execution receipt configuration (<code>[agent.tool_receipts]</code>).</p>
+<p>Receipts are short HMAC-SHA256 tags appended to tool results so the model cannot claim it ran a tool that never actually executed. See <code>docs/book/src/security/tool-receipts.md</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>Generate HMAC receipts on every tool execution. Default: <code>false</code>.</td></tr>
+<tr><td><code>inject_system_prompt</code></td><td>布尔</td><td><code>true</code></td><td>Inject the receipt-echo instruction into the system prompt so the</td></tr>
+<tr><td><code>show_in_response</code></td><td>布尔</td><td><code>false</code></td><td>Append a trailing <code>Tool receipts:</code> block to user-visible replies so</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="agents"><a class="header" href="#agents"><code>agents</code></a></h2>
+<p>多智能体工作流的委托智能体配置。</p>
+<h2 id="autonomy"><a class="header" href="#autonomy"><code>autonomy</code></a></h2>
+<p>自主性和安全策略配置（<code>[autonomy]</code> 部分）。</p>
+<p>控制代理可以执行的操作：Shell 命令、文件系统访问、风险审批关卡以及基于策略的预算。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_commands</code></td><td>字符串数组</td><td><code>["git","npm","cargo","ls","cat","grep","find","echo","pwd","wc","head","tail","date","df","du","uname","uptime","hostname","python","python3","pip","node","free"]</code></td><td>允许用于 shell 执行的程序名称白名单。</td></tr>
+<tr><td><code>allowed_roots</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许代理在工作区之外读取/写入的额外目录根路径。</td></tr>
+<tr><td><code>always_ask</code></td><td>字符串数组</td><td><code>[]</code></td><td>即使已选择“始终”，也始终需要交互式批准的工具。</td></tr>
+<tr><td><code>auto_approve</code></td><td>字符串数组</td><td><code>["file_read","memory_recall","web_search_tool","web_fetch","calculator","glob_search","content_search","image_info","weather","browser","browser_open"]</code></td><td>无需审批的工具（例如只读工具）。</td></tr>
+<tr><td><code>block_high_risk_commands</code></td><td>布尔</td><td><code>true</code></td><td>即使已列入白名单，也要阻止高风险的 shell 命令。</td></tr>
+<tr><td><code>forbidden_paths</code></td><td>字符串数组</td><td><code>["/etc","/root","/home","/usr","/bin","/sbin","/lib","/opt","/boot","/dev","/proc","/sys","/var","/tmp","~/.ssh","~/.gnupg","~/.aws","~/.config"]</code></td><td>显式路径拒绝列表。默认包含系统关键路径和敏感的隐藏目录。</td></tr>
+<tr><td><code>level</code></td><td>任何</td><td>—</td><td>代理的自主程度</td></tr>
+<tr><td><code>每小时最大操作数</code></td><td>整数</td><td><code>20</code></td><td>每个策略每小时允许的最大操作数。默认值：<code>100</code>。</td></tr>
+<tr><td><code>max_cost_per_day_cents</code></td><td>整数</td><td><code>500</code></td><td>每日每份保单的最高费用（以美分为单位）。默认值：<code>1000</code>。</td></tr>
+<tr><td><code>non_cli_excluded_tools</code></td><td>字符串数组</td><td><code>[]</code></td><td>从非 CLI 通道（例如 Telegram、Discord）中排除的工具。</td></tr>
+<tr><td><code>require_approval_for_medium_risk</code></td><td>布尔</td><td><code>true</code></td><td>要求对中等风险的 shell 命令进行显式批准。</td></tr>
+<tr><td><code>shell_env_passthrough</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许为 shell 工具子进程设置其他环境变量。</td></tr>
+<tr><td><code>shell_timeout_secs</code></td><td>整数</td><td><code>60</code></td><td>Shell 工具子进程的超时时间（秒）。默认值：60。</td></tr>
+<tr><td><code>workspace_only</code></td><td>布尔</td><td><code>true</code></td><td>将绝对文件系统路径限制为工作区相对引用。默认值：<code>true</code>。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="备份"><a class="header" href="#备份"><code>备份</code></a></h2>
+<p>备份工具配置（<code>[backup]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>压缩</code></td><td>布尔</td><td><code>true</code></td><td>压缩备份归档文件。</td></tr>
+<tr><td><code>destination_dir</code></td><td>字符串</td><td><code>"state/backups"</code></td><td>备份归档文件的输出目录（相对于工作区根目录）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>true</code></td><td>启用 <code>backup</code> 工具。</td></tr>
+<tr><td><code>encrypt</code></td><td>布尔</td><td><code>false</code></td><td>加密备份归档文件（需要配置密钥存储密钥）。</td></tr>
+<tr><td><code>include_dirs</code></td><td>字符串数组</td><td><code>["config","memory","audit","knowledge"]</code></td><td>要包含在备份中的工作区子目录。</td></tr>
+<tr><td><code>max_keep</code></td><td>整数</td><td><code>10</code></td><td>要保留的最大备份数量（最旧的将被清理）。</td></tr>
+<tr><td><code>schedule_cron</code></td><td>任何</td><td><code>null</code></td><td>用于计划自动备份的可选 cron 表达式。</td></tr>
+<tr><td><code>schedule_timezone</code></td><td>任何</td><td><code>null</code></td><td><code>schedule_cron</code> 的 IANA 时区。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="浏览器"><a class="header" href="#浏览器"><code>浏览器</code></a></h2>
+<p>浏览器自动化配置（<code>[browser]</code> 部分）。</p>
+<p>控制 <code>browser_open</code> 工具和浏览器自动化后端。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_domains</code></td><td>字符串数组</td><td><code>["*"]</code></td><td><code>browser_open</code> 允许的域名（精确匹配或子域名匹配）</td></tr>
+<tr><td><code>后端</code></td><td>字符串</td><td><code>"agent_browser"</code></td><td>浏览器自动化后端：“agent_browser” | “rust_native” | “computer_use” | “auto”</td></tr>
+<tr><td><code>computer_use</code></td><td>对象</td><td>—</td><td>计算机使用侧车配置（<code>[browser.computer_use]</code> 部分）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>true</code></td><td>启用 <code>browser_open</code> 工具（在系统浏览器中打开 URL，不进行抓取）</td></tr>
+<tr><td><code>native_chrome_path</code></td><td>任何</td><td><code>null</code></td><td>用于 rust-native 后端的可选 Chrome/Chromium 可执行文件路径</td></tr>
+<tr><td><code>native_headless</code></td><td>布尔</td><td><code>true</code></td><td>适用于 Rust 原生后端的无头模式</td></tr>
+<tr><td><code>native_webdriver_url</code></td><td>字符串</td><td><code>"http://127.0.0.1:9515"</code></td><td>用于 Rust 原生后端的 WebDriver 端点 URL（例如 <code>http://127.0.0.1:9515</code>）</td></tr>
+<tr><td><code>session_name</code></td><td>任何</td><td><code>null</code></td><td>浏览器会话名称（用于代理浏览器自动化）</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="browsercomputer_use"><a class="header" href="#browsercomputer_use"><code>browser.computer_use</code></a></h3>
+<p>计算机使用侧车配置（<code>[browser.computer_use]</code> 部分）。</p>
+<p>将操作系统级别的鼠标、键盘和截图操作委托给本地边车（sidecar）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allow_remote_endpoint</code></td><td>布尔</td><td><code>false</code></td><td>允许计算机使用旁路组件的远程/公共端点（默认值：false）</td></tr>
+<tr><td><code>api_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>用于计算机使用旁路组件的可选承载令牌</td></tr>
+<tr><td><code>endpoint</code></td><td>字符串</td><td><code>"http://127.0.0.1:8787/v1/actions"</code></td><td>用于计算机使用操作的 Sidecar 端点（操作系统级别的鼠标/键盘/截图）</td></tr>
+<tr><td><code>max_coordinate_x</code></td><td>任何</td><td><code>null</code></td><td>基于坐标的操作的可选 X 轴边界</td></tr>
+<tr><td><code>max_coordinate_y</code></td><td>任何</td><td><code>null</code></td><td>基于坐标的操作的可选 Y 轴边界</td></tr>
+<tr><td><code>timeout_ms</code></td><td>整数</td><td><code>15000</code></td><td>每个操作的请求超时时间（以毫秒为单位）</td></tr>
+<tr><td><code>window_allowlist</code></td><td>字符串数组</td><td><code>[]</code></td><td>可选的窗口标题/进程允许列表，转发到边车策略</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="browser_delegate"><a class="header" href="#browser_delegate"><code>browser_delegate</code></a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_domains</code></td><td>字符串数组</td><td><code>[]</code></td><td></td></tr>
+<tr><td><code>blocked_domains</code></td><td>字符串数组</td><td><code>[]</code></td><td></td></tr>
+<tr><td><code>chrome_profile_dir</code></td><td>字符串</td><td><code>""</code></td><td></td></tr>
+<tr><td><code>cli_binary</code></td><td>字符串</td><td><code>"claude"</code></td><td></td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td></td></tr>
+<tr><td><code>task_timeout_secs</code></td><td>整数</td><td><code>120</code></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="channels"><a class="header" href="#channels"><code>channels</code></a></h2>
+<p>顶级通道配置（<code>[channels]</code> 部分）。</p>
+<p>每个通道子部分（例如 <code>telegram</code>、<code>discord</code>）是可选的；将其设置为 <code>Some(...)</code> 即可启用该通道。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ack_reactions</code></td><td>布尔</td><td><code>true</code></td><td>是否添加确认反应（收到时显示 👀，✅/⚠️ 在</td></tr>
+<tr><td><code>bluesky</code></td><td>对象</td><td>—</td><td>Bluesky 频道配置（AT 协议）。</td></tr>
+<tr><td><code>clawdtalk</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>cli</code></td><td>布尔</td><td><code>true</code></td><td>启用 CLI 交互通道。默认值：<code>true</code>。</td></tr>
+<tr><td><code>debounce_ms</code></td><td>整数</td><td><code>0</code></td><td>入站消息去抖窗口（毫秒）。当发送方触发</td></tr>
+<tr><td><code>dingtalk</code></td><td>对象</td><td>—</td><td>钉钉 Stream 模式消息配置</td></tr>
+<tr><td><code>discord</code></td><td>对象</td><td>—</td><td>Discord 机器人频道配置。</td></tr>
+<tr><td><code>discord_history</code></td><td>对象</td><td>—</td><td>Discord 历史频道 — 将所有消息记录到 discord.db，并将 @提及 转发给代理。</td></tr>
+<tr><td><code>email</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>飞书</code></td><td>对象</td><td>—</td><td>飞书消息集成的配置。</td></tr>
+<tr><td><code>gmail_push</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>imessage</code></td><td>对象</td><td>—</td><td>iMessage 通道配置（仅限 macOS）。</td></tr>
+<tr><td><code>irc</code></td><td>对象</td><td>—</td><td>IRC 频道配置。</td></tr>
+<tr><td><code>lark</code></td><td>对象</td><td>—</td><td>用于消息集成的 Lark/飞书配置。</td></tr>
+<tr><td><code>line</code></td><td>对象</td><td>—</td><td>LINE Messaging API 通道配置。</td></tr>
+<tr><td><code>linq</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>矩阵</code></td><td>对象</td><td>—</td><td>矩阵通道配置。</td></tr>
+<tr><td><code>mattermost</code></td><td>对象</td><td>—</td><td>Mattermost 机器人频道配置。</td></tr>
+<tr><td><code>message_timeout_secs</code></td><td>整数</td><td><code>300</code></td><td>处理单个通道消息（LLM + 工具）的基础超时时间（秒）。</td></tr>
+<tr><td><code>mochat</code></td><td>对象</td><td>—</td><td>Mochat 渠道配置（Mochat 客服 API）</td></tr>
+<tr><td><code>mqtt</code></td><td>对象</td><td>—</td><td>MQTT 通道配置（SOP 监听器）。</td></tr>
+<tr><td><code>nextcloud_talk</code></td><td>对象</td><td>—</td><td>Nextcloud Talk 机器人配置（Webhook 接收 + OCS 发送 API）。</td></tr>
+<tr><td><code>qq</code></td><td>对象</td><td>—</td><td>QQ 官方机器人配置（腾讯 QQ 机器人 SDK）</td></tr>
+<tr><td><code>reddit</code></td><td>对象</td><td>—</td><td>Reddit 频道配置（OAuth2 机器人）。</td></tr>
+<tr><td><code>session_backend</code></td><td>字符串</td><td><code>"sqlite"</code></td><td>会话持久化后端：<code>"jsonl"</code>（旧版）或 <code>"sqlite"</code>（新版默认）。</td></tr>
+<tr><td><code>session_persistence</code></td><td>布尔</td><td><code>true</code></td><td>将频道对话历史持久化到 JSONL 文件中，以便会话能够持续存在</td></tr>
+<tr><td><code>session_ttl_hours</code></td><td>整数</td><td><code>0</code></td><td>自动归档超过此小时数的过期会话。<code>0</code> 表示禁用。默认值：<code>0</code>。</td></tr>
+<tr><td><code>show_tool_calls</code></td><td>布尔</td><td><code>false</code></td><td>是否发送工具调用通知消息（例如 <code>🔧 web_search_tool: …</code>）</td></tr>
+<tr><td><code>信号</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>slack</code></td><td>对象</td><td>—</td><td>Slack 机器人频道配置。</td></tr>
+<tr><td><code>telegram</code></td><td>对象</td><td>—</td><td>Telegram 机器人频道配置。</td></tr>
+<tr><td><code>twitter</code></td><td>对象</td><td>—</td><td>X/Twitter 频道配置（Twitter API v2）</td></tr>
+<tr><td><code>语音通话</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>voice_duplex</code></td><td>对象</td><td>—</td><td>语音双工配置（<code>[channels.voice_duplex]</code>）。</td></tr>
+<tr><td><code>wati</code></td><td>对象</td><td>—</td><td>WATI WhatsApp Business API 频道配置。</td></tr>
+<tr><td><code>webhook</code></td><td>对象</td><td>—</td><td>Webhook 通道配置。</td></tr>
+<tr><td><code>wechat</code></td><td>对象</td><td>—</td><td>WeChat personal iLink Bot channel configuration.</td></tr>
+<tr><td><code>wecom</code></td><td>对象</td><td>—</td><td>企业微信机器人 Webhook 配置</td></tr>
+<tr><td><code>whatsapp</code></td><td>对象</td><td>—</td><td>WhatsApp 频道配置（Cloud API 或 Web 模式）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsbluesky"><a class="header" href="#channelsbluesky"><code>channels.bluesky</code></a></h3>
+<p>Bluesky 频道配置（AT 协议）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>app_password</code>* 🔑</td><td>字符串</td><td>—</td><td>应用专用密码（来自 Bluesky 设置）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>handle</code>*</td><td>字符串</td><td>—</td><td>Bluesky 句柄（例如 <code>"mybot.bsky.social"</code>）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsclawdtalk"><a class="header" href="#channelsclawdtalk"><code>channels.clawdtalk</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_destinations</code></td><td>字符串数组</td><td><code>[]</code></td><td></td></tr>
+<tr><td><code>api_key</code>*</td><td>字符串</td><td>—</td><td></td></tr>
+<tr><td><code>connection_id</code>*</td><td>字符串</td><td>—</td><td></td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td></td></tr>
+<tr><td><code>from_number</code>*</td><td>字符串</td><td>—</td><td></td></tr>
+<tr><td><code>webhook_secret</code></td><td>任何</td><td><code>null</code></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsdingtalk"><a class="header" href="#channelsdingtalk"><code>channels.dingtalk</code></a></h3>
+<p>钉钉 Stream 模式消息配置</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的用户 ID（员工 ID）。空值 = 拒绝所有，“*” = 允许所有</td></tr>
+<tr><td><code>client_id</code>*</td><td>字符串</td><td>—</td><td>来自钉钉开发者控制台的客户端 ID（AppKey）</td></tr>
+<tr><td><code>client_secret</code>* 🔑</td><td>字符串</td><td>—</td><td>来自钉钉开发者控制台的客户端密钥（AppSecret）</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>proxy_url</code></td><td>任何</td><td><code>null</code></td><td>按通道代理 URL（http、https、socks5、socks5h）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsdiscord"><a class="header" href="#channelsdiscord"><code>channels.discord</code></a></h3>
+<p>Discord 机器人频道配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的 Discord 用户 ID。空值 = 拒绝所有。</td></tr>
+<tr><td><code>approval_timeout_secs</code></td><td>整数</td><td><code>300</code></td><td>在自动拒绝之前，等待操作员对 <code>always_ask</code> 工具批准的时间（秒）。</td></tr>
+<tr><td><code>bot_token</code>* 🔑</td><td>字符串</td><td>—</td><td>Discord 机器人令牌（来自 Discord 开发者门户）。</td></tr>
+<tr><td><code>draft_update_interval_ms</code></td><td>整数</td><td><code>1000</code></td><td>避免触发速率限制所需的草稿消息编辑最小间隔（毫秒）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>guild_id</code></td><td>任何</td><td>—</td><td>可选的公会（服务器）ID，用于将机器人限制在单个公会中。</td></tr>
+<tr><td><code>interrupt_on_new_message</code></td><td>布尔</td><td><code>false</code></td><td>当为 true 时，来自同一发送者在同一频道中的较新的 Discord 消息</td></tr>
+<tr><td><code>listen_to_bots</code></td><td>布尔</td><td><code>false</code></td><td>当为 true 时，处理来自其他机器人的消息（而不仅仅是人类）。</td></tr>
+<tr><td><code>mention_only</code></td><td>布尔</td><td><code>false</code></td><td>当为 true 时，仅响应 @提及 机器人的消息。</td></tr>
+<tr><td><code>multi_message_delay_ms</code></td><td>整数</td><td><code>800</code></td><td>在多消息模式下，发送每个消息块之间的延迟（毫秒）。</td></tr>
+<tr><td><code>proxy_url</code></td><td>任何</td><td><code>null</code></td><td>按通道代理 URL（http、https、socks5、socks5h）。</td></tr>
+<tr><td><code>stall_timeout_secs</code></td><td>整数</td><td><code>0</code></td><td>停滞看门狗超时时间（秒）。当非零时，机器人将中止</td></tr>
+<tr><td><code>stream_mode</code></td><td>任何</td><td>—</td><td>对于支持渐进式消息更新的通道，启用流式模式。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsdiscord_history"><a class="header" href="#channelsdiscord_history"><code>channels.discord_history</code></a></h3>
+<p>Discord 历史频道 — 将所有消息记录到 discord.db，并将 @提及 转发给代理。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的 Discord 用户 ID。空值 = 允许所有（开启日志记录）。</td></tr>
+<tr><td><code>bot_token</code>* 🔑</td><td>字符串</td><td>—</td><td>Discord 机器人令牌（来自 Discord 开发者门户）。</td></tr>
+<tr><td><code>channel_ids</code></td><td>字符串数组</td><td><code>[]</code></td><td>要监视的 Discord 频道 ID。留空 = 监视所有频道。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>guild_id</code></td><td>任何</td><td>—</td><td>可选的公会（服务器）ID，用于将日志限制到单个公会。</td></tr>
+<tr><td><code>proxy_url</code></td><td>任何</td><td><code>null</code></td><td>按通道代理 URL（http、https、socks5、socks5h）。</td></tr>
+<tr><td><code>respond_to_dms</code></td><td>布尔</td><td><code>true</code></td><td>当为 true（默认值）时，响应直接消息中的 @提及。</td></tr>
+<tr><td><code>store_dms</code></td><td>布尔</td><td><code>true</code></td><td>当为 true（默认值）时，将直接消息存储在 discord.db 中。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsemail"><a class="header" href="#channelsemail"><code>channels.email</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_senders</code></td><td>字符串数组</td><td><code>[]</code></td><td></td></tr>
+<tr><td><code>默认主题</code></td><td>字符串</td><td><code>"ZeroClaw 消息"</code></td><td></td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td></td></tr>
+<tr><td><code>from_address</code>*</td><td>字符串</td><td>—</td><td></td></tr>
+<tr><td><code>idle_timeout_secs</code></td><td>整数</td><td><code>1740</code></td><td></td></tr>
+<tr><td><code>imap_folder</code></td><td>字符串</td><td><code>"INBOX"</code></td><td></td></tr>
+<tr><td><code>imap_host</code>*</td><td>字符串</td><td>—</td><td></td></tr>
+<tr><td><code>imap_port</code></td><td>整数</td><td><code>993</code></td><td></td></tr>
+<tr><td><code>max_attachment_bytes</code></td><td>整数</td><td><code>26214400</code></td><td></td></tr>
+<tr><td><code>password</code>*</td><td>字符串</td><td>—</td><td></td></tr>
+<tr><td><code>poll_interval_secs</code></td><td>整数</td><td><code>60</code></td><td>当 IMAP 服务器未通告 IDLE 时使用的轮询间隔</td></tr>
+<tr><td><code>smtp_host</code>*</td><td>字符串</td><td>—</td><td></td></tr>
+<tr><td><code>smtp_port</code></td><td>整数</td><td><code>465</code></td><td></td></tr>
+<tr><td><code>smtp_tls</code></td><td>布尔</td><td><code>true</code></td><td></td></tr>
+<tr><td><code>username</code>*</td><td>字符串</td><td>—</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsfeishu"><a class="header" href="#channelsfeishu"><code>channels.feishu</code></a></h3>
+<p>飞书消息集成的配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的用户 ID 或 union ID（空 = 拒绝所有，“*” = 允许所有）</td></tr>
+<tr><td><code>app_id</code>*</td><td>字符串</td><td>—</td><td>来自飞书开发者控制台的 App ID</td></tr>
+<tr><td><code>app_secret</code>* 🔑</td><td>字符串</td><td>—</td><td>来自飞书开发者控制台的 App Secret</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>encrypt_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>用于 Webhook 消息解密的加密密钥（可选）</td></tr>
+<tr><td><code>mention_only</code></td><td>布尔</td><td><code>false</code></td><td>当为 true 时，仅在群组中回复 @提及机器人的消息。</td></tr>
+<tr><td><code>端口</code></td><td>任何</td><td><code>null</code></td><td>仅用于 webhook 模式的 HTTP 端口。当 <code>receive_mode = "webhook"</code> 时必须设置。</td></tr>
+<tr><td><code>proxy_url</code></td><td>任何</td><td><code>null</code></td><td>按通道代理 URL（http、https、socks5、socks5h）。</td></tr>
+<tr><td><code>receive_mode</code></td><td><code>websocket</code> | <code>webhook</code></td><td>—</td><td>ZeroClaw 如何从飞书/Lark 接收事件。</td></tr>
+<tr><td><code>verification_token</code> 🔑</td><td>任何</td><td><code>null</code></td><td>用于 Webhook 验证的验证令牌（可选）</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsgmail_push"><a class="header" href="#channelsgmail_push"><code>channels.gmail_push</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_senders</code></td><td>字符串数组</td><td><code>[]</code></td><td></td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td></td></tr>
+<tr><td><code>label_filter</code></td><td>字符串数组</td><td><code>["INBOX"]</code></td><td></td></tr>
+<tr><td><code>oauth_token</code></td><td>字符串</td><td><code>""</code></td><td></td></tr>
+<tr><td><code>topic</code>*</td><td>字符串</td><td>—</td><td></td></tr>
+<tr><td><code>webhook_secret</code></td><td>字符串</td><td><code>""</code></td><td></td></tr>
+<tr><td><code>webhook_url</code></td><td>字符串</td><td><code>""</code></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsimessage"><a class="header" href="#channelsimessage"><code>channels.imessage</code></a></h3>
+<p>iMessage 通道配置（仅限 macOS）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_contacts</code>*</td><td>字符串数组</td><td>—</td><td>允许的 iMessage 联系人（电话号码或电子邮件地址）。空值 = 拒绝所有。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsirc"><a class="header" href="#channelsirc"><code>channels.irc</code></a></h3>
+<p>IRC 频道配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的昵称（不区分大小写）或 “*” 表示全部</td></tr>
+<tr><td><code>channels</code></td><td>字符串数组</td><td><code>[]</code></td><td>连接时加入的频道</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>mention_only</code></td><td>布尔</td><td><code>false</code></td><td>When true, only respond to messages that mention the bot.</td></tr>
+<tr><td><code>nickname</code>*</td><td>字符串</td><td>—</td><td>机器人昵称</td></tr>
+<tr><td><code>nickserv_password</code> 🔑</td><td>任何</td><td>—</td><td>NickServ IDENTIFY 密码</td></tr>
+<tr><td><code>端口</code></td><td>整数</td><td><code>6697</code></td><td>IRC 服务器端口（默认：TLS 为 6697）</td></tr>
+<tr><td><code>sasl_password</code> 🔑</td><td>任何</td><td>—</td><td>SASL PLAIN 密码 (IRCv3)</td></tr>
+<tr><td><code>server</code>*</td><td>字符串</td><td>—</td><td>IRC 服务器主机名</td></tr>
+<tr><td><code>server_password</code> 🔑</td><td>任何</td><td>—</td><td>服务器密码（用于 ZNC 等跳板机）</td></tr>
+<tr><td><code>username</code></td><td>任何</td><td>—</td><td>用户名（如果未设置，则默认为昵称）</td></tr>
+<tr><td><code>verify_tls</code></td><td>任何</td><td>—</td><td>验证 TLS 证书（默认：true）</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelslark"><a class="header" href="#channelslark"><code>channels.lark</code></a></h3>
+<p>用于消息集成的 Lark/飞书配置。Lark 是国际版，飞书是中国版。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的用户 ID 或 union ID（空 = 拒绝所有，“*” = 允许所有）</td></tr>
+<tr><td><code>app_id</code>*</td><td>字符串</td><td>—</td><td>来自飞书开发者控制台的 App ID</td></tr>
+<tr><td><code>app_secret</code>* 🔑</td><td>字符串</td><td>—</td><td>来自 Lark/飞书开发者控制台的 App Secret</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>encrypt_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>用于 Webhook 消息解密的加密密钥（可选）</td></tr>
+<tr><td><code>mention_only</code></td><td>布尔</td><td><code>false</code></td><td>当为 true 时，仅在群组中回复 @提及机器人的消息。</td></tr>
+<tr><td><code>端口</code></td><td>任何</td><td><code>null</code></td><td>仅用于 webhook 模式的 HTTP 端口。当 <code>receive_mode = "webhook"</code> 时必须设置。</td></tr>
+<tr><td><code>proxy_url</code></td><td>任何</td><td><code>null</code></td><td>按通道代理 URL（http、https、socks5、socks5h）。</td></tr>
+<tr><td><code>receive_mode</code></td><td><code>websocket</code> | <code>webhook</code></td><td>—</td><td>ZeroClaw 如何从飞书/Lark 接收事件。</td></tr>
+<tr><td><code>use_feishu</code></td><td>布尔</td><td><code>false</code></td><td>是否使用飞书（中国）端点而不是 Lark（国际）</td></tr>
+<tr><td><code>verification_token</code> 🔑</td><td>任何</td><td><code>null</code></td><td>用于 Webhook 验证的验证令牌（可选）</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsline"><a class="header" href="#channelsline"><code>channels.line</code></a></h3>
+<p>LINE Messaging API 通道配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许与机器人交互的 LINE 用户 ID。</td></tr>
+<tr><td><code>channel_access_token</code> 🔑</td><td>字符串</td><td><code>""</code></td><td>长期有效的频道访问令牌（来自 LINE Developers Console）。</td></tr>
+<tr><td><code>channel_secret</code> 🔑</td><td>字符串</td><td><code>""</code></td><td>频道密钥（来自 LINE Developers Console）。</td></tr>
+<tr><td><code>dm_policy</code></td><td>任何</td><td>—</td><td>LINE 频道的 DM（1:1 聊天）访问策略。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>group_policy</code></td><td>任何</td><td>—</td><td>LINE 频道的群组/多人聊天策略。</td></tr>
+<tr><td><code>proxy_url</code></td><td>任何</td><td><code>null</code></td><td>按通道代理 URL（http、https、socks5、socks5h）。</td></tr>
+<tr><td><code>webhook_port</code></td><td>整数</td><td><code>8443</code></td><td>嵌入式 webhook 服务器监听的 TCP 端口。默认值：<code>8443</code>。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelslinq"><a class="header" href="#channelslinq"><code>channels.linq</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_senders</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的发送者句柄（电话号码）或 “*” 表示全部</td></tr>
+<tr><td><code>api_token</code>* 🔑</td><td>字符串</td><td>—</td><td>Linq Partner API 令牌（Bearer 认证）</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>from_phone</code>*</td><td>字符串</td><td>—</td><td>要发送的电话号码（E.164 格式）</td></tr>
+<tr><td><code>signing_secret</code> 🔑</td><td>任何</td><td><code>null</code></td><td>用于签名验证的 Webhook 签名密钥</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsmatrix"><a class="header" href="#channelsmatrix"><code>channels.matrix</code></a></h3>
+<p>矩阵通道配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>access_token</code>* 🔑</td><td>字符串</td><td>—</td><td>机器人账户的 Matrix 访问令牌。</td></tr>
+<tr><td><code>ack_reactions</code></td><td>布尔</td><td><code>true</code></td><td>When true (default), the bot sends acknowledgement reactions while processing</td></tr>
+<tr><td><code>allowed_rooms</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的 Matrix 房间 ID 或别名。空值 = 允许所有房间。</td></tr>
+<tr><td><code>allowed_users</code>*</td><td>字符串数组</td><td>—</td><td>允许的 Matrix 用户 ID。空值 = 拒绝所有。</td></tr>
+<tr><td><code>approval_timeout_secs</code></td><td>整数</td><td><code>300</code></td><td>在自动拒绝之前，等待操作员对 <code>always_ask</code> 工具批准的时间（秒）。</td></tr>
+<tr><td><code>device_id</code></td><td>任何</td><td><code>null</code></td><td>可选的 Matrix 设备 ID。</td></tr>
+<tr><td><code>draft_update_interval_ms</code></td><td>整数</td><td><code>1500</code></td><td>在 Partial 模式下，草稿消息编辑之间的最小间隔（毫秒）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>homeserver</code>*</td><td>字符串</td><td>—</td><td>Matrix 主服务器 URL（例如 <code>"https://matrix.org"</code>）。</td></tr>
+<tr><td><code>interrupt_on_new_message</code></td><td>布尔</td><td><code>false</code></td><td>是否在新消息到达时中断正在进行的代理响应。</td></tr>
+<tr><td><code>mention_only</code></td><td>布尔</td><td><code>false</code></td><td>当为 true 时，仅在群组中回复 @提及机器人的消息。</td></tr>
+<tr><td><code>multi_message_delay_ms</code></td><td>整数</td><td><code>800</code></td><td>在 MultiMessage 模式下，发送每个段落之间的延迟（毫秒）。</td></tr>
+<tr><td><code>password</code> 🔑</td><td>任何</td><td><code>null</code></td><td>Matrix 账户的可选登录密码（用于初始登录流程）。</td></tr>
+<tr><td><code>recovery_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>用于自动恢复端到端加密（E2EE）密钥备份的可选 Matrix 恢复密钥。</td></tr>
+<tr><td><code>reply_in_thread</code></td><td>布尔</td><td><code>true</code></td><td>When true (default), replies are sent as thread replies. Starts a new thread from the</td></tr>
+<tr><td><code>stream_mode</code></td><td>任何</td><td>—</td><td>对于支持渐进式消息更新的通道，启用流式模式。</td></tr>
+<tr><td><code>user_id</code></td><td>任何</td><td><code>null</code></td><td>可选的 Matrix 用户 ID（例如 <code>"@bot:matrix.org"</code>）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsmattermost"><a class="header" href="#channelsmattermost"><code>channels.mattermost</code></a></h3>
+<p>Mattermost 机器人频道配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的 Mattermost 用户 ID。空值 = 拒绝所有。</td></tr>
+<tr><td><code>bot_token</code>* 🔑</td><td>字符串</td><td>—</td><td>Mattermost 机器人访问令牌。</td></tr>
+<tr><td><code>channel_id</code></td><td>任何</td><td>—</td><td>可选的频道 ID，用于将机器人限制在单个频道中。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>interrupt_on_new_message</code></td><td>布尔</td><td><code>false</code></td><td>当为 true 时，来自同一发送者在同一频道中的较新的 Mattermost 消息</td></tr>
+<tr><td><code>mention_only</code></td><td>任何</td><td><code>null</code></td><td>当为 true 时，仅响应 @提及 机器人的消息。</td></tr>
+<tr><td><code>proxy_url</code></td><td>任何</td><td><code>null</code></td><td>按通道代理 URL（http、https、socks5、socks5h）。</td></tr>
+<tr><td><code>thread_replies</code></td><td>任何</td><td><code>null</code></td><td>当为 true（默认值）时，回复线程将显示在原始帖子下方。</td></tr>
+<tr><td><code>url</code>*</td><td>字符串</td><td>—</td><td>Mattermost 服务器 URL（例如 <code>"https://mattermost.example.com"</code>）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsmochat"><a class="header" href="#channelsmochat"><code>channels.mochat</code></a></h3>
+<p>Mochat 渠道配置（Mochat 客服 API）</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的用户 ID。空值 = 拒绝所有，“*” = 允许所有</td></tr>
+<tr><td><code>api_token</code>* 🔑</td><td>字符串</td><td>—</td><td>Mochat API 令牌</td></tr>
+<tr><td><code>api_url</code>*</td><td>字符串</td><td>—</td><td>Mochat API 基础 URL</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>poll_interval_secs</code></td><td>整数</td><td><code>5</code></td><td>轮询新消息的时间间隔（秒）。默认值：5</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsmqtt"><a class="header" href="#channelsmqtt"><code>channels.mqtt</code></a></h3>
+<p>MQTT 通道配置（SOP 监听器）。</p>
+<p>订阅 MQTT 主题并将传入的消息分发给 SOP 引擎进行处理。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>broker_url</code>*</td><td>字符串</td><td>—</td><td>MQTT 代理 URL（例如 <code>mqtt://localhost:1883</code> 或 <code>mqtts://broker.example.com:8883</code>）。</td></tr>
+<tr><td><code>client_id</code>*</td><td>字符串</td><td>—</td><td>MQTT 客户端 ID（每个代理必须唯一）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>keep_alive_secs</code></td><td>整数</td><td><code>30</code></td><td>保活间隔（秒，默认值：30）。防止在空闲时断开与代理的连接。</td></tr>
+<tr><td><code>password</code> 🔑</td><td>任何</td><td>—</td><td>用于身份验证的密码（可选）。</td></tr>
+<tr><td><code>qos</code></td><td>整数</td><td><code>1</code></td><td>MQTT QoS 级别（0 = 最多一次，1 = 至少一次，2 = 恰好一次）。默认值：1。</td></tr>
+<tr><td><code>topics</code></td><td>字符串数组</td><td><code>[]</code></td><td>要订阅的主题（例如，<code>sensors/#</code>、<code>alerts/+/critical</code>）。</td></tr>
+<tr><td><code>use_tls</code></td><td>布尔</td><td><code>false</code></td><td>启用 TLS 加密。必须与 broker_url 方案匹配：</td></tr>
+<tr><td><code>username</code></td><td>任何</td><td>—</td><td>用于身份验证的用户名（可选）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsnextcloud_talk"><a class="header" href="#channelsnextcloud_talk"><code>channels.nextcloud_talk</code></a></h3>
+<p>Nextcloud Talk 机器人配置（Webhook 接收 + OCS 发送 API）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的 Nextcloud 参与者 ID（<code>[]</code> = 拒绝所有，<code>"*"</code> = 允许所有）。</td></tr>
+<tr><td><code>app_token</code>* 🔑</td><td>字符串</td><td>—</td><td>用于 OCS API 承载认证的机器人应用令牌。</td></tr>
+<tr><td><code>base_url</code>*</td><td>字符串</td><td>—</td><td>Nextcloud 基础 URL（例如 <code>"https://cloud.example.com"</code>）。</td></tr>
+<tr><td><code>bot_name</code></td><td>任何</td><td><code>null</code></td><td>在 Nextcloud Talk 中显示机器人的名称（例如 “zeroclaw”）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>proxy_url</code></td><td>任何</td><td><code>null</code></td><td>按通道代理 URL（http、https、socks5、socks5h）。</td></tr>
+<tr><td><code>webhook_secret</code> 🔑</td><td>任何</td><td><code>null</code></td><td>用于 Webhook 签名验证的共享密钥。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsqq"><a class="header" href="#channelsqq"><code>channels.qq</code></a></h3>
+<p>QQ 官方机器人配置（腾讯 QQ 机器人 SDK）</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的用户 ID。空值 = 拒绝所有，“*” = 允许所有</td></tr>
+<tr><td><code>app_id</code>*</td><td>字符串</td><td>—</td><td>来自 QQ 机器人开发者控制台的 App ID</td></tr>
+<tr><td><code>app_secret</code>* 🔑</td><td>字符串</td><td>—</td><td>来自 QQ 机器人开发者控制台的 App Secret</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>proxy_url</code></td><td>任何</td><td><code>null</code></td><td>按通道代理 URL（http、https、socks5、socks5h）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsreddit"><a class="header" href="#channelsreddit"><code>channels.reddit</code></a></h3>
+<p>Reddit 频道配置（OAuth2 机器人）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>client_id</code>*</td><td>字符串</td><td>—</td><td>Reddit OAuth2 客户端 ID。</td></tr>
+<tr><td><code>client_secret</code>* 🔑</td><td>字符串</td><td>—</td><td>Reddit OAuth2 客户端密钥。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>refresh_token</code>* 🔑</td><td>字符串</td><td>—</td><td>用于持久访问的 Reddit OAuth2 刷新令牌。</td></tr>
+<tr><td><code>subreddit</code></td><td>任何</td><td><code>null</code></td><td>可选的 subreddit 用于过滤消息（不带 <code>r/</code> 前缀）。</td></tr>
+<tr><td><code>username</code>*</td><td>字符串</td><td>—</td><td>Reddit 机器人用户名（不带 <code>u/</code> 前缀）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelssignal"><a class="header" href="#channelssignal"><code>channels.signal</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>account</code>*</td><td>字符串</td><td>—</td><td>signal-cli 账户的 E.164 电话号码（例如 “+1234567890”）。</td></tr>
+<tr><td><code>allowed_from</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的发送者电话号码（E.164）或 “*” 表示所有。</td></tr>
+<tr><td><code>approval_timeout_secs</code></td><td>整数</td><td><code>300</code></td><td>在自动拒绝之前，等待操作员对 <code>always_ask</code> 工具批准的时间（秒）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>group_id</code></td><td>任何</td><td><code>null</code></td><td>可选的组 ID，用于过滤消息。</td></tr>
+<tr><td><code>http_url</code>*</td><td>字符串</td><td>—</td><td>signal-cli HTTP 守护进程的基 URL（例如 <code>"http://127.0.0.1:8686"</code>）。</td></tr>
+<tr><td><code>ignore_attachments</code></td><td>布尔</td><td><code>false</code></td><td>跳过仅包含附件的消息（无文本正文）。</td></tr>
+<tr><td><code>ignore_stories</code></td><td>布尔</td><td><code>false</code></td><td>跳过传入的故事消息。</td></tr>
+<tr><td><code>proxy_url</code></td><td>任何</td><td><code>null</code></td><td>按通道代理 URL（http、https、socks5、socks5h）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsslack"><a class="header" href="#channelsslack"><code>channels.slack</code></a></h3>
+<p>Slack 机器人频道配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的 Slack 用户 ID。空值 = 拒绝所有。</td></tr>
+<tr><td><code>app_token</code> 🔑</td><td>任何</td><td>—</td><td>用于 Socket Mode 的 Slack 应用级令牌 (xapp-…)。</td></tr>
+<tr><td><code>approval_timeout_secs</code></td><td>整数</td><td><code>300</code></td><td>在自动拒绝之前，等待操作员对 <code>always_ask</code> 工具批准的时间（秒）。</td></tr>
+<tr><td><code>bot_token</code>* 🔑</td><td>字符串</td><td>—</td><td>Slack 机器人 OAuth 令牌 (xoxb-…)。</td></tr>
+<tr><td><code>cancel_reaction</code></td><td>任何</td><td><code>null</code></td><td>取消正在进行的请求的 Emoji 反应名称（不带冒号）。</td></tr>
+<tr><td><code>channel_ids</code></td><td>字符串数组</td><td><code>[]</code></td><td>要监视的频道 ID 的显式列表。</td></tr>
+<tr><td><code>draft_update_interval_ms</code></td><td>整数</td><td><code>1200</code></td><td>为避免 Slack 速率限制，草稿消息编辑之间的最小间隔（毫秒）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>interrupt_on_new_message</code></td><td>布尔</td><td><code>false</code></td><td>当为 true 时，来自同一发送者在同一频道中的较新的 Slack 消息</td></tr>
+<tr><td><code>mention_only</code></td><td>布尔</td><td><code>false</code></td><td>当为 true 时，仅在群组中回复 @提及机器人的消息。</td></tr>
+<tr><td><code>proxy_url</code></td><td>任何</td><td><code>null</code></td><td>按通道代理 URL（http、https、socks5、socks5h）。</td></tr>
+<tr><td><code>stream_drafts</code></td><td>布尔</td><td><code>false</code></td><td>通过 <code>chat.update</code> 启用渐进式草稿消息流式传输。</td></tr>
+<tr><td><code>strict_mention_in_thread</code></td><td>布尔</td><td><code>false</code></td><td>When true (and <code>mention_only</code> is also true), messages inside a Slack</td></tr>
+<tr><td><code>thread_replies</code></td><td>任何</td><td><code>null</code></td><td>当为 true（默认值）时，回复将保留在原始的 Slack 线程中。</td></tr>
+<tr><td><code>use_markdown_blocks</code></td><td>布尔</td><td><code>false</code></td><td>使用较新的 Slack <code>markdown</code> 块类型（12 000 字符限制，更丰富的格式）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelstelegram"><a class="header" href="#channelstelegram"><code>channels.telegram</code></a></h3>
+<p>Telegram 机器人频道配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ack_reactions</code></td><td>任何</td><td><code>null</code></td><td>覆盖顶层 <code>ack_reactions</code> 设置。当为 <code>None</code> 时，</td></tr>
+<tr><td><code>allowed_users</code>*</td><td>字符串数组</td><td>—</td><td>允许的 Telegram 用户 ID 或用户名。空值 = 拒绝所有。</td></tr>
+<tr><td><code>approval_timeout_secs</code></td><td>整数</td><td><code>120</code></td><td>等待操作员点击内联键盘的时长（秒）</td></tr>
+<tr><td><code>bot_token</code>* 🔑</td><td>字符串</td><td>—</td><td>Telegram Bot API 令牌（来自 @BotFather）。</td></tr>
+<tr><td><code>draft_update_interval_ms</code></td><td>整数</td><td><code>1000</code></td><td>避免触发速率限制所需的草稿消息编辑最小间隔（毫秒）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>interrupt_on_new_message</code></td><td>布尔</td><td><code>false</code></td><td>当为 true 时，来自同一聊天中同一发送者的较新的 Telegram 消息</td></tr>
+<tr><td><code>mention_only</code></td><td>布尔</td><td><code>false</code></td><td>当为 true 时，仅在群组中回复 @提及机器人的消息。</td></tr>
+<tr><td><code>proxy_url</code></td><td>任何</td><td><code>null</code></td><td>按通道代理 URL（http、https、socks5、socks5h）。</td></tr>
+<tr><td><code>stream_mode</code></td><td>任何</td><td>—</td><td>对于支持渐进式消息更新的通道，启用流式模式。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelstwitter"><a class="header" href="#channelstwitter"><code>channels.twitter</code></a></h3>
+<p>X/Twitter 频道配置（Twitter API v2）</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的用户名或用户 ID。空值 = 拒绝所有，“*” = 允许所有</td></tr>
+<tr><td><code>bearer_token</code>* 🔑</td><td>字符串</td><td>—</td><td>Twitter API v2 的 Bearer Token（OAuth 2.0）</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsvoice_call"><a class="header" href="#channelsvoice_call"><code>channels.voice_call</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>account_id</code>*</td><td>字符串</td><td>—</td><td></td></tr>
+<tr><td><code>auth_token</code>*</td><td>字符串</td><td>—</td><td></td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td></td></tr>
+<tr><td><code>from_number</code>*</td><td>字符串</td><td>—</td><td></td></tr>
+<tr><td><code>max_call_duration_secs</code></td><td>整数</td><td><code>3600</code></td><td></td></tr>
+<tr><td><code>provider</code></td><td><code>twilio</code> | <code>telnyx</code> | <code>plivo</code></td><td>—</td><td>选择哪个电话服务提供商。</td></tr>
+<tr><td><code>require_outbound_approval</code></td><td>布尔</td><td><code>true</code></td><td></td></tr>
+<tr><td><code>transcription_logging</code></td><td>布尔</td><td><code>true</code></td><td></td></tr>
+<tr><td><code>tts_voice</code></td><td>任何</td><td><code>null</code></td><td></td></tr>
+<tr><td><code>webhook_base_url</code></td><td>任何</td><td><code>null</code></td><td></td></tr>
+<tr><td><code>webhook_port</code></td><td>整数</td><td><code>8090</code></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelsvoice_duplex"><a class="header" href="#channelsvoice_duplex"><code>channels.voice_duplex</code></a></h3>
+<p>语音双工配置（<code>[channels.voice_duplex]</code>）。</p>
+<p>启用通过 WebSocket 的全双工语音事件处理。当禁用时（默认值），语音事件将被拒绝为未知类型。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>通过 WebSocket 启用全双工语音事件处理。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelswati"><a class="header" href="#channelswati"><code>channels.wati</code></a></h3>
+<p>WATI WhatsApp Business API 频道配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_numbers</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的电话号码（E.164 格式）或 “*” 表示所有号码。</td></tr>
+<tr><td><code>api_token</code>* 🔑</td><td>字符串</td><td>—</td><td>WATI API 令牌（Bearer 认证）。</td></tr>
+<tr><td><code>api_url</code></td><td>字符串</td><td><code>"https://live-mt-server.wati.io"</code></td><td>WATI API 的基础 URL（默认：<a href="https://live-mt-server.wati.io">https://live-mt-server.wati.io</a>）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>proxy_url</code></td><td>任何</td><td><code>null</code></td><td>按通道代理 URL（http、https、socks5、socks5h）。</td></tr>
+<tr><td><code>tenant_id</code></td><td>任何</td><td><code>null</code></td><td>多通道设置的租户 ID（可选）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelswebhook"><a class="header" href="#channelswebhook"><code>channels.webhook</code></a></h3>
+<p>Webhook 通道配置。</p>
+<p>通过 HTTP POST 接收消息，并将回复发送到可配置的外部 URL。这是支持 Webhook 的任何系统的“通用适配器”。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>auth_header</code></td><td>任何</td><td><code>null</code></td><td>出站请求的可选 <code>Authorization</code> 头值。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>listen_path</code></td><td>任何</td><td><code>null</code></td><td>要监听的 URL 路径（默认值：<code>/webhook</code>）。</td></tr>
+<tr><td><code>端口</code>*</td><td>整数</td><td>—</td><td>用于接收传入 Webhook 的监听端口。</td></tr>
+<tr><td><code>secret</code> 🔑</td><td>任何</td><td>—</td><td>用于 Webhook 签名验证（HMAC-SHA256）的可选共享密钥。</td></tr>
+<tr><td><code>send_method</code></td><td>任何</td><td><code>null</code></td><td>用于出站消息的 HTTP 方法（<code>POST</code> 或 <code>PUT</code>）。默认值：<code>POST</code>。</td></tr>
+<tr><td><code>send_url</code></td><td>任何</td><td><code>null</code></td><td>用于 POST/PUT 出站消息的 URL。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelswechat"><a class="header" href="#channelswechat"><code>channels.wechat</code></a></h3>
+<p>WeChat personal iLink Bot channel configuration.</p>
+<p>Uses the iLink Bot API (<code>ilinkai.weixin.qq.com</code>) with QR-code login. The bot token is obtained by scanning a QR code and persisted to disk so subsequent restarts do not require re-scanning.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>Allowed WeChat user IDs (e.g. <code>"xxx@im.wechat"</code>).</td></tr>
+<tr><td><code>api_base_url</code></td><td>任何</td><td><code>null</code></td><td>Override the iLink API base URL. Default: <code>https://ilinkai.weixin.qq.com</code>.</td></tr>
+<tr><td><code>cdn_base_url</code></td><td>任何</td><td><code>null</code></td><td>Override the CDN base URL. Default: <code>https://novac2c.cdn.weixin.qq.com/c2c</code>.</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>state_dir</code></td><td>任何</td><td><code>null</code></td><td>Directory to persist bot token and sync cursor.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelswecom"><a class="header" href="#channelswecom"><code>channels.wecom</code></a></h3>
+<p>企业微信机器人 Webhook 配置</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的用户 ID。空值 = 拒绝所有，“*” = 允许所有</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>webhook_key</code>* 🔑</td><td>字符串</td><td>—</td><td>来自企业微信机器人配置的 Webhook 密钥</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="channelswhatsapp"><a class="header" href="#channelswhatsapp"><code>channels.whatsapp</code></a></h3>
+<p>WhatsApp 频道配置（Cloud API 或 Web 模式）。</p>
+<p>为 Cloud API 模式设置 <code>phone_number_id</code>，或为 Web 模式设置 <code>session_path</code>。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>access_token</code> 🔑</td><td>任何</td><td><code>null</code></td><td>来自 Meta Business Suite（Cloud API 模式）的访问令牌</td></tr>
+<tr><td><code>allowed_numbers</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许的电话号码（E.164 格式：+1234567890）或 “*” 表示所有</td></tr>
+<tr><td><code>app_secret</code> 🔑</td><td>任何</td><td><code>null</code></td><td>来自 Meta Business Suite 的应用密钥（用于 Webhook 签名验证）</td></tr>
+<tr><td><code>approval_timeout_secs</code></td><td>整数</td><td><code>300</code></td><td>在自动拒绝之前，等待操作员对 <code>always_ask</code> 工具批准的时间（秒）。</td></tr>
+<tr><td><code>dm_mention_patterns</code></td><td>字符串数组</td><td><code>[]</code></td><td>用于 DM 提及门控的正则表达式模式（不区分大小写）。</td></tr>
+<tr><td><code>dm_policy</code></td><td>任何</td><td>—</td><td>针对特定 WhatsApp 聊天类型（私聊或群组）的策略，当</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>该通道是否处于激活状态（必须显式启用）。默认值：false。</td></tr>
+<tr><td><code>group_mention_patterns</code></td><td>字符串数组</td><td><code>[]</code></td><td>用于群聊提及门控的正则表达式模式（不区分大小写）。</td></tr>
+<tr><td><code>group_policy</code></td><td>任何</td><td>—</td><td>针对特定 WhatsApp 聊天类型（私聊或群组）的策略，当</td></tr>
+<tr><td><code>mention_only</code></td><td>布尔</td><td><code>false</code></td><td>当为 true 时，仅在群组中响应 @提及机器人的消息（仅限 Web 模式）。</td></tr>
+<tr><td><code>模式</code></td><td>任何</td><td>—</td><td>WhatsApp Web 使用模式。</td></tr>
+<tr><td><code>pair_code</code></td><td>任何</td><td><code>null</code></td><td>用于链接的自定义配对码（Web 模式，可选）</td></tr>
+<tr><td><code>pair_phone</code></td><td>任何</td><td><code>null</code></td><td>用于配对码链接的电话号码（Web 模式，可选）</td></tr>
+<tr><td><code>phone_number_id</code></td><td>任何</td><td><code>null</code></td><td>来自 Meta Business API（Cloud API 模式）的电话号码 ID</td></tr>
+<tr><td><code>proxy_url</code></td><td>任何</td><td><code>null</code></td><td>按通道代理 URL（http、https、socks5、socks5h）。</td></tr>
+<tr><td><code>self_chat_mode</code></td><td>布尔</td><td><code>false</code></td><td>当为 true 且 mode = “personal” 时，始终在以下位置回复消息</td></tr>
+<tr><td><code>session_path</code></td><td>任何</td><td><code>null</code></td><td>WhatsApp Web 客户端（Web 模式）的会话数据库路径</td></tr>
+<tr><td><code>verify_token</code> 🔑</td><td>任何</td><td><code>null</code></td><td>Webhook 验证令牌（由你定义，Meta 会将其发回以进行验证）</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="claude_code"><a class="header" href="#claude_code"><code>claude_code</code></a></h2>
+<p>Claude Code CLI 工具配置（<code>[claude_code]</code> 部分）。</p>
+<p>将编码任务委派给 <code>claude -p</code> CLI。默认情况下，身份验证使用二进制文件自身的 OAuth 会话（Max 订阅）——除非 <code>env_passthrough</code> 包含 <code>ANTHROPIC_API_KEY</code>，否则无需 API 密钥。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_tools</code></td><td>字符串数组</td><td><code>["读取","编辑","Bash","写入"]</code></td><td>Claude Code 工具中子进程允许使用的内容</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 <code>claude_code</code> 工具</td></tr>
+<tr><td><code>env_passthrough</code></td><td>字符串数组</td><td><code>[]</code></td><td>传递给 claude 子进程的环境变量（例如，用于 API 密钥计费的 ANTHROPIC_API_KEY）</td></tr>
+<tr><td><code>max_output_bytes</code></td><td>整数</td><td><code>2097152</code></td><td>最大输出大小（以字节为单位，默认值为 2MB）</td></tr>
+<tr><td><code>system_prompt</code></td><td>任何</td><td><code>null</code></td><td>附加到 Claude Code 调用的可选系统提示</td></tr>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>600</code></td><td>最大执行时间（秒）（编码任务可能耗时较长）</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="claude_code_runner"><a class="header" href="#claude_code_runner"><code>claude_code_runner</code></a></h2>
+<p>Claude Code 任务运行器配置（<code>[claude_code_runner]</code> 部分）。</p>
+<p>在 tmux 会话中启动 Claude Code，并通过 HTTP 钩子将工具执行事件 POST 到 ZeroClaw 的网关，实时更新 Slack 消息中的进度以及 SSH 交接链接。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 <code>claude_code_runner</code> 工具</td></tr>
+<tr><td><code>session_ttl</code></td><td>整数</td><td><code>3600</code></td><td>会话存活时间（以秒为单位），在自动清理之前（默认值：3600）</td></tr>
+<tr><td><code>ssh_host</code></td><td>任何</td><td><code>null</code></td><td>用于会话切换链接的 SSH 主机（例如 “myhost.example.com”）</td></tr>
+<tr><td><code>tmux_prefix</code></td><td>字符串</td><td><code>"zc-claude-"</code></td><td>tmux 会话名称的前缀（默认值：“zc-claude-”）</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="cloud_ops"><a class="header" href="#cloud_ops"><code>cloud_ops</code></a></h2>
+<p>控制只读的云转换分析工具：IaC 审查、迁移评估、成本分析和架构审查。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cost_threshold_monthly_usd</code></td><td>数字</td><td><code>100.0</code></td><td>用于标记成本项的每月美元阈值。默认值：100.0。</td></tr>
+<tr><td><code>default_cloud</code></td><td>字符串</td><td><code>"aws"</code></td><td>分析上下文的默认云提供商。默认值：“aws”。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用云操作工具。默认值：false。</td></tr>
+<tr><td><code>iac_tools</code></td><td>字符串数组</td><td><code>["terraform"]</code></td><td>支持用于审查的 IaC 工具。默认值：[<code>terraform</code>]。</td></tr>
+<tr><td><code>supported_clouds</code></td><td>字符串数组</td><td><code>["aws","azure","gcp"]</code></td><td>支持的云提供商。默认值：[<code>aws</code>, <code>azure</code>, <code>gcp</code>]。</td></tr>
+<tr><td><code>well_architected_frameworks</code></td><td>字符串数组</td><td><code>["aws-waf"]</code></td><td>用于检查的架构最佳实践框架。默认值：[<code>aws-waf</code>]。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="codex_cli"><a class="header" href="#codex_cli"><code>codex_cli</code></a></h2>
+<p>Codex CLI 工具配置（<code>[codex_cli]</code> 部分）。</p>
+<p>将编码任务委托给 <code>codex -q</code> CLI。默认情况下，身份验证使用二进制文件自身的会话——除非 <code>env_passthrough</code> 包含 <code>OPENAI_API_KEY</code>，否则无需 API 密钥。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 <code>codex_cli</code> 工具</td></tr>
+<tr><td><code>env_passthrough</code></td><td>字符串数组</td><td><code>[]</code></td><td>传递给 codex 子进程的其他环境变量（例如 OPENAI_API_KEY）</td></tr>
+<tr><td><code>max_output_bytes</code></td><td>整数</td><td><code>2097152</code></td><td>最大输出大小（以字节为单位，默认值为 2MB）</td></tr>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>600</code></td><td>最大执行时间（秒）（编码任务可能耗时较长）</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="composio"><a class="header" href="#composio"><code>composio</code></a></h2>
+<p>Composio 托管的 OAuth 工具集成（<code>[composio]</code> 部分）。</p>
+<p>通过 Composio 平台提供对 1000 多个 OAuth 连接工具的访问。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>Composio API 密钥（当 secrets.encrypt = true 时以加密形式存储）</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 Composio 集成，支持 1000 多个 OAuth 工具</td></tr>
+<tr><td><code>entity_id</code></td><td>字符串</td><td><code>"默认"</code></td><td>多用户设置中的默认实体 ID</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="conversational_ai"><a class="header" href="#conversational_ai"><code>conversational_ai</code></a></h2>
+<p>对话式 AI 代理构建器配置（<code>[conversational_ai]</code> 部分）。</p>
+<p><strong>状态：保留供将来使用。</strong> 此配置会被解析，但尚未被运行时使用。设置 <code>enabled = true</code> 将产生启动警告。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>analytics_enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用对话分析跟踪。默认值：false（默认隐私保护）。</td></tr>
+<tr><td><code>auto_detect_language</code></td><td>布尔</td><td><code>true</code></td><td>自动从消息内容中检测用户语言。默认值：true。</td></tr>
+<tr><td><code>conversation_timeout_secs</code></td><td>整数</td><td><code>1800</code></td><td>会话超时时间（秒，表示不活跃时间）。默认值：1800。</td></tr>
+<tr><td><code>default_language</code></td><td>字符串</td><td><code>"en"</code></td><td>对话的默认语言（BCP-47 标签）。默认值：“en”。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用对话式 AI 功能。默认值：false。</td></tr>
+<tr><td><code>escalation_confidence_threshold</code></td><td>数字</td><td><code>0.3</code></td><td>低于此阈值的意图置信度将触发升级。默认值：0.3。</td></tr>
+<tr><td><code>knowledge_base_tool</code></td><td>任何</td><td><code>null</code></td><td>用于在对话期间进行基于 RAG 的知识库查找的可选工具名称。</td></tr>
+<tr><td><code>max_conversation_turns</code></td><td>整数</td><td><code>50</code></td><td>自动结束前的最大对话轮数。默认值：50。</td></tr>
+<tr><td><code>supported_languages</code></td><td>字符串数组</td><td><code>["en","de","fr","it"]</code></td><td>对话支持的语言。默认值：[<code>en</code>, <code>de</code>, <code>fr</code>, <code>it</code>]。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="cost"><a class="header" href="#cost"><code>cost</code></a></h2>
+<p>成本跟踪和预算强制执行配置（<code>[cost]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allow_override</code></td><td>布尔</td><td><code>false</code></td><td>允许通过 <code>--override</code> 标志（默认值：false）使请求超出预算</td></tr>
+<tr><td><code>daily_limit_usd</code></td><td>数字</td><td><code>10.0</code></td><td>每日支出限额（以美元计，默认值：10.00）</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>true</code></td><td>启用成本跟踪（默认：true）</td></tr>
+<tr><td><code>enforcement</code></td><td>对象</td><td>—</td><td>当达到预算限制时，用于成本强制执行行为的配置。</td></tr>
+<tr><td><code>monthly_limit_usd</code></td><td>数字</td><td><code>100.0</code></td><td>每月支出上限（以美元计，默认值：100.00）</td></tr>
+<tr><td><code>prices</code></td><td>映射</td><td><code>{}</code></td><td>按模型定价（每 100 万代币的美元价格）</td></tr>
+<tr><td><code>warn_at_percent</code></td><td>整数</td><td><code>80</code></td><td>当支出达到此百分比限制时发出警告（默认值：80）</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="成本执行"><a class="header" href="#成本执行"><code>成本执行</code></a></h3>
+<p>当达到预算限制时，用于成本强制执行行为的配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>模式</code></td><td>字符串</td><td><code>"warn"</code></td><td>执行模式：“warn”、“block” 或 “route_down”。</td></tr>
+<tr><td><code>reserve_percent</code></td><td>整数</td><td><code>10</code></td><td>将预算的此百分比保留用于关键操作。</td></tr>
+<tr><td><code>route_down_model</code></td><td>任何</td><td><code>null</code></td><td>当超出预算时路由到的模型（与“route_down”模式一起使用）。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="cron"><a class="header" href="#cron"><code>cron</code></a></h2>
+<p>Cron 任务配置（<code>[cron]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>在启动时追赶</code></td><td>布尔</td><td><code>true</code></td><td>在调度器启动时运行所有过期的作业。默认值：<code>true</code>。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>true</code></td><td>启用 cron 子系统。默认值：<code>true</code>。</td></tr>
+<tr><td><code>jobs</code></td><td>对象[]</td><td><code>[]</code></td><td>声明式 cron 作业定义（<code>[[cron.jobs]]</code>）。</td></tr>
+<tr><td><code>max_run_history</code></td><td>整数</td><td><code>50</code></td><td>保留的历史 cron 运行记录的最大数量。默认值：<code>50</code>。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="data_retention"><a class="header" href="#data_retention"><code>data_retention</code></a></h2>
+<p>数据保留和清理配置（<code>[data_retention]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>categories</code></td><td>字符串数组</td><td><code>[]</code></td><td>将保留策略的执行限制到特定的数据类别（空值表示所有类别）。</td></tr>
+<tr><td><code>dry_run</code></td><td>布尔</td><td><code>false</code></td><td>预览将被删除的内容，而不会实际删除任何内容。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 <code>data_management</code> 工具。</td></tr>
+<tr><td><code>retention_days</code></td><td>整数</td><td><code>90</code></td><td>在数据被清除之前保留的天数。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="delegate"><a class="header" href="#delegate"><code>delegate</code></a></h2>
+<p>全局委托工具配置，用于设置默认超时值。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>agentic_timeout_secs</code></td><td>整数</td><td><code>300</code></td><td>代理子代理运行的默认超时时间（以秒为单位）。</td></tr>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>120</code></td><td>非智能子代理提供程序调用的默认超时时间（以秒为单位）。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="escalation"><a class="header" href="#escalation"><code>escalation</code></a></h2>
+<p>Escalation routing configuration (<code>[escalation]</code> section).</p>
+<p>Controls which channels receive alert notifications when <code>escalate_to_human</code> is called with high or critical urgency. Channels are identified by name (e.g. <code>"telegram"</code>, <code>"slack"</code>). Alerts are sent best-effort and do not block the escalation.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>alert_channels</code></td><td>字符串数组</td><td><code>[]</code></td><td>Channel names to alert on high/critical escalations (default: empty).</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="网关"><a class="header" href="#网关"><code>网关</code></a></h2>
+<p>网关服务器配置（<code>[gateway]</code> 部分）。</p>
+<p>控制用于 webhook 和配对端点的 HTTP 网关。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allow_public_bind</code></td><td>布尔</td><td><code>false</code></td><td>允许绑定到非 localhost 地址而无需隧道（默认值：false）</td></tr>
+<tr><td><code>host</code></td><td>字符串</td><td><code>"127.0.0.1"</code></td><td>网关主机（默认：127.0.0.1）</td></tr>
+<tr><td><code>idempotency_max_keys</code></td><td>整数</td><td><code>10000</code></td><td>保留在内存中的最大不同幂等性键数量。</td></tr>
+<tr><td><code>idempotency_ttl_secs</code></td><td>整数</td><td><code>300</code></td><td>Webhook 幂等性键的 TTL（生存时间）。</td></tr>
+<tr><td><code>pair_rate_limit_per_minute</code></td><td>整数</td><td><code>10</code></td><td>每个客户端密钥每分钟最大 <code>/pair</code> 请求数。</td></tr>
+<tr><td><code>paired_tokens</code> 🔑</td><td>字符串数组</td><td><code>[]</code></td><td>配对的承载令牌（自动管理，非用户编辑）</td></tr>
+<tr><td><code>配对仪表板</code></td><td>对象</td><td>—</td><td>配对仪表板配置（<code>[gateway.pairing_dashboard]</code>）。</td></tr>
+<tr><td><code>path_prefix</code></td><td>任何</td><td><code>null</code></td><td>反向代理部署的可选 URL 路径前缀。</td></tr>
+<tr><td><code>端口</code></td><td>整数</td><td><code>42617</code></td><td>网关端口（默认值：42617）</td></tr>
+<tr><td><code>rate_limit_max_keys</code></td><td>整数</td><td><code>10000</code></td><td>网关速率限制器映射跟踪的最大不同客户端密钥数。</td></tr>
+<tr><td><code>require_pairing</code></td><td>布尔</td><td><code>true</code></td><td>在接收请求前要求配对（默认：true）</td></tr>
+<tr><td><code>session_persistence</code></td><td>布尔</td><td><code>true</code></td><td>将网关 WebSocket 聊天会话持久化到 SQLite。默认值：true。</td></tr>
+<tr><td><code>session_ttl_hours</code></td><td>整数</td><td><code>0</code></td><td>自动归档超过 N 小时未活动的网关会话。0 表示禁用。默认值：0。</td></tr>
+<tr><td><code>tls</code></td><td>对象</td><td>—</td><td>网关服务器的 TLS 配置（<code>[gateway.tls]</code>）。</td></tr>
+<tr><td><code>trust_forwarded_headers</code></td><td>布尔</td><td><code>false</code></td><td>信任代理转发的客户端 IP 头（<code>X-Forwarded-For</code>、<code>X-Real-IP</code>）。</td></tr>
+<tr><td><code>web_dist_dir</code></td><td>任何</td><td><code>null</code></td><td>Web 仪表板 <code>dist</code> 目录的路径。设置后，网关</td></tr>
+<tr><td><code>webhook_rate_limit_per_minute</code></td><td>整数</td><td><code>60</code></td><td>每个客户端密钥每分钟 <code>/webhook</code> 请求的最大数量。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="gatewaypairing_dashboard"><a class="header" href="#gatewaypairing_dashboard"><code>gateway.pairing_dashboard</code></a></h3>
+<p>配对仪表板配置（<code>[gateway.pairing_dashboard]</code>）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>code_length</code></td><td>整数</td><td><code>8</code></td><td>配对码的长度（默认值：8）</td></tr>
+<tr><td><code>code_ttl_secs</code></td><td>整数</td><td><code>3600</code></td><td>待配对代码的存活时间（秒）（默认值：3600）</td></tr>
+<tr><td><code>lockout_secs</code></td><td>整数</td><td><code>300</code></td><td>达到最大尝试次数后的锁定持续时间（秒）（默认值：300）</td></tr>
+<tr><td><code>max_failed_attempts</code></td><td>整数</td><td><code>5</code></td><td>锁定前最大失败配对尝试次数（默认值：5）</td></tr>
+<tr><td><code>max_pending_codes</code></td><td>整数</td><td><code>3</code></td><td>最大并发待配对代码数（默认值：3）</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="gatewaytls"><a class="header" href="#gatewaytls"><code>gateway.tls</code></a></h3>
+<p>网关服务器的 TLS 配置（<code>[gateway.tls]</code>）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cert_path</code>*</td><td>字符串</td><td>—</td><td>PEM 编码的服务器证书文件的路径。</td></tr>
+<tr><td><code>client_auth</code></td><td>对象</td><td>—</td><td>客户端证书认证（mTLS）配置（<code>[gateway.tls.client_auth]</code>）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>为网关启用 TLS（默认值：false）。</td></tr>
+<tr><td><code>key_path</code>*</td><td>字符串</td><td>—</td><td>PEM 编码的服务器私钥文件的路径。</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="gatewaytlsclient_auth"><a class="header" href="#gatewaytlsclient_auth"><code>gateway.tls.client_auth</code></a></h4>
+<p>客户端证书认证（mTLS）配置（<code>[gateway.tls.client_auth]</code>）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ca_cert_path</code></td><td>字符串</td><td><code>""</code></td><td>用于验证客户端证书的 PEM 编码 CA 证书的路径。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用客户端证书验证（默认值：false）。</td></tr>
+<tr><td><code>pinned_certs</code></td><td>字符串数组</td><td><code>[]</code></td><td>用于证书固定的可选 SHA-256 指纹。</td></tr>
+<tr><td><code>require_client_cert</code></td><td>布尔</td><td><code>true</code></td><td>拒绝未提供有效客户端证书的连接（默认值：true）。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="gemini_cli"><a class="header" href="#gemini_cli"><code>gemini_cli</code></a></h2>
+<p>Gemini CLI 工具配置（<code>[gemini_cli]</code> 部分）。</p>
+<p>将编码任务委托给 <code>gemini -p</code> CLI。默认情况下，身份验证使用二进制文件自身的会话——除非 <code>env_passthrough</code> 包含 <code>GOOGLE_API_KEY</code>，否则无需 API 密钥。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 <code>gemini_cli</code> 工具</td></tr>
+<tr><td><code>env_passthrough</code></td><td>字符串数组</td><td><code>[]</code></td><td>传递给 gemini 子进程的额外环境变量（例如 GOOGLE_API_KEY）</td></tr>
+<tr><td><code>max_output_bytes</code></td><td>整数</td><td><code>2097152</code></td><td>最大输出大小（以字节为单位，默认值为 2MB）</td></tr>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>600</code></td><td>最大执行时间（秒）（编码任务可能耗时较长）</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="google_workspace"><a class="header" href="#google_workspace"><code>google_workspace</code></a></h2>
+<p>Google Workspace CLI (<code>gws</code>) 工具配置（<code>[google_workspace]</code> 部分）。</p>
+<h2 id="默认值"><a class="header" href="#默认值">默认值</a></h2>
+<ul>
+<li><code>enabled</code>：<code>false</code>（除非显式选择加入，否则工具不会注册）。</li>
+<li><code>allowed_services</code>：空向量，表示授予对完整默认服务集的访问权限：<code>drive</code>、<code>sheets</code>、<code>gmail</code>、<code>calendar</code>、<code>docs</code>、<code>slides</code>、<code>tasks</code>、<code>people</code>、<code>chat</code>、<code>classroom</code>、<code>forms</code>、<code>keep</code>、<code>meet</code>、<code>events</code>。</li>
+<li><code>allowed_operations</code>：空向量，保留允许在指定服务集下使用任何资源/方法的遗留行为。</li>
+<li><code>credentials_path</code>：<code>None</code>（使用默认的 <code>gws</code> 凭据发现机制）。</li>
+<li><code>default_account</code>：<code>None</code>（使用 <code>gws</code> 活动账户）。</li>
+<li><code>rate_limit_per_minute</code>: <code>60</code>。</li>
+<li><code>timeout_secs</code>：<code>30</code>。</li>
+<li><code>audit_log</code>: <code>false</code>。</li>
+</ul>
+<h2 id="兼容性"><a class="header" href="#兼容性">兼容性</a></h2>
+<p>完全省略 <code>[google_workspace]</code> 部分的配置将被视为 <code>GoogleWorkspaceConfig::default()</code>（已禁用，所有默认值均允许）。添加该部分完全是可选的，不会影响其他配置部分。</p>
+<h2 id="回滚--迁移"><a class="header" href="#回滚--迁移">回滚 / 迁移</a></h2>
+<p>要撤销，请从配置文件中删除 <code>[google_workspace]</code> 部分（或设置 <code>enabled = false</code>）。无需进行数据迁移；该工具将不再被注册。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_operations</code></td><td>对象[]</td><td><code>[]</code></td><td>限制代理可以访问的资源/方法组合。</td></tr>
+<tr><td><code>allowed_services</code></td><td>字符串数组</td><td><code>[]</code></td><td>限制智能体可以访问的 Google Workspace 服务。</td></tr>
+<tr><td><code>audit_log</code></td><td>布尔</td><td><code>false</code></td><td>启用对每次 <code>gws</code> 调用（服务、资源、</td></tr>
+<tr><td><code>credentials_path</code></td><td>任何</td><td><code>null</code></td><td>服务账户 JSON 文件或 OAuth 客户端凭证文件的路径。</td></tr>
+<tr><td><code>默认账户</code></td><td>任何</td><td><code>null</code></td><td>传递给 <code>gws --account</code> 的默认 Google 账户邮箱。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 <code>google_workspace</code> 工具。默认值：<code>false</code>。</td></tr>
+<tr><td><code>rate_limit_per_minute</code></td><td>整数</td><td><code>60</code></td><td>每分钟允许的最大 <code>gws</code> API 调用次数。默认值：<code>60</code>。</td></tr>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>30</code></td><td>命令执行的超时时间（秒）。默认值：<code>30</code>。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="硬件"><a class="header" href="#硬件"><code>硬件</code></a></h2>
+<p>用于物理世界交互的向导驱动硬件配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>波特率</code></td><td>整数</td><td><code>115200</code></td><td>Baud rate negotiated on the serial link. 115200 matches the common Arduino / ESP32 bootloader default; bump to 230400+ when your firmware explicitly supports faster rates and you need the throughput.</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>Opt in to direct physical-hardware control — GPIO pins, USB-tethered microcontrollers (Arduino, ESP32, Nucleo), or SWD/JTAG debug probes. Leave off for software-only use; turning it on without the right transport configured does nothing.</td></tr>
+<tr><td><code>probe_target</code></td><td>任何</td><td><code>null</code></td><td>Target chip identifier for <code>transport = probe</code> (e.g. <code>STM32F401RE</code>, <code>nRF52840_xxAA</code>). Passed straight to probe-rs for flash/debug operations; must match a chip probe-rs recognizes.</td></tr>
+<tr><td><code>serial_port</code></td><td>任何</td><td><code>null</code></td><td>TTY path for the <code>serial</code> transport — e.g. <code>/dev/ttyACM0</code> on Linux, <code>/dev/tty.usbmodem1</code> on macOS, <code>COM3</code> on Windows. Ignored for other transports.</td></tr>
+<tr><td><code>transport</code></td><td><code>None</code> | <code>Native</code> | <code>Serial</code> | <code>Probe</code></td><td>—</td><td>硬件传输模式。</td></tr>
+<tr><td><code>workspace_datasheets</code></td><td>布尔</td><td><code>false</code></td><td>Index PDF schematics and datasheets from the workspace into a local RAG store, so the agent can look up pin assignments and electrical specs inline when you ask hardware questions. Off by default — turn on once the workspace has relevant PDFs dropped in.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="心跳"><a class="header" href="#心跳">心跳</a></h2>
+<p>用于定期健康检查的 <code>heartbeat</code> 配置（<code>[heartbeat]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>自适应</code></td><td>布尔</td><td><code>false</code></td><td>启用自适应间隔，在失败时退避，并在成功时加速</td></tr>
+<tr><td><code>deadman_channel</code></td><td>任何</td><td><code>null</code></td><td>用于死手开关警报的通道（例如 <code>telegram</code>）。回退到</td></tr>
+<tr><td><code>deadman_timeout_minutes</code></td><td>整数</td><td><code>0</code></td><td>死开关超时（分钟）。如果心跳未触发</td></tr>
+<tr><td><code>deadman_to</code></td><td>任何</td><td><code>null</code></td><td>死手开关警报的接收者。回退到 <code>to</code>。</td></tr>
+<tr><td><code>enabled</code>*</td><td>布尔</td><td>—</td><td>启用周期性心跳 ping。默认值：<code>true</code>。</td></tr>
+<tr><td><code>interval_minutes</code></td><td>整数</td><td><code>30</code></td><td>心跳 ping 之间的间隔（以分钟为单位）。最小值：<code>1</code>。默认值：<code>30</code>。</td></tr>
+<tr><td><code>load_session_context</code></td><td>布尔</td><td><code>false</code></td><td>在每个心跳任务执行之前加载通道会话历史</td></tr>
+<tr><td><code>max_interval_minutes</code></td><td>整数</td><td><code>120</code></td><td>自适应模式退避时的最大间隔（分钟）。默认值：<code>120</code>。</td></tr>
+<tr><td><code>max_run_history</code></td><td>整数</td><td><code>100</code></td><td>要保留的心跳运行历史记录的最大数量。默认值：<code>100</code>。</td></tr>
+<tr><td><code>消息</code></td><td>任何</td><td><code>null</code></td><td>当 <code>HEARTBEAT.md</code> 没有任务条目时，可选的回退任务文本。</td></tr>
+<tr><td><code>min_interval_minutes</code></td><td>整数</td><td><code>5</code></td><td>启用自适应模式时的最小间隔（以分钟为单位）。默认值：<code>5</code>。</td></tr>
+<tr><td><code>target</code></td><td>任何</td><td><code>null</code></td><td>心跳输出的可选传递通道（例如：<code>telegram</code>）。</td></tr>
+<tr><td><code>task_timeout_secs</code></td><td>整数</td><td><code>600</code></td><td>单个代理调用允许的最大墙钟秒数</td></tr>
+<tr><td><code>to</code></td><td>任何</td><td><code>null</code></td><td>可选的收件人/聊天标识符（当 <code>target</code> 为</td></tr>
+<tr><td><code>two_phase</code></td><td>布尔</td><td><code>true</code></td><td>启用两阶段心跳：第一阶段询问 LLM 是否运行，第二阶段</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="hooks"><a class="header" href="#hooks"><code>hooks</code></a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>builtin</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>enabled</code>*</td><td>布尔</td><td>—</td><td>启用生命周期钩子执行。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="hooksbuiltin"><a class="header" href="#hooksbuiltin"><code>hooks.builtin</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>command_logger</code>*</td><td>布尔</td><td>—</td><td>启用命令记录器钩子（记录工具调用以进行审计）。</td></tr>
+<tr><td><code>webhook_audit</code></td><td>对象</td><td>—</td><td>webhook-audit 内置钩子的配置。</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="hooksbuiltinwebhook_audit"><a class="header" href="#hooksbuiltinwebhook_audit"><code>hooks.builtin.webhook_audit</code></a></h4>
+<p>webhook-audit 内置钩子的配置。</p>
+<p>每当工具调用匹配配置的某个模式时，向外部端点发送带有 JSON 主体的 HTTP POST 请求。适用于集中式审计日志记录、SIEM 数据摄入或合规性管道。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 webhook-audit 钩子。默认值：<code>false</code>。</td></tr>
+<tr><td><code>include_args</code></td><td>布尔</td><td><code>false</code></td><td>在审计负载中包含工具调用参数。默认值：<code>false</code>。</td></tr>
+<tr><td><code>max_args_bytes</code></td><td>整数</td><td><code>4096</code></td><td>单个</td></tr>
+<tr><td><code>tool_patterns</code></td><td>字符串数组</td><td><code>[]</code></td><td>用于审计的工具名称的 Glob 模式（例如 <code>["Bash", "Write"]</code>）。</td></tr>
+<tr><td><code>url</code></td><td>字符串</td><td><code>""</code></td><td>接收审计 POST 请求的目标 URL。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="http_request"><a class="header" href="#http_request"><code>http_request</code></a></h2>
+<p>HTTP 请求工具配置（<code>[http_request]</code> 部分）。</p>
+<p>域名过滤：<code>allowed_domains</code> 控制哪些主机可以访问（使用 <code>["*"]</code> 表示所有公共主机，这是默认值）。如果 <code>allowed_domains</code> 为空，则所有请求都会被拒绝。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allow_private_hosts</code></td><td>布尔</td><td><code>false</code></td><td>允许向私有/LAN 主机（RFC 1918、回环、链路本地、.local）发起请求。</td></tr>
+<tr><td><code>allowed_domains</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许用于 HTTP 请求的域名（精确匹配或子域名匹配）</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 <code>http_request</code> 工具以进行 API 交互</td></tr>
+<tr><td><code>max_response_size</code></td><td>整数</td><td><code>1000000</code></td><td>最大响应大小（以字节为单位）（默认值：1MB，0 = 无限制）</td></tr>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>30</code></td><td>请求超时时间（秒，默认值：30）</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="identity"><a class="header" href="#identity"><code>identity</code></a></h2>
+<p>身份格式配置（<code>[identity]</code> 部分）。</p>
+<p>支持 <code>"openclaw"</code>（默认）或 <code>"aieos"</code> 身份文档。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>aieos_inline</code></td><td>任何</td><td><code>null</code></td><td>内联 AIEOS JSON（替代文件路径）</td></tr>
+<tr><td><code>aieos_path</code></td><td>任何</td><td><code>null</code></td><td>AIEOS JSON 文件的路径（相对于工作区）</td></tr>
+<tr><td><code>format</code></td><td>字符串</td><td><code>"openclaw"</code></td><td>身份格式：“openclaw”（默认）或 “aieos”</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="image_gen"><a class="header" href="#image_gen"><code>image_gen</code></a></h2>
+<p>独立图像生成工具配置（<code>[image_gen]</code>）。</p>
+<p>启用后，会注册一个 <code>image_gen</code> 工具，该工具通过 fal.ai 的同步 API（Flux / Nano Banana 模型）生成图像，并将其保存到工作区的 <code>images/</code> 目录中。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key_env</code></td><td>字符串</td><td><code>"FAL_API_KEY"</code></td><td>保存 fal.ai API 密钥的环境变量名称。</td></tr>
+<tr><td><code>default_model</code></td><td>字符串</td><td><code>"fal-ai/flux/schnell"</code></td><td>默认 fal.ai 模型标识符。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用独立图像生成工具。默认值：false。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="jira"><a class="header" href="#jira"><code>jira</code></a></h2>
+<p>Jira 集成配置（<code>[jira]</code>）。</p>
+<p>当 <code>enabled = true</code> 时，注册 <code>jira</code> 工具，该工具可以获取工单、使用 JQL 进行搜索以及添加评论。需要提供 <code>base_url</code> 和 <code>api_token</code>（或 <code>JIRA_API_TOKEN</code> 环境变量）。</p>
+<h2 id="默认值-1"><a class="header" href="#默认值-1">默认值</a></h2>
+<ul>
+<li><code>enabled</code>: <code>false</code></li>
+<li><code>allowed_actions</code>: <code>["get_ticket"]</code> — 默认情况下为只读。添加 <code>"search_tickets"</code> 或 <code>"comment_ticket"</code> 以解锁这些操作。</li>
+<li><code>timeout_secs</code>: <code>30</code></li>
+</ul>
+<h2 id="认证"><a class="header" href="#认证">认证</a></h2>
+<p>Jira Cloud uses HTTP Basic auth: <code>email</code> + <code>api_token</code>. Jira Server/Data Center uses Bearer token auth: omit <code>email</code> and set <code>api_token</code> to a personal access token. <code>api_token</code> is stored encrypted at rest; set it here or via <code>JIRA_API_TOKEN</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_actions</code></td><td>字符串数组</td><td><code>["get_ticket"]</code></td><td>允许智能体调用的操作。</td></tr>
+<tr><td><code>api_token</code> 🔑</td><td>字符串</td><td><code>""</code></td><td>Jira API 令牌。在静态时加密。回退到 <code>JIRA_API_TOKEN</code> 环境变量。</td></tr>
+<tr><td><code>base_url</code></td><td>字符串</td><td><code>""</code></td><td>Atlassian 实例的基础 URL，例如 <code>https://yourco.atlassian.net</code>。</td></tr>
+<tr><td><code>email</code></td><td>任何</td><td>—</td><td>Jira account email used for Basic auth (Cloud).</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 <code>jira</code> 工具。默认值：<code>false</code>。</td></tr>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>30</code></td><td>请求超时时间（秒）。默认值：<code>30</code>。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="知识"><a class="header" href="#知识"><code>知识</code></a></h2>
+<p>用于捕获和复用专业知识的知识图谱配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>auto_capture</code></td><td>布尔</td><td><code>false</code></td><td>自动从对话中捕获知识。默认值：false。</td></tr>
+<tr><td><code>跨工作区搜索</code></td><td>布尔</td><td><code>false</code></td><td>允许跨工作区进行搜索（默认禁用，以实现客户端数据隔离）。</td></tr>
+<tr><td><code>db_path</code></td><td>字符串</td><td><code>"/home/runner/.zeroclaw/knowledge.db"</code></td><td>知识图谱 SQLite 数据库的路径。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用知识图谱工具。默认值：false。</td></tr>
+<tr><td><code>max_nodes</code></td><td>整数</td><td><code>100000</code></td><td>知识节点的最大数量。默认值：100000。</td></tr>
+<tr><td><code>suggest_on_query</code></td><td>布尔</td><td><code>true</code></td><td>主动建议在查询时提供相关知识。默认值：true。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="link_enricher"><a class="header" href="#link_enricher"><code>link_enricher</code></a></h2>
+<p>自动理解入站频道消息中的链接（<code>[link_enricher]</code>）。</p>
+<p>启用后，传入消息中的 URL 将被自动抓取并生成摘要。该摘要会附加在消息之前，供代理在处理消息前使用，从而让大语言模型（LLM）获得链接页面的上下文信息，而无需显式调用工具。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用链接增强管道阶段（默认：false）</td></tr>
+<tr><td><code>max_links</code></td><td>整数</td><td><code>3</code></td><td>每条消息最多获取的链接数（默认值：3）</td></tr>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>10</code></td><td>每个链接的获取超时时间（秒）（默认值：10）</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="linkedin"><a class="header" href="#linkedin"><code>linkedin</code></a></h2>
+<p>LinkedIn 集成配置（<code>[linkedin]</code> 部分）。</p>
+<p>启用后，<code>linkedin</code> 工具将注册到代理工具界面中。需要在工作区的 <code>.env</code> 文件中配置 <code>LINKEDIN_*</code> 凭据。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_version</code></td><td>字符串</td><td><code>"202602"</code></td><td>LinkedIn REST API 版本头（YYYYMM 格式）。</td></tr>
+<tr><td><code>content</code></td><td>对象</td><td>—</td><td>LinkedIn 自动发布的内容策略配置（<code>[linkedin.content]</code>）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 LinkedIn 工具。</td></tr>
+<tr><td><code>image</code></td><td>对象</td><td>—</td><td>LinkedIn 帖子的图像生成配置（<code>[linkedin.image]</code>）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="linkedincontent"><a class="header" href="#linkedincontent"><code>linkedin.content</code></a></h3>
+<p>LinkedIn 自动发布的内容策略配置（<code>[linkedin.content]</code>）。</p>
+<p>代理通过 <code>linkedin get_content_strategy</code> 操作读取此内容，以了解需要检查的提要、需要突出的仓库以及如何撰写帖子。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>github_repos</code></td><td>字符串数组</td><td><code>[]</code></td><td>要突出的 GitHub 仓库（格式：<code>owner/repo</code>）。</td></tr>
+<tr><td><code>github_users</code></td><td>字符串数组</td><td><code>[]</code></td><td>可供参考的 GitHub 用户公开活动。</td></tr>
+<tr><td><code>instructions</code></td><td>字符串</td><td><code>""</code></td><td>AI 代理的自由格式发布说明。</td></tr>
+<tr><td><code>persona</code></td><td>字符串</td><td><code>""</code></td><td>专业人物描述（姓名、角色、专长）。</td></tr>
+<tr><td><code>rss_feeds</code></td><td>字符串数组</td><td><code>[]</code></td><td>用于监控主题灵感的 RSS 订阅源 URL（仅标题）。</td></tr>
+<tr><td><code>topics</code></td><td>字符串数组</td><td><code>[]</code></td><td>用于帖子主题的专业领域和兴趣点。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="linkedinimage"><a class="header" href="#linkedinimage"><code>linkedin.image</code></a></h3>
+<p>LinkedIn 帖子的图像生成配置（<code>[linkedin.image]</code>）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>card_accent_color</code></td><td>字符串</td><td><code>"#0A66C2"</code></td><td>备用卡片的强调色（CSS 十六进制值）。</td></tr>
+<tr><td><code>dalle</code></td><td>对象</td><td>—</td><td>OpenAI DALL-E 设置（<code>[linkedin.image.dalle]</code>）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>为帖子启用图像生成功能。</td></tr>
+<tr><td><code>fallback_card</code></td><td>布尔</td><td><code>true</code></td><td>当所有 AI 提供商均失败时，生成一个品牌化的 SVG 文本卡片。</td></tr>
+<tr><td><code>flux</code></td><td>对象</td><td>—</td><td>Flux (fal.ai) 图像生成设置 (<code>[linkedin.image.flux]</code>)。</td></tr>
+<tr><td><code>imagen</code></td><td>对象</td><td>—</td><td>Google Imagen（Vertex AI）设置（<code>[linkedin.image.imagen]</code>）。</td></tr>
+<tr><td><code>providers</code></td><td>字符串数组</td><td><code>["stability","imagen","dalle","flux"]</code></td><td>提供程序优先级顺序。按顺序尝试；第一个成功即获胜。</td></tr>
+<tr><td><code>稳定性</code></td><td>对象</td><td>—</td><td>Stability AI 图像生成设置 (<code>[linkedin.image.stability]</code>)。</td></tr>
+<tr><td><code>temp_dir</code></td><td>字符串</td><td><code>"linkedin/images"</code></td><td>生成图像的临时目录，相对于工作区。</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="linkedinimagedalle"><a class="header" href="#linkedinimagedalle"><code>linkedin.image.dalle</code></a></h4>
+<p>OpenAI DALL-E 设置（<code>[linkedin.image.dalle]</code>）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key_env</code></td><td>字符串</td><td><code>"OPENAI_API_KEY"</code></td><td>保存 OpenAI API 密钥的环境变量名称。</td></tr>
+<tr><td><code>模型</code></td><td>字符串</td><td><code>"dall-e-3"</code></td><td>DALL-E 模型标识符。</td></tr>
+<tr><td><code>size</code></td><td>字符串</td><td><code>"1024x1024"</code></td><td>图像尺寸。</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="linkedinimageflux"><a class="header" href="#linkedinimageflux"><code>linkedin.image.flux</code></a></h4>
+<p>Flux (fal.ai) 图像生成设置 (<code>[linkedin.image.flux]</code>)。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key_env</code></td><td>字符串</td><td><code>"FAL_API_KEY"</code></td><td>保存 fal.ai API 密钥的环境变量名称。</td></tr>
+<tr><td><code>模型</code></td><td>字符串</td><td><code>"fal-ai/flux/schnell"</code></td><td>Flux 模型标识符。</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="linkedinimageimagen"><a class="header" href="#linkedinimageimagen"><code>linkedin.image.imagen</code></a></h4>
+<p>Google Imagen（Vertex AI）设置（<code>[linkedin.image.imagen]</code>）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key_env</code></td><td>字符串</td><td><code>"GOOGLE_VERTEX_API_KEY"</code></td><td>保存 API 密钥的环境变量名称。</td></tr>
+<tr><td><code>project_id_env</code></td><td>字符串</td><td><code>"GOOGLE_CLOUD_PROJECT"</code></td><td>Google Cloud 项目 ID 的环境变量。</td></tr>
+<tr><td><code>region</code></td><td>字符串</td><td><code>"us-central1"</code></td><td>Vertex AI 区域。</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="linkedinimagestability"><a class="header" href="#linkedinimagestability"><code>linkedin.image.stability</code></a></h4>
+<p>Stability AI 图像生成设置 (<code>[linkedin.image.stability]</code>)。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key_env</code></td><td>字符串</td><td><code>"STABILITY_API_KEY"</code></td><td>保存 API 密钥的环境变量名称。</td></tr>
+<tr><td><code>模型</code></td><td>字符串</td><td><code>"stable-diffusion-xl-1024-v1-0"</code></td><td>稳定性模型标识符。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="locale"><a class="header" href="#locale"><code>locale</code></a></h2>
+<p>工具描述的语言环境（例如 <code>"en"</code>、<code>"zh-CN"</code>）。</p>
+<p>设置后，系统提示中显示的工具描述将从 Fluent <code>.ftl</code> 区域设置文件中加载。如果未找到，则回退到内嵌的英文描述，再回退到硬编码的描述。</p>
+<p>如果省略或为空，则从 <code>ZEROCLAW_LOCALE</code>、<code>LANG</code> 或 <code>LC_ALL</code> 环境变量中自动检测区域设置（默认为 <code>"en"</code>）。</p>
+<h2 id="mcp"><a class="header" href="#mcp"><code>mcp</code></a></h2>
+<p>外部 MCP 客户端配置（<code>[mcp]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>延迟加载</code></td><td>布尔</td><td><code>true</code></td><td>通过 <code>tool_search</code> 按需加载 MCP 工具模式，而不是提前加载</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 MCP 工具加载。</td></tr>
+<tr><td><code>servers</code></td><td>对象[]</td><td><code>[]</code></td><td>Configured MCP servers. The <code>#[nested]</code> annotation makes the macro</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="media_pipeline"><a class="header" href="#media_pipeline"><code>media_pipeline</code></a></h2>
+<p>自动媒体理解流水线配置（<code>[media_pipeline]</code>）。</p>
+<p>启用后，到达代理之前的入站频道消息中的媒体附件会经过预处理：音频会被转录，图像会被标注，视频会被摘要。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>describe_images</code></td><td>布尔</td><td><code>true</code></td><td>当启用支持视觉的模型时，添加图片描述。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>媒体管道的总开关（默认值：false）。</td></tr>
+<tr><td><code>summarize_video</code></td><td>布尔</td><td><code>true</code></td><td>总结视频附件（占位符 — 需要外部 API）。</td></tr>
+<tr><td><code>transcribe_audio</code></td><td>布尔</td><td><code>true</code></td><td>使用配置的转录提供商转录音频附件。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="memory"><a class="header" href="#memory"><code>memory</code></a></h2>
+<p>内存后端配置（<code>[memory]</code> 部分）。</p>
+<p>控制对话记忆存储、嵌入、混合搜索、响应缓存以及记忆快照/加载。后端特定的子表（<code>[memory.qdrant]</code>、<code>[memory.postgres]</code>）也位于此处。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>archive_after_days</code></td><td>整数</td><td><code>7</code></td><td>Move daily/session files to the archive directory after this many days. Keeps the hot working set small without deleting history.</td></tr>
+<tr><td><code>audit_enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用内存操作的审计日志记录。</td></tr>
+<tr><td><code>audit_retention_days</code></td><td>整数</td><td><code>30</code></td><td>审计条目的保留天数（默认值：30）。</td></tr>
+<tr><td><code>auto_hydrate</code></td><td>布尔</td><td><code>true</code></td><td>当 <code>brain.db</code> 缺失时，从 <code>MEMORY_SNAPSHOT.md</code> 自动重新水合</td></tr>
+<tr><td><code>auto_save</code>*</td><td>布尔</td><td>—</td><td>Auto-save what <em>you</em> tell ZeroClaw into memory as conversation history — the agent’s own replies are not saved. Turn off if you want memory to only hold things you explicitly record via the memory tool.</td></tr>
+<tr><td><code>后端</code>*</td><td>字符串</td><td>—</td><td>Where conversations, notes, and memories live. <code>sqlite</code> = embedded DB with optional vector + keyword hybrid search (fast, self-contained, default pick); <code>markdown</code> = plain-text files you can read and edit by hand (portable but no vector search); <code>lucid</code> = sync with the external <code>lucid-memory</code> CLI; <code>qdrant</code> = dedicated vector DB via <code>[memory.qdrant]</code> or <code>QDRANT_URL</code> env var; <code>none</code> = disable memory entirely.</td></tr>
+<tr><td><code>chunk_max_tokens</code></td><td>整数</td><td><code>512</code></td><td>文档拆分时每个块的最大令牌数</td></tr>
+<tr><td><code>conflict_threshold</code></td><td>数字</td><td><code>0.85</code></td><td>用于冲突检测的余弦相似度阈值（0.0–1.0）。</td></tr>
+<tr><td><code>conversation_retention_days</code></td><td>整数</td><td><code>30</code></td><td>For the sqlite backend only — drop conversation rows older than this many days to keep the DB lean. Doesn’t touch core memories or notes.</td></tr>
+<tr><td><code>default_namespace</code></td><td>字符串</td><td><code>"默认"</code></td><td>内存条目的默认命名空间。</td></tr>
+<tr><td><code>embedding_cache_size</code></td><td>整数</td><td><code>10000</code></td><td>在 LRU 驱逐之前，最大嵌入缓存条目数</td></tr>
+<tr><td><code>embedding_dimensions</code></td><td>整数</td><td><code>1536</code></td><td>Vector width produced by the embedding model — must match the model’s native dimension or vectors won’t store correctly. Look up the number on the provider’s model page.</td></tr>
+<tr><td><code>embedding_model</code></td><td>字符串</td><td><code>"text-embedding-3-small"</code></td><td>Embedding model identifier — must match a model your chosen embedding provider serves (e.g. <code>text-embedding-3-small</code> for OpenAI). Changing this invalidates existing embeddings; you’ll need to re-index.</td></tr>
+<tr><td><code>embedding_provider</code></td><td>字符串</td><td><code>"none"</code></td><td>Source of embedding vectors for semantic search. <code>none</code> = keyword-only retrieval (no API calls, no vector cost); <code>openai</code> = OpenAI’s embedding API; <code>custom:URL</code> = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).</td></tr>
+<tr><td><code>fts_early_return_score</code></td><td>数字</td><td><code>0.85</code></td><td>全文检索（FTS）分数阈值，超过该值时将提前返回，不再执行向量搜索（0.0–1.0）。</td></tr>
+<tr><td><code>hygiene_enabled</code></td><td>布尔</td><td><code>true</code></td><td>Run the periodic hygiene pass that archives stale daily/session files and enforces retention windows. Leave on unless you want to manage cleanup yourself.</td></tr>
+<tr><td><code>keyword_weight</code></td><td>数字</td><td><code>0.3</code></td><td>How heavily BM25 (keyword) overlap counts when <code>search_mode = hybrid</code>. Raise toward 1.0 for exact-term matching; lower it when paraphrases should still score well.</td></tr>
+<tr><td><code>min_relevance_score</code></td><td>数字</td><td><code>0.4</code></td><td>包含在上下文中的内存的最小混合分数（0.0–1.0）。</td></tr>
+<tr><td><code>策略</code></td><td>对象</td><td>—</td><td>内存策略配置（<code>[memory.policy]</code> 部分）。</td></tr>
+<tr><td><code>postgres</code></td><td>对象</td><td>—</td><td>PostgreSQL 内存后端配置（<code>[memory.postgres]</code> 部分）。</td></tr>
+<tr><td><code>purge_after_days</code></td><td>整数</td><td><code>30</code></td><td>Delete archived files permanently after this many days. Set high if you need long-term history; set low for privacy / disk-space reasons.</td></tr>
+<tr><td><code>qdrant</code></td><td>对象</td><td>—</td><td>Qdrant 向量数据库后端配置（<code>[memory.qdrant]</code> 部分）。</td></tr>
+<tr><td><code>rerank_enabled</code></td><td>布尔</td><td><code>false</code></td><td>当候选数量超过阈值时启用 LLM 重排序。</td></tr>
+<tr><td><code>rerank_threshold</code></td><td>整数</td><td><code>5</code></td><td>触发重新排序的最小候选数量。</td></tr>
+<tr><td><code>response_cache_enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 LLM 响应缓存以避免为重复提示付费</td></tr>
+<tr><td><code>response_cache_hot_entries</code></td><td>整数</td><td><code>256</code></td><td>两级响应缓存的最大内存热缓存条目数（默认值：256）</td></tr>
+<tr><td><code>response_cache_max_entries</code></td><td>整数</td><td><code>5000</code></td><td>在 LRU 淘汰之前缓存响应的最大数量（默认值：5000）</td></tr>
+<tr><td><code>response_cache_ttl_minutes</code></td><td>整数</td><td><code>60</code></td><td>缓存响应的 TTL（以分钟为单位）（默认值：60）</td></tr>
+<tr><td><code>retrieval_stages</code></td><td>字符串数组</td><td><code>["缓存","全文搜索","向量"]</code></td><td>按顺序执行的检索阶段。有效值：“cache”、“fts”、“vector”。</td></tr>
+<tr><td><code>search_mode</code></td><td>任何</td><td>—</td><td>内存检索策略</td></tr>
+<tr><td><code>snapshot_enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用核心记忆的定期导出至 <code>MEMORY_SNAPSHOT.md</code></td></tr>
+<tr><td><code>snapshot_on_hygiene</code></td><td>布尔</td><td><code>false</code></td><td>在卫生检查阶段运行快照（心跳驱动）</td></tr>
+<tr><td><code>sqlite_open_timeout_secs</code></td><td>任何</td><td><code>null</code></td><td>对于 SQLite 后端：打开数据库时等待的最大秒数（例如，文件被锁定）。</td></tr>
+<tr><td><code>vector_weight</code></td><td>数字</td><td><code>0.7</code></td><td>How heavily vector (semantic) similarity counts when <code>search_mode = hybrid</code>. Raise toward 1.0 to favor meaning-based matches; lower it to lean on keyword overlap instead.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="memorypolicy"><a class="header" href="#memorypolicy"><code>memory.policy</code></a></h3>
+<p>内存策略配置（<code>[memory.policy]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_entries_per_category</code></td><td>整数</td><td><code>0</code></td><td>每个类别的最大条目数（0 = 无限制）。</td></tr>
+<tr><td><code>max_entries_per_namespace</code></td><td>整数</td><td><code>0</code></td><td>每个命名空间的最大条目数（0 = 无限制）。</td></tr>
+<tr><td><code>read_only_namespaces</code></td><td>字符串数组</td><td><code>[]</code></td><td>只读命名空间（写入操作将被拒绝）。</td></tr>
+<tr><td><code>按类别保留天数</code></td><td>映射</td><td><code>{}</code></td><td>按类别保留的天数（覆盖全局设置）。键值包括：“core”、“daily”、“conversation”。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="memorypostgres"><a class="header" href="#memorypostgres"><code>memory.postgres</code></a></h3>
+<p>PostgreSQL 内存后端配置（<code>[memory.postgres]</code> 部分）。</p>
+<p>当 <code>[memory].backend = "postgres"</code> 时使用。连接参数（<code>db_url</code>、<code>schema</code>、<code>table</code>、<code>connect_timeout_secs</code>）位于 <code>[storage.provider.config]</code> 下；此结构体仅保存向量搜索设置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>vector_dimensions</code></td><td>整数</td><td><code>1536</code></td><td>pgvector 嵌入的向量维度（默认值：1536）。</td></tr>
+<tr><td><code>vector_enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 pgvector 扩展以支持混合向量+关键词召回。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="memoryqdrant"><a class="header" href="#memoryqdrant"><code>memory.qdrant</code></a></h3>
+<p>Qdrant 向量数据库后端配置（<code>[memory.qdrant]</code> 部分）。</p>
+<p>当 <code>[memory].backend = "qdrant"</code> 时使用。如果未显式设置，URL、集合和 API 密钥将回退到环境变量（<code>QDRANT_URL</code>、<code>QDRANT_COLLECTION</code>、<code>QDRANT_API_KEY</code>）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key</code></td><td>任何</td><td><code>null</code></td><td>用于 Qdrant Cloud 或安全实例的可选 API 密钥。</td></tr>
+<tr><td><code>collection</code></td><td>字符串</td><td><code>"zeroclaw_memories"</code></td><td>用于存储记忆的 Qdrant 集合名称。</td></tr>
+<tr><td><code>url</code></td><td>任何</td><td><code>null</code></td><td>Qdrant 服务器 URL（例如 <code>"http://localhost:6333"</code>）。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="microsoft365"><a class="header" href="#microsoft365"><code>microsoft365</code></a></h2>
+<p>通过 Microsoft Graph API（<code>[microsoft365]</code> 部分）集成 Microsoft 365。</p>
+<p>提供对 Outlook 邮件、Teams 消息、日历事件、OneDrive 文件和 SharePoint 搜索的访问。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>auth_flow</code></td><td>字符串</td><td><code>"client_credentials"</code></td><td>认证流程：“client_credentials” 或 “device_code”</td></tr>
+<tr><td><code>client_id</code></td><td>任何</td><td><code>null</code></td><td>Azure AD 应用程序（客户端）ID</td></tr>
+<tr><td><code>client_secret</code> 🔑</td><td>任何</td><td><code>null</code></td><td>Azure AD 客户端密钥（当 secrets.encrypt = true 时以加密形式存储）</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 Microsoft 365 集成</td></tr>
+<tr><td><code>scopes</code></td><td>字符串数组</td><td><code>["https://graph.microsoft.com/.default"]</code></td><td>要请求的 OAuth 作用域</td></tr>
+<tr><td><code>tenant_id</code></td><td>任何</td><td><code>null</code></td><td>Azure AD 租户 ID</td></tr>
+<tr><td><code>token_cache_encrypted</code></td><td>布尔</td><td><code>true</code></td><td>加密磁盘上的令牌缓存文件</td></tr>
+<tr><td><code>user_id</code></td><td>任何</td><td><code>null</code></td><td>用户主体名称或“me”（用于委派流程）</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="多模态"><a class="header" href="#多模态"><code>多模态</code></a></h2>
+<p>多模态（图像）处理配置（<code>[multimodal]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allow_remote_fetch</code></td><td>布尔</td><td><code>false</code></td><td>允许获取远程图片 URL（http/https）。默认禁用。</td></tr>
+<tr><td><code>max_image_size_mb</code></td><td>整数</td><td><code>5</code></td><td>在进行 base64 编码之前，最大图像负载大小（以 MiB 为单位）。</td></tr>
+<tr><td><code>max_images</code></td><td>整数</td><td><code>4</code></td><td>每个请求允许的最大图片附件数量。</td></tr>
+<tr><td><code>vision_model</code></td><td>任何</td><td><code>null</code></td><td>用于路由到视觉提供者的模型（例如 <code>"llava:7b"</code>）。</td></tr>
+<tr><td><code>vision_provider</code></td><td>任何</td><td><code>null</code></td><td>用于视觉/图像消息的提供商名称（例如 <code>"ollama"</code>）。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="node_transport"><a class="header" href="#node_transport"><code>node_transport</code></a></h2>
+<p>节点间通信的安全传输配置（<code>[node_transport]</code>）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_peers</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许特定的节点 IP/CIDR。</td></tr>
+<tr><td><code>connection_pool_size</code></td><td>整数</td><td><code>4</code></td><td>每个对等节点的最大连接数。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>true</code></td><td>启用安全传输层。</td></tr>
+<tr><td><code>max_request_age_secs</code></td><td>整数</td><td><code>300</code></td><td>签名请求的最大有效期（秒）（防重放保护）。</td></tr>
+<tr><td><code>mutual_tls</code></td><td>布尔</td><td><code>false</code></td><td>要求客户端证书（双向 TLS）。</td></tr>
+<tr><td><code>require_https</code></td><td>布尔</td><td><code>true</code></td><td>要求所有节点通信使用 HTTPS。</td></tr>
+<tr><td><code>shared_secret</code></td><td>字符串</td><td><code>""</code></td><td>节点间 HMAC 认证使用的共享密钥。</td></tr>
+<tr><td><code>tls_cert_path</code></td><td>任何</td><td><code>null</code></td><td>TLS 证书文件的路径。</td></tr>
+<tr><td><code>tls_key_path</code></td><td>任何</td><td><code>null</code></td><td>TLS 私钥文件的路径。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="节点"><a class="header" href="#节点"><code>节点</code></a></h2>
+<p>动态节点发现系统的配置（<code>[nodes]</code>）。</p>
+<p>启用后，外部进程/设备可以通过 WebSocket 连接到 <code>/ws/nodes</code>，并在运行时声明其功能。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>auth_token</code></td><td>任何</td><td><code>null</code></td><td>用于节点身份验证的可选承载令牌。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用动态节点发现端点。</td></tr>
+<tr><td><code>max_nodes</code></td><td>整数</td><td><code>16</code></td><td>最大并发节点连接数。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="notion"><a class="header" href="#notion"><code>notion</code></a></h2>
+<p>Notion 集成配置（<code>[notion]</code>）。</p>
+<p>当 <code>enabled = true</code> 时，代理会轮询 Notion 数据库以查找待处理的任务，并暴露一个 <code>notion</code> 工具，用于查询、读取、创建和更新页面。需要提供 <code>api_key</code>（或 <code>NOTION_API_KEY</code> 环境变量）和 <code>database_id</code>。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key</code> 🔑</td><td>字符串</td><td><code>""</code></td><td></td></tr>
+<tr><td><code>database_id</code></td><td>字符串</td><td><code>""</code></td><td></td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td></td></tr>
+<tr><td><code>input_property</code></td><td>字符串</td><td><code>"输入"</code></td><td></td></tr>
+<tr><td><code>max_concurrent</code></td><td>整数</td><td><code>4</code></td><td></td></tr>
+<tr><td><code>poll_interval_secs</code></td><td>整数</td><td><code>5</code></td><td></td></tr>
+<tr><td><code>recover_stale</code></td><td>布尔</td><td><code>true</code></td><td></td></tr>
+<tr><td><code>result_property</code></td><td>字符串</td><td><code>"结果"</code></td><td></td></tr>
+<tr><td><code>status_property</code></td><td>字符串</td><td><code>"状态"</code></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="可观测性"><a class="header" href="#可观测性">可观测性</a></h2>
+<p>可观测性后端配置（<code>[observability]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>后端</code>*</td><td>字符串</td><td>—</td><td>“none” | “log” | “verbose” | “prometheus” | “otel”</td></tr>
+<tr><td><code>otel_endpoint</code></td><td>任何</td><td><code>null</code></td><td>OTLP 端点（例如 <code>"http://localhost:4318"</code>）。仅在 <code>backend = "otel"</code> 时使用。</td></tr>
+<tr><td><code>otel_headers</code></td><td>任何</td><td><code>null</code></td><td>随每个 OTLP 导出请求发送的可选 HTTP 头（例如授权头）。</td></tr>
+<tr><td><code>otel_service_name</code></td><td>任何</td><td><code>null</code></td><td>报告给 OTel collector 的服务名称。默认为 “zeroclaw”。</td></tr>
+<tr><td><code>runtime_trace_max_entries</code></td><td>整数</td><td><code>200</code></td><td>当 <code>runtime_trace_mode = "rolling"</code> 时保留的最大条目数。</td></tr>
+<tr><td><code>runtime_trace_mode</code></td><td>字符串</td><td><code>"none"</code></td><td>运行时跟踪存储模式：“none” | “rolling” | “full”。</td></tr>
+<tr><td><code>runtime_trace_path</code></td><td>字符串</td><td><code>"state/runtime-trace.jsonl"</code></td><td>运行时跟踪文件路径。相对路径将在 <code>workspace_dir</code> 下解析。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="onboard_state"><a class="header" href="#onboard_state"><code>onboard_state</code></a></h2>
+<p>多客户端工作区隔离配置。</p>
+<p>When enabled, each client engagement gets an isolated workspace with separate memory, audit, secrets, and tool restrictions. Opaque state the <code>zeroclaw onboard</code> flow writes so it can tell, on a re-run, which sections the user has already walked through at least once — which lets it offer “Reconfigure? [y/N]” skip gates instead of forcing users through every field again.</p>
+<p>This is meta-state about the onboard process, not user-facing config.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>completed_sections</code></td><td>字符串数组</td><td><code>[]</code></td><td>Section keys the user has completed at least once via onboard.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="opencode_cli"><a class="header" href="#opencode_cli"><code>opencode_cli</code></a></h2>
+<p>OpenCode CLI 工具配置（<code>[opencode_cli]</code> 部分）。</p>
+<p>将编码任务委托给 <code>opencode run</code> CLI。默认情况下，身份验证使用二进制文件自身的会话——除非 <code>env_passthrough</code> 包含特定于提供者的密钥，否则无需 API 密钥。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 <code>opencode_cli</code> 工具</td></tr>
+<tr><td><code>env_passthrough</code></td><td>字符串数组</td><td><code>[]</code></td><td>传递给 opencode 子进程的其他环境变量</td></tr>
+<tr><td><code>max_output_bytes</code></td><td>整数</td><td><code>2097152</code></td><td>最大输出大小（以字节为单位，默认值为 2MB）</td></tr>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>600</code></td><td>最大执行时间（秒）（编码任务可能耗时较长）</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="pacing"><a class="header" href="#pacing"><code>pacing</code></a></h2>
+<p>用于慢速/本地 LLM 工作负载的速率控制（<code>[pacing]</code> 部分）。</p>
+<p>所有字段均为可选，默认值会保留现有行为。设置这些字段时，它们会扩展——而非替换——现有的超时和环路检测子系统。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>loop_detection_enabled</code></td><td>布尔</td><td><code>true</code></td><td>启用基于模式的循环检测（精确重复、乒乓、</td></tr>
+<tr><td><code>loop_detection_max_repeats</code></td><td>整数</td><td><code>3</code></td><td>在首次出现之前，连续相同的工具+参数调用次数</td></tr>
+<tr><td><code>loop_detection_min_elapsed_secs</code></td><td>任何</td><td><code>null</code></td><td>激活循环检测前经过的最小秒数。</td></tr>
+<tr><td><code>loop_detection_window_size</code></td><td>整数</td><td><code>20</code></td><td>基于模式的循环检测器的滑动窗口大小。</td></tr>
+<tr><td><code>loop_ignore_tools</code></td><td>字符串数组</td><td><code>[]</code></td><td>从相同输出/交替模式循环中排除的工具名称</td></tr>
+<tr><td><code>message_timeout_scale_max</code></td><td>任何</td><td><code>null</code></td><td>覆盖硬编码的超时缩放上限（默认值：4）。</td></tr>
+<tr><td><code>step_timeout_secs</code></td><td>任何</td><td><code>null</code></td><td>每步超时时间（秒）：允许单个步骤执行的最大时间</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="外围设备"><a class="header" href="#外围设备">外围设备</a></h2>
+<p>外围板集成配置（<code>[peripherals]</code> 部分）。</p>
+<p>启用后，看板将成为智能体工具。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>boards</code></td><td>对象[]</td><td><code>[]</code></td><td>板级配置（nucleo-f401re、rpi-gpio 等）</td></tr>
+<tr><td><code>datasheet_dir</code></td><td>任何</td><td><code>null</code></td><td>用于 RAG 检索的数据集文档路径（相对于工作区）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用外围设备支持（板子成为代理工具）</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="pipeline"><a class="header" href="#pipeline"><code>pipeline</code></a></h2>
+<p>流水线工具配置（<code>[pipeline]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_tools</code></td><td>字符串数组</td><td><code>[]</code></td><td>流水线步骤中允许使用的工具。引用了不在该列表中的工具的步骤</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 <code>execute_pipeline</code> 元工具。</td></tr>
+<tr><td><code>max_steps</code></td><td>整数</td><td><code>20</code></td><td>单次管道调用中允许的最大步骤数。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="插件"><a class="header" href="#插件"><code>插件</code></a></h2>
+<p>插件系统配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>auto_discover</code></td><td>布尔</td><td><code>false</code></td><td>在启动时自动发现并加载插件</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用插件系统（默认：false）</td></tr>
+<tr><td><code>max_plugins</code></td><td>整数</td><td><code>50</code></td><td>可加载的最大插件数量</td></tr>
+<tr><td><code>plugins_dir</code></td><td>字符串</td><td><code>"/home/runner/.zeroclaw/plugins"</code></td><td>存储插件的目录</td></tr>
+<tr><td><code>security</code></td><td>对象</td><td>—</td><td>插件签名验证配置（<code>[plugins.security]</code>）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="pluginssecurity"><a class="header" href="#pluginssecurity"><code>plugins.security</code></a></h3>
+<p>插件签名验证配置（<code>[plugins.security]</code>）。</p>
+<p>控制插件清单的 Ed25519 签名验证。在 <code>strict</code>（严格）模式下，仅加载由受信任发布者密钥签名的插件。在 <code>permissive</code>（宽松）模式下，未签名或不受信任的插件会产生警告但仍会被加载。在 <code>disabled</code>（禁用）模式（默认值）下，不进行任何签名检查。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>signature_mode</code></td><td>字符串</td><td><code>"disabled"</code></td><td>签名强制执行模式：“disabled”（禁用）、“permissive”（宽松）或“strict”（严格）。</td></tr>
+<tr><td><code>trusted_publisher_keys</code></td><td>字符串数组</td><td><code>[]</code></td><td>受信任插件发布者的 Hex 编码 Ed25519 公钥。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="project_intel"><a class="header" href="#project_intel"><code>project_intel</code></a></h2>
+<p>项目交付智能配置（<code>[project_intel]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>default_language</code></td><td>字符串</td><td><code>"en"</code></td><td>默认报告语言（en、de、fr、it）。默认值为 “en”。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 project_intel 工具。默认值：false。</td></tr>
+<tr><td><code>include_git_data</code></td><td>布尔</td><td><code>true</code></td><td>在报告中包含 git log 数据。默认值：true。</td></tr>
+<tr><td><code>include_jira_data</code></td><td>布尔</td><td><code>false</code></td><td>在报告中包含 Jira 数据。默认值：false。</td></tr>
+<tr><td><code>jira_base_url</code></td><td>任何</td><td><code>null</code></td><td>Jira 实例的基础 URL（如果 include_jira_data 为 true，则为必填项）。</td></tr>
+<tr><td><code>report_output_dir</code></td><td>字符串</td><td><code>"/home/runner/.zeroclaw/project-reports"</code></td><td>生成报告的输出目录。</td></tr>
+<tr><td><code>风险敏感度</code></td><td>字符串</td><td><code>"medium"</code></td><td>风险检测灵敏度：低、中、高。默认值：“medium”。</td></tr>
+<tr><td><code>templates_dir</code></td><td>任何</td><td><code>null</code></td><td>可选的自定义模板目录。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="providers"><a class="header" href="#providers"><code>providers</code></a></h2>
+<p>顶层 <code>[providers]</code> 部分。用于封装模型提供商配置文件、路由规则以及可选的回退引用。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>embedding_routes</code></td><td>对象[]</td><td>—</td><td>嵌入路由规则 — 将 <code>hint:&lt;name&gt;</code> 路由到特定的 provider+model 组合。</td></tr>
+<tr><td><code>fallback</code></td><td>任何</td><td>—</td><td>当没有路由匹配时，要使用的提供程序条目的键。</td></tr>
+<tr><td><code>model_routes</code></td><td>对象[]</td><td>—</td><td>模型路由规则 — 将 <code>hint:&lt;name&gt;</code> 路由到特定的提供商+模型组合。</td></tr>
+<tr><td><code>models</code></td><td>映射</td><td>—</td><td>按 ID 键控的命名模型提供程序配置文件。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="代理"><a class="header" href="#代理"><code>代理</code></a></h2>
+<p>出站 HTTP/HTTPS/SOCKS5 流量的代理配置（<code>[proxy]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>all_proxy</code></td><td>任何</td><td><code>null</code></td><td>所有方案的备用代理 URL。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>为选定的作用域启用代理支持。</td></tr>
+<tr><td><code>http_proxy</code></td><td>任何</td><td><code>null</code></td><td>HTTP 请求的代理 URL（支持 http、https、socks5、socks5h）。</td></tr>
+<tr><td><code>https_proxy</code></td><td>任何</td><td><code>null</code></td><td>用于 HTTPS 请求的代理 URL（支持 http、https、socks5、socks5h）。</td></tr>
+<tr><td><code>no_proxy</code></td><td>字符串数组</td><td><code>[]</code></td><td>不代理绕过列表。格式与 NO_PROXY 相同。</td></tr>
+<tr><td><code>scope</code></td><td>任何</td><td>—</td><td>代理应用程序范围 — 确定哪些出站流量使用代理。</td></tr>
+<tr><td><code>services</code></td><td>字符串数组</td><td><code>[]</code></td><td>当 scope = “services” 时使用的服务选择器。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="query_classification"><a class="header" href="#query_classification"><code>query_classification</code></a></h2>
+<p>自动查询分类 — 通过关键词/模式对用户消息进行分类，并将其路由到相应的模型提示。默认情况下禁用。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用自动查询分类。默认值：<code>false</code>。</td></tr>
+<tr><td><code>规则</code></td><td>对象[]</td><td><code>[]</code></td><td>按优先级顺序评估的分类规则。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="可靠性"><a class="header" href="#可靠性"><code>可靠性</code></a></h2>
+<p>可靠性和监控配置（<code>[reliability]</code> 部分）。</p>
+<p>控制提供者的重试、回退链、API 密钥轮换以及通道重启退避。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_keys</code></td><td>字符串数组</td><td><code>[]</code></td><td>用于在速率限制（429）错误时进行轮询轮换的其他 API 密钥。</td></tr>
+<tr><td><code>channel_initial_backoff_secs</code></td><td>整数</td><td><code>2</code></td><td>通道/守护进程重启的初始退避时间。</td></tr>
+<tr><td><code>channel_max_backoff_secs</code></td><td>整数</td><td><code>60</code></td><td>通道/守护进程重启的最大退避时间。</td></tr>
+<tr><td><code>fallback_providers</code></td><td>字符串数组</td><td><code>[]</code></td><td>回退提供程序链（例如 <code>["anthropic", "openai"]</code>）。</td></tr>
+<tr><td><code>model_fallbacks</code></td><td>映射</td><td><code>{}</code></td><td>按模型的备用链。当某个模型失败时，按顺序尝试以下替代方案。</td></tr>
+<tr><td><code>provider_backoff_ms</code></td><td>整数</td><td><code>500</code></td><td>提供程序重试延迟的基础退避时间（毫秒）。</td></tr>
+<tr><td><code>provider_retries</code></td><td>整数</td><td><code>2</code></td><td>每个提供者的重试次数，达到上限后才会进行故障转移。</td></tr>
+<tr><td><code>scheduler_poll_secs</code></td><td>整数</td><td><code>15</code></td><td>调度器轮询间隔（秒）。</td></tr>
+<tr><td><code>scheduler_retries</code></td><td>整数</td><td><code>2</code></td><td>定时任务执行尝试的最大重试次数。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="运行时"><a class="header" href="#运行时"><code>运行时</code></a></h2>
+<p>运行时适配器配置（<code>[runtime]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docker</code></td><td>对象</td><td>—</td><td>Docker 运行时配置（<code>[runtime.docker]</code> 部分）。</td></tr>
+<tr><td><code>kind</code></td><td>字符串</td><td><code>"native"</code></td><td>运行时类型（<code>native</code> | <code>docker</code>）。</td></tr>
+<tr><td><code>reasoning_effort</code></td><td>任何</td><td><code>null</code></td><td>对于暴露了级别控制功能的提供程序，可选的推理努力。</td></tr>
+<tr><td><code>reasoning_enabled</code></td><td>任何</td><td><code>null</code></td><td>针对暴露显式控制功能的提供程序的全局推理覆盖。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="runtimedocker"><a class="header" href="#runtimedocker"><code>runtime.docker</code></a></h3>
+<p>Docker 运行时配置（<code>[runtime.docker]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_workspace_roots</code></td><td>字符串数组</td><td><code>[]</code></td><td>Docker 挂载验证的可选工作区根目录允许列表。</td></tr>
+<tr><td><code>cpu_limit</code></td><td>任何</td><td><code>1.0</code></td><td>可选的 CPU 限制（<code>None</code> = 无显式限制）。</td></tr>
+<tr><td><code>image</code></td><td>字符串</td><td><code>"alpine:3.20"</code></td><td>用于执行 shell 命令的运行时镜像。</td></tr>
+<tr><td><code>memory_limit_mb</code></td><td>任何</td><td><code>512</code></td><td>可选的内存限制（以 MB 为单位）（<code>None</code> = 无显式限制）。</td></tr>
+<tr><td><code>mount_workspace</code></td><td>布尔</td><td><code>true</code></td><td>将配置的工作区挂载到 <code>/workspace</code>。</td></tr>
+<tr><td><code>network</code></td><td>字符串</td><td><code>"none"</code></td><td>Docker 网络模式（<code>none</code>、<code>bridge</code> 等）。</td></tr>
+<tr><td><code>read_only_rootfs</code></td><td>布尔</td><td><code>true</code></td><td>以只读方式挂载根文件系统。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="scheduler"><a class="header" href="#scheduler"><code>scheduler</code></a></h2>
+<p>用于周期性任务执行的调度器配置（<code>[scheduler]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>true</code></td><td>启用内置调度器循环。</td></tr>
+<tr><td><code>max_concurrent</code></td><td>整数</td><td><code>4</code></td><td>每个调度器轮询周期执行的最大任务数。</td></tr>
+<tr><td><code>max_tasks</code></td><td>整数</td><td><code>64</code></td><td>持久化计划任务的最大数量。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="schema_version"><a class="header" href="#schema_version"><code>schema_version</code></a></h2>
+<p>配置文件模式版本。</p>
+<h2 id="secrets"><a class="header" href="#secrets"><code>secrets</code></a></h2>
+<p>加密配置（<code>[secrets]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>encrypt</code></td><td>布尔</td><td><code>true</code></td><td>在 <code>config.toml</code> 中为 API 密钥和令牌启用加密</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="security"><a class="header" href="#security"><code>security</code></a></h2>
+<p>用于沙箱隔离、资源限制和审计日志记录的安全配置</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>审计</code></td><td>对象</td><td>—</td><td>审计日志配置</td></tr>
+<tr><td><code>estop</code></td><td>映射</td><td>—</td><td>急停配置。</td></tr>
+<tr><td><code>nevis</code></td><td>映射</td><td>—</td><td>Nevis IAM 集成配置。</td></tr>
+<tr><td><code>otp</code></td><td>映射</td><td>—</td><td>安全 OTP 配置。</td></tr>
+<tr><td><code>资源</code></td><td>对象</td><td>—</td><td>命令执行的资源限制</td></tr>
+<tr><td>沙箱</td><td>对象</td><td>—</td><td>用于操作系统级隔离的沙箱配置</td></tr>
+<tr><td><code>webauthn</code></td><td>对象</td><td>—</td><td>WebAuthn / FIDO2 硬件密钥身份验证配置（<code>[security.webauthn]</code>）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="securityaudit"><a class="header" href="#securityaudit"><code>security.audit</code></a></h3>
+<p>审计日志配置</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>true</code></td><td>启用审计日志</td></tr>
+<tr><td><code>log_path</code></td><td>字符串</td><td><code>"audit.log"</code></td><td>审计日志文件的路径（相对于 zeroclaw 目录）</td></tr>
+<tr><td><code>max_size_mb</code></td><td>整数</td><td><code>100</code></td><td>日志文件在轮换前的最大大小（以 MB 为单位）</td></tr>
+<tr><td><code>sign_events</code></td><td>布尔</td><td><code>false</code></td><td>使用 HMAC 对事件进行签名，以提供篡改证据</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="securityestop"><a class="header" href="#securityestop"><code>security.estop</code></a></h3>
+<p>急停配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用紧急停止控制。</td></tr>
+<tr><td><code>require_otp_to_resume</code></td><td>布尔</td><td><code>true</code></td><td>在恢复操作之前，需要有效的 OTP。</td></tr>
+<tr><td><code>state_file</code></td><td>字符串</td><td><code>"/home/runner/.zeroclaw/estop-state.json"</code></td><td>用于持久化急停状态的文件路径。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="securitynevis"><a class="header" href="#securitynevis"><code>security.nevis</code></a></h3>
+<p>Nevis IAM 集成配置。</p>
+<p>当 <code>enabled</code> 为 true 时，ZeroClaw 会根据 Nevis Security Suite 实例验证传入的请求，并将 Nevis 角色映射到工具/工作区权限。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>client_id</code></td><td>字符串</td><td><code>""</code></td><td>在 Nevis 中注册的 OAuth2 客户端 ID。</td></tr>
+<tr><td><code>client_secret</code> 🔑</td><td>任何</td><td><code>null</code></td><td>OAuth2 客户端密钥。在磁盘上存储时通过 SecretStore 进行加密。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 Nevis IAM 集成。默认为 false，以保持向后兼容。</td></tr>
+<tr><td><code>instance_url</code></td><td>字符串</td><td><code>""</code></td><td>Nevis 实例的基础 URL（例如 <code>https://nevis.example.com</code>）。</td></tr>
+<tr><td><code>jwks_url</code></td><td>任何</td><td><code>null</code></td><td>用于本地令牌验证的 JWKS 端点 URL。</td></tr>
+<tr><td><code>realm</code></td><td>字符串</td><td><code>"master"</code></td><td>要验证的 Nevis 领域。</td></tr>
+<tr><td><code>require_mfa</code></td><td>布尔</td><td><code>false</code></td><td>要求对所有通过 Nevis 身份验证的请求进行 MFA 验证。</td></tr>
+<tr><td><code>role_mapping</code></td><td>映射[]</td><td><code>[]</code></td><td>Nevis 角色到 ZeroClaw 权限的映射。</td></tr>
+<tr><td><code>session_timeout_secs</code></td><td>整数</td><td><code>3600</code></td><td>会话超时时间（秒）。</td></tr>
+<tr><td><code>token_validation</code></td><td>字符串</td><td><code>"local"</code></td><td>令牌验证策略：<code>"local"</code>（JWKS）或 <code>"remote"</code>（令牌检查）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="securityotp"><a class="header" href="#securityotp"><code>security.otp</code></a></h3>
+<p>安全 OTP 配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cache_valid_secs</code></td><td>整数</td><td><code>300</code></td><td>重用窗口以保存最近验证的 OTP 代码。</td></tr>
+<tr><td><code>challenge_max_attempts</code></td><td>整数</td><td><code>3</code></td><td>在锁定之前，OTP 挑战尝试的最大次数。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 OTP 门控。默认情况下为禁用，以保持向后兼容性。</td></tr>
+<tr><td><code>gated_actions</code></td><td>字符串数组</td><td><code>["shell","file_write","browser_open","browser","memory_forget"]</code></td><td>受 OTP 限制的工具/操作名称。</td></tr>
+<tr><td><code>gated_domain_categories</code></td><td>字符串数组</td><td><code>[]</code></td><td>域类别预设已扩展为 <code>gated_domains</code>。</td></tr>
+<tr><td><code>gated_domains</code></td><td>字符串数组</td><td><code>[]</code></td><td>通过 OTP 限制的显式域模式。</td></tr>
+<tr><td><code>method</code></td><td>任何</td><td>—</td><td>OTP 验证策略。</td></tr>
+<tr><td><code>token_ttl_secs</code></td><td>整数</td><td><code>30</code></td><td>TOTP 时间步长（以秒为单位）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="securityresources"><a class="header" href="#securityresources"><code>security.resources</code></a></h3>
+<p>命令执行的资源限制</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_cpu_time_seconds</code></td><td>整数</td><td><code>60</code></td><td>每个命令的最大 CPU 时间（以秒为单位）</td></tr>
+<tr><td><code>max_memory_mb</code></td><td>整数</td><td><code>512</code></td><td>每个命令的最大内存（以 MB 为单位）</td></tr>
+<tr><td><code>max_subprocesses</code></td><td>整数</td><td><code>10</code></td><td>最大子进程数</td></tr>
+<tr><td><code>memory_monitoring</code></td><td>布尔</td><td><code>true</code></td><td>启用内存监控</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="securitysandbox"><a class="header" href="#securitysandbox"><code>security.sandbox</code></a></h3>
+<p>用于操作系统级隔离的沙箱配置</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>后端</code></td><td>任何</td><td>—</td><td>沙箱后端选择</td></tr>
+<tr><td><code>enabled</code></td><td>任何</td><td><code>null</code></td><td>启用沙盒机制（None = 自动检测，Some = 显式指定）</td></tr>
+<tr><td><code>firejail_args</code></td><td>字符串数组</td><td><code>[]</code></td><td>自定义 Firejail 参数（当后端 = firejail 时）</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="securitywebauthn"><a class="header" href="#securitywebauthn"><code>security.webauthn</code></a></h3>
+<p>WebAuthn / FIDO2 硬件密钥身份验证配置（<code>[security.webauthn]</code>）。</p>
+<p>启用通过硬件安全密钥（如 YubiKey、SoloKey 等）和平台身份验证器（如 Touch ID、Windows Hello）进行注册和身份验证。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 WebAuthn 认证。默认值：false。</td></tr>
+<tr><td><code>rp_id</code></td><td>字符串</td><td><code>"localhost"</code></td><td>依赖方 ID（域名，例如 “example.com”）。默认值：“localhost”。</td></tr>
+<tr><td><code>rp_name</code></td><td>字符串</td><td><code>"ZeroClaw"</code></td><td>依赖方显示名称。默认值：“ZeroClaw”。</td></tr>
+<tr><td><code>rp_origin</code></td><td>字符串</td><td><code>"http://localhost:42617"</code></td><td>依赖方来源 URL（例如 <code>"https://example.com"</code>）。默认值：<code>"http://localhost:42617"</code>。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="security_ops"><a class="header" href="#security_ops"><code>security_ops</code></a></h2>
+<p>托管式网络安全服务 (MCSS) 仪表板代理配置 (<code>[security_ops]</code>)。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>auto_triage</code></td><td>布尔</td><td><code>false</code></td><td>无需用户提示即可自动分类传入的警报。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用安全操作工具。</td></tr>
+<tr><td><code>max_auto_severity</code></td><td>字符串</td><td><code>"低"</code></td><td>可以自动修复而无需审批的最大严重性级别。</td></tr>
+<tr><td><code>playbooks_dir</code></td><td>字符串</td><td><code>"/home/runner/.zeroclaw/playbooks"</code></td><td>包含事件响应剧本定义（JSON）的目录。</td></tr>
+<tr><td><code>report_output_dir</code></td><td>字符串</td><td><code>"/home/runner/.zeroclaw/security-reports"</code></td><td>用于生成安全报告的目录。</td></tr>
+<tr><td><code>require_approval_for_actions</code></td><td>布尔</td><td><code>true</code></td><td>在执行 playbook 操作之前，需要人工审批。</td></tr>
+<tr><td><code>siem_integration</code></td><td>任何</td><td><code>null</code></td><td>可选的 SIEM Webhook URL，用于警报摄入。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="shell_tool"><a class="header" href="#shell_tool"><code>shell_tool</code></a></h2>
+<p>Shell 工具配置（<code>[shell_tool]</code> 部分）。</p>
+<p>控制 <code>shell</code> 执行工具的行为。主要的可调参数是 <code>timeout_secs</code> —— 单个 shell 命令在被终止前允许运行的最大墙钟时间。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>60</code></td><td>最大 shell 命令执行时间（秒）（默认值：60）。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="技能"><a class="header" href="#技能"><code>技能</code></a></h2>
+<p>技能加载配置（<code>[skills]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allow_scripts</code></td><td>布尔</td><td><code>false</code></td><td>允许技能中包含脚本类文件（<code>.sh</code>、<code>.bash</code>、<code>.ps1</code>、shebang shell 文件）。</td></tr>
+<tr><td><code>open_skills_dir</code></td><td>任何</td><td><code>null</code></td><td>可选的本地 open-skills 仓库路径。</td></tr>
+<tr><td><code>open_skills_enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用加载和同步社区开放技能仓库。</td></tr>
+<tr><td><code>prompt_injection_mode</code></td><td>任何</td><td>—</td><td>技能加载配置（<code>[skills]</code> 部分）。</td></tr>
+<tr><td><code>registry_url</code></td><td>任何</td><td><code>null</code></td><td>用于裸名安装的技能注册表仓库的 URL。</td></tr>
+<tr><td><code>skill_creation</code></td><td>对象</td><td>—</td><td>自主技能创建配置（<code>[skills.skill_creation]</code> 部分）。</td></tr>
+<tr><td><code>技能提升</code></td><td>对象</td><td>—</td><td>技能自我改进配置（<code>[skills.auto_improve]</code> 部分）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="skillsskill_creation"><a class="header" href="#skillsskill_creation"><code>skills.skill_creation</code></a></h3>
+<p>自主技能创建配置（<code>[skills.skill_creation]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>在成功完成多步骤任务后启用自动技能创建。</td></tr>
+<tr><td><code>max_skills</code></td><td>整数</td><td><code>500</code></td><td>保留的最大自动生成的技能数量。</td></tr>
+<tr><td><code>similarity_threshold</code></td><td>数字</td><td><code>0.85</code></td><td>用于去重的嵌入相似度阈值。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="skillsskill_improvement"><a class="header" href="#skillsskill_improvement"><code>skills.skill_improvement</code></a></h3>
+<p>技能自我改进配置（<code>[skills.auto_improve]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cooldown_secs</code></td><td>整数</td><td><code>3600</code></td><td>同一技能改进之间的最小间隔（以秒为单位）。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>true</code></td><td>在成功使用技能后启用自动技能提升。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="sop"><a class="header" href="#sop"><code>sop</code></a></h2>
+<p>标准操作程序引擎配置（<code>[sop]</code>）。</p>
+<p><code>default_execution_mode</code> 字段使用来自 <code>sop::types</code> 的 <code>SopExecutionMode</code> 类型（通过 <code>sop::SopExecutionMode</code> 重新导出）。为了避免循环模块引用，配置使用相同的枚举定义来存储它。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>approval_timeout_secs</code></td><td>整数</td><td><code>300</code></td><td>审批超时时间（秒）。当运行等待审批的时间超过</td></tr>
+<tr><td><code>default_execution_mode</code></td><td>字符串</td><td><code>"监督式"</code></td><td>对于省略 <code>execution_mode</code> 的 SOP，其默认执行模式。</td></tr>
+<tr><td><code>max_concurrent_total</code></td><td>整数</td><td><code>4</code></td><td>所有 SOP 的最大总并发运行次数。</td></tr>
+<tr><td><code>max_finished_runs</code></td><td>整数</td><td><code>100</code></td><td>保留在内存中用于状态查询的最大完成运行次数。</td></tr>
+<tr><td><code>sops_dir</code></td><td>任何</td><td><code>null</code></td><td>包含 SOP 定义的目录（带有 SOP.toml 和 SOP.md 的子目录）。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="存储"><a class="header" href="#存储"><code>存储</code></a></h2>
+<p>持久化存储配置（<code>[storage]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>provider</code></td><td>对象</td><td>—</td><td>存储提供程序配置部分的包装器。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="storageprovider"><a class="header" href="#storageprovider"><code>storage.provider</code></a></h3>
+<p>存储提供程序配置部分的包装器。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>config</code></td><td>对象</td><td>—</td><td>远程存储后端的存储提供程序后端配置。</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="storageproviderconfig"><a class="header" href="#storageproviderconfig"><code>storage.provider.config</code></a></h4>
+<p>远程存储后端的存储提供程序后端配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>connect_timeout_secs</code></td><td>任何</td><td><code>null</code></td><td>远程提供者的可选连接超时时间（以秒为单位）。</td></tr>
+<tr><td><code>db_url</code> 🔑</td><td>任何</td><td><code>null</code></td><td>远程提供者的连接 URL。</td></tr>
+<tr><td><code>provider</code></td><td>字符串</td><td><code>""</code></td><td>存储引擎键（例如 “sqlite”、“qdrant”）。</td></tr>
+<tr><td><code>schema</code></td><td>字符串</td><td><code>"public"</code></td><td>SQL 后端的数据库架构。</td></tr>
+<tr><td><code>table</code></td><td>字符串</td><td><code>"memories"</code></td><td>用于内存条目的表名。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="swarms"><a class="header" href="#swarms"><code>swarms</code></a></h2>
+<p>用于多智能体编排的集群配置。</p>
+<h2 id="text_browser"><a class="header" href="#text_browser"><code>text_browser</code></a></h2>
+<p>文本浏览器工具配置（<code>[text_browser]</code> 部分）。</p>
+<p>使用基于文本的浏览器（如 lynx、links、w3m）将网页渲染为纯文本。专为无图形浏览器的无头环境或 SSH 环境设计。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 <code>text_browser</code> 工具</td></tr>
+<tr><td><code>preferred_browser</code></td><td>任何</td><td><code>null</code></td><td>首选文本浏览器（“lynx”、“links”或“w3m”）。如果未设置，则自动检测。</td></tr>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>30</code></td><td>请求超时时间（秒，默认值：30）</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="转录"><a class="header" href="#转录"><code>转录</code></a></h2>
+<p>支持多提供商的语音转录配置。</p>
+<p>顶层的 <code>api_url</code>、<code>model</code> 和 <code>api_key</code> 字段保留，以与现有的基于 Groq 的配置保持向后兼容。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>用于转录请求的 API 密钥（Groq 提供商）。</td></tr>
+<tr><td><code>api_url</code></td><td>字符串</td><td><code>"https://api.groq.com/openai/v1/audio/transcriptions"</code></td><td>Whisper API 端点 URL（Groq 提供商）。</td></tr>
+<tr><td><code>assemblyai</code></td><td>对象</td><td>—</td><td>AssemblyAI STT 提供商配置（<code>[transcription.assemblyai]</code>）。</td></tr>
+<tr><td><code>deepgram</code></td><td>对象</td><td>—</td><td>Deepgram STT 提供商配置（<code>[transcription.deepgram]</code>）。</td></tr>
+<tr><td><code>default_provider</code></td><td>字符串</td><td><code>"groq"</code></td><td>默认 STT 提供商：“groq”、“openai”、“deepgram”、“assemblyai”、“google”。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>为支持该功能的频道启用语音转录。</td></tr>
+<tr><td><code>google</code></td><td>对象</td><td>—</td><td>Google Cloud Speech-to-Text 提供程序配置（<code>[transcription.google]</code>）。</td></tr>
+<tr><td><code>initial_prompt</code></td><td>任何</td><td><code>null</code></td><td>可选的初始提示，用于使转录偏向预期的词汇</td></tr>
+<tr><td><code>language</code></td><td>任何</td><td><code>null</code></td><td>Groq 提供者的可选语言提示（ISO-639-1，例如 “en”、“ru”）。</td></tr>
+<tr><td><code>local_whisper</code></td><td>对象</td><td>—</td><td>本地/自托管的 Whisper 兼容的 STT 端点（<code>[transcription.local_whisper]</code>）。</td></tr>
+<tr><td><code>max_duration_secs</code></td><td>整数</td><td><code>120</code></td><td>最大语音时长（以秒为单位），超过此长度的消息将被跳过。</td></tr>
+<tr><td><code>模型</code></td><td>字符串</td><td><code>"whisper-large-v3-turbo"</code></td><td>Whisper 模型名称（Groq 提供商）。</td></tr>
+<tr><td><code>openai</code></td><td>对象</td><td>—</td><td>OpenAI Whisper STT 提供程序配置（<code>[transcription.openai]</code>）。</td></tr>
+<tr><td><code>transcribe_non_ptt_audio</code></td><td>布尔</td><td><code>false</code></td><td>同时转录 WhatsApp 上的非 PTT（转发/普通）音频消息，</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="transcriptionassemblyai"><a class="header" href="#transcriptionassemblyai"><code>transcription.assemblyai</code></a></h3>
+<p>AssemblyAI STT 提供商配置（<code>[transcription.assemblyai]</code>）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>AssemblyAI API 密钥。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="transcriptiondeepgram"><a class="header" href="#transcriptiondeepgram"><code>transcription.deepgram</code></a></h3>
+<p>Deepgram STT 提供商配置（<code>[transcription.deepgram]</code>）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>Deepgram API 密钥。</td></tr>
+<tr><td><code>模型</code></td><td>字符串</td><td><code>"nova-2"</code></td><td>Deepgram 模型名称（默认值：“nova-2”）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="transcriptiongoogle"><a class="header" href="#transcriptiongoogle"><code>transcription.google</code></a></h3>
+<p>Google Cloud Speech-to-Text 提供程序配置（<code>[transcription.google]</code>）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>Google Cloud API 密钥。</td></tr>
+<tr><td><code>language_code</code></td><td>字符串</td><td><code>"zh-CN"</code></td><td>BCP-47 语言代码（默认值：“en-US”）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="transcriptionlocal_whisper"><a class="header" href="#transcriptionlocal_whisper"><code>transcription.local_whisper</code></a></h3>
+<p>本地/自托管的 Whisper 兼容的 STT 端点（<code>[transcription.local_whisper]</code>）。</p>
+<p>配置自托管的 STT 端点。可以是本地主机、私有网络主机或任何可访问的 URL。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>bearer_token</code> 🔑</td><td>任何</td><td><code>null</code></td><td>用于端点身份验证的 Bearer 令牌。</td></tr>
+<tr><td><code>max_audio_bytes</code></td><td>整数</td><td><code>26214400</code></td><td>此端点接受的最大音频文件大小（以字节为单位）。</td></tr>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>300</code></td><td>请求超时时间（秒）。默认值为 300（适用于本地 GPU 上的大文件）。</td></tr>
+<tr><td><code>url</code>*</td><td>字符串</td><td>—</td><td>HTTP 或 HTTPS 端点 URL，例如 <code>"http://10.10.0.1:8001/v1/transcribe"</code>。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="transcriptionopenai"><a class="header" href="#transcriptionopenai"><code>transcription.openai</code></a></h3>
+<p>OpenAI Whisper STT 提供程序配置（<code>[transcription.openai]</code>）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>用于 Whisper 转录的 OpenAI API 密钥。</td></tr>
+<tr><td><code>模型</code></td><td>字符串</td><td><code>"whisper-1"</code></td><td>Whisper 模型名称（默认值：“whisper-1”）。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="信任"><a class="header" href="#信任">信任</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>correction_penalty</code></td><td>数字</td><td><code>0.05</code></td><td></td></tr>
+<tr><td><code>decay_half_life_days</code></td><td>数字</td><td><code>30.0</code></td><td></td></tr>
+<tr><td><code>initial_score</code></td><td>数字</td><td><code>0.8</code></td><td></td></tr>
+<tr><td><code>regression_threshold</code></td><td>数字</td><td><code>0.5</code></td><td></td></tr>
+<tr><td><code>success_boost</code></td><td>数字</td><td><code>0.01</code></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="tts"><a class="header" href="#tts"><code>tts</code></a></h2>
+<p>文本转语音配置（<code>[tts]</code>）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>默认格式</code></td><td>字符串</td><td><code>"mp3"</code></td><td>默认音频输出格式（<code>"mp3"</code>、<code>"opus"</code>、<code>"wav"</code>）。</td></tr>
+<tr><td><code>default_provider</code></td><td>字符串</td><td><code>"openai"</code></td><td>默认 TTS 提供商（<code>"openai"</code>、<code>"elevenlabs"</code>、<code>"google"</code>、<code>"edge"</code>）。</td></tr>
+<tr><td><code>default_voice</code></td><td>字符串</td><td><code>"alloy"</code></td><td>传递给所选提供者的默认语音 ID。</td></tr>
+<tr><td><code>edge</code></td><td>对象</td><td>—</td><td>Edge TTS 提供程序配置（免费，基于子进程）。</td></tr>
+<tr><td><code>elevenlabs</code></td><td>对象</td><td>—</td><td>ElevenLabs TTS 提供商配置。</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 TTS 合成。</td></tr>
+<tr><td><code>google</code></td><td>对象</td><td>—</td><td>Google Cloud TTS 提供程序配置。</td></tr>
+<tr><td><code>max_text_length</code></td><td>整数</td><td><code>4096</code></td><td>最大输入文本长度（字符数，默认值为 4096）。</td></tr>
+<tr><td><code>openai</code></td><td>对象</td><td>—</td><td>OpenAI TTS 提供商配置。</td></tr>
+<tr><td><code>piper</code></td><td>对象</td><td>—</td><td>Piper TTS 提供商配置（本地 GPU 加速，OpenAI 兼容端点）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="ttsedge"><a class="header" href="#ttsedge"><code>tts.edge</code></a></h3>
+<p>Edge TTS 提供程序配置（免费，基于子进程）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>binary_path</code></td><td>字符串</td><td><code>"edge-tts"</code></td><td><code>edge-tts</code> 二进制文件的路径（默认值为 <code>"edge-tts"</code>）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="ttselevenlabs"><a class="header" href="#ttselevenlabs"><code>tts.elevenlabs</code></a></h3>
+<p>ElevenLabs TTS 提供商配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>ElevenLabs 的 API 密钥。</td></tr>
+<tr><td><code>model_id</code></td><td>字符串</td><td><code>"eleven_monolingual_v1"</code></td><td>模型 ID（默认值为 <code>"eleven_monolingual_v1"</code>）。</td></tr>
+<tr><td><code>similarity_boost</code></td><td>数字</td><td><code>0.5</code></td><td>相似度提升（0.0-1.0，默认值为 <code>0.5</code>）。</td></tr>
+<tr><td><code>稳定性</code></td><td>数字</td><td><code>0.5</code></td><td>语音稳定性（0.0-1.0，默认值为 <code>0.5</code>）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="ttsgoogle"><a class="header" href="#ttsgoogle"><code>tts.google</code></a></h3>
+<p>Google Cloud TTS 提供程序配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>Google Cloud TTS 的 API 密钥。</td></tr>
+<tr><td><code>language_code</code></td><td>字符串</td><td><code>"zh-CN"</code></td><td>语言代码（默认值为 <code>"en-US"</code>）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="ttsopenai"><a class="header" href="#ttsopenai"><code>tts.openai</code></a></h3>
+<p>OpenAI TTS 提供商配置。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>OpenAI TTS 的 API 密钥。</td></tr>
+<tr><td><code>模型</code></td><td>字符串</td><td><code>"tts-1"</code></td><td>模型名称（默认值为 <code>"tts-1"</code>）。</td></tr>
+<tr><td><code>速度</code></td><td>数字</td><td><code>1.0</code></td><td>播放速度乘数（默认值为 <code>1.0</code>）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="ttspiper"><a class="header" href="#ttspiper"><code>tts.piper</code></a></h3>
+<p>Piper TTS 提供商配置（本地 GPU 加速，OpenAI 兼容端点）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_url</code></td><td>字符串</td><td><code>"http://127.0.0.1:5000/v1/audio/speech"</code></td><td>Piper TTS HTTP 服务器的基础 URL（例如 <code>"http://127.0.0.1:5000/v1/audio/speech"</code>）。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="隧道"><a class="header" href="#隧道">隧道</a></h2>
+<p>用于将网关公开暴露的隧道配置（<code>[tunnel]</code> 部分）。</p>
+<p>支持的提供程序：<code>"none"</code>（默认）、<code>"cloudflare"</code>、<code>"tailscale"</code>、<code>"ngrok"</code>、<code>"openvpn"</code>、<code>"pinggy"</code>、<code>"custom"</code>。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cloudflare</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>custom</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>ngrok</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>openvpn</code></td><td>对象</td><td>—</td><td>OpenVPN 隧道配置（<code>[tunnel.openvpn]</code>）。</td></tr>
+<tr><td><code>pinggy</code></td><td>对象</td><td>—</td><td></td></tr>
+<tr><td><code>provider</code>*</td><td>字符串</td><td>—</td><td>How the gateway gets exposed to the public internet so webhooks (Telegram, Slack, etc.) can reach it. <code>none</code> = keep it local, no tunnel; <code>cloudflare</code> = Cloudflare Tunnel via cloudflared (needs a Zero Trust account and token); <code>tailscale</code> = Tailscale Funnel/Serve (tailnet-only or public, no account beyond tailscale); <code>ngrok</code> = ngrok agent with auth token; <code>openvpn</code> = bring-your-own OpenVPN egress; <code>pinggy</code> = Pinggy SSH tunnels (quick one-shot URLs); <code>custom</code> = run an arbitrary command you define under <code>[tunnel.custom]</code>.</td></tr>
+<tr><td><code>tailscale</code></td><td>对象</td><td>—</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="tunnelcloudflare"><a class="header" href="#tunnelcloudflare"><code>tunnel.cloudflare</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>token</code> 🔑</td><td>字符串</td><td><code>""</code></td><td>Cloudflare Tunnel 令牌（来自 Zero Trust 仪表板）</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="tunnelcustom"><a class="header" href="#tunnelcustom"><code>tunnel.custom</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>health_url</code></td><td>任何</td><td><code>null</code></td><td>用于检查隧道健康状态的可选 URL</td></tr>
+<tr><td><code>start_command</code></td><td>字符串</td><td><code>""</code></td><td>用于启动隧道的命令模板。使用 {port} 和 {host} 占位符。</td></tr>
+<tr><td><code>url_pattern</code></td><td>任何</td><td><code>null</code></td><td>用于从命令标准输出中提取公共 URL 的可选正则表达式</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="tunnelngrok"><a class="header" href="#tunnelngrok"><code>tunnel.ngrok</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>auth_token</code> 🔑</td><td>字符串</td><td><code>""</code></td><td>ngrok 认证令牌</td></tr>
+<tr><td><code>domain</code></td><td>任何</td><td><code>null</code></td><td>可选的自定义域名</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="tunnelopenvpn"><a class="header" href="#tunnelopenvpn"><code>tunnel.openvpn</code></a></h3>
+<p>OpenVPN 隧道配置（<code>[tunnel.openvpn]</code>）。</p>
+<p>当 <code>tunnel.provider = "openvpn"</code> 时此项为必填。完全省略此部分将保留之前的行为。设置 <code>tunnel.provider = "none"</code>（或删除 <code>[tunnel.openvpn]</code> 块）将干净地回退到无隧道模式。</p>
+<p>默认值：<code>connect_timeout_secs = 30</code>。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>advertise_address</code></td><td>任何</td><td><code>null</code></td><td>VPN 连接后显示的地址（例如 <code>"10.8.0.2:42617"</code>）。</td></tr>
+<tr><td><code>auth_file</code></td><td>任何</td><td><code>null</code></td><td>可选的认证凭据文件路径（<code>--auth-user-pass</code>）。</td></tr>
+<tr><td><code>config_file</code>*</td><td>字符串</td><td>—</td><td><code>.ovpn</code> 配置文件的路径（不能为空）。</td></tr>
+<tr><td><code>connect_timeout_secs</code></td><td>整数</td><td><code>30</code></td><td>连接超时时间（秒）（默认值：30，必须大于 0）。</td></tr>
+<tr><td><code>extra_args</code></td><td>字符串数组</td><td><code>[]</code></td><td>额外 OpenVPN CLI 参数原样转发。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="tunnelpinggy"><a class="header" href="#tunnelpinggy"><code>tunnel.pinggy</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>region</code></td><td>任何</td><td><code>null</code></td><td>服务器区域：<code>"us"</code>（美国）、<code>"eu"</code>（欧洲）、<code>"ap"</code>（亚洲）、<code>"br"</code>（南美洲）、<code>"au"</code>（澳大利亚），或省略以自动选择。</td></tr>
+<tr><td><code>token</code> 🔑</td><td>任何</td><td><code>null</code></td><td>Pinggy 访问令牌（可选 — 免费套餐无需令牌即可使用）。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="tunneltailscale"><a class="header" href="#tunneltailscale"><code>tunnel.tailscale</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td>漏斗</td><td>布尔</td><td><code>false</code></td><td>使用 Tailscale Funnel（公共互联网）与 Serve（仅限 Tailnet）</td></tr>
+<tr><td><code>hostname</code></td><td>任何</td><td><code>null</code></td><td>可选的主机名覆盖</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="verifiable_intent"><a class="header" href="#verifiable_intent"><code>verifiable_intent</code></a></h2>
+<p>可验证意图（VI）凭证的验证与签发（<code>[verifiable_intent]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>在 commerce 工具调用中启用 VI 凭据验证（默认值：false）。</td></tr>
+<tr><td><code>严格性</code></td><td>字符串</td><td><code>"strict"</code></td><td>约束评估的严格模式：“strict”（在未知时失败关闭）</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="web_fetch"><a class="header" href="#web_fetch"><code>web_fetch</code></a></h2>
+<p>Web 获取工具配置（<code>[web_fetch]</code> 部分）。</p>
+<p>抓取网页并将 HTML 转换为纯文本，以便 LLM 使用。域名过滤：<code>allowed_domains</code> 控制哪些主机可以访问（使用 <code>["*"]</code> 表示所有公共主机）。<code>blocked_domains</code> 的优先级高于 <code>allowed_domains</code>。如果 <code>allowed_domains</code> 为空，则拒绝所有请求（默认拒绝）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allowed_domains</code></td><td>字符串数组</td><td><code>["*"]</code></td><td>允许用于 Web 获取的域名（精确或子域名匹配；<code>["*"]</code> = 所有公共主机）</td></tr>
+<tr><td><code>allowed_private_hosts</code></td><td>字符串数组</td><td><code>[]</code></td><td>允许绕过 SSRF 保护的私有/内部主机（例如 <code>["192.168.1.10", "internal.local"]</code>）</td></tr>
+<tr><td><code>blocked_domains</code></td><td>字符串数组</td><td><code>[]</code></td><td>被阻止的域名（精确或子域名匹配；始终优先于允许的域名）</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 <code>web_fetch</code> 工具以获取网页内容</td></tr>
+<tr><td><code>firecrawl</code></td><td>对象</td><td>—</td><td>用于 JS 密集型网站和反爬虫网站的 Firecrawl 回退配置。</td></tr>
+<tr><td><code>max_response_size</code></td><td>整数</td><td><code>500000</code></td><td>最大响应大小（以字节为单位）（默认值：500KB，纯文本比原始 HTML 小得多）</td></tr>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>30</code></td><td>请求超时时间（秒，默认值：30）</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="web_fetchfirecrawl"><a class="header" href="#web_fetchfirecrawl"><code>web_fetch.firecrawl</code></a></h3>
+<p>用于 JS 密集型网站和反爬虫网站的 Firecrawl 回退配置。</p>
+<p>启用后，如果标准网页抓取失败（HTTP 错误、空响应体或响应体长度不足 100 个字符，表明可能是仅依赖 JavaScript 的页面），该工具将回退到使用 Firecrawl API 进行隐蔽内容提取。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api_key_env</code></td><td>字符串</td><td><code>"FIRECRAWL_API_KEY"</code></td><td>Firecrawl API 密钥的环境变量名称</td></tr>
+<tr><td><code>api_url</code></td><td>字符串</td><td><code>"https://api.firecrawl.dev/v1"</code></td><td>Firecrawl API 的基础 URL</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 Firecrawl 回退</td></tr>
+<tr><td><code>模式</code></td><td>任何</td><td>—</td><td>Firecrawl 回退模式：抓取单个页面或爬取链接页面。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="web_search"><a class="header" href="#web_search"><code>web_search</code></a></h2>
+<p>Web 搜索工具配置（<code>[web_search]</code> 部分）。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>brave_api_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>Brave 搜索 API 密钥（如果提供程序为 “brave” 则为必填项）</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>启用 <code>web_search_tool</code> 以进行网络搜索</td></tr>
+<tr><td><code>max_results</code></td><td>整数</td><td><code>5</code></td><td>每次搜索的最大结果数（1-10）</td></tr>
+<tr><td><code>provider</code></td><td>字符串</td><td><code>"duckduckgo"</code></td><td>Search provider: “duckduckgo” (free), “brave” (requires API key), “tavily” (requires API key), or “searxng” (self-hosted)</td></tr>
+<tr><td><code>searxng_instance_url</code></td><td>任何</td><td><code>null</code></td><td>SearXNG 实例 URL（当提供者为 <code>"searxng"</code> 时必需），例如 <code>"https://searx.example.com"</code>。</td></tr>
+<tr><td><code>tavily_api_key</code> 🔑</td><td>任何</td><td><code>null</code></td><td>Tavily Search API key (required if provider is “tavily”)</td></tr>
+<tr><td><code>timeout_secs</code></td><td>整数</td><td><code>15</code></td><td>请求超时时间（秒）</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="工作区"><a class="header" href="#工作区"><code>工作区</code></a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>类型</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>active_workspace</code></td><td>任何</td><td><code>null</code></td><td>Which workspace profile is currently active — picks the <code>&lt;workspaces_dir&gt;/&lt;name&gt;/</code> directory ZeroClaw reads from and writes to. Required when multi-workspace is enabled; ignored otherwise.</td></tr>
+<tr><td><code>跨工作区搜索</code></td><td>布尔</td><td><code>false</code></td><td>Let memory search span all workspaces instead of only the active one. Off by default — turning it on defeats the point of isolation and is only useful for global admin queries.</td></tr>
+<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>Turn on multi-workspace profiles — each named engagement gets its own memory, secrets, and audit directories so work for one client/project never bleeds into another. Leave off for single-workspace mode where everything lives under <code>~/.zeroclaw/workspace</code>.</td></tr>
+<tr><td><code>isolate_audit</code></td><td>布尔</td><td><code>true</code></td><td>Give each profile its own tool-call and channel-message audit trail, so you can hand off logs for a single engagement without exposing other work.</td></tr>
+<tr><td><code>isolate_memory</code></td><td>布尔</td><td><code>true</code></td><td>Give each profile its own <code>brain.db</code> so conversation history, notes, and memories from one engagement don’t leak into another. Turn off only if you want all profiles sharing a single memory store.</td></tr>
+<tr><td><code>isolate_secrets</code></td><td>布尔</td><td><code>true</code></td><td>Scope provider API keys, channel tokens, and other secrets to the active profile — so a key added while on <code>client-a</code> isn’t visible from <code>client-b</code>. Turn off only if you want all profiles sharing one secret namespace.</td></tr>
+<tr><td><code>workspaces_dir</code></td><td>字符串</td><td><code>"/home/runner/.zeroclaw/workspaces"</code></td><td>Parent directory holding all workspace profiles, one subdirectory per profile. Override to keep profiles on a separate disk or inside an encrypted volume.</td></tr>
+</tbody>
+</table>
+</div>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../reference/cli.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../api.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../reference/cli.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../api.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

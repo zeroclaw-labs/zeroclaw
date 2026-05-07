@@ -1,0 +1,1084 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>有意架构 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-53bbdbb2.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-088a9fdb.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/foundations/fnd-001-intentional-architecture.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="fnd-001有意架构--zeroclaw-微内核过渡"><a class="header" href="#fnd-001有意架构--zeroclaw-微内核过渡">FND-001：有意架构 — ZeroClaw 微内核过渡</a></h1>
+<h3 id="从-v070-开始--类型架构--修订版-3"><a class="header" href="#从-v070-开始--类型架构--修订版-3">从 v0.7.0 开始 · 类型：架构 · 修订版 3</a></h3>
+<blockquote>
+<p><strong>规范参考</strong> · 团队已批准 · 修订版 3 讨论线程及完整修订历史：<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5574">#5574</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>在你们阅读此内容之前，给团队的一条提示。</strong></p>
+<p>本文档旨在帮助我们从被动增长的代码库转向有意识构建的代码库。如果其中的一些概念对你来说还很陌生，这并非问题——这说明本文档正在发挥作用。你未来遇到的每一位资深工程师都曾通过痛苦的经历（在变得过于庞大而难以理解的代码库中）学到了这些教训。我们拥有难得的机会，可以在问题变得棘手之前尽早识别模式并加以纠正。这是一件好事。请慢慢阅读。</p>
+</blockquote>
+<hr>
+<h2 id="目录"><a class="header" href="#目录">目录</a></h2>
+<ol>
+<li><a href="#1-a-development-philosophy-vision-first">开发理念：愿景优先</a></li>
+<li><a href="#2-the-vision--what-zeroclaw-is">愿景——ZeroClaw 是什么</a></li>
+<li><a href="#3-honest-assessment-where-we-are-today">诚实评估：我们目前的状况</a></li>
+<li><a href="#4-the-target-architecture">目标架构</a>
+<ul>
+<li><a href="#441-versioning-policy">4.4.1 版本控制策略</a></li>
+<li><a href="#442-release-artifacts">4.4.2 发布制品</a></li>
+</ul>
+</li>
+<li><a href="#5-standards-we-should-adopt">我们应采用的标准</a></li>
+<li><a href="#6-phased-roadmap-v070--v100">分阶段路线图：v0.7.0 → v1.0.0</a></li>
+<li><a href="#7-code-and-complexity-metrics">代码和复杂度指标</a></li>
+<li><a href="#8-这对贡献者的影响">这对贡献者的影响</a></li>
+</ol>
+<hr>
+<h2 id="修订历史"><a class="header" href="#修订历史">修订历史</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>修订</th><th>日期</th><th>摘要</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>2026年4月9日</td><td>初始草稿</td></tr>
+<tr><td>2</td><td>2026年4月9日</td><td>新增 §4.4.1 版本策略（统一工作区继承、稳定性层级、产品级破坏性变更定义）；新增 §4.4.2 发布制品（特性标志的命运、标准发布二进制文件配置、发布制品矩阵）；新增关于版本策略和可观测性默认值的讨论问题</td></tr>
+<tr><td>3</td><td>2026-04-10</td><td>根据 PR #5559 的实施反馈进行术语修正：在代理编排层中，将“kernel”统一改为“runtime”；“kernel”现在特指不可简化的基础层（<code>--no-default-features</code> 构建）；§4.1 更新为描述明确的两层架构（基础层 + 运行时）；§4.2–§4.3 的依赖图和组件映射已更新，以显示 <code>zeroclaw-runtime</code>；Phase 2 从“The Kernel”重命名为“The Runtime”；二进制大小目标被重新定义为具有衡量进展跟踪的愿景性北极星指标，而非硬性门槛；§7 更新为包含实际的 Phase 1 测量结果（6.6 MB 基础层构建），并明确指出架构分解有助于优化，但优化是独立的第二轮工作。</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="1-开发理念愿景优先"><a class="header" href="#1-开发理念愿景优先">1. 开发理念：愿景优先</a></h2>
+<p>我们在软件中做出的每一个决策——构建什么、如何构建、跳过什么——都应源自一个意图层级结构：</p>
+<pre><code>Vision
+  └── Architecture
+        └── Design
+              └── Implementation
+                    └── Testing
+                          └── Documentation
+                                └── Release
+</code></pre>
+<p>这不是瀑布式流程，而是一个<strong>决策层级</strong>。这意味着在编写函数时，你应该能够向上追溯一条清晰的链路：这个函数之所以存在，是因为某个设计决策；该设计决策之所以存在，是因为某个架构选择；而该架构选择之所以存在，是因为某种愿景。如果你无法画出这条链路，那么这段代码可能就不应该存在。</p>
+<p><strong>各层在实际中的含义：</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>层</th><th>它回答的问题</th><th>如果没有它，会发生什么问题</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>愿景</strong></td><td><em>为什么会有这个项目？它面向谁？成功的标准是什么？</em></td><td>你构建的东西没人需要，或者在不同版本之间自相矛盾。</td></tr>
+<tr><td><strong>架构</strong></td><td>哪些结构决策使这一愿景成为可能？</td><td>最终你会得到一个“大泥球”——代码可以运行，但无法在不破坏其他部分的情况下进行修改。</td></tr>
+<tr><td><strong>设计</strong></td><td><em>组件之间是如何关联的？它们之间的接口是什么？</em></td><td>你得到了紧耦合——组件之间对彼此内部的了解过多。</td></tr>
+<tr><td><strong>实现</strong></td><td><em>如何构建这个特定组件？</em></td><td>Bug、性能问题、安全漏洞</td></tr>
+<tr><td><strong>测试</strong></td><td><em>实现是否符合设计？设计是否服务于架构？</em></td><td>你发布了有问题的东西，但不知道为什么</td></tr>
+<tr><td><strong>文档</strong></td><td><em>我们如何将这一知识传递给下一个人？</em></td><td>每位贡献者都必须从头开始重新发现一切</td></tr>
+<tr><td><strong>发布</strong></td><td>我们如何安全且可持续地将此功能带给用户？</td><td>用户会遇到损坏或令人困惑的软件</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="跳过顶部的弊端"><a class="header" href="#跳过顶部的弊端">跳过顶部的弊端</a></h3>
+<p>ZeroClaw 由 AI 工具基于 OpenClaw 的 TypeScript 代码库引导生成。AI 代码生成工作在<strong>实现</strong>层进行。它编写执行具体功能的函数、结构体和模块。它不设定愿景，不做架构决策，也不定义设计契约。</p>
+<p>结果是一个功能强大但架构上偶然形成的代码库。代码在今天能够完成它需要完成的任务，但它并不是经过设计的——而是逐渐积累而成的。这种模式在我们的行业中有一个名字：<strong>大泥球（Big Ball of Mud）</strong>。它是软件中最常见的架构，不是因为有人选择了它，而是因为你跳过了层次结构的上层时得到的结果。</p>
+<p>这份 RFC 是我们修复这一问题的机会——不是通过抛弃现有的有效方案，而是通过采用<strong>绞杀榕模式</strong>（Strangler Fig Pattern）在其周围构建有意的架构：我们在旧架构的边缘构建新结构，并随时间逐步迁移，直到旧结构完全消失。没有“大爆炸”式的重写，也没有抛弃现有代码。只有稳步、有意的改进。</p>
+<hr>
+<h2 id="2-愿景zeroclaw-是什么"><a class="header" href="#2-愿景zeroclaw-是什么">2. 愿景——ZeroClaw 是什么</a></h2>
+<p>在讨论架构之前，我们需要明确我们正在构建的内容。这就是愿景层（Vision layer）。后续的所有内容都必须服务于这一目标。</p>
+<blockquote>
+<p><strong>ZeroClaw 是一个个人 AI 助手运行时，任何人都可以在任何硬件上运行它——从 10 美元的嵌入式开发板到云服务器——无需任何配置开销，无需依赖外部服务，且在能力和安全性方面毫无妥协。</strong></p>
+</blockquote>
+<p>将其分解为具体的承诺：</p>
+<p><strong>零开销。</strong> 核心代理在毫秒级启动，并且占用的内存比一个浏览器标签页还要少。这并非营销宣传，而是架构约束。我们做出的每一个决策都必须在此约束下进行测试。</p>
+<p><strong>零外部依赖。</strong> 下载 ZeroClaw 并配置好 LLM 提供商的用户，无需安装任何其他内容即可拥有一个可用且实用的 AI 助手。频道、仪表板和集成是按需添加的功能，而非使用前的必要前提。</p>
+<p><strong>零妥协。</strong> Lean 并不意味着弱。ZeroClaw 必须具备严谨的安全模型、真实的可观测性以及真正的可扩展性。通过组合来解决“小二进制文件”与“完整功能”之间的张力：一个小型核心，通过你选择的组件进行扩展。</p>
+<p><strong>适用于所有技能水平。</strong> 无论是使用 10 美元的 Raspberry Pi 的学生，还是负责生产部署的团队，都应感受到 ZeroClaw 是专为他们设计的。这意味着默认体验必须简洁，而高级体验必须强大——而不是两个不同的产品。</p>
+<p><strong>用户自有。</strong> 您的数据、您的硬件、您的配置。ZeroClaw 不需要账户，不会向外部发送数据，也不会将您锁定在某个平台上。</p>
+<hr>
+<h2 id="3-诚实评估我们目前的状况"><a class="header" href="#3-诚实评估我们目前的状况">3. 诚实评估：我们目前的状况</a></h2>
+<p>本节并非对任何人的工作进行批评。这是一次诊断，而你不指出问题所在，就无法解决问题。</p>
+<h3 id="31-结构问题"><a class="header" href="#31-结构问题">3.1 结构问题</a></h3>
+<p>整个 ZeroClaw 代码库目前都位于一个 Rust crate 中。这意味着：</p>
+<ul>
+<li>无论你是否使用 Telegram，Telegram 频道和核心代理循环都从同一个源代码树中编译</li>
+<li>Web 仪表板（一个完整的 React 应用程序）通过 <code>rust-embed</code> 嵌入到二进制文件中，使得每个二进制文件都包含 Web UI，即使对于仅使用 CLI 的用户也是如此。</li>
+<li>网关 HTTP 服务器包含用于 WhatsApp、WATI、Linq、Nextcloud Talk 和 Gmail 的 webhook 处理程序——这意味着特定的通道集成已内置到 Web 服务器中。</li>
+<li>所有 70 多个工具都被编译到二进制文件中，无论用户是否会调用这些工具。</li>
+<li>排除代码的唯一机制是 Cargo 特性标志，这要求用户具备 Rust 开发环境并从源代码重新编译。</li>
+</ul>
+<p><strong>对用户的后果：</strong> 其宣称的目标是为 10 美元硬件打造精简的二进制文件。但该二进制文件包含了 27 个消息通道的代码、70 多个工具、完整的 Web 服务器、React 应用程序，以及与 Jira、Notion、Google Workspace、LinkedIn 等的集成——其中大多数是任何给定用户都不会使用的功能。</p>
+<p><strong>对贡献者的影响：</strong> 当一个文件长达 9,500 行时，就无法理解它。当所有功能都集中在一个 crate 中时，修改任何内容都有可能导致整个系统崩溃。</p>
+<h3 id="32-证据"><a class="header" href="#32-证据">3.2 证据</a></h3>
+<p>这些是从当前代码库中得出的测量事实，而非估算值：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>文件</th><th>行</th><th>它的作用</th><th>它应该做什么</th></tr>
+</thead>
+<tbody>
+<tr><td><code>src/agent/loop_.rs</code></td><td>约 9,500</td><td>工具调用解析、流式处理、历史记录、成本跟踪、模型路由、记忆、凭证清理、上下文构建</td><td>编排单个智能体回合</td></tr>
+<tr><td><code>src/gateway/mod.rs</code></td><td>~2,260</td><td>Web 服务器 + React 应用服务器 + WhatsApp Webhook + WATI Webhook + Linq Webhook + Nextcloud Webhook + Gmail Webhook + 配对 + 速率限制 + WebAuthn</td><td>提供 Web 仪表板 API</td></tr>
+<tr><td><code>src/providers/mod.rs</code></td><td>~3,750</td><td>工厂 + 40+ 个提供程序实现 + OAuth 流程 + 凭据解析 + 错误清理</td><td>路由到提供程序</td></tr>
+<tr><td><code>src/tools/mod.rs</code></td><td><code>all_tools_with_runtime()</code> 在第 387–1066 行</td><td>无条件实例化所有 70 多个工具</td><td>注册用户配置的工具</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>一个 9,500 行的文件不是一个模块。它是一个碰巧带有 <code>.rs</code> 扩展名的单体。</strong></p>
+<h3 id="33-已经做得好的部分"><a class="header" href="#33-已经做得好的部分">3.3 已经做得好的部分</a></h3>
+<p>这一诊断不应掩盖真正设计良好的部分：</p>
+<ul>
+<li><strong>特质层非常出色。</strong> <code>Provider</code>、<code>Channel</code>、<code>Tool</code>、<code>Memory</code>、<code>Observer</code>、<code>RuntimeAdapter</code> 和 <code>Peripheral</code> 是清晰且文档完善的 Rust 特质。这些正是正确的分层点。问题在于它们并未对应 crate 边界，因此编译器无法强制执行分层结构。</li>
+<li><strong>WASM 插件系统已部分构建完成。</strong> <code>PluginHost</code>、<code>WasmTool</code>、<code>WasmChannel</code>、<code>PluginManifest</code> 以及 Ed25519 签名验证均已存在于 <code>src/plugins/</code> 中。执行桥接器目前为存根实现，但整体结构正确。</li>
+<li><strong>可观测性系统已成熟。</strong> OpenTelemetry、Prometheus 和 DORA 指标均基于一个清晰的 <code>Observer</code> trait 实现。这是生产级质量的工作。</li>
+<li><strong>安全模型设计周到。</strong> 配对码、自主级别、沙箱机制以及策略执行都体现了明确的设计意图。</li>
+</ul>
+<p>我们不是在重写 ZeroClaw。我们是在为它已有的优秀理念提供一个可以成长的框架。</p>
+<hr>
+<h2 id="4-目标架构"><a class="header" href="#4-目标架构">4. 目标架构</a></h2>
+<h3 id="41-微内核模型"><a class="header" href="#41-微内核模型">4.1 微内核模型</a></h3>
+<p>微内核架构将一个最小化且稳定的核心与可选的子系统分离开来，这些子系统用于扩展核心功能。在操作系统中，经典的例子是一个仅处理内存和调度的内核，而其他所有组件——如文件系统、设备驱动程序和网络协议栈——都作为独立的进程运行，并通过定义良好的接口进行通信。</p>
+<p>对于 AI 代理运行时，该映射揭示了 <strong>两个不同的内部层</strong>，而操作系统类比将它们混为一谈：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>操作系统微内核概念</th><th>ZeroClaw 等效</th></tr>
+</thead>
+<tbody>
+<tr><td>内核</td><td><strong>基础层</strong> — API 特性、配置、提供程序、内存后端、基础设施、工具调用解析器。不可简化的核心：使用 <code>--no-default-features</code> 构建。能够与 LLM 交换消息并存储内存。仅此而已。</td></tr>
+<tr><td>初始化 / 运行时系统</td><td><strong>Agent 运行时层</strong> — 编排循环、安全策略执行、插件主机、核心工具、IPC API。<code>zeroclaw-runtime</code> crate，由 <code>agent-runtime</code> 特性控制。正是这一层使 ZeroClaw 成为一个 <em>agent</em>，而不仅仅是一个库。</td></tr>
+<tr><td>IPC</td><td>运行时与外部组件之间的本地套接字 / IPC API</td></tr>
+<tr><td>设备驱动程序</td><td>频道插件（Telegram、Discord 等）</td></tr>
+<tr><td>文件系统驱动程序</td><td>内存后端插件（SQLite、Markdown）</td></tr>
+<tr><td>用户进程</td><td>网关二进制文件，Tauri 桌面应用</td></tr>
+</tbody>
+</table>
+</div>
+<p>这一区别很重要：<strong>基础</strong>是任何 ZeroClaw 二进制文件正常运行所必须存在的最小条件。<strong>运行时</strong>是它作为代理（agent）正常运行所必须存在的最小条件。其余部分都是组合而成的。</p>
+<p>这一双层拆分是在阶段 1 工作区分解过程中确定的（PR #5559），并反映在 crate 命名中：<code>zeroclaw-runtime</code>（crate）由 <code>agent-runtime</code>（特性）进行门控。本 RFC 的早期版本中，“kernel”一词被松散地用于指代现在正确命名为 runtime 层的组件。本修订版在整个文档中更正了这一术语。</p>
+<h3 id="42-依赖规则"><a class="header" href="#42-依赖规则">4.2 依赖规则</a></h3>
+<p>该设计中最关键的架构规则——如果违反，整个结构就会崩溃——是：</p>
+<blockquote>
+<p><strong>依赖关系向内流动。运行时对插件一无所知。插件了解 API。没有任何东西了解所有东西。</strong></p>
+</blockquote>
+<pre><code>    zeroclaw-api          ← defines all traits (Provider, Channel, Tool, ...)
+         ▲                  no implementations, no heavy dependencies
+         │ depends on
+  foundation crates       ← zeroclaw-config, zeroclaw-providers, zeroclaw-memory,
+         ▲                  zeroclaw-infra, zeroclaw-tool-call-parser
+         │ depends on        all depend on zeroclaw-api; no cross-dependencies
+    zeroclaw-runtime      ← implements the agent loop (agent-runtime feature)
+         ▲                  depends on zeroclaw-api + foundation crates
+         │ depends on        knows nothing about specific channels or tools
+  plugin crates           ← zeroclaw-channel-discord, zeroclaw-tools-web, ...
+         ▲                  depend on zeroclaw-api (not the runtime)
+         │ depends on
+  zeroclaw binary         ← thin wiring layer
+                             reads config, registers plugins, starts runtime
+</code></pre>
+<p>如果 <code>zeroclaw-runtime</code> 导入了 <code>TelegramChannel</code>，则架构已被违反。一旦定义了 crate 边界，编译器将强制执行此规则。</p>
+<h3 id="43-组件映射"><a class="header" href="#43-组件映射">4.3 组件映射</a></h3>
+<pre><code>┌─────────────────────────────────────────────────────────────────────┐
+│                    zeroclaw (binary crate)                          │
+│  Reads config → registers only configured components → starts       │
+│                                                                     │
+│   ┌──────────────────────────────────────────────────────────────┐  │
+│   │              zeroclaw-runtime  (agent-runtime feature)       │  │
+│   │                                                              │  │
+│   │  Agent Loop · CLI Channel · Security Policy                  │  │
+│   │  Plugin Host · Local IPC API                                 │  │
+│   │  Core Tools: shell, file, git, memory recall/store           │  │
+│   │                                                              │  │
+│   │  ┌──────────────────────────────────────────────────────┐   │  │
+│   │  │   Foundation  (--no-default-features)                │   │  │
+│   │  │                                                      │   │  │
+│   │  │  zeroclaw-api · zeroclaw-config · zeroclaw-infra     │   │  │
+│   │  │  zeroclaw-providers · zeroclaw-memory                │   │  │
+│   │  │  zeroclaw-tool-call-parser                           │   │  │
+│   │  │                                                      │   │  │
+│   │  │  Vision target: &lt;5 MB RAM at runtime                 │   │  │
+│   │  └──────────────────────────────────────────────────────┘   │  │
+│   └──────────────────────────────────────────────────────────────┘  │
+│                              ▲                                      │
+│                   zeroclaw-api (traits only)                        │
+│                              ▲                                      │
+│   ┌──────────────┐  ┌────────┴────────┐  ┌─────────────────────┐   │
+│   │  zeroclaw-gw │  │  Channel plugins│  │   Tool plugins      │   │
+│   │  (opt-in     │  │                 │  │                     │   │
+│   │   binary)    │  │  channel-discord│  │  tools-web          │   │
+│   │              │  │  channel-slack  │  │  tools-integrations │   │
+│   │  HTTP/WS/SSE │  │  channel-tg     │  │  tools-hardware     │   │
+│   │  Web UI      │  │  channel-email  │  │  tools-mcp          │   │
+│   │  REST API    │  │  ...            │  │  ...                │   │
+│   └──────┬───────┘  └─────────────────┘  └─────────────────────┘   │
+│          │                                                          │
+│          ▼                                                          │
+│   ┌─────────────────┐                                               │
+│   │ zeroclaw-desktop│   ← Tauri app (already exists in apps/tauri)  │
+│   │ System tray app │     bundles zeroclaw-gw as a sidecar          │
+│   │ Native GUI      │                                               │
+│   └─────────────────┘                                               │
+└─────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="44-分发模型"><a class="header" href="#44-分发模型">4.4 分发模型</a></h3>
+<p>该架构支持一种简洁的分发方案，无需最终用户安装 Rust 工具链：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>用户想要</th><th>他们下载的内容</th><th><code>zeroclaw onboard</code> 的作用</th></tr>
+</thead>
+<tbody>
+<tr><td>仅 CLI</td><td><code>zeroclaw</code> 运行时二进制文件</td><td>配置提供程序，完成</td></tr>
+<tr><td>CLI + Discord</td><td><code>zeroclaw</code> 运行时二进制文件</td><td>下载并安装 <code>channel-discord.wasm</code></td></tr>
+<tr><td>本地 Web UI</td><td><code>zeroclaw</code> + <code>zeroclaw-gw</code></td><td>配置两者，打开浏览器</td></tr>
+<tr><td>桌面应用</td><td><code>zeroclaw-desktop</code> 安装程序</td><td>捆绑运行时 + 网关 + UI</td></tr>
+<tr><td>一切</td><td><code>zeroclaw-desktop</code> 或 <code>zeroclaw --profile full</code></td><td>下载所有插件</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>zeroclaw plugin install</code> 命令（由已存在的 <code>PluginHost</code> 提供支持）将成为包管理器。<code>zeroclaw onboard</code> 向导会将其集成，使非技术用户无需接触 <code>cargo</code>。</p>
+<h4 id="441-版本控制策略"><a class="header" href="#441-版本控制策略">4.4.1 版本控制策略</a></h4>
+<p>随着 ZeroClaw 从单个 crate 过渡到多 crate 工作区，从一开始就必须将两个问题分开处理：</p>
+<ul>
+<li><strong>产品版本</strong> —— <code>zeroclaw --version</code> 报告的版本，以及 GitHub Releases、更新日志和包管理器（Homebrew、apt、cargo-binstall）所跟踪的版本。这是操作人员和用户进行推理的版本。</li>
+<li><strong>组件稳定性</strong>——某个组件的成熟度和可靠性。仅凭一个版本号无法传达这一信息。</li>
+</ul>
+<p>这两者是正交的。将它们混淆会产生误导性的语义化版本（semver）噪声，并削弱对版本号的信任。本策略对两者都进行了定义。</p>
+<hr>
+<p><strong>包版本控制：统一但有意的例外</strong></p>
+<p>所有应用程序 crate——内核、网关、工具插件 crate、通道插件 crate 以及 CLI——均使用 Cargo 工作区包继承：</p>
+<pre><code class="language-toml"># Cargo.toml (工作区根目录)
+[workspace.package]
+version = "0.8.0"
+
+# crates/zeroclaw-kernel/Cargo.toml
+[package]
+version.workspace = true
+</code></pre>
+<p>根目录中的 <code>Cargo.toml</code> 中的单个版本是权威的产品版本。这是正确的模型，因为：</p>
+<ul>
+<li>用户、操作员和打包者只需处理一个版本，而不是十二个</li>
+<li>通过 <code>release-plz</code> 实现发布自动化非常简单：一个 PR，一次版本升级，一个变更日志条目</li>
+<li>它体现了 ZeroClaw 作为<strong>产品</strong>的身份，而非库生态系统</li>
+<li>WIT 接口版本（而非 Rust crate 版本）才是实际的插件 ABI 契约（见 §5.2）</li>
+</ul>
+<p>有三个 crate 类被有意排除在工作区继承之外，并以其自身的节奏维护独立版本：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>箱</th><th>独立的原因</th></tr>
+</thead>
+<tbody>
+<tr><td><code>zeroclaw-api</code></td><td>从 <code>0.1.0</code> 开始；其 <code>1.0.0</code> 版本是 v1.0.0 的正式里程碑交付物，标志着为插件 SDK 作者提供了稳定的 Rust 特性接口。</td></tr>
+<tr><td><code>aardvark-sys</code>, <code>zeroclaw-robot-kit</code></td><td>具有各自用户群体和维护周期的硬件库 crate，而非应用程序组件</td></tr>
+<tr><td>WIT 接口文件（<code>wit/*.wit</code>）</td><td>通过 <code>@since</code> 和 <code>@unstable</code> 注解进行版本控制，遵循 WASI 组件模型规范；这些是主要的插件 ABI 契约，完全独立于 Cargo 的语义化版本控制（semver）。</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<p><strong>对产品名称而言，“破坏性”的含义</strong></p>
+<p>由于应用 crate 共享统一版本，团队需要定义一个产品级别的破坏性变更——这与单个 crate 内部实现中的破坏性变更不同。如果插件 crate 中的破坏性变更未跨越以下任何边界，则它<strong>不是</strong>产品级别的破坏性变更，也无需进行 MAJOR 版本升级。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>更新</th><th>保证有效时</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>主要</strong></td><td>WIT 接口发生不兼容变更（现有插件必须重新编译）；内核 IPC API 发生不兼容变更（网关或外部客户端会中断）；配置文件架构需要迁移；CLI 命令或标志被移除或重命名</td></tr>
+<tr><td><strong>次要</strong></td><td>工作区中的新功能；注册表中可用的新插件；稳定的新 API；稳定性级别提升；弃用公告（非移除）</td></tr>
+<tr><td><strong>补丁</strong></td><td>错误修复；安全补丁；文档修正；无新功能，无弃用</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<p><strong>稳定性层级</strong></p>
+<p>产品版本回答的是“这是哪个发行版？”。稳定性层级回答的是“我可以多大程度上依赖此组件？”。每个组件——内核、网关、插件 crate、WIT 接口——都带有三个层级之一。层级在组件的 <code>AGENTS.md</code> 及其插件注册表清单中均有记录。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>层级</th><th>含义</th><th>含义</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>稳定</strong></td><td>受产品变更策略的约束。在没有主版本升级和发布迁移指南的情况下，不会进行破坏性变更。</td><td>内核（目标：v0.8.0），<code>zeroclaw-api</code> WIT 接口（目标：v0.9.0），内核 IPC API（目标：v1.0.0）</td></tr>
+<tr><td><strong>测试版</strong></td><td>功能完整且经过测试。次要版本中允许包含破坏性变更，但会在更新日志中通过升级说明进行公告。</td><td><code>zeroclaw-gw</code>（v0.9.0 → v1.0.0），成熟的通道和工具插件</td></tr>
+<tr><td><strong>实验性</strong></td><td>不提供稳定性保证。可能在 PATCH 版本中发生破坏性变更。必须在文档和插件注册表清单中明确标记为 <code>experimental</code>。</td><td>新的工具集成、新的通道实现、早期硬件插件</td></tr>
+</tbody>
+</table>
+</div>
+<p>稳定性层级通过团队有意的决策进行<strong>提升，绝不会降级</strong>。提升记录在变更日志中，对于架构组件，还需记录在架构决策记录（ADR）中。一个组件必须在其当前层级至少保持一个完整的发布周期，才能考虑提升。</p>
+<hr>
+<p><strong>发布自动化</strong></p>
+<p>发布流程使用 <a href="https://release-plz.eplant.org/"><code>release-plz</code></a>，该工具在推送到 <code>master</code> 分支时会自动创建发布 PR、更新工作区版本，并根据规范化的提交信息生成变更日志。<code>release-plz</code> 原生支持工作区继承，并自动处理 crate 的发布顺序。具有独立版本的 crate（如 <code>zeroclaw-api</code> 和硬件库 crate）则通过该工具的 per-crate 配置进行单独管理。</p>
+<h4 id="442-发布制品"><a class="header" href="#442-发布制品">4.4.2 发布制品</a></h4>
+<p>微内核转换改变了“哪些功能被编译进去”这一问题的根本性质。目前，该问题只有一个答案：你传递给 <code>cargo build</code> 的任意功能标志。转换之后，它被拆分为两个独立的问题：</p>
+<ul>
+<li><strong>内核二进制文件中包含的内容</strong> — 在编译时固定，按平台确定，并发布到 GitHub Releases</li>
+<li><strong>可用的功能</strong> — 由通过 <code>zeroclaw plugin install</code> 安装的插件在运行时确定</li>
+</ul>
+<p>这些问题已不再相同，当前 <code>Cargo.toml</code> 中的 <code>[features]</code> 部分必须从这个角度来解读。</p>
+<hr>
+<p><strong>当前编译时功能标志的命运</strong></p>
+<p>随着架构的成熟，当前 <code>Cargo.toml</code> 中的 20 多个功能标志可分为三类：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>存储桶</th><th>标志</th><th>结果</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>退休 → 插件</strong></td><td><code>channel-nostr</code>, <code>channel-matrix</code>, <code>channel-lark</code>, <code>channel-feishu</code>, <code>whatsapp-web</code>, <code>browser-native</code></td><td>已从内核中移除。每个模块都作为 WASM 插件 crate 发布到插件注册表中。无需在编译时做出决策。</td></tr>
+<tr><td><strong>始终开启</strong></td><td><code>plugins-wasm</code>，<code>skill-creation</code></td><td>无条件编译到每个内核二进制文件中。<code>plugins-wasm</code> 是内核的核心机制；<code>skill-creation</code> 是一个零开销的代码路径。两者都不应依赖于任何标志。</td></tr>
+<tr><td><strong>Stay → 平台/基础设施标志</strong></td><td><code>peripheral-rpi</code>, <code>hardware</code>, <code>sandbox-landlock</code>, <code>sandbox-bubblewrap</code>, <code>voice-wake</code>, <code>probe</code></td><td>保留为编译时标志，因为它们需要原生库链接或操作系统级别的访问权限，而这些功能无法由 WASM 插件提供。<code>peripheral-rpi</code> 和 <code>hardware</code> 仅出现在特定平台的发布目标中。</td></tr>
+</tbody>
+</table>
+</div>
+<p>有两个标志需要在 v0.8.0 版本发布前由团队做出明确决策，因此在此处提出，而非单方面解决：</p>
+<ul>
+<li><strong><code>observability-prometheus</code></strong> — 当前处于 <code>default</code> 状态。Prometheus 指标会增加可测量的二进制体积开销。问题在于，生产环境运行时是否应默认启用可观测性，还是由操作员选择启用。建议：在标准发行版中保持 <code>default</code>；对于体积严重受限的目标平台，操作员可以通过 <code>--no-default-features</code> 进行构建。</li>
+<li><strong><code>observability-otel</code></strong> — OTLP 导出具有更大的依赖项影响（opentelemetry + reqwest 阻塞客户端）。建议：保持为可选功能，不加入 <code>default</code>。需要跟踪导出的生产部署需显式启用此功能。</li>
+</ul>
+<p>随着通道和工具标志的弃用，<code>ci-all</code> 元特性大幅简化。到 v1.0.0 版本时，它仅涵盖剩余的平台和基础设施标志。</p>
+<hr>
+<p><strong>标准的发布内核二进制文件</strong></p>
+<p>为每个平台目标发布到 GitHub Releases 的二进制文件是使用以下配置构建的：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>编译在</th><th>未编译</th></tr>
+</thead>
+<tbody>
+<tr><td>核心代理循环</td><td>任何通道实现</td></tr>
+<tr><td>10–12 个核心工具（参见第二阶段 D2）</td><td>任何非核心工具</td></tr>
+<tr><td>SQLite + Markdown 内存后端</td><td>浏览器自动化</td></tr>
+<tr><td>插件主机（<code>plugins-wasm</code>，始终开启）</td><td><code>observability-otel</code>（操作员选择加入）</td></tr>
+<tr><td><code>observability-prometheus</code></td><td><code>voice-wake</code>（依赖 libasound2）</td></tr>
+<tr><td><code>skill-creation</code>（零开销）</td><td><code>probe</code>（小众硬件调试）</td></tr>
+<tr><td>IPC 服务器</td><td>Web 资源（已移至 <code>zeroclaw-gw</code>）</td></tr>
+<tr><td>支持的平台沙箱</td><td><code>peripheral-rpi</code>（独立的硬件构建）</td></tr>
+</tbody>
+</table>
+</div>
+<p>不再提供“构建所有组件”的二进制文件。该概念模型已被 <code>zeroclaw plugin install --profile full</code> 取代，该命令会在安装精简内核二进制文件后下载完整的插件目录。</p>
+<hr>
+<p><strong>发布制品矩阵</strong></p>
+<p>每个 GitHub 版本会发布以下制品：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>工件</th><th>目标</th><th>备注</th></tr>
+</thead>
+<tbody>
+<tr><td><code>zeroclaw</code> 内核二进制文件</td><td><code>x86_64-unknown-linux-musl</code>, <code>aarch64-unknown-linux-gnu</code>, <code>armv7-unknown-linux-gnueabihf</code>, <code>x86_64-apple-darwin</code>, <code>aarch64-apple-darwin</code>, <code>x86_64-pc-windows-msvc</code></td><td>适用于 Linux x86_64 的静态 musl 构建；适用于 ARM 目标的 GNU</td></tr>
+<tr><td><code>zeroclaw</code> 内核二进制文件（硬件）</td><td><code>aarch64-unknown-linux-gnu</code>, <code>armv7-unknown-linux-gnueabihf</code></td><td>相同的构建目标，使用 <code>peripheral-rpi</code> 和 <code>hardware</code> 标志编译，适用于树莓派部署</td></tr>
+<tr><td><code>zeroclaw-gw</code> 网关二进制文件</td><td>与内核相同的平台矩阵</td><td>与内核一同发布；用户需单独安装</td></tr>
+<tr><td>WASM 插件文件</td><td><code>wasm32-wasip1</code></td><td>已发布到插件注册表（非 GitHub Releases）；可通过 <code>zeroclaw plugin install</code> 安装</td></tr>
+<tr><td><code>zeroclaw-desktop</code> 安装程序</td><td>适用于 macOS、Windows、Linux（AppImage/deb）的 <code>x86_64</code> 和 <code>aarch64</code></td><td>捆绑内核 + 网关 + 完整插件集；由 Tauri 工作流构建</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>wasm32-wasip1</code> 插件的构建在独立的 CI 作业中运行，并以其自身的周期发布到插件注册表。插件的发布不需要内核的发布。</p>
+<hr>
+<h3 id="45-网关分离"><a class="header" href="#45-网关分离">4.5 网关分离</a></h3>
+<p>当前的网关混淆了两个必须分离的概念：</p>
+<pre><code>Current (wrong):
+  zeroclaw binary
+    └── gateway
+          ├── Web UI server (serves React app)
+          ├── REST/WS/SSE API
+          ├── WhatsApp webhook handler  ← this is a channel, not a web server
+          ├── WATI webhook handler      ← this is a channel, not a web server
+          ├── Linq webhook handler      ← this is a channel, not a web server
+          ├── Nextcloud webhook handler ← this is a channel, not a web server
+          └── Gmail push handler        ← this is a channel, not a web server
+
+Target (correct):
+  zeroclaw-kernel
+    └── Local IPC API (Unix socket / 127.x HTTP)
+
+  zeroclaw-gw (separate binary, optional)
+    └── Connects to kernel IPC API
+    └── Web UI server
+    └── REST/WS/SSE API
+    └── Generic webhook proxy → routes to channel plugins
+
+  channel-whatsapp.wasm
+    └── Registers its own webhook route with the gateway
+    └── Handles WhatsApp-specific message parsing
+</code></pre>
+<p><strong>为什么这很重要：</strong> 当网关是独立进程时，即使网关崩溃、重启或不可用，也不会影响代理。内核将继续运行。这在边缘硬件使用场景中尤为重要——运行内核的树莓派可以通过通道插件以出站方式连接到 VPS 提供的 Web UI，无需任何入站防火墙规则。</p>
+<hr>
+<h2 id="5-我们应该采用的标准"><a class="header" href="#5-我们应该采用的标准">5. 我们应该采用的标准</a></h2>
+<p>标准是许多聪明人在多年间达成的共识。采用这些标准意味着我们可以免费获得这些年的思考成果，并且我们的软件能够与生态系统自然集成。以下是直接适用于 ZeroClaw 的标准。</p>
+<h3 id="51-可观测性opentelemetry"><a class="header" href="#51-可观测性opentelemetry">5.1 可观测性：OpenTelemetry</a></h3>
+<p><strong>它是什么：</strong> OpenTelemetry（OTel）是用于从软件系统收集追踪、指标和日志的行业标准。它由云原生计算基金会（Cloud Native Computing Foundation）维护，并得到所有主要云提供商和监控工具的支持。</p>
+<p><strong>对 ZeroClaw 的意义：</strong> 我们已经针对 <code>Observer</code> 特性实现了 <code>OtelObserver</code>。我们拥有 Prometheus 指标和 DORA 指标。问题在于，这些指标在代码库中尚未标准化——某些模块使用 <code>tracing::info!</code> 进行日志记录，而其他模块则发出 <code>ObserverEvent</code>，且两者之间尚未建立关联。</p>
+<p><strong>我们应该做什么：</strong></p>
+<ul>
+<li>采用 OpenTelemetry 作为所有组件的统一可观测性接口</li>
+<li>确保每个插件在执行时都生成 OTel 跨度，以便用户可以看到从“在 Discord 上收到消息”到“代理调用 shell 工具”再到“发送响应”的完整追踪。</li>
+<li>采用 W3C Trace Context（<code>traceparent</code>/<code>tracestate</code> 头）在 kernel ↔ gateway ↔ plugin 边界上传播 trace ID</li>
+<li>当设置 <code>ZEROCLAW_LOG_FORMAT=json</code> 时，结构化日志输出应为 JSON 格式（已使用 <code>tracing</code> crate，只需添加一个 JSON 订阅器即可）。</li>
+</ul>
+<p><strong>标准：</strong> OpenTelemetry 规范 · W3C Trace Context (REC) · RFC 5424 (Syslog，用于系统日志集成)</p>
+<h3 id="52-插件接口wasi-和-wit"><a class="header" href="#52-插件接口wasi-和-wit">5.2 插件接口：WASI 和 WIT</a></h3>
+<p><strong>它是什么：</strong> WASI（WebAssembly 系统接口）是 WebAssembly 模块用于与主机系统交互的标准 API。WIT（WebAssembly 接口类型）是用于描述 WASM 组件导出和导入内容的接口定义语言——可以将其视为 WASM 插件的 <code>.proto</code> 文件。</p>
+<p><strong>对 ZeroClaw 的重要性：</strong> 我们的 <code>WasmTool</code> 和 <code>WasmChannel</code> 桥接器目前缺乏对插件 WASM 二进制文件必须导出的内容的正式约定。这意味着插件作者必须猜测。WIT 文件精确定义了该约定，并支持为任何语言的插件作者自动生成代码。</p>
+<p><strong>我们应该做什么：</strong></p>
+<ul>
+<li>为 <code>Tool</code>、<code>Channel</code> 和 <code>Memory</code> 插件类型定义 WIT 接口文件（在工作区根目录下的 <code>wit/</code> 目录中）</li>
+<li>使用 <code>wit-bindgen</code> 从这些 WIT 文件生成 Rust 主机端绑定</li>
+<li>将 WIT 接口记录为官方插件 SDK</li>
+<li>插件作者使用 Rust（或 Go、C 或 Python）编写符合 WIT 接口的代码，并执行 <code>cargo build --target wasm32-wasi</code>——生成的结果会放入 <code>~/.zeroclaw/plugins/</code> 目录中。</li>
+</ul>
+<p><strong>标准：</strong> WASI 0.2 · W3C WebAssembly 组件模型 · WIT IDL</p>
+<h3 id="53-本地-apiopenapi-31"><a class="header" href="#53-本地-apiopenapi-31">5.3 本地 API：OpenAPI 3.1</a></h3>
+<p><strong>它是什么：</strong> OpenAPI 是描述 HTTP API 的标准。3.1 版本与 JSON Schema Draft 2020-12 保持一致。</p>
+<p><strong>对 ZeroClaw 的重要性：</strong> 内核的本地 IPC API（网关和其他组件连接的套接字）需要一个稳定、有文档支持的契约。如果没有正式规范，网关和内核会随时间推移而无声地偏离。</p>
+<p><strong>我们应该做什么：</strong></p>
+<ul>
+<li>
+<pre><code class="language-yaml">openapi: 3.1.0
+info:
+  title: Kernel Local IPC API
+  version: 1.0.0
+  description: &gt;
+    This specification defines the local Inter-Process Communication (IPC) API
+    for the kernel. It allows processes to exchange messages and synchronize
+    operations within the same system.
+servers:
+  - url: /api/v1/ipc
+    description: Local IPC endpoint
+paths:
+  /send:
+    post:
+      summary: Send a message to another process
+      operationId: sendMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Message'
+      responses:
+        '200':
+          description: Message sent successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Response'
+        '400':
+          description: Invalid request
+        '500':
+          description: Internal server error
+  /receive:
+    get:
+      summary: Receive a message from another process
+      operationId: receiveMessage
+      parameters:
+        - name: timeout
+          in: query
+          required: false
+          schema:
+            type: integer
+            description: Timeout in milliseconds
+      responses:
+        '200':
+          description: Message received successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '408':
+          description: Request timeout
+        '500':
+          description: Internal server error
+components:
+  schemas:
+    Message:
+      type: object
+      properties:
+        sender:
+          type: string
+          description: Sender process ID
+        receiver:
+          type: string
+          description: Receiver process ID
+        payload:
+          type: string
+          description: Message content
+        timestamp:
+          type: string
+          format: date-time
+          description: Message timestamp
+    Response:
+      type: object
+      properties:
+        status:
+          type: string
+          description: Operation status
+        message:
+          type: string
+          description: Response message
+</code></pre>
+</li>
+<li>
+<p>使用 <code>utoipa</code> 或 <code>aide</code> 从规范生成 Rust 服务端存根</p>
+</li>
+<li>
+<p>将规范发布为 <code>docs/reference/api/kernel-ipc-api.yaml</code></p>
+</li>
+<li>
+<p>网关的外部 API 也应包含 OpenAPI 规范</p>
+</li>
+</ul>
+<p><strong>标准：</strong> OpenAPI 3.1 · JSON Schema Draft 2020-12</p>
+<h3 id="54-安全性owasp-asvs"><a class="header" href="#54-安全性owasp-asvs">5.4 安全性：OWASP ASVS</a></h3>
+<p><strong>它是什么：</strong> OWASP 应用安全验证标准（OWASP Application Security Verification Standard）是一份按风险等级（L1 基础、L2 标准、L3 高级）组织的安全需求清单。</p>
+<p><strong>对 ZeroClaw 的重要性：</strong> 网关处理来自外部服务的 Webhook、处理不受信任的用户输入以及管理密钥。配对系统、WebAuthn 支持和速率限制均已存在——但缺乏验证这些功能是否完整或正确的框架。</p>
+<p><strong>我们应该做什么：</strong></p>
+<ul>
+<li>目标 ASVS 第 2 级适用于网关和安全模块</li>
+<li>完成 Level 2 检查清单，并记录我们满足哪些要求、部分满足哪些要求，以及哪些要求不在范围内。</li>
+<li>将其作为与安全相关的问题和 PR 的基础</li>
+</ul>
+<p><strong>标准：</strong> OWASP ASVS 4.0 · OWASP Top 10</p>
+<h3 id="55-质量模型isoiec-25010"><a class="header" href="#55-质量模型isoiec-25010">5.5 质量模型：ISO/IEC 25010</a></h3>
+<p><strong>它是什么：</strong> ISO/IEC 25010 定义了一个软件产品质量模型，包含八个顶层特性：功能适用性、性能效率、兼容性、可用性、可靠性、安全性、可维护性和可移植性。</p>
+<p><strong>对 ZeroClaw 的意义：</strong> 当有人问“这是否足够好以合并？”时，答案目前具有主观性。ISO 25010 为我们提供了用于讨论的术语体系。愿景承诺直接对应如下：“零开销” → 性能效率；“任意硬件” → 可移植性；“零妥协” → 安全性 + 可靠性。</p>
+<p><strong>我们应该做什么：</strong></p>
+<ul>
+<li>在 PR 审查中，使用这八个质量特性作为审视重大变更的视角</li>
+<li>在针对架构变更的 PR 模板中包含简短的质量影响说明（例如：“此变更通过降低网关与通道实现之间的耦合性来提升可维护性，且不影响性能效率”）</li>
+</ul>
+<p><strong>标准：</strong> ISO/IEC 25010:2023</p>
+<h3 id="56-已采用--保留这些"><a class="header" href="#56-已采用--保留这些">5.6 已采用 — 保留这些</a></h3>
+<p>这些已经就位，应保持其状态：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标准</th><th>状态</th><th>在哪里</th></tr>
+</thead>
+<tbody>
+<tr><td>语义化版本控制 2.0.0</td><td>✅ 已采纳</td><td><code>Cargo.toml</code>，发行版</td></tr>
+<tr><td>常规提交</td><td>✅ 已采纳</td><td><code>AGENTS.md</code>，提交历史</td></tr>
+<tr><td>RFC 3339 / ISO 8601 时间戳</td><td>✅ 已采纳</td><td><code>MemoryEntry</code>，所有时间戳</td></tr>
+<tr><td>XDG 基础目录规范</td><td>✅ 已采纳</td><td>正在使用的 <code>directories</code> 库</td></tr>
+<tr><td>保持变更日志</td><td>✅ 已采纳</td><td><code>CHANGELOG.md</code></td></tr>
+<tr><td>Rust API 指南</td><td>✅ 部分</td><td>Clippy 配置强制执行许多</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="6-分阶段路线图v070--v100"><a class="header" href="#6-分阶段路线图v070--v100">6. 分阶段路线图：v0.7.0 → v1.0.0</a></h2>
+<p>每个阶段都遵循“愿景 → 架构 → 设计 → 实现 → 测试 → 文档 → 发布”的层级结构。在某个阶段的设计被审查并达成一致之前，不会开始该阶段的实现工作。</p>
+<p>整体迁移策略采用<strong>绞杀榕模式</strong>：我们在新架构的边缘逐步构建，并持续向内迁移，直到旧结构被完全替换。我们从不进行“停止世界”式的重写。应用程序始终处于可交付状态。</p>
+<hr>
+<h3 id="第一阶段--v070--接缝"><a class="header" href="#第一阶段--v070--接缝">第一阶段 · v0.7.0 — “接缝”</a></h3>
+<p><strong>主题：</strong> 在不改变任何行为的前提下，使架构可见。先绘制线条。</p>
+<p><strong>为什么需要这个阶段：</strong> 在分层架构的层成为真正的边界之前，无法进行迁移。目前，这些特性（traits）仅定义了逻辑上的分界线，但编译器并未强制执行这些分界线——所有内容都位于同一个 crate 中，因此任何模块都可以导入任何其他模块。这个阶段将使这些分界线成为现实。</p>
+<p><strong>愿景对齐：</strong> 所有视觉属性对用户均无变化。这完全是内部机制。其价值在于，每个未来的贡献现在都有了结构化的归属，新贡献者可以分部分地理解代码库，而不必一次性全部掌握。</p>
+<h4 id="交付成果"><a class="header" href="#交付成果">交付成果</a></h4>
+<p><strong>D1：提取 <code>zeroclaw-api</code> 库</strong></p>
+<p>创建一个新的 crate <code>crates/zeroclaw-api</code>，其中仅包含 trait 定义及其支持类型。不包含任何实现。不依赖重型依赖项。该 crate 的编译时间应控制在两秒以内。</p>
+<p>进入此 crate：</p>
+<ul>
+<li><code>src/providers/traits.rs</code> → <code>Provider</code>、<code>ChatMessage</code>、<code>ChatResponse</code>、<code>ToolCall</code>、<code>StreamChunk</code>、<code>ProviderCapabilities</code></li>
+<li><code>src/channels/traits.rs</code> → <code>Channel</code>、<code>ChannelMessage</code>、<code>SendMessage</code></li>
+<li><code>src/tools/traits.rs</code> → <code>Tool</code>、<code>ToolResult</code>、<code>ToolSpec</code></li>
+<li><code>src/memory/traits.rs</code> → <code>Memory</code>、<code>MemoryEntry</code>、<code>MemoryCategory</code></li>
+<li><code>src/observability/traits.rs</code> → <code>Observer</code>、<code>ObserverEvent</code>、<code>ObserverMetric</code></li>
+<li><code>src/runtime/traits.rs</code> → <code>RuntimeAdapter</code></li>
+<li><code>src/peripherals/traits.rs</code> → <code>Peripheral</code></li>
+</ul>
+<p>工作区中的其他所有需要这些类型的 crate 都将 <code>zeroclaw-api</code> 添加为依赖项。编译器现在强制执行以下规则：任何实现 crate 都不能绕过 API 层直接导入另一个实现 crate。</p>
+<p><strong>D2：提取 <code>zeroclaw-tool-call-parser</code> crate</strong></p>
+<p><code>src/agent/loop_.rs</code> 中的工具调用解析逻辑大约包含 1,400 行纯文本转换代码：它接收来自 LLM 的字符串，并返回结构化工具调用列表。该模块不依赖于代理状态、内存、提供商或通道。它支持十几种不同的 LLM 输出格式（JSON、XML、GLM 风格、MiniMax、Perl 风格、markdown 代码块等）。</p>
+<p>这个逻辑是：</p>
+<ol>
+<li>自包含——非常适合其自己的 crate</li>
+<li>项目中最具模糊测试能力的代码——属性测试应放在这里</li>
+<li>对 Rust 生态系统的真正贡献——没有其他 crate 能全面实现这一点</li>
+</ol>
+<p>创建 <code>crates/zeroclaw-tool-call-parser</code>，其公共 API 大致如下：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub fn parse(text: &amp;str, specs: &amp;[ToolSpec]) -&gt; ParseResult
+
+pub struct ParseResult {
+    pub calls: Vec&lt;ParsedToolCall&gt;,
+    pub remaining_text: Option&lt;String&gt;,
+}
+
+pub struct ParsedToolCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
+    pub tool_call_id: Option&lt;String&gt;,
+}
+<span class="boring">}</span></code></pre>
+<p><code>loop_.rs</code> 中现有的约 300 个解析测试将移至本 crate。<code>loop_.rs</code> 将减少约 1,400 行代码。</p>
+<p><strong>D3：采用 OpenTelemetry 作为可观测性标准</strong></p>
+<p>规范化现有实现：文档说明 <code>ObserverEvent</code> 和 <code>ObserverMetric</code> 是内部事件总线，而 <code>OtelObserver</code> 是标准的后端实现。为 <code>ZEROCLAW_LOG_FORMAT=json</code> 添加 JSON 结构化日志记录订阅者。采用 W3C Trace Context 以支持未来的跨组件追踪。</p>
+<p><strong>D4：编写 WIT 接口文件</strong></p>
+<p>在实现 WASM 插件执行之前，先定义接口契约。在工作区根目录创建一个 <code>wit/</code> 目录，用于存放以下接口定义：</p>
+<ul>
+<li><code>zeroclaw:tool/tool.wit</code> — Tool 插件接口</li>
+<li><code>zeroclaw:channel/channel.wit</code> — Channel 插件接口</li>
+</ul>
+<p>这些将成为官方的插件 SDK。v0.8.0 中的实现将从这些文件生成。</p>
+<h4 id="v070-的成功指标"><a class="header" href="#v070-的成功指标">v0.7.0 的成功指标</a></h4>
+<ul>
+<li><code>zeroclaw-api</code> 在不到 2 秒内编译完成，且无任何实现依赖</li>
+<li><code>zeroclaw-tool-call-parser</code> 的测试覆盖率 ≥ 95%（该逻辑完全可独立测试）</li>
+<li><code>loop_.rs</code> 文件行数不到 8,000 行</li>
+<li>零用户可见的行为变更</li>
+<li>零性能回退（基准测试套件通过）</li>
+</ul>
+<hr>
+<h3 id="第二阶段--v080--运行时"><a class="header" href="#第二阶段--v080--运行时">第二阶段 · v0.8.0 — “运行时”</a></h3>
+<p><strong>主题：</strong> 将代理运行时形式化为一个干净、可独立部署的单元。所有非运行时部分均视为访客。</p>
+<p><strong>为何选择此阶段：</strong> 一旦存在接缝（v0.7.0），我们就可以明确地绘制运行时边界。此阶段将 <code>zeroclaw-runtime</code> 提取为一个独立的 crate，完成 WASM 插件执行桥接，并连接插件注册表客户端——这是运行时外部所有内容与其连接机制。</p>
+<p><strong>愿景对齐：</strong> 这是组合模型对用户真正产生意义的地方。只想使用 CLI 代理的用户只需下载一个二进制文件，运行 <code>zeroclaw onboard</code> 即可完成设置——无需 Rust 工具链，也无需编译。<code>zeroclaw onboard</code> 向导将具备按需下载插件组件的能力。</p>
+<h4 id="交付成果-1"><a class="header" href="#交付成果-1">交付成果</a></h4>
+<p><strong>D1：规范化 <code>zeroclaw-runtime</code> 库</strong></p>
+<p>将代理编排循环、CLI 通道、安全策略、插件主机和 IPC API 提取到 <code>crates/zeroclaw-runtime</code> 中，并通过 <code>agent-runtime</code> 特性进行条件编译。该 crate 依赖于 <code>zeroclaw-api</code> 和基础 crates。它不依赖 Telegram、Discord、Anthropic 或任何特定工具的实现。</p>
+<p>运行时导出了一个干净的公共 API：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct Runtime { ... }
+
+pub struct Registry {
+    pub fn register_channel(&amp;mut self, ch: Arc&lt;dyn Channel&gt;);
+    pub fn register_tool(&amp;mut self, t: Box&lt;dyn Tool&gt;);
+    pub fn set_provider(&amp;mut self, p: Arc&lt;dyn Provider&gt;);
+    pub fn set_memory(&amp;mut self, m: Arc&lt;dyn Memory&gt;);
+    pub fn set_observer(&amp;mut self, o: Arc&lt;dyn Observer&gt;);
+}
+
+pub async fn run(runtime: Runtime, registry: Registry) -&gt; anyhow::Result&lt;()&gt;;
+<span class="boring">}</span></code></pre>
+<p>二进制 crate 变成了一个薄层的接线层，它读取配置并调用 <code>run</code>。</p>
+<p><strong>D2：完成 WASM 执行桥接</strong></p>
+<p>将 Extism 集成到 <code>WasmTool::execute</code> 和 <code>WasmChannel</code> 中。<code>PluginHost</code> 已经负责发现与安装。执行桥接是缺失的部分。借助 v0.7.0 中定义的 WIT 接口，使用 <code>wit-bindgen</code> 生成主机端绑定。</p>
+<p>使用 Extism 的完整 <code>WasmTool::execute</code> 实现大约需要 30–50 行代码。主要工作在于定义 WASM 插件可以在 <code>PluginPermission</code> 中已定义的权限模型内调用的主机函数（HTTP 请求、内存访问、日志记录）。</p>
+<p><strong>D3：组件注册表客户端</strong></p>
+<p>添加一个由简单注册表客户端支持的 <code>zeroclaw plugin</code> 子命令：</p>
+<pre><code>zeroclaw plugin list              # list installed plugins
+zeroclaw plugin search &lt;query&gt;    # search the component registry
+zeroclaw plugin install &lt;name&gt;    # download, verify, and install a plugin
+zeroclaw plugin remove &lt;name&gt;     # remove an installed plugin
+zeroclaw plugin update            # update all installed plugins
+</code></pre>
+<p>注册表是一个 JSON 索引文件，通过已知 URL（例如 <code>https://plugins.zeroclawlabs.ai/index.json</code>）提供。每个条目包含名称、版本、下载 URL、SHA-256 校验和以及发布者的 Ed25519 公钥。<code>PluginHost</code> 的签名验证已经处理了安全模型。</p>
+<p><strong>D4：将 <code>zeroclaw onboard</code> 与插件系统集成</strong></p>
+<p>引导向导应询问用户希望选择哪些频道和集成，然后为每个选项调用 <code>PluginRegistry::install</code>。无需编译。用户只需下载二进制文件，运行 <code>zeroclaw onboard</code>，即可在不到两分钟内拥有一个已配置好的工作代理。</p>
+<p><strong>D5：将 <code>all_tools_with_runtime</code> 缩减为仅包含核心工具</strong></p>
+<p>内核包含了用户在使用无插件安装的有用代理时所需的全部工具：<code>shell</code>、<code>file_read</code>、<code>file_write</code>、<code>file_edit</code>、<code>git_operations</code>、<code>glob_search</code>、<code>content_search</code>、<code>memory_recall</code>、<code>memory_store</code>、<code>memory_forget</code> 和 <code>web_fetch</code>。其余功能均由已安装的插件注册。</p>
+<h4 id="v080-的成功指标"><a class="header" href="#v080-的成功指标">v0.8.0 的成功指标</a></h4>
+<ul>
+<li><code>zeroclaw-runtime</code> 独立编译，不包含任何通道或工具实现代码</li>
+<li><code>zeroclaw plugin install channel-discord</code> 端到端工作正常</li>
+<li><code>zeroclaw onboard</code> 安装插件，无需 Rust 工具链</li>
+<li>运行时二进制文件的大小在发布说明中<strong>被跟踪和报告</strong>；目标是朝着愿景目标（见第7节）实现持续下降。</li>
+<li>一个使用 WIT 接口编写的 Rust WASM 工具插件执行正确</li>
+</ul>
+<hr>
+<h3 id="阶段-3--v090--网关"><a class="header" href="#阶段-3--v090--网关">阶段 3 · v0.9.0 — “网关”</a></h3>
+<p><strong>主题：</strong> 将 Web 界面与代理核心分离。</p>
+<p><strong>为什么需要这个阶段：</strong> 网关目前是整个代码库中最大的结构耦合点。它嵌入了一个编译后的 React 应用程序，处理特定于通道的 webhook 逻辑，并且被编译到每一个二进制文件中——包括那些旨在用于价值 10 美元的边缘硬件的二进制文件，而这些硬件永远不会用于提供网页服务。</p>
+<p><strong>愿景对齐：</strong> 此阶段完全兑现了“零外部依赖”的承诺。在树莓派上，用户将获得一个内核二进制文件，其中不包含 Web 服务器、React 应用或 HTTP 监听器。希望使用 Web 仪表板的用户需单独安装 <code>zeroclaw-gw</code>。</p>
+<h4 id="交付成果-2"><a class="header" href="#交付成果-2">交付成果</a></h4>
+<p><strong>D1：定义内核 IPC API</strong></p>
+<p>在提取网关之前，先为内核在 Unix 套接字或回环端口上暴露的本地 API 定义 OpenAPI 3.1 规范。该 API 是网关、Tauri 应用以及任何未来客户端所连接的接口，也是内核与外部世界之间的稳定契约。</p>
+<p>端点包括：发送消息、接收流式响应、列出活跃会话、列出已安装的插件、获取代理状态、管理内存、触发定时任务。这是一份设计文档——在编写任何实现代码之前，应先审查并确认规范。</p>
+<p><strong>D2：实现内核 IPC 服务器</strong></p>
+<p>在 <code>zeroclaw-kernel</code> 中通过特性标志（<code>--features ipc</code>）添加 IPC 服务器。在支持的平台（如 Unix 系统）上，内核会在 <code>~/.zeroclaw/kernel.sock</code> 处的 Unix 套接字上监听。在 Windows 上，使用命名管道。<code>zeroclaw gateway</code> 命令（当前 Web 服务器的入口点）将变为 <code>zeroclaw-gw</code>，并连接到该套接字。</p>
+<p><strong>D3：将 <code>zeroclaw-gw</code> 提取为独立的二进制文件</strong></p>
+<p>将 <code>src/gateway/</code> 移至新的 <code>crates/zeroclaw-gw/</code> crate，并为其创建独立的二进制文件。该 crate 依赖于 <code>zeroclaw-api</code>，并通过 IPC API 与内核连接。通过 <code>rust-embed</code> 嵌入的 React 应用也完全迁移至该 crate 中——内核二进制文件不再包含任何 Web 资源。</p>
+<p><strong>D4：将通道 Webhook 处理程序从网关中迁移出去</strong></p>
+<p>目前位于 <code>gateway/mod.rs</code> 中的 WhatsApp、WATI、Linq、Nextcloud Talk 和 Gmail webhook 处理程序将移至各自的通道插件。网关提供一个通用的 webhook 注册 API：通道插件在加载时，会注册其 webhook 路径前缀及其处理函数。网关将传入的 webhook 路由到已注册的处理程序。网关不再知晓 WhatsApp。</p>
+<p><strong>D5：正式确定 Tauri 辅助进程的关系</strong></p>
+<p>更新 <code>apps/tauri/</code>，将 <code>zeroclaw-gw</code> 作为 Tauri sidecar 二进制文件进行打包。Tauri 应用成为“完整体验”分发版本：它会自动启动内核和网关，并打开 Web UI。下载 Tauri 应用的用户无需操作终端即可让一切正常运行。</p>
+<h4 id="v090-的成功指标"><a class="header" href="#v090-的成功指标">v0.9.0 的成功指标</a></h4>
+<ul>
+<li>内核二进制文件（发布版）不包含任何 Web 资源或 HTTP 服务器代码</li>
+<li><code>zeroclaw-gw</code> 启动，通过 IPC 连接到内核，并提供 Web 仪表板</li>
+<li>移除 <code>zeroclaw-gw</code> 不会破坏内核或任何通道插件</li>
+<li>WhatsApp、WATI、Linq、Nextcloud Talk 和 Gmail 频道代码已移至插件 crate</li>
+<li>Tauri 桌面应用包正确打包并启动了两个二进制文件</li>
+</ul>
+<hr>
+<h3 id="第-4-阶段--v100--平台"><a class="header" href="#第-4-阶段--v100--平台">第 4 阶段 · v1.0.0 — “平台”</a></h3>
+<p><strong>主题：</strong> ZeroClaw 成为一个可组合的平台，而非单体应用。</p>
+<p><strong>为何选择此阶段：</strong> 随着内核稳定、网关分离以及插件系统正常运行，v1.0.0 将成为架构转化为产品的关键版本。外部开发者可以编写并发布插件，用户能够按需组装他们想要的 ZeroClaw。该二进制文件也能切实兑现其轻量级架构的承诺。</p>
+<h4 id="交付成果-3"><a class="header" href="#交付成果-3">交付成果</a></h4>
+<p><strong>D1：将所有剩余通道迁移到插件</strong></p>
+<p>每个 27+ 通道实现都成为一个独立的 WASM 插件 crate。它们以签名发布的形式发布到组件注册表中。内核二进制文件不包含任何通道实现，除了 CLI。</p>
+<p><strong>D2：将长尾工具迁移到插件</strong></p>
+<p>大约 60 个工具被移至插件 crate，并按领域分组：<code>zeroclaw-tools-web</code>（浏览器、搜索、截图、PDF）、<code>zeroclaw-tools-integrations</code>（Jira、Notion、Google Workspace、MS365、LinkedIn）、<code>zeroclaw-tools-hardware</code>（板级信息、GPIO）、<code>zeroclaw-tools-cloud</code>（云运维、安全运维）。内核仅保留 v0.8.0 中确定的 10–12 个核心工具。</p>
+<p><strong>D3：插件 SDK 和开发者文档</strong></p>
+<p>发布插件开发指南。开发者应能在一个下午内编写一个新的工具插件：</p>
+<ol>
+<li>将 <code>zeroclaw-plugin-sdk</code> 添加为依赖项</li>
+<li>实现由 WIT 生成的 trait</li>
+<li><code>cargo build --target wasm32-wasi</code></li>
+<li><code>zeroclaw 插件安装 ./my-plugin/</code></li>
+</ol>
+<p>SDK 负责处理主机函数绑定、清单格式以及权限模型。</p>
+<p><strong>D4：将内核 IPC API 稳定至 v1.0</strong></p>
+<p>内核 IPC API 具有版本前缀（<code>/v1/</code>）和稳定性保证。该 API 不允许在 v1.x 中进行破坏性更改。这是第三方客户端和网关所依赖的契约。</p>
+<p><strong>D5：将版本控制策略和稳定性层级定义提取到 <code>docs/book/src/maintainers/stability-tiers.md</code></strong></p>
+<p>本 RFC 第 4.4.1 节中定义的版本控制策略和稳定性层级表将成为常驻的贡献者参考文档，位于 <code>docs/book/src/maintainers/stability-tiers.md</code>。该文档是贡献者在为新插件 crate 分配层级时日常使用的参考，也是维护者在做出发布决策时查阅的资料。本 RFC 本身保留了这些决策背后的原因（<em>why</em>）；而提取出的文档则是贡献者查阅的具体内容（<em>what</em>）。</p>
+<h4 id="v100-的成功指标"><a class="header" href="#v100-的成功指标">v1.0.0 的成功指标</a></h4>
+<ul>
+<li>运行时二进制大小<strong>会对照愿景目标进行跟踪</strong>（见§7）；作为 v1.0.0 工作流的一部分，预计将对每个 crate 执行专门的优化流程。</li>
+<li>第三方开发者仅使用公开文档即可发布一个可用的插件</li>
+<li>所有 27 多个通道实现均可作为可下载插件在注册表中获取</li>
+<li><code>zeroclaw onboard</code> 在未安装 Rust 工具链的 Raspberry Pi Zero 2W 上，可在不到 2 分钟内完成完整设置。</li>
+<li>完整的插件目录可通过 <code>zeroclaw plugin install --profile full</code> 安装</li>
+</ul>
+<hr>
+<h2 id="7-代码与复杂度指标"><a class="header" href="#7-代码与复杂度指标">7. 代码与复杂度指标</a></h2>
+<p>这些估计值是基于对当前代码库的直接代码分析得出的。它们旨在提供规模感，而非精确预测。</p>
+<h3 id="移出运行时的代码行数"><a class="header" href="#移出运行时的代码行数">移出运行时的代码行数</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>什么在移动</th><th>近似行</th><th>目的地</th></tr>
+</thead>
+<tbody>
+<tr><td>工具调用解析器（来自 <code>loop_.rs</code>）</td><td>~1,400</td><td><code>zeroclaw-tool-call-parser</code> 库</td></tr>
+<tr><td>60 多个非核心工具实现</td><td>约 30,000</td><td>插件 crate</td></tr>
+<tr><td>24+ 非核心通道实现</td><td>~7,200</td><td>插件 crate</td></tr>
+<tr><td>网关 HTTP 服务器</td><td>~2,260</td><td><code>zeroclaw-gw</code> 库</td></tr>
+<tr><td>嵌入式 React 应用（二进制权重）</td><td>—</td><td><code>zeroclaw-gw</code> 库</td></tr>
+<tr><td>从网关转发通道 webhook 处理程序</td><td>~500</td><td>通道插件 crate</td></tr>
+<tr><td><strong>估计从运行时中移除的总量</strong></td><td><strong>约 41,000 行</strong></td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="文件级复杂度降低"><a class="header" href="#文件级复杂度降低">文件级复杂度降低</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>文件</th><th>当前行</th><th>迁移后的目标</th><th>归约</th></tr>
+</thead>
+<tbody>
+<tr><td><code>src/agent/loop_.rs</code></td><td>约 9,500</td><td>~5,000</td><td>~47%</td></tr>
+<tr><td><code>src/gateway/mod.rs</code></td><td>~2,260</td><td>移动到 <code>zeroclaw-gw</code></td><td>100%</td></tr>
+<tr><td><code>src/tools/mod.rs</code></td><td><code>all_tools_with_runtime</code> 大约有 680 行</td><td>约 80 行（仅核心工具）</td><td>~88%</td></tr>
+<tr><td><code>src/providers/mod.rs</code></td><td>~3,750</td><td>约 1,200（提供商自行注册）</td><td>~68%</td></tr>
+<tr><td><code>src/channels/mod.rs</code></td><td>~200 + 44 通道文件</td><td>仅限 CLI 通道</td><td>~90%</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="二进制大小--测量进展与目标"><a class="header" href="#二进制大小--测量进展与目标">二进制大小 — 测量进展与目标</a></h3>
+<p>该项目的愿景以运行时指标来表述：<strong>&lt;5 MB RAM</strong> 在 $10 的硬件上。磁盘上的二进制文件大小与运行时内存占用（RSS）相关但不完全相同——按需分页意味着只有已执行的代码路径会被驻留。两者都会被跟踪。</p>
+<blockquote>
+<p><strong>两阶段模型：</strong> 架构分解（阶段 1–3）与二进制体积优化是独立的工作流。分解通过将依赖项隔离到其所属的 crate 中，从而为优化创造条件。按 crate 最大化效率是预期的第二阶段工作，而非结构本身工作的交付成果。</p>
+</blockquote>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>配置</th><th>预分解（v0.6.x）</th><th>第一阶段结果（v0.7.0）</th><th>视觉目标</th></tr>
+</thead>
+<tbody>
+<tr><td>完整的单体二进制文件</td><td>约 8.8 MB</td><td>不适用（由插件模型替换）</td><td>N/A</td></tr>
+<tr><td>仅基础功能（<code>--no-default-features</code>）</td><td>N/A</td><td><strong>6.6 MB</strong> <em>(测量值，已剥离)</em></td><td>优化传递后待定</td></tr>
+<tr><td>运行时二进制文件（基础 + <code>agent-runtime</code>）</td><td>N/A</td><td>已跟踪</td><td>内存占用：运行时 ≤ 5 MB</td></tr>
+<tr><td>运行时 + 网关</td><td>N/A</td><td>已跟踪</td><td>~5–7 MB 磁盘空间</td></tr>
+<tr><td>运行时 + 网关 + 前 5 个频道</td><td>N/A</td><td>已跟踪</td><td>约 8–10 MB（插件为独立文件）</td></tr>
+<tr><td>Tauri 桌面应用（包含所有依赖）</td><td>N/A</td><td>已跟踪</td><td>~20–25 MB 安装程序</td></tr>
+</tbody>
+</table>
+</div>
+<p>6.6 MB 的 Phase 1 基础构建版本相较于 8.8 MB 的单体应用代表了实质性的进展，并证明了代码分解正在发挥作用。要实现愿景目标，需要在完成结构分解后，对每个 crate 进行专门的依赖审计和优化流程——审查每个 crate 的 <code>Cargo.toml</code> 以识别不必要或功能过度的依赖，验证 LTO 和 strip 配置，并审计实际所需的 tokio/serde 特性标志。</p>
+<p>关键的结构转变：二进制大小不再取决于“在构建时编译的功能”，而是取决于“在运行时安装的插件”，由用户控制。这一转变是第 1–3 阶段的架构目标。而大小数字则是后续阶段的优化目标。</p>
+<h3 id="编译时间改进"><a class="header" href="#编译时间改进">编译时间改进</a></h3>
+<p>目前，对该代码库执行完整的 <code>cargo build --release</code> 会在单个编译单元中编译所有通道、所有工具、所有提供程序以及嵌入式 React 应用。Crate 分解意味着：</p>
+<ul>
+<li>内核独立编译，其编译输出会被缓存</li>
+<li>对 <code>channel-discord</code> 的更改不会重新编译内核</li>
+<li>仅重新编译其插件</li>
+<li>CI 可以在作业间并行化 crate 编译</li>
+</ul>
+<p>增量构建的估计墙钟时间改进：对于未触及内核的更改，可减少 60–75% 的时间。</p>
+<hr>
+<h2 id="8-这对贡献者意味着什么"><a class="header" href="#8-这对贡献者意味着什么">8. 这对贡献者意味着什么</a></h2>
+<h3 id="对于新贡献者"><a class="header" href="#对于新贡献者">对于新贡献者</a></h3>
+<p>大型代码库的新贡献者最常见的抱怨是：“我不知道从哪里开始。” 在当前架构下，要回答“一条 Discord 消息会流向哪里？”这个问题，需要追踪 <code>channels/discord.rs</code> → <code>channels/mod.rs</code> → <code>gateway/mod.rs</code> → <code>agent/loop_.rs</code> → 数十个其他文件。</p>
+<p>采用微内核架构时，答案是：“消息会发送到内核的 <code>Channel</code> 接收端，通过 <code>channel-discord</code> 插件。” 新贡献者只需阅读一个插件 crate 即可完全理解 Discord 频道。他们只需阅读 <code>zeroclaw-kernel</code>，无需涉及任何频道或工具代码，即可理解完整的代理循环。</p>
+<p><strong>给新贡献者的一条经验法则：</strong> 如果你能用一句话描述你的更改，且不涉及多个组件，说明你正处于合适的粒度。例如，“修复 Discord 频道处理线程回复的 bug” 只涉及一个组件；而“重构代理循环、更新 Discord 频道并修复内存后端” 则涉及三个组件——这应该拆分为三个 PR。</p>
+<h3 id="对于维护者"><a class="header" href="#对于维护者">对于维护者</a></h3>
+<p>每个错误报告都会有一个明确的归属。例如，“代理调用工具不正确” → <code>zeroclaw-tool-call-parser</code> 或 <code>zeroclaw-runtime</code>。“Discord 集成出现问题” → <code>channel-discord</code> 插件。“Web 仪表板无法加载” → <code>zeroclaw-gw</code>。目前，这些错误可能出现在 50,000 多行代码中的任何位置。</p>
+<h3 id="对于发布流程"><a class="header" href="#对于发布流程">对于发布流程</a></h3>
+<p>插件模型意味着频道和工具可以拥有独立的发布周期。Telegram 频道的错误修复不需要新的内核发布。内核的稳定性成为其他一切构建的基础。对插件的快速迭代不会危及内核的稳定性。</p>
+<h3 id="面向社区"><a class="header" href="#面向社区">面向社区</a></h3>
+<p>已发布的 WIT 接口和插件 SDK 意味着任何人都可以在不 Fork 的情况下扩展 ZeroClaw。需要特定集成的公司可以针对公开接口编写插件。这就是生态系统构建的方式。</p>
+<hr>
+<h2 id="附录-a术语表"><a class="header" href="#附录-a术语表">附录 A：术语表</a></h2>
+<p>本文档中可能包含一些不熟悉的术语：</p>
+<p><strong>大泥球</strong>——一种（或缺乏）架构，其中代码库在没有结构规划的情况下有机增长。这个名字来源于 Brian Foote 和 Joseph Yoder 在 1997 年发表的一篇论文。它是软件中最常见的架构，不是因为有人选择它，而是因为它是你默认得到的结果。</p>
+<p><strong>康威定律</strong> —— “任何设计系统的组织，其产出的设计在结构上都会映射该组织的沟通结构。”（Mel Conway，1968 年）如果贡献者各自为政、互不沟通，代码结构也会反映出这一点；如果贡献者之间协作紧密，并在各自工作之间定义清晰的接口，代码结构同样会反映出这种协作模式。</p>
+<p><strong>依赖倒置原则</strong> — 高层模块不应依赖于低层模块。两者都应依赖于抽象。这就是为什么 <code>zeroclaw-runtime</code> 依赖于 <code>zeroclaw-api</code>（抽象）而不是 <code>channel-discord</code>（具体实现）。</p>
+<p><strong>微内核</strong> — 一种架构，其中核心系统仅包含必要的最小功能，其他所有功能由独立组件提供，并通过定义良好的接口与核心进行通信。</p>
+<p><strong>绞杀榕模式</strong>（Strangler Fig Pattern）—— 一种迁移策略，通过在现有系统旁边构建新组件，逐步替换现有系统的各个部分。该模式得名于绞杀榕植物，它会围绕现有树木生长，直至完全替换原树。其关键特性是：在迁移过程中，系统始终处于运行状态且始终可部署。</p>
+<p><strong>技术债务</strong> — 在软件设计中采取捷径所积累的代价。就像金融债务一样，适度的技术债务可以提高效率（让你更快地发布产品）。但过大的技术债务会变得难以承受（你会把所有时间都花在支付“利息”——即修复 bug 和实现变通方案上——而不是开发新功能）。</p>
+<p><strong>WIT（WebAssembly 接口类型）</strong> — 一种用于描述 WASM 组件导出和导入内容的接口定义语言。可以将其视为一种契约：“一个 Tool 插件必须导出一个名为 <code>execute</code> 的函数，该函数接收 JSON 并返回 JSON。” WIT 使这种契约变得精确且机器可读。</p>
+<hr>
+<h2 id="附录-b延伸阅读"><a class="header" href="#附录-b延伸阅读">附录 B：延伸阅读</a></h2>
+<p>这些是团队可能会觉得有价值的资源。它们不是必读内容，但每一项都直接影响了本提案。</p>
+<ul>
+<li>
+<p><strong>《软件设计哲学》</strong> — John Ousterhout。这是关于在软件中管理复杂性的最佳简短书籍。他提出的“深层模块”（简单接口、强大实现）的概念正是微内核模型所追求的目标。</p>
+</li>
+<li>
+<p><strong>“整洁架构”</strong> —— 罗伯特·C·马丁。本文档第 4.2 节中描述的依赖规则源自本书。</p>
+</li>
+<li>
+<p><strong>《Release It!》</strong> — Michael Nygard。本书提供了构建在生产环境中保持高可用性的软件的实用模式。此处讨论的网关分离和熔断器模式均源自该书。</p>
+</li>
+<li>
+<p><strong>Rust API 指南</strong> — https://rust-lang.github.io/api-guidelines/ — 设计惯用 Rust 库的官方指南。我们的 trait 接口应遵循这些约定。</p>
+</li>
+<li>
+<p><strong>WebAssembly 组件模型</strong> — https://component-model.bytecodealliance.org/ — 本 RFC 中提出的插件系统的技术基础。</p>
+</li>
+<li>
+<p><strong>OpenTelemetry 规范</strong> — https://opentelemetry.io/docs/specs/ — 我们采用的可观测性标准的完整规范。</p>
+</li>
+</ul>
+<hr>
+<p><em>本提案基于对 ZeroClaw 代码库 v0.6.8 版本的详细分析制定。所引用的代码指标均源自对源文件的直接测量。架构建议反映了在系统软件设计中采用的成熟模式，并结合了 ZeroClaw 项目的具体约束与目标。</em></p>
+<p>欢迎提供反馈、纠正和反建议。最好的架构是团队理解并认同的架构，而不是由某一个人独断的架构。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/index.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-002-documentation-standards.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/index.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-002-documentation-standards.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,687 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Engineering infrastructure - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-c5ad0191.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-425f4b80.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/foundations/fnd-004-engineering-infrastructure.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="fnd-004-engineering-infrastructure--cicd-pipeline-and-release-automation"><a class="header" href="#fnd-004-engineering-infrastructure--cicd-pipeline-and-release-automation">FND-004: Engineering Infrastructure — CI/CD Pipeline and Release Automation</a></h1>
+<h3 id="supporting-v070--v100--type-architecture--rev-1"><a class="header" href="#supporting-v070--v100--type-architecture--rev-1">Supporting v0.7.0 → v1.0.0 · Type: Architecture · Rev. 1</a></h3>
+<blockquote>
+<p><strong>Canonical reference</strong> · Ratified by the team · Rev. 1
+Discussion thread and full revision history: <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5579">#5579</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>A note to the team before you read this.</strong></p>
+<p>This document is about the scaffolding around the code — the automation that builds it, tests it, audits it, and ships it. That scaffolding is invisible when it works well and painful when it does not. Most teams do not think about it until it is painful, and by then it has grown into something nobody fully understands. This RFC is an attempt to get ahead of that. If you have never thought deeply about CI/CD before, this is a good place to start. If you have, you will recognise the patterns. Either way, the goal is the same: a pipeline that gives the team confidence without getting in the way.</p>
+</blockquote>
+<hr>
+<h2 id="table-of-contents"><a class="header" href="#table-of-contents">Table of Contents</a></h2>
+<ol>
+<li><a href="#1-context-pipelines-are-architecture">Context: Pipelines Are Architecture</a></li>
+<li><a href="#2-honest-assessment-where-we-are-today">Honest Assessment: Where We Are Today</a></li>
+<li><a href="#3-the-target-pipeline-design">The Target Pipeline Design</a></li>
+<li><a href="#4-security-scanning-as-a-lifecycle">Security Scanning as a Lifecycle</a></li>
+<li><a href="#5-release-automation-aligned-to-the-distribution-model">Release Automation Aligned to the Distribution Model</a></li>
+<li><a href="#6-standards-we-should-adopt">Standards We Should Adopt</a></li>
+<li><a href="#7-phased-roadmap">Phased Roadmap</a></li>
+<li><a href="#8-what-this-means-for-contributors">What This Means for Contributors</a></li>
+</ol>
+<hr>
+<h2 id="revision-history"><a class="header" href="#revision-history">Revision History</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Rev</th><th>Date</th><th>Summary</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>2026-04-09</td><td>Initial draft</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="1-context-pipelines-are-architecture"><a class="header" href="#1-context-pipelines-are-architecture">1. Context: Pipelines Are Architecture</a></h2>
+<p>The architecture RFC (#5574) established a principle: <em>dependencies flow inward, and structure is enforced by the compiler.</em> The same principle applies to the pipeline that surrounds the code. A pipeline is not just automation — it is a set of architectural decisions about what you trust, what you verify, when you verify it, and how you ship.</p>
+<p>Those decisions have consequences. A pipeline that was designed for a monolith will actively resist a microkernel. A security gate that has no triage process will either block everything or get bypassed. A release workflow built around one binary will not survive a distribution model with five artifact types. These are not configuration problems. They are design problems, and they deserve the same intentional treatment as the code architecture.</p>
+<p>The current pipeline grew reactively, the same way <code>loop_.rs</code> grew to 9,500 lines. Nobody chose the current state. It accumulated. PR #5559 — the first major step of the microkernel transition — exposed several places where the pipeline’s assumptions no longer hold. That is a useful signal. It means now is exactly the right moment to stop, assess, and design intentionally.</p>
+<p>This RFC does for the pipeline what the architecture RFC does for the codebase: names what exists, identifies the structural problems, and proposes a path forward that is consistent with where the project is going.</p>
+<hr>
+<h2 id="2-honest-assessment-where-we-are-today"><a class="header" href="#2-honest-assessment-where-we-are-today">2. Honest Assessment: Where We Are Today</a></h2>
+<p>This section is not criticism. It is a diagnosis. The current pipeline reflects the decisions that made sense at the time. The goal is to understand it clearly enough to improve it.</p>
+<h3 id="21-two-workflows-doing-the-same-work"><a class="header" href="#21-two-workflows-doing-the-same-work">2.1 Two Workflows Doing the Same Work</a></h3>
+<p>The repository currently has two separate workflows that run on pull requests against <code>master</code>:</p>
+<ul>
+<li><code>checks-on-pr.yml</code> — branded as “Quality Gate”</li>
+<li><code>ci-run.yml</code> — branded as “CI”</li>
+</ul>
+<p>Both run Lint, Build, Test, and Security jobs independently on every PR. This means every PR triggers two full pipeline runs in parallel. For a monolith with a single compilation unit, this was expensive but manageable. For a multi-crate workspace, it doubles an already significant CI budget with no additional signal.</p>
+<p>The duplication has a subtler cost beyond compute minutes: when a check fails in one workflow but not the other, contributors do not know which result to trust. When a new check needs to be added, it must be added in two places. When behaviour needs to change, it must change in two places. Two sources of truth is the same problem as two sources of truth in code.</p>
+<h3 id="22-single-binary-assumptions-are-baked-in-everywhere"><a class="header" href="#22-single-binary-assumptions-are-baked-in-everywhere">2.2 Single-Binary Assumptions Are Baked In Everywhere</a></h3>
+<p>The release automation — <code>release-stable-manual.yml</code>, <code>release-beta-on-push.yml</code>, <code>publish-crates.yml</code>, <code>pub-aur.yml</code>, <code>pub-homebrew-core.yml</code>, <code>pub-scoop.yml</code>, <code>discord-release.yml</code>, <code>tweet-release.yml</code> — was designed around the assumption that a release is one binary. You build it, sign it, push it to package managers, and announce it.</p>
+<p>The architecture RFC defines a distribution model with five distinct artifact types: the kernel binary (multiple platform targets), the hardware-variant kernel binary, the gateway binary, WASM plugin files, and the Tauri desktop installer. None of the current release workflows account for this structure. When the architecture transition reaches Phase 3 and Phase 4, every one of these workflows will need to change — unless they are redesigned now with that model in mind.</p>
+<h3 id="23-security-scanning-without-a-lifecycle"><a class="header" href="#23-security-scanning-without-a-lifecycle">2.3 Security Scanning Without a Lifecycle</a></h3>
+<p>The security job runs <code>cargo audit</code> as a hard gate. If any advisory is present in the dependency tree, the gate fails and the PR cannot merge. The intent is correct. The implementation has a structural problem.</p>
+<p><code>cargo audit</code> reports all advisories in the dependency tree: active vulnerabilities, unmaintained crates, and informational notices. It does not distinguish between:</p>
+<ul>
+<li>A critical vulnerability in a crate the project actively calls</li>
+<li>A vulnerability in a transitive dependency three levels deep in an optional feature</li>
+<li>An “unmaintained” notice for a crate the project depends on indirectly through a third-party library it cannot control</li>
+<li>A pre-existing advisory that was present before this PR was opened</li>
+</ul>
+<p>When all of these produce the same hard failure, the gate becomes noise. The realistic response to noise is to lower the gate, ignore the failures, or suppress the checks. All three of those responses make the project less secure, not more. A security gate that cannot be maintained will not be maintained.</p>
+<p>PR #5559 surfaced twelve RUSTSEC-2026 advisories simultaneously. Without tooling to distinguish “new advisory introduced by this PR” from “pre-existing advisory present on master,” the PR author and reviewers cannot know whether this PR made the security posture worse.</p>
+<h3 id="24-the-strict-delta-lint-script"><a class="header" href="#24-the-strict-delta-lint-script">2.4 The Strict Delta Lint Script</a></h3>
+<p><code>ci-run.yml</code> includes a job that runs <code>scripts/ci/rust_strict_delta_gate.sh</code> — a custom script that compares clippy output against the base SHA of the PR. The concept is sound: you want to know whether this PR introduced new warnings, not just whether warnings exist in the codebase. The implementation works well for small, focused PRs against a monolithic crate.</p>
+<p>A PR that moves 260,000 lines of code across 10 new crates, touching hundreds of files, puts this script in territory it was not designed for. The changed-file surface is too large for an incremental comparison to produce a meaningful signal. The script needs to understand workspace structure — specifically that a change to a file in <code>crates/zeroclaw-channels/</code> should be evaluated in the context of that crate, not the root.</p>
+<h3 id="25-no-workspace-aware-caching-or-scoping"><a class="header" href="#25-no-workspace-aware-caching-or-scoping">2.5 No Workspace-Aware Caching or Scoping</a></h3>
+<p>The current Rust cache configuration (<code>Swatinem/rust-cache</code>) is adequate for a single crate. For a multi-crate workspace, cache effectiveness depends on understanding which crates changed and which compiled artifacts can be reused. Without explicit workspace scoping, a change to any crate can invalidate caches that other crates depend on, producing full recompilation on every PR.</p>
+<p>More significantly, there is no mechanism for running CI only against the crates affected by a given change. A PR that fixes a typo in <code>zeroclaw-tool-call-parser</code> does not need to rebuild and retest the gateway. As the workspace grows toward the 30+ crate model the architecture RFC envisions, the cost of running the full pipeline on every PR becomes a meaningful obstacle to contribution.</p>
+<h3 id="26-action-pinning-is-good--but-undocumented"><a class="header" href="#26-action-pinning-is-good--but-undocumented">2.6 Action Pinning Is Good — But Undocumented</a></h3>
+<p>The existing workflows do pin actions to full commit SHAs, which is correct security practice and worth acknowledging. But there is no documented policy explaining why, no process for reviewing when those SHAs should be updated, and no automation for keeping them current. Good behaviour without a policy is fragile — the next contributor to add a workflow step may not know why SHA pinning matters and will use a mutable tag instead.</p>
+<hr>
+<h2 id="3-the-target-pipeline-design"><a class="header" href="#3-the-target-pipeline-design">3. The Target Pipeline Design</a></h2>
+<h3 id="31-one-pipeline-one-source-of-truth"><a class="header" href="#31-one-pipeline-one-source-of-truth">3.1 One Pipeline, One Source of Truth</a></h3>
+<p>The two parallel workflows should be consolidated into a single, well-structured pipeline. The distinction between “Quality Gate” and “CI” is not meaningful to contributors — both are checks a PR must pass. The consolidation creates one place to find check results, one place to update when behaviour changes, and one place to document what each check is doing and why.</p>
+<p>The consolidated pipeline follows a staged structure where fast, cheap checks run first and gate slower, more expensive ones:</p>
+<pre><code>Stage 1: Format + Lint (2–5 min)
+  └── cargo fmt --check
+  └── cargo clippy --workspace --all-targets -- -D warnings
+  └── Docs quality gate
+
+Stage 2: Build + Check (parallel, 5–15 min)
+  └── Build matrix (Linux x86_64, macOS ARM, Windows)
+  └── cargo check --features ci-all
+  └── cargo check --no-default-features (kernel profile)
+  └── cargo check --target i686 (32-bit)
+
+Stage 3: Test (10–30 min, gated on Stage 1)
+  └── cargo nextest run --workspace
+
+Stage 4: Security (parallel with Stage 3)
+  └── cargo deny check (licenses, sources, advisories)
+  └── Advisory triage gate (see §4)
+
+Stage 5: Required Gate
+  └── Composite status — branch protection requires only this job
+</code></pre>
+<p>Stages 2, 3, and 4 run in parallel after Stage 1 passes. This means a formatting error fails fast without burning compute on a build that will be thrown away. The Required Gate job aggregates all results so branch protection needs to track only one job name — a pattern already present in both current workflows.</p>
+<h3 id="32-workspace-aware-clippy"><a class="header" href="#32-workspace-aware-clippy">3.2 Workspace-Aware Clippy</a></h3>
+<p>The current clippy invocation runs against the default feature set of the root crate. The correct invocation for a multi-crate workspace is:</p>
+<pre><code class="language-bash">cargo clippy --workspace --all-targets -- -D warnings
+</code></pre>
+<p>The <code>--workspace</code> flag ensures every crate in the workspace is linted, not just the root. The <code>--all-targets</code> flag includes tests, benchmarks, and examples. Combined with <code>--features ci-all</code> for the feature-gated check, this gives a complete picture.</p>
+<p>The strict delta lint concept — checking whether this PR introduced new warnings rather than whether warnings exist at all — is worth preserving. The implementation should move from a shell script comparing diff output to a proper workspace-aware invocation that evaluates each affected crate independently. A simpler and more reliable approach: require <code>--workspace -D warnings</code> to pass clean at all times, making the delta concept implicit. If the baseline is always clean, any PR that introduces a warning fails. This removes the need for a custom comparison script entirely.</p>
+<h3 id="33-changed-crate-detection"><a class="header" href="#33-changed-crate-detection">3.3 Changed-Crate Detection</a></h3>
+<p>For a workspace growing toward 30+ crates, running the full test suite on every PR regardless of what changed is wasteful. The pipeline should detect which crates were affected by the PR and scope test execution accordingly.</p>
+<p>The mechanism is straightforward: compare the files changed in the PR against the workspace member list, identify which crates contain changed files, expand the set to include all crates that depend on any changed crate (downstream impact), and run tests only for that set.</p>
+<pre><code>PR changes: crates/zeroclaw-tool-call-parser/src/lib.rs
+
+Affected crates:
+  zeroclaw-tool-call-parser     ← directly changed
+  zeroclaw-misc                 ← depends on it
+  zeroclawlabs (root)           ← depends on it
+
+Not affected:
+  zeroclaw-channels             ← no dependency path
+  zeroclaw-memory               ← no dependency path
+  zeroclaw-providers            ← no dependency path
+</code></pre>
+<p>This is implemented using <code>cargo metadata</code> to extract the dependency graph and a short script to walk it. The full test suite continues to run on pushes to <code>master</code> and on release branches. PRs run the affected-crate subset.</p>
+<h3 id="34-caching-strategy"><a class="header" href="#34-caching-strategy">3.4 Caching Strategy</a></h3>
+<p><code>Swatinem/rust-cache</code> supports workspace-aware caching through its <code>workspaces</code> configuration. The cache key should incorporate the workspace member list so that adding a new crate invalidates appropriately without invalidating unrelated crate caches.</p>
+<pre><code class="language-yaml">- uses: Swatinem/rust-cache@&lt;sha&gt;
+  with:
+    workspaces: |
+      . -&gt; target
+    cache-on-failure: true
+    save-if: ${{ github.ref == 'refs/heads/master' }}
+</code></pre>
+<p>The <code>save-if</code> condition means cache is only written on <code>master</code> pushes, not on every PR. PRs read from the cache but do not write competing versions. This avoids cache thrashing when multiple PRs are open simultaneously.</p>
+<hr>
+<h2 id="4-security-scanning-as-a-lifecycle"><a class="header" href="#4-security-scanning-as-a-lifecycle">4. Security Scanning as a Lifecycle</a></h2>
+<h3 id="41-the-problem-with-a-binary-gate"><a class="header" href="#41-the-problem-with-a-binary-gate">4.1 The Problem With a Binary Gate</a></h3>
+<p>A security gate that blocks on any advisory, without context, trains the team to treat security failures as noise. That is the opposite of the intended effect. The goal is a gate that is:</p>
+<ul>
+<li><strong>High signal</strong> — failures mean something real that this PR affected</li>
+<li><strong>Actionable</strong> — the contributor knows what to do and why</li>
+<li><strong>Sustainable</strong> — the gate can be maintained without constant manual intervention</li>
+</ul>
+<p><code>cargo audit</code> alone does not achieve this. <code>cargo deny</code> does.</p>
+<h3 id="42-cargo-deny-as-the-primary-security-tool"><a class="header" href="#42-cargo-deny-as-the-primary-security-tool">4.2 cargo-deny as the Primary Security Tool</a></h3>
+<p><code>cargo deny</code> is a more capable successor to <code>cargo audit</code> for project-level dependency policy. It enforces:</p>
+<ul>
+<li><strong>Advisories</strong> — RUSTSEC database, with the ability to deny, warn, or explicitly ignore specific advisories with a documented justification</li>
+<li><strong>Licenses</strong> — ensures all dependencies use acceptable licenses (important as the workspace grows and new contributors add deps)</li>
+<li><strong>Sources</strong> — ensures dependencies come only from approved registries (crates.io, path, git with specific hosts)</li>
+<li><strong>Duplicates</strong> — warns when multiple versions of the same crate appear in the dependency tree</li>
+</ul>
+<p>The key capability is the <code>[advisories]</code> section of <code>deny.toml</code>, which allows explicit ignores:</p>
+<pre><code class="language-toml">[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+vulnerability = "deny"
+unmaintained = "warn"
+unsound = "deny"
+notice = "warn"
+
+ignore = [
+    # RUSTSEC-2024-0388: `derivative` unmaintained — pulled in transitively
+    # through matrix-sdk; no direct usage, no active exploit. Tracked in #XXXX.
+    { id = "RUSTSEC-2024-0388", reason = "Transitive dep via matrix-sdk; no direct usage" },
+]
+</code></pre>
+<p>This approach transforms security scanning from a binary pass/fail into a documented, auditable policy. Every ignored advisory has a written justification and a tracking issue. Reviewers can see exactly which advisories are being suppressed and why. When a suppressed advisory escalates (a new exploit is found, a fix is available), the tracking issue is the reminder.</p>
+<h3 id="43-advisory-triage-process"><a class="header" href="#43-advisory-triage-process">4.3 Advisory Triage Process</a></h3>
+<p>When a new advisory appears in the dependency tree — whether from a PR or from the daily advisory database update — the process is:</p>
+<ol>
+<li><strong>Classify the advisory</strong>: Is the affected crate a direct dependency or transitive? Does ZeroClaw call the vulnerable code path? Is there a fixed version available?</li>
+<li><strong>Determine the response</strong>:
+<ul>
+<li><em>Vulnerability in a direct dep with a fix available</em> → update the dep, no ignore needed</li>
+<li><em>Vulnerability in a transitive dep with a fix available</em> → pin the transitive version or wait for the direct dep to update; open a tracking issue</li>
+<li><em>Unmaintained notice, no active exploit</em> → add to <code>deny.toml</code> ignore list with justification and tracking issue</li>
+<li><em>Critical vulnerability with no fix</em> → assess workaround; may block the PR</li>
+</ul>
+</li>
+<li><strong>Record the decision</strong> in <code>deny.toml</code> with the advisory ID, a brief rationale, and a link to the tracking issue</li>
+</ol>
+<p>This process means a PR like #5559 that surfaces twelve pre-existing advisories does not fail the gate without context. The advisories are triaged, the pre-existing ones are documented, and the gate reports only on new un-triaged advisories introduced by the PR.</p>
+<h3 id="44-daily-advisory-scan"><a class="header" href="#44-daily-advisory-scan">4.4 Daily Advisory Scan</a></h3>
+<p>Security advisories are published continuously. A PR that passed the security gate when it merged may contain a vulnerability published the following week. The pipeline should include a scheduled daily run against <code>master</code> that checks the advisory database and opens a GitHub Issue if new un-triaged advisories are found.</p>
+<pre><code class="language-yaml">on:
+  schedule:
+    - cron: '0 9 * * *'  # 09:00 UTC daily
+</code></pre>
+<p>This separates the advisory triage cycle from the PR merge cycle. Contributors are not blocked by advisories that appeared after their PR was written. The security team (or whoever is on rotation) handles the daily scan output as a regular maintenance task.</p>
+<hr>
+<h2 id="5-release-automation-aligned-to-the-distribution-model"><a class="header" href="#5-release-automation-aligned-to-the-distribution-model">5. Release Automation Aligned to the Distribution Model</a></h2>
+<h3 id="51-the-current-mismatch"><a class="header" href="#51-the-current-mismatch">5.1 The Current Mismatch</a></h3>
+<p>The architecture RFC §4.4.2 defines the following release artifacts:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Artifact</th><th>Build target</th><th>Published to</th></tr>
+</thead>
+<tbody>
+<tr><td>Kernel binary (standard)</td><td>x86_64-linux-musl, aarch64-linux-gnu, armv7-linux-gnueabihf, x86_64-darwin, aarch64-darwin, x86_64-windows</td><td>GitHub Releases</td></tr>
+<tr><td>Kernel binary (hardware)</td><td>aarch64-linux-gnu, armv7-linux-gnueabihf</td><td>GitHub Releases</td></tr>
+<tr><td>Gateway binary</td><td>Same platform matrix</td><td>GitHub Releases</td></tr>
+<tr><td>WASM plugin files</td><td>wasm32-wasip1</td><td>Plugin registry</td></tr>
+<tr><td>Desktop installer</td><td>x86_64 + aarch64, macOS/Windows/Linux</td><td>GitHub Releases, platform stores</td></tr>
+</tbody>
+</table>
+</div>
+<p>The current release workflows know about exactly one of these: the standard binary. The rest do not exist in the automation yet. This is appropriate for now — the plugin system is not yet complete. But the release workflows should be designed with this model in mind so they do not need to be rewritten as each new artifact type is introduced.</p>
+<h3 id="52-a-release-pipeline-structure"><a class="header" href="#52-a-release-pipeline-structure">5.2 A Release Pipeline Structure</a></h3>
+<p>The target release pipeline is a directed graph of jobs, not a monolithic workflow:</p>
+<pre><code>version-bump (release-plz PR merged)
+    │
+    ├── build-kernel-standard (matrix: 6 targets)
+    ├── build-kernel-hardware (matrix: 2 ARM targets + hardware flags)
+    ├── build-gateway (matrix: 6 targets)
+    ├── build-plugins-wasm (matrix: all plugin crates → wasm32-wasip1)
+    └── build-desktop (matrix: macOS, Windows, Linux AppImage/deb)
+            │
+            ├── publish-github-release (attaches all kernel + gateway binaries)
+            ├── publish-plugin-registry (uploads WASM files)
+            ├── publish-aur (kernel binary for Arch Linux)
+            ├── publish-homebrew (kernel binary for macOS)
+            ├── publish-scoop (kernel binary for Windows)
+            └── announce (Discord, social)
+</code></pre>
+<p>Each build job is independent and can be triggered separately for hotfix releases. The publish jobs depend on all relevant build jobs succeeding. The announce job runs last.</p>
+<p>This structure means a plugin-only release (a new version of <code>channel-discord.wasm</code>) can run only the <code>build-plugins-wasm</code> and <code>publish-plugin-registry</code> jobs without triggering a full kernel rebuild. A kernel patch release runs <code>build-kernel-*</code> and the downstream publish jobs without touching the plugin registry.</p>
+<h3 id="53-release-plz-for-workspace-aware-version-management"><a class="header" href="#53-release-plz-for-workspace-aware-version-management">5.3 Release-plz for Workspace-Aware Version Management</a></h3>
+<p>The architecture RFC §4.4.1 specifies <code>release-plz</code> as the release automation tool. <code>release-plz</code> integrates directly with this pipeline model:</p>
+<ul>
+<li>On push to <code>master</code>, <code>release-plz</code> opens a “Release PR” that bumps the workspace version, updates changelogs from conventional commit history, and lists all crates that have changed since the last release</li>
+<li>When the Release PR is merged, the release pipeline triggers automatically</li>
+<li>Crates with <code>version.workspace = true</code> are bumped together; independently-versioned crates (<code>zeroclaw-api</code>, hardware library crates) are handled separately per the versioning policy</li>
+</ul>
+<p>The Release PR serves as a review checkpoint: the team sees exactly what version will be published and what the changelog says before anything goes out. This replaces manual version bumps and the <code>version-sync.yml</code> workflow.</p>
+<h3 id="54-action-pinning-policy"><a class="header" href="#54-action-pinning-policy">5.4 Action Pinning Policy</a></h3>
+<p>The current workflows already pin actions to full commit SHAs. This is correct and should be formalised as an explicit policy so it survives contributor turnover:</p>
+<p><strong>Policy:</strong> All <code>uses:</code> references in workflow files must be pinned to a full commit SHA with a version comment. Mutable tags (<code>@v4</code>, <code>@main</code>, <code>@latest</code>) are not permitted. No exceptions.</p>
+<pre><code class="language-yaml"># Correct
+- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+# Not permitted
+- uses: actions/checkout@v4
+- uses: actions/checkout@main
+</code></pre>
+<p><strong>Rationale:</strong> A mutable tag is a promise from a third party that the action’s behaviour will not change. That promise has been broken repeatedly across the GitHub Actions ecosystem. A SHA pin means the workflow runs exactly what was reviewed, regardless of what the action author does after the fact. This is especially important for actions that have write permissions or access to secrets.</p>
+<p>The update process: use <code>dependabot</code> or <code>renovate</code> configured for GitHub Actions to open PRs when new SHA versions are available. The team reviews and merges those PRs. This keeps actions current without requiring manual monitoring.</p>
+<hr>
+<h2 id="6-standards-we-should-adopt"><a class="header" href="#6-standards-we-should-adopt">6. Standards We Should Adopt</a></h2>
+<h3 id="61-slsa-supply-chain-security-framework"><a class="header" href="#61-slsa-supply-chain-security-framework">6.1 SLSA: Supply Chain Security Framework</a></h3>
+<p>SLSA (Supply-chain Levels for Software Artifacts, pronounced “salsa”) is a framework developed by Google and adopted across the industry for securing the software supply chain. It defines four levels of build integrity, from basic to hermetic.</p>
+<p>For ZeroClaw’s current scale and team size, <strong>SLSA Level 2</strong> is the appropriate target:</p>
+<ul>
+<li>Builds run on a hosted CI platform (already true — GitHub Actions)</li>
+<li>Build scripts are version-controlled (already true)</li>
+<li>Build provenance is generated and attached to release artifacts (the step to add)</li>
+</ul>
+<p>SLSA Level 2 provenance means each release artifact ships with a cryptographically signed attestation that records: what source commit produced it, which workflow produced it, and that the workflow ran on the expected platform. Users and package managers can verify this attestation. It closes the gap between “we say this binary came from this source” and “this binary provably came from this source.”</p>
+<p>GitHub Actions supports SLSA Level 2 provenance generation natively through the <code>actions/attest-build-provenance</code> action. The cost to add it is one step per build job.</p>
+<h3 id="62-conventional-commits-already-implied--formalise-it"><a class="header" href="#62-conventional-commits-already-implied--formalise-it">6.2 Conventional Commits (Already Implied — Formalise It)</a></h3>
+<p>The architecture RFC’s versioning policy and release-plz integration both depend on conventional commit format for changelog generation. The governance RFC already references PR title conventions. This RFC formalises the connection: conventional commit format in commit messages and PR titles is a requirement, not a suggestion, because it is the input that drives automated changelog generation.</p>
+<p>The categories that matter for ZeroClaw’s changelog:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Prefix</th><th>Changelog section</th><th>Version impact</th></tr>
+</thead>
+<tbody>
+<tr><td><code>feat:</code></td><td>New features</td><td>MINOR</td></tr>
+<tr><td><code>fix:</code></td><td>Bug fixes</td><td>PATCH</td></tr>
+<tr><td><code>feat!:</code> or <code>fix!:</code></td><td>Breaking changes</td><td>MAJOR</td></tr>
+<tr><td><code>chore:</code></td><td>Maintenance</td><td>No release entry</td></tr>
+<tr><td><code>docs:</code></td><td>Documentation</td><td>No release entry</td></tr>
+<tr><td><code>perf:</code></td><td>Performance</td><td>PATCH</td></tr>
+<tr><td><code>security:</code></td><td>Security fixes</td><td>PATCH (at minimum)</td></tr>
+</tbody>
+</table>
+</div>
+<p>CI enforces this with a PR title lint job that validates the title matches the conventional commit format before any other check runs.</p>
+<h3 id="63-reusable-workflows"><a class="header" href="#63-reusable-workflows">6.3 Reusable Workflows</a></h3>
+<p>As the number of crates and artifact types grows, workflow duplication becomes a maintenance problem. GitHub Actions supports reusable workflows — a workflow that can be called from another workflow like a function. The build matrix, the security scan, and the test runner should each be extracted as reusable workflows.</p>
+<pre><code>.github/
+  workflows/
+    ci.yml               ← PR checks (calls reusable workflows)
+    release.yml          ← Release pipeline (calls reusable workflows)
+    daily-audit.yml      ← Scheduled security scan
+  _workflows/            ← Reusable workflow definitions
+    build-rust.yml       ← Parameterised build job
+    test-workspace.yml   ← Parameterised test job
+    security-scan.yml    ← cargo-deny invocation + triage
+    publish-release.yml  ← Parameterised publish job
+</code></pre>
+<p>A reusable workflow is called with parameters:</p>
+<pre><code class="language-yaml">jobs:
+  build-kernel:
+    uses: ./.github/_workflows/build-rust.yml
+    with:
+      target: x86_64-unknown-linux-musl
+      features: ""
+      profile: dist
+</code></pre>
+<p>This means the CI workflow and the release workflow share the same build definition. A fix to the build process applies everywhere at once.</p>
+<hr>
+<h2 id="7-phased-roadmap"><a class="header" href="#7-phased-roadmap">7. Phased Roadmap</a></h2>
+<p>The pipeline migration follows the same Strangler Fig approach as the code migration: build alongside, migrate steadily, never break the existing gate.</p>
+<hr>
+<h3 id="phase-1--v070--rationalise"><a class="header" href="#phase-1--v070--rationalise">Phase 1 · v0.7.0 — “Rationalise”</a></h3>
+<p><strong>Theme:</strong> One pipeline, clean signal, no duplication.</p>
+<p><strong>Why this phase:</strong> The architectural transition is already underway. The pipeline needs to stop fighting it before it makes implementation work harder than it needs to be.</p>
+<h4 id="deliverables"><a class="header" href="#deliverables">Deliverables</a></h4>
+<p><strong>D1: Consolidate <code>checks-on-pr.yml</code> and <code>ci-run.yml</code> into a single workflow</strong></p>
+<p>Merge the two PR workflows into one. The consolidated workflow keeps the staged structure defined in §3.1. The <code>Quality Gate</code> and <code>CI</code> naming distinction disappears. There is one workflow, one set of results, one place to look.</p>
+<p>The composite gate job (<code>CI Required Gate</code>) is preserved. Branch protection continues to require only that single job. This means the internal structure of the pipeline can change without requiring branch protection rule updates.</p>
+<p><strong>D2: Replace <code>cargo audit</code> with <code>cargo deny</code></strong></p>
+<p>Add <code>deny.toml</code> to the repository root. Configure the <code>[advisories]</code>, <code>[licenses]</code>, and <code>[sources]</code> sections. Triage all current RUSTSEC advisories on <code>master</code>: update what can be updated, document what cannot with justification and tracking issues. The security gate passes clean on <code>master</code> before this phase is complete.</p>
+<p><strong>D3: Fix workspace-aware clippy invocation</strong></p>
+<p>Change <code>cargo clippy --all-targets -- -D warnings</code> to <code>cargo clippy --workspace --all-targets -- -D warnings</code> in the consolidated workflow. Remove the <code>rust_strict_delta_gate.sh</code> script — with <code>--workspace -D warnings</code> always enforced clean, the delta concept is implicit.</p>
+<p><strong>D4: Formalise action pinning policy</strong></p>
+<p>Add a <code>SECURITY.md</code> note and a CI check that validates all <code>uses:</code> references in workflow files are SHA-pinned. Add <code>dependabot</code> configuration for GitHub Actions updates.</p>
+<p><strong>D5: Add daily advisory scan workflow</strong></p>
+<p>Add <code>daily-audit.yml</code> as a scheduled workflow running <code>cargo deny check advisories</code> against <code>master</code> at 09:00 UTC. On failure, open a GitHub Issue with the advisory details using <code>gh issue create</code>.</p>
+<h4 id="success-metrics-for-phase-1"><a class="header" href="#success-metrics-for-phase-1">Success Metrics for Phase 1</a></h4>
+<ul>
+<li>Single PR workflow file, no duplication</li>
+<li>Security gate passes clean on <code>master</code> with documented triage for all pre-existing advisories</li>
+<li><code>cargo clippy --workspace</code> runs and passes clean</li>
+<li>No mutable action tag references in any workflow file</li>
+<li>Daily advisory scan operational</li>
+</ul>
+<hr>
+<h3 id="phase-2--v080--workspace-aware"><a class="header" href="#phase-2--v080--workspace-aware">Phase 2 · v0.8.0 — “Workspace-Aware”</a></h3>
+<p><strong>Theme:</strong> The pipeline understands the workspace. Fast feedback for focused changes.</p>
+<p><strong>Why this phase:</strong> By v0.8.0 the workspace will have grown further. Running the full pipeline on every PR will be increasingly expensive. Contributors to <code>zeroclaw-tool-call-parser</code> should not wait 30 minutes for a gateway rebuild.</p>
+<h4 id="deliverables-1"><a class="header" href="#deliverables-1">Deliverables</a></h4>
+<p><strong>D1: Changed-crate detection</strong></p>
+<p>Add a <code>scripts/ci/affected_crates.sh</code> script that uses <code>cargo metadata</code> to build the dependency graph and returns the set of crates affected by the PR’s changed files. The CI workflow uses this output to scope test execution.</p>
+<p><strong>D2: Per-crate test scoping</strong></p>
+<p>Add <code>--package</code> flags to <code>cargo nextest</code> based on the affected-crate output. Full workspace tests continue to run on <code>master</code> pushes and nightly. PRs run the affected subset.</p>
+<p><strong>D3: Workspace-aware cache configuration</strong></p>
+<p>Update <code>Swatinem/rust-cache</code> configuration with explicit workspace scoping and <code>save-if: ${{ github.ref == 'refs/heads/master' }}</code> to prevent cache thrashing from concurrent PRs.</p>
+<p><strong>D4: Extract reusable workflow definitions</strong></p>
+<p>Extract the build, test, and security jobs into reusable workflow files under <code>.github/_workflows/</code>. Update <code>ci.yml</code> and the new <code>release.yml</code> skeleton to call them.</p>
+<h4 id="success-metrics-for-phase-2"><a class="header" href="#success-metrics-for-phase-2">Success Metrics for Phase 2</a></h4>
+<ul>
+<li>A PR touching only <code>zeroclaw-tool-call-parser</code> runs tests for that crate and its dependents, not the full workspace</li>
+<li>Cache hit rate on CI above 80% for incremental builds</li>
+<li>Reusable workflows in place for build, test, and security jobs</li>
+</ul>
+<hr>
+<h3 id="phase-3--v090--release-pipeline"><a class="header" href="#phase-3--v090--release-pipeline">Phase 3 · v0.9.0 — “Release Pipeline”</a></h3>
+<p><strong>Theme:</strong> Release automation that matches the distribution model.</p>
+<p><strong>Why this phase:</strong> Phase 3 of the architecture RFC extracts <code>zeroclaw-gw</code> as a separate binary. The first multi-artifact release happens here. The release pipeline must be ready before it is needed.</p>
+<h4 id="deliverables-2"><a class="header" href="#deliverables-2">Deliverables</a></h4>
+<p><strong>D1: Introduce <code>release-plz</code> and remove <code>version-sync.yml</code></strong></p>
+<p>Configure <code>release-plz</code> for the workspace. Workspace application crates use <code>version.workspace = true</code>. <code>zeroclaw-api</code> and hardware library crates are configured with independent release settings. The <code>version-sync.yml</code> workflow is retired.</p>
+<p><strong>D2: Build the structured release pipeline in <code>release.yml</code></strong></p>
+<p>Implement the directed release graph from §5.2: <code>build-kernel-standard</code>, <code>build-kernel-hardware</code>, <code>build-gateway</code>, with downstream publish jobs. Plugin build jobs are stubbed — they succeed with no-op until Phase 4.</p>
+<p><strong>D3: Add SLSA Level 2 provenance</strong></p>
+<p>Add <code>actions/attest-build-provenance</code> to each build job. Provenance attestations are attached to GitHub Release assets. Document verification instructions in <code>SECURITY.md</code>.</p>
+<p><strong>D4: Retire redundant release workflows</strong></p>
+<p>Consolidate <code>release-stable-manual.yml</code>, <code>release-beta-on-push.yml</code>, <code>pub-aur.yml</code>, <code>pub-homebrew-core.yml</code>, <code>pub-scoop.yml</code>, <code>discord-release.yml</code>, <code>tweet-release.yml</code> into the structured <code>release.yml</code> pipeline. These workflows grew independently; the structured pipeline replaces them with a single, auditable flow.</p>
+<h4 id="success-metrics-for-phase-3"><a class="header" href="#success-metrics-for-phase-3">Success Metrics for Phase 3</a></h4>
+<ul>
+<li><code>release-plz</code> opens and manages Release PRs on <code>master</code></li>
+<li>Kernel and gateway binaries are built and published from a single <code>release.yml</code> workflow</li>
+<li>SLSA Level 2 provenance attached to all release assets</li>
+<li>Redundant release workflows retired</li>
+</ul>
+<hr>
+<h3 id="phase-4--v100--platform-pipeline"><a class="header" href="#phase-4--v100--platform-pipeline">Phase 4 · v1.0.0 — “Platform Pipeline”</a></h3>
+<p><strong>Theme:</strong> The pipeline ships the platform, not just the binary.</p>
+<p><strong>Why this phase:</strong> v1.0.0 is when WASM plugins become publishable. The pipeline must handle plugin publishing, registry upload, and the Tauri desktop installer as first-class release artifacts.</p>
+<h4 id="deliverables-3"><a class="header" href="#deliverables-3">Deliverables</a></h4>
+<p><strong>D1: Activate WASM plugin build jobs</strong></p>
+<p>Implement <code>build-plugins-wasm</code> in the release pipeline. Each plugin crate builds to <code>wasm32-wasip1</code> in a dedicated job. Plugin manifests are generated and signed. The <code>publish-plugin-registry</code> job uploads signed WASM files to the plugin registry.</p>
+<p><strong>D2: Desktop installer build and publish</strong></p>
+<p>Complete the Tauri build jobs for macOS, Windows, and Linux. The installer bundles the kernel and gateway binaries. Code signing credentials for macOS and Windows are documented as required repository secrets with a setup guide.</p>
+<p><strong>D3: Publish the CI/CD standards to <code>docs/book/src/maintainers/ci-and-actions.md</code></strong></p>
+<p>The action pinning policy, advisory triage process, conventional commit requirements, and release pipeline structure defined in this RFC are extracted to <code>docs/book/src/maintainers/ci-and-actions.md</code> as a standing reference. This RFC remains the historical record of the decisions; the extracted document is what contributors look up day-to-day.</p>
+<p><strong>D4: Contributor onboarding for the pipeline</strong></p>
+<p>Add a <code>Running CI Locally</code> section to the contributing documentation that shows contributors how to replicate the CI checks on their own machine before pushing:</p>
+<pre><code class="language-bash"># What CI runs — run these before pushing
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo nextest run --workspace
+cargo deny check
+</code></pre>
+<h4 id="success-metrics-for-phase-4"><a class="header" href="#success-metrics-for-phase-4">Success Metrics for Phase 4</a></h4>
+<ul>
+<li>WASM plugin files are published to the registry as part of the release pipeline</li>
+<li>Tauri desktop installer is built and published automatically on release</li>
+<li><code>docs/book/src/maintainers/ci-and-actions.md</code> exists and covers action pinning, advisory triage, and conventional commits</li>
+<li>A contributor can replicate all CI checks locally with four commands</li>
+</ul>
+<hr>
+<h2 id="8-what-this-means-for-contributors"><a class="header" href="#8-what-this-means-for-contributors">8. What This Means for Contributors</a></h2>
+<h3 id="for-contributors-opening-prs"><a class="header" href="#for-contributors-opening-prs">For contributors opening PRs</a></h3>
+<p>The consolidated pipeline means one place to look for results. Stage 1 (format and lint) fails fast — if you have a formatting error, you know in two minutes without waiting for a build. If Stage 1 passes, the build and test stages run in parallel and you have a full result in under 30 minutes for most changes.</p>
+<p>The conventional commit requirement on PR titles is enforced by CI. If your title does not match the format, the lint job fails immediately with a clear message. This is not bureaucracy — it is the input that generates the changelog automatically, which means releases happen faster and with less manual work.</p>
+<h3 id="for-contributors-adding-dependencies"><a class="header" href="#for-contributors-adding-dependencies">For contributors adding dependencies</a></h3>
+<p>Every new dependency passes through <code>cargo deny</code>. If the dependency has a known vulnerability, an unacceptable license, or comes from an untrusted source, the security gate fails and tells you why. This is by design. The right response is to investigate the dependency, not to suppress the check.</p>
+<p>If a dependency carries an advisory that is not fixable (a transitive dep with no available update), the triage process in §4.3 is how you document that. Open a tracking issue, add the ignore entry to <code>deny.toml</code> with your justification, and move forward. The security posture is maintained through documentation, not through hoping the advisory goes away.</p>
+<h3 id="for-contributors-adding-workflow-files"><a class="header" href="#for-contributors-adding-workflow-files">For contributors adding workflow files</a></h3>
+<p>New workflow files follow three rules without exception:</p>
+<ol>
+<li>All <code>uses:</code> references are SHA-pinned with a version comment</li>
+<li>New jobs are extracted as reusable workflows if they duplicate logic from an existing job</li>
+<li>New release-related jobs are added to <code>release.yml</code>, not as new workflow files</li>
+</ol>
+<p>When in doubt, ask before adding. Workflow files are high-risk changes — they run with elevated permissions on CI infrastructure and can affect supply chain security. They deserve the same review standard as <code>src/security/</code>.</p>
+<h3 id="for-maintainers"><a class="header" href="#for-maintainers">For maintainers</a></h3>
+<p>The daily advisory scan means security is a regular maintenance task, not a crisis. When a new advisory fires, the triage process is well-defined and the outcome is documented in <code>deny.toml</code> and a tracking issue. Reviewers can audit the full history of advisory decisions in git history.</p>
+<p>The Release PR from <code>release-plz</code> is the release review checkpoint. Before anything is published, the team sees the version, the changelog, and the list of changed crates. Releases do not happen by accident.</p>
+<hr>
+<h2 id="appendix-a-glossary"><a class="header" href="#appendix-a-glossary">Appendix A: Glossary</a></h2>
+<p><strong>SLSA (Supply-chain Levels for Software Artifacts)</strong> — A security framework that defines levels of build integrity, from basic provenance to fully hermetic builds. Developed by Google and adopted by the OpenSSF. Level 2 is the practical target for most open-source projects: hosted build platform, version-controlled build scripts, signed provenance attached to artifacts.</p>
+<p><strong>Provenance</strong> — A cryptographically signed record of where a build artifact came from: which source commit, which workflow, which platform. Allows users and package managers to verify that a binary was produced from the claimed source by the claimed process.</p>
+<p><strong><code>cargo deny</code></strong> — A Cargo plugin that enforces dependency policy across three dimensions: security advisories (from the RustSec database), software licenses (against a defined allowlist), and source registries (ensuring deps come only from approved locations). More configurable than <code>cargo audit</code> and better suited to policy management at scale.</p>
+<p><strong><code>release-plz</code></strong> — A Rust-ecosystem release automation tool that creates “Release PRs” on push to the default branch, bumping versions and generating changelogs from conventional commit history. Workspace-aware; understands which crates changed and which need new versions.</p>
+<p><strong>Reusable workflow</strong> — A GitHub Actions workflow that can be called as a job from another workflow, with parameters. Allows build, test, and security logic to be defined once and called from both the PR pipeline and the release pipeline.</p>
+<p><strong>Conventional commits</strong> — A commit message convention (<code>feat:</code>, <code>fix:</code>, <code>chore:</code>, etc.) that enables automated changelog generation and version determination. The input that tools like <code>release-plz</code> use to decide whether a release is a patch, minor, or major bump.</p>
+<p><strong>Strangler Fig (in pipeline context)</strong> — The same migration strategy applied to workflows: build the new pipeline structure alongside the existing one, migrate jobs one at a time, retire the old files only when the new structure is complete and verified.</p>
+<hr>
+<h2 id="appendix-b-further-reading"><a class="header" href="#appendix-b-further-reading">Appendix B: Further Reading</a></h2>
+<ul>
+<li>
+<p><strong>SLSA Framework</strong> — https://slsa.dev — The full specification and implementation guides for supply chain security levels.</p>
+</li>
+<li>
+<p><strong><code>cargo deny</code> documentation</strong> — https://embarkstudios.github.io/cargo-deny/ — Configuration reference for the <code>deny.toml</code> policy file, including all advisory, license, and source options.</p>
+</li>
+<li>
+<p><strong><code>release-plz</code> documentation</strong> — https://release-plz.eplant.org — Workspace configuration, changelog format customisation, and GitHub Actions integration guide.</p>
+</li>
+<li>
+<p><strong>GitHub Actions security hardening</strong> — https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions — Official guidance on SHA pinning, token permissions, and supply chain risk in Actions workflows.</p>
+</li>
+<li>
+<p><strong>Conventional Commits specification</strong> — https://www.conventionalcommits.org — The full specification for commit message format and its relationship to semantic versioning.</p>
+</li>
+<li>
+<p><strong>OpenSSF Scorecard</strong> — https://securityscorecards.dev — An automated tool that scores open-source projects on security practices including dependency pinning, branch protection, code review requirements, and more. Useful as a baseline assessment and ongoing health metric.</p>
+</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-003-governance.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-005-contribution-culture.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-003-governance.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-005-contribution-culture.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

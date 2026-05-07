@@ -1,0 +1,78 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Derive macro that generates secret and property methods for config structs."><title>Configurable in zeroclaw_macros - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-b7b9f40b.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="zeroclaw_macros" data-themes="" data-resource-suffix="" data-rustdoc-version="1.95.0 (59807616e 2026-04-14)" data-channel="1.95.0" data-search-js="search-63369b7b.js" data-stringdex-js="stringdex-b897f86f.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc derive"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Configurable</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../zeroclaw_macros/index.html">zeroclaw_<wbr>macros</a><span class="version">0.7.5</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Configurable</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#attributes" title="Attributes">Attributes</a></li><li><a href="#generated-methods" title="Generated methods">Generated methods</a><ul><li><a href="#secret-methods" title="Secret methods">Secret methods</a></li><li><a href="#property-methods" title="Property methods">Property methods</a></li></ul></li><li><a href="#adding-a-new-config-struct" title="Adding a new config struct">Adding a new config struct</a><ul><li><a href="#enum-fields" title="Enum fields">Enum fields</a></li></ul></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="index.html">In crate zeroclaw_<wbr>macros</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">zeroclaw_macros</a></div><h1>Derive Macro <span class="derive">Configurable</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/zeroclaw_macros/lib.rs.html#117-977">Source</a> </span></div><pre class="rust item-decl"><code>#[derive(Configurable)]
+{
+    <span class="comment">// Attributes available to this derive:</span>
+    #[secret]
+    #[nested]
+    #[prefix]
+    #[serde]
+    #[derived_from_secret]
+    #[display_name]
+    #[description]
+    #[integration]
+}
+</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Derive macro that generates secret and property methods for config structs.</p>
+<h2 id="attributes"><a class="doc-anchor" href="#attributes">§</a>Attributes</h2>
+<ul>
+<li><code>#[secret]</code> on a <code>String</code> or <code>Option&lt;String&gt;</code> field marks it as a secret.</li>
+<li><code>#[nested]</code> on a nested struct or <code>Option&lt;StructWithSecrets&gt;</code> field
+delegates secret discovery and setting to the child.</li>
+<li><code>#[prefix = "channels.matrix"]</code> on the struct sets the dotted path prefix.</li>
+</ul>
+<h2 id="generated-methods"><a class="doc-anchor" href="#generated-methods">§</a>Generated methods</h2><h3 id="secret-methods"><a class="doc-anchor" href="#secret-methods">§</a>Secret methods</h3>
+<ul>
+<li><code>secret_fields(&amp;self) -&gt; Vec&lt;SecretFieldInfo&gt;</code></li>
+<li><code>set_secret(&amp;mut self, name: &amp;str, value: String) -&gt; Result&lt;()&gt;</code></li>
+<li><code>encrypt_secrets(&amp;mut self, store: &amp;SecretStore) -&gt; Result&lt;()&gt;</code></li>
+<li><code>decrypt_secrets(&amp;mut self, store: &amp;SecretStore) -&gt; Result&lt;()&gt;</code></li>
+</ul>
+<h3 id="property-methods"><a class="doc-anchor" href="#property-methods">§</a>Property methods</h3>
+<ul>
+<li><code>prop_fields(&amp;self) -&gt; Vec&lt;PropFieldInfo&gt;</code> — enumerate all fields</li>
+<li><code>get_prop(&amp;self, name: &amp;str) -&gt; Result&lt;String&gt;</code> — get current value as string</li>
+<li><code>set_prop(&amp;mut self, name: &amp;str, value_str: &amp;str) -&gt; Result&lt;()&gt;</code> — parse string and set</li>
+<li><code>prop_is_secret(name: &amp;str) -&gt; bool</code> — static check</li>
+<li><code>init_defaults(&amp;mut self, prefix: Option&lt;&amp;str&gt;) -&gt; Vec&lt;&amp;'static str&gt;</code> — instantiate None nested sections</li>
+</ul>
+<h2 id="adding-a-new-config-struct"><a class="doc-anchor" href="#adding-a-new-config-struct">§</a>Adding a new config struct</h2>
+<ol>
+<li>Derive <code>Configurable</code> and <code>Default</code>, set <code>#[prefix]</code>, add <code>enabled</code> if the
+section is opt-in:</li>
+</ol>
+
+<div class="example-wrap ignore"><a href="#" class="tooltip" title="This example is not tested">ⓘ</a><pre class="rust rust-example-rendered"><code><span class="kw">use </span>zeroclaw_macros::Configurable;
+
+<span class="attr">#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[prefix = <span class="string">"channels.your-channel"</span>]
+</span><span class="kw">pub struct </span>YourChannelConfig {
+    <span class="attr">#[serde(default)]
+    </span><span class="kw">pub </span>enabled: bool,
+    <span class="attr">#[secret]
+    </span><span class="kw">pub </span>bot_token: String,
+    <span class="attr">#[secret]
+    </span><span class="kw">pub </span>webhook_secret: <span class="prelude-ty">Option</span>&lt;String&gt;,
+    <span class="kw">pub </span>room_id: String,
+}</code></pre></div>
+<ol start="2">
+<li>
+<p>If the struct nests inside a parent (e.g. <code>ChannelsConfig</code>), add <code>#[nested]</code>
+on the parent’s field so the tree traversal finds it.</p>
+</li>
+<li>
+<p>Field names convert from <code>snake_case</code> to <code>kebab-case</code> for CLI use.
+<code>bot_token</code> on a struct with <code>#[prefix = "channels.your-channel"]</code>
+becomes <code>channels.your-channel.bot-token</code>.</p>
+</li>
+</ol>
+<h3 id="enum-fields"><a class="doc-anchor" href="#enum-fields">§</a>Enum fields</h3>
+<p>Enum types used as fields must implement <code>HasPropKind</code>. Add the type to the
+<code>impl_enum_prop_kind!</code> block in <code>crates/zeroclaw-config/src/schema.rs</code>, or
+implement <code>HasPropKind</code> at the enum’s definition site:</p>
+
+<div class="example-wrap ignore"><a href="#" class="tooltip" title="This example is not tested">ⓘ</a><pre class="rust rust-example-rendered"><code><span class="kw">impl </span><span class="kw">crate</span>::config::HasPropKind <span class="kw">for </span>YourEnum {
+    <span class="kw">const </span>PROP_KIND: <span class="kw">crate</span>::config::PropKind = <span class="kw">crate</span>::config::PropKind::Enum;
+}</code></pre></div>
+<p>Live examples: see <code>ChannelsConfig</code>, <code>ProvidersConfig</code>, and <code>MemoryConfig</code>
+in <code>crates/zeroclaw-config/src/schema.rs</code>.</p>
+</div></details></section></div></main></body></html>

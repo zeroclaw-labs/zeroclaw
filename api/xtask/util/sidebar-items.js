@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["book_dir","copy_dir_all","ensure_cargo_tool","fluent_locales","fluent_locales_dir","ftl_files_in","locale_entries","locales","mdbook_program","po_dir","pot_file","read_provider_config","ref_dir","repo_root","require_tool","run_cmd"],"struct":["LocaleEntry","ProviderConfig"]};

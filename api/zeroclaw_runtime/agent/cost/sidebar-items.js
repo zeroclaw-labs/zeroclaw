@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["check_tool_loop_budget","record_tool_loop_cost_usage"],"static":["TOOL_LOOP_COST_TRACKING_CONTEXT"],"struct":["ToolLoopCostTrackingContext","TurnUsage"]};

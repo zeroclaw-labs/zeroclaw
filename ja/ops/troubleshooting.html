@@ -1,0 +1,414 @@
+<!DOCTYPE HTML>
+<html lang="ja" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>トラブルシューティング - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-83844b35.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-69ff217c.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/ops/troubleshooting.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="トラブルシューティング"><a class="header" href="#トラブルシューティング">トラブルシューティング</a></h1>
+<p>遭遇する可能性が高い順の一般的な失敗モード。</p>
+<p>まず最初に確認すべき箇所：</p>
+<pre><code class="language-bash">zeroclaw doctor
+</code></pre>
+<p>一連のチェックを実行し、要約を表示します。以下に示される詳細は、<code>doctor</code> コマンドがフラグとして出力する内容の詳細版です。</p>
+<hr>
+<h2 id="インストール時"><a class="header" href="#インストール時">インストール時</a></h2>
+<h3 id="cargoが見つかりません"><a class="header" href="#cargoが見つかりません"><code>cargo</code>が見つかりません</a></h3>
+<pre><code class="language-bash">curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+</code></pre>
+<p>Rustを完全にスキップするには、<code>install.sh</code> / <code>setup.bat</code> に <code>--prebuilt</code> を渡してください。</p>
+<h3 id="ビルド依存関係が不足しています-linux"><a class="header" href="#ビルド依存関係が不足しています-linux">ビルド依存関係が不足しています (Linux)</a></h3>
+<p>ディストロのベースラインツールチェーンをインストールし、<code>./install.sh</code> を再実行してください：</p>
+<pre><code class="language-bash"># Debian / Ubuntu
+sudo apt install build-essential pkg-config
+
+# Fedora / RHEL
+sudo dnf group install development-tools &amp;&amp; sudo dnf install pkg-config
+
+# Arch
+sudo pacman -S base-devel
+</code></pre>
+<p>ディストロ別の完全なリスト: <a href="../setup/linux.html">セットアップ → Linux</a>。</p>
+<h3 id="低ramホストでoomをビルドする"><a class="header" href="#低ramホストでoomをビルドする">低RAMホストでOOMをビルドする</a></h3>
+<p>ZeroClaw をソースコードからコンパイルするには、ピーク時に約 2 GB の RAM が必要です。512 MB の Raspberry Pi では、OOM（Out of Memory）が発生します。</p>
+<p>オプション:</p>
+<ol>
+<li><strong>プリビルドを使用する</strong> — <code>./install.sh --prebuilt</code> はツールチェーンをスキップし、GitHub Releases からダウンロードします。</li>
+<li><strong>大きなマシンでクロスコンパイルし、バイナリをコピーする</strong></li>
+<li><strong>ビルドを直列化</strong> — <code>CARGO_BUILD_JOBS=1 cargo build --release --locked</code></li>
+<li><strong>スワップを追加</strong>（RAMでは動作しますが、ディスク容量を消費するため、両方が利用可能か確認してください）</li>
+</ol>
+<h3 id="ビルドが非常に遅い"><a class="header" href="#ビルドが非常に遅い">ビルドが非常に遅い</a></h3>
+<p>Matrix E2EE スタック（<code>matrix-sdk</code>、<code>ruma</code>、<code>vodozemac</code>）および TLS/crypto ネイティブ依存関係（<code>aws-lc-sys</code>、<code>ring</code>）が主なコストです。これらが必要ない場合はオプトアウトしてください：</p>
+<pre><code class="language-bash">cargo build --release --locked --no-default-features --features デフォルトの軽量
+</code></pre>
+<p>または、何が起きているかを確認してください：</p>
+<pre><code class="language-bash">cargo check --timings
+# report at target/cargo-timings/cargo-timing.html
+</code></pre>
+<h3 id="インストール後zeroclaw-コマンドが見つかりません"><a class="header" href="#インストール後zeroclaw-コマンドが見つかりません">インストール後、<code>zeroclaw: コマンドが見つかりません</code></a></h3>
+<p><code>cargo install</code> はバイナリを <code>~/.cargo/bin/</code> に配置します。PATH に追加してください：</p>
+<pre><code class="language-bash">export PATH="$HOME/.cargo/bin:$PATH"
+</code></pre>
+<p>シェルプロファイルに永続化してください。</p>
+<hr>
+<h2 id="オンボーディング"><a class="header" href="#オンボーディング">オンボーディング</a></h2>
+<h3 id="ウィザードは存在しない設定を要求しています"><a class="header" href="#ウィザードは存在しない設定を要求しています">ウィザードは存在しない設定を要求しています</a></h3>
+<p>以前のインストールで <code>~/.zeroclaw/config.toml</code> が残っている場合、<code>--force</code> オプションを付けて再実行してください：</p>
+<pre><code class="language-bash">zeroclaw onboard --force
+</code></pre>
+<p>または、ディレクトリを削除して最初からやり直してください:</p>
+<pre><code class="language-bash">rm -rf ~/.zeroclaw
+zeroclaw onboard
+</code></pre>
+<h3 id="homebrewでインストールしたがウィザードが間違ったパスに書き込む"><a class="header" href="#homebrewでインストールしたがウィザードが間違ったパスに書き込む">Homebrewでインストールしたが、ウィザードが間違ったパスに書き込む</a></h3>
+<p>Homebrew は <code>$HOMEBREW_PREFIX/var/zeroclaw/</code> を優先してインストールします（<code>brew services</code> が動作するため）。この設定が検出されるとウィザードが警告を表示します。オンボーディング前に <code>ZEROCLAW_WORKSPACE</code> を Homebrew のパスに設定してください：</p>
+<pre><code class="language-bash">export ZEROCLAW_WORKSPACE="$HOMEBREW_PREFIX/var/zeroclaw"
+zeroclaw onboard
+</code></pre>
+<p>または、手動でシンボリックリンクを一度作成します:</p>
+<pre><code class="language-bash">ln -s "$HOMEBREW_PREFIX/var/zeroclaw" ~/.zeroclaw
+</code></pre>
+<hr>
+<h2 id="ランタイム"><a class="header" href="#ランタイム">ランタイム</a></h2>
+<h3 id="デーモンが起動しすぐに終了します"><a class="header" href="#デーモンが起動しすぐに終了します">デーモンが起動し、すぐに終了します</a></h3>
+<p>実際のエラーを確認するには、journald またはプラットフォームのログ（<a href="./observability.html">ログと観測性</a> を参照）を確認してください。一般的な原因:</p>
+<ul>
+<li><strong>無効な設定</strong> — 解決された値を表示するには <code>zeroclaw config list</code> を、期待される構造を確認するには <code>zeroclaw config schema</code> を使用してください。</li>
+<li><strong>ポートの競合</strong> — <code>42617</code> で別のプロセスが使用中です。<code>[gateway] port</code> を変更するか、ポートを解放してください。</li>
+<li><strong>シークレットの欠落</strong> — 暗号化されたシークレットストアが復号できません。キーファイルが失われているため、バックアップから復元するか、オンボーディングを再実行してください。</li>
+</ul>
+<h3 id="デーモンが再起動を繰り返す"><a class="header" href="#デーモンが再起動を繰り返す">デーモンが再起動を繰り返す</a></h3>
+<p><code>systemctl --user status zeroclaw</code> は最後の終了コードを表示します。設定ファイルにエラーがある場合、サービスは再起動を停止し（終了コード 2）、設定ファイルを修正する必要があります。パニックが発生した場合は、ユニットは 10 秒ごとに再試行します。</p>
+<p>デバッグログを有効にして、次の障害をキャッチします：</p>
+<pre><code class="language-bash">zeroclaw service stop
+RUST_LOG=zeroclaw=debug zeroclaw daemon
+</code></pre>
+<h3 id="ゲートウェイに到達できない"><a class="header" href="#ゲートウェイに到達できない">ゲートウェイに到達できない</a></h3>
+<pre><code class="language-bash">curl -sv http://localhost:42617/health
+</code></pre>
+<p>接続が拒否された場合：デーモンが実行されていないか、異なるインターフェースにバインドされています。設定ファイルの <code>[gateway] host</code> / <code>port</code> を確認してください。</p>
+<p>403 / 401 の場合: ペアリングが完了していないか、トークンが期限切れです。ペアリングフローを再度実行してください。</p>
+<hr>
+<h2 id="チャンネル"><a class="header" href="#チャンネル">チャンネル</a></h2>
+<h3 id="telegram-他の-getupdates-リクエストによって終了"><a class="header" href="#telegram-他の-getupdates-リクエストによって終了">Telegram: <code>他の getUpdates リクエストによって終了</code></a></h3>
+<p>2つのプロセスが同じボットトークンをポーリングしています。Telegramでは、一度に1つのポーラーしか許可されていません。</p>
+<p>修正: そのトークンを使用している <code>zeroclaw daemon</code> / <code>zeroclaw channel start</code> を1つ以外すべて停止する。</p>
+<h3 id="discord--slack-の認証失敗"><a class="header" href="#discord--slack-の認証失敗">Discord / Slack の認証失敗</a></h3>
+<p>Discordのトークンは、Developer Portalで再生成すると期限切れになります。Slackのボットトークンは期限切れにはなりませんが、取り消すことができます。ターゲットのワークスペース/ギルドにボットがまだインストールされていることを確認してください。</p>
+<p>どちらかの場合:</p>
+<pre><code class="language-bash">zeroclaw channel doctor discord
+zeroclaw channel doctor slack
+</code></pre>
+<h3 id="matrix-不明なデバイス"><a class="header" href="#matrix-不明なデバイス">Matrix: 「不明なデバイス」</a></h3>
+<p>デバイスキーを保持せずに再オンボーディングした場合、ホームサーバーは未検証の新しいデバイスとして認識されます。ログイン済みの別のクライアントから再検証するか、キーストアをリセットしてください。</p>
+<pre><code class="language-bash">rm -rf ~/.zeroclaw/workspace/matrix-crypto
+# 次のチャンネル開始時にペアリングフローを再実行
+</code></pre>
+<h3 id="imap-ポーリングが停止しました"><a class="header" href="#imap-ポーリングが停止しました">IMAP ポーリングが停止しました</a></h3>
+<p>最も多いのは認証の失敗です。プロバイダーがパスワードを更新したか、アプリ固有のパスワードの有効期限が切れた可能性があります。確認してください：</p>
+<pre><code class="language-bash">journalctl --user -u zeroclaw -n 200 | grep -i imap
+</code></pre>
+<hr>
+<h2 id="プロバイダー"><a class="header" href="#プロバイダー">プロバイダー</a></h2>
+<h3 id="ollama-への接続がタイムアウトしました"><a class="header" href="#ollama-への接続がタイムアウトしました">「Ollama への接続がタイムアウトしました」</a></h3>
+<ul>
+<li>Ollama デーモンが実行されていません: <code>systemctl status ollama</code> (Linux)、<code>brew services list</code> (macOS)</li>
+<li>設定ファイルのURLが間違っています — コンテナ内から <code>localhost:11434</code> はホストに到達しません。<code>host.docker.internal</code> またはホストのLAN IPを使用してください。</li>
+<li>ポート 11434 がファイアウォールによってブロックされています — ローカルでは稀ですが、共有 LAN では一般的です</li>
+</ul>
+<h3 id="anthropic--openai-401"><a class="header" href="#anthropic--openai-401">Anthropic / OpenAI 401</a></h3>
+<p>APIキーが無効または期限切れです。プロバイダーのダッシュボードで再生成し、<code>[providers.models.&lt;name&gt;] api_key</code> に更新して、サービスを再起動してください。</p>
+<p>OAuth（<code>sk-ant-oat*</code>）を使用している場合、OAuth トークンが期限切れになっている可能性があります。OAuth で発行されたトークンは比較的長期間有効ですが、無期限ではありません。再認証してください。</p>
+<h3 id="フォールバックチェーンは常にフォールバックを使用しプライマリは使用されません"><a class="header" href="#フォールバックチェーンは常にフォールバックを使用しプライマリは使用されません">フォールバックチェーンは常にフォールバックを使用し、プライマリは使用されません。</a></h3>
+<p>レイテンシとエラーログを確認してください — プライマリーが定期的にタイムアウトしている可能性があります。その場合、プライマリーのリトライカウントを減らしてより早くフェイルオーバーさせるか、プライマリーが不安定な原因を修正してください。</p>
+<hr>
+<h2 id="ツール"><a class="header" href="#ツール">ツール</a></h2>
+<h3 id="ポリシーによってシェルコマンドがブロックされました"><a class="header" href="#ポリシーによってシェルコマンドがブロックされました">ポリシーによってシェルコマンドがブロックされました</a></h3>
+<p>未知のコマンドに対する <code>Supervised</code> 自律モードでの期待される動作。いずれか：</p>
+<ul>
+<li>プロンプトが表示されたら、インラインで承認してください。</li>
+<li>コマンドを <code>[autonomy] allowed_commands</code> に追加する</li>
+<li>コンテキストを信頼できる場合は、自律性を <code>Full</code> に引き上げます。</li>
+</ul>
+<p><a href="../security/autonomy.html">セキュリティ → 自律レベル</a> を参照してください。</p>
+<h3 id="dockerサンドボックス内でツール呼び出しが失敗する"><a class="header" href="#dockerサンドボックス内でツール呼び出しが失敗する">Dockerサンドボックス内でツール呼び出しが失敗する</a></h3>
+<ul>
+<li>コンテナイメージがプルされません — <code>docker pull zeroclawlabs/tool-runner</code></li>
+<li>Docker デーモンが ZeroClaw ユーザーから到達できません — <code>docker info</code> を確認してください</li>
+<li>ツールは、パススルーされないデバイスが必要です — <code>allow_devices</code> を拡張してください</li>
+</ul>
+<h3 id="ブラウザツールが最初の使用時にハングする"><a class="header" href="#ブラウザツールが最初の使用時にハングする">ブラウザツールが最初の使用時にハングする</a></h3>
+<p>Playwright は初回起動時に Chromium（約150MB）をダウンロードします。ダウンロードが完了するまでお待ちください。もし処理が止まったままになる場合は、ディスク容量とプロキシ設定を確認してください。</p>
+<hr>
+<h2 id="サービスモード"><a class="header" href="#サービスモード">サービスモード</a></h2>
+<h3 id="サービスはインストールされていますが非アクティブ状態です"><a class="header" href="#サービスはインストールされていますが非アクティブ状態です">サービスはインストールされていますが、非アクティブ状態です</a></h3>
+<pre><code class="language-bash">zeroclaw service start
+zeroclaw service status
+</code></pre>
+<p>インタラクティブには成功するが、バックグラウンドでサービスが終了する場合、ほとんどは設定ファイルか権限の問題です。ジャーナルを確認してください：</p>
+<pre><code class="language-bash">journalctl --user -u zeroclaw --since 5分前
+</code></pre>
+<h3 id="サービスが設定ファイルを見つけられません"><a class="header" href="#サービスが設定ファイルを見つけられません">サービスが設定ファイルを見つけられません</a></h3>
+<p>サービスとCLIは、異なるユーザーとして実行される場合や、異なる環境変数で実行される場合に、設定ファイルを異なる方法で解決する可能性があります。デーモンが認識するパスを強制的に出力します：</p>
+<pre><code class="language-bash">zeroclaw config list
+</code></pre>
+<p><code>zeroclaw config list</code>（あなたとして）とサービス（そのユーザーとして）でパスが異なる場合、次のいずれかを行ってください：</p>
+<ul>
+<li>サービスユニットの <code>Environment=</code> に <code>ZEROCLAW_CONFIG_DIR</code> を設定する</li>
+<li>サービスを実行します（ lingering-enabled ユーザーサービスとして）</li>
+<li>設定ファイルをサービスが期待するパスにコピーまたはシンボリックリンクしてください。</li>
+</ul>
+<hr>
+<h2 id="まだお困りですか"><a class="header" href="#まだお困りですか">まだお困りですか？</a></h2>
+<p>診断情報を収集し、問題を報告してください：</p>
+<pre><code class="language-bash">zeroclaw --version
+zeroclaw doctor
+zeroclaw channel doctor
+journalctl --user -u zeroclaw --since 1時間前 &gt; zeroclaw-log.txt
+</code></pre>
+<p><code>zeroclaw-log.txt</code> をサニタイズ（漏れなくチャンネルトークンを削除）し、その問題を参照してください。参照先は <a href="../contributing/communication.html">Contributing → Communication</a> をご覧ください。</p>
+<h2 id="関連項目も参照してください"><a class="header" href="#関連項目も参照してください">関連項目も参照してください</a></h2>
+<ul>
+<li><a href="./observability.html">ログと観測性</a></li>
+<li><a href="./service.html">サービスとデーモン</a></li>
+<li><a href="../setup/service.html">セットアップ → サービス管理</a></li>
+<li><a href="../reference/config.html">参照 → 設定</a></li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../ops/observability.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../ops/network-deployment.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../ops/observability.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../ops/network-deployment.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

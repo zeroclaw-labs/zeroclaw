@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["apply_provider_trait_defaults","excluded_paths","is_excluded","memory_backend_excludes","provider_family_excludes","providers_models_key"]};

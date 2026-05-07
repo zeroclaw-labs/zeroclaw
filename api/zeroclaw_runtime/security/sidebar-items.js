@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["AutonomyLevel"],"fn":["redact"],"mod":["audit","detect","docker","domain_matcher","estop","firejail","iam_policy","leak_detector","nevis","otp","pairing","playbook","policy","prompt_guard","secrets","traits","vulnerability","workspace_boundary"],"struct":["DomainMatcher","PairingGuard","SecretStore","SecurityPolicy"]};

@@ -1,0 +1,1711 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `crates/zeroclaw-runtime/src/cron/store.rs`."><title>store.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-b7b9f40b.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="zeroclaw_runtime" data-themes="" data-resource-suffix="" data-rustdoc-version="1.95.0 (59807616e 2026-04-14)" data-channel="1.95.0" data-search-js="search-63369b7b.js" data-stringdex-js="stringdex-b897f86f.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../static.files/src-script-813739b1.js"></script><script defer src="../../../src-files.js"></script><script defer src="../../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">zeroclaw_runtime/cron/</div>store.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-4"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="kw">use </span><span class="kw">crate</span>::cron::{
+<a href=#2 id=2 data-nosnippet>2</a>    CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
+<a href=#3 id=3 data-nosnippet>3</a>    next_run_for_schedule, schedule_cron_expression, validate_delivery_config, validate_schedule,
+<a href=#4 id=4 data-nosnippet>4</a>};
+<a href=#5 id=5 data-nosnippet>5</a><span class="kw">use </span>anyhow::{Context, <span class="prelude-ty">Result</span>};
+<a href=#6 id=6 data-nosnippet>6</a><span class="kw">use </span>chrono::{DateTime, Utc};
+<a href=#7 id=7 data-nosnippet>7</a><span class="kw">use </span>rusqlite::types::{FromSqlResult, ValueRef};
+<a href=#8 id=8 data-nosnippet>8</a><span class="kw">use </span>rusqlite::{Connection, params};
+<a href=#9 id=9 data-nosnippet>9</a><span class="kw">use </span>uuid::Uuid;
+<a href=#10 id=10 data-nosnippet>10</a><span class="kw">use </span>zeroclaw_config::schema::Config;
+<a href=#11 id=11 data-nosnippet>11</a>
+<a href=#12 id=12 data-nosnippet>12</a><span class="kw">const </span>MAX_CRON_OUTPUT_BYTES: usize = <span class="number">16 </span>* <span class="number">1024</span>;
+<a href=#13 id=13 data-nosnippet>13</a><span class="kw">const </span>TRUNCATED_OUTPUT_MARKER: <span class="kw-2">&amp;</span>str = <span class="string">"\n...[truncated]"</span>;
+<a href=#14 id=14 data-nosnippet>14</a>
+<a href=#15 id=15 data-nosnippet>15</a><span class="kw">impl </span>rusqlite::types::FromSql <span class="kw">for </span>JobType {
+<a href=#16 id=16 data-nosnippet>16</a>    <span class="kw">fn </span>column_result(value: ValueRef&lt;<span class="lifetime">'_</span>&gt;) -&gt; FromSqlResult&lt;<span class="self">Self</span>&gt; {
+<a href=#17 id=17 data-nosnippet>17</a>        <span class="kw">let </span>text = value.as_str()<span class="question-mark">?</span>;
+<a href=#18 id=18 data-nosnippet>18</a>        JobType::try_from(text).map_err(|e| rusqlite::types::FromSqlError::Other(e.into()))
+<a href=#19 id=19 data-nosnippet>19</a>    }
+<a href=#20 id=20 data-nosnippet>20</a>}
+<a href=#21 id=21 data-nosnippet>21</a>
+<a href=#22 id=22 data-nosnippet>22</a><span class="attr">#[cfg(test)]
+<a href=#23 id=23 data-nosnippet>23</a></span><span class="kw">pub fn </span>add_job(config: <span class="kw-2">&amp;</span>Config, expression: <span class="kw-2">&amp;</span>str, command: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;CronJob&gt; {
+<a href=#24 id=24 data-nosnippet>24</a>    <span class="kw">let </span>schedule = Schedule::Cron {
+<a href=#25 id=25 data-nosnippet>25</a>        expr: expression.to_string(),
+<a href=#26 id=26 data-nosnippet>26</a>        tz: <span class="prelude-val">None</span>,
+<a href=#27 id=27 data-nosnippet>27</a>    };
+<a href=#28 id=28 data-nosnippet>28</a>    add_shell_job(config, <span class="prelude-val">None</span>, schedule, command, <span class="prelude-val">None</span>)
+<a href=#29 id=29 data-nosnippet>29</a>}
+<a href=#30 id=30 data-nosnippet>30</a>
+<a href=#31 id=31 data-nosnippet>31</a><span class="kw">pub fn </span>add_shell_job(
+<a href=#32 id=32 data-nosnippet>32</a>    config: <span class="kw-2">&amp;</span>Config,
+<a href=#33 id=33 data-nosnippet>33</a>    name: <span class="prelude-ty">Option</span>&lt;String&gt;,
+<a href=#34 id=34 data-nosnippet>34</a>    schedule: Schedule,
+<a href=#35 id=35 data-nosnippet>35</a>    command: <span class="kw-2">&amp;</span>str,
+<a href=#36 id=36 data-nosnippet>36</a>    delivery: <span class="prelude-ty">Option</span>&lt;DeliveryConfig&gt;,
+<a href=#37 id=37 data-nosnippet>37</a>) -&gt; <span class="prelude-ty">Result</span>&lt;CronJob&gt; {
+<a href=#38 id=38 data-nosnippet>38</a>    <span class="kw">let </span>now = Utc::now();
+<a href=#39 id=39 data-nosnippet>39</a>    validate_schedule(<span class="kw-2">&amp;</span>schedule, now)<span class="question-mark">?</span>;
+<a href=#40 id=40 data-nosnippet>40</a>    validate_delivery_config(delivery.as_ref())<span class="question-mark">?</span>;
+<a href=#41 id=41 data-nosnippet>41</a>    <span class="kw">let </span>next_run = next_run_for_schedule(<span class="kw-2">&amp;</span>schedule, now)<span class="question-mark">?</span>;
+<a href=#42 id=42 data-nosnippet>42</a>    <span class="kw">let </span>id = Uuid::new_v4().to_string();
+<a href=#43 id=43 data-nosnippet>43</a>    <span class="kw">let </span>expression = schedule_cron_expression(<span class="kw-2">&amp;</span>schedule).unwrap_or_default();
+<a href=#44 id=44 data-nosnippet>44</a>    <span class="kw">let </span>schedule_json = serde_json::to_string(<span class="kw-2">&amp;</span>schedule)<span class="question-mark">?</span>;
+<a href=#45 id=45 data-nosnippet>45</a>    <span class="kw">let </span>delivery = delivery.unwrap_or_default();
+<a href=#46 id=46 data-nosnippet>46</a>
+<a href=#47 id=47 data-nosnippet>47</a>    <span class="kw">let </span>delete_after_run = <span class="macro">matches!</span>(schedule, Schedule::At { .. });
+<a href=#48 id=48 data-nosnippet>48</a>
+<a href=#49 id=49 data-nosnippet>49</a>    with_connection(config, |conn| {
+<a href=#50 id=50 data-nosnippet>50</a>        conn.execute(
+<a href=#51 id=51 data-nosnippet>51</a>            <span class="string">"INSERT INTO cron_jobs (
+<a href=#52 id=52 data-nosnippet>52</a>                id, expression, command, schedule, job_type, prompt, name, session_target, model,
+<a href=#53 id=53 data-nosnippet>53</a>                enabled, delivery, delete_after_run, created_at, next_run
+<a href=#54 id=54 data-nosnippet>54</a>             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9)"</span>,
+<a href=#55 id=55 data-nosnippet>55</a>            <span class="macro">params!</span>[
+<a href=#56 id=56 data-nosnippet>56</a>                id,
+<a href=#57 id=57 data-nosnippet>57</a>                expression,
+<a href=#58 id=58 data-nosnippet>58</a>                command,
+<a href=#59 id=59 data-nosnippet>59</a>                schedule_json,
+<a href=#60 id=60 data-nosnippet>60</a>                name,
+<a href=#61 id=61 data-nosnippet>61</a>                serde_json::to_string(<span class="kw-2">&amp;</span>delivery)<span class="question-mark">?</span>,
+<a href=#62 id=62 data-nosnippet>62</a>                <span class="kw">if </span>delete_after_run { <span class="number">1 </span>} <span class="kw">else </span>{ <span class="number">0 </span>},
+<a href=#63 id=63 data-nosnippet>63</a>                now.to_rfc3339(),
+<a href=#64 id=64 data-nosnippet>64</a>                next_run.to_rfc3339(),
+<a href=#65 id=65 data-nosnippet>65</a>            ],
+<a href=#66 id=66 data-nosnippet>66</a>        )
+<a href=#67 id=67 data-nosnippet>67</a>        .context(<span class="string">"Failed to insert cron shell job"</span>)<span class="question-mark">?</span>;
+<a href=#68 id=68 data-nosnippet>68</a>        <span class="prelude-val">Ok</span>(())
+<a href=#69 id=69 data-nosnippet>69</a>    })<span class="question-mark">?</span>;
+<a href=#70 id=70 data-nosnippet>70</a>
+<a href=#71 id=71 data-nosnippet>71</a>    get_job(config, <span class="kw-2">&amp;</span>id)
+<a href=#72 id=72 data-nosnippet>72</a>}
+<a href=#73 id=73 data-nosnippet>73</a>
+<a href=#74 id=74 data-nosnippet>74</a><span class="attr">#[allow(clippy::too_many_arguments)]
+<a href=#75 id=75 data-nosnippet>75</a></span><span class="kw">pub fn </span>add_agent_job(
+<a href=#76 id=76 data-nosnippet>76</a>    config: <span class="kw-2">&amp;</span>Config,
+<a href=#77 id=77 data-nosnippet>77</a>    name: <span class="prelude-ty">Option</span>&lt;String&gt;,
+<a href=#78 id=78 data-nosnippet>78</a>    schedule: Schedule,
+<a href=#79 id=79 data-nosnippet>79</a>    prompt: <span class="kw-2">&amp;</span>str,
+<a href=#80 id=80 data-nosnippet>80</a>    session_target: SessionTarget,
+<a href=#81 id=81 data-nosnippet>81</a>    model: <span class="prelude-ty">Option</span>&lt;String&gt;,
+<a href=#82 id=82 data-nosnippet>82</a>    delivery: <span class="prelude-ty">Option</span>&lt;DeliveryConfig&gt;,
+<a href=#83 id=83 data-nosnippet>83</a>    delete_after_run: bool,
+<a href=#84 id=84 data-nosnippet>84</a>    allowed_tools: <span class="prelude-ty">Option</span>&lt;Vec&lt;String&gt;&gt;,
+<a href=#85 id=85 data-nosnippet>85</a>) -&gt; <span class="prelude-ty">Result</span>&lt;CronJob&gt; {
+<a href=#86 id=86 data-nosnippet>86</a>    <span class="kw">let </span>now = Utc::now();
+<a href=#87 id=87 data-nosnippet>87</a>    validate_schedule(<span class="kw-2">&amp;</span>schedule, now)<span class="question-mark">?</span>;
+<a href=#88 id=88 data-nosnippet>88</a>    validate_delivery_config(delivery.as_ref())<span class="question-mark">?</span>;
+<a href=#89 id=89 data-nosnippet>89</a>    <span class="kw">let </span>next_run = next_run_for_schedule(<span class="kw-2">&amp;</span>schedule, now)<span class="question-mark">?</span>;
+<a href=#90 id=90 data-nosnippet>90</a>    <span class="kw">let </span>id = Uuid::new_v4().to_string();
+<a href=#91 id=91 data-nosnippet>91</a>    <span class="kw">let </span>expression = schedule_cron_expression(<span class="kw-2">&amp;</span>schedule).unwrap_or_default();
+<a href=#92 id=92 data-nosnippet>92</a>    <span class="kw">let </span>schedule_json = serde_json::to_string(<span class="kw-2">&amp;</span>schedule)<span class="question-mark">?</span>;
+<a href=#93 id=93 data-nosnippet>93</a>    <span class="kw">let </span>delivery = delivery.unwrap_or_default();
+<a href=#94 id=94 data-nosnippet>94</a>
+<a href=#95 id=95 data-nosnippet>95</a>    with_connection(config, |conn| {
+<a href=#96 id=96 data-nosnippet>96</a>        conn.execute(
+<a href=#97 id=97 data-nosnippet>97</a>            <span class="string">"INSERT INTO cron_jobs (
+<a href=#98 id=98 data-nosnippet>98</a>                id, expression, command, schedule, job_type, prompt, name, session_target, model,
+<a href=#99 id=99 data-nosnippet>99</a>                enabled, delivery, delete_after_run, allowed_tools, created_at, next_run
+<a href=#100 id=100 data-nosnippet>100</a>             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12)"</span>,
+<a href=#101 id=101 data-nosnippet>101</a>            <span class="macro">params!</span>[
+<a href=#102 id=102 data-nosnippet>102</a>                id,
+<a href=#103 id=103 data-nosnippet>103</a>                expression,
+<a href=#104 id=104 data-nosnippet>104</a>                schedule_json,
+<a href=#105 id=105 data-nosnippet>105</a>                prompt,
+<a href=#106 id=106 data-nosnippet>106</a>                name,
+<a href=#107 id=107 data-nosnippet>107</a>                session_target.as_str(),
+<a href=#108 id=108 data-nosnippet>108</a>                model,
+<a href=#109 id=109 data-nosnippet>109</a>                serde_json::to_string(<span class="kw-2">&amp;</span>delivery)<span class="question-mark">?</span>,
+<a href=#110 id=110 data-nosnippet>110</a>                <span class="kw">if </span>delete_after_run { <span class="number">1 </span>} <span class="kw">else </span>{ <span class="number">0 </span>},
+<a href=#111 id=111 data-nosnippet>111</a>                encode_allowed_tools(allowed_tools.as_ref())<span class="question-mark">?</span>,
+<a href=#112 id=112 data-nosnippet>112</a>                now.to_rfc3339(),
+<a href=#113 id=113 data-nosnippet>113</a>                next_run.to_rfc3339(),
+<a href=#114 id=114 data-nosnippet>114</a>            ],
+<a href=#115 id=115 data-nosnippet>115</a>        )
+<a href=#116 id=116 data-nosnippet>116</a>        .context(<span class="string">"Failed to insert cron agent job"</span>)<span class="question-mark">?</span>;
+<a href=#117 id=117 data-nosnippet>117</a>        <span class="prelude-val">Ok</span>(())
+<a href=#118 id=118 data-nosnippet>118</a>    })<span class="question-mark">?</span>;
+<a href=#119 id=119 data-nosnippet>119</a>
+<a href=#120 id=120 data-nosnippet>120</a>    get_job(config, <span class="kw-2">&amp;</span>id)
+<a href=#121 id=121 data-nosnippet>121</a>}
+<a href=#122 id=122 data-nosnippet>122</a>
+<a href=#123 id=123 data-nosnippet>123</a><span class="kw">pub fn </span>list_jobs(config: <span class="kw-2">&amp;</span>Config) -&gt; <span class="prelude-ty">Result</span>&lt;Vec&lt;CronJob&gt;&gt; {
+<a href=#124 id=124 data-nosnippet>124</a>    with_connection(config, |conn| {
+<a href=#125 id=125 data-nosnippet>125</a>        <span class="kw">let </span><span class="kw-2">mut </span>stmt = conn.prepare(
+<a href=#126 id=126 data-nosnippet>126</a>            <span class="string">"SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+<a href=#127 id=127 data-nosnippet>127</a>                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+<a href=#128 id=128 data-nosnippet>128</a>                    allowed_tools, source, uses_memory
+<a href=#129 id=129 data-nosnippet>129</a>             FROM cron_jobs ORDER BY next_run ASC"</span>,
+<a href=#130 id=130 data-nosnippet>130</a>        )<span class="question-mark">?</span>;
+<a href=#131 id=131 data-nosnippet>131</a>
+<a href=#132 id=132 data-nosnippet>132</a>        <span class="kw">let </span>rows = stmt.query_map([], map_cron_job_row)<span class="question-mark">?</span>;
+<a href=#133 id=133 data-nosnippet>133</a>
+<a href=#134 id=134 data-nosnippet>134</a>        <span class="kw">let </span><span class="kw-2">mut </span>jobs = Vec::new();
+<a href=#135 id=135 data-nosnippet>135</a>        <span class="kw">for </span>row <span class="kw">in </span>rows {
+<a href=#136 id=136 data-nosnippet>136</a>            jobs.push(row<span class="question-mark">?</span>);
+<a href=#137 id=137 data-nosnippet>137</a>        }
+<a href=#138 id=138 data-nosnippet>138</a>        <span class="prelude-val">Ok</span>(jobs)
+<a href=#139 id=139 data-nosnippet>139</a>    })
+<a href=#140 id=140 data-nosnippet>140</a>}
+<a href=#141 id=141 data-nosnippet>141</a>
+<a href=#142 id=142 data-nosnippet>142</a><span class="kw">pub fn </span>get_job(config: <span class="kw-2">&amp;</span>Config, job_id: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;CronJob&gt; {
+<a href=#143 id=143 data-nosnippet>143</a>    with_connection(config, |conn| {
+<a href=#144 id=144 data-nosnippet>144</a>        <span class="kw">let </span><span class="kw-2">mut </span>stmt = conn.prepare(
+<a href=#145 id=145 data-nosnippet>145</a>            <span class="string">"SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+<a href=#146 id=146 data-nosnippet>146</a>                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+<a href=#147 id=147 data-nosnippet>147</a>                    allowed_tools, source, uses_memory
+<a href=#148 id=148 data-nosnippet>148</a>             FROM cron_jobs WHERE id = ?1"</span>,
+<a href=#149 id=149 data-nosnippet>149</a>        )<span class="question-mark">?</span>;
+<a href=#150 id=150 data-nosnippet>150</a>
+<a href=#151 id=151 data-nosnippet>151</a>        <span class="kw">let </span><span class="kw-2">mut </span>rows = stmt.query(<span class="macro">params!</span>[job_id])<span class="question-mark">?</span>;
+<a href=#152 id=152 data-nosnippet>152</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(row) = rows.next()<span class="question-mark">? </span>{
+<a href=#153 id=153 data-nosnippet>153</a>            map_cron_job_row(row).map_err(Into::into)
+<a href=#154 id=154 data-nosnippet>154</a>        } <span class="kw">else </span>{
+<a href=#155 id=155 data-nosnippet>155</a>            <span class="macro">anyhow::bail!</span>(<span class="string">"Cron job '{job_id}' not found"</span>)
+<a href=#156 id=156 data-nosnippet>156</a>        }
+<a href=#157 id=157 data-nosnippet>157</a>    })
+<a href=#158 id=158 data-nosnippet>158</a>}
+<a href=#159 id=159 data-nosnippet>159</a>
+<a href=#160 id=160 data-nosnippet>160</a><span class="kw">pub fn </span>remove_job(config: <span class="kw-2">&amp;</span>Config, id: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;()&gt; {
+<a href=#161 id=161 data-nosnippet>161</a>    <span class="kw">let </span>changed = with_connection(config, |conn| {
+<a href=#162 id=162 data-nosnippet>162</a>        conn.execute(<span class="string">"DELETE FROM cron_jobs WHERE id = ?1"</span>, <span class="macro">params!</span>[id])
+<a href=#163 id=163 data-nosnippet>163</a>            .context(<span class="string">"Failed to delete cron job"</span>)
+<a href=#164 id=164 data-nosnippet>164</a>    })<span class="question-mark">?</span>;
+<a href=#165 id=165 data-nosnippet>165</a>
+<a href=#166 id=166 data-nosnippet>166</a>    <span class="kw">if </span>changed == <span class="number">0 </span>{
+<a href=#167 id=167 data-nosnippet>167</a>        <span class="macro">anyhow::bail!</span>(<span class="string">"Cron job '{id}' not found"</span>);
+<a href=#168 id=168 data-nosnippet>168</a>    }
+<a href=#169 id=169 data-nosnippet>169</a>
+<a href=#170 id=170 data-nosnippet>170</a>    <span class="macro">println!</span>(<span class="string">"✅ Removed cron job {id}"</span>);
+<a href=#171 id=171 data-nosnippet>171</a>    <span class="prelude-val">Ok</span>(())
+<a href=#172 id=172 data-nosnippet>172</a>}
+<a href=#173 id=173 data-nosnippet>173</a>
+<a href=#174 id=174 data-nosnippet>174</a><span class="kw">pub fn </span>due_jobs(config: <span class="kw-2">&amp;</span>Config, now: DateTime&lt;Utc&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;Vec&lt;CronJob&gt;&gt; {
+<a href=#175 id=175 data-nosnippet>175</a>    <span class="kw">let </span>lim = i64::try_from(config.scheduler.max_tasks.max(<span class="number">1</span>))
+<a href=#176 id=176 data-nosnippet>176</a>        .context(<span class="string">"Scheduler max_tasks overflows i64"</span>)<span class="question-mark">?</span>;
+<a href=#177 id=177 data-nosnippet>177</a>    with_connection(config, |conn| {
+<a href=#178 id=178 data-nosnippet>178</a>        <span class="kw">let </span><span class="kw-2">mut </span>stmt = conn.prepare(
+<a href=#179 id=179 data-nosnippet>179</a>            <span class="string">"SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+<a href=#180 id=180 data-nosnippet>180</a>                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+<a href=#181 id=181 data-nosnippet>181</a>                    allowed_tools, source, uses_memory
+<a href=#182 id=182 data-nosnippet>182</a>             FROM cron_jobs
+<a href=#183 id=183 data-nosnippet>183</a>             WHERE enabled = 1 AND next_run &lt;= ?1
+<a href=#184 id=184 data-nosnippet>184</a>             ORDER BY next_run ASC
+<a href=#185 id=185 data-nosnippet>185</a>             LIMIT ?2"</span>,
+<a href=#186 id=186 data-nosnippet>186</a>        )<span class="question-mark">?</span>;
+<a href=#187 id=187 data-nosnippet>187</a>
+<a href=#188 id=188 data-nosnippet>188</a>        <span class="kw">let </span>rows = stmt.query_map(<span class="macro">params!</span>[now.to_rfc3339(), lim], map_cron_job_row)<span class="question-mark">?</span>;
+<a href=#189 id=189 data-nosnippet>189</a>
+<a href=#190 id=190 data-nosnippet>190</a>        <span class="kw">let </span><span class="kw-2">mut </span>jobs = Vec::new();
+<a href=#191 id=191 data-nosnippet>191</a>        <span class="kw">for </span>row <span class="kw">in </span>rows {
+<a href=#192 id=192 data-nosnippet>192</a>            <span class="kw">match </span>row {
+<a href=#193 id=193 data-nosnippet>193</a>                <span class="prelude-val">Ok</span>(job) =&gt; jobs.push(job),
+<a href=#194 id=194 data-nosnippet>194</a>                <span class="prelude-val">Err</span>(e) =&gt; <span class="macro">tracing::warn!</span>(<span class="string">"Skipping cron job with unparseable row data: {e}"</span>),
+<a href=#195 id=195 data-nosnippet>195</a>            }
+<a href=#196 id=196 data-nosnippet>196</a>        }
+<a href=#197 id=197 data-nosnippet>197</a>        <span class="prelude-val">Ok</span>(jobs)
+<a href=#198 id=198 data-nosnippet>198</a>    })
+<a href=#199 id=199 data-nosnippet>199</a>}
+<a href=#200 id=200 data-nosnippet>200</a>
+<a href=#201 id=201 data-nosnippet>201</a><span class="doccomment">/// Return **all** enabled overdue jobs without the `max_tasks` limit.
+<a href=#202 id=202 data-nosnippet>202</a>///
+<a href=#203 id=203 data-nosnippet>203</a>/// Used by the scheduler startup catch-up to ensure every missed job is
+<a href=#204 id=204 data-nosnippet>204</a>/// executed at least once after a period of downtime (late boot, daemon
+<a href=#205 id=205 data-nosnippet>205</a>/// restart, etc.).
+<a href=#206 id=206 data-nosnippet>206</a></span><span class="kw">pub fn </span>all_overdue_jobs(config: <span class="kw-2">&amp;</span>Config, now: DateTime&lt;Utc&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;Vec&lt;CronJob&gt;&gt; {
+<a href=#207 id=207 data-nosnippet>207</a>    with_connection(config, |conn| {
+<a href=#208 id=208 data-nosnippet>208</a>        <span class="kw">let </span><span class="kw-2">mut </span>stmt = conn.prepare(
+<a href=#209 id=209 data-nosnippet>209</a>            <span class="string">"SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+<a href=#210 id=210 data-nosnippet>210</a>                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+<a href=#211 id=211 data-nosnippet>211</a>                    allowed_tools, source, uses_memory
+<a href=#212 id=212 data-nosnippet>212</a>             FROM cron_jobs
+<a href=#213 id=213 data-nosnippet>213</a>             WHERE enabled = 1 AND next_run &lt;= ?1
+<a href=#214 id=214 data-nosnippet>214</a>             ORDER BY next_run ASC"</span>,
+<a href=#215 id=215 data-nosnippet>215</a>        )<span class="question-mark">?</span>;
+<a href=#216 id=216 data-nosnippet>216</a>
+<a href=#217 id=217 data-nosnippet>217</a>        <span class="kw">let </span>rows = stmt.query_map(<span class="macro">params!</span>[now.to_rfc3339()], map_cron_job_row)<span class="question-mark">?</span>;
+<a href=#218 id=218 data-nosnippet>218</a>
+<a href=#219 id=219 data-nosnippet>219</a>        <span class="kw">let </span><span class="kw-2">mut </span>jobs = Vec::new();
+<a href=#220 id=220 data-nosnippet>220</a>        <span class="kw">for </span>row <span class="kw">in </span>rows {
+<a href=#221 id=221 data-nosnippet>221</a>            <span class="kw">match </span>row {
+<a href=#222 id=222 data-nosnippet>222</a>                <span class="prelude-val">Ok</span>(job) =&gt; jobs.push(job),
+<a href=#223 id=223 data-nosnippet>223</a>                <span class="prelude-val">Err</span>(e) =&gt; <span class="macro">tracing::warn!</span>(<span class="string">"Skipping cron job with unparseable row data: {e}"</span>),
+<a href=#224 id=224 data-nosnippet>224</a>            }
+<a href=#225 id=225 data-nosnippet>225</a>        }
+<a href=#226 id=226 data-nosnippet>226</a>        <span class="prelude-val">Ok</span>(jobs)
+<a href=#227 id=227 data-nosnippet>227</a>    })
+<a href=#228 id=228 data-nosnippet>228</a>}
+<a href=#229 id=229 data-nosnippet>229</a>
+<a href=#230 id=230 data-nosnippet>230</a><span class="kw">pub fn </span>update_job(config: <span class="kw-2">&amp;</span>Config, job_id: <span class="kw-2">&amp;</span>str, patch: CronJobPatch) -&gt; <span class="prelude-ty">Result</span>&lt;CronJob&gt; {
+<a href=#231 id=231 data-nosnippet>231</a>    <span class="kw">let </span><span class="kw-2">mut </span>job = get_job(config, job_id)<span class="question-mark">?</span>;
+<a href=#232 id=232 data-nosnippet>232</a>    <span class="kw">let </span><span class="kw-2">mut </span>schedule_changed = <span class="bool-val">false</span>;
+<a href=#233 id=233 data-nosnippet>233</a>
+<a href=#234 id=234 data-nosnippet>234</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(schedule) = patch.schedule {
+<a href=#235 id=235 data-nosnippet>235</a>        validate_schedule(<span class="kw-2">&amp;</span>schedule, Utc::now())<span class="question-mark">?</span>;
+<a href=#236 id=236 data-nosnippet>236</a>        job.schedule = schedule;
+<a href=#237 id=237 data-nosnippet>237</a>        job.expression = schedule_cron_expression(<span class="kw-2">&amp;</span>job.schedule).unwrap_or_default();
+<a href=#238 id=238 data-nosnippet>238</a>        schedule_changed = <span class="bool-val">true</span>;
+<a href=#239 id=239 data-nosnippet>239</a>    }
+<a href=#240 id=240 data-nosnippet>240</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(command) = patch.command {
+<a href=#241 id=241 data-nosnippet>241</a>        job.command = command;
+<a href=#242 id=242 data-nosnippet>242</a>    }
+<a href=#243 id=243 data-nosnippet>243</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(prompt) = patch.prompt {
+<a href=#244 id=244 data-nosnippet>244</a>        job.prompt = <span class="prelude-val">Some</span>(prompt);
+<a href=#245 id=245 data-nosnippet>245</a>    }
+<a href=#246 id=246 data-nosnippet>246</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(name) = patch.name {
+<a href=#247 id=247 data-nosnippet>247</a>        job.name = <span class="prelude-val">Some</span>(name);
+<a href=#248 id=248 data-nosnippet>248</a>    }
+<a href=#249 id=249 data-nosnippet>249</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(enabled) = patch.enabled {
+<a href=#250 id=250 data-nosnippet>250</a>        job.enabled = enabled;
+<a href=#251 id=251 data-nosnippet>251</a>    }
+<a href=#252 id=252 data-nosnippet>252</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(delivery) = patch.delivery {
+<a href=#253 id=253 data-nosnippet>253</a>        job.delivery = delivery;
+<a href=#254 id=254 data-nosnippet>254</a>    }
+<a href=#255 id=255 data-nosnippet>255</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(model) = patch.model {
+<a href=#256 id=256 data-nosnippet>256</a>        job.model = <span class="prelude-val">Some</span>(model);
+<a href=#257 id=257 data-nosnippet>257</a>    }
+<a href=#258 id=258 data-nosnippet>258</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(target) = patch.session_target {
+<a href=#259 id=259 data-nosnippet>259</a>        job.session_target = target;
+<a href=#260 id=260 data-nosnippet>260</a>    }
+<a href=#261 id=261 data-nosnippet>261</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(delete_after_run) = patch.delete_after_run {
+<a href=#262 id=262 data-nosnippet>262</a>        job.delete_after_run = delete_after_run;
+<a href=#263 id=263 data-nosnippet>263</a>    }
+<a href=#264 id=264 data-nosnippet>264</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(allowed_tools) = patch.allowed_tools {
+<a href=#265 id=265 data-nosnippet>265</a>        <span class="comment">// Empty list means "clear the allowlist" (all tools available),
+<a href=#266 id=266 data-nosnippet>266</a>        // not "allow zero tools".
+<a href=#267 id=267 data-nosnippet>267</a>        </span><span class="kw">if </span>allowed_tools.is_empty() {
+<a href=#268 id=268 data-nosnippet>268</a>            job.allowed_tools = <span class="prelude-val">None</span>;
+<a href=#269 id=269 data-nosnippet>269</a>        } <span class="kw">else </span>{
+<a href=#270 id=270 data-nosnippet>270</a>            job.allowed_tools = <span class="prelude-val">Some</span>(allowed_tools);
+<a href=#271 id=271 data-nosnippet>271</a>        }
+<a href=#272 id=272 data-nosnippet>272</a>    }
+<a href=#273 id=273 data-nosnippet>273</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(uses_memory) = patch.uses_memory {
+<a href=#274 id=274 data-nosnippet>274</a>        job.uses_memory = uses_memory;
+<a href=#275 id=275 data-nosnippet>275</a>    }
+<a href=#276 id=276 data-nosnippet>276</a>
+<a href=#277 id=277 data-nosnippet>277</a>    <span class="kw">if </span>schedule_changed {
+<a href=#278 id=278 data-nosnippet>278</a>        job.next_run = next_run_for_schedule(<span class="kw-2">&amp;</span>job.schedule, Utc::now())<span class="question-mark">?</span>;
+<a href=#279 id=279 data-nosnippet>279</a>    }
+<a href=#280 id=280 data-nosnippet>280</a>
+<a href=#281 id=281 data-nosnippet>281</a>    with_connection(config, |conn| {
+<a href=#282 id=282 data-nosnippet>282</a>        conn.execute(
+<a href=#283 id=283 data-nosnippet>283</a>            <span class="string">"UPDATE cron_jobs
+<a href=#284 id=284 data-nosnippet>284</a>             SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
+<a href=#285 id=285 data-nosnippet>285</a>                 session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
+<a href=#286 id=286 data-nosnippet>286</a>                 allowed_tools = ?12, next_run = ?13, uses_memory = ?14
+<a href=#287 id=287 data-nosnippet>287</a>             WHERE id = ?15"</span>,
+<a href=#288 id=288 data-nosnippet>288</a>            <span class="macro">params!</span>[
+<a href=#289 id=289 data-nosnippet>289</a>                job.expression,
+<a href=#290 id=290 data-nosnippet>290</a>                job.command,
+<a href=#291 id=291 data-nosnippet>291</a>                serde_json::to_string(<span class="kw-2">&amp;</span>job.schedule)<span class="question-mark">?</span>,
+<a href=#292 id=292 data-nosnippet>292</a>                &lt;JobType <span class="kw">as </span>Into&lt;<span class="kw-2">&amp;</span>str&gt;&gt;::into(job.job_type).to_string(),
+<a href=#293 id=293 data-nosnippet>293</a>                job.prompt,
+<a href=#294 id=294 data-nosnippet>294</a>                job.name,
+<a href=#295 id=295 data-nosnippet>295</a>                job.session_target.as_str(),
+<a href=#296 id=296 data-nosnippet>296</a>                job.model,
+<a href=#297 id=297 data-nosnippet>297</a>                <span class="kw">if </span>job.enabled { <span class="number">1 </span>} <span class="kw">else </span>{ <span class="number">0 </span>},
+<a href=#298 id=298 data-nosnippet>298</a>                serde_json::to_string(<span class="kw-2">&amp;</span>job.delivery)<span class="question-mark">?</span>,
+<a href=#299 id=299 data-nosnippet>299</a>                <span class="kw">if </span>job.delete_after_run { <span class="number">1 </span>} <span class="kw">else </span>{ <span class="number">0 </span>},
+<a href=#300 id=300 data-nosnippet>300</a>                encode_allowed_tools(job.allowed_tools.as_ref())<span class="question-mark">?</span>,
+<a href=#301 id=301 data-nosnippet>301</a>                job.next_run.to_rfc3339(),
+<a href=#302 id=302 data-nosnippet>302</a>                <span class="kw">if </span>job.uses_memory { <span class="number">1 </span>} <span class="kw">else </span>{ <span class="number">0 </span>},
+<a href=#303 id=303 data-nosnippet>303</a>                job.id,
+<a href=#304 id=304 data-nosnippet>304</a>            ],
+<a href=#305 id=305 data-nosnippet>305</a>        )
+<a href=#306 id=306 data-nosnippet>306</a>        .context(<span class="string">"Failed to update cron job"</span>)<span class="question-mark">?</span>;
+<a href=#307 id=307 data-nosnippet>307</a>        <span class="prelude-val">Ok</span>(())
+<a href=#308 id=308 data-nosnippet>308</a>    })<span class="question-mark">?</span>;
+<a href=#309 id=309 data-nosnippet>309</a>
+<a href=#310 id=310 data-nosnippet>310</a>    get_job(config, job_id)
+<a href=#311 id=311 data-nosnippet>311</a>}
+<a href=#312 id=312 data-nosnippet>312</a>
+<a href=#313 id=313 data-nosnippet>313</a><span class="kw">pub fn </span>record_last_run(
+<a href=#314 id=314 data-nosnippet>314</a>    config: <span class="kw-2">&amp;</span>Config,
+<a href=#315 id=315 data-nosnippet>315</a>    job_id: <span class="kw-2">&amp;</span>str,
+<a href=#316 id=316 data-nosnippet>316</a>    finished_at: DateTime&lt;Utc&gt;,
+<a href=#317 id=317 data-nosnippet>317</a>    success: bool,
+<a href=#318 id=318 data-nosnippet>318</a>    output: <span class="kw-2">&amp;</span>str,
+<a href=#319 id=319 data-nosnippet>319</a>) -&gt; <span class="prelude-ty">Result</span>&lt;()&gt; {
+<a href=#320 id=320 data-nosnippet>320</a>    <span class="kw">let </span>status = <span class="kw">if </span>success { <span class="string">"ok" </span>} <span class="kw">else </span>{ <span class="string">"error" </span>};
+<a href=#321 id=321 data-nosnippet>321</a>    <span class="kw">let </span>bounded_output = truncate_cron_output(output);
+<a href=#322 id=322 data-nosnippet>322</a>    with_connection(config, |conn| {
+<a href=#323 id=323 data-nosnippet>323</a>        conn.execute(
+<a href=#324 id=324 data-nosnippet>324</a>            <span class="string">"UPDATE cron_jobs
+<a href=#325 id=325 data-nosnippet>325</a>             SET last_run = ?1, last_status = ?2, last_output = ?3
+<a href=#326 id=326 data-nosnippet>326</a>             WHERE id = ?4"</span>,
+<a href=#327 id=327 data-nosnippet>327</a>            <span class="macro">params!</span>[finished_at.to_rfc3339(), status, bounded_output, job_id],
+<a href=#328 id=328 data-nosnippet>328</a>        )
+<a href=#329 id=329 data-nosnippet>329</a>        .context(<span class="string">"Failed to update cron last run fields"</span>)<span class="question-mark">?</span>;
+<a href=#330 id=330 data-nosnippet>330</a>        <span class="prelude-val">Ok</span>(())
+<a href=#331 id=331 data-nosnippet>331</a>    })
+<a href=#332 id=332 data-nosnippet>332</a>}
+<a href=#333 id=333 data-nosnippet>333</a>
+<a href=#334 id=334 data-nosnippet>334</a><span class="kw">pub fn </span>reschedule_after_run(
+<a href=#335 id=335 data-nosnippet>335</a>    config: <span class="kw-2">&amp;</span>Config,
+<a href=#336 id=336 data-nosnippet>336</a>    job: <span class="kw-2">&amp;</span>CronJob,
+<a href=#337 id=337 data-nosnippet>337</a>    success: bool,
+<a href=#338 id=338 data-nosnippet>338</a>    output: <span class="kw-2">&amp;</span>str,
+<a href=#339 id=339 data-nosnippet>339</a>) -&gt; <span class="prelude-ty">Result</span>&lt;()&gt; {
+<a href=#340 id=340 data-nosnippet>340</a>    <span class="kw">let </span>now = Utc::now();
+<a href=#341 id=341 data-nosnippet>341</a>    <span class="kw">let </span>status = <span class="kw">if </span>success { <span class="string">"ok" </span>} <span class="kw">else </span>{ <span class="string">"error" </span>};
+<a href=#342 id=342 data-nosnippet>342</a>    <span class="kw">let </span>bounded_output = truncate_cron_output(output);
+<a href=#343 id=343 data-nosnippet>343</a>
+<a href=#344 id=344 data-nosnippet>344</a>    <span class="comment">// One-shot `At` schedules have no future occurrence — record the run
+<a href=#345 id=345 data-nosnippet>345</a>    // result and disable the job so it won't be picked up again.
+<a href=#346 id=346 data-nosnippet>346</a>    </span><span class="kw">if </span><span class="macro">matches!</span>(job.schedule, Schedule::At { .. }) {
+<a href=#347 id=347 data-nosnippet>347</a>        with_connection(config, |conn| {
+<a href=#348 id=348 data-nosnippet>348</a>            conn.execute(
+<a href=#349 id=349 data-nosnippet>349</a>                <span class="string">"UPDATE cron_jobs
+<a href=#350 id=350 data-nosnippet>350</a>                 SET enabled = 0, last_run = ?1, last_status = ?2, last_output = ?3
+<a href=#351 id=351 data-nosnippet>351</a>                 WHERE id = ?4"</span>,
+<a href=#352 id=352 data-nosnippet>352</a>                <span class="macro">params!</span>[now.to_rfc3339(), status, bounded_output, job.id],
+<a href=#353 id=353 data-nosnippet>353</a>            )
+<a href=#354 id=354 data-nosnippet>354</a>            .context(<span class="string">"Failed to disable completed one-shot cron job"</span>)<span class="question-mark">?</span>;
+<a href=#355 id=355 data-nosnippet>355</a>            <span class="prelude-val">Ok</span>(())
+<a href=#356 id=356 data-nosnippet>356</a>        })
+<a href=#357 id=357 data-nosnippet>357</a>    } <span class="kw">else </span>{
+<a href=#358 id=358 data-nosnippet>358</a>        <span class="kw">let </span>next_run = next_run_for_schedule(<span class="kw-2">&amp;</span>job.schedule, now)<span class="question-mark">?</span>;
+<a href=#359 id=359 data-nosnippet>359</a>        with_connection(config, |conn| {
+<a href=#360 id=360 data-nosnippet>360</a>            conn.execute(
+<a href=#361 id=361 data-nosnippet>361</a>                <span class="string">"UPDATE cron_jobs
+<a href=#362 id=362 data-nosnippet>362</a>                 SET next_run = ?1, last_run = ?2, last_status = ?3, last_output = ?4
+<a href=#363 id=363 data-nosnippet>363</a>                 WHERE id = ?5"</span>,
+<a href=#364 id=364 data-nosnippet>364</a>                <span class="macro">params!</span>[
+<a href=#365 id=365 data-nosnippet>365</a>                    next_run.to_rfc3339(),
+<a href=#366 id=366 data-nosnippet>366</a>                    now.to_rfc3339(),
+<a href=#367 id=367 data-nosnippet>367</a>                    status,
+<a href=#368 id=368 data-nosnippet>368</a>                    bounded_output,
+<a href=#369 id=369 data-nosnippet>369</a>                    job.id
+<a href=#370 id=370 data-nosnippet>370</a>                ],
+<a href=#371 id=371 data-nosnippet>371</a>            )
+<a href=#372 id=372 data-nosnippet>372</a>            .context(<span class="string">"Failed to update cron job run state"</span>)<span class="question-mark">?</span>;
+<a href=#373 id=373 data-nosnippet>373</a>            <span class="prelude-val">Ok</span>(())
+<a href=#374 id=374 data-nosnippet>374</a>        })
+<a href=#375 id=375 data-nosnippet>375</a>    }
+<a href=#376 id=376 data-nosnippet>376</a>}
+<a href=#377 id=377 data-nosnippet>377</a>
+<a href=#378 id=378 data-nosnippet>378</a><span class="kw">pub fn </span>record_run(
+<a href=#379 id=379 data-nosnippet>379</a>    config: <span class="kw-2">&amp;</span>Config,
+<a href=#380 id=380 data-nosnippet>380</a>    job_id: <span class="kw-2">&amp;</span>str,
+<a href=#381 id=381 data-nosnippet>381</a>    started_at: DateTime&lt;Utc&gt;,
+<a href=#382 id=382 data-nosnippet>382</a>    finished_at: DateTime&lt;Utc&gt;,
+<a href=#383 id=383 data-nosnippet>383</a>    status: <span class="kw-2">&amp;</span>str,
+<a href=#384 id=384 data-nosnippet>384</a>    output: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;,
+<a href=#385 id=385 data-nosnippet>385</a>    duration_ms: i64,
+<a href=#386 id=386 data-nosnippet>386</a>) -&gt; <span class="prelude-ty">Result</span>&lt;()&gt; {
+<a href=#387 id=387 data-nosnippet>387</a>    <span class="kw">let </span>bounded_output = output.map(truncate_cron_output);
+<a href=#388 id=388 data-nosnippet>388</a>    with_connection(config, |conn| {
+<a href=#389 id=389 data-nosnippet>389</a>        <span class="comment">// Wrap INSERT + pruning DELETE in an explicit transaction so that
+<a href=#390 id=390 data-nosnippet>390</a>        // if the DELETE fails, the INSERT is rolled back and the run table
+<a href=#391 id=391 data-nosnippet>391</a>        // cannot grow unboundedly.
+<a href=#392 id=392 data-nosnippet>392</a>        </span><span class="kw">let </span>tx = conn.unchecked_transaction()<span class="question-mark">?</span>;
+<a href=#393 id=393 data-nosnippet>393</a>
+<a href=#394 id=394 data-nosnippet>394</a>        tx.execute(
+<a href=#395 id=395 data-nosnippet>395</a>            <span class="string">"INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
+<a href=#396 id=396 data-nosnippet>396</a>             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"</span>,
+<a href=#397 id=397 data-nosnippet>397</a>            <span class="macro">params!</span>[
+<a href=#398 id=398 data-nosnippet>398</a>                job_id,
+<a href=#399 id=399 data-nosnippet>399</a>                started_at.to_rfc3339(),
+<a href=#400 id=400 data-nosnippet>400</a>                finished_at.to_rfc3339(),
+<a href=#401 id=401 data-nosnippet>401</a>                status,
+<a href=#402 id=402 data-nosnippet>402</a>                bounded_output.as_deref(),
+<a href=#403 id=403 data-nosnippet>403</a>                duration_ms,
+<a href=#404 id=404 data-nosnippet>404</a>            ],
+<a href=#405 id=405 data-nosnippet>405</a>        )
+<a href=#406 id=406 data-nosnippet>406</a>        .context(<span class="string">"Failed to insert cron run"</span>)<span class="question-mark">?</span>;
+<a href=#407 id=407 data-nosnippet>407</a>
+<a href=#408 id=408 data-nosnippet>408</a>        <span class="kw">let </span>keep = i64::from(config.cron.max_run_history.max(<span class="number">1</span>));
+<a href=#409 id=409 data-nosnippet>409</a>        tx.execute(
+<a href=#410 id=410 data-nosnippet>410</a>            <span class="string">"DELETE FROM cron_runs
+<a href=#411 id=411 data-nosnippet>411</a>             WHERE job_id = ?1
+<a href=#412 id=412 data-nosnippet>412</a>               AND id NOT IN (
+<a href=#413 id=413 data-nosnippet>413</a>                 SELECT id FROM cron_runs
+<a href=#414 id=414 data-nosnippet>414</a>                 WHERE job_id = ?1
+<a href=#415 id=415 data-nosnippet>415</a>                 ORDER BY started_at DESC, id DESC
+<a href=#416 id=416 data-nosnippet>416</a>                 LIMIT ?2
+<a href=#417 id=417 data-nosnippet>417</a>               )"</span>,
+<a href=#418 id=418 data-nosnippet>418</a>            <span class="macro">params!</span>[job_id, keep],
+<a href=#419 id=419 data-nosnippet>419</a>        )
+<a href=#420 id=420 data-nosnippet>420</a>        .context(<span class="string">"Failed to prune cron run history"</span>)<span class="question-mark">?</span>;
+<a href=#421 id=421 data-nosnippet>421</a>
+<a href=#422 id=422 data-nosnippet>422</a>        tx.commit()
+<a href=#423 id=423 data-nosnippet>423</a>            .context(<span class="string">"Failed to commit cron run transaction"</span>)<span class="question-mark">?</span>;
+<a href=#424 id=424 data-nosnippet>424</a>        <span class="prelude-val">Ok</span>(())
+<a href=#425 id=425 data-nosnippet>425</a>    })
+<a href=#426 id=426 data-nosnippet>426</a>}
+<a href=#427 id=427 data-nosnippet>427</a>
+<a href=#428 id=428 data-nosnippet>428</a><span class="kw">fn </span>truncate_cron_output(output: <span class="kw-2">&amp;</span>str) -&gt; String {
+<a href=#429 id=429 data-nosnippet>429</a>    <span class="kw">if </span>output.len() &lt;= MAX_CRON_OUTPUT_BYTES {
+<a href=#430 id=430 data-nosnippet>430</a>        <span class="kw">return </span>output.to_string();
+<a href=#431 id=431 data-nosnippet>431</a>    }
+<a href=#432 id=432 data-nosnippet>432</a>
+<a href=#433 id=433 data-nosnippet>433</a>    <span class="kw">if </span>MAX_CRON_OUTPUT_BYTES &lt;= TRUNCATED_OUTPUT_MARKER.len() {
+<a href=#434 id=434 data-nosnippet>434</a>        <span class="kw">return </span>TRUNCATED_OUTPUT_MARKER.to_string();
+<a href=#435 id=435 data-nosnippet>435</a>    }
+<a href=#436 id=436 data-nosnippet>436</a>
+<a href=#437 id=437 data-nosnippet>437</a>    <span class="kw">let </span><span class="kw-2">mut </span>cutoff = MAX_CRON_OUTPUT_BYTES - TRUNCATED_OUTPUT_MARKER.len();
+<a href=#438 id=438 data-nosnippet>438</a>    <span class="kw">while </span>cutoff &gt; <span class="number">0 </span>&amp;&amp; !output.is_char_boundary(cutoff) {
+<a href=#439 id=439 data-nosnippet>439</a>        cutoff -= <span class="number">1</span>;
+<a href=#440 id=440 data-nosnippet>440</a>    }
+<a href=#441 id=441 data-nosnippet>441</a>
+<a href=#442 id=442 data-nosnippet>442</a>    <span class="kw">let </span><span class="kw-2">mut </span>truncated = output[..cutoff].to_string();
+<a href=#443 id=443 data-nosnippet>443</a>    truncated.push_str(TRUNCATED_OUTPUT_MARKER);
+<a href=#444 id=444 data-nosnippet>444</a>    truncated
+<a href=#445 id=445 data-nosnippet>445</a>}
+<a href=#446 id=446 data-nosnippet>446</a>
+<a href=#447 id=447 data-nosnippet>447</a><span class="kw">pub fn </span>list_runs(config: <span class="kw-2">&amp;</span>Config, job_id: <span class="kw-2">&amp;</span>str, limit: usize) -&gt; <span class="prelude-ty">Result</span>&lt;Vec&lt;CronRun&gt;&gt; {
+<a href=#448 id=448 data-nosnippet>448</a>    with_connection(config, |conn| {
+<a href=#449 id=449 data-nosnippet>449</a>        <span class="kw">let </span>lim = i64::try_from(limit.max(<span class="number">1</span>)).context(<span class="string">"Run history limit overflow"</span>)<span class="question-mark">?</span>;
+<a href=#450 id=450 data-nosnippet>450</a>        <span class="kw">let </span><span class="kw-2">mut </span>stmt = conn.prepare(
+<a href=#451 id=451 data-nosnippet>451</a>            <span class="string">"SELECT id, job_id, started_at, finished_at, status, output, duration_ms
+<a href=#452 id=452 data-nosnippet>452</a>             FROM cron_runs
+<a href=#453 id=453 data-nosnippet>453</a>             WHERE job_id = ?1
+<a href=#454 id=454 data-nosnippet>454</a>             ORDER BY started_at DESC, id DESC
+<a href=#455 id=455 data-nosnippet>455</a>             LIMIT ?2"</span>,
+<a href=#456 id=456 data-nosnippet>456</a>        )<span class="question-mark">?</span>;
+<a href=#457 id=457 data-nosnippet>457</a>
+<a href=#458 id=458 data-nosnippet>458</a>        <span class="kw">let </span>rows = stmt.query_map(<span class="macro">params!</span>[job_id, lim], |row| {
+<a href=#459 id=459 data-nosnippet>459</a>            <span class="prelude-val">Ok</span>(CronRun {
+<a href=#460 id=460 data-nosnippet>460</a>                id: row.get(<span class="number">0</span>)<span class="question-mark">?</span>,
+<a href=#461 id=461 data-nosnippet>461</a>                job_id: row.get(<span class="number">1</span>)<span class="question-mark">?</span>,
+<a href=#462 id=462 data-nosnippet>462</a>                started_at: parse_rfc3339(<span class="kw-2">&amp;</span>row.get::&lt;<span class="kw">_</span>, String&gt;(<span class="number">2</span>)<span class="question-mark">?</span>)
+<a href=#463 id=463 data-nosnippet>463</a>                    .map_err(sql_conversion_error)<span class="question-mark">?</span>,
+<a href=#464 id=464 data-nosnippet>464</a>                finished_at: parse_rfc3339(<span class="kw-2">&amp;</span>row.get::&lt;<span class="kw">_</span>, String&gt;(<span class="number">3</span>)<span class="question-mark">?</span>)
+<a href=#465 id=465 data-nosnippet>465</a>                    .map_err(sql_conversion_error)<span class="question-mark">?</span>,
+<a href=#466 id=466 data-nosnippet>466</a>                status: row.get(<span class="number">4</span>)<span class="question-mark">?</span>,
+<a href=#467 id=467 data-nosnippet>467</a>                output: row.get(<span class="number">5</span>)<span class="question-mark">?</span>,
+<a href=#468 id=468 data-nosnippet>468</a>                duration_ms: row.get(<span class="number">6</span>)<span class="question-mark">?</span>,
+<a href=#469 id=469 data-nosnippet>469</a>            })
+<a href=#470 id=470 data-nosnippet>470</a>        })<span class="question-mark">?</span>;
+<a href=#471 id=471 data-nosnippet>471</a>
+<a href=#472 id=472 data-nosnippet>472</a>        <span class="kw">let </span><span class="kw-2">mut </span>runs = Vec::new();
+<a href=#473 id=473 data-nosnippet>473</a>        <span class="kw">for </span>row <span class="kw">in </span>rows {
+<a href=#474 id=474 data-nosnippet>474</a>            runs.push(row<span class="question-mark">?</span>);
+<a href=#475 id=475 data-nosnippet>475</a>        }
+<a href=#476 id=476 data-nosnippet>476</a>        <span class="prelude-val">Ok</span>(runs)
+<a href=#477 id=477 data-nosnippet>477</a>    })
+<a href=#478 id=478 data-nosnippet>478</a>}
+<a href=#479 id=479 data-nosnippet>479</a>
+<a href=#480 id=480 data-nosnippet>480</a><span class="kw">fn </span>parse_rfc3339(raw: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;DateTime&lt;Utc&gt;&gt; {
+<a href=#481 id=481 data-nosnippet>481</a>    <span class="kw">let </span>parsed = DateTime::parse_from_rfc3339(raw)
+<a href=#482 id=482 data-nosnippet>482</a>        .with_context(|| <span class="macro">format!</span>(<span class="string">"Invalid RFC3339 timestamp in cron DB: {raw}"</span>))<span class="question-mark">?</span>;
+<a href=#483 id=483 data-nosnippet>483</a>    <span class="prelude-val">Ok</span>(parsed.with_timezone(<span class="kw-2">&amp;</span>Utc))
+<a href=#484 id=484 data-nosnippet>484</a>}
+<a href=#485 id=485 data-nosnippet>485</a>
+<a href=#486 id=486 data-nosnippet>486</a><span class="kw">fn </span>sql_conversion_error(err: anyhow::Error) -&gt; rusqlite::Error {
+<a href=#487 id=487 data-nosnippet>487</a>    rusqlite::Error::ToSqlConversionFailure(err.into())
+<a href=#488 id=488 data-nosnippet>488</a>}
+<a href=#489 id=489 data-nosnippet>489</a>
+<a href=#490 id=490 data-nosnippet>490</a><span class="kw">fn </span>map_cron_job_row(row: <span class="kw-2">&amp;</span>rusqlite::Row&lt;<span class="lifetime">'_</span>&gt;) -&gt; rusqlite::Result&lt;CronJob&gt; {
+<a href=#491 id=491 data-nosnippet>491</a>    <span class="kw">let </span>expression: String = row.get(<span class="number">1</span>)<span class="question-mark">?</span>;
+<a href=#492 id=492 data-nosnippet>492</a>    <span class="kw">let </span>schedule_raw: <span class="prelude-ty">Option</span>&lt;String&gt; = row.get(<span class="number">3</span>)<span class="question-mark">?</span>;
+<a href=#493 id=493 data-nosnippet>493</a>    <span class="kw">let </span>schedule =
+<a href=#494 id=494 data-nosnippet>494</a>        decode_schedule(schedule_raw.as_deref(), <span class="kw-2">&amp;</span>expression).map_err(sql_conversion_error)<span class="question-mark">?</span>;
+<a href=#495 id=495 data-nosnippet>495</a>
+<a href=#496 id=496 data-nosnippet>496</a>    <span class="kw">let </span>delivery_raw: <span class="prelude-ty">Option</span>&lt;String&gt; = row.get(<span class="number">10</span>)<span class="question-mark">?</span>;
+<a href=#497 id=497 data-nosnippet>497</a>    <span class="kw">let </span>delivery = decode_delivery(delivery_raw.as_deref()).map_err(sql_conversion_error)<span class="question-mark">?</span>;
+<a href=#498 id=498 data-nosnippet>498</a>
+<a href=#499 id=499 data-nosnippet>499</a>    <span class="kw">let </span>next_run_raw: String = row.get(<span class="number">13</span>)<span class="question-mark">?</span>;
+<a href=#500 id=500 data-nosnippet>500</a>    <span class="kw">let </span>last_run_raw: <span class="prelude-ty">Option</span>&lt;String&gt; = row.get(<span class="number">14</span>)<span class="question-mark">?</span>;
+<a href=#501 id=501 data-nosnippet>501</a>    <span class="kw">let </span>created_at_raw: String = row.get(<span class="number">12</span>)<span class="question-mark">?</span>;
+<a href=#502 id=502 data-nosnippet>502</a>    <span class="kw">let </span>allowed_tools_raw: <span class="prelude-ty">Option</span>&lt;String&gt; = row.get(<span class="number">17</span>)<span class="question-mark">?</span>;
+<a href=#503 id=503 data-nosnippet>503</a>    <span class="kw">let </span>source: <span class="prelude-ty">Option</span>&lt;String&gt; = row.get(<span class="number">18</span>)<span class="question-mark">?</span>;
+<a href=#504 id=504 data-nosnippet>504</a>    <span class="kw">let </span>uses_memory: <span class="prelude-ty">Option</span>&lt;i64&gt; = row.get(<span class="number">19</span>)<span class="question-mark">?</span>;
+<a href=#505 id=505 data-nosnippet>505</a>
+<a href=#506 id=506 data-nosnippet>506</a>    <span class="prelude-val">Ok</span>(CronJob {
+<a href=#507 id=507 data-nosnippet>507</a>        id: row.get(<span class="number">0</span>)<span class="question-mark">?</span>,
+<a href=#508 id=508 data-nosnippet>508</a>        expression,
+<a href=#509 id=509 data-nosnippet>509</a>        schedule,
+<a href=#510 id=510 data-nosnippet>510</a>        command: row.get(<span class="number">2</span>)<span class="question-mark">?</span>,
+<a href=#511 id=511 data-nosnippet>511</a>        job_type: row.get(<span class="number">4</span>)<span class="question-mark">?</span>,
+<a href=#512 id=512 data-nosnippet>512</a>        prompt: row.get(<span class="number">5</span>)<span class="question-mark">?</span>,
+<a href=#513 id=513 data-nosnippet>513</a>        name: row.get(<span class="number">6</span>)<span class="question-mark">?</span>,
+<a href=#514 id=514 data-nosnippet>514</a>        session_target: SessionTarget::parse(<span class="kw-2">&amp;</span>row.get::&lt;<span class="kw">_</span>, String&gt;(<span class="number">7</span>)<span class="question-mark">?</span>),
+<a href=#515 id=515 data-nosnippet>515</a>        model: row.get(<span class="number">8</span>)<span class="question-mark">?</span>,
+<a href=#516 id=516 data-nosnippet>516</a>        enabled: row.get::&lt;<span class="kw">_</span>, i64&gt;(<span class="number">9</span>)<span class="question-mark">? </span>!= <span class="number">0</span>,
+<a href=#517 id=517 data-nosnippet>517</a>        delivery,
+<a href=#518 id=518 data-nosnippet>518</a>        delete_after_run: row.get::&lt;<span class="kw">_</span>, i64&gt;(<span class="number">11</span>)<span class="question-mark">? </span>!= <span class="number">0</span>,
+<a href=#519 id=519 data-nosnippet>519</a>        source: source.unwrap_or_else(|| <span class="string">"imperative"</span>.to_string()),
+<a href=#520 id=520 data-nosnippet>520</a>        uses_memory: uses_memory != <span class="prelude-val">Some</span>(<span class="number">0</span>),
+<a href=#521 id=521 data-nosnippet>521</a>        created_at: parse_rfc3339(<span class="kw-2">&amp;</span>created_at_raw).map_err(sql_conversion_error)<span class="question-mark">?</span>,
+<a href=#522 id=522 data-nosnippet>522</a>        next_run: parse_rfc3339(<span class="kw-2">&amp;</span>next_run_raw).map_err(sql_conversion_error)<span class="question-mark">?</span>,
+<a href=#523 id=523 data-nosnippet>523</a>        last_run: <span class="kw">match </span>last_run_raw {
+<a href=#524 id=524 data-nosnippet>524</a>            <span class="prelude-val">Some</span>(raw) =&gt; <span class="prelude-val">Some</span>(parse_rfc3339(<span class="kw-2">&amp;</span>raw).map_err(sql_conversion_error)<span class="question-mark">?</span>),
+<a href=#525 id=525 data-nosnippet>525</a>            <span class="prelude-val">None </span>=&gt; <span class="prelude-val">None</span>,
+<a href=#526 id=526 data-nosnippet>526</a>        },
+<a href=#527 id=527 data-nosnippet>527</a>        last_status: row.get(<span class="number">15</span>)<span class="question-mark">?</span>,
+<a href=#528 id=528 data-nosnippet>528</a>        last_output: row.get(<span class="number">16</span>)<span class="question-mark">?</span>,
+<a href=#529 id=529 data-nosnippet>529</a>        allowed_tools: decode_allowed_tools(allowed_tools_raw.as_deref())
+<a href=#530 id=530 data-nosnippet>530</a>            .map_err(sql_conversion_error)<span class="question-mark">?</span>,
+<a href=#531 id=531 data-nosnippet>531</a>    })
+<a href=#532 id=532 data-nosnippet>532</a>}
+<a href=#533 id=533 data-nosnippet>533</a>
+<a href=#534 id=534 data-nosnippet>534</a><span class="kw">fn </span>decode_schedule(schedule_raw: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;, expression: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;Schedule&gt; {
+<a href=#535 id=535 data-nosnippet>535</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(raw) = schedule_raw {
+<a href=#536 id=536 data-nosnippet>536</a>        <span class="kw">let </span>trimmed = raw.trim();
+<a href=#537 id=537 data-nosnippet>537</a>        <span class="kw">if </span>!trimmed.is_empty() {
+<a href=#538 id=538 data-nosnippet>538</a>            <span class="kw">return </span>serde_json::from_str(trimmed)
+<a href=#539 id=539 data-nosnippet>539</a>                .with_context(|| <span class="macro">format!</span>(<span class="string">"Failed to parse cron schedule JSON: {trimmed}"</span>));
+<a href=#540 id=540 data-nosnippet>540</a>        }
+<a href=#541 id=541 data-nosnippet>541</a>    }
+<a href=#542 id=542 data-nosnippet>542</a>
+<a href=#543 id=543 data-nosnippet>543</a>    <span class="kw">if </span>expression.trim().is_empty() {
+<a href=#544 id=544 data-nosnippet>544</a>        <span class="macro">anyhow::bail!</span>(<span class="string">"Missing schedule and legacy expression for cron job"</span>)
+<a href=#545 id=545 data-nosnippet>545</a>    }
+<a href=#546 id=546 data-nosnippet>546</a>
+<a href=#547 id=547 data-nosnippet>547</a>    <span class="prelude-val">Ok</span>(Schedule::Cron {
+<a href=#548 id=548 data-nosnippet>548</a>        expr: expression.to_string(),
+<a href=#549 id=549 data-nosnippet>549</a>        tz: <span class="prelude-val">None</span>,
+<a href=#550 id=550 data-nosnippet>550</a>    })
+<a href=#551 id=551 data-nosnippet>551</a>}
+<a href=#552 id=552 data-nosnippet>552</a>
+<a href=#553 id=553 data-nosnippet>553</a><span class="kw">fn </span>decode_delivery(delivery_raw: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;DeliveryConfig&gt; {
+<a href=#554 id=554 data-nosnippet>554</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(raw) = delivery_raw {
+<a href=#555 id=555 data-nosnippet>555</a>        <span class="kw">let </span>trimmed = raw.trim();
+<a href=#556 id=556 data-nosnippet>556</a>        <span class="kw">if </span>!trimmed.is_empty() {
+<a href=#557 id=557 data-nosnippet>557</a>            <span class="kw">return </span>serde_json::from_str(trimmed)
+<a href=#558 id=558 data-nosnippet>558</a>                .with_context(|| <span class="macro">format!</span>(<span class="string">"Failed to parse cron delivery JSON: {trimmed}"</span>));
+<a href=#559 id=559 data-nosnippet>559</a>        }
+<a href=#560 id=560 data-nosnippet>560</a>    }
+<a href=#561 id=561 data-nosnippet>561</a>    <span class="prelude-val">Ok</span>(DeliveryConfig::default())
+<a href=#562 id=562 data-nosnippet>562</a>}
+<a href=#563 id=563 data-nosnippet>563</a>
+<a href=#564 id=564 data-nosnippet>564</a><span class="kw">fn </span>encode_allowed_tools(allowed_tools: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>Vec&lt;String&gt;&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="prelude-ty">Option</span>&lt;String&gt;&gt; {
+<a href=#565 id=565 data-nosnippet>565</a>    allowed_tools
+<a href=#566 id=566 data-nosnippet>566</a>        .map(serde_json::to_string)
+<a href=#567 id=567 data-nosnippet>567</a>        .transpose()
+<a href=#568 id=568 data-nosnippet>568</a>        .context(<span class="string">"Failed to serialize cron allowed_tools"</span>)
+<a href=#569 id=569 data-nosnippet>569</a>}
+<a href=#570 id=570 data-nosnippet>570</a>
+<a href=#571 id=571 data-nosnippet>571</a><span class="kw">fn </span>decode_allowed_tools(raw: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="prelude-ty">Option</span>&lt;Vec&lt;String&gt;&gt;&gt; {
+<a href=#572 id=572 data-nosnippet>572</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(raw) = raw {
+<a href=#573 id=573 data-nosnippet>573</a>        <span class="kw">let </span>trimmed = raw.trim();
+<a href=#574 id=574 data-nosnippet>574</a>        <span class="kw">if </span>!trimmed.is_empty() {
+<a href=#575 id=575 data-nosnippet>575</a>            <span class="kw">return </span>serde_json::from_str(trimmed)
+<a href=#576 id=576 data-nosnippet>576</a>                .map(<span class="prelude-val">Some</span>)
+<a href=#577 id=577 data-nosnippet>577</a>                .with_context(|| <span class="macro">format!</span>(<span class="string">"Failed to parse cron allowed_tools JSON: {trimmed}"</span>));
+<a href=#578 id=578 data-nosnippet>578</a>        }
+<a href=#579 id=579 data-nosnippet>579</a>    }
+<a href=#580 id=580 data-nosnippet>580</a>    <span class="prelude-val">Ok</span>(<span class="prelude-val">None</span>)
+<a href=#581 id=581 data-nosnippet>581</a>}
+<a href=#582 id=582 data-nosnippet>582</a>
+<a href=#583 id=583 data-nosnippet>583</a><span class="doccomment">/// Synchronize declarative cron job definitions from config into the database.
+<a href=#584 id=584 data-nosnippet>584</a>///
+<a href=#585 id=585 data-nosnippet>585</a>/// For each declarative job (identified by `id`):
+<a href=#586 id=586 data-nosnippet>586</a>/// - If the job exists in DB: update it to match the config definition.
+<a href=#587 id=587 data-nosnippet>587</a>/// - If the job does not exist: insert it.
+<a href=#588 id=588 data-nosnippet>588</a>///
+<a href=#589 id=589 data-nosnippet>589</a>/// Jobs created imperatively (via CLI/API) are never modified or deleted.
+<a href=#590 id=590 data-nosnippet>590</a>/// Declarative jobs that are no longer present in config are removed.
+<a href=#591 id=591 data-nosnippet>591</a></span><span class="kw">pub fn </span>sync_declarative_jobs(
+<a href=#592 id=592 data-nosnippet>592</a>    config: <span class="kw-2">&amp;</span>Config,
+<a href=#593 id=593 data-nosnippet>593</a>    decls: <span class="kw-2">&amp;</span>[zeroclaw_config::schema::CronJobDecl],
+<a href=#594 id=594 data-nosnippet>594</a>) -&gt; <span class="prelude-ty">Result</span>&lt;()&gt; {
+<a href=#595 id=595 data-nosnippet>595</a>    <span class="kw">use </span>zeroclaw_config::schema::CronScheduleDecl;
+<a href=#596 id=596 data-nosnippet>596</a>
+<a href=#597 id=597 data-nosnippet>597</a>    <span class="kw">if </span>decls.is_empty() {
+<a href=#598 id=598 data-nosnippet>598</a>        <span class="comment">// If no declarative jobs are defined, clean up any previously
+<a href=#599 id=599 data-nosnippet>599</a>        // synced declarative jobs that are no longer in config.
+<a href=#600 id=600 data-nosnippet>600</a>        </span>with_connection(config, |conn| {
+<a href=#601 id=601 data-nosnippet>601</a>            <span class="kw">let </span>deleted = conn
+<a href=#602 id=602 data-nosnippet>602</a>                .execute(<span class="string">"DELETE FROM cron_jobs WHERE source = 'declarative'"</span>, [])
+<a href=#603 id=603 data-nosnippet>603</a>                .context(<span class="string">"Failed to remove stale declarative cron jobs"</span>)<span class="question-mark">?</span>;
+<a href=#604 id=604 data-nosnippet>604</a>            <span class="kw">if </span>deleted &gt; <span class="number">0 </span>{
+<a href=#605 id=605 data-nosnippet>605</a>                <span class="macro">tracing::info!</span>(
+<a href=#606 id=606 data-nosnippet>606</a>                    count = deleted,
+<a href=#607 id=607 data-nosnippet>607</a>                    <span class="string">"Removed declarative cron jobs no longer in config"
+<a href=#608 id=608 data-nosnippet>608</a>                </span>);
+<a href=#609 id=609 data-nosnippet>609</a>            }
+<a href=#610 id=610 data-nosnippet>610</a>            <span class="prelude-val">Ok</span>(())
+<a href=#611 id=611 data-nosnippet>611</a>        })<span class="question-mark">?</span>;
+<a href=#612 id=612 data-nosnippet>612</a>        <span class="kw">return </span><span class="prelude-val">Ok</span>(());
+<a href=#613 id=613 data-nosnippet>613</a>    }
+<a href=#614 id=614 data-nosnippet>614</a>
+<a href=#615 id=615 data-nosnippet>615</a>    <span class="comment">// Validate declarations before touching the DB.
+<a href=#616 id=616 data-nosnippet>616</a>    </span><span class="kw">for </span>decl <span class="kw">in </span>decls {
+<a href=#617 id=617 data-nosnippet>617</a>        validate_decl(decl)<span class="question-mark">?</span>;
+<a href=#618 id=618 data-nosnippet>618</a>    }
+<a href=#619 id=619 data-nosnippet>619</a>
+<a href=#620 id=620 data-nosnippet>620</a>    <span class="kw">let </span>now = Utc::now();
+<a href=#621 id=621 data-nosnippet>621</a>
+<a href=#622 id=622 data-nosnippet>622</a>    with_connection(config, |conn| {
+<a href=#623 id=623 data-nosnippet>623</a>        <span class="comment">// Collect IDs of all declarative jobs currently defined in config.
+<a href=#624 id=624 data-nosnippet>624</a>        </span><span class="kw">let </span>config_ids: std::collections::HashSet&lt;<span class="kw-2">&amp;</span>str&gt; =
+<a href=#625 id=625 data-nosnippet>625</a>            decls.iter().map(|d| d.id.as_str()).collect();
+<a href=#626 id=626 data-nosnippet>626</a>
+<a href=#627 id=627 data-nosnippet>627</a>        <span class="comment">// Remove declarative jobs no longer in config.
+<a href=#628 id=628 data-nosnippet>628</a>        </span>{
+<a href=#629 id=629 data-nosnippet>629</a>            <span class="kw">let </span><span class="kw-2">mut </span>stmt = conn.prepare(<span class="string">"SELECT id FROM cron_jobs WHERE source = 'declarative'"</span>)<span class="question-mark">?</span>;
+<a href=#630 id=630 data-nosnippet>630</a>            <span class="kw">let </span>db_ids: Vec&lt;String&gt; = stmt
+<a href=#631 id=631 data-nosnippet>631</a>                .query_map([], |row| row.get(<span class="number">0</span>))<span class="question-mark">?
+<a href=#632 id=632 data-nosnippet>632</a>                </span>.filter_map(|r| r.ok())
+<a href=#633 id=633 data-nosnippet>633</a>                .collect();
+<a href=#634 id=634 data-nosnippet>634</a>
+<a href=#635 id=635 data-nosnippet>635</a>            <span class="kw">for </span>db_id <span class="kw">in </span><span class="kw-2">&amp;</span>db_ids {
+<a href=#636 id=636 data-nosnippet>636</a>                <span class="kw">if </span>!config_ids.contains(db_id.as_str()) {
+<a href=#637 id=637 data-nosnippet>637</a>                    conn.execute(<span class="string">"DELETE FROM cron_jobs WHERE id = ?1"</span>, <span class="macro">params!</span>[db_id])
+<a href=#638 id=638 data-nosnippet>638</a>                        .with_context(|| {
+<a href=#639 id=639 data-nosnippet>639</a>                            <span class="macro">format!</span>(<span class="string">"Failed to remove stale declarative cron job '{db_id}'"</span>)
+<a href=#640 id=640 data-nosnippet>640</a>                        })<span class="question-mark">?</span>;
+<a href=#641 id=641 data-nosnippet>641</a>                    <span class="macro">tracing::info!</span>(
+<a href=#642 id=642 data-nosnippet>642</a>                        job_id = %db_id,
+<a href=#643 id=643 data-nosnippet>643</a>                        <span class="string">"Removed declarative cron job no longer in config"
+<a href=#644 id=644 data-nosnippet>644</a>                    </span>);
+<a href=#645 id=645 data-nosnippet>645</a>                }
+<a href=#646 id=646 data-nosnippet>646</a>            }
+<a href=#647 id=647 data-nosnippet>647</a>        }
+<a href=#648 id=648 data-nosnippet>648</a>
+<a href=#649 id=649 data-nosnippet>649</a>        <span class="kw">for </span>decl <span class="kw">in </span>decls {
+<a href=#650 id=650 data-nosnippet>650</a>            <span class="kw">let </span>schedule = convert_schedule_decl(<span class="kw-2">&amp;</span>decl.schedule)<span class="question-mark">?</span>;
+<a href=#651 id=651 data-nosnippet>651</a>            <span class="kw">let </span>expression = schedule_cron_expression(<span class="kw-2">&amp;</span>schedule).unwrap_or_default();
+<a href=#652 id=652 data-nosnippet>652</a>            <span class="kw">let </span>schedule_json = serde_json::to_string(<span class="kw-2">&amp;</span>schedule)<span class="question-mark">?</span>;
+<a href=#653 id=653 data-nosnippet>653</a>            <span class="kw">let </span>job_type = <span class="kw-2">&amp;</span>decl.job_type;
+<a href=#654 id=654 data-nosnippet>654</a>            <span class="kw">let </span>session_target = decl.session_target.as_deref().unwrap_or(<span class="string">"isolated"</span>);
+<a href=#655 id=655 data-nosnippet>655</a>            <span class="kw">let </span>delivery = <span class="kw">match </span><span class="kw-2">&amp;</span>decl.delivery {
+<a href=#656 id=656 data-nosnippet>656</a>                <span class="prelude-val">Some</span>(d) =&gt; convert_delivery_decl(d),
+<a href=#657 id=657 data-nosnippet>657</a>                <span class="prelude-val">None </span>=&gt; DeliveryConfig::default(),
+<a href=#658 id=658 data-nosnippet>658</a>            };
+<a href=#659 id=659 data-nosnippet>659</a>            <span class="kw">let </span>delivery_json = serde_json::to_string(<span class="kw-2">&amp;</span>delivery)<span class="question-mark">?</span>;
+<a href=#660 id=660 data-nosnippet>660</a>            <span class="kw">let </span>allowed_tools_json = encode_allowed_tools(decl.allowed_tools.as_ref())<span class="question-mark">?</span>;
+<a href=#661 id=661 data-nosnippet>661</a>            <span class="kw">let </span>command = decl.command.as_deref().unwrap_or(<span class="string">""</span>);
+<a href=#662 id=662 data-nosnippet>662</a>            <span class="kw">let </span>delete_after_run = <span class="macro">matches!</span>(decl.schedule, CronScheduleDecl::At { .. });
+<a href=#663 id=663 data-nosnippet>663</a>
+<a href=#664 id=664 data-nosnippet>664</a>            <span class="comment">// Check if job already exists.
+<a href=#665 id=665 data-nosnippet>665</a>            </span><span class="kw">let </span>exists: bool = conn
+<a href=#666 id=666 data-nosnippet>666</a>                .prepare(<span class="string">"SELECT COUNT(*) FROM cron_jobs WHERE id = ?1"</span>)<span class="question-mark">?
+<a href=#667 id=667 data-nosnippet>667</a>                </span>.query_row(<span class="macro">params!</span>[decl.id], |row| row.get::&lt;<span class="kw">_</span>, i64&gt;(<span class="number">0</span>))
+<a href=#668 id=668 data-nosnippet>668</a>                .map(|c| c &gt; <span class="number">0</span>)
+<a href=#669 id=669 data-nosnippet>669</a>                .unwrap_or(<span class="bool-val">false</span>);
+<a href=#670 id=670 data-nosnippet>670</a>
+<a href=#671 id=671 data-nosnippet>671</a>            <span class="kw">if </span>exists {
+<a href=#672 id=672 data-nosnippet>672</a>                <span class="comment">// Update existing declarative job — preserve runtime state
+<a href=#673 id=673 data-nosnippet>673</a>                // (next_run, last_run, last_status, last_output, created_at).
+<a href=#674 id=674 data-nosnippet>674</a>                // Only update the schedule's next_run if the schedule itself changed.
+<a href=#675 id=675 data-nosnippet>675</a>                </span><span class="kw">let </span>current_schedule_raw: <span class="prelude-ty">Option</span>&lt;String&gt; = conn
+<a href=#676 id=676 data-nosnippet>676</a>                    .prepare(<span class="string">"SELECT schedule FROM cron_jobs WHERE id = ?1"</span>)<span class="question-mark">?
+<a href=#677 id=677 data-nosnippet>677</a>                    </span>.query_row(<span class="macro">params!</span>[decl.id], |row| row.get(<span class="number">0</span>))
+<a href=#678 id=678 data-nosnippet>678</a>                    .ok();
+<a href=#679 id=679 data-nosnippet>679</a>
+<a href=#680 id=680 data-nosnippet>680</a>                <span class="kw">let </span>schedule_changed = current_schedule_raw.as_deref() != <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>schedule_json);
+<a href=#681 id=681 data-nosnippet>681</a>
+<a href=#682 id=682 data-nosnippet>682</a>                <span class="kw">if </span>schedule_changed {
+<a href=#683 id=683 data-nosnippet>683</a>                    <span class="kw">let </span>next_run = next_run_for_schedule(<span class="kw-2">&amp;</span>schedule, now)<span class="question-mark">?</span>;
+<a href=#684 id=684 data-nosnippet>684</a>                    conn.execute(
+<a href=#685 id=685 data-nosnippet>685</a>                        <span class="string">"UPDATE cron_jobs
+<a href=#686 id=686 data-nosnippet>686</a>                         SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4,
+<a href=#687 id=687 data-nosnippet>687</a>                             prompt = ?5, name = ?6, session_target = ?7, model = ?8,
+<a href=#688 id=688 data-nosnippet>688</a>                             enabled = ?9, delivery = ?10, delete_after_run = ?11,
+<a href=#689 id=689 data-nosnippet>689</a>                             allowed_tools = ?12, source = 'declarative', next_run = ?13,
+<a href=#690 id=690 data-nosnippet>690</a>                             uses_memory = ?14
+<a href=#691 id=691 data-nosnippet>691</a>                         WHERE id = ?15"</span>,
+<a href=#692 id=692 data-nosnippet>692</a>                        <span class="macro">params!</span>[
+<a href=#693 id=693 data-nosnippet>693</a>                            expression,
+<a href=#694 id=694 data-nosnippet>694</a>                            command,
+<a href=#695 id=695 data-nosnippet>695</a>                            schedule_json,
+<a href=#696 id=696 data-nosnippet>696</a>                            job_type,
+<a href=#697 id=697 data-nosnippet>697</a>                            decl.prompt,
+<a href=#698 id=698 data-nosnippet>698</a>                            decl.name,
+<a href=#699 id=699 data-nosnippet>699</a>                            session_target,
+<a href=#700 id=700 data-nosnippet>700</a>                            decl.model,
+<a href=#701 id=701 data-nosnippet>701</a>                            <span class="kw">if </span>decl.enabled { <span class="number">1 </span>} <span class="kw">else </span>{ <span class="number">0 </span>},
+<a href=#702 id=702 data-nosnippet>702</a>                            delivery_json,
+<a href=#703 id=703 data-nosnippet>703</a>                            <span class="kw">if </span>delete_after_run { <span class="number">1 </span>} <span class="kw">else </span>{ <span class="number">0 </span>},
+<a href=#704 id=704 data-nosnippet>704</a>                            allowed_tools_json,
+<a href=#705 id=705 data-nosnippet>705</a>                            next_run.to_rfc3339(),
+<a href=#706 id=706 data-nosnippet>706</a>                            <span class="kw">if </span>decl.uses_memory { <span class="number">1 </span>} <span class="kw">else </span>{ <span class="number">0 </span>},
+<a href=#707 id=707 data-nosnippet>707</a>                            decl.id,
+<a href=#708 id=708 data-nosnippet>708</a>                        ],
+<a href=#709 id=709 data-nosnippet>709</a>                    )
+<a href=#710 id=710 data-nosnippet>710</a>                    .with_context(|| {
+<a href=#711 id=711 data-nosnippet>711</a>                        <span class="macro">format!</span>(<span class="string">"Failed to update declarative cron job '{}'"</span>, decl.id)
+<a href=#712 id=712 data-nosnippet>712</a>                    })<span class="question-mark">?</span>;
+<a href=#713 id=713 data-nosnippet>713</a>                } <span class="kw">else </span>{
+<a href=#714 id=714 data-nosnippet>714</a>                    conn.execute(
+<a href=#715 id=715 data-nosnippet>715</a>                        <span class="string">"UPDATE cron_jobs
+<a href=#716 id=716 data-nosnippet>716</a>                         SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4,
+<a href=#717 id=717 data-nosnippet>717</a>                             prompt = ?5, name = ?6, session_target = ?7, model = ?8,
+<a href=#718 id=718 data-nosnippet>718</a>                             enabled = ?9, delivery = ?10, delete_after_run = ?11,
+<a href=#719 id=719 data-nosnippet>719</a>                             allowed_tools = ?12, source = 'declarative',
+<a href=#720 id=720 data-nosnippet>720</a>                             uses_memory = ?13
+<a href=#721 id=721 data-nosnippet>721</a>                         WHERE id = ?14"</span>,
+<a href=#722 id=722 data-nosnippet>722</a>                        <span class="macro">params!</span>[
+<a href=#723 id=723 data-nosnippet>723</a>                            expression,
+<a href=#724 id=724 data-nosnippet>724</a>                            command,
+<a href=#725 id=725 data-nosnippet>725</a>                            schedule_json,
+<a href=#726 id=726 data-nosnippet>726</a>                            job_type,
+<a href=#727 id=727 data-nosnippet>727</a>                            decl.prompt,
+<a href=#728 id=728 data-nosnippet>728</a>                            decl.name,
+<a href=#729 id=729 data-nosnippet>729</a>                            session_target,
+<a href=#730 id=730 data-nosnippet>730</a>                            decl.model,
+<a href=#731 id=731 data-nosnippet>731</a>                            <span class="kw">if </span>decl.enabled { <span class="number">1 </span>} <span class="kw">else </span>{ <span class="number">0 </span>},
+<a href=#732 id=732 data-nosnippet>732</a>                            delivery_json,
+<a href=#733 id=733 data-nosnippet>733</a>                            <span class="kw">if </span>delete_after_run { <span class="number">1 </span>} <span class="kw">else </span>{ <span class="number">0 </span>},
+<a href=#734 id=734 data-nosnippet>734</a>                            allowed_tools_json,
+<a href=#735 id=735 data-nosnippet>735</a>                            <span class="kw">if </span>decl.uses_memory { <span class="number">1 </span>} <span class="kw">else </span>{ <span class="number">0 </span>},
+<a href=#736 id=736 data-nosnippet>736</a>                            decl.id,
+<a href=#737 id=737 data-nosnippet>737</a>                        ],
+<a href=#738 id=738 data-nosnippet>738</a>                    )
+<a href=#739 id=739 data-nosnippet>739</a>                    .with_context(|| {
+<a href=#740 id=740 data-nosnippet>740</a>                        <span class="macro">format!</span>(<span class="string">"Failed to update declarative cron job '{}'"</span>, decl.id)
+<a href=#741 id=741 data-nosnippet>741</a>                    })<span class="question-mark">?</span>;
+<a href=#742 id=742 data-nosnippet>742</a>                }
+<a href=#743 id=743 data-nosnippet>743</a>
+<a href=#744 id=744 data-nosnippet>744</a>                <span class="macro">tracing::debug!</span>(job_id = %decl.id, <span class="string">"Updated declarative cron job"</span>);
+<a href=#745 id=745 data-nosnippet>745</a>            } <span class="kw">else </span>{
+<a href=#746 id=746 data-nosnippet>746</a>                <span class="comment">// Insert new declarative job.
+<a href=#747 id=747 data-nosnippet>747</a>                </span><span class="kw">let </span>next_run = next_run_for_schedule(<span class="kw-2">&amp;</span>schedule, now)<span class="question-mark">?</span>;
+<a href=#748 id=748 data-nosnippet>748</a>                conn.execute(
+<a href=#749 id=749 data-nosnippet>749</a>                    <span class="string">"INSERT INTO cron_jobs (
+<a href=#750 id=750 data-nosnippet>750</a>                        id, expression, command, schedule, job_type, prompt, name,
+<a href=#751 id=751 data-nosnippet>751</a>                        session_target, model, enabled, delivery, delete_after_run,
+<a href=#752 id=752 data-nosnippet>752</a>                        allowed_tools, source, uses_memory, created_at, next_run
+<a href=#753 id=753 data-nosnippet>753</a>                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'declarative', ?14, ?15, ?16)"</span>,
+<a href=#754 id=754 data-nosnippet>754</a>                    <span class="macro">params!</span>[
+<a href=#755 id=755 data-nosnippet>755</a>                        decl.id,
+<a href=#756 id=756 data-nosnippet>756</a>                        expression,
+<a href=#757 id=757 data-nosnippet>757</a>                        command,
+<a href=#758 id=758 data-nosnippet>758</a>                        schedule_json,
+<a href=#759 id=759 data-nosnippet>759</a>                        job_type,
+<a href=#760 id=760 data-nosnippet>760</a>                        decl.prompt,
+<a href=#761 id=761 data-nosnippet>761</a>                        decl.name,
+<a href=#762 id=762 data-nosnippet>762</a>                        session_target,
+<a href=#763 id=763 data-nosnippet>763</a>                        decl.model,
+<a href=#764 id=764 data-nosnippet>764</a>                        <span class="kw">if </span>decl.enabled { <span class="number">1 </span>} <span class="kw">else </span>{ <span class="number">0 </span>},
+<a href=#765 id=765 data-nosnippet>765</a>                        delivery_json,
+<a href=#766 id=766 data-nosnippet>766</a>                        <span class="kw">if </span>delete_after_run { <span class="number">1 </span>} <span class="kw">else </span>{ <span class="number">0 </span>},
+<a href=#767 id=767 data-nosnippet>767</a>                        allowed_tools_json,
+<a href=#768 id=768 data-nosnippet>768</a>                        <span class="kw">if </span>decl.uses_memory { <span class="number">1 </span>} <span class="kw">else </span>{ <span class="number">0 </span>},
+<a href=#769 id=769 data-nosnippet>769</a>                        now.to_rfc3339(),
+<a href=#770 id=770 data-nosnippet>770</a>                        next_run.to_rfc3339(),
+<a href=#771 id=771 data-nosnippet>771</a>                    ],
+<a href=#772 id=772 data-nosnippet>772</a>                )
+<a href=#773 id=773 data-nosnippet>773</a>                .with_context(|| {
+<a href=#774 id=774 data-nosnippet>774</a>                    <span class="macro">format!</span>(
+<a href=#775 id=775 data-nosnippet>775</a>                        <span class="string">"Failed to insert declarative cron job '{}'"</span>,
+<a href=#776 id=776 data-nosnippet>776</a>                        decl.id
+<a href=#777 id=777 data-nosnippet>777</a>                    )
+<a href=#778 id=778 data-nosnippet>778</a>                })<span class="question-mark">?</span>;
+<a href=#779 id=779 data-nosnippet>779</a>
+<a href=#780 id=780 data-nosnippet>780</a>                <span class="macro">tracing::info!</span>(job_id = %decl.id, <span class="string">"Inserted declarative cron job from config"</span>);
+<a href=#781 id=781 data-nosnippet>781</a>            }
+<a href=#782 id=782 data-nosnippet>782</a>        }
+<a href=#783 id=783 data-nosnippet>783</a>
+<a href=#784 id=784 data-nosnippet>784</a>        <span class="prelude-val">Ok</span>(())
+<a href=#785 id=785 data-nosnippet>785</a>    })
+<a href=#786 id=786 data-nosnippet>786</a>}
+<a href=#787 id=787 data-nosnippet>787</a>
+<a href=#788 id=788 data-nosnippet>788</a><span class="doccomment">/// Validate a declarative cron job definition.
+<a href=#789 id=789 data-nosnippet>789</a></span><span class="kw">fn </span>validate_decl(decl: <span class="kw-2">&amp;</span>zeroclaw_config::schema::CronJobDecl) -&gt; <span class="prelude-ty">Result</span>&lt;()&gt; {
+<a href=#790 id=790 data-nosnippet>790</a>    <span class="kw">if </span>decl.id.trim().is_empty() {
+<a href=#791 id=791 data-nosnippet>791</a>        <span class="macro">anyhow::bail!</span>(<span class="string">"Declarative cron job has empty id"</span>);
+<a href=#792 id=792 data-nosnippet>792</a>    }
+<a href=#793 id=793 data-nosnippet>793</a>
+<a href=#794 id=794 data-nosnippet>794</a>    <span class="kw">match </span>decl.job_type.to_lowercase().as_str() {
+<a href=#795 id=795 data-nosnippet>795</a>        <span class="string">"shell" </span>=&gt; {
+<a href=#796 id=796 data-nosnippet>796</a>            <span class="kw">if </span>decl.command.as_deref().is_none_or(|c| c.trim().is_empty()) {
+<a href=#797 id=797 data-nosnippet>797</a>                <span class="macro">anyhow::bail!</span>(
+<a href=#798 id=798 data-nosnippet>798</a>                    <span class="string">"Declarative cron job '{}': shell job requires a non-empty 'command'"</span>,
+<a href=#799 id=799 data-nosnippet>799</a>                    decl.id
+<a href=#800 id=800 data-nosnippet>800</a>                );
+<a href=#801 id=801 data-nosnippet>801</a>            }
+<a href=#802 id=802 data-nosnippet>802</a>        }
+<a href=#803 id=803 data-nosnippet>803</a>        <span class="string">"agent" </span>=&gt; {
+<a href=#804 id=804 data-nosnippet>804</a>            <span class="kw">if </span>decl.prompt.as_deref().is_none_or(|p| p.trim().is_empty()) {
+<a href=#805 id=805 data-nosnippet>805</a>                <span class="macro">anyhow::bail!</span>(
+<a href=#806 id=806 data-nosnippet>806</a>                    <span class="string">"Declarative cron job '{}': agent job requires a non-empty 'prompt'"</span>,
+<a href=#807 id=807 data-nosnippet>807</a>                    decl.id
+<a href=#808 id=808 data-nosnippet>808</a>                );
+<a href=#809 id=809 data-nosnippet>809</a>            }
+<a href=#810 id=810 data-nosnippet>810</a>        }
+<a href=#811 id=811 data-nosnippet>811</a>        other =&gt; {
+<a href=#812 id=812 data-nosnippet>812</a>            <span class="macro">anyhow::bail!</span>(
+<a href=#813 id=813 data-nosnippet>813</a>                <span class="string">"Declarative cron job '{}': invalid job_type '{}', expected 'shell' or 'agent'"</span>,
+<a href=#814 id=814 data-nosnippet>814</a>                decl.id,
+<a href=#815 id=815 data-nosnippet>815</a>                other
+<a href=#816 id=816 data-nosnippet>816</a>            );
+<a href=#817 id=817 data-nosnippet>817</a>        }
+<a href=#818 id=818 data-nosnippet>818</a>    }
+<a href=#819 id=819 data-nosnippet>819</a>
+<a href=#820 id=820 data-nosnippet>820</a>    <span class="prelude-val">Ok</span>(())
+<a href=#821 id=821 data-nosnippet>821</a>}
+<a href=#822 id=822 data-nosnippet>822</a>
+<a href=#823 id=823 data-nosnippet>823</a><span class="doccomment">/// Convert a `CronScheduleDecl` to the runtime `Schedule` type.
+<a href=#824 id=824 data-nosnippet>824</a></span><span class="kw">fn </span>convert_schedule_decl(decl: <span class="kw-2">&amp;</span>zeroclaw_config::schema::CronScheduleDecl) -&gt; <span class="prelude-ty">Result</span>&lt;Schedule&gt; {
+<a href=#825 id=825 data-nosnippet>825</a>    <span class="kw">use </span>zeroclaw_config::schema::CronScheduleDecl;
+<a href=#826 id=826 data-nosnippet>826</a>    <span class="kw">match </span>decl {
+<a href=#827 id=827 data-nosnippet>827</a>        CronScheduleDecl::Cron { expr, tz } =&gt; <span class="prelude-val">Ok</span>(Schedule::Cron {
+<a href=#828 id=828 data-nosnippet>828</a>            expr: expr.clone(),
+<a href=#829 id=829 data-nosnippet>829</a>            tz: tz.clone(),
+<a href=#830 id=830 data-nosnippet>830</a>        }),
+<a href=#831 id=831 data-nosnippet>831</a>        CronScheduleDecl::Every { every_ms } =&gt; <span class="prelude-val">Ok</span>(Schedule::Every {
+<a href=#832 id=832 data-nosnippet>832</a>            every_ms: <span class="kw-2">*</span>every_ms,
+<a href=#833 id=833 data-nosnippet>833</a>        }),
+<a href=#834 id=834 data-nosnippet>834</a>        CronScheduleDecl::At { at } =&gt; {
+<a href=#835 id=835 data-nosnippet>835</a>            <span class="kw">let </span>parsed = DateTime::parse_from_rfc3339(at)
+<a href=#836 id=836 data-nosnippet>836</a>                .with_context(|| {
+<a href=#837 id=837 data-nosnippet>837</a>                    <span class="macro">format!</span>(<span class="string">"Invalid RFC3339 timestamp in declarative cron 'at': {at}"</span>)
+<a href=#838 id=838 data-nosnippet>838</a>                })<span class="question-mark">?
+<a href=#839 id=839 data-nosnippet>839</a>                </span>.with_timezone(<span class="kw-2">&amp;</span>Utc);
+<a href=#840 id=840 data-nosnippet>840</a>            <span class="prelude-val">Ok</span>(Schedule::At { at: parsed })
+<a href=#841 id=841 data-nosnippet>841</a>        }
+<a href=#842 id=842 data-nosnippet>842</a>    }
+<a href=#843 id=843 data-nosnippet>843</a>}
+<a href=#844 id=844 data-nosnippet>844</a>
+<a href=#845 id=845 data-nosnippet>845</a><span class="doccomment">/// Convert a `DeliveryConfigDecl` to the runtime `DeliveryConfig`.
+<a href=#846 id=846 data-nosnippet>846</a></span><span class="kw">fn </span>convert_delivery_decl(decl: <span class="kw-2">&amp;</span>zeroclaw_config::schema::DeliveryConfigDecl) -&gt; DeliveryConfig {
+<a href=#847 id=847 data-nosnippet>847</a>    DeliveryConfig {
+<a href=#848 id=848 data-nosnippet>848</a>        mode: decl.mode.clone(),
+<a href=#849 id=849 data-nosnippet>849</a>        channel: decl.channel.clone(),
+<a href=#850 id=850 data-nosnippet>850</a>        to: decl.to.clone(),
+<a href=#851 id=851 data-nosnippet>851</a>        best_effort: decl.best_effort,
+<a href=#852 id=852 data-nosnippet>852</a>    }
+<a href=#853 id=853 data-nosnippet>853</a>}
+<a href=#854 id=854 data-nosnippet>854</a>
+<a href=#855 id=855 data-nosnippet>855</a><span class="kw">fn </span>add_column_if_missing(conn: <span class="kw-2">&amp;</span>Connection, name: <span class="kw-2">&amp;</span>str, sql_type: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;()&gt; {
+<a href=#856 id=856 data-nosnippet>856</a>    <span class="kw">let </span><span class="kw-2">mut </span>stmt = conn.prepare(<span class="string">"PRAGMA table_info(cron_jobs)"</span>)<span class="question-mark">?</span>;
+<a href=#857 id=857 data-nosnippet>857</a>    <span class="kw">let </span><span class="kw-2">mut </span>rows = stmt.query([])<span class="question-mark">?</span>;
+<a href=#858 id=858 data-nosnippet>858</a>    <span class="kw">while let </span><span class="prelude-val">Some</span>(row) = rows.next()<span class="question-mark">? </span>{
+<a href=#859 id=859 data-nosnippet>859</a>        <span class="kw">let </span>col_name: String = row.get(<span class="number">1</span>)<span class="question-mark">?</span>;
+<a href=#860 id=860 data-nosnippet>860</a>        <span class="kw">if </span>col_name == name {
+<a href=#861 id=861 data-nosnippet>861</a>            <span class="kw">return </span><span class="prelude-val">Ok</span>(());
+<a href=#862 id=862 data-nosnippet>862</a>        }
+<a href=#863 id=863 data-nosnippet>863</a>    }
+<a href=#864 id=864 data-nosnippet>864</a>    <span class="comment">// Drop the statement/rows before executing ALTER to release any locks
+<a href=#865 id=865 data-nosnippet>865</a>    </span>drop(rows);
+<a href=#866 id=866 data-nosnippet>866</a>    drop(stmt);
+<a href=#867 id=867 data-nosnippet>867</a>
+<a href=#868 id=868 data-nosnippet>868</a>    <span class="comment">// Tolerate "duplicate column name" errors to handle the race where
+<a href=#869 id=869 data-nosnippet>869</a>    // another process adds the column between our PRAGMA check and ALTER.
+<a href=#870 id=870 data-nosnippet>870</a>    </span><span class="kw">match </span>conn.execute(
+<a href=#871 id=871 data-nosnippet>871</a>        <span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">"ALTER TABLE cron_jobs ADD COLUMN {name} {sql_type}"</span>),
+<a href=#872 id=872 data-nosnippet>872</a>        [],
+<a href=#873 id=873 data-nosnippet>873</a>    ) {
+<a href=#874 id=874 data-nosnippet>874</a>        <span class="prelude-val">Ok</span>(<span class="kw">_</span>) =&gt; <span class="prelude-val">Ok</span>(()),
+<a href=#875 id=875 data-nosnippet>875</a>        <span class="prelude-val">Err</span>(rusqlite::Error::SqliteFailure(err, <span class="prelude-val">Some</span>(<span class="kw-2">ref </span>msg)))
+<a href=#876 id=876 data-nosnippet>876</a>            <span class="kw">if </span>msg.contains(<span class="string">"duplicate column name"</span>) =&gt;
+<a href=#877 id=877 data-nosnippet>877</a>        {
+<a href=#878 id=878 data-nosnippet>878</a>            <span class="macro">tracing::debug!</span>(<span class="string">"Column cron_jobs.{name} already exists (concurrent migration): {err}"</span>);
+<a href=#879 id=879 data-nosnippet>879</a>            <span class="prelude-val">Ok</span>(())
+<a href=#880 id=880 data-nosnippet>880</a>        }
+<a href=#881 id=881 data-nosnippet>881</a>        <span class="prelude-val">Err</span>(e) =&gt; <span class="prelude-val">Err</span>(e).with_context(|| <span class="macro">format!</span>(<span class="string">"Failed to add cron_jobs.{name}"</span>)),
+<a href=#882 id=882 data-nosnippet>882</a>    }
+<a href=#883 id=883 data-nosnippet>883</a>}
+<a href=#884 id=884 data-nosnippet>884</a>
+<a href=#885 id=885 data-nosnippet>885</a><span class="kw">fn </span>with_connection&lt;T&gt;(config: <span class="kw-2">&amp;</span>Config, f: <span class="kw">impl </span>FnOnce(<span class="kw-2">&amp;</span>Connection) -&gt; <span class="prelude-ty">Result</span>&lt;T&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;T&gt; {
+<a href=#886 id=886 data-nosnippet>886</a>    <span class="kw">let </span>db_path = config.workspace_dir.join(<span class="string">"cron"</span>).join(<span class="string">"jobs.db"</span>);
+<a href=#887 id=887 data-nosnippet>887</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(parent) = db_path.parent() {
+<a href=#888 id=888 data-nosnippet>888</a>        std::fs::create_dir_all(parent)
+<a href=#889 id=889 data-nosnippet>889</a>            .with_context(|| <span class="macro">format!</span>(<span class="string">"Failed to create cron directory: {}"</span>, parent.display()))<span class="question-mark">?</span>;
+<a href=#890 id=890 data-nosnippet>890</a>    }
+<a href=#891 id=891 data-nosnippet>891</a>
+<a href=#892 id=892 data-nosnippet>892</a>    <span class="kw">let </span>conn = Connection::open(<span class="kw-2">&amp;</span>db_path)
+<a href=#893 id=893 data-nosnippet>893</a>        .with_context(|| <span class="macro">format!</span>(<span class="string">"Failed to open cron DB: {}"</span>, db_path.display()))<span class="question-mark">?</span>;
+<a href=#894 id=894 data-nosnippet>894</a>
+<a href=#895 id=895 data-nosnippet>895</a>    conn.execute_batch(
+<a href=#896 id=896 data-nosnippet>896</a>        <span class="string">"PRAGMA foreign_keys = ON;
+<a href=#897 id=897 data-nosnippet>897</a>         CREATE TABLE IF NOT EXISTS cron_jobs (
+<a href=#898 id=898 data-nosnippet>898</a>            id               TEXT PRIMARY KEY,
+<a href=#899 id=899 data-nosnippet>899</a>            expression       TEXT NOT NULL,
+<a href=#900 id=900 data-nosnippet>900</a>            command          TEXT NOT NULL,
+<a href=#901 id=901 data-nosnippet>901</a>            schedule         TEXT,
+<a href=#902 id=902 data-nosnippet>902</a>            job_type         TEXT NOT NULL DEFAULT 'shell',
+<a href=#903 id=903 data-nosnippet>903</a>            prompt           TEXT,
+<a href=#904 id=904 data-nosnippet>904</a>            name             TEXT,
+<a href=#905 id=905 data-nosnippet>905</a>            session_target   TEXT NOT NULL DEFAULT 'isolated',
+<a href=#906 id=906 data-nosnippet>906</a>            model            TEXT,
+<a href=#907 id=907 data-nosnippet>907</a>            enabled          INTEGER NOT NULL DEFAULT 1,
+<a href=#908 id=908 data-nosnippet>908</a>            delivery         TEXT,
+<a href=#909 id=909 data-nosnippet>909</a>            delete_after_run INTEGER NOT NULL DEFAULT 0,
+<a href=#910 id=910 data-nosnippet>910</a>            allowed_tools    TEXT,
+<a href=#911 id=911 data-nosnippet>911</a>            created_at       TEXT NOT NULL,
+<a href=#912 id=912 data-nosnippet>912</a>            next_run         TEXT NOT NULL,
+<a href=#913 id=913 data-nosnippet>913</a>            last_run         TEXT,
+<a href=#914 id=914 data-nosnippet>914</a>            last_status      TEXT,
+<a href=#915 id=915 data-nosnippet>915</a>            last_output      TEXT
+<a href=#916 id=916 data-nosnippet>916</a>        );
+<a href=#917 id=917 data-nosnippet>917</a>        CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run);
+<a href=#918 id=918 data-nosnippet>918</a>
+<a href=#919 id=919 data-nosnippet>919</a>        CREATE TABLE IF NOT EXISTS cron_runs (
+<a href=#920 id=920 data-nosnippet>920</a>            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+<a href=#921 id=921 data-nosnippet>921</a>            job_id      TEXT NOT NULL,
+<a href=#922 id=922 data-nosnippet>922</a>            started_at  TEXT NOT NULL,
+<a href=#923 id=923 data-nosnippet>923</a>            finished_at TEXT NOT NULL,
+<a href=#924 id=924 data-nosnippet>924</a>            status      TEXT NOT NULL,
+<a href=#925 id=925 data-nosnippet>925</a>            output      TEXT,
+<a href=#926 id=926 data-nosnippet>926</a>            duration_ms INTEGER,
+<a href=#927 id=927 data-nosnippet>927</a>            FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
+<a href=#928 id=928 data-nosnippet>928</a>        );
+<a href=#929 id=929 data-nosnippet>929</a>        CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
+<a href=#930 id=930 data-nosnippet>930</a>        CREATE INDEX IF NOT EXISTS idx_cron_runs_started_at ON cron_runs(started_at);
+<a href=#931 id=931 data-nosnippet>931</a>        CREATE INDEX IF NOT EXISTS idx_cron_runs_job_started ON cron_runs(job_id, started_at);"</span>,
+<a href=#932 id=932 data-nosnippet>932</a>    )
+<a href=#933 id=933 data-nosnippet>933</a>    .context(<span class="string">"Failed to initialize cron schema"</span>)<span class="question-mark">?</span>;
+<a href=#934 id=934 data-nosnippet>934</a>
+<a href=#935 id=935 data-nosnippet>935</a>    add_column_if_missing(<span class="kw-2">&amp;</span>conn, <span class="string">"schedule"</span>, <span class="string">"TEXT"</span>)<span class="question-mark">?</span>;
+<a href=#936 id=936 data-nosnippet>936</a>    add_column_if_missing(<span class="kw-2">&amp;</span>conn, <span class="string">"job_type"</span>, <span class="string">"TEXT NOT NULL DEFAULT 'shell'"</span>)<span class="question-mark">?</span>;
+<a href=#937 id=937 data-nosnippet>937</a>    add_column_if_missing(<span class="kw-2">&amp;</span>conn, <span class="string">"prompt"</span>, <span class="string">"TEXT"</span>)<span class="question-mark">?</span>;
+<a href=#938 id=938 data-nosnippet>938</a>    add_column_if_missing(<span class="kw-2">&amp;</span>conn, <span class="string">"name"</span>, <span class="string">"TEXT"</span>)<span class="question-mark">?</span>;
+<a href=#939 id=939 data-nosnippet>939</a>    add_column_if_missing(<span class="kw-2">&amp;</span>conn, <span class="string">"session_target"</span>, <span class="string">"TEXT NOT NULL DEFAULT 'isolated'"</span>)<span class="question-mark">?</span>;
+<a href=#940 id=940 data-nosnippet>940</a>    add_column_if_missing(<span class="kw-2">&amp;</span>conn, <span class="string">"model"</span>, <span class="string">"TEXT"</span>)<span class="question-mark">?</span>;
+<a href=#941 id=941 data-nosnippet>941</a>    add_column_if_missing(<span class="kw-2">&amp;</span>conn, <span class="string">"enabled"</span>, <span class="string">"INTEGER NOT NULL DEFAULT 1"</span>)<span class="question-mark">?</span>;
+<a href=#942 id=942 data-nosnippet>942</a>    add_column_if_missing(<span class="kw-2">&amp;</span>conn, <span class="string">"delivery"</span>, <span class="string">"TEXT"</span>)<span class="question-mark">?</span>;
+<a href=#943 id=943 data-nosnippet>943</a>    add_column_if_missing(<span class="kw-2">&amp;</span>conn, <span class="string">"delete_after_run"</span>, <span class="string">"INTEGER NOT NULL DEFAULT 0"</span>)<span class="question-mark">?</span>;
+<a href=#944 id=944 data-nosnippet>944</a>    add_column_if_missing(<span class="kw-2">&amp;</span>conn, <span class="string">"allowed_tools"</span>, <span class="string">"TEXT"</span>)<span class="question-mark">?</span>;
+<a href=#945 id=945 data-nosnippet>945</a>    add_column_if_missing(<span class="kw-2">&amp;</span>conn, <span class="string">"source"</span>, <span class="string">"TEXT DEFAULT 'imperative'"</span>)<span class="question-mark">?</span>;
+<a href=#946 id=946 data-nosnippet>946</a>    add_column_if_missing(<span class="kw-2">&amp;</span>conn, <span class="string">"uses_memory"</span>, <span class="string">"INTEGER NOT NULL DEFAULT 1"</span>)<span class="question-mark">?</span>;
+<a href=#947 id=947 data-nosnippet>947</a>
+<a href=#948 id=948 data-nosnippet>948</a>    f(<span class="kw-2">&amp;</span>conn)
+<a href=#949 id=949 data-nosnippet>949</a>}
+<a href=#950 id=950 data-nosnippet>950</a>
+<a href=#951 id=951 data-nosnippet>951</a><span class="attr">#[cfg(test)]
+<a href=#952 id=952 data-nosnippet>952</a></span><span class="kw">mod </span>tests {
+<a href=#953 id=953 data-nosnippet>953</a>    <span class="kw">use </span>super::<span class="kw-2">*</span>;
+<a href=#954 id=954 data-nosnippet>954</a>    <span class="kw">use </span>chrono::Duration <span class="kw">as </span>ChronoDuration;
+<a href=#955 id=955 data-nosnippet>955</a>    <span class="kw">use </span>tempfile::TempDir;
+<a href=#956 id=956 data-nosnippet>956</a>    <span class="kw">use </span>zeroclaw_config::schema::Config;
+<a href=#957 id=957 data-nosnippet>957</a>
+<a href=#958 id=958 data-nosnippet>958</a>    <span class="kw">fn </span>test_config(tmp: <span class="kw-2">&amp;</span>TempDir) -&gt; Config {
+<a href=#959 id=959 data-nosnippet>959</a>        <span class="kw">let </span>config = Config {
+<a href=#960 id=960 data-nosnippet>960</a>            workspace_dir: tmp.path().join(<span class="string">"workspace"</span>),
+<a href=#961 id=961 data-nosnippet>961</a>            config_path: tmp.path().join(<span class="string">"config.toml"</span>),
+<a href=#962 id=962 data-nosnippet>962</a>            ..Config::default()
+<a href=#963 id=963 data-nosnippet>963</a>        };
+<a href=#964 id=964 data-nosnippet>964</a>        std::fs::create_dir_all(<span class="kw-2">&amp;</span>config.workspace_dir).unwrap();
+<a href=#965 id=965 data-nosnippet>965</a>        config
+<a href=#966 id=966 data-nosnippet>966</a>    }
+<a href=#967 id=967 data-nosnippet>967</a>
+<a href=#968 id=968 data-nosnippet>968</a>    <span class="attr">#[test]
+<a href=#969 id=969 data-nosnippet>969</a>    </span><span class="kw">fn </span>add_job_accepts_five_field_expression() {
+<a href=#970 id=970 data-nosnippet>970</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#971 id=971 data-nosnippet>971</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#972 id=972 data-nosnippet>972</a>
+<a href=#973 id=973 data-nosnippet>973</a>        <span class="kw">let </span>job = add_job(<span class="kw-2">&amp;</span>config, <span class="string">"*/5 * * * *"</span>, <span class="string">"echo ok"</span>).unwrap();
+<a href=#974 id=974 data-nosnippet>974</a>        <span class="macro">assert_eq!</span>(job.expression, <span class="string">"*/5 * * * *"</span>);
+<a href=#975 id=975 data-nosnippet>975</a>        <span class="macro">assert_eq!</span>(job.command, <span class="string">"echo ok"</span>);
+<a href=#976 id=976 data-nosnippet>976</a>        <span class="macro">assert!</span>(<span class="macro">matches!</span>(job.schedule, Schedule::Cron { .. }));
+<a href=#977 id=977 data-nosnippet>977</a>    }
+<a href=#978 id=978 data-nosnippet>978</a>
+<a href=#979 id=979 data-nosnippet>979</a>    <span class="attr">#[test]
+<a href=#980 id=980 data-nosnippet>980</a>    </span><span class="kw">fn </span>add_shell_job_marks_at_schedule_for_auto_delete() {
+<a href=#981 id=981 data-nosnippet>981</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#982 id=982 data-nosnippet>982</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#983 id=983 data-nosnippet>983</a>
+<a href=#984 id=984 data-nosnippet>984</a>        <span class="kw">let </span>one_shot = add_shell_job(
+<a href=#985 id=985 data-nosnippet>985</a>            <span class="kw-2">&amp;</span>config,
+<a href=#986 id=986 data-nosnippet>986</a>            <span class="prelude-val">None</span>,
+<a href=#987 id=987 data-nosnippet>987</a>            Schedule::At {
+<a href=#988 id=988 data-nosnippet>988</a>                at: Utc::now() + ChronoDuration::minutes(<span class="number">10</span>),
+<a href=#989 id=989 data-nosnippet>989</a>            },
+<a href=#990 id=990 data-nosnippet>990</a>            <span class="string">"echo once"</span>,
+<a href=#991 id=991 data-nosnippet>991</a>            <span class="prelude-val">None</span>,
+<a href=#992 id=992 data-nosnippet>992</a>        )
+<a href=#993 id=993 data-nosnippet>993</a>        .unwrap();
+<a href=#994 id=994 data-nosnippet>994</a>        <span class="macro">assert!</span>(one_shot.delete_after_run);
+<a href=#995 id=995 data-nosnippet>995</a>
+<a href=#996 id=996 data-nosnippet>996</a>        <span class="kw">let </span>recurring = add_shell_job(
+<a href=#997 id=997 data-nosnippet>997</a>            <span class="kw-2">&amp;</span>config,
+<a href=#998 id=998 data-nosnippet>998</a>            <span class="prelude-val">None</span>,
+<a href=#999 id=999 data-nosnippet>999</a>            Schedule::Every { every_ms: <span class="number">60_000 </span>},
+<a href=#1000 id=1000 data-nosnippet>1000</a>            <span class="string">"echo recurring"</span>,
+<a href=#1001 id=1001 data-nosnippet>1001</a>            <span class="prelude-val">None</span>,
+<a href=#1002 id=1002 data-nosnippet>1002</a>        )
+<a href=#1003 id=1003 data-nosnippet>1003</a>        .unwrap();
+<a href=#1004 id=1004 data-nosnippet>1004</a>        <span class="macro">assert!</span>(!recurring.delete_after_run);
+<a href=#1005 id=1005 data-nosnippet>1005</a>    }
+<a href=#1006 id=1006 data-nosnippet>1006</a>
+<a href=#1007 id=1007 data-nosnippet>1007</a>    <span class="attr">#[test]
+<a href=#1008 id=1008 data-nosnippet>1008</a>    </span><span class="kw">fn </span>add_shell_job_persists_delivery() {
+<a href=#1009 id=1009 data-nosnippet>1009</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1010 id=1010 data-nosnippet>1010</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1011 id=1011 data-nosnippet>1011</a>
+<a href=#1012 id=1012 data-nosnippet>1012</a>        <span class="kw">let </span>job = add_shell_job(
+<a href=#1013 id=1013 data-nosnippet>1013</a>            <span class="kw-2">&amp;</span>config,
+<a href=#1014 id=1014 data-nosnippet>1014</a>            <span class="prelude-val">Some</span>(<span class="string">"deliver-shell"</span>.into()),
+<a href=#1015 id=1015 data-nosnippet>1015</a>            Schedule::Cron {
+<a href=#1016 id=1016 data-nosnippet>1016</a>                expr: <span class="string">"*/5 * * * *"</span>.into(),
+<a href=#1017 id=1017 data-nosnippet>1017</a>                tz: <span class="prelude-val">None</span>,
+<a href=#1018 id=1018 data-nosnippet>1018</a>            },
+<a href=#1019 id=1019 data-nosnippet>1019</a>            <span class="string">"echo delivered"</span>,
+<a href=#1020 id=1020 data-nosnippet>1020</a>            <span class="prelude-val">Some</span>(DeliveryConfig {
+<a href=#1021 id=1021 data-nosnippet>1021</a>                mode: <span class="string">"announce"</span>.into(),
+<a href=#1022 id=1022 data-nosnippet>1022</a>                channel: <span class="prelude-val">Some</span>(<span class="string">"discord"</span>.into()),
+<a href=#1023 id=1023 data-nosnippet>1023</a>                to: <span class="prelude-val">Some</span>(<span class="string">"1234567890"</span>.into()),
+<a href=#1024 id=1024 data-nosnippet>1024</a>                best_effort: <span class="bool-val">true</span>,
+<a href=#1025 id=1025 data-nosnippet>1025</a>            }),
+<a href=#1026 id=1026 data-nosnippet>1026</a>        )
+<a href=#1027 id=1027 data-nosnippet>1027</a>        .unwrap();
+<a href=#1028 id=1028 data-nosnippet>1028</a>
+<a href=#1029 id=1029 data-nosnippet>1029</a>        <span class="macro">assert_eq!</span>(job.delivery.mode, <span class="string">"announce"</span>);
+<a href=#1030 id=1030 data-nosnippet>1030</a>        <span class="macro">assert_eq!</span>(job.delivery.channel.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"discord"</span>));
+<a href=#1031 id=1031 data-nosnippet>1031</a>        <span class="macro">assert_eq!</span>(job.delivery.to.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"1234567890"</span>));
+<a href=#1032 id=1032 data-nosnippet>1032</a>
+<a href=#1033 id=1033 data-nosnippet>1033</a>        <span class="kw">let </span>stored = get_job(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job.id).unwrap();
+<a href=#1034 id=1034 data-nosnippet>1034</a>        <span class="macro">assert_eq!</span>(stored.delivery.mode, <span class="string">"announce"</span>);
+<a href=#1035 id=1035 data-nosnippet>1035</a>        <span class="macro">assert_eq!</span>(stored.delivery.channel.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"discord"</span>));
+<a href=#1036 id=1036 data-nosnippet>1036</a>        <span class="macro">assert_eq!</span>(stored.delivery.to.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"1234567890"</span>));
+<a href=#1037 id=1037 data-nosnippet>1037</a>    }
+<a href=#1038 id=1038 data-nosnippet>1038</a>
+<a href=#1039 id=1039 data-nosnippet>1039</a>    <span class="attr">#[test]
+<a href=#1040 id=1040 data-nosnippet>1040</a>    </span><span class="kw">fn </span>add_agent_job_rejects_invalid_announce_delivery() {
+<a href=#1041 id=1041 data-nosnippet>1041</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1042 id=1042 data-nosnippet>1042</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1043 id=1043 data-nosnippet>1043</a>
+<a href=#1044 id=1044 data-nosnippet>1044</a>        <span class="kw">let </span>err = add_agent_job(
+<a href=#1045 id=1045 data-nosnippet>1045</a>            <span class="kw-2">&amp;</span>config,
+<a href=#1046 id=1046 data-nosnippet>1046</a>            <span class="prelude-val">Some</span>(<span class="string">"deliver-agent"</span>.into()),
+<a href=#1047 id=1047 data-nosnippet>1047</a>            Schedule::Cron {
+<a href=#1048 id=1048 data-nosnippet>1048</a>                expr: <span class="string">"*/5 * * * *"</span>.into(),
+<a href=#1049 id=1049 data-nosnippet>1049</a>                tz: <span class="prelude-val">None</span>,
+<a href=#1050 id=1050 data-nosnippet>1050</a>            },
+<a href=#1051 id=1051 data-nosnippet>1051</a>            <span class="string">"summarize logs"</span>,
+<a href=#1052 id=1052 data-nosnippet>1052</a>            SessionTarget::Isolated,
+<a href=#1053 id=1053 data-nosnippet>1053</a>            <span class="prelude-val">None</span>,
+<a href=#1054 id=1054 data-nosnippet>1054</a>            <span class="prelude-val">Some</span>(DeliveryConfig {
+<a href=#1055 id=1055 data-nosnippet>1055</a>                mode: <span class="string">"announce"</span>.into(),
+<a href=#1056 id=1056 data-nosnippet>1056</a>                channel: <span class="prelude-val">Some</span>(<span class="string">"discord"</span>.into()),
+<a href=#1057 id=1057 data-nosnippet>1057</a>                to: <span class="prelude-val">None</span>,
+<a href=#1058 id=1058 data-nosnippet>1058</a>                best_effort: <span class="bool-val">true</span>,
+<a href=#1059 id=1059 data-nosnippet>1059</a>            }),
+<a href=#1060 id=1060 data-nosnippet>1060</a>            <span class="bool-val">false</span>,
+<a href=#1061 id=1061 data-nosnippet>1061</a>            <span class="prelude-val">None</span>,
+<a href=#1062 id=1062 data-nosnippet>1062</a>        )
+<a href=#1063 id=1063 data-nosnippet>1063</a>        .unwrap_err();
+<a href=#1064 id=1064 data-nosnippet>1064</a>
+<a href=#1065 id=1065 data-nosnippet>1065</a>        <span class="macro">assert!</span>(err.to_string().contains(<span class="string">"delivery.to is required"</span>));
+<a href=#1066 id=1066 data-nosnippet>1066</a>    }
+<a href=#1067 id=1067 data-nosnippet>1067</a>
+<a href=#1068 id=1068 data-nosnippet>1068</a>    <span class="attr">#[test]
+<a href=#1069 id=1069 data-nosnippet>1069</a>    </span><span class="kw">fn </span>add_shell_job_rejects_invalid_delivery_mode() {
+<a href=#1070 id=1070 data-nosnippet>1070</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1071 id=1071 data-nosnippet>1071</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1072 id=1072 data-nosnippet>1072</a>
+<a href=#1073 id=1073 data-nosnippet>1073</a>        <span class="kw">let </span>err = add_shell_job(
+<a href=#1074 id=1074 data-nosnippet>1074</a>            <span class="kw-2">&amp;</span>config,
+<a href=#1075 id=1075 data-nosnippet>1075</a>            <span class="prelude-val">Some</span>(<span class="string">"deliver-shell"</span>.into()),
+<a href=#1076 id=1076 data-nosnippet>1076</a>            Schedule::Cron {
+<a href=#1077 id=1077 data-nosnippet>1077</a>                expr: <span class="string">"*/5 * * * *"</span>.into(),
+<a href=#1078 id=1078 data-nosnippet>1078</a>                tz: <span class="prelude-val">None</span>,
+<a href=#1079 id=1079 data-nosnippet>1079</a>            },
+<a href=#1080 id=1080 data-nosnippet>1080</a>            <span class="string">"echo delivered"</span>,
+<a href=#1081 id=1081 data-nosnippet>1081</a>            <span class="prelude-val">Some</span>(DeliveryConfig {
+<a href=#1082 id=1082 data-nosnippet>1082</a>                mode: <span class="string">"annouce"</span>.into(),
+<a href=#1083 id=1083 data-nosnippet>1083</a>                channel: <span class="prelude-val">Some</span>(<span class="string">"discord"</span>.into()),
+<a href=#1084 id=1084 data-nosnippet>1084</a>                to: <span class="prelude-val">Some</span>(<span class="string">"1234567890"</span>.into()),
+<a href=#1085 id=1085 data-nosnippet>1085</a>                best_effort: <span class="bool-val">true</span>,
+<a href=#1086 id=1086 data-nosnippet>1086</a>            }),
+<a href=#1087 id=1087 data-nosnippet>1087</a>        )
+<a href=#1088 id=1088 data-nosnippet>1088</a>        .unwrap_err();
+<a href=#1089 id=1089 data-nosnippet>1089</a>
+<a href=#1090 id=1090 data-nosnippet>1090</a>        <span class="macro">assert!</span>(err.to_string().contains(<span class="string">"unsupported delivery mode"</span>));
+<a href=#1091 id=1091 data-nosnippet>1091</a>    }
+<a href=#1092 id=1092 data-nosnippet>1092</a>
+<a href=#1093 id=1093 data-nosnippet>1093</a>    <span class="attr">#[test]
+<a href=#1094 id=1094 data-nosnippet>1094</a>    </span><span class="kw">fn </span>add_list_remove_roundtrip() {
+<a href=#1095 id=1095 data-nosnippet>1095</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1096 id=1096 data-nosnippet>1096</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1097 id=1097 data-nosnippet>1097</a>
+<a href=#1098 id=1098 data-nosnippet>1098</a>        <span class="kw">let </span>job = add_job(<span class="kw-2">&amp;</span>config, <span class="string">"*/10 * * * *"</span>, <span class="string">"echo roundtrip"</span>).unwrap();
+<a href=#1099 id=1099 data-nosnippet>1099</a>        <span class="kw">let </span>listed = list_jobs(<span class="kw-2">&amp;</span>config).unwrap();
+<a href=#1100 id=1100 data-nosnippet>1100</a>        <span class="macro">assert_eq!</span>(listed.len(), <span class="number">1</span>);
+<a href=#1101 id=1101 data-nosnippet>1101</a>        <span class="macro">assert_eq!</span>(listed[<span class="number">0</span>].id, job.id);
+<a href=#1102 id=1102 data-nosnippet>1102</a>
+<a href=#1103 id=1103 data-nosnippet>1103</a>        remove_job(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job.id).unwrap();
+<a href=#1104 id=1104 data-nosnippet>1104</a>        <span class="macro">assert!</span>(list_jobs(<span class="kw-2">&amp;</span>config).unwrap().is_empty());
+<a href=#1105 id=1105 data-nosnippet>1105</a>    }
+<a href=#1106 id=1106 data-nosnippet>1106</a>
+<a href=#1107 id=1107 data-nosnippet>1107</a>    <span class="attr">#[test]
+<a href=#1108 id=1108 data-nosnippet>1108</a>    </span><span class="kw">fn </span>due_jobs_filters_by_timestamp_and_enabled() {
+<a href=#1109 id=1109 data-nosnippet>1109</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1110 id=1110 data-nosnippet>1110</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1111 id=1111 data-nosnippet>1111</a>
+<a href=#1112 id=1112 data-nosnippet>1112</a>        <span class="kw">let </span>job = add_job(<span class="kw-2">&amp;</span>config, <span class="string">"* * * * *"</span>, <span class="string">"echo due"</span>).unwrap();
+<a href=#1113 id=1113 data-nosnippet>1113</a>
+<a href=#1114 id=1114 data-nosnippet>1114</a>        <span class="kw">let </span>due_now = due_jobs(<span class="kw-2">&amp;</span>config, Utc::now()).unwrap();
+<a href=#1115 id=1115 data-nosnippet>1115</a>        <span class="macro">assert!</span>(due_now.is_empty(), <span class="string">"new job should not be due immediately"</span>);
+<a href=#1116 id=1116 data-nosnippet>1116</a>
+<a href=#1117 id=1117 data-nosnippet>1117</a>        <span class="kw">let </span>far_future = Utc::now() + ChronoDuration::days(<span class="number">365</span>);
+<a href=#1118 id=1118 data-nosnippet>1118</a>        <span class="kw">let </span>due_future = due_jobs(<span class="kw-2">&amp;</span>config, far_future).unwrap();
+<a href=#1119 id=1119 data-nosnippet>1119</a>        <span class="macro">assert_eq!</span>(due_future.len(), <span class="number">1</span>, <span class="string">"job should be due in far future"</span>);
+<a href=#1120 id=1120 data-nosnippet>1120</a>
+<a href=#1121 id=1121 data-nosnippet>1121</a>        <span class="kw">let _ </span>= update_job(
+<a href=#1122 id=1122 data-nosnippet>1122</a>            <span class="kw-2">&amp;</span>config,
+<a href=#1123 id=1123 data-nosnippet>1123</a>            <span class="kw-2">&amp;</span>job.id,
+<a href=#1124 id=1124 data-nosnippet>1124</a>            CronJobPatch {
+<a href=#1125 id=1125 data-nosnippet>1125</a>                enabled: <span class="prelude-val">Some</span>(<span class="bool-val">false</span>),
+<a href=#1126 id=1126 data-nosnippet>1126</a>                ..CronJobPatch::default()
+<a href=#1127 id=1127 data-nosnippet>1127</a>            },
+<a href=#1128 id=1128 data-nosnippet>1128</a>        )
+<a href=#1129 id=1129 data-nosnippet>1129</a>        .unwrap();
+<a href=#1130 id=1130 data-nosnippet>1130</a>        <span class="kw">let </span>due_after_disable = due_jobs(<span class="kw-2">&amp;</span>config, far_future).unwrap();
+<a href=#1131 id=1131 data-nosnippet>1131</a>        <span class="macro">assert!</span>(due_after_disable.is_empty());
+<a href=#1132 id=1132 data-nosnippet>1132</a>    }
+<a href=#1133 id=1133 data-nosnippet>1133</a>
+<a href=#1134 id=1134 data-nosnippet>1134</a>    <span class="attr">#[test]
+<a href=#1135 id=1135 data-nosnippet>1135</a>    </span><span class="kw">fn </span>due_jobs_respects_scheduler_max_tasks_limit() {
+<a href=#1136 id=1136 data-nosnippet>1136</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1137 id=1137 data-nosnippet>1137</a>        <span class="kw">let </span><span class="kw-2">mut </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1138 id=1138 data-nosnippet>1138</a>        config.scheduler.max_tasks = <span class="number">2</span>;
+<a href=#1139 id=1139 data-nosnippet>1139</a>
+<a href=#1140 id=1140 data-nosnippet>1140</a>        <span class="kw">let _ </span>= add_job(<span class="kw-2">&amp;</span>config, <span class="string">"* * * * *"</span>, <span class="string">"echo due-1"</span>).unwrap();
+<a href=#1141 id=1141 data-nosnippet>1141</a>        <span class="kw">let _ </span>= add_job(<span class="kw-2">&amp;</span>config, <span class="string">"* * * * *"</span>, <span class="string">"echo due-2"</span>).unwrap();
+<a href=#1142 id=1142 data-nosnippet>1142</a>        <span class="kw">let _ </span>= add_job(<span class="kw-2">&amp;</span>config, <span class="string">"* * * * *"</span>, <span class="string">"echo due-3"</span>).unwrap();
+<a href=#1143 id=1143 data-nosnippet>1143</a>
+<a href=#1144 id=1144 data-nosnippet>1144</a>        <span class="kw">let </span>far_future = Utc::now() + ChronoDuration::days(<span class="number">365</span>);
+<a href=#1145 id=1145 data-nosnippet>1145</a>        <span class="kw">let </span>due = due_jobs(<span class="kw-2">&amp;</span>config, far_future).unwrap();
+<a href=#1146 id=1146 data-nosnippet>1146</a>        <span class="macro">assert_eq!</span>(due.len(), <span class="number">2</span>);
+<a href=#1147 id=1147 data-nosnippet>1147</a>    }
+<a href=#1148 id=1148 data-nosnippet>1148</a>
+<a href=#1149 id=1149 data-nosnippet>1149</a>    <span class="attr">#[test]
+<a href=#1150 id=1150 data-nosnippet>1150</a>    </span><span class="kw">fn </span>all_overdue_jobs_ignores_max_tasks_limit() {
+<a href=#1151 id=1151 data-nosnippet>1151</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1152 id=1152 data-nosnippet>1152</a>        <span class="kw">let </span><span class="kw-2">mut </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1153 id=1153 data-nosnippet>1153</a>        config.scheduler.max_tasks = <span class="number">2</span>;
+<a href=#1154 id=1154 data-nosnippet>1154</a>
+<a href=#1155 id=1155 data-nosnippet>1155</a>        <span class="kw">let _ </span>= add_job(<span class="kw-2">&amp;</span>config, <span class="string">"* * * * *"</span>, <span class="string">"echo ov-1"</span>).unwrap();
+<a href=#1156 id=1156 data-nosnippet>1156</a>        <span class="kw">let _ </span>= add_job(<span class="kw-2">&amp;</span>config, <span class="string">"* * * * *"</span>, <span class="string">"echo ov-2"</span>).unwrap();
+<a href=#1157 id=1157 data-nosnippet>1157</a>        <span class="kw">let _ </span>= add_job(<span class="kw-2">&amp;</span>config, <span class="string">"* * * * *"</span>, <span class="string">"echo ov-3"</span>).unwrap();
+<a href=#1158 id=1158 data-nosnippet>1158</a>
+<a href=#1159 id=1159 data-nosnippet>1159</a>        <span class="kw">let </span>far_future = Utc::now() + ChronoDuration::days(<span class="number">365</span>);
+<a href=#1160 id=1160 data-nosnippet>1160</a>        <span class="comment">// due_jobs respects the limit
+<a href=#1161 id=1161 data-nosnippet>1161</a>        </span><span class="kw">let </span>due = due_jobs(<span class="kw-2">&amp;</span>config, far_future).unwrap();
+<a href=#1162 id=1162 data-nosnippet>1162</a>        <span class="macro">assert_eq!</span>(due.len(), <span class="number">2</span>);
+<a href=#1163 id=1163 data-nosnippet>1163</a>        <span class="comment">// all_overdue_jobs returns everything
+<a href=#1164 id=1164 data-nosnippet>1164</a>        </span><span class="kw">let </span>overdue = all_overdue_jobs(<span class="kw-2">&amp;</span>config, far_future).unwrap();
+<a href=#1165 id=1165 data-nosnippet>1165</a>        <span class="macro">assert_eq!</span>(overdue.len(), <span class="number">3</span>);
+<a href=#1166 id=1166 data-nosnippet>1166</a>    }
+<a href=#1167 id=1167 data-nosnippet>1167</a>
+<a href=#1168 id=1168 data-nosnippet>1168</a>    <span class="attr">#[test]
+<a href=#1169 id=1169 data-nosnippet>1169</a>    </span><span class="kw">fn </span>all_overdue_jobs_excludes_disabled_jobs() {
+<a href=#1170 id=1170 data-nosnippet>1170</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1171 id=1171 data-nosnippet>1171</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1172 id=1172 data-nosnippet>1172</a>
+<a href=#1173 id=1173 data-nosnippet>1173</a>        <span class="kw">let </span>job = add_job(<span class="kw-2">&amp;</span>config, <span class="string">"* * * * *"</span>, <span class="string">"echo disabled"</span>).unwrap();
+<a href=#1174 id=1174 data-nosnippet>1174</a>        <span class="kw">let _ </span>= update_job(
+<a href=#1175 id=1175 data-nosnippet>1175</a>            <span class="kw-2">&amp;</span>config,
+<a href=#1176 id=1176 data-nosnippet>1176</a>            <span class="kw-2">&amp;</span>job.id,
+<a href=#1177 id=1177 data-nosnippet>1177</a>            CronJobPatch {
+<a href=#1178 id=1178 data-nosnippet>1178</a>                enabled: <span class="prelude-val">Some</span>(<span class="bool-val">false</span>),
+<a href=#1179 id=1179 data-nosnippet>1179</a>                ..CronJobPatch::default()
+<a href=#1180 id=1180 data-nosnippet>1180</a>            },
+<a href=#1181 id=1181 data-nosnippet>1181</a>        )
+<a href=#1182 id=1182 data-nosnippet>1182</a>        .unwrap();
+<a href=#1183 id=1183 data-nosnippet>1183</a>
+<a href=#1184 id=1184 data-nosnippet>1184</a>        <span class="kw">let </span>far_future = Utc::now() + ChronoDuration::days(<span class="number">365</span>);
+<a href=#1185 id=1185 data-nosnippet>1185</a>        <span class="kw">let </span>overdue = all_overdue_jobs(<span class="kw-2">&amp;</span>config, far_future).unwrap();
+<a href=#1186 id=1186 data-nosnippet>1186</a>        <span class="macro">assert!</span>(overdue.is_empty());
+<a href=#1187 id=1187 data-nosnippet>1187</a>    }
+<a href=#1188 id=1188 data-nosnippet>1188</a>
+<a href=#1189 id=1189 data-nosnippet>1189</a>    <span class="attr">#[test]
+<a href=#1190 id=1190 data-nosnippet>1190</a>    </span><span class="kw">fn </span>add_agent_job_persists_allowed_tools() {
+<a href=#1191 id=1191 data-nosnippet>1191</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1192 id=1192 data-nosnippet>1192</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1193 id=1193 data-nosnippet>1193</a>
+<a href=#1194 id=1194 data-nosnippet>1194</a>        <span class="kw">let </span>job = add_agent_job(
+<a href=#1195 id=1195 data-nosnippet>1195</a>            <span class="kw-2">&amp;</span>config,
+<a href=#1196 id=1196 data-nosnippet>1196</a>            <span class="prelude-val">Some</span>(<span class="string">"agent"</span>.into()),
+<a href=#1197 id=1197 data-nosnippet>1197</a>            Schedule::Every { every_ms: <span class="number">60_000 </span>},
+<a href=#1198 id=1198 data-nosnippet>1198</a>            <span class="string">"do work"</span>,
+<a href=#1199 id=1199 data-nosnippet>1199</a>            SessionTarget::Isolated,
+<a href=#1200 id=1200 data-nosnippet>1200</a>            <span class="prelude-val">None</span>,
+<a href=#1201 id=1201 data-nosnippet>1201</a>            <span class="prelude-val">None</span>,
+<a href=#1202 id=1202 data-nosnippet>1202</a>            <span class="bool-val">false</span>,
+<a href=#1203 id=1203 data-nosnippet>1203</a>            <span class="prelude-val">Some</span>(<span class="macro">vec!</span>[<span class="string">"file_read"</span>.into(), <span class="string">"web_search"</span>.into()]),
+<a href=#1204 id=1204 data-nosnippet>1204</a>        )
+<a href=#1205 id=1205 data-nosnippet>1205</a>        .unwrap();
+<a href=#1206 id=1206 data-nosnippet>1206</a>
+<a href=#1207 id=1207 data-nosnippet>1207</a>        <span class="macro">assert_eq!</span>(
+<a href=#1208 id=1208 data-nosnippet>1208</a>            job.allowed_tools,
+<a href=#1209 id=1209 data-nosnippet>1209</a>            <span class="prelude-val">Some</span>(<span class="macro">vec!</span>[<span class="string">"file_read"</span>.into(), <span class="string">"web_search"</span>.into()])
+<a href=#1210 id=1210 data-nosnippet>1210</a>        );
+<a href=#1211 id=1211 data-nosnippet>1211</a>
+<a href=#1212 id=1212 data-nosnippet>1212</a>        <span class="kw">let </span>stored = get_job(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job.id).unwrap();
+<a href=#1213 id=1213 data-nosnippet>1213</a>        <span class="macro">assert_eq!</span>(stored.allowed_tools, job.allowed_tools);
+<a href=#1214 id=1214 data-nosnippet>1214</a>    }
+<a href=#1215 id=1215 data-nosnippet>1215</a>
+<a href=#1216 id=1216 data-nosnippet>1216</a>    <span class="attr">#[test]
+<a href=#1217 id=1217 data-nosnippet>1217</a>    </span><span class="kw">fn </span>update_job_persists_allowed_tools_patch() {
+<a href=#1218 id=1218 data-nosnippet>1218</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1219 id=1219 data-nosnippet>1219</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1220 id=1220 data-nosnippet>1220</a>
+<a href=#1221 id=1221 data-nosnippet>1221</a>        <span class="kw">let </span>job = add_agent_job(
+<a href=#1222 id=1222 data-nosnippet>1222</a>            <span class="kw-2">&amp;</span>config,
+<a href=#1223 id=1223 data-nosnippet>1223</a>            <span class="prelude-val">Some</span>(<span class="string">"agent"</span>.into()),
+<a href=#1224 id=1224 data-nosnippet>1224</a>            Schedule::Every { every_ms: <span class="number">60_000 </span>},
+<a href=#1225 id=1225 data-nosnippet>1225</a>            <span class="string">"do work"</span>,
+<a href=#1226 id=1226 data-nosnippet>1226</a>            SessionTarget::Isolated,
+<a href=#1227 id=1227 data-nosnippet>1227</a>            <span class="prelude-val">None</span>,
+<a href=#1228 id=1228 data-nosnippet>1228</a>            <span class="prelude-val">None</span>,
+<a href=#1229 id=1229 data-nosnippet>1229</a>            <span class="bool-val">false</span>,
+<a href=#1230 id=1230 data-nosnippet>1230</a>            <span class="prelude-val">None</span>,
+<a href=#1231 id=1231 data-nosnippet>1231</a>        )
+<a href=#1232 id=1232 data-nosnippet>1232</a>        .unwrap();
+<a href=#1233 id=1233 data-nosnippet>1233</a>
+<a href=#1234 id=1234 data-nosnippet>1234</a>        <span class="kw">let </span>updated = update_job(
+<a href=#1235 id=1235 data-nosnippet>1235</a>            <span class="kw-2">&amp;</span>config,
+<a href=#1236 id=1236 data-nosnippet>1236</a>            <span class="kw-2">&amp;</span>job.id,
+<a href=#1237 id=1237 data-nosnippet>1237</a>            CronJobPatch {
+<a href=#1238 id=1238 data-nosnippet>1238</a>                allowed_tools: <span class="prelude-val">Some</span>(<span class="macro">vec!</span>[<span class="string">"shell"</span>.into()]),
+<a href=#1239 id=1239 data-nosnippet>1239</a>                ..CronJobPatch::default()
+<a href=#1240 id=1240 data-nosnippet>1240</a>            },
+<a href=#1241 id=1241 data-nosnippet>1241</a>        )
+<a href=#1242 id=1242 data-nosnippet>1242</a>        .unwrap();
+<a href=#1243 id=1243 data-nosnippet>1243</a>
+<a href=#1244 id=1244 data-nosnippet>1244</a>        <span class="macro">assert_eq!</span>(updated.allowed_tools, <span class="prelude-val">Some</span>(<span class="macro">vec!</span>[<span class="string">"shell"</span>.into()]));
+<a href=#1245 id=1245 data-nosnippet>1245</a>        <span class="macro">assert_eq!</span>(
+<a href=#1246 id=1246 data-nosnippet>1246</a>            get_job(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job.id).unwrap().allowed_tools,
+<a href=#1247 id=1247 data-nosnippet>1247</a>            <span class="prelude-val">Some</span>(<span class="macro">vec!</span>[<span class="string">"shell"</span>.into()])
+<a href=#1248 id=1248 data-nosnippet>1248</a>        );
+<a href=#1249 id=1249 data-nosnippet>1249</a>    }
+<a href=#1250 id=1250 data-nosnippet>1250</a>
+<a href=#1251 id=1251 data-nosnippet>1251</a>    <span class="attr">#[test]
+<a href=#1252 id=1252 data-nosnippet>1252</a>    </span><span class="kw">fn </span>reschedule_after_run_persists_last_status_and_last_run() {
+<a href=#1253 id=1253 data-nosnippet>1253</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1254 id=1254 data-nosnippet>1254</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1255 id=1255 data-nosnippet>1255</a>
+<a href=#1256 id=1256 data-nosnippet>1256</a>        <span class="kw">let </span>job = add_job(<span class="kw-2">&amp;</span>config, <span class="string">"*/15 * * * *"</span>, <span class="string">"echo run"</span>).unwrap();
+<a href=#1257 id=1257 data-nosnippet>1257</a>        reschedule_after_run(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job, <span class="bool-val">false</span>, <span class="string">"failed output"</span>).unwrap();
+<a href=#1258 id=1258 data-nosnippet>1258</a>
+<a href=#1259 id=1259 data-nosnippet>1259</a>        <span class="kw">let </span>listed = list_jobs(<span class="kw-2">&amp;</span>config).unwrap();
+<a href=#1260 id=1260 data-nosnippet>1260</a>        <span class="kw">let </span>stored = listed.iter().find(|j| j.id == job.id).unwrap();
+<a href=#1261 id=1261 data-nosnippet>1261</a>        <span class="macro">assert_eq!</span>(stored.last_status.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"error"</span>));
+<a href=#1262 id=1262 data-nosnippet>1262</a>        <span class="macro">assert!</span>(stored.last_run.is_some());
+<a href=#1263 id=1263 data-nosnippet>1263</a>        <span class="macro">assert_eq!</span>(stored.last_output.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"failed output"</span>));
+<a href=#1264 id=1264 data-nosnippet>1264</a>    }
+<a href=#1265 id=1265 data-nosnippet>1265</a>
+<a href=#1266 id=1266 data-nosnippet>1266</a>    <span class="attr">#[test]
+<a href=#1267 id=1267 data-nosnippet>1267</a>    </span><span class="kw">fn </span>job_type_from_sql_reads_valid_value() {
+<a href=#1268 id=1268 data-nosnippet>1268</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1269 id=1269 data-nosnippet>1269</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1270 id=1270 data-nosnippet>1270</a>        <span class="kw">let </span>now = Utc::now();
+<a href=#1271 id=1271 data-nosnippet>1271</a>
+<a href=#1272 id=1272 data-nosnippet>1272</a>        with_connection(<span class="kw-2">&amp;</span>config, |conn| {
+<a href=#1273 id=1273 data-nosnippet>1273</a>            conn.execute(
+<a href=#1274 id=1274 data-nosnippet>1274</a>                <span class="string">"INSERT INTO cron_jobs (id, expression, command, schedule, job_type, created_at, next_run)
+<a href=#1275 id=1275 data-nosnippet>1275</a>                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"</span>,
+<a href=#1276 id=1276 data-nosnippet>1276</a>                <span class="macro">params!</span>[
+<a href=#1277 id=1277 data-nosnippet>1277</a>                    <span class="string">"job-type-valid"</span>,
+<a href=#1278 id=1278 data-nosnippet>1278</a>                    <span class="string">"*/5 * * * *"</span>,
+<a href=#1279 id=1279 data-nosnippet>1279</a>                    <span class="string">"echo ok"</span>,
+<a href=#1280 id=1280 data-nosnippet>1280</a>                    Option::&lt;String&gt;::None,
+<a href=#1281 id=1281 data-nosnippet>1281</a>                    <span class="string">"agent"</span>,
+<a href=#1282 id=1282 data-nosnippet>1282</a>                    now.to_rfc3339(),
+<a href=#1283 id=1283 data-nosnippet>1283</a>                    (now + ChronoDuration::minutes(<span class="number">5</span>)).to_rfc3339(),
+<a href=#1284 id=1284 data-nosnippet>1284</a>                ],
+<a href=#1285 id=1285 data-nosnippet>1285</a>            )<span class="question-mark">?</span>;
+<a href=#1286 id=1286 data-nosnippet>1286</a>            <span class="prelude-val">Ok</span>(())
+<a href=#1287 id=1287 data-nosnippet>1287</a>        })
+<a href=#1288 id=1288 data-nosnippet>1288</a>        .unwrap();
+<a href=#1289 id=1289 data-nosnippet>1289</a>
+<a href=#1290 id=1290 data-nosnippet>1290</a>        <span class="kw">let </span>job = get_job(<span class="kw-2">&amp;</span>config, <span class="string">"job-type-valid"</span>).unwrap();
+<a href=#1291 id=1291 data-nosnippet>1291</a>        <span class="macro">assert_eq!</span>(job.job_type, JobType::Agent);
+<a href=#1292 id=1292 data-nosnippet>1292</a>    }
+<a href=#1293 id=1293 data-nosnippet>1293</a>
+<a href=#1294 id=1294 data-nosnippet>1294</a>    <span class="attr">#[test]
+<a href=#1295 id=1295 data-nosnippet>1295</a>    </span><span class="kw">fn </span>job_type_from_sql_rejects_invalid_value() {
+<a href=#1296 id=1296 data-nosnippet>1296</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1297 id=1297 data-nosnippet>1297</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1298 id=1298 data-nosnippet>1298</a>        <span class="kw">let </span>now = Utc::now();
+<a href=#1299 id=1299 data-nosnippet>1299</a>
+<a href=#1300 id=1300 data-nosnippet>1300</a>        with_connection(<span class="kw-2">&amp;</span>config, |conn| {
+<a href=#1301 id=1301 data-nosnippet>1301</a>            conn.execute(
+<a href=#1302 id=1302 data-nosnippet>1302</a>                <span class="string">"INSERT INTO cron_jobs (id, expression, command, schedule, job_type, created_at, next_run)
+<a href=#1303 id=1303 data-nosnippet>1303</a>                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"</span>,
+<a href=#1304 id=1304 data-nosnippet>1304</a>                <span class="macro">params!</span>[
+<a href=#1305 id=1305 data-nosnippet>1305</a>                    <span class="string">"job-type-invalid"</span>,
+<a href=#1306 id=1306 data-nosnippet>1306</a>                    <span class="string">"*/5 * * * *"</span>,
+<a href=#1307 id=1307 data-nosnippet>1307</a>                    <span class="string">"echo ok"</span>,
+<a href=#1308 id=1308 data-nosnippet>1308</a>                    Option::&lt;String&gt;::None,
+<a href=#1309 id=1309 data-nosnippet>1309</a>                    <span class="string">"unknown"</span>,
+<a href=#1310 id=1310 data-nosnippet>1310</a>                    now.to_rfc3339(),
+<a href=#1311 id=1311 data-nosnippet>1311</a>                    (now + ChronoDuration::minutes(<span class="number">5</span>)).to_rfc3339(),
+<a href=#1312 id=1312 data-nosnippet>1312</a>                ],
+<a href=#1313 id=1313 data-nosnippet>1313</a>            )<span class="question-mark">?</span>;
+<a href=#1314 id=1314 data-nosnippet>1314</a>            <span class="prelude-val">Ok</span>(())
+<a href=#1315 id=1315 data-nosnippet>1315</a>        })
+<a href=#1316 id=1316 data-nosnippet>1316</a>        .unwrap();
+<a href=#1317 id=1317 data-nosnippet>1317</a>
+<a href=#1318 id=1318 data-nosnippet>1318</a>        <span class="macro">assert!</span>(get_job(<span class="kw-2">&amp;</span>config, <span class="string">"job-type-invalid"</span>).is_err());
+<a href=#1319 id=1319 data-nosnippet>1319</a>    }
+<a href=#1320 id=1320 data-nosnippet>1320</a>
+<a href=#1321 id=1321 data-nosnippet>1321</a>    <span class="attr">#[test]
+<a href=#1322 id=1322 data-nosnippet>1322</a>    </span><span class="kw">fn </span>migration_falls_back_to_legacy_expression() {
+<a href=#1323 id=1323 data-nosnippet>1323</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1324 id=1324 data-nosnippet>1324</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1325 id=1325 data-nosnippet>1325</a>
+<a href=#1326 id=1326 data-nosnippet>1326</a>        with_connection(<span class="kw-2">&amp;</span>config, |conn| {
+<a href=#1327 id=1327 data-nosnippet>1327</a>            conn.execute(
+<a href=#1328 id=1328 data-nosnippet>1328</a>                <span class="string">"INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
+<a href=#1329 id=1329 data-nosnippet>1329</a>                 VALUES (?1, ?2, ?3, ?4, ?5)"</span>,
+<a href=#1330 id=1330 data-nosnippet>1330</a>                <span class="macro">params!</span>[
+<a href=#1331 id=1331 data-nosnippet>1331</a>                    <span class="string">"legacy-id"</span>,
+<a href=#1332 id=1332 data-nosnippet>1332</a>                    <span class="string">"*/5 * * * *"</span>,
+<a href=#1333 id=1333 data-nosnippet>1333</a>                    <span class="string">"echo legacy"</span>,
+<a href=#1334 id=1334 data-nosnippet>1334</a>                    Utc::now().to_rfc3339(),
+<a href=#1335 id=1335 data-nosnippet>1335</a>                    (Utc::now() + ChronoDuration::minutes(<span class="number">5</span>)).to_rfc3339(),
+<a href=#1336 id=1336 data-nosnippet>1336</a>                ],
+<a href=#1337 id=1337 data-nosnippet>1337</a>            )<span class="question-mark">?</span>;
+<a href=#1338 id=1338 data-nosnippet>1338</a>            conn.execute(
+<a href=#1339 id=1339 data-nosnippet>1339</a>                <span class="string">"UPDATE cron_jobs SET schedule = NULL WHERE id = 'legacy-id'"</span>,
+<a href=#1340 id=1340 data-nosnippet>1340</a>                [],
+<a href=#1341 id=1341 data-nosnippet>1341</a>            )<span class="question-mark">?</span>;
+<a href=#1342 id=1342 data-nosnippet>1342</a>            <span class="prelude-val">Ok</span>(())
+<a href=#1343 id=1343 data-nosnippet>1343</a>        })
+<a href=#1344 id=1344 data-nosnippet>1344</a>        .unwrap();
+<a href=#1345 id=1345 data-nosnippet>1345</a>
+<a href=#1346 id=1346 data-nosnippet>1346</a>        <span class="kw">let </span>job = get_job(<span class="kw-2">&amp;</span>config, <span class="string">"legacy-id"</span>).unwrap();
+<a href=#1347 id=1347 data-nosnippet>1347</a>        <span class="macro">assert!</span>(<span class="macro">matches!</span>(job.schedule, Schedule::Cron { .. }));
+<a href=#1348 id=1348 data-nosnippet>1348</a>    }
+<a href=#1349 id=1349 data-nosnippet>1349</a>
+<a href=#1350 id=1350 data-nosnippet>1350</a>    <span class="attr">#[test]
+<a href=#1351 id=1351 data-nosnippet>1351</a>    </span><span class="kw">fn </span>record_and_prune_runs() {
+<a href=#1352 id=1352 data-nosnippet>1352</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1353 id=1353 data-nosnippet>1353</a>        <span class="kw">let </span><span class="kw-2">mut </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1354 id=1354 data-nosnippet>1354</a>        config.cron.max_run_history = <span class="number">2</span>;
+<a href=#1355 id=1355 data-nosnippet>1355</a>        <span class="kw">let </span>job = add_job(<span class="kw-2">&amp;</span>config, <span class="string">"*/5 * * * *"</span>, <span class="string">"echo ok"</span>).unwrap();
+<a href=#1356 id=1356 data-nosnippet>1356</a>        <span class="kw">let </span>base = Utc::now();
+<a href=#1357 id=1357 data-nosnippet>1357</a>
+<a href=#1358 id=1358 data-nosnippet>1358</a>        <span class="kw">for </span>idx <span class="kw">in </span><span class="number">0</span>..<span class="number">3 </span>{
+<a href=#1359 id=1359 data-nosnippet>1359</a>            <span class="kw">let </span>start = base + ChronoDuration::seconds(idx);
+<a href=#1360 id=1360 data-nosnippet>1360</a>            <span class="kw">let </span>end = start + ChronoDuration::milliseconds(<span class="number">100</span>);
+<a href=#1361 id=1361 data-nosnippet>1361</a>            record_run(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job.id, start, end, <span class="string">"ok"</span>, <span class="prelude-val">Some</span>(<span class="string">"done"</span>), <span class="number">100</span>).unwrap();
+<a href=#1362 id=1362 data-nosnippet>1362</a>        }
+<a href=#1363 id=1363 data-nosnippet>1363</a>
+<a href=#1364 id=1364 data-nosnippet>1364</a>        <span class="kw">let </span>runs = list_runs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job.id, <span class="number">10</span>).unwrap();
+<a href=#1365 id=1365 data-nosnippet>1365</a>        <span class="macro">assert_eq!</span>(runs.len(), <span class="number">2</span>);
+<a href=#1366 id=1366 data-nosnippet>1366</a>    }
+<a href=#1367 id=1367 data-nosnippet>1367</a>
+<a href=#1368 id=1368 data-nosnippet>1368</a>    <span class="attr">#[test]
+<a href=#1369 id=1369 data-nosnippet>1369</a>    </span><span class="kw">fn </span>remove_job_cascades_run_history() {
+<a href=#1370 id=1370 data-nosnippet>1370</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1371 id=1371 data-nosnippet>1371</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1372 id=1372 data-nosnippet>1372</a>        <span class="kw">let </span>job = add_job(<span class="kw-2">&amp;</span>config, <span class="string">"*/5 * * * *"</span>, <span class="string">"echo ok"</span>).unwrap();
+<a href=#1373 id=1373 data-nosnippet>1373</a>        <span class="kw">let </span>start = Utc::now();
+<a href=#1374 id=1374 data-nosnippet>1374</a>        record_run(
+<a href=#1375 id=1375 data-nosnippet>1375</a>            <span class="kw-2">&amp;</span>config,
+<a href=#1376 id=1376 data-nosnippet>1376</a>            <span class="kw-2">&amp;</span>job.id,
+<a href=#1377 id=1377 data-nosnippet>1377</a>            start,
+<a href=#1378 id=1378 data-nosnippet>1378</a>            start + ChronoDuration::milliseconds(<span class="number">5</span>),
+<a href=#1379 id=1379 data-nosnippet>1379</a>            <span class="string">"ok"</span>,
+<a href=#1380 id=1380 data-nosnippet>1380</a>            <span class="prelude-val">Some</span>(<span class="string">"ok"</span>),
+<a href=#1381 id=1381 data-nosnippet>1381</a>            <span class="number">5</span>,
+<a href=#1382 id=1382 data-nosnippet>1382</a>        )
+<a href=#1383 id=1383 data-nosnippet>1383</a>        .unwrap();
+<a href=#1384 id=1384 data-nosnippet>1384</a>
+<a href=#1385 id=1385 data-nosnippet>1385</a>        remove_job(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job.id).unwrap();
+<a href=#1386 id=1386 data-nosnippet>1386</a>        <span class="kw">let </span>runs = list_runs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job.id, <span class="number">10</span>).unwrap();
+<a href=#1387 id=1387 data-nosnippet>1387</a>        <span class="macro">assert!</span>(runs.is_empty());
+<a href=#1388 id=1388 data-nosnippet>1388</a>    }
+<a href=#1389 id=1389 data-nosnippet>1389</a>
+<a href=#1390 id=1390 data-nosnippet>1390</a>    <span class="attr">#[test]
+<a href=#1391 id=1391 data-nosnippet>1391</a>    </span><span class="kw">fn </span>record_run_truncates_large_output() {
+<a href=#1392 id=1392 data-nosnippet>1392</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1393 id=1393 data-nosnippet>1393</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1394 id=1394 data-nosnippet>1394</a>        <span class="kw">let </span>job = add_job(<span class="kw-2">&amp;</span>config, <span class="string">"*/5 * * * *"</span>, <span class="string">"echo trunc"</span>).unwrap();
+<a href=#1395 id=1395 data-nosnippet>1395</a>        <span class="kw">let </span>output = <span class="string">"x"</span>.repeat(MAX_CRON_OUTPUT_BYTES + <span class="number">512</span>);
+<a href=#1396 id=1396 data-nosnippet>1396</a>
+<a href=#1397 id=1397 data-nosnippet>1397</a>        record_run(
+<a href=#1398 id=1398 data-nosnippet>1398</a>            <span class="kw-2">&amp;</span>config,
+<a href=#1399 id=1399 data-nosnippet>1399</a>            <span class="kw-2">&amp;</span>job.id,
+<a href=#1400 id=1400 data-nosnippet>1400</a>            Utc::now(),
+<a href=#1401 id=1401 data-nosnippet>1401</a>            Utc::now(),
+<a href=#1402 id=1402 data-nosnippet>1402</a>            <span class="string">"ok"</span>,
+<a href=#1403 id=1403 data-nosnippet>1403</a>            <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>output),
+<a href=#1404 id=1404 data-nosnippet>1404</a>            <span class="number">1</span>,
+<a href=#1405 id=1405 data-nosnippet>1405</a>        )
+<a href=#1406 id=1406 data-nosnippet>1406</a>        .unwrap();
+<a href=#1407 id=1407 data-nosnippet>1407</a>
+<a href=#1408 id=1408 data-nosnippet>1408</a>        <span class="kw">let </span>runs = list_runs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job.id, <span class="number">1</span>).unwrap();
+<a href=#1409 id=1409 data-nosnippet>1409</a>        <span class="kw">let </span>stored = runs[<span class="number">0</span>].output.as_deref().unwrap_or_default();
+<a href=#1410 id=1410 data-nosnippet>1410</a>        <span class="macro">assert!</span>(stored.ends_with(TRUNCATED_OUTPUT_MARKER));
+<a href=#1411 id=1411 data-nosnippet>1411</a>        <span class="macro">assert!</span>(stored.len() &lt;= MAX_CRON_OUTPUT_BYTES);
+<a href=#1412 id=1412 data-nosnippet>1412</a>    }
+<a href=#1413 id=1413 data-nosnippet>1413</a>
+<a href=#1414 id=1414 data-nosnippet>1414</a>    <span class="attr">#[test]
+<a href=#1415 id=1415 data-nosnippet>1415</a>    </span><span class="kw">fn </span>reschedule_after_run_disables_at_schedule_job() {
+<a href=#1416 id=1416 data-nosnippet>1416</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1417 id=1417 data-nosnippet>1417</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1418 id=1418 data-nosnippet>1418</a>        <span class="kw">let </span>at = Utc::now() + ChronoDuration::minutes(<span class="number">10</span>);
+<a href=#1419 id=1419 data-nosnippet>1419</a>        <span class="kw">let </span>job = add_shell_job(<span class="kw-2">&amp;</span>config, <span class="prelude-val">None</span>, Schedule::At { at }, <span class="string">"echo once"</span>, <span class="prelude-val">None</span>).unwrap();
+<a href=#1420 id=1420 data-nosnippet>1420</a>
+<a href=#1421 id=1421 data-nosnippet>1421</a>        reschedule_after_run(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job, <span class="bool-val">true</span>, <span class="string">"done"</span>).unwrap();
+<a href=#1422 id=1422 data-nosnippet>1422</a>
+<a href=#1423 id=1423 data-nosnippet>1423</a>        <span class="kw">let </span>stored = get_job(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job.id).unwrap();
+<a href=#1424 id=1424 data-nosnippet>1424</a>        <span class="macro">assert!</span>(
+<a href=#1425 id=1425 data-nosnippet>1425</a>            !stored.enabled,
+<a href=#1426 id=1426 data-nosnippet>1426</a>            <span class="string">"At schedule job should be disabled after reschedule"
+<a href=#1427 id=1427 data-nosnippet>1427</a>        </span>);
+<a href=#1428 id=1428 data-nosnippet>1428</a>        <span class="macro">assert_eq!</span>(stored.last_status.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"ok"</span>));
+<a href=#1429 id=1429 data-nosnippet>1429</a>    }
+<a href=#1430 id=1430 data-nosnippet>1430</a>
+<a href=#1431 id=1431 data-nosnippet>1431</a>    <span class="attr">#[test]
+<a href=#1432 id=1432 data-nosnippet>1432</a>    </span><span class="kw">fn </span>reschedule_after_run_disables_at_schedule_job_on_failure() {
+<a href=#1433 id=1433 data-nosnippet>1433</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1434 id=1434 data-nosnippet>1434</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1435 id=1435 data-nosnippet>1435</a>        <span class="kw">let </span>at = Utc::now() + ChronoDuration::minutes(<span class="number">10</span>);
+<a href=#1436 id=1436 data-nosnippet>1436</a>        <span class="kw">let </span>job = add_shell_job(<span class="kw-2">&amp;</span>config, <span class="prelude-val">None</span>, Schedule::At { at }, <span class="string">"echo once"</span>, <span class="prelude-val">None</span>).unwrap();
+<a href=#1437 id=1437 data-nosnippet>1437</a>
+<a href=#1438 id=1438 data-nosnippet>1438</a>        reschedule_after_run(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job, <span class="bool-val">false</span>, <span class="string">"failed"</span>).unwrap();
+<a href=#1439 id=1439 data-nosnippet>1439</a>
+<a href=#1440 id=1440 data-nosnippet>1440</a>        <span class="kw">let </span>stored = get_job(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job.id).unwrap();
+<a href=#1441 id=1441 data-nosnippet>1441</a>        <span class="macro">assert!</span>(
+<a href=#1442 id=1442 data-nosnippet>1442</a>            !stored.enabled,
+<a href=#1443 id=1443 data-nosnippet>1443</a>            <span class="string">"At schedule job should be disabled after reschedule even on failure"
+<a href=#1444 id=1444 data-nosnippet>1444</a>        </span>);
+<a href=#1445 id=1445 data-nosnippet>1445</a>        <span class="macro">assert_eq!</span>(stored.last_status.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"error"</span>));
+<a href=#1446 id=1446 data-nosnippet>1446</a>        <span class="macro">assert_eq!</span>(stored.last_output.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"failed"</span>));
+<a href=#1447 id=1447 data-nosnippet>1447</a>    }
+<a href=#1448 id=1448 data-nosnippet>1448</a>
+<a href=#1449 id=1449 data-nosnippet>1449</a>    <span class="attr">#[test]
+<a href=#1450 id=1450 data-nosnippet>1450</a>    </span><span class="kw">fn </span>reschedule_after_run_truncates_last_output() {
+<a href=#1451 id=1451 data-nosnippet>1451</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1452 id=1452 data-nosnippet>1452</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1453 id=1453 data-nosnippet>1453</a>        <span class="kw">let </span>job = add_job(<span class="kw-2">&amp;</span>config, <span class="string">"*/5 * * * *"</span>, <span class="string">"echo trunc"</span>).unwrap();
+<a href=#1454 id=1454 data-nosnippet>1454</a>        <span class="kw">let </span>output = <span class="string">"y"</span>.repeat(MAX_CRON_OUTPUT_BYTES + <span class="number">1024</span>);
+<a href=#1455 id=1455 data-nosnippet>1455</a>
+<a href=#1456 id=1456 data-nosnippet>1456</a>        reschedule_after_run(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job, <span class="bool-val">false</span>, <span class="kw-2">&amp;</span>output).unwrap();
+<a href=#1457 id=1457 data-nosnippet>1457</a>
+<a href=#1458 id=1458 data-nosnippet>1458</a>        <span class="kw">let </span>stored = get_job(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>job.id).unwrap();
+<a href=#1459 id=1459 data-nosnippet>1459</a>        <span class="kw">let </span>last_output = stored.last_output.as_deref().unwrap_or_default();
+<a href=#1460 id=1460 data-nosnippet>1460</a>        <span class="macro">assert!</span>(last_output.ends_with(TRUNCATED_OUTPUT_MARKER));
+<a href=#1461 id=1461 data-nosnippet>1461</a>        <span class="macro">assert!</span>(last_output.len() &lt;= MAX_CRON_OUTPUT_BYTES);
+<a href=#1462 id=1462 data-nosnippet>1462</a>    }
+<a href=#1463 id=1463 data-nosnippet>1463</a>
+<a href=#1464 id=1464 data-nosnippet>1464</a>    <span class="comment">// ── Declarative cron job sync tests ──────────────────────────
+<a href=#1465 id=1465 data-nosnippet>1465</a>
+<a href=#1466 id=1466 data-nosnippet>1466</a>    </span><span class="kw">fn </span>make_shell_decl(id: <span class="kw-2">&amp;</span>str, expr: <span class="kw-2">&amp;</span>str, cmd: <span class="kw-2">&amp;</span>str) -&gt; zeroclaw_config::schema::CronJobDecl {
+<a href=#1467 id=1467 data-nosnippet>1467</a>        zeroclaw_config::schema::CronJobDecl {
+<a href=#1468 id=1468 data-nosnippet>1468</a>            id: id.to_string(),
+<a href=#1469 id=1469 data-nosnippet>1469</a>            name: <span class="prelude-val">Some</span>(<span class="macro">format!</span>(<span class="string">"decl-{id}"</span>)),
+<a href=#1470 id=1470 data-nosnippet>1470</a>            job_type: <span class="string">"shell"</span>.to_string(),
+<a href=#1471 id=1471 data-nosnippet>1471</a>            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+<a href=#1472 id=1472 data-nosnippet>1472</a>                expr: expr.to_string(),
+<a href=#1473 id=1473 data-nosnippet>1473</a>                tz: <span class="prelude-val">None</span>,
+<a href=#1474 id=1474 data-nosnippet>1474</a>            },
+<a href=#1475 id=1475 data-nosnippet>1475</a>            command: <span class="prelude-val">Some</span>(cmd.to_string()),
+<a href=#1476 id=1476 data-nosnippet>1476</a>            prompt: <span class="prelude-val">None</span>,
+<a href=#1477 id=1477 data-nosnippet>1477</a>            enabled: <span class="bool-val">true</span>,
+<a href=#1478 id=1478 data-nosnippet>1478</a>            model: <span class="prelude-val">None</span>,
+<a href=#1479 id=1479 data-nosnippet>1479</a>            allowed_tools: <span class="prelude-val">None</span>,
+<a href=#1480 id=1480 data-nosnippet>1480</a>            uses_memory: <span class="bool-val">true</span>,
+<a href=#1481 id=1481 data-nosnippet>1481</a>            session_target: <span class="prelude-val">None</span>,
+<a href=#1482 id=1482 data-nosnippet>1482</a>            delivery: <span class="prelude-val">None</span>,
+<a href=#1483 id=1483 data-nosnippet>1483</a>        }
+<a href=#1484 id=1484 data-nosnippet>1484</a>    }
+<a href=#1485 id=1485 data-nosnippet>1485</a>
+<a href=#1486 id=1486 data-nosnippet>1486</a>    <span class="kw">fn </span>make_agent_decl(id: <span class="kw-2">&amp;</span>str, expr: <span class="kw-2">&amp;</span>str, prompt: <span class="kw-2">&amp;</span>str) -&gt; zeroclaw_config::schema::CronJobDecl {
+<a href=#1487 id=1487 data-nosnippet>1487</a>        zeroclaw_config::schema::CronJobDecl {
+<a href=#1488 id=1488 data-nosnippet>1488</a>            id: id.to_string(),
+<a href=#1489 id=1489 data-nosnippet>1489</a>            name: <span class="prelude-val">Some</span>(<span class="macro">format!</span>(<span class="string">"decl-{id}"</span>)),
+<a href=#1490 id=1490 data-nosnippet>1490</a>            job_type: <span class="string">"agent"</span>.to_string(),
+<a href=#1491 id=1491 data-nosnippet>1491</a>            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+<a href=#1492 id=1492 data-nosnippet>1492</a>                expr: expr.to_string(),
+<a href=#1493 id=1493 data-nosnippet>1493</a>                tz: <span class="prelude-val">None</span>,
+<a href=#1494 id=1494 data-nosnippet>1494</a>            },
+<a href=#1495 id=1495 data-nosnippet>1495</a>            command: <span class="prelude-val">None</span>,
+<a href=#1496 id=1496 data-nosnippet>1496</a>            prompt: <span class="prelude-val">Some</span>(prompt.to_string()),
+<a href=#1497 id=1497 data-nosnippet>1497</a>            enabled: <span class="bool-val">true</span>,
+<a href=#1498 id=1498 data-nosnippet>1498</a>            model: <span class="prelude-val">None</span>,
+<a href=#1499 id=1499 data-nosnippet>1499</a>            allowed_tools: <span class="prelude-val">None</span>,
+<a href=#1500 id=1500 data-nosnippet>1500</a>            uses_memory: <span class="bool-val">true</span>,
+<a href=#1501 id=1501 data-nosnippet>1501</a>            session_target: <span class="prelude-val">None</span>,
+<a href=#1502 id=1502 data-nosnippet>1502</a>            delivery: <span class="prelude-val">None</span>,
+<a href=#1503 id=1503 data-nosnippet>1503</a>        }
+<a href=#1504 id=1504 data-nosnippet>1504</a>    }
+<a href=#1505 id=1505 data-nosnippet>1505</a>
+<a href=#1506 id=1506 data-nosnippet>1506</a>    <span class="attr">#[test]
+<a href=#1507 id=1507 data-nosnippet>1507</a>    </span><span class="kw">fn </span>sync_inserts_new_declarative_job() {
+<a href=#1508 id=1508 data-nosnippet>1508</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1509 id=1509 data-nosnippet>1509</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1510 id=1510 data-nosnippet>1510</a>
+<a href=#1511 id=1511 data-nosnippet>1511</a>        <span class="kw">let </span>decls = <span class="macro">vec!</span>[make_shell_decl(<span class="string">"daily-backup"</span>, <span class="string">"0 2 * * *"</span>, <span class="string">"echo backup"</span>)];
+<a href=#1512 id=1512 data-nosnippet>1512</a>        sync_declarative_jobs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>decls).unwrap();
+<a href=#1513 id=1513 data-nosnippet>1513</a>
+<a href=#1514 id=1514 data-nosnippet>1514</a>        <span class="kw">let </span>job = get_job(<span class="kw-2">&amp;</span>config, <span class="string">"daily-backup"</span>).unwrap();
+<a href=#1515 id=1515 data-nosnippet>1515</a>        <span class="macro">assert_eq!</span>(job.command, <span class="string">"echo backup"</span>);
+<a href=#1516 id=1516 data-nosnippet>1516</a>        <span class="macro">assert_eq!</span>(job.source, <span class="string">"declarative"</span>);
+<a href=#1517 id=1517 data-nosnippet>1517</a>        <span class="macro">assert_eq!</span>(job.name.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"decl-daily-backup"</span>));
+<a href=#1518 id=1518 data-nosnippet>1518</a>    }
+<a href=#1519 id=1519 data-nosnippet>1519</a>
+<a href=#1520 id=1520 data-nosnippet>1520</a>    <span class="attr">#[test]
+<a href=#1521 id=1521 data-nosnippet>1521</a>    </span><span class="kw">fn </span>sync_updates_existing_declarative_job() {
+<a href=#1522 id=1522 data-nosnippet>1522</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1523 id=1523 data-nosnippet>1523</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1524 id=1524 data-nosnippet>1524</a>
+<a href=#1525 id=1525 data-nosnippet>1525</a>        <span class="kw">let </span>decls = <span class="macro">vec!</span>[make_shell_decl(<span class="string">"updatable"</span>, <span class="string">"0 2 * * *"</span>, <span class="string">"echo v1"</span>)];
+<a href=#1526 id=1526 data-nosnippet>1526</a>        sync_declarative_jobs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>decls).unwrap();
+<a href=#1527 id=1527 data-nosnippet>1527</a>
+<a href=#1528 id=1528 data-nosnippet>1528</a>        <span class="kw">let </span>job_v1 = get_job(<span class="kw-2">&amp;</span>config, <span class="string">"updatable"</span>).unwrap();
+<a href=#1529 id=1529 data-nosnippet>1529</a>        <span class="macro">assert_eq!</span>(job_v1.command, <span class="string">"echo v1"</span>);
+<a href=#1530 id=1530 data-nosnippet>1530</a>
+<a href=#1531 id=1531 data-nosnippet>1531</a>        <span class="kw">let </span>decls_v2 = <span class="macro">vec!</span>[make_shell_decl(<span class="string">"updatable"</span>, <span class="string">"0 3 * * *"</span>, <span class="string">"echo v2"</span>)];
+<a href=#1532 id=1532 data-nosnippet>1532</a>        sync_declarative_jobs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>decls_v2).unwrap();
+<a href=#1533 id=1533 data-nosnippet>1533</a>
+<a href=#1534 id=1534 data-nosnippet>1534</a>        <span class="kw">let </span>job_v2 = get_job(<span class="kw-2">&amp;</span>config, <span class="string">"updatable"</span>).unwrap();
+<a href=#1535 id=1535 data-nosnippet>1535</a>        <span class="macro">assert_eq!</span>(job_v2.command, <span class="string">"echo v2"</span>);
+<a href=#1536 id=1536 data-nosnippet>1536</a>        <span class="macro">assert_eq!</span>(job_v2.expression, <span class="string">"0 3 * * *"</span>);
+<a href=#1537 id=1537 data-nosnippet>1537</a>        <span class="macro">assert_eq!</span>(job_v2.source, <span class="string">"declarative"</span>);
+<a href=#1538 id=1538 data-nosnippet>1538</a>    }
+<a href=#1539 id=1539 data-nosnippet>1539</a>
+<a href=#1540 id=1540 data-nosnippet>1540</a>    <span class="attr">#[test]
+<a href=#1541 id=1541 data-nosnippet>1541</a>    </span><span class="kw">fn </span>sync_does_not_delete_imperative_jobs() {
+<a href=#1542 id=1542 data-nosnippet>1542</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1543 id=1543 data-nosnippet>1543</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1544 id=1544 data-nosnippet>1544</a>
+<a href=#1545 id=1545 data-nosnippet>1545</a>        <span class="comment">// Create an imperative job via the normal API.
+<a href=#1546 id=1546 data-nosnippet>1546</a>        </span><span class="kw">let </span>imperative = add_job(<span class="kw-2">&amp;</span>config, <span class="string">"*/10 * * * *"</span>, <span class="string">"echo imperative"</span>).unwrap();
+<a href=#1547 id=1547 data-nosnippet>1547</a>
+<a href=#1548 id=1548 data-nosnippet>1548</a>        <span class="comment">// Sync declarative jobs (none of which match the imperative job).
+<a href=#1549 id=1549 data-nosnippet>1549</a>        </span><span class="kw">let </span>decls = <span class="macro">vec!</span>[make_shell_decl(<span class="string">"my-decl"</span>, <span class="string">"0 2 * * *"</span>, <span class="string">"echo decl"</span>)];
+<a href=#1550 id=1550 data-nosnippet>1550</a>        sync_declarative_jobs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>decls).unwrap();
+<a href=#1551 id=1551 data-nosnippet>1551</a>
+<a href=#1552 id=1552 data-nosnippet>1552</a>        <span class="comment">// Imperative job should still exist.
+<a href=#1553 id=1553 data-nosnippet>1553</a>        </span><span class="kw">let </span>still_there = get_job(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>imperative.id).unwrap();
+<a href=#1554 id=1554 data-nosnippet>1554</a>        <span class="macro">assert_eq!</span>(still_there.command, <span class="string">"echo imperative"</span>);
+<a href=#1555 id=1555 data-nosnippet>1555</a>        <span class="macro">assert_eq!</span>(still_there.source, <span class="string">"imperative"</span>);
+<a href=#1556 id=1556 data-nosnippet>1556</a>
+<a href=#1557 id=1557 data-nosnippet>1557</a>        <span class="comment">// Declarative job should also exist.
+<a href=#1558 id=1558 data-nosnippet>1558</a>        </span><span class="kw">let </span>decl_job = get_job(<span class="kw-2">&amp;</span>config, <span class="string">"my-decl"</span>).unwrap();
+<a href=#1559 id=1559 data-nosnippet>1559</a>        <span class="macro">assert_eq!</span>(decl_job.command, <span class="string">"echo decl"</span>);
+<a href=#1560 id=1560 data-nosnippet>1560</a>    }
+<a href=#1561 id=1561 data-nosnippet>1561</a>
+<a href=#1562 id=1562 data-nosnippet>1562</a>    <span class="attr">#[test]
+<a href=#1563 id=1563 data-nosnippet>1563</a>    </span><span class="kw">fn </span>sync_removes_stale_declarative_jobs() {
+<a href=#1564 id=1564 data-nosnippet>1564</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1565 id=1565 data-nosnippet>1565</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1566 id=1566 data-nosnippet>1566</a>
+<a href=#1567 id=1567 data-nosnippet>1567</a>        <span class="comment">// Insert two declarative jobs.
+<a href=#1568 id=1568 data-nosnippet>1568</a>        </span><span class="kw">let </span>decls = <span class="macro">vec!</span>[
+<a href=#1569 id=1569 data-nosnippet>1569</a>            make_shell_decl(<span class="string">"keeper"</span>, <span class="string">"0 2 * * *"</span>, <span class="string">"echo keep"</span>),
+<a href=#1570 id=1570 data-nosnippet>1570</a>            make_shell_decl(<span class="string">"stale"</span>, <span class="string">"0 3 * * *"</span>, <span class="string">"echo stale"</span>),
+<a href=#1571 id=1571 data-nosnippet>1571</a>        ];
+<a href=#1572 id=1572 data-nosnippet>1572</a>        sync_declarative_jobs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>decls).unwrap();
+<a href=#1573 id=1573 data-nosnippet>1573</a>
+<a href=#1574 id=1574 data-nosnippet>1574</a>        <span class="comment">// Now sync with only "keeper" — "stale" should be removed.
+<a href=#1575 id=1575 data-nosnippet>1575</a>        </span><span class="kw">let </span>decls_v2 = <span class="macro">vec!</span>[make_shell_decl(<span class="string">"keeper"</span>, <span class="string">"0 2 * * *"</span>, <span class="string">"echo keep"</span>)];
+<a href=#1576 id=1576 data-nosnippet>1576</a>        sync_declarative_jobs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>decls_v2).unwrap();
+<a href=#1577 id=1577 data-nosnippet>1577</a>
+<a href=#1578 id=1578 data-nosnippet>1578</a>        <span class="macro">assert!</span>(get_job(<span class="kw-2">&amp;</span>config, <span class="string">"stale"</span>).is_err());
+<a href=#1579 id=1579 data-nosnippet>1579</a>        <span class="macro">assert!</span>(get_job(<span class="kw-2">&amp;</span>config, <span class="string">"keeper"</span>).is_ok());
+<a href=#1580 id=1580 data-nosnippet>1580</a>    }
+<a href=#1581 id=1581 data-nosnippet>1581</a>
+<a href=#1582 id=1582 data-nosnippet>1582</a>    <span class="attr">#[test]
+<a href=#1583 id=1583 data-nosnippet>1583</a>    </span><span class="kw">fn </span>sync_empty_removes_all_declarative_jobs() {
+<a href=#1584 id=1584 data-nosnippet>1584</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1585 id=1585 data-nosnippet>1585</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1586 id=1586 data-nosnippet>1586</a>
+<a href=#1587 id=1587 data-nosnippet>1587</a>        <span class="kw">let </span>decls = <span class="macro">vec!</span>[make_shell_decl(<span class="string">"to-remove"</span>, <span class="string">"0 2 * * *"</span>, <span class="string">"echo bye"</span>)];
+<a href=#1588 id=1588 data-nosnippet>1588</a>        sync_declarative_jobs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>decls).unwrap();
+<a href=#1589 id=1589 data-nosnippet>1589</a>        <span class="macro">assert!</span>(get_job(<span class="kw-2">&amp;</span>config, <span class="string">"to-remove"</span>).is_ok());
+<a href=#1590 id=1590 data-nosnippet>1590</a>
+<a href=#1591 id=1591 data-nosnippet>1591</a>        <span class="comment">// Sync with empty list.
+<a href=#1592 id=1592 data-nosnippet>1592</a>        </span>sync_declarative_jobs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>[]).unwrap();
+<a href=#1593 id=1593 data-nosnippet>1593</a>        <span class="macro">assert!</span>(get_job(<span class="kw-2">&amp;</span>config, <span class="string">"to-remove"</span>).is_err());
+<a href=#1594 id=1594 data-nosnippet>1594</a>    }
+<a href=#1595 id=1595 data-nosnippet>1595</a>
+<a href=#1596 id=1596 data-nosnippet>1596</a>    <span class="attr">#[test]
+<a href=#1597 id=1597 data-nosnippet>1597</a>    </span><span class="kw">fn </span>sync_validates_shell_job_requires_command() {
+<a href=#1598 id=1598 data-nosnippet>1598</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1599 id=1599 data-nosnippet>1599</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1600 id=1600 data-nosnippet>1600</a>
+<a href=#1601 id=1601 data-nosnippet>1601</a>        <span class="kw">let </span><span class="kw-2">mut </span>decl = make_shell_decl(<span class="string">"bad"</span>, <span class="string">"0 2 * * *"</span>, <span class="string">"echo ok"</span>);
+<a href=#1602 id=1602 data-nosnippet>1602</a>        decl.command = <span class="prelude-val">None</span>;
+<a href=#1603 id=1603 data-nosnippet>1603</a>
+<a href=#1604 id=1604 data-nosnippet>1604</a>        <span class="kw">let </span>result = sync_declarative_jobs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>[decl]);
+<a href=#1605 id=1605 data-nosnippet>1605</a>        <span class="macro">assert!</span>(result.is_err());
+<a href=#1606 id=1606 data-nosnippet>1606</a>        <span class="macro">assert!</span>(result.unwrap_err().to_string().contains(<span class="string">"command"</span>));
+<a href=#1607 id=1607 data-nosnippet>1607</a>    }
+<a href=#1608 id=1608 data-nosnippet>1608</a>
+<a href=#1609 id=1609 data-nosnippet>1609</a>    <span class="attr">#[test]
+<a href=#1610 id=1610 data-nosnippet>1610</a>    </span><span class="kw">fn </span>sync_validates_agent_job_requires_prompt() {
+<a href=#1611 id=1611 data-nosnippet>1611</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1612 id=1612 data-nosnippet>1612</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1613 id=1613 data-nosnippet>1613</a>
+<a href=#1614 id=1614 data-nosnippet>1614</a>        <span class="kw">let </span><span class="kw-2">mut </span>decl = make_agent_decl(<span class="string">"bad-agent"</span>, <span class="string">"0 2 * * *"</span>, <span class="string">"do stuff"</span>);
+<a href=#1615 id=1615 data-nosnippet>1615</a>        decl.prompt = <span class="prelude-val">None</span>;
+<a href=#1616 id=1616 data-nosnippet>1616</a>
+<a href=#1617 id=1617 data-nosnippet>1617</a>        <span class="kw">let </span>result = sync_declarative_jobs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>[decl]);
+<a href=#1618 id=1618 data-nosnippet>1618</a>        <span class="macro">assert!</span>(result.is_err());
+<a href=#1619 id=1619 data-nosnippet>1619</a>        <span class="macro">assert!</span>(result.unwrap_err().to_string().contains(<span class="string">"prompt"</span>));
+<a href=#1620 id=1620 data-nosnippet>1620</a>    }
+<a href=#1621 id=1621 data-nosnippet>1621</a>
+<a href=#1622 id=1622 data-nosnippet>1622</a>    <span class="attr">#[test]
+<a href=#1623 id=1623 data-nosnippet>1623</a>    </span><span class="kw">fn </span>sync_agent_job_inserts_correctly() {
+<a href=#1624 id=1624 data-nosnippet>1624</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1625 id=1625 data-nosnippet>1625</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1626 id=1626 data-nosnippet>1626</a>
+<a href=#1627 id=1627 data-nosnippet>1627</a>        <span class="kw">let </span>decls = <span class="macro">vec!</span>[make_agent_decl(
+<a href=#1628 id=1628 data-nosnippet>1628</a>            <span class="string">"agent-check"</span>,
+<a href=#1629 id=1629 data-nosnippet>1629</a>            <span class="string">"*/15 * * * *"</span>,
+<a href=#1630 id=1630 data-nosnippet>1630</a>            <span class="string">"check health"</span>,
+<a href=#1631 id=1631 data-nosnippet>1631</a>        )];
+<a href=#1632 id=1632 data-nosnippet>1632</a>        sync_declarative_jobs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>decls).unwrap();
+<a href=#1633 id=1633 data-nosnippet>1633</a>
+<a href=#1634 id=1634 data-nosnippet>1634</a>        <span class="kw">let </span>job = get_job(<span class="kw-2">&amp;</span>config, <span class="string">"agent-check"</span>).unwrap();
+<a href=#1635 id=1635 data-nosnippet>1635</a>        <span class="macro">assert_eq!</span>(job.job_type, JobType::Agent);
+<a href=#1636 id=1636 data-nosnippet>1636</a>        <span class="macro">assert_eq!</span>(job.prompt.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"check health"</span>));
+<a href=#1637 id=1637 data-nosnippet>1637</a>        <span class="macro">assert_eq!</span>(job.source, <span class="string">"declarative"</span>);
+<a href=#1638 id=1638 data-nosnippet>1638</a>    }
+<a href=#1639 id=1639 data-nosnippet>1639</a>
+<a href=#1640 id=1640 data-nosnippet>1640</a>    <span class="attr">#[test]
+<a href=#1641 id=1641 data-nosnippet>1641</a>    </span><span class="kw">fn </span>sync_every_schedule_works() {
+<a href=#1642 id=1642 data-nosnippet>1642</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#1643 id=1643 data-nosnippet>1643</a>        <span class="kw">let </span>config = test_config(<span class="kw-2">&amp;</span>tmp);
+<a href=#1644 id=1644 data-nosnippet>1644</a>
+<a href=#1645 id=1645 data-nosnippet>1645</a>        <span class="kw">let </span>decl = zeroclaw_config::schema::CronJobDecl {
+<a href=#1646 id=1646 data-nosnippet>1646</a>            id: <span class="string">"interval-job"</span>.to_string(),
+<a href=#1647 id=1647 data-nosnippet>1647</a>            name: <span class="prelude-val">None</span>,
+<a href=#1648 id=1648 data-nosnippet>1648</a>            job_type: <span class="string">"shell"</span>.to_string(),
+<a href=#1649 id=1649 data-nosnippet>1649</a>            schedule: zeroclaw_config::schema::CronScheduleDecl::Every { every_ms: <span class="number">60000 </span>},
+<a href=#1650 id=1650 data-nosnippet>1650</a>            command: <span class="prelude-val">Some</span>(<span class="string">"echo interval"</span>.to_string()),
+<a href=#1651 id=1651 data-nosnippet>1651</a>            prompt: <span class="prelude-val">None</span>,
+<a href=#1652 id=1652 data-nosnippet>1652</a>            enabled: <span class="bool-val">true</span>,
+<a href=#1653 id=1653 data-nosnippet>1653</a>            model: <span class="prelude-val">None</span>,
+<a href=#1654 id=1654 data-nosnippet>1654</a>            allowed_tools: <span class="prelude-val">None</span>,
+<a href=#1655 id=1655 data-nosnippet>1655</a>            uses_memory: <span class="bool-val">true</span>,
+<a href=#1656 id=1656 data-nosnippet>1656</a>            session_target: <span class="prelude-val">None</span>,
+<a href=#1657 id=1657 data-nosnippet>1657</a>            delivery: <span class="prelude-val">None</span>,
+<a href=#1658 id=1658 data-nosnippet>1658</a>        };
+<a href=#1659 id=1659 data-nosnippet>1659</a>
+<a href=#1660 id=1660 data-nosnippet>1660</a>        sync_declarative_jobs(<span class="kw-2">&amp;</span>config, <span class="kw-2">&amp;</span>[decl]).unwrap();
+<a href=#1661 id=1661 data-nosnippet>1661</a>
+<a href=#1662 id=1662 data-nosnippet>1662</a>        <span class="kw">let </span>job = get_job(<span class="kw-2">&amp;</span>config, <span class="string">"interval-job"</span>).unwrap();
+<a href=#1663 id=1663 data-nosnippet>1663</a>        <span class="macro">assert!</span>(<span class="macro">matches!</span>(job.schedule, Schedule::Every { every_ms: <span class="number">60000 </span>}));
+<a href=#1664 id=1664 data-nosnippet>1664</a>        <span class="macro">assert_eq!</span>(job.command, <span class="string">"echo interval"</span>);
+<a href=#1665 id=1665 data-nosnippet>1665</a>    }
+<a href=#1666 id=1666 data-nosnippet>1666</a>
+<a href=#1667 id=1667 data-nosnippet>1667</a>    <span class="attr">#[test]
+<a href=#1668 id=1668 data-nosnippet>1668</a>    </span><span class="kw">fn </span>declarative_config_parses_from_toml() {
+<a href=#1669 id=1669 data-nosnippet>1669</a>        <span class="kw">let </span>toml_str = <span class="string">r#"
+<a href=#1670 id=1670 data-nosnippet>1670</a>enabled = true
+<a href=#1671 id=1671 data-nosnippet>1671</a>
+<a href=#1672 id=1672 data-nosnippet>1672</a>[[jobs]]
+<a href=#1673 id=1673 data-nosnippet>1673</a>id = "daily-report"
+<a href=#1674 id=1674 data-nosnippet>1674</a>name = "Daily Report"
+<a href=#1675 id=1675 data-nosnippet>1675</a>job_type = "shell"
+<a href=#1676 id=1676 data-nosnippet>1676</a>command = "echo report"
+<a href=#1677 id=1677 data-nosnippet>1677</a>schedule = { kind = "cron", expr = "0 9 * * *" }
+<a href=#1678 id=1678 data-nosnippet>1678</a>
+<a href=#1679 id=1679 data-nosnippet>1679</a>[[jobs]]
+<a href=#1680 id=1680 data-nosnippet>1680</a>id = "health-check"
+<a href=#1681 id=1681 data-nosnippet>1681</a>job_type = "agent"
+<a href=#1682 id=1682 data-nosnippet>1682</a>prompt = "Check server health"
+<a href=#1683 id=1683 data-nosnippet>1683</a>schedule = { kind = "every", every_ms = 300000 }
+<a href=#1684 id=1684 data-nosnippet>1684</a>        "#</span>;
+<a href=#1685 id=1685 data-nosnippet>1685</a>
+<a href=#1686 id=1686 data-nosnippet>1686</a>        <span class="kw">let </span>parsed: zeroclaw_config::schema::CronConfig = toml::from_str(toml_str).unwrap();
+<a href=#1687 id=1687 data-nosnippet>1687</a>        <span class="macro">assert!</span>(parsed.enabled);
+<a href=#1688 id=1688 data-nosnippet>1688</a>        <span class="macro">assert_eq!</span>(parsed.jobs.len(), <span class="number">2</span>);
+<a href=#1689 id=1689 data-nosnippet>1689</a>
+<a href=#1690 id=1690 data-nosnippet>1690</a>        <span class="macro">assert_eq!</span>(parsed.jobs[<span class="number">0</span>].id, <span class="string">"daily-report"</span>);
+<a href=#1691 id=1691 data-nosnippet>1691</a>        <span class="macro">assert_eq!</span>(parsed.jobs[<span class="number">0</span>].command.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"echo report"</span>));
+<a href=#1692 id=1692 data-nosnippet>1692</a>        <span class="macro">assert!</span>(<span class="macro">matches!</span>(
+<a href=#1693 id=1693 data-nosnippet>1693</a>            parsed.jobs[<span class="number">0</span>].schedule,
+<a href=#1694 id=1694 data-nosnippet>1694</a>            zeroclaw_config::schema::CronScheduleDecl::Cron { <span class="kw-2">ref </span>expr, .. } <span class="kw">if </span>expr == <span class="string">"0 9 * * *"
+<a href=#1695 id=1695 data-nosnippet>1695</a>        </span>));
+<a href=#1696 id=1696 data-nosnippet>1696</a>
+<a href=#1697 id=1697 data-nosnippet>1697</a>        <span class="macro">assert_eq!</span>(parsed.jobs[<span class="number">1</span>].id, <span class="string">"health-check"</span>);
+<a href=#1698 id=1698 data-nosnippet>1698</a>        <span class="macro">assert_eq!</span>(parsed.jobs[<span class="number">1</span>].job_type, <span class="string">"agent"</span>);
+<a href=#1699 id=1699 data-nosnippet>1699</a>        <span class="macro">assert_eq!</span>(
+<a href=#1700 id=1700 data-nosnippet>1700</a>            parsed.jobs[<span class="number">1</span>].prompt.as_deref(),
+<a href=#1701 id=1701 data-nosnippet>1701</a>            <span class="prelude-val">Some</span>(<span class="string">"Check server health"</span>)
+<a href=#1702 id=1702 data-nosnippet>1702</a>        );
+<a href=#1703 id=1703 data-nosnippet>1703</a>        <span class="macro">assert!</span>(<span class="macro">matches!</span>(
+<a href=#1704 id=1704 data-nosnippet>1704</a>            parsed.jobs[<span class="number">1</span>].schedule,
+<a href=#1705 id=1705 data-nosnippet>1705</a>            zeroclaw_config::schema::CronScheduleDecl::Every { every_ms: <span class="number">300_000 </span>}
+<a href=#1706 id=1706 data-nosnippet>1706</a>        ));
+<a href=#1707 id=1707 data-nosnippet>1707</a>    }
+<a href=#1708 id=1708 data-nosnippet>1708</a>}
+</code></pre></div></section></main></body></html>

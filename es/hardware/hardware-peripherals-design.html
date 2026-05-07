@@ -1,0 +1,517 @@
+<!DOCTYPE HTML>
+<html lang="es" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Diseño de periféricos - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-8cdc8f66.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-a1a0ea85.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/hardware/hardware-peripherals-design.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="diseño-de-periféricos-de-hardware--zeroclaw"><a class="header" href="#diseño-de-periféricos-de-hardware--zeroclaw">Diseño de Periféricos de Hardware — ZeroClaw</a></h1>
+<p>ZeroClaw permite que los microcontroladores (MCUs) y las computadoras de placa única (SBC) <strong>interpreten dinámicamente comandos en lenguaje natural</strong>, generen código específico del hardware y ejecuten interacciones con periféricos en tiempo real.</p>
+<h2 id="1-visión"><a class="header" href="#1-visión">1. Visión</a></h2>
+<p><strong>Objetivo:</strong> ZeroClaw actúa como un agente de IA consciente del hardware que:</p>
+<ul>
+<li>Recibe activadores en lenguaje natural (por ejemplo, “Mover el brazo X”, “Encender el LED”) a través de canales (WhatsApp, Telegram).</li>
+<li>Obtiene documentación precisa del hardware (datasheets, mapas de registros)</li>
+<li>Sintetiza código/lógica en Rust utilizando un modelo de lenguaje grande (LLM) (Gemini, modelos de código abierto locales)</li>
+<li>Ejecuta la lógica para manipular periféricos (GPIO, I2C, SPI)</li>
+<li>Persiste el código optimizado para su reutilización futura</li>
+</ul>
+<p><strong>Modelo mental:</strong> ZeroClaw = cerebro que comprende el hardware. Los periféricos = brazos y piernas que controla.</p>
+<h2 id="2-dos-modos-de-operación"><a class="header" href="#2-dos-modos-de-operación">2. Dos modos de operación</a></h2>
+<h3 id="modo-1-edge-native-autónomo"><a class="header" href="#modo-1-edge-native-autónomo">Modo 1: Edge-Native (Autónomo)</a></h3>
+<p><strong>Objetivo:</strong> Placas con Wi-Fi (ESP32, Raspberry Pi).</p>
+<p>ZeroClaw se ejecuta <strong>directamente en el dispositivo</strong>. La placa inicia un servidor gRPC/nanoRPC y se comunica con los periféricos de forma local.</p>
+<pre><code>┌─────────────────────────────────────────────────────────────────────────────┐
+│  ZeroClaw on ESP32 / Raspberry Pi (Edge-Native)                             │
+│                                                                             │
+│  ┌─────────────┐    ┌──────────────┐    ┌─────────────────────────────────┐ │
+│  │ Channels    │───►│ Agent Loop   │───►│ RAG: datasheets, register maps  │ │
+│  │ WhatsApp    │    │ (LLM calls)  │    │ → LLM context                    │ │
+│  │ Telegram    │    └──────┬───────┘    └─────────────────────────────────┘ │
+│  └─────────────┘           │                                                 │
+│                            ▼                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │ Code synthesis → Wasm / dynamic exec → GPIO / I2C / SPI → persist       ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                             │
+│  gRPC/nanoRPC server ◄──► Peripherals (GPIO, I2C, SPI, sensors, actuators)  │
+└─────────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p><strong>Flujo de trabajo:</strong></p>
+<ol>
+<li>“Enciende el LED en el pin 13”</li>
+<li>ZeroClaw obtiene documentación específica de la placa (por ejemplo, el mapeo de GPIO de ESP32).</li>
+<li>LLM sintetiza código en Rust</li>
+<li>El código se ejecuta en un entorno aislado (Wasm o enlace dinámico)</li>
+<li>El GPIO se alterna; el resultado se devuelve al usuario</li>
+<li>El código optimizado se guarda para futuras solicitudes de “Encender LED”.</li>
+</ol>
+<p><strong>Todo ocurre en el dispositivo.</strong> No se requiere un host.</p>
+<h3 id="modo-2-mediado-por-el-host-desarrollo--depuración"><a class="header" href="#modo-2-mediado-por-el-host-desarrollo--depuración">Modo 2: Mediado por el host (Desarrollo / Depuración)</a></h3>
+<p><strong>Objetivo:</strong> Hardware conectado a un host (macOS, Linux) mediante USB / J-Link / Aardvark.</p>
+<p>ZeroClaw se ejecuta en el <strong>host</strong> y mantiene un enlace consciente del hardware con el objetivo. Se utiliza para desarrollo, introspección y flasheo.</p>
+<pre><code>┌─────────────────────┐                    ┌──────────────────────────────────┐
+│  ZeroClaw on Mac    │   USB / J-Link /   │  STM32 Nucleo-F401RE              │
+│                     │   Aardvark         │  (or other MCU)                    │
+│  - Channels         │ ◄────────────────► │  - Memory map                     │
+│  - LLM              │                    │  - Peripherals (GPIO, ADC, I2C)    │
+│  - Hardware probe   │   VID/PID          │  - Flash / RAM                     │
+│  - Flash / debug    │   discovery        │                                    │
+└─────────────────────┘                    └──────────────────────────────────┘
+</code></pre>
+<p><strong>Flujo de trabajo:</strong></p>
+<ol>
+<li>¿Cuáles son las direcciones de memoria legibles en este dispositivo USB?</li>
+<li>ZeroClaw identifica el hardware conectado (VID/PID, arquitectura)</li>
+<li>Realiza el mapeo de memoria; sugiere los espacios de direcciones disponibles</li>
+<li>Devuelve el resultado al usuario</li>
+</ol>
+<p><strong>O:</strong></p>
+<ol>
+<li>Flash this firmware to the Nucleo</li>
+<li>ZeroClaw escribe/flasha mediante OpenOCD o probe-rs</li>
+<li>Confirma el éxito</li>
+</ol>
+<p><strong>O:</strong></p>
+<ol>
+<li>ZeroClaw descubre automáticamente: <em>“STM32 Nucleo en /dev/ttyACM0, ARM Cortex-M4”</em></li>
+<li>Sugerencias: <em>“Puedo leer/escribir GPIO, ADC, flash. ¿Qué te gustaría hacer?”</em></li>
+</ol>
+<hr>
+<h3 id="comparación-de-modos"><a class="header" href="#comparación-de-modos">Comparación de modos</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Aspecto</th><th>Nativo de la nube</th><th>Mediado por el host</th></tr>
+</thead>
+<tbody>
+<tr><td>ZeroClaw se ejecuta en</td><td>Dispositivo (ESP32, RPi)</td><td>Host (Mac, Linux)</td></tr>
+<tr><td>Enlace de hardware</td><td>Local (GPIO, I2C, SPI)</td><td>USB, J-Link, Aardvark</td></tr>
+<tr><td>LLM</td><td>En el dispositivo o en la nube (Gemini)</td><td>Host (en la nube o local)</td></tr>
+<tr><td>Caso de uso</td><td>Producción, independiente</td><td>Desarrollo, depuración, introspección</td></tr>
+<tr><td>Canales</td><td>WhatsApp, etc. (vía WiFi)</td><td>Telegram, CLI, etc.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="3-modos-heredados--más-simples-antes-de-llm-en-el-borde"><a class="header" href="#3-modos-heredados--más-simples-antes-de-llm-en-el-borde">3. Modos heredados / más simples (antes de LLM en el borde)</a></h2>
+<p>Para placas sin WiFi o antes de que Edge-Native esté completamente listo:</p>
+<h3 id="modo-a-host--periférico-remoto-stm32-a-través-de-serie"><a class="header" href="#modo-a-host--periférico-remoto-stm32-a-través-de-serie">Modo A: Host + Periférico Remoto (STM32 a través de serie)</a></h3>
+<p>El host ejecuta ZeroClaw; el periférico ejecuta un firmware mínimo. JSON simple a través de serial.</p>
+<h3 id="modo-b-rpi-como-host-gpio-nativo"><a class="header" href="#modo-b-rpi-como-host-gpio-nativo">Modo B: RPi como host (GPIO nativo)</a></h3>
+<p>ZeroClaw en Pi; GPIO mediante rppal o sysfs. Sin firmware separado.</p>
+<h2 id="4-requisitos-técnicos"><a class="header" href="#4-requisitos-técnicos">4. Requisitos técnicos</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Requisito</th><th>Descripción</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Idioma</strong></td><td>Rust puro. <code>no_std</code> donde sea aplicable para objetivos embebidos (STM32, ESP32).</td></tr>
+<tr><td><strong>Comunicación</strong></td><td>Pila gRPC o nanoRPC ligera para el procesamiento de comandos de baja latencia.</td></tr>
+<tr><td><strong>Ejecución dinámica</strong></td><td>Ejecuta de forma segura la lógica generada por LLM en tiempo real: entorno de ejecución Wasm para el aislamiento, o vinculación dinámica donde sea compatible.</td></tr>
+<tr><td><strong>Recuperación de documentación</strong></td><td>Pipeline de RAG (Generación Aumentada por Recuperación) para alimentar fragmentos de hojas de datos, mapas de registros y diagramas de pines en el contexto del LLM.</td></tr>
+<tr><td><strong>Descubrimiento de hardware</strong></td><td>Identificación basada en VID/PID para dispositivos USB; detección de arquitectura (ARM Cortex-M, RISC-V, etc.).</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="pipeline-de-rag-recuperación-de-datasheets"><a class="header" href="#pipeline-de-rag-recuperación-de-datasheets">Pipeline de RAG (Recuperación de Datasheets)</a></h3>
+<ul>
+<li><strong>Índice:</strong> Hojas de datos, manuales de referencia, mapas de registros (PDF → fragmentos, incrustaciones).</li>
+<li><strong>Recuperar:</strong> En la consulta del usuario (“activar LED”), obtener fragmentos relevantes (por ejemplo, la sección de GPIO para la placa objetivo).</li>
+<li><strong>Inyectar:</strong> Agregar al prompt o contexto del sistema de LLM.</li>
+<li><strong>Resultado:</strong> El LLM genera código preciso y específico para la placa.</li>
+</ul>
+<h3 id="opciones-de-ejecución-dinámica"><a class="header" href="#opciones-de-ejecución-dinámica">Opciones de ejecución dinámica</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Opción</th><th>Ventajas</th><th>Contras</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Wasm</strong></td><td>Aislado, portátil, sin FFI</td><td>Carga adicional; acceso limitado al hardware desde Wasm</td></tr>
+<tr><td><strong>Enlace dinámico</strong></td><td>Velocidad nativa, acceso completo al hardware</td><td>Específico de la plataforma; preocupaciones de seguridad</td></tr>
+<tr><td><strong>DSL interpretado</strong></td><td>Seguro, auditable</td><td>Más lento; expresividad limitada</td></tr>
+<tr><td><strong>Plantillas precompiladas</strong></td><td>Rápido y seguro</td><td>Menos flexible; requiere una biblioteca de plantillas</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Recomendación:</strong> Comienza con plantillas precompiladas y parametrización; evoluciona a Wasm para la lógica definida por el usuario una vez que sea estable.</p>
+<h2 id="5-cli-y-configuración"><a class="header" href="#5-cli-y-configuración">5. CLI y Configuración</a></h2>
+<p>Consulta la <a href="../reference/cli.html">referencia de CLI</a> para los subcomandos <code>zeroclaw hardware</code> / <code>zeroclaw peripheral</code> y la <a href="../reference/config.html">referencia de configuración</a> para los campos <code>[peripherals]</code> y <code>[[peripherals.boards]]</code>.</p>
+<h2 id="6-arquitectura-periférico-como-punto-de-extensión"><a class="header" href="#6-arquitectura-periférico-como-punto-de-extensión">6. Arquitectura: Periférico como punto de extensión</a></h2>
+<h3 id="nuevo-rasgo-peripheral"><a class="header" href="#nuevo-rasgo-peripheral">Nuevo rasgo: <code>Peripheral</code></a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>/// Un periférico de hardware que expone capacidades como herramientas.
+#[async_trait]
+pub trait Peripheral: Send + Sync {
+    fn name(&amp;self) -&gt; &amp;str;
+    fn board_type(&amp;self) -&gt; &amp;str;  // por ejemplo, "nucleo-f401re", "rpi-gpio"
+    async fn connect(&amp;mut self) -&gt; anyhow::Result&lt;()&gt;;
+    async fn disconnect(&amp;mut self) -&gt; anyhow::Result&lt;()&gt;;
+    async fn health_check(&amp;self) -&gt; bool;
+    /// Herramientas que proporciona este periférico (gpio_read, gpio_write, sensor_read, etc.)
+    fn tools(&amp;self) -&gt; Vec&lt;Box&lt;dyn Tool&gt;&gt;;
+}
+<span class="boring">}</span></code></pre>
+<h3 id="flujo"><a class="header" href="#flujo">Flujo</a></h3>
+<ol>
+<li><strong>Inicio:</strong> ZeroClaw carga la configuración y detecta <code>peripherals.boards</code>.</li>
+<li><strong>Conectar:</strong> Para cada placa, crea una implementación de <code>Peripheral</code> y llama a <code>connect()</code>.</li>
+<li><strong>Herramientas:</strong> Recopilar herramientas de todos los periféricos conectados; fusionar con las herramientas predeterminadas.</li>
+<li><strong>Bucle del agente:</strong> El agente puede llamar a <code>gpio_write</code>, <code>sensor_read</code>, etc., que delegan en el periférico.</li>
+<li><strong>Apagado:</strong> Llama a <code>disconnect()</code> en cada periférico.</li>
+</ol>
+<h3 id="soporte-de-placa"><a class="header" href="#soporte-de-placa">Soporte de placa</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Tablero</th><th>Transporte</th><th>Firmware / Controlador</th><th>Herramientas</th></tr>
+</thead>
+<tbody>
+<tr><td>nucleo-f401re</td><td>serial</td><td>Zephyr / Embassy</td><td>gpio_read, gpio_write, adc_read</td></tr>
+<tr><td>rpi-gpio</td><td>nativo</td><td>rppal o sysfs</td><td>gpio_read, gpio_write</td></tr>
+<tr><td>esp32</td><td>serial/ws</td><td>ESP-IDF / Embassy</td><td>gpio, wifi, mqtt</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="7-protocolos-de-comunicación"><a class="header" href="#7-protocolos-de-comunicación">7. Protocolos de comunicación</a></h2>
+<h3 id="grpc--nanorpc-nativo-para-el-borde-mediado-por-el-host"><a class="header" href="#grpc--nanorpc-nativo-para-el-borde-mediado-por-el-host">gRPC / nanoRPC (Nativo para el borde, Mediado por el host)</a></h3>
+<p>Para RPC tipado y de baja latencia entre ZeroClaw y periféricos:</p>
+<ul>
+<li><strong>nanoRPC</strong> o <strong>tonic</strong> (gRPC): Servicios definidos mediante Protobuf.</li>
+<li>Métodos: <code>GpioWrite</code>, <code>GpioRead</code>, <code>I2cTransfer</code>, <code>SpiTransfer</code>, <code>MemoryRead</code>, <code>FlashWrite</code>, etc.</li>
+<li>Habilita las llamadas bidireccionales en streaming y la generación de código a partir de archivos <code>.proto</code>.</li>
+</ul>
+<h3 id="fallback-en-serie-host-mediated-legacy"><a class="header" href="#fallback-en-serie-host-mediated-legacy">Fallback en serie (Host-Mediated, legacy)</a></h3>
+<p>JSON simple sobre serie para placas sin soporte de gRPC:</p>
+<p><strong>Solicitud (host → periférico):</strong></p>
+<pre><code class="language-json">{"id":"1","cmd":`gpio_write`,"args":{"pin":13,"valor":1}}
+</code></pre>
+<p><strong>Respuesta (periférico → host):</strong></p>
+<pre><code class="language-json">{"id":"1","ok":true,"resultado":"hecho"}
+</code></pre>
+<h2 id="8-firmware-repositorio-o-crate-separado"><a class="header" href="#8-firmware-repositorio-o-crate-separado">8. Firmware (Repositorio o Crate separado)</a></h2>
+<ul>
+<li><strong>zeroclaw-firmware</strong> o <strong>zeroclaw-peripheral</strong> — un crate/espacio de trabajo separado.</li>
+<li>Objetivos: <code>thumbv7em-none-eabihf</code> (STM32), <code>armv7-unknown-linux-gnueabihf</code> (RPi), etc.</li>
+<li>Utiliza <code>embassy</code> o Zephyr para STM32.</li>
+<li>Implementa el protocolo anterior.</li>
+<li>El usuario flashea esto en la placa; ZeroClaw se conecta y descubre las capacidades.</li>
+</ul>
+<h2 id="9-fases-de-implementación"><a class="header" href="#9-fases-de-implementación">9. Fases de implementación</a></h2>
+<h3 id="fase-1-esqueleto--completado"><a class="header" href="#fase-1-esqueleto--completado">Fase 1: Esqueleto ✅ (Completado)</a></h3>
+<ul>
+<li><input disabled="" type="checkbox" checked=""> Añade el rasgo <code>Peripheral</code>, el esquema de configuración y la CLI (<code>zeroclaw peripheral list/add</code>)</li>
+<li><input disabled="" type="checkbox" checked=""> Agrega la bandera <code>--peripheral</code> al agente</li>
+<li><input disabled="" type="checkbox" checked=""> Documentar en AGENTS.md</li>
+</ul>
+<h3 id="fase-2-mediada-por-el-host--descubrimiento-de-hardware--completado"><a class="header" href="#fase-2-mediada-por-el-host--descubrimiento-de-hardware--completado">Fase 2: Mediada por el host — Descubrimiento de hardware ✅ (Completado)</a></h3>
+<ul>
+<li><input disabled="" type="checkbox" checked=""> <code>zeroclaw hardware discover</code>: enumerar dispositivos USB (VID/PID)</li>
+<li><input disabled="" type="checkbox" checked=""> Registro de placas: mapa VID/PID → arquitectura, nombre (por ejemplo, Nucleo-F401RE)</li>
+<li><input disabled="" type="checkbox" checked=""> <code>zeroclaw hardware introspect &lt;path&gt;</code>: mapa de memoria, lista de periféricos</li>
+</ul>
+<h3 id="fase-3-mediada-por-el-host--serie--j-link"><a class="header" href="#fase-3-mediada-por-el-host--serie--j-link">Fase 3: Mediada por el host — Serie / J-Link</a></h3>
+<ul>
+<li><input disabled="" type="checkbox" checked=""> <code>SerialPeripheral</code> para STM32 a través de USB CDC</li>
+<li><input disabled="" type="checkbox"> Integración de probe-rs o OpenOCD para flash/debug</li>
+<li><input disabled="" type="checkbox" checked=""> Herramientas: <code>gpio_read</code>, <code>gpio_write</code> (memory_read, flash_write en el futuro)</li>
+</ul>
+<h3 id="fase-4-pipeline-rag--completado"><a class="header" href="#fase-4-pipeline-rag--completado">Fase 4: Pipeline RAG ✅ (Completado)</a></h3>
+<ul>
+<li><input disabled="" type="checkbox" checked=""> Índice de hojas de datos (markdown/texto → fragmentos)</li>
+<li><input disabled="" type="checkbox" checked=""> Recuperar e inyectar en el contexto del LLM para consultas relacionadas con el hardware</li>
+<li><input disabled="" type="checkbox" checked=""> Aumento específico del tablero</li>
+</ul>
+<p><strong>Uso:</strong> <code>zeroclaw config set peripherals.datasheet-dir docs/datasheets</code>. Coloca archivos <code>.md</code> o <code>.txt</code> nombrados según la placa (por ejemplo, <code>nucleo-f401re.md</code>, <code>rpi-gpio.md</code>). Los archivos en <code>_generic/</code> o nombrados <code>generic.md</code> se aplican a todas las placas. Los fragmentos se recuperan mediante coincidencia de palabras clave y se inyectan en el contexto del mensaje del usuario.</p>
+<h3 id="fase-5-edge-native--rpi--completado"><a class="header" href="#fase-5-edge-native--rpi--completado">Fase 5: Edge-Native — RPi ✅ (Completado)</a></h3>
+<ul>
+<li><input disabled="" type="checkbox" checked=""> ZeroClaw en Raspberry Pi (GPIO nativo a través de rppal)</li>
+<li><input disabled="" type="checkbox"> Servidor gRPC/nanoRPC para acceso local a periféricos</li>
+<li><input disabled="" type="checkbox"> Persistencia de código (almacenar fragmentos sintetizados)</li>
+</ul>
+<h3 id="fase-6-edge-native--esp32"><a class="header" href="#fase-6-edge-native--esp32">Fase 6: Edge-Native — ESP32</a></h3>
+<ul>
+<li><input disabled="" type="checkbox" checked=""> ESP32 mediado por el host (transporte serial) — mismo protocolo JSON que STM32</li>
+<li><input disabled="" type="checkbox" checked=""> crate de firmware <code>esp32</code> (<code>firmware/esp32</code>) — GPIO sobre UART</li>
+<li><input disabled="" type="checkbox" checked=""> ESP32 en el registro de hardware (CH340 VID/PID)</li>
+<li><input disabled="" type="checkbox"> ZeroClaw <em>en</em> ESP32 (WiFi + LLM, nativo en el borde) — futuro</li>
+<li><input disabled="" type="checkbox"> Ejecución basada en Wasm o plantillas para la lógica generada por LLM</li>
+</ul>
+<p><strong>Uso:</strong> Flash <code>firmware/esp32</code> en ESP32, añade <code>board = "esp32"</code>, <code>transport = "serial"</code>, <code>path = "/dev/ttyUSB0"</code> a la configuración.</p>
+<h3 id="fase-7-ejecución-dinámica-código-generado-por-llm"><a class="header" href="#fase-7-ejecución-dinámica-código-generado-por-llm">Fase 7: Ejecución dinámica (código generado por LLM)</a></h3>
+<ul>
+<li><input disabled="" type="checkbox"> Biblioteca de plantillas: fragmentos de GPIO/I2C/SPI parametrizados</li>
+<li><input disabled="" type="checkbox"> Opcional: Entorno de ejecución Wasm para lógica definida por el usuario (en un entorno aislado)</li>
+<li><input disabled="" type="checkbox"> Persistir y reutilizar rutas de código optimizadas</li>
+</ul>
+<h2 id="10-consideraciones-de-seguridad"><a class="header" href="#10-consideraciones-de-seguridad">10. Consideraciones de seguridad</a></h2>
+<ul>
+<li><strong>Ruta serial:</strong> Valida que <code>path</code> esté en la lista permitida (por ejemplo, <code>/dev/ttyACM*</code>, <code>/dev/ttyUSB*</code>); nunca rutas arbitrarias.</li>
+<li><strong>GPIO:</strong> Restringir los pines que se exponen; evitar los pines de alimentación y de reinicio.</li>
+<li><strong>Sin secretos en el periférico:</strong> El firmware no debe almacenar claves API; el host gestiona la autenticación.</li>
+</ul>
+<h2 id="11-objetivos-no-contemplados-por-ahora"><a class="header" href="#11-objetivos-no-contemplados-por-ahora">11. Objetivos no contemplados (por ahora)</a></h2>
+<ul>
+<li>Ejecutar ZeroClaw completo <em>en</em> STM32 sin interfaz (sin WiFi, RAM limitada) — en su lugar, utiliza Host-Mediated.</li>
+<li>Garantías en tiempo real — los periféricos son de mejor esfuerzo</li>
+<li>Ejecución arbitraria de código nativo desde LLM: preferir Wasm o plantillas</li>
+</ul>
+<h2 id="12-documentos-relacionados"><a class="header" href="#12-documentos-relacionados">12. Documentos relacionados</a></h2>
+<ul>
+<li><a href="adding-boards-and-tools.html">adding-boards-and-tools.md</a> — Cómo agregar placas y hojas de datos</li>
+<li><a href="../ops/network-deployment.html">network-deployment.md</a> — Despliegue de red y RPi</li>
+</ul>
+<h2 id="13-referencias"><a class="header" href="#13-referencias">13. Referencias</a></h2>
+<ul>
+<li><a href="https://docs.zephyrproject.org/latest/develop/languages/rust/index.html">Soporte de Rust para Zephyr RTOS</a></li>
+<li><a href="https://embassy.dev/">Embassy</a> — marco de trabajo asíncrono para sistemas embebidos</li>
+<li><a href="https://github.com/golemparts/rppal">rppal</a> — GPIO de Raspberry Pi en Rust</li>
+<li><a href="https://www.st.com/en/evaluation-tools/nucleo-f401re.html">STM32 Nucleo-F401RE</a></li>
+<li><a href="https://github.com/hyperium/tonic">tonic</a> — gRPC para Rust</li>
+<li><a href="https://probe.rs/">probe-rs</a> — depurador ARM, flash, acceso a memoria</li>
+<li><a href="https://github.com/nic-hartley/nusb">nusb</a> — Enumeración de dispositivos USB (VID/PID)</li>
+</ul>
+<h2 id="14-resumen-del-prompt-en-crudo"><a class="header" href="#14-resumen-del-prompt-en-crudo">14. Resumen del Prompt en crudo</a></h2>
+<blockquote>
+<p><em>“Placas como ESP, Raspberry Pi o placas con WiFi pueden conectarse a un LLM (Gemini o de código abierto). ZeroClaw se ejecuta en el dispositivo, crea su propio gRPC, lo inicia y se comunica con los periféricos. El usuario pregunta a través de WhatsApp: ‘mueve el brazo X’ o ‘enciende el LED’. ZeroClaw obtiene documentación precisa, escribe el código, lo ejecuta, lo almacena de manera óptima, lo ejecuta y enciende el LED, todo en la placa de desarrollo.”</em></p>
+<p>Para un STM Nucleo conectado a mi Mac mediante USB/J-Link/Aardvark: ZeroClaw, desde mi Mac, accede al hardware, instala o escribe lo que considere necesario en el dispositivo y devuelve el resultado. Ejemplo: ‘Oye ZeroClaw, ¿cuáles son las direcciones disponibles/legibles en este dispositivo USB?’ Puede determinar qué está conectado en cada lugar y hacer sugerencias.</p>
+</blockquote>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../hardware/adding-boards-and-tools.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../hardware/arduino-uno-q-setup.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../hardware/adding-boards-and-tools.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../hardware/arduino-uno-q-setup.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

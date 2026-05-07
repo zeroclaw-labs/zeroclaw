@@ -1,0 +1,756 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `crates/zeroclaw-runtime/src/sop/dispatch.rs`."><title>dispatch.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-b7b9f40b.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="zeroclaw_runtime" data-themes="" data-resource-suffix="" data-rustdoc-version="1.95.0 (59807616e 2026-04-14)" data-channel="1.95.0" data-search-js="search-63369b7b.js" data-stringdex-js="stringdex-b897f86f.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../static.files/src-script-813739b1.js"></script><script defer src="../../../src-files.js"></script><script defer src="../../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">zeroclaw_runtime/sop/</div>dispatch.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! Unified SOP event dispatch helpers.
+<a href=#2 id=2 data-nosnippet>2</a>//!
+<a href=#3 id=3 data-nosnippet>3</a>//! All event sources (MQTT, webhook, cron, peripheral) route through
+<a href=#4 id=4 data-nosnippet>4</a>//! `dispatch_sop_event` so that locking, audit, and health bookkeeping
+<a href=#5 id=5 data-nosnippet>5</a>//! happen in exactly one place.
+<a href=#6 id=6 data-nosnippet>6</a>
+<a href=#7 id=7 data-nosnippet>7</a></span><span class="kw">use </span>std::sync::{Arc, Mutex};
+<a href=#8 id=8 data-nosnippet>8</a>
+<a href=#9 id=9 data-nosnippet>9</a><span class="kw">use </span>tracing::{debug, info, warn};
+<a href=#10 id=10 data-nosnippet>10</a>
+<a href=#11 id=11 data-nosnippet>11</a><span class="kw">use </span><span class="kw">super</span>::audit::SopAuditLogger;
+<a href=#12 id=12 data-nosnippet>12</a><span class="kw">use </span><span class="kw">super</span>::engine::{SopEngine, now_iso8601};
+<a href=#13 id=13 data-nosnippet>13</a><span class="kw">use </span><span class="kw">super</span>::types::{SopEvent, SopRun, SopRunAction, SopTriggerSource};
+<a href=#14 id=14 data-nosnippet>14</a>
+<a href=#15 id=15 data-nosnippet>15</a><span class="comment">// ── Dispatch result ─────────────────────────────────────────────
+<a href=#16 id=16 data-nosnippet>16</a>
+<a href=#17 id=17 data-nosnippet>17</a></span><span class="doccomment">/// Outcome of attempting to dispatch an event to the SOP engine.
+<a href=#18 id=18 data-nosnippet>18</a></span><span class="attr">#[derive(Debug, Clone)]
+<a href=#19 id=19 data-nosnippet>19</a></span><span class="kw">pub enum </span>DispatchResult {
+<a href=#20 id=20 data-nosnippet>20</a>    <span class="doccomment">/// A new SOP run was started. `action` carries the next step the runtime
+<a href=#21 id=21 data-nosnippet>21</a>    /// must execute (or wait for approval on). Callers that cannot act on the
+<a href=#22 id=22 data-nosnippet>22</a>    /// action (e.g. headless fan-in) must still audit/log it — never silently
+<a href=#23 id=23 data-nosnippet>23</a>    /// drop.
+<a href=#24 id=24 data-nosnippet>24</a>    </span>Started {
+<a href=#25 id=25 data-nosnippet>25</a>        run_id: String,
+<a href=#26 id=26 data-nosnippet>26</a>        sop_name: String,
+<a href=#27 id=27 data-nosnippet>27</a>        action: Box&lt;SopRunAction&gt;,
+<a href=#28 id=28 data-nosnippet>28</a>    },
+<a href=#29 id=29 data-nosnippet>29</a>    <span class="doccomment">/// A matching SOP was found but could not start (cooldown / concurrency).
+<a href=#30 id=30 data-nosnippet>30</a>    </span>Skipped { sop_name: String, reason: String },
+<a href=#31 id=31 data-nosnippet>31</a>    <span class="doccomment">/// No loaded SOP matched the event.
+<a href=#32 id=32 data-nosnippet>32</a>    </span>NoMatch,
+<a href=#33 id=33 data-nosnippet>33</a>}
+<a href=#34 id=34 data-nosnippet>34</a>
+<a href=#35 id=35 data-nosnippet>35</a><span class="comment">// ── Action helpers ──────────────────────────────────────────────
+<a href=#36 id=36 data-nosnippet>36</a>
+<a href=#37 id=37 data-nosnippet>37</a></span><span class="doccomment">/// Extract the `run_id` from any `SopRunAction` variant.
+<a href=#38 id=38 data-nosnippet>38</a></span><span class="kw">fn </span>extract_run_id_from_action(action: <span class="kw-2">&amp;</span>SopRunAction) -&gt; <span class="kw-2">&amp;</span>str {
+<a href=#39 id=39 data-nosnippet>39</a>    <span class="kw">match </span>action {
+<a href=#40 id=40 data-nosnippet>40</a>        SopRunAction::ExecuteStep { run_id, .. }
+<a href=#41 id=41 data-nosnippet>41</a>        | SopRunAction::WaitApproval { run_id, .. }
+<a href=#42 id=42 data-nosnippet>42</a>        | SopRunAction::DeterministicStep { run_id, .. }
+<a href=#43 id=43 data-nosnippet>43</a>        | SopRunAction::CheckpointWait { run_id, .. }
+<a href=#44 id=44 data-nosnippet>44</a>        | SopRunAction::Completed { run_id, .. }
+<a href=#45 id=45 data-nosnippet>45</a>        | SopRunAction::Failed { run_id, .. } =&gt; run_id,
+<a href=#46 id=46 data-nosnippet>46</a>    }
+<a href=#47 id=47 data-nosnippet>47</a>}
+<a href=#48 id=48 data-nosnippet>48</a>
+<a href=#49 id=49 data-nosnippet>49</a><span class="doccomment">/// Short label for logging which action was returned.
+<a href=#50 id=50 data-nosnippet>50</a></span><span class="kw">fn </span>action_label(action: <span class="kw-2">&amp;</span>SopRunAction) -&gt; <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str {
+<a href=#51 id=51 data-nosnippet>51</a>    <span class="kw">match </span>action {
+<a href=#52 id=52 data-nosnippet>52</a>        SopRunAction::ExecuteStep { .. } =&gt; <span class="string">"ExecuteStep"</span>,
+<a href=#53 id=53 data-nosnippet>53</a>        SopRunAction::WaitApproval { .. } =&gt; <span class="string">"WaitApproval"</span>,
+<a href=#54 id=54 data-nosnippet>54</a>        SopRunAction::DeterministicStep { .. } =&gt; <span class="string">"DeterministicStep"</span>,
+<a href=#55 id=55 data-nosnippet>55</a>        SopRunAction::CheckpointWait { .. } =&gt; <span class="string">"CheckpointWait"</span>,
+<a href=#56 id=56 data-nosnippet>56</a>        SopRunAction::Completed { .. } =&gt; <span class="string">"Completed"</span>,
+<a href=#57 id=57 data-nosnippet>57</a>        SopRunAction::Failed { .. } =&gt; <span class="string">"Failed"</span>,
+<a href=#58 id=58 data-nosnippet>58</a>    }
+<a href=#59 id=59 data-nosnippet>59</a>}
+<a href=#60 id=60 data-nosnippet>60</a>
+<a href=#61 id=61 data-nosnippet>61</a><span class="comment">// ── Core dispatch ───────────────────────────────────────────────
+<a href=#62 id=62 data-nosnippet>62</a>
+<a href=#63 id=63 data-nosnippet>63</a></span><span class="doccomment">/// Dispatch an incoming event to the SOP engine.
+<a href=#64 id=64 data-nosnippet>64</a>///
+<a href=#65 id=65 data-nosnippet>65</a>/// Pattern (batch lock — exactly 2 acquisitions):
+<a href=#66 id=66 data-nosnippet>66</a>/// 1. Lock → `match_trigger` → collect SOP names → drop lock
+<a href=#67 id=67 data-nosnippet>67</a>/// 2. Lock → for each name: `start_run` → collect results → drop lock
+<a href=#68 id=68 data-nosnippet>68</a>/// 3. Async (no lock): audit each started run
+<a href=#69 id=69 data-nosnippet>69</a></span><span class="kw">pub async fn </span>dispatch_sop_event(
+<a href=#70 id=70 data-nosnippet>70</a>    engine: <span class="kw-2">&amp;</span>Arc&lt;Mutex&lt;SopEngine&gt;&gt;,
+<a href=#71 id=71 data-nosnippet>71</a>    audit: <span class="kw-2">&amp;</span>SopAuditLogger,
+<a href=#72 id=72 data-nosnippet>72</a>    event: SopEvent,
+<a href=#73 id=73 data-nosnippet>73</a>) -&gt; Vec&lt;DispatchResult&gt; {
+<a href=#74 id=74 data-nosnippet>74</a>    <span class="comment">// Phase 1: match
+<a href=#75 id=75 data-nosnippet>75</a>    </span><span class="kw">let </span>matched_names: Vec&lt;String&gt; = <span class="kw">match </span>engine.lock() {
+<a href=#76 id=76 data-nosnippet>76</a>        <span class="prelude-val">Ok</span>(eng) =&gt; eng
+<a href=#77 id=77 data-nosnippet>77</a>            .match_trigger(<span class="kw-2">&amp;</span>event)
+<a href=#78 id=78 data-nosnippet>78</a>            .iter()
+<a href=#79 id=79 data-nosnippet>79</a>            .map(|s| s.name.clone())
+<a href=#80 id=80 data-nosnippet>80</a>            .collect(),
+<a href=#81 id=81 data-nosnippet>81</a>        <span class="prelude-val">Err</span>(e) =&gt; {
+<a href=#82 id=82 data-nosnippet>82</a>            <span class="kw">crate</span>::health::mark_component_error(<span class="string">"sop_dispatch"</span>, <span class="macro">format!</span>(<span class="string">"lock poisoned: {e}"</span>));
+<a href=#83 id=83 data-nosnippet>83</a>            <span class="macro">warn!</span>(<span class="string">"SOP dispatch: engine lock poisoned during match phase: {e}"</span>);
+<a href=#84 id=84 data-nosnippet>84</a>            <span class="kw">return </span><span class="macro">vec!</span>[];
+<a href=#85 id=85 data-nosnippet>85</a>        }
+<a href=#86 id=86 data-nosnippet>86</a>    };
+<a href=#87 id=87 data-nosnippet>87</a>
+<a href=#88 id=88 data-nosnippet>88</a>    <span class="kw">if </span>matched_names.is_empty() {
+<a href=#89 id=89 data-nosnippet>89</a>        <span class="macro">debug!</span>(<span class="string">"SOP dispatch: no match for event"</span>);
+<a href=#90 id=90 data-nosnippet>90</a>        <span class="kw">return </span><span class="macro">vec!</span>[DispatchResult::NoMatch];
+<a href=#91 id=91 data-nosnippet>91</a>    }
+<a href=#92 id=92 data-nosnippet>92</a>
+<a href=#93 id=93 data-nosnippet>93</a>    <span class="macro">info!</span>(
+<a href=#94 id=94 data-nosnippet>94</a>        <span class="string">"SOP dispatch: {} SOP(s) matched: {:?}"</span>,
+<a href=#95 id=95 data-nosnippet>95</a>        matched_names.len(),
+<a href=#96 id=96 data-nosnippet>96</a>        matched_names
+<a href=#97 id=97 data-nosnippet>97</a>    );
+<a href=#98 id=98 data-nosnippet>98</a>
+<a href=#99 id=99 data-nosnippet>99</a>    <span class="comment">// Phase 2: start runs
+<a href=#100 id=100 data-nosnippet>100</a>    </span><span class="kw">let </span><span class="kw-2">mut </span>results = Vec::new();
+<a href=#101 id=101 data-nosnippet>101</a>    <span class="kw">let </span><span class="kw-2">mut </span>started_runs: Vec&lt;SopRun&gt; = Vec::new();
+<a href=#102 id=102 data-nosnippet>102</a>
+<a href=#103 id=103 data-nosnippet>103</a>    {
+<a href=#104 id=104 data-nosnippet>104</a>        <span class="kw">let </span><span class="kw-2">mut </span>eng = <span class="kw">match </span>engine.lock() {
+<a href=#105 id=105 data-nosnippet>105</a>            <span class="prelude-val">Ok</span>(e) =&gt; e,
+<a href=#106 id=106 data-nosnippet>106</a>            <span class="prelude-val">Err</span>(e) =&gt; {
+<a href=#107 id=107 data-nosnippet>107</a>                <span class="kw">crate</span>::health::mark_component_error(<span class="string">"sop_dispatch"</span>, <span class="macro">format!</span>(<span class="string">"lock poisoned: {e}"</span>));
+<a href=#108 id=108 data-nosnippet>108</a>                <span class="macro">warn!</span>(<span class="string">"SOP dispatch: engine lock poisoned during start phase: {e}"</span>);
+<a href=#109 id=109 data-nosnippet>109</a>                <span class="kw">return </span><span class="macro">vec!</span>[];
+<a href=#110 id=110 data-nosnippet>110</a>            }
+<a href=#111 id=111 data-nosnippet>111</a>        };
+<a href=#112 id=112 data-nosnippet>112</a>
+<a href=#113 id=113 data-nosnippet>113</a>        <span class="kw">for </span>sop_name <span class="kw">in </span><span class="kw-2">&amp;</span>matched_names {
+<a href=#114 id=114 data-nosnippet>114</a>            <span class="kw">match </span>eng.start_run(sop_name, event.clone()) {
+<a href=#115 id=115 data-nosnippet>115</a>                <span class="prelude-val">Ok</span>(action) =&gt; {
+<a href=#116 id=116 data-nosnippet>116</a>                    <span class="comment">// Extract run_id from the action (authoritative source)
+<a href=#117 id=117 data-nosnippet>117</a>                    </span><span class="kw">let </span>run_id = extract_run_id_from_action(<span class="kw-2">&amp;</span>action).to_string();
+<a href=#118 id=118 data-nosnippet>118</a>                    <span class="comment">// Snapshot the run for audit (must be done under lock)
+<a href=#119 id=119 data-nosnippet>119</a>                    </span><span class="kw">if let </span><span class="prelude-val">Some</span>(run) = eng.active_runs().get(<span class="kw-2">&amp;</span>run_id) {
+<a href=#120 id=120 data-nosnippet>120</a>                        started_runs.push(run.clone());
+<a href=#121 id=121 data-nosnippet>121</a>                    }
+<a href=#122 id=122 data-nosnippet>122</a>                    <span class="macro">info!</span>(
+<a href=#123 id=123 data-nosnippet>123</a>                        <span class="string">"SOP dispatch: started '{}' run {run_id} (action: {})"</span>,
+<a href=#124 id=124 data-nosnippet>124</a>                        sop_name,
+<a href=#125 id=125 data-nosnippet>125</a>                        action_label(<span class="kw-2">&amp;</span>action),
+<a href=#126 id=126 data-nosnippet>126</a>                    );
+<a href=#127 id=127 data-nosnippet>127</a>                    results.push(DispatchResult::Started {
+<a href=#128 id=128 data-nosnippet>128</a>                        run_id,
+<a href=#129 id=129 data-nosnippet>129</a>                        sop_name: sop_name.clone(),
+<a href=#130 id=130 data-nosnippet>130</a>                        action: Box::new(action),
+<a href=#131 id=131 data-nosnippet>131</a>                    });
+<a href=#132 id=132 data-nosnippet>132</a>                }
+<a href=#133 id=133 data-nosnippet>133</a>                <span class="prelude-val">Err</span>(e) =&gt; {
+<a href=#134 id=134 data-nosnippet>134</a>                    <span class="macro">info!</span>(<span class="string">"SOP dispatch: skipped '{}': {e}"</span>, sop_name);
+<a href=#135 id=135 data-nosnippet>135</a>                    results.push(DispatchResult::Skipped {
+<a href=#136 id=136 data-nosnippet>136</a>                        sop_name: sop_name.clone(),
+<a href=#137 id=137 data-nosnippet>137</a>                        reason: e.to_string(),
+<a href=#138 id=138 data-nosnippet>138</a>                    });
+<a href=#139 id=139 data-nosnippet>139</a>                }
+<a href=#140 id=140 data-nosnippet>140</a>            }
+<a href=#141 id=141 data-nosnippet>141</a>        }
+<a href=#142 id=142 data-nosnippet>142</a>    } <span class="comment">// lock dropped
+<a href=#143 id=143 data-nosnippet>143</a>
+<a href=#144 id=144 data-nosnippet>144</a>    // Phase 3: audit (async, no lock)
+<a href=#145 id=145 data-nosnippet>145</a>    </span><span class="kw">for </span>run <span class="kw">in </span><span class="kw-2">&amp;</span>started_runs {
+<a href=#146 id=146 data-nosnippet>146</a>        <span class="kw">if let </span><span class="prelude-val">Err</span>(e) = audit.log_run_start(run).<span class="kw">await </span>{
+<a href=#147 id=147 data-nosnippet>147</a>            <span class="macro">warn!</span>(<span class="string">"SOP dispatch: audit log failed for run {}: {e}"</span>, run.run_id);
+<a href=#148 id=148 data-nosnippet>148</a>        }
+<a href=#149 id=149 data-nosnippet>149</a>    }
+<a href=#150 id=150 data-nosnippet>150</a>
+<a href=#151 id=151 data-nosnippet>151</a>    <span class="kw">crate</span>::health::mark_component_ok(<span class="string">"sop_dispatch"</span>);
+<a href=#152 id=152 data-nosnippet>152</a>    results
+<a href=#153 id=153 data-nosnippet>153</a>}
+<a href=#154 id=154 data-nosnippet>154</a>
+<a href=#155 id=155 data-nosnippet>155</a><span class="comment">// ── Headless result processing ──────────────────────────────────
+<a href=#156 id=156 data-nosnippet>156</a>
+<a href=#157 id=157 data-nosnippet>157</a></span><span class="doccomment">/// Process dispatch results in headless (non-agent-loop) callers.
+<a href=#158 id=158 data-nosnippet>158</a>///
+<a href=#159 id=159 data-nosnippet>159</a>/// This handles audit and logging for fan-in callers (MQTT, webhook, cron)
+<a href=#160 id=160 data-nosnippet>160</a>/// that cannot execute SOP steps interactively. For `WaitApproval` actions,
+<a href=#161 id=161 data-nosnippet>161</a>/// approval timeout polling in the scheduler handles progression.
+<a href=#162 id=162 data-nosnippet>162</a>/// For `ExecuteStep` actions, the run is started in the engine but steps
+<a href=#163 id=163 data-nosnippet>163</a>/// cannot be executed without an agent loop — this is logged as a warning.
+<a href=#164 id=164 data-nosnippet>164</a></span><span class="kw">pub fn </span>process_headless_results(results: <span class="kw-2">&amp;</span>[DispatchResult]) {
+<a href=#165 id=165 data-nosnippet>165</a>    <span class="kw">for </span>result <span class="kw">in </span>results {
+<a href=#166 id=166 data-nosnippet>166</a>        <span class="kw">match </span>result {
+<a href=#167 id=167 data-nosnippet>167</a>            DispatchResult::Started {
+<a href=#168 id=168 data-nosnippet>168</a>                run_id,
+<a href=#169 id=169 data-nosnippet>169</a>                sop_name,
+<a href=#170 id=170 data-nosnippet>170</a>                action,
+<a href=#171 id=171 data-nosnippet>171</a>            } =&gt; <span class="kw">match </span>action.as_ref() {
+<a href=#172 id=172 data-nosnippet>172</a>                SopRunAction::ExecuteStep { step, .. } =&gt; {
+<a href=#173 id=173 data-nosnippet>173</a>                    <span class="macro">warn!</span>(
+<a href=#174 id=174 data-nosnippet>174</a>                        <span class="string">"SOP headless dispatch: run {run_id} ('{sop_name}') ready for step {} \
+<a href=#175 id=175 data-nosnippet>175</a>                         '{}' but no agent loop available to execute"</span>,
+<a href=#176 id=176 data-nosnippet>176</a>                        step.number, step.title,
+<a href=#177 id=177 data-nosnippet>177</a>                    );
+<a href=#178 id=178 data-nosnippet>178</a>                }
+<a href=#179 id=179 data-nosnippet>179</a>                SopRunAction::WaitApproval { step, .. } =&gt; {
+<a href=#180 id=180 data-nosnippet>180</a>                    <span class="macro">info!</span>(
+<a href=#181 id=181 data-nosnippet>181</a>                        <span class="string">"SOP headless dispatch: run {run_id} ('{sop_name}') waiting for approval \
+<a href=#182 id=182 data-nosnippet>182</a>                         on step {} '{}'. Timeout polling will handle progression"</span>,
+<a href=#183 id=183 data-nosnippet>183</a>                        step.number, step.title,
+<a href=#184 id=184 data-nosnippet>184</a>                    );
+<a href=#185 id=185 data-nosnippet>185</a>                }
+<a href=#186 id=186 data-nosnippet>186</a>                SopRunAction::DeterministicStep { step, .. } =&gt; {
+<a href=#187 id=187 data-nosnippet>187</a>                    <span class="macro">info!</span>(
+<a href=#188 id=188 data-nosnippet>188</a>                        <span class="string">"SOP headless dispatch: run {run_id} ('{sop_name}') deterministic step {} \
+<a href=#189 id=189 data-nosnippet>189</a>                         '{}'"</span>,
+<a href=#190 id=190 data-nosnippet>190</a>                        step.number, step.title,
+<a href=#191 id=191 data-nosnippet>191</a>                    );
+<a href=#192 id=192 data-nosnippet>192</a>                }
+<a href=#193 id=193 data-nosnippet>193</a>                SopRunAction::CheckpointWait {
+<a href=#194 id=194 data-nosnippet>194</a>                    step, state_file, ..
+<a href=#195 id=195 data-nosnippet>195</a>                } =&gt; {
+<a href=#196 id=196 data-nosnippet>196</a>                    <span class="macro">info!</span>(
+<a href=#197 id=197 data-nosnippet>197</a>                        <span class="string">"SOP headless dispatch: run {run_id} ('{sop_name}') checkpoint at step {} \
+<a href=#198 id=198 data-nosnippet>198</a>                         '{}', state persisted to {}"</span>,
+<a href=#199 id=199 data-nosnippet>199</a>                        step.number,
+<a href=#200 id=200 data-nosnippet>200</a>                        step.title,
+<a href=#201 id=201 data-nosnippet>201</a>                        state_file.display(),
+<a href=#202 id=202 data-nosnippet>202</a>                    );
+<a href=#203 id=203 data-nosnippet>203</a>                }
+<a href=#204 id=204 data-nosnippet>204</a>                SopRunAction::Completed { .. } =&gt; {
+<a href=#205 id=205 data-nosnippet>205</a>                    <span class="macro">info!</span>(
+<a href=#206 id=206 data-nosnippet>206</a>                        <span class="string">"SOP headless dispatch: run {run_id} ('{sop_name}') completed immediately"
+<a href=#207 id=207 data-nosnippet>207</a>                    </span>);
+<a href=#208 id=208 data-nosnippet>208</a>                }
+<a href=#209 id=209 data-nosnippet>209</a>                SopRunAction::Failed { reason, .. } =&gt; {
+<a href=#210 id=210 data-nosnippet>210</a>                    <span class="macro">warn!</span>(<span class="string">"SOP headless dispatch: run {run_id} ('{sop_name}') failed: {reason}"</span>);
+<a href=#211 id=211 data-nosnippet>211</a>                }
+<a href=#212 id=212 data-nosnippet>212</a>            },
+<a href=#213 id=213 data-nosnippet>213</a>            DispatchResult::Skipped { sop_name, reason } =&gt; {
+<a href=#214 id=214 data-nosnippet>214</a>                <span class="macro">info!</span>(<span class="string">"SOP headless dispatch: skipped '{sop_name}': {reason}"</span>);
+<a href=#215 id=215 data-nosnippet>215</a>            }
+<a href=#216 id=216 data-nosnippet>216</a>            DispatchResult::NoMatch =&gt; {}
+<a href=#217 id=217 data-nosnippet>217</a>        }
+<a href=#218 id=218 data-nosnippet>218</a>    }
+<a href=#219 id=219 data-nosnippet>219</a>}
+<a href=#220 id=220 data-nosnippet>220</a>
+<a href=#221 id=221 data-nosnippet>221</a><span class="comment">// ── Peripheral signal helper ────────────────────────────────────
+<a href=#222 id=222 data-nosnippet>222</a>
+<a href=#223 id=223 data-nosnippet>223</a></span><span class="doccomment">/// Convenience wrapper for peripheral hardware callbacks.
+<a href=#224 id=224 data-nosnippet>224</a>///
+<a href=#225 id=225 data-nosnippet>225</a>/// Builds a `SopEvent` with source `Peripheral` and topic `"{board}/{signal}"`
+<a href=#226 id=226 data-nosnippet>226</a>/// then dispatches it through the standard path.
+<a href=#227 id=227 data-nosnippet>227</a></span><span class="kw">pub async fn </span>dispatch_peripheral_signal(
+<a href=#228 id=228 data-nosnippet>228</a>    engine: <span class="kw-2">&amp;</span>Arc&lt;Mutex&lt;SopEngine&gt;&gt;,
+<a href=#229 id=229 data-nosnippet>229</a>    audit: <span class="kw-2">&amp;</span>SopAuditLogger,
+<a href=#230 id=230 data-nosnippet>230</a>    board: <span class="kw-2">&amp;</span>str,
+<a href=#231 id=231 data-nosnippet>231</a>    signal: <span class="kw-2">&amp;</span>str,
+<a href=#232 id=232 data-nosnippet>232</a>    payload: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;,
+<a href=#233 id=233 data-nosnippet>233</a>) -&gt; Vec&lt;DispatchResult&gt; {
+<a href=#234 id=234 data-nosnippet>234</a>    <span class="kw">let </span>event = SopEvent {
+<a href=#235 id=235 data-nosnippet>235</a>        source: SopTriggerSource::Peripheral,
+<a href=#236 id=236 data-nosnippet>236</a>        topic: <span class="prelude-val">Some</span>(<span class="macro">format!</span>(<span class="string">"{board}/{signal}"</span>)),
+<a href=#237 id=237 data-nosnippet>237</a>        payload: payload.map(String::from),
+<a href=#238 id=238 data-nosnippet>238</a>        timestamp: now_iso8601(),
+<a href=#239 id=239 data-nosnippet>239</a>    };
+<a href=#240 id=240 data-nosnippet>240</a>    dispatch_sop_event(engine, audit, event).<span class="kw">await
+<a href=#241 id=241 data-nosnippet>241</a></span>}
+<a href=#242 id=242 data-nosnippet>242</a>
+<a href=#243 id=243 data-nosnippet>243</a><span class="comment">// ── Cron SOP cache + check ──────────────────────────────────────
+<a href=#244 id=244 data-nosnippet>244</a>
+<a href=#245 id=245 data-nosnippet>245</a></span><span class="doccomment">/// Pre-parsed cron schedules for SOP triggers.
+<a href=#246 id=246 data-nosnippet>246</a>///
+<a href=#247 id=247 data-nosnippet>247</a>/// Built once at daemon startup to avoid re-parsing cron expressions
+<a href=#248 id=248 data-nosnippet>248</a>/// on every scheduler tick.
+<a href=#249 id=249 data-nosnippet>249</a></span><span class="attr">#[derive(Clone)]
+<a href=#250 id=250 data-nosnippet>250</a></span><span class="kw">pub struct </span>SopCronCache {
+<a href=#251 id=251 data-nosnippet>251</a>    <span class="doccomment">/// (sop_name, raw_expression, parsed_schedule)
+<a href=#252 id=252 data-nosnippet>252</a>    </span>schedules: Vec&lt;(String, String, cron::Schedule)&gt;,
+<a href=#253 id=253 data-nosnippet>253</a>}
+<a href=#254 id=254 data-nosnippet>254</a>
+<a href=#255 id=255 data-nosnippet>255</a><span class="kw">impl </span>SopCronCache {
+<a href=#256 id=256 data-nosnippet>256</a>    <span class="doccomment">/// Build cache from the current engine state.
+<a href=#257 id=257 data-nosnippet>257</a>    ///
+<a href=#258 id=258 data-nosnippet>258</a>    /// Locks the engine once, iterates SOPs, parses Cron trigger expressions.
+<a href=#259 id=259 data-nosnippet>259</a>    /// Invalid expressions are logged and skipped (fail-closed).
+<a href=#260 id=260 data-nosnippet>260</a>    </span><span class="kw">pub fn </span>from_engine(engine: <span class="kw-2">&amp;</span>Arc&lt;Mutex&lt;SopEngine&gt;&gt;) -&gt; <span class="self">Self </span>{
+<a href=#261 id=261 data-nosnippet>261</a>        <span class="kw">let </span><span class="kw-2">mut </span>schedules = Vec::new();
+<a href=#262 id=262 data-nosnippet>262</a>        <span class="kw">let </span>eng = <span class="kw">match </span>engine.lock() {
+<a href=#263 id=263 data-nosnippet>263</a>            <span class="prelude-val">Ok</span>(e) =&gt; e,
+<a href=#264 id=264 data-nosnippet>264</a>            <span class="prelude-val">Err</span>(e) =&gt; {
+<a href=#265 id=265 data-nosnippet>265</a>                <span class="macro">warn!</span>(<span class="string">"SopCronCache: engine lock poisoned: {e}"</span>);
+<a href=#266 id=266 data-nosnippet>266</a>                <span class="kw">return </span><span class="self">Self </span>{ schedules };
+<a href=#267 id=267 data-nosnippet>267</a>            }
+<a href=#268 id=268 data-nosnippet>268</a>        };
+<a href=#269 id=269 data-nosnippet>269</a>
+<a href=#270 id=270 data-nosnippet>270</a>        <span class="kw">for </span>sop <span class="kw">in </span>eng.sops() {
+<a href=#271 id=271 data-nosnippet>271</a>            <span class="kw">for </span>trigger <span class="kw">in </span><span class="kw-2">&amp;</span>sop.triggers {
+<a href=#272 id=272 data-nosnippet>272</a>                <span class="kw">if let </span><span class="kw">super</span>::types::SopTrigger::Cron { expression } = trigger {
+<a href=#273 id=273 data-nosnippet>273</a>                    <span class="comment">// Normalize 5-field crontab to 6-field (prepend seconds)
+<a href=#274 id=274 data-nosnippet>274</a>                    </span><span class="kw">let </span>normalized = <span class="kw">match </span><span class="kw">crate</span>::cron::normalize_expression(expression) {
+<a href=#275 id=275 data-nosnippet>275</a>                        <span class="prelude-val">Ok</span>(n) =&gt; n,
+<a href=#276 id=276 data-nosnippet>276</a>                        <span class="prelude-val">Err</span>(e) =&gt; {
+<a href=#277 id=277 data-nosnippet>277</a>                            <span class="macro">warn!</span>(
+<a href=#278 id=278 data-nosnippet>278</a>                                <span class="string">"SopCronCache: invalid cron expression '{}' in SOP '{}': {e}"</span>,
+<a href=#279 id=279 data-nosnippet>279</a>                                expression, sop.name
+<a href=#280 id=280 data-nosnippet>280</a>                            );
+<a href=#281 id=281 data-nosnippet>281</a>                            <span class="kw">continue</span>;
+<a href=#282 id=282 data-nosnippet>282</a>                        }
+<a href=#283 id=283 data-nosnippet>283</a>                    };
+<a href=#284 id=284 data-nosnippet>284</a>                    <span class="kw">match </span>normalized.parse::&lt;cron::Schedule&gt;() {
+<a href=#285 id=285 data-nosnippet>285</a>                        <span class="prelude-val">Ok</span>(schedule) =&gt; {
+<a href=#286 id=286 data-nosnippet>286</a>                            schedules.push((sop.name.clone(), expression.clone(), schedule));
+<a href=#287 id=287 data-nosnippet>287</a>                        }
+<a href=#288 id=288 data-nosnippet>288</a>                        <span class="prelude-val">Err</span>(e) =&gt; {
+<a href=#289 id=289 data-nosnippet>289</a>                            <span class="macro">warn!</span>(
+<a href=#290 id=290 data-nosnippet>290</a>                                <span class="string">"SopCronCache: failed to parse cron schedule '{}' for SOP '{}': {e}"</span>,
+<a href=#291 id=291 data-nosnippet>291</a>                                normalized, sop.name
+<a href=#292 id=292 data-nosnippet>292</a>                            );
+<a href=#293 id=293 data-nosnippet>293</a>                        }
+<a href=#294 id=294 data-nosnippet>294</a>                    }
+<a href=#295 id=295 data-nosnippet>295</a>                }
+<a href=#296 id=296 data-nosnippet>296</a>            }
+<a href=#297 id=297 data-nosnippet>297</a>        }
+<a href=#298 id=298 data-nosnippet>298</a>
+<a href=#299 id=299 data-nosnippet>299</a>        <span class="macro">info!</span>(<span class="string">"SopCronCache: cached {} cron schedule(s)"</span>, schedules.len());
+<a href=#300 id=300 data-nosnippet>300</a>        <span class="self">Self </span>{ schedules }
+<a href=#301 id=301 data-nosnippet>301</a>    }
+<a href=#302 id=302 data-nosnippet>302</a>
+<a href=#303 id=303 data-nosnippet>303</a>    <span class="doccomment">/// Return the cached schedules (for testing).
+<a href=#304 id=304 data-nosnippet>304</a>    </span><span class="attr">#[cfg(test)]
+<a href=#305 id=305 data-nosnippet>305</a>    </span><span class="kw">pub fn </span>schedules(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>[(String, String, cron::Schedule)] {
+<a href=#306 id=306 data-nosnippet>306</a>        <span class="kw-2">&amp;</span><span class="self">self</span>.schedules
+<a href=#307 id=307 data-nosnippet>307</a>    }
+<a href=#308 id=308 data-nosnippet>308</a>}
+<a href=#309 id=309 data-nosnippet>309</a>
+<a href=#310 id=310 data-nosnippet>310</a><span class="doccomment">/// Check all cached cron SOP triggers for firings in the window
+<a href=#311 id=311 data-nosnippet>311</a>/// `(last_check, now]` and dispatch events for each.
+<a href=#312 id=312 data-nosnippet>312</a>///
+<a href=#313 id=313 data-nosnippet>313</a>/// Uses window-based evaluation so ticks between polls are never missed.
+<a href=#314 id=314 data-nosnippet>314</a></span><span class="kw">pub async fn </span>check_sop_cron_triggers(
+<a href=#315 id=315 data-nosnippet>315</a>    engine: <span class="kw-2">&amp;</span>Arc&lt;Mutex&lt;SopEngine&gt;&gt;,
+<a href=#316 id=316 data-nosnippet>316</a>    audit: <span class="kw-2">&amp;</span>SopAuditLogger,
+<a href=#317 id=317 data-nosnippet>317</a>    cache: <span class="kw-2">&amp;</span>SopCronCache,
+<a href=#318 id=318 data-nosnippet>318</a>    last_check: <span class="kw-2">&amp;mut </span>chrono::DateTime&lt;chrono::Utc&gt;,
+<a href=#319 id=319 data-nosnippet>319</a>) -&gt; Vec&lt;DispatchResult&gt; {
+<a href=#320 id=320 data-nosnippet>320</a>    <span class="kw">let </span>now = chrono::Utc::now();
+<a href=#321 id=321 data-nosnippet>321</a>    <span class="kw">let </span><span class="kw-2">mut </span>all_results = Vec::new();
+<a href=#322 id=322 data-nosnippet>322</a>
+<a href=#323 id=323 data-nosnippet>323</a>    <span class="kw">for </span>(_sop_name, expression, schedule) <span class="kw">in </span><span class="kw-2">&amp;</span>cache.schedules {
+<a href=#324 id=324 data-nosnippet>324</a>        <span class="comment">// Check if any occurrence fell in the window (last_check, now].
+<a href=#325 id=325 data-nosnippet>325</a>        // At-most-once semantics: even if multiple ticks of the same expression
+<a href=#326 id=326 data-nosnippet>326</a>        // fell in the window (e.g., scheduler delayed), we fire only once.
+<a href=#327 id=327 data-nosnippet>327</a>        // This is intentional — SOP triggers should not retroactively batch-fire.
+<a href=#328 id=328 data-nosnippet>328</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>upcoming = schedule.after(last_check);
+<a href=#329 id=329 data-nosnippet>329</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(next) = upcoming.next()
+<a href=#330 id=330 data-nosnippet>330</a>            &amp;&amp; next &lt;= now
+<a href=#331 id=331 data-nosnippet>331</a>        {
+<a href=#332 id=332 data-nosnippet>332</a>            <span class="comment">// This expression fired in the window
+<a href=#333 id=333 data-nosnippet>333</a>            </span><span class="kw">let </span>event = SopEvent {
+<a href=#334 id=334 data-nosnippet>334</a>                source: SopTriggerSource::Cron,
+<a href=#335 id=335 data-nosnippet>335</a>                topic: <span class="prelude-val">Some</span>(expression.clone()),
+<a href=#336 id=336 data-nosnippet>336</a>                payload: <span class="prelude-val">None</span>,
+<a href=#337 id=337 data-nosnippet>337</a>                timestamp: now_iso8601(),
+<a href=#338 id=338 data-nosnippet>338</a>            };
+<a href=#339 id=339 data-nosnippet>339</a>            <span class="kw">let </span>results = dispatch_sop_event(engine, audit, event).<span class="kw">await</span>;
+<a href=#340 id=340 data-nosnippet>340</a>            all_results.extend(results);
+<a href=#341 id=341 data-nosnippet>341</a>        }
+<a href=#342 id=342 data-nosnippet>342</a>    }
+<a href=#343 id=343 data-nosnippet>343</a>
+<a href=#344 id=344 data-nosnippet>344</a>    <span class="kw-2">*</span>last_check = now;
+<a href=#345 id=345 data-nosnippet>345</a>    all_results
+<a href=#346 id=346 data-nosnippet>346</a>}
+<a href=#347 id=347 data-nosnippet>347</a>
+<a href=#348 id=348 data-nosnippet>348</a><span class="comment">// ── Tests ───────────────────────────────────────────────────────
+<a href=#349 id=349 data-nosnippet>349</a>
+<a href=#350 id=350 data-nosnippet>350</a></span><span class="attr">#[cfg(test)]
+<a href=#351 id=351 data-nosnippet>351</a></span><span class="kw">mod </span>tests {
+<a href=#352 id=352 data-nosnippet>352</a>    <span class="kw">use </span>super::<span class="kw-2">*</span>;
+<a href=#353 id=353 data-nosnippet>353</a>    <span class="kw">use </span><span class="kw">crate</span>::sop::types::{
+<a href=#354 id=354 data-nosnippet>354</a>        Sop, SopExecutionMode, SopPriority, SopRunAction, SopStep, SopTrigger, SopTriggerSource,
+<a href=#355 id=355 data-nosnippet>355</a>    };
+<a href=#356 id=356 data-nosnippet>356</a>    <span class="kw">use </span>zeroclaw_config::schema::{MemoryConfig, SopConfig};
+<a href=#357 id=357 data-nosnippet>357</a>    <span class="kw">use </span>zeroclaw_memory::traits::Memory;
+<a href=#358 id=358 data-nosnippet>358</a>
+<a href=#359 id=359 data-nosnippet>359</a>    <span class="kw">fn </span>test_sop(name: <span class="kw-2">&amp;</span>str, triggers: Vec&lt;SopTrigger&gt;) -&gt; Sop {
+<a href=#360 id=360 data-nosnippet>360</a>        Sop {
+<a href=#361 id=361 data-nosnippet>361</a>            name: name.into(),
+<a href=#362 id=362 data-nosnippet>362</a>            description: <span class="macro">format!</span>(<span class="string">"Test SOP: {name}"</span>),
+<a href=#363 id=363 data-nosnippet>363</a>            version: <span class="string">"1.0.0"</span>.into(),
+<a href=#364 id=364 data-nosnippet>364</a>            priority: SopPriority::Normal,
+<a href=#365 id=365 data-nosnippet>365</a>            execution_mode: SopExecutionMode::Auto,
+<a href=#366 id=366 data-nosnippet>366</a>            triggers,
+<a href=#367 id=367 data-nosnippet>367</a>            steps: <span class="macro">vec!</span>[SopStep {
+<a href=#368 id=368 data-nosnippet>368</a>                number: <span class="number">1</span>,
+<a href=#369 id=369 data-nosnippet>369</a>                title: <span class="string">"Step one"</span>.into(),
+<a href=#370 id=370 data-nosnippet>370</a>                body: <span class="string">"Do step one"</span>.into(),
+<a href=#371 id=371 data-nosnippet>371</a>                suggested_tools: <span class="macro">vec!</span>[],
+<a href=#372 id=372 data-nosnippet>372</a>                requires_confirmation: <span class="bool-val">false</span>,
+<a href=#373 id=373 data-nosnippet>373</a>                kind: <span class="kw">crate</span>::sop::SopStepKind::default(),
+<a href=#374 id=374 data-nosnippet>374</a>                schema: <span class="prelude-val">None</span>,
+<a href=#375 id=375 data-nosnippet>375</a>            }],
+<a href=#376 id=376 data-nosnippet>376</a>            cooldown_secs: <span class="number">0</span>,
+<a href=#377 id=377 data-nosnippet>377</a>            max_concurrent: <span class="number">2</span>,
+<a href=#378 id=378 data-nosnippet>378</a>            location: <span class="prelude-val">None</span>,
+<a href=#379 id=379 data-nosnippet>379</a>            deterministic: <span class="bool-val">false</span>,
+<a href=#380 id=380 data-nosnippet>380</a>        }
+<a href=#381 id=381 data-nosnippet>381</a>    }
+<a href=#382 id=382 data-nosnippet>382</a>
+<a href=#383 id=383 data-nosnippet>383</a>    <span class="kw">fn </span>test_engine(sops: Vec&lt;Sop&gt;) -&gt; Arc&lt;Mutex&lt;SopEngine&gt;&gt; {
+<a href=#384 id=384 data-nosnippet>384</a>        <span class="kw">let </span><span class="kw-2">mut </span>engine = SopEngine::new(SopConfig::default());
+<a href=#385 id=385 data-nosnippet>385</a>        engine.set_sops_for_test(sops);
+<a href=#386 id=386 data-nosnippet>386</a>        Arc::new(Mutex::new(engine))
+<a href=#387 id=387 data-nosnippet>387</a>    }
+<a href=#388 id=388 data-nosnippet>388</a>
+<a href=#389 id=389 data-nosnippet>389</a>    <span class="kw">fn </span>test_audit() -&gt; SopAuditLogger {
+<a href=#390 id=390 data-nosnippet>390</a>        <span class="kw">let </span>mem_cfg = MemoryConfig {
+<a href=#391 id=391 data-nosnippet>391</a>            backend: <span class="string">"sqlite"</span>.into(),
+<a href=#392 id=392 data-nosnippet>392</a>            ..MemoryConfig::default()
+<a href=#393 id=393 data-nosnippet>393</a>        };
+<a href=#394 id=394 data-nosnippet>394</a>        <span class="kw">let </span>tmp = tempfile::tempdir().unwrap();
+<a href=#395 id=395 data-nosnippet>395</a>        <span class="kw">let </span>memory: Arc&lt;<span class="kw">dyn </span>Memory&gt; =
+<a href=#396 id=396 data-nosnippet>396</a>            Arc::from(zeroclaw_memory::create_memory(<span class="kw-2">&amp;</span>mem_cfg, tmp.path(), <span class="prelude-val">None</span>).unwrap());
+<a href=#397 id=397 data-nosnippet>397</a>        <span class="comment">// Leak the tempdir so it lives for the test
+<a href=#398 id=398 data-nosnippet>398</a>        </span>std::mem::forget(tmp);
+<a href=#399 id=399 data-nosnippet>399</a>        SopAuditLogger::new(memory)
+<a href=#400 id=400 data-nosnippet>400</a>    }
+<a href=#401 id=401 data-nosnippet>401</a>
+<a href=#402 id=402 data-nosnippet>402</a>    <span class="attr">#[tokio::test]
+<a href=#403 id=403 data-nosnippet>403</a>    </span><span class="kw">async fn </span>dispatch_starts_matching_sop() {
+<a href=#404 id=404 data-nosnippet>404</a>        <span class="kw">let </span>engine = test_engine(<span class="macro">vec!</span>[test_sop(
+<a href=#405 id=405 data-nosnippet>405</a>            <span class="string">"mqtt-sop"</span>,
+<a href=#406 id=406 data-nosnippet>406</a>            <span class="macro">vec!</span>[SopTrigger::Mqtt {
+<a href=#407 id=407 data-nosnippet>407</a>                topic: <span class="string">"sensors/temp"</span>.into(),
+<a href=#408 id=408 data-nosnippet>408</a>                condition: <span class="prelude-val">None</span>,
+<a href=#409 id=409 data-nosnippet>409</a>            }],
+<a href=#410 id=410 data-nosnippet>410</a>        )]);
+<a href=#411 id=411 data-nosnippet>411</a>        <span class="kw">let </span>audit = test_audit();
+<a href=#412 id=412 data-nosnippet>412</a>
+<a href=#413 id=413 data-nosnippet>413</a>        <span class="kw">let </span>event = SopEvent {
+<a href=#414 id=414 data-nosnippet>414</a>            source: SopTriggerSource::Mqtt,
+<a href=#415 id=415 data-nosnippet>415</a>            topic: <span class="prelude-val">Some</span>(<span class="string">"sensors/temp"</span>.into()),
+<a href=#416 id=416 data-nosnippet>416</a>            payload: <span class="prelude-val">Some</span>(<span class="string">r#"{"value": 42}"#</span>.into()),
+<a href=#417 id=417 data-nosnippet>417</a>            timestamp: now_iso8601(),
+<a href=#418 id=418 data-nosnippet>418</a>        };
+<a href=#419 id=419 data-nosnippet>419</a>
+<a href=#420 id=420 data-nosnippet>420</a>        <span class="kw">let </span>results = dispatch_sop_event(<span class="kw-2">&amp;</span>engine, <span class="kw-2">&amp;</span>audit, event).<span class="kw">await</span>;
+<a href=#421 id=421 data-nosnippet>421</a>        <span class="macro">assert_eq!</span>(results.len(), <span class="number">1</span>);
+<a href=#422 id=422 data-nosnippet>422</a>        <span class="macro">assert!</span>(
+<a href=#423 id=423 data-nosnippet>423</a>            <span class="macro">matches!</span>(<span class="kw-2">&amp;</span>results[<span class="number">0</span>], DispatchResult::Started { sop_name, action, .. } <span class="kw">if </span>sop_name == <span class="string">"mqtt-sop" </span>&amp;&amp; <span class="macro">matches!</span>(action.as_ref(), SopRunAction::ExecuteStep { .. }))
+<a href=#424 id=424 data-nosnippet>424</a>        );
+<a href=#425 id=425 data-nosnippet>425</a>    }
+<a href=#426 id=426 data-nosnippet>426</a>
+<a href=#427 id=427 data-nosnippet>427</a>    <span class="attr">#[tokio::test]
+<a href=#428 id=428 data-nosnippet>428</a>    </span><span class="kw">async fn </span>dispatch_skips_when_cooldown_active() {
+<a href=#429 id=429 data-nosnippet>429</a>        <span class="kw">let </span><span class="kw-2">mut </span>sop = test_sop(<span class="string">"cooldown-sop"</span>, <span class="macro">vec!</span>[SopTrigger::Manual]);
+<a href=#430 id=430 data-nosnippet>430</a>        sop.cooldown_secs = <span class="number">3600</span>;
+<a href=#431 id=431 data-nosnippet>431</a>        sop.max_concurrent = <span class="number">1</span>;
+<a href=#432 id=432 data-nosnippet>432</a>        <span class="kw">let </span>engine = test_engine(<span class="macro">vec!</span>[sop]);
+<a href=#433 id=433 data-nosnippet>433</a>        <span class="kw">let </span>audit = test_audit();
+<a href=#434 id=434 data-nosnippet>434</a>
+<a href=#435 id=435 data-nosnippet>435</a>        <span class="comment">// Start a run manually so that completing it will trigger cooldown
+<a href=#436 id=436 data-nosnippet>436</a>        </span>{
+<a href=#437 id=437 data-nosnippet>437</a>            <span class="kw">let </span><span class="kw-2">mut </span>eng = engine.lock().unwrap();
+<a href=#438 id=438 data-nosnippet>438</a>            <span class="kw">let </span>_action = eng
+<a href=#439 id=439 data-nosnippet>439</a>                .start_run(
+<a href=#440 id=440 data-nosnippet>440</a>                    <span class="string">"cooldown-sop"</span>,
+<a href=#441 id=441 data-nosnippet>441</a>                    SopEvent {
+<a href=#442 id=442 data-nosnippet>442</a>                        source: SopTriggerSource::Manual,
+<a href=#443 id=443 data-nosnippet>443</a>                        topic: <span class="prelude-val">None</span>,
+<a href=#444 id=444 data-nosnippet>444</a>                        payload: <span class="prelude-val">None</span>,
+<a href=#445 id=445 data-nosnippet>445</a>                        timestamp: now_iso8601(),
+<a href=#446 id=446 data-nosnippet>446</a>                    },
+<a href=#447 id=447 data-nosnippet>447</a>                )
+<a href=#448 id=448 data-nosnippet>448</a>                .unwrap();
+<a href=#449 id=449 data-nosnippet>449</a>            <span class="comment">// Complete the run
+<a href=#450 id=450 data-nosnippet>450</a>            </span><span class="kw">let </span>run_id = eng.active_runs().keys().next().unwrap().clone();
+<a href=#451 id=451 data-nosnippet>451</a>            eng.advance_step(
+<a href=#452 id=452 data-nosnippet>452</a>                <span class="kw-2">&amp;</span>run_id,
+<a href=#453 id=453 data-nosnippet>453</a>                <span class="kw">crate</span>::sop::types::SopStepResult {
+<a href=#454 id=454 data-nosnippet>454</a>                    step_number: <span class="number">1</span>,
+<a href=#455 id=455 data-nosnippet>455</a>                    status: <span class="kw">crate</span>::sop::types::SopStepStatus::Completed,
+<a href=#456 id=456 data-nosnippet>456</a>                    output: <span class="string">"done"</span>.into(),
+<a href=#457 id=457 data-nosnippet>457</a>                    started_at: now_iso8601(),
+<a href=#458 id=458 data-nosnippet>458</a>                    completed_at: <span class="prelude-val">Some</span>(now_iso8601()),
+<a href=#459 id=459 data-nosnippet>459</a>                },
+<a href=#460 id=460 data-nosnippet>460</a>            )
+<a href=#461 id=461 data-nosnippet>461</a>            .unwrap();
+<a href=#462 id=462 data-nosnippet>462</a>        }
+<a href=#463 id=463 data-nosnippet>463</a>
+<a href=#464 id=464 data-nosnippet>464</a>        <span class="comment">// Now dispatch — should skip due to cooldown
+<a href=#465 id=465 data-nosnippet>465</a>        </span><span class="kw">let </span>event = SopEvent {
+<a href=#466 id=466 data-nosnippet>466</a>            source: SopTriggerSource::Manual,
+<a href=#467 id=467 data-nosnippet>467</a>            topic: <span class="prelude-val">None</span>,
+<a href=#468 id=468 data-nosnippet>468</a>            payload: <span class="prelude-val">None</span>,
+<a href=#469 id=469 data-nosnippet>469</a>            timestamp: now_iso8601(),
+<a href=#470 id=470 data-nosnippet>470</a>        };
+<a href=#471 id=471 data-nosnippet>471</a>        <span class="kw">let </span>results = dispatch_sop_event(<span class="kw-2">&amp;</span>engine, <span class="kw-2">&amp;</span>audit, event).<span class="kw">await</span>;
+<a href=#472 id=472 data-nosnippet>472</a>        <span class="macro">assert_eq!</span>(results.len(), <span class="number">1</span>);
+<a href=#473 id=473 data-nosnippet>473</a>        <span class="macro">assert!</span>(
+<a href=#474 id=474 data-nosnippet>474</a>            <span class="macro">matches!</span>(<span class="kw-2">&amp;</span>results[<span class="number">0</span>], DispatchResult::Skipped { sop_name, .. } <span class="kw">if </span>sop_name == <span class="string">"cooldown-sop"</span>)
+<a href=#475 id=475 data-nosnippet>475</a>        );
+<a href=#476 id=476 data-nosnippet>476</a>    }
+<a href=#477 id=477 data-nosnippet>477</a>
+<a href=#478 id=478 data-nosnippet>478</a>    <span class="attr">#[tokio::test]
+<a href=#479 id=479 data-nosnippet>479</a>    </span><span class="kw">async fn </span>dispatch_returns_no_match_for_unknown_event() {
+<a href=#480 id=480 data-nosnippet>480</a>        <span class="kw">let </span>engine = test_engine(<span class="macro">vec!</span>[test_sop(<span class="string">"manual-sop"</span>, <span class="macro">vec!</span>[SopTrigger::Manual])]);
+<a href=#481 id=481 data-nosnippet>481</a>        <span class="kw">let </span>audit = test_audit();
+<a href=#482 id=482 data-nosnippet>482</a>
+<a href=#483 id=483 data-nosnippet>483</a>        <span class="comment">// Send an MQTT event — the SOP only has a Manual trigger
+<a href=#484 id=484 data-nosnippet>484</a>        </span><span class="kw">let </span>event = SopEvent {
+<a href=#485 id=485 data-nosnippet>485</a>            source: SopTriggerSource::Mqtt,
+<a href=#486 id=486 data-nosnippet>486</a>            topic: <span class="prelude-val">Some</span>(<span class="string">"some/topic"</span>.into()),
+<a href=#487 id=487 data-nosnippet>487</a>            payload: <span class="prelude-val">None</span>,
+<a href=#488 id=488 data-nosnippet>488</a>            timestamp: now_iso8601(),
+<a href=#489 id=489 data-nosnippet>489</a>        };
+<a href=#490 id=490 data-nosnippet>490</a>        <span class="kw">let </span>results = dispatch_sop_event(<span class="kw-2">&amp;</span>engine, <span class="kw-2">&amp;</span>audit, event).<span class="kw">await</span>;
+<a href=#491 id=491 data-nosnippet>491</a>        <span class="macro">assert_eq!</span>(results.len(), <span class="number">1</span>);
+<a href=#492 id=492 data-nosnippet>492</a>        <span class="macro">assert!</span>(<span class="macro">matches!</span>(<span class="kw-2">&amp;</span>results[<span class="number">0</span>], DispatchResult::NoMatch));
+<a href=#493 id=493 data-nosnippet>493</a>    }
+<a href=#494 id=494 data-nosnippet>494</a>
+<a href=#495 id=495 data-nosnippet>495</a>    <span class="attr">#[tokio::test]
+<a href=#496 id=496 data-nosnippet>496</a>    </span><span class="kw">async fn </span>dispatch_batch_lock_starts_multiple_sops() {
+<a href=#497 id=497 data-nosnippet>497</a>        <span class="kw">let </span>sop1 = test_sop(
+<a href=#498 id=498 data-nosnippet>498</a>            <span class="string">"webhook-sop-1"</span>,
+<a href=#499 id=499 data-nosnippet>499</a>            <span class="macro">vec!</span>[SopTrigger::Webhook {
+<a href=#500 id=500 data-nosnippet>500</a>                path: <span class="string">"/api/deploy"</span>.into(),
+<a href=#501 id=501 data-nosnippet>501</a>            }],
+<a href=#502 id=502 data-nosnippet>502</a>        );
+<a href=#503 id=503 data-nosnippet>503</a>        <span class="kw">let </span>sop2 = test_sop(
+<a href=#504 id=504 data-nosnippet>504</a>            <span class="string">"webhook-sop-2"</span>,
+<a href=#505 id=505 data-nosnippet>505</a>            <span class="macro">vec!</span>[SopTrigger::Webhook {
+<a href=#506 id=506 data-nosnippet>506</a>                path: <span class="string">"/api/deploy"</span>.into(),
+<a href=#507 id=507 data-nosnippet>507</a>            }],
+<a href=#508 id=508 data-nosnippet>508</a>        );
+<a href=#509 id=509 data-nosnippet>509</a>        <span class="kw">let </span>engine = test_engine(<span class="macro">vec!</span>[sop1, sop2]);
+<a href=#510 id=510 data-nosnippet>510</a>        <span class="kw">let </span>audit = test_audit();
+<a href=#511 id=511 data-nosnippet>511</a>
+<a href=#512 id=512 data-nosnippet>512</a>        <span class="kw">let </span>event = SopEvent {
+<a href=#513 id=513 data-nosnippet>513</a>            source: SopTriggerSource::Webhook,
+<a href=#514 id=514 data-nosnippet>514</a>            topic: <span class="prelude-val">Some</span>(<span class="string">"/api/deploy"</span>.into()),
+<a href=#515 id=515 data-nosnippet>515</a>            payload: <span class="prelude-val">None</span>,
+<a href=#516 id=516 data-nosnippet>516</a>            timestamp: now_iso8601(),
+<a href=#517 id=517 data-nosnippet>517</a>        };
+<a href=#518 id=518 data-nosnippet>518</a>
+<a href=#519 id=519 data-nosnippet>519</a>        <span class="kw">let </span>results = dispatch_sop_event(<span class="kw-2">&amp;</span>engine, <span class="kw-2">&amp;</span>audit, event).<span class="kw">await</span>;
+<a href=#520 id=520 data-nosnippet>520</a>        <span class="kw">let </span>started_count = results
+<a href=#521 id=521 data-nosnippet>521</a>            .iter()
+<a href=#522 id=522 data-nosnippet>522</a>            .filter(|r| <span class="macro">matches!</span>(r, DispatchResult::Started { .. }))
+<a href=#523 id=523 data-nosnippet>523</a>            .count();
+<a href=#524 id=524 data-nosnippet>524</a>        <span class="macro">assert_eq!</span>(started_count, <span class="number">2</span>);
+<a href=#525 id=525 data-nosnippet>525</a>    }
+<a href=#526 id=526 data-nosnippet>526</a>
+<a href=#527 id=527 data-nosnippet>527</a>    <span class="doccomment">/// B1 DoD: prove that the action returned by `start_run` is captured in
+<a href=#528 id=528 data-nosnippet>528</a>    /// `DispatchResult::Started` — not silently dropped.
+<a href=#529 id=529 data-nosnippet>529</a>    </span><span class="attr">#[tokio::test]
+<a href=#530 id=530 data-nosnippet>530</a>    </span><span class="kw">async fn </span>dispatch_captures_action_for_wait_approval() {
+<a href=#531 id=531 data-nosnippet>531</a>        <span class="comment">// Supervised mode → WaitApproval on step 1
+<a href=#532 id=532 data-nosnippet>532</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>sop = test_sop(
+<a href=#533 id=533 data-nosnippet>533</a>            <span class="string">"supervised-sop"</span>,
+<a href=#534 id=534 data-nosnippet>534</a>            <span class="macro">vec!</span>[SopTrigger::Mqtt {
+<a href=#535 id=535 data-nosnippet>535</a>                topic: <span class="string">"alert"</span>.into(),
+<a href=#536 id=536 data-nosnippet>536</a>                condition: <span class="prelude-val">None</span>,
+<a href=#537 id=537 data-nosnippet>537</a>            }],
+<a href=#538 id=538 data-nosnippet>538</a>        );
+<a href=#539 id=539 data-nosnippet>539</a>        sop.execution_mode = SopExecutionMode::Supervised;
+<a href=#540 id=540 data-nosnippet>540</a>        <span class="kw">let </span>engine = test_engine(<span class="macro">vec!</span>[sop]);
+<a href=#541 id=541 data-nosnippet>541</a>        <span class="kw">let </span>audit = test_audit();
+<a href=#542 id=542 data-nosnippet>542</a>
+<a href=#543 id=543 data-nosnippet>543</a>        <span class="kw">let </span>event = SopEvent {
+<a href=#544 id=544 data-nosnippet>544</a>            source: SopTriggerSource::Mqtt,
+<a href=#545 id=545 data-nosnippet>545</a>            topic: <span class="prelude-val">Some</span>(<span class="string">"alert"</span>.into()),
+<a href=#546 id=546 data-nosnippet>546</a>            payload: <span class="prelude-val">None</span>,
+<a href=#547 id=547 data-nosnippet>547</a>            timestamp: now_iso8601(),
+<a href=#548 id=548 data-nosnippet>548</a>        };
+<a href=#549 id=549 data-nosnippet>549</a>
+<a href=#550 id=550 data-nosnippet>550</a>        <span class="kw">let </span>results = dispatch_sop_event(<span class="kw-2">&amp;</span>engine, <span class="kw-2">&amp;</span>audit, event).<span class="kw">await</span>;
+<a href=#551 id=551 data-nosnippet>551</a>        <span class="macro">assert_eq!</span>(results.len(), <span class="number">1</span>);
+<a href=#552 id=552 data-nosnippet>552</a>        <span class="kw">match </span><span class="kw-2">&amp;</span>results[<span class="number">0</span>] {
+<a href=#553 id=553 data-nosnippet>553</a>            DispatchResult::Started {
+<a href=#554 id=554 data-nosnippet>554</a>                run_id,
+<a href=#555 id=555 data-nosnippet>555</a>                sop_name,
+<a href=#556 id=556 data-nosnippet>556</a>                action,
+<a href=#557 id=557 data-nosnippet>557</a>            } =&gt; {
+<a href=#558 id=558 data-nosnippet>558</a>                <span class="macro">assert_eq!</span>(sop_name, <span class="string">"supervised-sop"</span>);
+<a href=#559 id=559 data-nosnippet>559</a>                <span class="macro">assert!</span>(!run_id.is_empty());
+<a href=#560 id=560 data-nosnippet>560</a>                <span class="macro">assert!</span>(
+<a href=#561 id=561 data-nosnippet>561</a>                    <span class="macro">matches!</span>(action.as_ref(), SopRunAction::WaitApproval { .. }),
+<a href=#562 id=562 data-nosnippet>562</a>                    <span class="string">"Supervised SOP must return WaitApproval, got {:?}"</span>,
+<a href=#563 id=563 data-nosnippet>563</a>                    action
+<a href=#564 id=564 data-nosnippet>564</a>                );
+<a href=#565 id=565 data-nosnippet>565</a>            }
+<a href=#566 id=566 data-nosnippet>566</a>            other =&gt; <span class="macro">panic!</span>(<span class="string">"Expected Started, got {other:?}"</span>),
+<a href=#567 id=567 data-nosnippet>567</a>        }
+<a href=#568 id=568 data-nosnippet>568</a>    }
+<a href=#569 id=569 data-nosnippet>569</a>
+<a href=#570 id=570 data-nosnippet>570</a>    <span class="doccomment">/// B1 DoD: Auto-mode SOP returns ExecuteStep action in dispatch result.
+<a href=#571 id=571 data-nosnippet>571</a>    </span><span class="attr">#[tokio::test]
+<a href=#572 id=572 data-nosnippet>572</a>    </span><span class="kw">async fn </span>dispatch_captures_action_for_execute_step() {
+<a href=#573 id=573 data-nosnippet>573</a>        <span class="kw">let </span>engine = test_engine(<span class="macro">vec!</span>[test_sop(<span class="string">"auto-sop"</span>, <span class="macro">vec!</span>[SopTrigger::Manual])]);
+<a href=#574 id=574 data-nosnippet>574</a>        <span class="kw">let </span>audit = test_audit();
+<a href=#575 id=575 data-nosnippet>575</a>
+<a href=#576 id=576 data-nosnippet>576</a>        <span class="kw">let </span>event = SopEvent {
+<a href=#577 id=577 data-nosnippet>577</a>            source: SopTriggerSource::Manual,
+<a href=#578 id=578 data-nosnippet>578</a>            topic: <span class="prelude-val">None</span>,
+<a href=#579 id=579 data-nosnippet>579</a>            payload: <span class="prelude-val">None</span>,
+<a href=#580 id=580 data-nosnippet>580</a>            timestamp: now_iso8601(),
+<a href=#581 id=581 data-nosnippet>581</a>        };
+<a href=#582 id=582 data-nosnippet>582</a>
+<a href=#583 id=583 data-nosnippet>583</a>        <span class="kw">let </span>results = dispatch_sop_event(<span class="kw-2">&amp;</span>engine, <span class="kw-2">&amp;</span>audit, event).<span class="kw">await</span>;
+<a href=#584 id=584 data-nosnippet>584</a>        <span class="macro">assert_eq!</span>(results.len(), <span class="number">1</span>);
+<a href=#585 id=585 data-nosnippet>585</a>        <span class="kw">match </span><span class="kw-2">&amp;</span>results[<span class="number">0</span>] {
+<a href=#586 id=586 data-nosnippet>586</a>            DispatchResult::Started { action, .. } =&gt; {
+<a href=#587 id=587 data-nosnippet>587</a>                <span class="macro">assert!</span>(
+<a href=#588 id=588 data-nosnippet>588</a>                    <span class="macro">matches!</span>(action.as_ref(), SopRunAction::ExecuteStep { .. }),
+<a href=#589 id=589 data-nosnippet>589</a>                    <span class="string">"Auto SOP must return ExecuteStep, got {:?}"</span>,
+<a href=#590 id=590 data-nosnippet>590</a>                    action
+<a href=#591 id=591 data-nosnippet>591</a>                );
+<a href=#592 id=592 data-nosnippet>592</a>            }
+<a href=#593 id=593 data-nosnippet>593</a>            other =&gt; <span class="macro">panic!</span>(<span class="string">"Expected Started, got {other:?}"</span>),
+<a href=#594 id=594 data-nosnippet>594</a>        }
+<a href=#595 id=595 data-nosnippet>595</a>    }
+<a href=#596 id=596 data-nosnippet>596</a>
+<a href=#597 id=597 data-nosnippet>597</a>    <span class="attr">#[tokio::test]
+<a href=#598 id=598 data-nosnippet>598</a>    </span><span class="kw">async fn </span>peripheral_signal_dispatches_to_matching_sop() {
+<a href=#599 id=599 data-nosnippet>599</a>        <span class="kw">let </span>engine = test_engine(<span class="macro">vec!</span>[test_sop(
+<a href=#600 id=600 data-nosnippet>600</a>            <span class="string">"gpio-sop"</span>,
+<a href=#601 id=601 data-nosnippet>601</a>            <span class="macro">vec!</span>[SopTrigger::Peripheral {
+<a href=#602 id=602 data-nosnippet>602</a>                board: <span class="string">"nucleo"</span>.into(),
+<a href=#603 id=603 data-nosnippet>603</a>                signal: <span class="string">"pin_3"</span>.into(),
+<a href=#604 id=604 data-nosnippet>604</a>                condition: <span class="prelude-val">None</span>,
+<a href=#605 id=605 data-nosnippet>605</a>            }],
+<a href=#606 id=606 data-nosnippet>606</a>        )]);
+<a href=#607 id=607 data-nosnippet>607</a>        <span class="kw">let </span>audit = test_audit();
+<a href=#608 id=608 data-nosnippet>608</a>
+<a href=#609 id=609 data-nosnippet>609</a>        <span class="kw">let </span>results =
+<a href=#610 id=610 data-nosnippet>610</a>            dispatch_peripheral_signal(<span class="kw-2">&amp;</span>engine, <span class="kw-2">&amp;</span>audit, <span class="string">"nucleo"</span>, <span class="string">"pin_3"</span>, <span class="prelude-val">Some</span>(<span class="string">"1"</span>)).<span class="kw">await</span>;
+<a href=#611 id=611 data-nosnippet>611</a>        <span class="macro">assert_eq!</span>(results.len(), <span class="number">1</span>);
+<a href=#612 id=612 data-nosnippet>612</a>        <span class="macro">assert!</span>(
+<a href=#613 id=613 data-nosnippet>613</a>            <span class="macro">matches!</span>(<span class="kw-2">&amp;</span>results[<span class="number">0</span>], DispatchResult::Started { sop_name, .. } <span class="kw">if </span>sop_name == <span class="string">"gpio-sop" </span>)
+<a href=#614 id=614 data-nosnippet>614</a>        );
+<a href=#615 id=615 data-nosnippet>615</a>    }
+<a href=#616 id=616 data-nosnippet>616</a>
+<a href=#617 id=617 data-nosnippet>617</a>    <span class="attr">#[tokio::test]
+<a href=#618 id=618 data-nosnippet>618</a>    </span><span class="kw">async fn </span>peripheral_signal_no_match_returns_empty() {
+<a href=#619 id=619 data-nosnippet>619</a>        <span class="kw">let </span>engine = test_engine(<span class="macro">vec!</span>[test_sop(
+<a href=#620 id=620 data-nosnippet>620</a>            <span class="string">"gpio-sop"</span>,
+<a href=#621 id=621 data-nosnippet>621</a>            <span class="macro">vec!</span>[SopTrigger::Peripheral {
+<a href=#622 id=622 data-nosnippet>622</a>                board: <span class="string">"nucleo"</span>.into(),
+<a href=#623 id=623 data-nosnippet>623</a>                signal: <span class="string">"pin_3"</span>.into(),
+<a href=#624 id=624 data-nosnippet>624</a>                condition: <span class="prelude-val">None</span>,
+<a href=#625 id=625 data-nosnippet>625</a>            }],
+<a href=#626 id=626 data-nosnippet>626</a>        )]);
+<a href=#627 id=627 data-nosnippet>627</a>        <span class="kw">let </span>audit = test_audit();
+<a href=#628 id=628 data-nosnippet>628</a>
+<a href=#629 id=629 data-nosnippet>629</a>        <span class="kw">let </span>results = dispatch_peripheral_signal(<span class="kw-2">&amp;</span>engine, <span class="kw-2">&amp;</span>audit, <span class="string">"rpi"</span>, <span class="string">"gpio_5"</span>, <span class="prelude-val">None</span>).<span class="kw">await</span>;
+<a href=#630 id=630 data-nosnippet>630</a>        <span class="macro">assert_eq!</span>(results.len(), <span class="number">1</span>);
+<a href=#631 id=631 data-nosnippet>631</a>        <span class="macro">assert!</span>(<span class="macro">matches!</span>(<span class="kw-2">&amp;</span>results[<span class="number">0</span>], DispatchResult::NoMatch));
+<a href=#632 id=632 data-nosnippet>632</a>    }
+<a href=#633 id=633 data-nosnippet>633</a>
+<a href=#634 id=634 data-nosnippet>634</a>    <span class="attr">#[test]
+<a href=#635 id=635 data-nosnippet>635</a>    </span><span class="kw">fn </span>cron_cache_skips_invalid_expression() {
+<a href=#636 id=636 data-nosnippet>636</a>        <span class="kw">let </span>sop = test_sop(
+<a href=#637 id=637 data-nosnippet>637</a>            <span class="string">"bad-cron"</span>,
+<a href=#638 id=638 data-nosnippet>638</a>            <span class="macro">vec!</span>[SopTrigger::Cron {
+<a href=#639 id=639 data-nosnippet>639</a>                expression: <span class="string">"not a valid cron"</span>.into(),
+<a href=#640 id=640 data-nosnippet>640</a>            }],
+<a href=#641 id=641 data-nosnippet>641</a>        );
+<a href=#642 id=642 data-nosnippet>642</a>        <span class="kw">let </span>engine = test_engine(<span class="macro">vec!</span>[sop]);
+<a href=#643 id=643 data-nosnippet>643</a>        <span class="kw">let </span>cache = SopCronCache::from_engine(<span class="kw-2">&amp;</span>engine);
+<a href=#644 id=644 data-nosnippet>644</a>        <span class="macro">assert!</span>(cache.schedules().is_empty());
+<a href=#645 id=645 data-nosnippet>645</a>    }
+<a href=#646 id=646 data-nosnippet>646</a>
+<a href=#647 id=647 data-nosnippet>647</a>    <span class="attr">#[test]
+<a href=#648 id=648 data-nosnippet>648</a>    </span><span class="kw">fn </span>cron_cache_parses_valid_expression() {
+<a href=#649 id=649 data-nosnippet>649</a>        <span class="kw">let </span>sop = test_sop(
+<a href=#650 id=650 data-nosnippet>650</a>            <span class="string">"valid-cron"</span>,
+<a href=#651 id=651 data-nosnippet>651</a>            <span class="macro">vec!</span>[SopTrigger::Cron {
+<a href=#652 id=652 data-nosnippet>652</a>                expression: <span class="string">"0 */5 * * *"</span>.into(),
+<a href=#653 id=653 data-nosnippet>653</a>            }],
+<a href=#654 id=654 data-nosnippet>654</a>        );
+<a href=#655 id=655 data-nosnippet>655</a>        <span class="kw">let </span>engine = test_engine(<span class="macro">vec!</span>[sop]);
+<a href=#656 id=656 data-nosnippet>656</a>        <span class="kw">let </span>cache = SopCronCache::from_engine(<span class="kw-2">&amp;</span>engine);
+<a href=#657 id=657 data-nosnippet>657</a>        <span class="macro">assert_eq!</span>(cache.schedules().len(), <span class="number">1</span>);
+<a href=#658 id=658 data-nosnippet>658</a>        <span class="macro">assert_eq!</span>(cache.schedules()[<span class="number">0</span>].<span class="number">0</span>, <span class="string">"valid-cron"</span>);
+<a href=#659 id=659 data-nosnippet>659</a>        <span class="macro">assert_eq!</span>(cache.schedules()[<span class="number">0</span>].<span class="number">1</span>, <span class="string">"0 */5 * * *"</span>);
+<a href=#660 id=660 data-nosnippet>660</a>    }
+<a href=#661 id=661 data-nosnippet>661</a>
+<a href=#662 id=662 data-nosnippet>662</a>    <span class="attr">#[tokio::test]
+<a href=#663 id=663 data-nosnippet>663</a>    </span><span class="kw">async fn </span>cron_sop_trigger_fires_on_schedule() {
+<a href=#664 id=664 data-nosnippet>664</a>        <span class="kw">let </span>sop = test_sop(
+<a href=#665 id=665 data-nosnippet>665</a>            <span class="string">"cron-sop"</span>,
+<a href=#666 id=666 data-nosnippet>666</a>            <span class="macro">vec!</span>[SopTrigger::Cron {
+<a href=#667 id=667 data-nosnippet>667</a>                expression: <span class="string">"* * * * *"</span>.into(),
+<a href=#668 id=668 data-nosnippet>668</a>            }],
+<a href=#669 id=669 data-nosnippet>669</a>        );
+<a href=#670 id=670 data-nosnippet>670</a>        <span class="kw">let </span>engine = test_engine(<span class="macro">vec!</span>[sop]);
+<a href=#671 id=671 data-nosnippet>671</a>        <span class="kw">let </span>audit = test_audit();
+<a href=#672 id=672 data-nosnippet>672</a>        <span class="kw">let </span>cache = SopCronCache::from_engine(<span class="kw-2">&amp;</span>engine);
+<a href=#673 id=673 data-nosnippet>673</a>
+<a href=#674 id=674 data-nosnippet>674</a>        <span class="comment">// Set last_check to 2 minutes ago so the window contains a tick
+<a href=#675 id=675 data-nosnippet>675</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>last_check = chrono::Utc::now() - chrono::Duration::minutes(<span class="number">2</span>);
+<a href=#676 id=676 data-nosnippet>676</a>        <span class="kw">let </span>results = check_sop_cron_triggers(<span class="kw-2">&amp;</span>engine, <span class="kw-2">&amp;</span>audit, <span class="kw-2">&amp;</span>cache, <span class="kw-2">&amp;mut </span>last_check).<span class="kw">await</span>;
+<a href=#677 id=677 data-nosnippet>677</a>
+<a href=#678 id=678 data-nosnippet>678</a>        <span class="kw">let </span>started = results
+<a href=#679 id=679 data-nosnippet>679</a>            .iter()
+<a href=#680 id=680 data-nosnippet>680</a>            .filter(|r| <span class="macro">matches!</span>(r, DispatchResult::Started { .. }))
+<a href=#681 id=681 data-nosnippet>681</a>            .count();
+<a href=#682 id=682 data-nosnippet>682</a>        <span class="macro">assert!</span>(started &gt;= <span class="number">1</span>, <span class="string">"Expected at least 1 started SOP from cron"</span>);
+<a href=#683 id=683 data-nosnippet>683</a>    }
+<a href=#684 id=684 data-nosnippet>684</a>
+<a href=#685 id=685 data-nosnippet>685</a>    <span class="attr">#[tokio::test]
+<a href=#686 id=686 data-nosnippet>686</a>    </span><span class="kw">async fn </span>cron_sop_only_matching_expression_fires() {
+<a href=#687 id=687 data-nosnippet>687</a>        <span class="kw">let </span>sop1 = test_sop(
+<a href=#688 id=688 data-nosnippet>688</a>            <span class="string">"every-min"</span>,
+<a href=#689 id=689 data-nosnippet>689</a>            <span class="macro">vec!</span>[SopTrigger::Cron {
+<a href=#690 id=690 data-nosnippet>690</a>                expression: <span class="string">"* * * * *"</span>.into(),
+<a href=#691 id=691 data-nosnippet>691</a>            }],
+<a href=#692 id=692 data-nosnippet>692</a>        );
+<a href=#693 id=693 data-nosnippet>693</a>        <span class="comment">// An expression that won't fire in a 2-minute window from now:
+<a href=#694 id=694 data-nosnippet>694</a>        // "0 0 1 1 *" = midnight Jan 1
+<a href=#695 id=695 data-nosnippet>695</a>        </span><span class="kw">let </span>sop2 = test_sop(
+<a href=#696 id=696 data-nosnippet>696</a>            <span class="string">"yearly"</span>,
+<a href=#697 id=697 data-nosnippet>697</a>            <span class="macro">vec!</span>[SopTrigger::Cron {
+<a href=#698 id=698 data-nosnippet>698</a>                expression: <span class="string">"0 0 1 1 *"</span>.into(),
+<a href=#699 id=699 data-nosnippet>699</a>            }],
+<a href=#700 id=700 data-nosnippet>700</a>        );
+<a href=#701 id=701 data-nosnippet>701</a>        <span class="kw">let </span>engine = test_engine(<span class="macro">vec!</span>[sop1, sop2]);
+<a href=#702 id=702 data-nosnippet>702</a>        <span class="kw">let </span>audit = test_audit();
+<a href=#703 id=703 data-nosnippet>703</a>        <span class="kw">let </span>cache = SopCronCache::from_engine(<span class="kw-2">&amp;</span>engine);
+<a href=#704 id=704 data-nosnippet>704</a>
+<a href=#705 id=705 data-nosnippet>705</a>        <span class="kw">let </span><span class="kw-2">mut </span>last_check = chrono::Utc::now() - chrono::Duration::minutes(<span class="number">2</span>);
+<a href=#706 id=706 data-nosnippet>706</a>        <span class="kw">let </span>results = check_sop_cron_triggers(<span class="kw-2">&amp;</span>engine, <span class="kw-2">&amp;</span>audit, <span class="kw-2">&amp;</span>cache, <span class="kw-2">&amp;mut </span>last_check).<span class="kw">await</span>;
+<a href=#707 id=707 data-nosnippet>707</a>
+<a href=#708 id=708 data-nosnippet>708</a>        <span class="comment">// Only "every-min" should have fired
+<a href=#709 id=709 data-nosnippet>709</a>        </span><span class="kw">let </span>started_names: Vec&lt;<span class="kw-2">&amp;</span>str&gt; = results
+<a href=#710 id=710 data-nosnippet>710</a>            .iter()
+<a href=#711 id=711 data-nosnippet>711</a>            .filter_map(|r| <span class="kw">match </span>r {
+<a href=#712 id=712 data-nosnippet>712</a>                DispatchResult::Started { sop_name, .. } =&gt; <span class="prelude-val">Some</span>(sop_name.as_str()),
+<a href=#713 id=713 data-nosnippet>713</a>                <span class="kw">_ </span>=&gt; <span class="prelude-val">None</span>,
+<a href=#714 id=714 data-nosnippet>714</a>            })
+<a href=#715 id=715 data-nosnippet>715</a>            .collect();
+<a href=#716 id=716 data-nosnippet>716</a>        <span class="macro">assert!</span>(started_names.contains(<span class="kw-2">&amp;</span><span class="string">"every-min"</span>));
+<a href=#717 id=717 data-nosnippet>717</a>        <span class="macro">assert!</span>(!started_names.contains(<span class="kw-2">&amp;</span><span class="string">"yearly"</span>));
+<a href=#718 id=718 data-nosnippet>718</a>    }
+<a href=#719 id=719 data-nosnippet>719</a>
+<a href=#720 id=720 data-nosnippet>720</a>    <span class="attr">#[tokio::test]
+<a href=#721 id=721 data-nosnippet>721</a>    </span><span class="kw">async fn </span>cron_sop_window_check_does_not_miss_tick() {
+<a href=#722 id=722 data-nosnippet>722</a>        <span class="kw">let </span>sop = test_sop(
+<a href=#723 id=723 data-nosnippet>723</a>            <span class="string">"every-min"</span>,
+<a href=#724 id=724 data-nosnippet>724</a>            <span class="macro">vec!</span>[SopTrigger::Cron {
+<a href=#725 id=725 data-nosnippet>725</a>                expression: <span class="string">"* * * * *"</span>.into(),
+<a href=#726 id=726 data-nosnippet>726</a>            }],
+<a href=#727 id=727 data-nosnippet>727</a>        );
+<a href=#728 id=728 data-nosnippet>728</a>        <span class="kw">let </span>engine = test_engine(<span class="macro">vec!</span>[sop]);
+<a href=#729 id=729 data-nosnippet>729</a>        <span class="kw">let </span>audit = test_audit();
+<a href=#730 id=730 data-nosnippet>730</a>        <span class="kw">let </span>cache = SopCronCache::from_engine(<span class="kw-2">&amp;</span>engine);
+<a href=#731 id=731 data-nosnippet>731</a>
+<a href=#732 id=732 data-nosnippet>732</a>        <span class="comment">// Simulate: last_check was 5 minutes ago, poll just now
+<a href=#733 id=733 data-nosnippet>733</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>last_check = chrono::Utc::now() - chrono::Duration::minutes(<span class="number">5</span>);
+<a href=#734 id=734 data-nosnippet>734</a>        <span class="kw">let </span>results = check_sop_cron_triggers(<span class="kw-2">&amp;</span>engine, <span class="kw-2">&amp;</span>audit, <span class="kw-2">&amp;</span>cache, <span class="kw-2">&amp;mut </span>last_check).<span class="kw">await</span>;
+<a href=#735 id=735 data-nosnippet>735</a>
+<a href=#736 id=736 data-nosnippet>736</a>        <span class="comment">// At least one tick should have been caught
+<a href=#737 id=737 data-nosnippet>737</a>        </span><span class="kw">let </span>started = results
+<a href=#738 id=738 data-nosnippet>738</a>            .iter()
+<a href=#739 id=739 data-nosnippet>739</a>            .filter(|r| <span class="macro">matches!</span>(r, DispatchResult::Started { .. }))
+<a href=#740 id=740 data-nosnippet>740</a>            .count();
+<a href=#741 id=741 data-nosnippet>741</a>        <span class="macro">assert!</span>(
+<a href=#742 id=742 data-nosnippet>742</a>            started &gt;= <span class="number">1</span>,
+<a href=#743 id=743 data-nosnippet>743</a>            <span class="string">"Window-based check should catch ticks from 5 minutes ago"
+<a href=#744 id=744 data-nosnippet>744</a>        </span>);
+<a href=#745 id=745 data-nosnippet>745</a>
+<a href=#746 id=746 data-nosnippet>746</a>        <span class="comment">// last_check should be updated to approximately now
+<a href=#747 id=747 data-nosnippet>747</a>        </span><span class="kw">let </span>now = chrono::Utc::now();
+<a href=#748 id=748 data-nosnippet>748</a>        <span class="macro">assert!</span>(
+<a href=#749 id=749 data-nosnippet>749</a>            (now - last_check).num_seconds() &lt; <span class="number">2</span>,
+<a href=#750 id=750 data-nosnippet>750</a>            <span class="string">"last_check should be updated to now"
+<a href=#751 id=751 data-nosnippet>751</a>        </span>);
+<a href=#752 id=752 data-nosnippet>752</a>    }
+<a href=#753 id=753 data-nosnippet>753</a>}
+</code></pre></div></section></main></body></html>

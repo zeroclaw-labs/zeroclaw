@@ -1,0 +1,431 @@
+<!DOCTYPE HTML>
+<html lang="fr" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>ACP (Agent Client Protocol) - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-141176d3.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-4a111ca2.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/channels/acp.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="acp--protocole-client-agent"><a class="header" href="#acp--protocole-client-agent">ACP — Protocole Client-Agent</a></h1>
+<p><strong>ACP</strong> is a JSON-RPC 2.0 protocol over stdio that lets editors and IDEs drive a running ZeroClaw agent as a session host. Newline-delimited JSON — lightweight, streamable, easy to wire to a subprocess.</p>
+<p>Think of it as “LSP for agents”: the editor launches <code>zeroclaw acp</code>, sends prompts over stdin, and receives session updates on stdout.</p>
+<h2 id="ce-à-quoi-vous-lutiliseriez"><a class="header" href="#ce-à-quoi-vous-lutiliseriez">Ce à quoi vous l’utiliseriez</a></h2>
+<ul>
+<li>Une extension d’éditeur qui propose une commande « demander à l’agent à propos de ce fichier »</li>
+<li>Une intégration de multiplexeur de terminal qui ouvre un panneau latéral avec une session d’agent</li>
+<li>Un runner CI qui pilote l’agent de manière programmatique sans configuration complète du gateway.</li>
+<li>Tout ce qui souhaite des sessions d’agent sans HTTP et sans lier de port</li>
+</ul>
+<h2 id="protocol-shape--v1"><a class="header" href="#protocol-shape--v1">Protocol shape — v1</a></h2>
+<p>All messages are JSON-RPC 2.0 (newline-delimited). ZeroClaw implements <strong>protocol version 1</strong>.</p>
+<h3 id="initialiser"><a class="header" href="#initialiser"><code>initialiser</code></a></h3>
+<p>Poignée de main. Retourne les capacités du serveur.</p>
+<pre><code class="language-json">→ {"jsonrpc":"2.0","id":1,« méthode »:"initialiser"}
+← {"jsonrpc":"2.0","id":1,"résultat":{
+    "protocolVersion": 1,
+    "agentCapabilities": {
+      "loadSession": false,
+      "promptCapabilities": {"image": false, "audio": false, "embeddedContext": false},
+      "mcpCapabilities": {"http": false, "sse": false},
+      "sessionCapabilities": {}
+    },
+    "agentInfo": {
+      « nom »: "zeroclaw-acp",
+      "title": "ZeroClaw ACP",
+      "version": "0.7.x"
+    },
+    "authMethods": [],
+    "_meta": {
+      "zeroclaw": {
+        "modèle par défaut": "anthropic/claude-sonnet-4.6",
+        "maxSessions": 10,
+        `sessionTimeoutSecs`: 3600
+      }
+    }
+  }}
+</code></pre>
+<p><code>_meta.zeroclaw</code> carries ZeroClaw-specific extension fields not in the base ACP spec. Clients that only implement the base spec can ignore this object.</p>
+<p>The server always responds <code>protocolVersion: 1</code>. If you send a client-side <code>protocolVersion: 0</code>, you still get <code>1</code> back — v0 clients will see parse errors on the new message shapes; see <a href="#version-compatibility">version compatibility</a> below.</p>
+<h3 id="sessionnew"><a class="header" href="#sessionnew"><code>session/new</code></a></h3>
+<p>Open an isolated agent session. The optional <code>cwd</code> parameter (aliases: <code>workspaceDir</code>, <code>workspace_dir</code>) pins the per-session file-access boundary — it becomes the <code>workspace_dir</code> inside the <code>SecurityPolicy</code> that all file tools enforce. The agent’s persistent data directory (memory, identity, cron) remains the daemon-level <code>workspace_dir</code> from config.</p>
+<pre><code class="language-json">→ {"jsonrpc":"2.0","id":2,« méthode »:"session/new","paramètres":{
+    "répertoire de travail courant": "/path/to/project"
+  }}
+← {"jsonrpc":"2.0","id":2,"résultat":{
+    "sessionId": "s-ab12cd",
+    "workspaceDir": "/path/to/project"
+  }}
+</code></pre>
+<p><code>cwd</code> is canonicalized on intake — <code>../</code> traversal cannot escape the intended root. If <code>cwd</code> is omitted, the server uses the daemon’s launch directory.</p>
+<h3 id="sessionprompt"><a class="header" href="#sessionprompt"><code>session/prompt</code></a></h3>
+<p>Send a prompt. The response is a sequence of <code>session/update</code> notifications streaming back, terminated by the <code>session/prompt</code> result.</p>
+<pre><code class="language-json">→ {"jsonrpc":"2.0","id":3,« méthode »:"session/prompt","paramètres":{
+    "sessionId": "s-ab12cd",
+    "invite": Résumez les modifications du dernier commit.
+  }}
+← {"jsonrpc":"2.0",« méthode »:"session/mise à jour","paramètres":{
+    "sessionId": "s-ab12cd",
+    "update": {"sessionUpdate": "agent_message_chunk", "contenu": {"type":« texte »,« texte »:« Le dernier commit... »}}
+  }}
+← {"jsonrpc":"2.0",« méthode »:"session/mise à jour","paramètres":{
+    "sessionId": "s-ab12cd",
+    "update": {"sessionUpdate": "tool_call", "toolCallId": "tc-1", "title": "shell",
+               "type": "execute", "statut": "pending", "rawInput": {...}}
+  }}
+← {"jsonrpc":"2.0",« méthode »:"session/mise à jour","paramètres":{
+    "sessionId": "s-ab12cd",
+    "update": {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1",
+               "statut": terminé, "rawOutput": "..."}
+  }}
+← {"jsonrpc":"2.0","id":3,"résultat":{
+    "sessionId": "s-ab12cd",
+    "stopReason": "end_turn",
+    "contenu": "The last commit introduces..."
+  }}
+</code></pre>
+<p><code>stopReason</code> is <code>"end_turn"</code> on normal completion. The ACP completion signal is <code>stopReason</code>; ZeroClaw also includes the current final <code>content</code> string for existing clients.</p>
+<h3 id="sessionupdate-notifications-agent--client"><a class="header" href="#sessionupdate-notifications-agent--client"><code>session/update</code> notifications (agent → client)</a></h3>
+<p>ZeroClaw sends four kinds of <code>session/update</code> notification during a prompt turn. The discriminant is the <code>sessionUpdate</code> field inside <code>update</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>sessionUpdate</code> value</th><th>When emitted</th><th>Key fields</th></tr>
+</thead>
+<tbody>
+<tr><td><code>agent_message_chunk</code></td><td>Each streaming text token</td><td><code>content.type = "text"</code>, <code>content.text</code></td></tr>
+<tr><td><code>agent_thought_chunk</code></td><td>Internal reasoning tokens (when enabled)</td><td><code>content.type = "text"</code>, <code>content.text</code></td></tr>
+<tr><td><code>tool_call</code></td><td>Tool call initiated</td><td><code>toolCallId</code>, <code>title</code>, <code>kind</code>, <code>status: "pending"</code>, <code>rawInput</code></td></tr>
+<tr><td><code>tool_call_update</code></td><td>Tool call completed</td><td><code>toolCallId</code>, <code>status: "finished"</code>, <code>rawOutput</code>, <code>content[]</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>toolCallId</code> on <code>tool_call</code> and <code>tool_call_update</code> are stable and correlated — the update completing a call carries the same <code>toolCallId</code> as the one that opened it.</p>
+<p>The <code>name</code> field on <code>tool_call_update</code> is a ZeroClaw extension (not required by the base ACP spec). Clients can use it for display; it’s safe to ignore.</p>
+<h3 id="sessionrequest_permission-agent--client-outbound-request"><a class="header" href="#sessionrequest_permission-agent--client-outbound-request"><code>session/request_permission</code> (agent → client, outbound request)</a></h3>
+<p>When a tool requires user approval (via <code>always_ask</code> in the autonomy config, or the <code>ask_user</code>/<code>escalate_to_human</code> tools), ZeroClaw issues a <strong>JSON-RPC request</strong> from agent to client. The client must reply with a result before the tool call proceeds.</p>
+<pre><code class="language-json">← {"jsonrpc":"2.0","id":"zc-out-0",« méthode »:"session/request_permission","paramètres":{
+    "sessionId": "s-ab12cd",
+    "options": [
+      {"optionId": "allow-once",  « nom »: "Allow once",  "type": "allow_once"},
+      {"optionId": "allow-always",« nom »: "Always allow","type": "allow_always"},
+      {"optionId": "reject-once", « nom »: "Reject",      "type": "reject_once"}
+    ],
+    "toolCall": {
+      "toolCallId": "approval-...",
+      "title": "Approve shell?",
+      "type": "execute",
+      "statut": "pending",
+      "rawInput": {"tool": "shell", "summary": "git status --short"},
+      "contenu": [{"type": "contenu", "contenu": {"type": « texte », « texte »: "git status --short"}}]
+    }
+  }}
+→ {"jsonrpc":"2.0","id":"zc-out-0","résultat":{
+    "outcome": {"outcome": "selected", "optionId": "allow-once"}
+  }}
+</code></pre>
+<p>The server-issued id (<code>"zc-out-N"</code>) is always a string prefixed <code>zc-out-</code> — disjoint from any integer or string ids the client uses for its own requests.</p>
+<p>Response shape:</p>
+<ul>
+<li><code>{"outcome": {"outcome": "selected", "optionId": "&lt;id&gt;"}}</code> — user picked an option</li>
+<li><code>{"outcome": {"outcome": "cancelled"}}</code> — user dismissed the prompt</li>
+</ul>
+<p>If the client never replies (crash, network drop, user closes IDE), the request times out after <code>sessionTimeoutSecs</code> and the tool call is denied.</p>
+<p><code>ask_user</code> uses the same <code>session/request_permission</code> mechanism, mapping the question’s <code>choices</code> to permission options. Free-form (no-choices) <code>ask_user</code> is not supported until the <a href="https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx">ACP elicitation RFD</a> lands. Calling <code>ask_user</code> without <code>choices</code> on an ACP session fast-fails with a clear error.</p>
+<h3 id="sessioncancel"><a class="header" href="#sessioncancel"><code>session/cancel</code></a></h3>
+<p>Abort an in-flight <code>session/prompt</code> turn.</p>
+<p><strong>Cancel vs. stop:</strong> <code>session/cancel</code> aborts an in-flight prompt turn and returns <code>stopReason: "cancelled"</code> with any streamed text accumulated up to the interrupt point. <code>session/stop</code> gracefully ends the session after the current turn completes — it waits for the turn to finish rather than interrupting it.</p>
+<p>The canonical parameter is <code>sessionId</code>; <code>session_id</code> is accepted as a compatibility alias.</p>
+<pre><code class="language-json">→ {"jsonrpc":"2.0",« méthode »:"session/cancel","paramètres":{"sessionId":"s-ab12cd"}}
+← {"jsonrpc":"2.0",« méthode »:"session/mise à jour","paramètres":{
+    "sessionId": "s-ab12cd",
+    "update": {"sessionUpdate": "agent_message_chunk", "contenu": {"type":« texte »,« texte »:"partial..."}}
+  }}
+← {"jsonrpc":"2.0","id":3,"résultat":{
+    "sessionId": "s-ab12cd",
+    "stopReason": "cancelled",
+    "contenu": "partial...\n\n[interrupted by user]"
+  }}
+</code></pre>
+<p>Only one <code>session/prompt</code> may be active for a session at a time. A second prompt for the same session is rejected until the active turn completes or is cancelled.</p>
+<p>If no turn is active for the session, the cancel is a noop — it succeeds silently without error. This follows ACP notification semantics: notifications must not produce errors.</p>
+<h3 id="sessionstop-zeroclaw-extension"><a class="header" href="#sessionstop-zeroclaw-extension"><code>session/stop</code> <em>(ZeroClaw extension)</em></a></h3>
+<p>Cleanly end a session. Not in the base ACP spec — ZeroClaw-specific. If a future ACP spec revision adds <code>session/stop</code> with different semantics, this will be renamed <code>_meta/session/stop</code>.</p>
+<pre><code class="language-json">→ {"jsonrpc":"2.0","id":4,« méthode »:"session/stop","paramètres":{"sessionId":"s-ab12cd"}}
+← {"jsonrpc":"2.0","id":4,"résultat":{« arrêté »:true}}
+</code></pre>
+<h3 id="sessionupdate-client--server-zeroclaw-extension"><a class="header" href="#sessionupdate-client--server-zeroclaw-extension"><code>session/update</code> (client → server) <em>(ZeroClaw extension)</em></a></h3>
+<p>ZeroClaw also accepts inbound <code>session/update</code> (and the legacy <code>session/event</code> alias) notifications from the client for custom event injection. Not in the base ACP spec — ZeroClaw-specific. If the ACP spec later defines an inbound <code>session/update</code> with different semantics, this will be renamed <code>_meta/session/update</code>.</p>
+<h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
+<pre><code class="language-toml">[acp]
+max_sessions = 10
+session_timeout_secs = 3600       # idle sessions killed after 1 hour
+</code></pre>
+<p>When running <code>zeroclaw acp</code> as a subprocess, the command starts the server unconditionally. When running as a daemon, the gateway exposes ACP over WebSocket at <code>/acp</code> with no additional config required.</p>
+<h2 id="en-cours"><a class="header" href="#en-cours">En cours</a></h2>
+<p><strong>En tant que sous-processus (intégration IDE typique) :</strong></p>
+<pre><code class="language-bash">zeroclaw acp
+</code></pre>
+<p>Le binaire lit l’entrée standard, écrit sur la sortie standard et se termine sur EOF.</p>
+<p><strong>As a WebSocket service (daemon mode):</strong></p>
+<p>Start the daemon normally. The gateway always exposes ACP over WebSocket at the <code>/acp</code> endpoint — no extra config flag is required.</p>
+<h2 id="version-compatibility"><a class="header" href="#version-compatibility">Version compatibility</a></h2>
+<p>ACP v0 clients (using the flat <code>{streaming, maxSessions, ...}</code> initialize response and <code>kind: "text"|"tool_call"</code> session/update shape) will see deserialization errors on connecting to a v1 server. The discriminants and envelope shapes changed in a breaking way. Upgrade steps:</p>
+<ul>
+<li>Use <code>sessionUpdate</code> (not <code>kind</code>) to discriminate <code>session/update</code> notifications.</li>
+<li>Parse <code>session/prompt</code> results as <code>{sessionId, stopReason, content}</code> (not <code>{finished, usage}</code>).</li>
+<li>Implement <code>session/request_permission</code> response handling — the approval mechanism moved from a server notification to a client-answered RPC.</li>
+<li>Drop the <code>systemPrompt</code> param from <code>session/new</code> — it is not read.</li>
+</ul>
+<h2 id="sécurité"><a class="header" href="#sécurité">Sécurité</a></h2>
+<p>ACP inherits the running config’s autonomy level. When <code>[autonomy] level = "supervised"</code>, medium-risk tool calls trigger approval via the ACP back-channel — a <code>session/request_permission</code> outbound request the client must acknowledge. In <code>full</code> mode, tool calls execute without approval and <code>workspace_only</code> is implicitly disabled (the agent can reach paths outside the session cwd); <code>forbidden_paths</code> still apply.</p>
+<p>The <code>cwd</code> from <code>session/new</code> becomes the <code>SecurityPolicy</code> workspace boundary used by all file and shell tools for that session. Note: the agent’s system prompt currently reflects the daemon’s global <code>workspace_dir</code> rather than the session <code>cwd</code> — this does not affect enforcement, only the directory the model believes it is working in.</p>
+<h2 id="référence-du-code"><a class="header" href="#référence-du-code">Référence du code</a></h2>
+<ul>
+<li>ACP server: <code>crates/zeroclaw-channels/src/orchestrator/acp_server.rs</code></li>
+<li>ACP back-channel: <code>crates/zeroclaw-channels/src/acp_channel.rs</code></li>
+<li>Per-session path enforcement: <code>crates/zeroclaw-config/src/policy.rs</code> (<code>SecurityPolicy::from_config</code>), <code>crates/zeroclaw-runtime/src/agent/agent.rs</code> (<code>from_config_with_session_cwd_and_mcp</code>)</li>
+<li>OS-level sandbox detection/backends: <code>crates/zeroclaw-runtime/src/security/detect.rs</code>, <code>landlock.rs</code>, <code>bubblewrap.rs</code>, <code>seatbelt.rs</code></li>
+</ul>
+<h2 id="voir-aussi"><a class="header" href="#voir-aussi">Voir aussi</a></h2>
+<ul>
+<li><a href="./overview.html">Chaînes → Vue d’ensemble</a></li>
+<li><a href="../tools/mcp.html">Tools → MCP</a> — clients providing tools to the agent; ACP is the inverse</li>
+<li><a href="../security/autonomy.html">Security → Autonomy</a></li>
+<li><a href="../security/overview.html">Sécurité → Aperçu</a></li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../channels/webhook.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../tools/overview.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../channels/webhook.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../tools/overview.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

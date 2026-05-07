@@ -1,0 +1,1363 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>命令行界面 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-53bbdbb2.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-088a9fdb.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/reference/cli.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="zeroclaw-的命令行帮助"><a class="header" href="#zeroclaw-的命令行帮助"><code>zeroclaw</code> 的命令行帮助</a></h1>
+<p>本文档包含 <code>zeroclaw</code> 命令行程序的帮助内容。</p>
+<p><strong>命令概述：</strong></p>
+<ul>
+<li><a href="#zeroclaw"><code>zeroclaw</code>↴</a></li>
+<li><a href="#zeroclaw-onboard"><code>zeroclaw onboard</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-workspace"><code>zeroclaw onboard workspace</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-providers"><code>zeroclaw onboard providers</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-channels"><code>zeroclaw onboard channels</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-memory"><code>zeroclaw onboard memory</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-hardware"><code>zeroclaw onboard hardware</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-tunnel"><code>zeroclaw onboard tunnel</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-personality"><code>zeroclaw onboard personality</code>↴</a></li>
+<li><a href="#zeroclaw-agent"><code>zeroclaw agent</code>↴</a></li>
+<li><a href="#zeroclaw-gateway"><code>zeroclaw gateway</code>↴</a></li>
+<li><a href="#zeroclaw-gateway-start"><code>zeroclaw gateway start</code>↴</a></li>
+<li><a href="#zeroclaw-gateway-restart"><code>zeroclaw gateway restart</code>↴</a></li>
+<li><a href="#zeroclaw-gateway-get-paircode"><code>zeroclaw gateway get-paircode</code>↴</a></li>
+<li><a href="#zeroclaw-acp"><code>zeroclaw acp</code>↴</a></li>
+<li><a href="#zeroclaw-daemon"><code>zeroclaw 守护进程</code>↴</a></li>
+<li><a href="#zeroclaw-service"><code>zeroclaw service</code>↴</a></li>
+<li><a href="#zeroclaw-service-install"><code>zeroclaw service install</code>↴</a></li>
+<li><a href="#zeroclaw-service-start"><code>zeroclaw service start</code>↴</a></li>
+<li><a href="#zeroclaw-service-stop"><code>zeroclaw service stop</code>↴</a></li>
+<li><a href="#zeroclaw-service-restart"><code>zeroclaw service restart</code>↴</a></li>
+<li><a href="#zeroclaw-service-status"><code>zeroclaw service status</code>↴</a></li>
+<li><a href="#zeroclaw-service-uninstall"><code>zeroclaw service uninstall</code>↴</a></li>
+<li><a href="#zeroclaw-service-logs"><code>zeroclaw service logs</code>↴</a></li>
+<li><a href="#zeroclaw-doctor"><code>zeroclaw doctor</code>↴</a></li>
+<li><a href="#zeroclaw-doctor-models"><code>zeroclaw doctor models</code>↴</a></li>
+<li><a href="#zeroclaw-doctor-traces"><code>zeroclaw doctor traces</code>↴</a></li>
+<li><a href="#zeroclaw-status"><code>zeroclaw status</code>↴</a></li>
+<li><a href="#zeroclaw-estop"><code>zeroclaw estop</code>↴</a></li>
+<li><a href="#zeroclaw-estop-status"><code>zeroclaw estop status</code>↴</a></li>
+<li><a href="#zeroclaw-estop-resume"><code>zeroclaw estop resume</code>↴</a></li>
+<li><a href="#zeroclaw-cron"><code>zeroclaw cron</code>↴</a></li>
+<li><a href="#zeroclaw-cron-list"><code>zeroclaw cron list</code>↴</a></li>
+<li><a href="#zeroclaw-cron-add"><code>zeroclaw cron add</code>↴</a></li>
+<li><a href="#zeroclaw-cron-add-at"><code>zeroclaw cron add-at</code>↴</a></li>
+<li><a href="#zeroclaw-cron-add-every"><code>zeroclaw cron add-every</code>↴</a></li>
+<li><a href="#zeroclaw-cron-once"><code>zeroclaw cron once</code>↴</a></li>
+<li><a href="#zeroclaw-cron-remove"><code>zeroclaw cron remove</code>↴</a></li>
+<li><a href="#zeroclaw-cron-update"><code>zeroclaw cron update</code>↴</a></li>
+<li><a href="#zeroclaw-cron-pause"><code>zeroclaw cron pause</code>↴</a></li>
+<li><a href="#zeroclaw-cron-resume"><code>zeroclaw cron resume</code>↴</a></li>
+<li><a href="#zeroclaw-models"><code>zeroclaw 模型</code>↴</a></li>
+<li><a href="#zeroclaw-models-refresh"><code>zeroclaw 模型刷新</code>↴</a></li>
+<li><a href="#zeroclaw-models-list"><code>zeroclaw models list</code>↴</a></li>
+<li><a href="#zeroclaw-models-set"><code>zeroclaw models set</code>↴</a></li>
+<li><a href="#zeroclaw-models-status"><code>zeroclaw models status</code>↴</a></li>
+<li><a href="#zeroclaw-providers"><code>zeroclaw 提供程序</code>↴</a></li>
+<li><a href="#zeroclaw-channel"><code>zeroclaw channel</code>↴</a></li>
+<li><a href="#zeroclaw-channel-list"><code>zeroclaw 频道列表</code>↴</a></li>
+<li><a href="#zeroclaw-channel-start"><code>zeroclaw channel start</code>↴</a></li>
+<li><a href="#zeroclaw-channel-doctor"><code>zeroclaw channel doctor</code>↴</a></li>
+<li><a href="#zeroclaw-channel-add"><code>zeroclaw channel add</code>↴</a></li>
+<li><a href="#zeroclaw-channel-remove"><code>zeroclaw channel remove</code>↴</a></li>
+<li><a href="#zeroclaw-channel-bind-telegram"><code>zeroclaw channel bind-telegram</code>↴</a></li>
+<li><a href="#zeroclaw-channel-send"><code>zeroclaw channel send</code>↴</a></li>
+<li><a href="#zeroclaw-integrations"><code>zeroclaw 集成</code>↴</a></li>
+<li><a href="#zeroclaw-integrations-info"><code>zeroclaw 集成信息</code>↴</a></li>
+<li><a href="#zeroclaw-skills"><code>zeroclaw skills</code>↴</a></li>
+<li><a href="#zeroclaw-skills-list"><code>zeroclaw skills list</code>↴</a></li>
+<li><a href="#zeroclaw-skills-audit"><code>zeroclaw 技能审计</code>↴</a></li>
+<li><a href="#zeroclaw-skills-install"><code>zeroclaw skills install</code>↴</a></li>
+<li><a href="#zeroclaw-skills-remove"><code>zeroclaw skills remove</code>↴</a></li>
+<li><a href="#zeroclaw-skills-test"><code>zeroclaw 技能测试</code>↴</a></li>
+<li><a href="#zeroclaw-sop"><code>zeroclaw sop</code>↴</a></li>
+<li><a href="#zeroclaw-sop-list"><code>zeroclaw sop list</code>↴</a></li>
+<li><a href="#zeroclaw-sop-validate"><code>zeroclaw sop validate</code>↴</a></li>
+<li><a href="#zeroclaw-sop-show"><code>zeroclaw sop show</code>↴</a></li>
+<li><a href="#zeroclaw-migrate"><code>zeroclaw migrate</code>↴</a></li>
+<li><a href="#zeroclaw-migrate-openclaw"><code>zeroclaw migrate openclaw</code>↴</a></li>
+<li><a href="#zeroclaw-auth"><code>zeroclaw auth</code>↴</a></li>
+<li><a href="#zeroclaw-auth-login"><code>zeroclaw auth login</code>↴</a></li>
+<li><a href="#zeroclaw-auth-paste-redirect"><code>zeroclaw auth paste-redirect</code>↴</a></li>
+<li><a href="#zeroclaw-auth-paste-token"><code>zeroclaw auth paste-token</code>↴</a></li>
+<li><a href="#zeroclaw-auth-setup-token"><code>zeroclaw auth setup-token</code>↴</a></li>
+<li><a href="#zeroclaw-auth-refresh"><code>zeroclaw auth refresh</code>↴</a></li>
+<li><a href="#zeroclaw-auth-logout"><code>zeroclaw auth logout</code>↴</a></li>
+<li><a href="#zeroclaw-auth-use"><code>zeroclaw auth use</code>↴</a></li>
+<li><a href="#zeroclaw-auth-list"><code>zeroclaw auth list</code>↴</a></li>
+<li><a href="#zeroclaw-auth-status"><code>zeroclaw auth status</code>↴</a></li>
+<li><a href="#zeroclaw-hardware"><code>zeroclaw 硬件</code>↴</a></li>
+<li><a href="#zeroclaw-hardware-discover"><code>zeroclaw 硬件发现</code>↴</a></li>
+<li><a href="#zeroclaw-hardware-introspect"><code>zeroclaw 硬件自省</code>↴</a></li>
+<li><a href="#zeroclaw-hardware-info"><code>zeroclaw 硬件信息</code>↴</a></li>
+<li><a href="#zeroclaw-peripheral"><code>zeroclaw 外围设备</code>↴</a></li>
+<li><a href="#zeroclaw-peripheral-list"><code>zeroclaw 外设列表</code>↴</a></li>
+<li><a href="#zeroclaw-peripheral-add"><code>zeroclaw peripheral add</code>↴</a></li>
+<li><a href="#zeroclaw-peripheral-flash"><code>zeroclaw 外围闪存</code>↴</a></li>
+<li><a href="#zeroclaw-peripheral-setup-uno-q"><code>zeroclaw peripheral setup-uno-q</code>↴</a></li>
+<li><a href="#zeroclaw-peripheral-flash-nucleo"><code>zeroclaw peripheral flash-nucleo</code>↴</a></li>
+<li><a href="#zeroclaw-memory"><code>zeroclaw memory</code>↴</a></li>
+<li><a href="#zeroclaw-memory-list"><code>zeroclaw memory list</code>↴</a></li>
+<li><a href="#zeroclaw-memory-get"><code>zeroclaw memory get</code>↴</a></li>
+<li><a href="#zeroclaw-memory-stats"><code>zeroclaw 内存统计</code>↴</a></li>
+<li><a href="#zeroclaw-memory-clear"><code>zeroclaw memory clear</code>↴</a></li>
+<li><a href="#zeroclaw-memory-reindex"><code>zeroclaw memory reindex</code>↴</a></li>
+<li><a href="#zeroclaw-config"><code>zeroclaw config</code>↴</a></li>
+<li><a href="#zeroclaw-config-schema"><code>zeroclaw 配置模式</code>↴</a></li>
+<li><a href="#zeroclaw-config-list"><code>zeroclaw config list</code>↴</a></li>
+<li><a href="#zeroclaw-config-get"><code>zeroclaw config get</code>↴</a></li>
+<li><a href="#zeroclaw-config-set"><code>zeroclaw config set</code>↴</a></li>
+<li><a href="#zeroclaw-config-init"><code>zeroclaw config init</code>↴</a></li>
+<li><a href="#zeroclaw-config-migrate"><code>zeroclaw config migrate</code>↴</a></li>
+<li><a href="#zeroclaw-config-patch"><code>zeroclaw config patch</code>↴</a></li>
+<li><a href="#zeroclaw-config-docs"><code>zeroclaw config docs</code>↴</a></li>
+<li><a href="#zeroclaw-update"><code>zeroclaw update</code>↴</a></li>
+<li><a href="#zeroclaw-self-test"><code>zeroclaw 自测</code>↴</a></li>
+<li><a href="#zeroclaw-completions"><code>zeroclaw completions</code>↴</a></li>
+<li><a href="#zeroclaw-desktop"><code>zeroclaw 桌面版</code>↴</a></li>
+</ul>
+<h2 id="zeroclaw"><a class="header" href="#zeroclaw"><code>zeroclaw</code></a></h2>
+<p>最快、最小的 AI 助手。</p>
+<p><strong>用法：</strong> <code>zeroclaw [OPTIONS] &lt;COMMAND&gt;</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>onboard</code> — 初始化您的工作区和配置</li>
+<li><code>agent</code> — 启动 AI 代理循环</li>
+<li><code>gateway</code> — 启动/管理网关服务器（webhooks、websockets）</li>
+<li><code>acp</code> — 通过 stdio 启动 ACP（Agent Control Protocol）服务器</li>
+<li><code>daemon</code> — 启动长期运行的自主运行时（网关 + 通道 + 心跳 + 调度器）</li>
+<li><code>service</code> — 管理操作系统服务生命周期（launchd/systemd 用户服务）</li>
+<li><code>doctor</code> — 运行守护进程/调度器/通道新鲜度的诊断</li>
+<li><code>status</code> — 显示系统状态（详细信息）</li>
+<li><code>estop</code> — 启用、检查并恢复紧急停止状态</li>
+<li><code>cron</code> — 配置和管理定时任务</li>
+<li><code>models</code> — 管理提供商模型目录</li>
+<li><code>providers</code> — 列出支持的 AI 提供商</li>
+<li><code>channel</code> — 管理频道（Telegram、Discord、Slack）</li>
+<li><code>integrations</code> — 浏览 50 多种集成</li>
+<li><code>skills</code> — 管理技能（用户定义的能力）</li>
+<li><code>sop</code> — 管理标准操作程序（SOP）</li>
+<li><code>migrate</code> — 从其他代理运行时迁移数据</li>
+<li><code>auth</code> — 管理提供商订阅身份验证配置文件</li>
+<li><code>hardware</code> — 发现并检查 USB 硬件</li>
+<li><code>peripheral</code> — 管理硬件外设（STM32、RPi GPIO 等）</li>
+<li><code>memory</code> — 管理代理记忆（列出、获取、统计、清除）</li>
+<li><code>config</code> — 管理配置</li>
+<li><code>update</code> — 检查并应用更新</li>
+<li><code>self-test</code> — 运行诊断自检</li>
+<li><code>completions</code> — 生成 shell 补全脚本并输出到标准输出</li>
+<li><code>desktop</code> — 启动或安装配套桌面应用</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--config-dir &lt;CONFIG_DIR&gt;</code></li>
+</ul>
+<h2 id="zeroclaw-onboard"><a class="header" href="#zeroclaw-onboard"><code>zeroclaw onboard</code></a></h2>
+<p>初始化您的工作区和配置</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard [OPTIONS] [COMMAND]</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>workspace</code> — Workspace isolation settings</li>
+<li><code>providers</code> — Provider selection, credentials, and live model picker</li>
+<li><code>channels</code> — Messaging channels (Telegram, Discord, Slack, Matrix, …)</li>
+<li><code>memory</code> — Memory backend (sqlite, lucid, markdown, none) + auto-save</li>
+<li><code>hardware</code> — Physical hardware transport (native GPIO, serial, probe)</li>
+<li><code>tunnel</code> — Public tunnel provider (cloudflare, ngrok, tailscale, …)</li>
+<li><code>personality</code> — Edit the markdown files that shape your agent (SOUL, IDENTITY, USER, …)</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--quick</code> — Skip interactive prompts; read from –api-key/–provider/–model/–memory</li>
+<li><code>--cli</code> — Force the dialoguer CLI backend instead of the default ratatui TUI</li>
+<li><code>--force</code> — Don’t ask “keep stored secret?” — always re-prompt</li>
+<li><code>--reinit</code> — Back up existing config and start from defaults</li>
+<li><code>--api-key &lt;API_KEY&gt;</code> — 用于提供商配置的 API 密钥</li>
+<li><code>--provider &lt;PROVIDER&gt;</code> — Provider name (sets providers.fallback)</li>
+<li><code>--model &lt;MODEL&gt;</code> — Model ID override</li>
+<li><code>--memory &lt;MEMORY&gt;</code> — Memory backend (sqlite, lucid, markdown, none)</li>
+</ul>
+<h2 id="zeroclaw-onboard-workspace"><a class="header" href="#zeroclaw-onboard-workspace"><code>zeroclaw onboard workspace</code></a></h2>
+<p>Workspace isolation settings</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard workspace</code></p>
+<h2 id="zeroclaw-onboard-providers"><a class="header" href="#zeroclaw-onboard-providers"><code>zeroclaw onboard providers</code></a></h2>
+<p>Provider selection, credentials, and live model picker</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard providers</code></p>
+<h2 id="zeroclaw-onboard-channels"><a class="header" href="#zeroclaw-onboard-channels"><code>zeroclaw onboard channels</code></a></h2>
+<p>Messaging channels (Telegram, Discord, Slack, Matrix, …)</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard channels</code></p>
+<h2 id="zeroclaw-onboard-memory"><a class="header" href="#zeroclaw-onboard-memory"><code>zeroclaw onboard memory</code></a></h2>
+<p>Memory backend (sqlite, lucid, markdown, none) + auto-save</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard memory</code></p>
+<h2 id="zeroclaw-onboard-hardware"><a class="header" href="#zeroclaw-onboard-hardware"><code>zeroclaw onboard hardware</code></a></h2>
+<p>Physical hardware transport (native GPIO, serial, probe)</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard hardware</code></p>
+<h2 id="zeroclaw-onboard-tunnel"><a class="header" href="#zeroclaw-onboard-tunnel"><code>zeroclaw onboard tunnel</code></a></h2>
+<p>Public tunnel provider (cloudflare, ngrok, tailscale, …)</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard tunnel</code></p>
+<h2 id="zeroclaw-onboard-personality"><a class="header" href="#zeroclaw-onboard-personality"><code>zeroclaw onboard personality</code></a></h2>
+<p>Edit the markdown files that shape your agent (SOUL, IDENTITY, USER, …)</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard personality</code></p>
+<h2 id="zeroclaw-agent"><a class="header" href="#zeroclaw-agent"><code>zeroclaw agent</code></a></h2>
+<p>启动 AI 代理循环。</p>
+<p>启动与配置的 AI 提供商的交互式聊天会话。使用 <code>--message</code> 进行单次查询，无需进入交互模式。</p>
+<p>示例：zeroclaw agent                              # 交互式会话 zeroclaw agent -m “Summarize today’s logs”  # 单条消息 zeroclaw agent -p anthropic –model claude-sonnet-4-20250514 zeroclaw agent –peripheral nucleo-f401re:/dev/ttyACM0</p>
+<p><strong>用法：</strong> <code>zeroclaw agent [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>-m</code>, <code>--message &lt;MESSAGE&gt;</code> — 单消息模式（不进入交互模式）</li>
+<li><code>--session-state-file &lt;SESSION_STATE_FILE&gt;</code> — 在此 JSON 文件中加载和保存交互式会话状态</li>
+<li><code>-p</code>, <code>--provider &lt;PROVIDER&gt;</code> — 要使用的提供商（openrouter、anthropic、openai、openai-codex）</li>
+<li><code>--model &lt;MODEL&gt;</code> — 要使用的模型</li>
+<li><code>-t</code>, <code>--temperature &lt;TEMPERATURE&gt;</code> — 温度（0.0 - 2.0，默认值为配置中的 <code>default_temperature</code>）</li>
+<li><code>--peripheral &lt;PERIPHERAL&gt;</code> — 附加外围设备（板子:路径，例如 nucleo-f401re:/dev/ttyACM0）</li>
+</ul>
+<h2 id="zeroclaw-gateway"><a class="header" href="#zeroclaw-gateway"><code>zeroclaw gateway</code></a></h2>
+<p>管理网关服务器（webhooks、websockets）。</p>
+<p>启动、重启或检查接受传入 webhook 事件和 WebSocket 连接的 HTTP/WebSocket 网关。</p>
+<p>示例：zeroclaw gateway start              # 启动网关 zeroclaw gateway restart            # 重启网关 zeroclaw gateway get-paircode       # 显示配对码</p>
+<p><strong>用法：</strong> <code>zeroclaw gateway [COMMAND]</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>start</code> — 启动网关服务器（如果未指定子命令，则为默认选项）</li>
+<li><code>restart</code> — 重启网关服务器</li>
+<li><code>get-paircode</code> — 显示或生成配对码，无需重启</li>
+</ul>
+<h2 id="zeroclaw-gateway-start"><a class="header" href="#zeroclaw-gateway-start"><code>zeroclaw gateway start</code></a></h2>
+<p>启动网关服务器（webhooks、websockets）。</p>
+<p>运行 HTTP/WebSocket 网关，该网关接受传入的 webhook 事件和 WebSocket 连接。绑定地址默认为配置文件中的值（gateway.host / gateway.port）。</p>
+<p>示例：zeroclaw gateway start              # 使用配置默认值 zeroclaw gateway start -p 8080      # 监听端口 8080 zeroclaw gateway start –host 0.0.0.0   # 需要 [gateway].allow_public_bind=true 或隧道 zeroclaw gateway start -p 0         # 随机可用端口</p>
+<p><strong>用法：</strong> <code>zeroclaw gateway start [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>-p</code>, <code>--port &lt;PORT&gt;</code> — 监听的端口（使用 0 表示随机可用端口）；默认为配置项 <code>gateway.port</code></li>
+<li><code>--host &lt;HOST&gt;</code> — 要绑定的主机；默认为配置中的 <code>gateway.host</code>。注意：绑定到 <code>0.0.0.0</code> 需要在配置中设置 <code>gateway.allow_public_bind = true</code></li>
+</ul>
+<h2 id="zeroclaw-gateway-restart"><a class="header" href="#zeroclaw-gateway-restart"><code>zeroclaw gateway restart</code></a></h2>
+<p>重启网关服务器。</p>
+<p>如果存在正在运行的网关，则停止它，然后使用当前配置启动新实例。</p>
+<p>示例：zeroclaw gateway restart            # 使用配置默认值重启 zeroclaw gateway restart -p 8080    # 在端口 8080 上重启</p>
+<p><strong>用法：</strong> <code>zeroclaw gateway restart [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>-p</code>, <code>--port &lt;PORT&gt;</code> — 监听的端口（使用 0 表示随机可用端口）；默认为配置项 <code>gateway.port</code></li>
+<li><code>--host &lt;HOST&gt;</code> — 要绑定的主机；默认为配置中的 <code>gateway.host</code>。注意：绑定到 <code>0.0.0.0</code> 需要在配置中设置 <code>gateway.allow_public_bind = true</code></li>
+</ul>
+<h2 id="zeroclaw-gateway-get-paircode"><a class="header" href="#zeroclaw-gateway-get-paircode"><code>zeroclaw gateway get-paircode</code></a></h2>
+<p>显示或生成网关配对码。</p>
+<p>显示用于连接新客户端的配对码，而无需重启网关。需要网关正在运行。</p>
+<p>使用 <code>--new</code> 参数时，即使网关之前已配对，也会生成一个新的配对码（适用于添加额外客户端）。</p>
+<p>示例：zeroclaw gateway get-paircode       # 显示当前配对码 zeroclaw gateway get-paircode –new # 生成新的配对码</p>
+<p><strong>用法：</strong> <code>zeroclaw gateway get-paircode [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--new</code> — 生成新的配对码（即使已配对）</li>
+</ul>
+<h2 id="zeroclaw-acp"><a class="header" href="#zeroclaw-acp"><code>zeroclaw acp</code></a></h2>
+<p>启动 ACP 服务器（基于 stdio 的 JSON-RPC 2.0）。</p>
+<p>在标准输入/标准输出上启动一个 JSON-RPC 2.0 服务器，用于 IDE 和工具集成。支持会话管理，并将流式代理响应作为通知发送。</p>
+<p>方法：initialize、session/new、session/prompt、session/stop。</p>
+<p>示例：zeroclaw acp                        # 启动 ACP 服务器 zeroclaw acp –max-sessions 5       # 限制并发会话数</p>
+<p><strong>用法：</strong> <code>zeroclaw acp [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--max-sessions &lt;MAX_SESSIONS&gt;</code> — 最大并发会话数（默认值：10）</li>
+<li><code>--session-timeout &lt;SESSION_TIMEOUT&gt;</code> — 会话不活动超时时间（秒）（默认值：3600）</li>
+</ul>
+<h2 id="zeroclaw-守护进程"><a class="header" href="#zeroclaw-守护进程"><code>zeroclaw 守护进程</code></a></h2>
+<p>启动长期运行的自主守护进程。</p>
+<p>启动完整的 ZeroClaw 运行时：包括网关服务器、所有已配置的频道（Telegram、Discord、Slack 等）、心跳监控器和定时任务调度器。这是在生产环境或作为常驻助手运行 ZeroClaw 的推荐方式。</p>
+<p>使用 <code>zeroclaw service install</code> 将守护进程注册为操作系统服务（systemd/launchd），以便在启动时自动运行。</p>
+<p>示例：zeroclaw daemon                   # 使用默认配置 zeroclaw daemon -p 9090           # 网关在端口 9090 上 zeroclaw daemon –host 127.0.0.1  # 仅限本地主机</p>
+<p><strong>用法：</strong> <code>zeroclaw daemon [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>-p</code>, <code>--port &lt;PORT&gt;</code> — 监听的端口（使用 0 表示随机可用端口）；默认为配置项 <code>gateway.port</code></li>
+<li><code>--host &lt;HOST&gt;</code> — 要绑定的主机；默认为配置中的 <code>gateway.host</code></li>
+</ul>
+<h2 id="zeroclaw-service"><a class="header" href="#zeroclaw-service"><code>zeroclaw service</code></a></h2>
+<p>管理操作系统服务生命周期（launchd/systemd 用户服务）</p>
+<p><strong>用法：</strong> <code>zeroclaw service [OPTIONS] &lt;COMMAND&gt;</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>install</code> — 安装守护进程服务单元，以实现开机自启和自动重启</li>
+<li><code>start</code> — 启动守护进程服务</li>
+<li><code>stop</code> — 停止守护进程服务</li>
+<li><code>restart</code> — 重启守护进程服务以应用最新配置</li>
+<li><code>status</code> — 检查守护进程服务状态</li>
+<li><code>uninstall</code> — 卸载守护进程服务单元</li>
+<li><code>logs</code> — 查看守护进程服务日志</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li>
+<p><code>--service-init &lt;SERVICE_INIT&gt;</code> — 要使用的初始化系统：auto（自动检测）、systemd 或 openrc</p>
+<p>默认值：<code>auto</code></p>
+<p>可能的值：<code>auto</code>、<code>systemd</code>、<code>openrc</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-service-install"><a class="header" href="#zeroclaw-service-install"><code>zeroclaw service install</code></a></h2>
+<p>安装守护进程服务单元以实现自动启动和重启</p>
+<p><strong>用法：</strong> <code>zeroclaw service install</code></p>
+<h2 id="zeroclaw-service-start"><a class="header" href="#zeroclaw-service-start"><code>zeroclaw service start</code></a></h2>
+<p>启动守护进程服务</p>
+<p><strong>用法：</strong> <code>zeroclaw service start</code></p>
+<h2 id="zeroclaw-service-stop"><a class="header" href="#zeroclaw-service-stop"><code>zeroclaw service stop</code></a></h2>
+<p>停止守护进程服务</p>
+<p><strong>用法：</strong> <code>zeroclaw service stop</code></p>
+<h2 id="zeroclaw-service-restart"><a class="header" href="#zeroclaw-service-restart"><code>zeroclaw service restart</code></a></h2>
+<p>重启守护进程服务以应用最新配置</p>
+<p><strong>用法：</strong> <code>zeroclaw service restart</code></p>
+<h2 id="zeroclaw-服务状态"><a class="header" href="#zeroclaw-服务状态"><code>zeroclaw 服务状态</code></a></h2>
+<p>检查守护进程服务状态</p>
+<p><strong>用法：</strong> <code>zeroclaw service status</code></p>
+<h2 id="zeroclaw-service-uninstall"><a class="header" href="#zeroclaw-service-uninstall"><code>zeroclaw service uninstall</code></a></h2>
+<p>卸载守护进程服务单元</p>
+<p><strong>用法：</strong> <code>zeroclaw service uninstall</code></p>
+<h2 id="zeroclaw-service-logs"><a class="header" href="#zeroclaw-service-logs"><code>zeroclaw service logs</code></a></h2>
+<p>跟踪守护进程服务日志</p>
+<p><strong>用法：</strong> <code>zeroclaw service logs [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li>
+<p><code>-n</code>, <code>--lines &lt;LINES&gt;</code> — 显示的行数（默认值：50）</p>
+<p>默认值：<code>50</code></p>
+</li>
+<li>
+<p><code>-f</code>、<code>--follow</code> — 跟踪日志输出（类似于 <code>tail -f</code>）</p>
+</li>
+</ul>
+<h2 id="zeroclaw-doctor"><a class="header" href="#zeroclaw-doctor"><code>zeroclaw doctor</code></a></h2>
+<p>运行守护进程/调度器/通道新鲜度的诊断</p>
+<p><strong>用法：</strong> <code>zeroclaw doctor [COMMAND]</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>models</code> — 跨提供商探测模型目录并报告可用性</li>
+<li><code>traces</code> — 查询运行时跟踪事件（工具诊断和模型回复）</li>
+</ul>
+<h2 id="zeroclaw-doctor-models"><a class="header" href="#zeroclaw-doctor-models"><code>zeroclaw doctor models</code></a></h2>
+<p>探测各提供商的模型目录并报告可用性</p>
+<p><strong>用法：</strong> <code>zeroclaw doctor models [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--provider &lt;PROVIDER&gt;</code> — 仅探测指定的提供者（默认：所有已知提供者）</li>
+<li><code>--use-cache</code> — 优先使用缓存的目录（跳过强制实时刷新）</li>
+</ul>
+<h2 id="zeroclaw-doctor-traces"><a class="header" href="#zeroclaw-doctor-traces"><code>zeroclaw doctor traces</code></a></h2>
+<p>查询运行时跟踪事件（工具诊断和模型回复）</p>
+<p><strong>用法：</strong> <code>zeroclaw doctor traces [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li>
+<p><code>--id &lt;ID&gt;</code> — 按 ID 显示特定的跟踪事件</p>
+</li>
+<li>
+<p><code>--event &lt;EVENT&gt;</code> — 按事件类型过滤列表输出</p>
+</li>
+<li>
+<p><code>--contains &lt;CONTAINS&gt;</code> — 跨消息/负载的不区分大小写的文本匹配</p>
+</li>
+<li>
+<p><code>--limit &lt;LIMIT&gt;</code> — 显示的最大事件数</p>
+<p>默认值：<code>20</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-status"><a class="header" href="#zeroclaw-status"><code>zeroclaw status</code></a></h2>
+<p>显示系统状态（详细信息）</p>
+<p><strong>用法：</strong> <code>zeroclaw status [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--format &lt;FORMAT&gt;</code> — 输出格式：“exit-code” 在健康时退出码为 0，否则为 1（用于 Docker HEALTHCHECK）</li>
+</ul>
+<h2 id="zeroclaw-estop"><a class="header" href="#zeroclaw-estop"><code>zeroclaw estop</code></a></h2>
+<p>激活、检查并恢复紧急停止状态。</p>
+<p>示例：- <code>zeroclaw estop</code> - <code>zeroclaw estop --level network-kill</code> - <code>zeroclaw estop --level domain-block --domain "*.chase.com"</code> - <code>zeroclaw estop --level tool-freeze --tool shell --tool browser</code> - <code>zeroclaw estop status</code> - <code>zeroclaw estop resume --network</code> - <code>zeroclaw estop resume --domain "*.chase.com"</code> - <code>zeroclaw estop resume --tool shell</code></p>
+<p><strong>用法：</strong> <code>zeroclaw estop [OPTIONS] [COMMAND]</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>status</code> — 打印当前急停状态</li>
+<li><code>resume</code> — 从已激活的急停级别恢复</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li>
+<p><code>--level &lt;LEVEL&gt;</code> — 从 <code>zeroclaw estop</code> 触发急停时使用的级别</p>
+<p>可能的值：<code>kill-all</code>、<code>network-kill</code>、<code>domain-block</code>、<code>tool-freeze</code></p>
+</li>
+<li>
+<p><code>--domain &lt;DOMAINS&gt;</code> — <code>domain-block</code> 的域名模式（可重复）</p>
+</li>
+<li>
+<p><code>--tool &lt;TOOLS&gt;</code> — <code>tool-freeze</code> 使用的工具名称（可重复指定）</p>
+</li>
+</ul>
+<h2 id="zeroclaw-急停状态"><a class="header" href="#zeroclaw-急停状态"><code>zeroclaw 急停状态</code></a></h2>
+<p>打印当前急停状态</p>
+<p><strong>用法：</strong> <code>zeroclaw estop status</code></p>
+<h2 id="zeroclaw-停止-恢复"><a class="header" href="#zeroclaw-停止-恢复"><code>zeroclaw 停止 恢复</code></a></h2>
+<p>从已激活的急停电平恢复</p>
+<p><strong>用法：</strong> <code>zeroclaw estop resume [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--network</code> — 仅恢复网络终止</li>
+<li><code>--domain &lt;DOMAINS&gt;</code> — 恢复一个或多个被阻止的域名模式</li>
+<li><code>--tool &lt;TOOLS&gt;</code> — 恢复一个或多个冻结的工具</li>
+<li><code>--otp &lt;OTP&gt;</code> — OTP 验证码。如果省略且需要 OTP，则会显示提示</li>
+</ul>
+<h2 id="zeroclaw-cron"><a class="header" href="#zeroclaw-cron"><code>zeroclaw cron</code></a></h2>
+<p>配置和管理定时任务。</p>
+<p>使用 cron 表达式、RFC 3339 时间戳、持续时间或固定间隔来安排周期性、一次性或基于间隔的任务。</p>
+<p>Cron 表达式使用标准的 5 字段格式：‘min hour day month weekday’。时区默认为 UTC；可通过 –tz 和 IANA 时区名称进行覆盖。</p>
+<p>示例：zeroclaw cron list zeroclaw cron add ‘0 9 * * 1-5’ ‘早上好’ –tz America/New_York –agent zeroclaw cron add ‘*/30 * * * <em>’ ‘检查系统健康状态’ –agent zeroclaw cron add ‘</em>/5 * * * *’ ‘echo ok’ zeroclaw cron add-at 2025-01-15T14:00:00Z ‘发送提醒’ –agent zeroclaw cron add-every 60000 ‘Ping 心跳’ zeroclaw cron once 30m ‘30 分钟后运行备份’ –agent zeroclaw cron pause TASK_ID zeroclaw cron update TASK_ID –expression ‘0 8 * * *’ –tz Europe/London</p>
+<p><strong>用法：</strong> <code>zeroclaw cron &lt;COMMAND&gt;</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>list</code> — 列出所有计划任务</li>
+<li><code>add</code> — 添加新的计划任务</li>
+<li><code>add-at</code> — 在 RFC3339 时间戳处添加一个一次性定时任务</li>
+<li><code>add-every</code> — 添加一个固定间隔的定时任务</li>
+<li><code>once</code> — 添加一个一次性延迟任务（例如 “30m”、“2h”、“1d”）</li>
+<li><code>remove</code> — 移除已调度的任务</li>
+<li><code>update</code> — 更新计划任务</li>
+<li><code>pause</code> — 暂停计划任务</li>
+<li><code>resume</code> — 恢复暂停的任务</li>
+</ul>
+<h2 id="zeroclaw-cron-list"><a class="header" href="#zeroclaw-cron-list"><code>zeroclaw cron list</code></a></h2>
+<p>列出所有计划任务</p>
+<p><strong>用法：</strong> <code>zeroclaw cron list</code></p>
+<h2 id="zeroclaw-cron-add"><a class="header" href="#zeroclaw-cron-add"><code>zeroclaw cron add</code></a></h2>
+<p>添加一个新的周期性计划任务。</p>
+<p>使用标准的 5 字段 cron 语法：‘min hour day month weekday’。默认情况下，时间以 UTC 进行评估；使用 –tz 和 IANA 时区名称来覆盖。</p>
+<p>示例：zeroclaw cron add ‘0 9 * * 1-5’ ‘Good morning’ –tz America/New_York –agent zeroclaw cron add ‘*/30 * * * <em>’ ‘Check system health’ –agent zeroclaw cron add ‘</em>/5 * * * *’ ‘echo ok’</p>
+<p><strong>用法：</strong> <code>zeroclaw cron add [OPTIONS] &lt;EXPRESSION&gt; &lt;COMMAND&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;EXPRESSION&gt;</code> — Cron 表达式</li>
+<li><code>&lt;COMMAND&gt;</code> — 要运行的命令（Shell）或提示（代理）</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--tz &lt;TZ&gt;</code> — 可选的 IANA 时区（例如 America/Los_Angeles）</li>
+<li><code>--agent</code> — 将参数视为代理提示，而非 shell 命令</li>
+<li><code>--allowed-tool &lt;ALLOWED_TOOLS&gt;</code> — 限制代理的定时任务仅使用指定的工具名称（可重复，仅适用于代理）</li>
+</ul>
+<h2 id="zeroclaw-cron-add-at"><a class="header" href="#zeroclaw-cron-add-at"><code>zeroclaw cron add-at</code></a></h2>
+<p>添加一个在特定 UTC 时间戳触发的单次任务。</p>
+<p>时间戳必须采用 RFC 3339 格式（例如 2025-01-15T14:00:00Z）。</p>
+<p>示例：zeroclaw cron add-at 2025-01-15T14:00:00Z ‘发送提醒’ zeroclaw cron add-at 2025-12-31T23:59:00Z ‘新年快乐！’</p>
+<p><strong>用法：</strong> <code>zeroclaw cron add-at [OPTIONS] &lt;AT&gt; &lt;COMMAND&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;AT&gt;</code> — RFC3339 格式的瞬时时间戳</li>
+<li><code>&lt;COMMAND&gt;</code> — 要运行的命令（Shell）或提示（代理）</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--agent</code> — 将参数视为代理提示，而非 shell 命令</li>
+<li><code>--allowed-tool &lt;ALLOWED_TOOLS&gt;</code> — 限制代理的定时任务仅使用指定的工具名称（可重复，仅适用于代理）</li>
+</ul>
+<h2 id="zeroclaw-cron-add-every"><a class="header" href="#zeroclaw-cron-add-every"><code>zeroclaw cron add-every</code></a></h2>
+<p>添加一个以固定间隔重复的任务。</p>
+<p>间隔以毫秒为单位指定。例如，60000 = 1 分钟。</p>
+<p>示例：zeroclaw cron add-every 60000 ‘Ping 心跳’     # 每分钟执行一次 zeroclaw cron add-every 3600000 ‘每小时报告’    # 每小时执行一次</p>
+<p><strong>用法：</strong> <code>zeroclaw cron add-every [OPTIONS] &lt;EVERY_MS&gt; &lt;COMMAND&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;EVERY_MS&gt;</code> — 以毫秒为单位的间隔</li>
+<li><code>&lt;COMMAND&gt;</code> — 要运行的命令（Shell）或提示（代理）</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--agent</code> — 将参数视为代理提示，而非 shell 命令</li>
+<li><code>--allowed-tool &lt;ALLOWED_TOOLS&gt;</code> — 限制代理的定时任务仅使用指定的工具名称（可重复，仅适用于代理）</li>
+</ul>
+<h2 id="zeroclaw-cron-once"><a class="header" href="#zeroclaw-cron-once"><code>zeroclaw cron once</code></a></h2>
+<p>添加一个从现在起延迟后触发的一次性任务。</p>
+<p>接受人类可读的时间间隔：s（秒）、m（分钟）、h（小时）、d（天）。</p>
+<p>示例：zeroclaw cron once 30m ‘在 30 分钟后运行备份’ zeroclaw cron once 2h ‘跟进部署’ zeroclaw cron once 1d ‘每日检查’</p>
+<p><strong>用法：</strong> <code>zeroclaw cron once [OPTIONS] &lt;DELAY&gt; &lt;COMMAND&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;DELAY&gt;</code> — 延迟持续时间</li>
+<li><code>&lt;COMMAND&gt;</code> — 要运行的命令（Shell）或提示（代理）</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--agent</code> — 将参数视为代理提示，而非 shell 命令</li>
+<li><code>--allowed-tool &lt;ALLOWED_TOOLS&gt;</code> — 限制代理的定时任务仅使用指定的工具名称（可重复，仅适用于代理）</li>
+</ul>
+<h2 id="zeroclaw-cron-remove"><a class="header" href="#zeroclaw-cron-remove"><code>zeroclaw cron remove</code></a></h2>
+<p>删除计划任务</p>
+<p><strong>用法：</strong> <code>zeroclaw cron remove &lt;ID&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;ID&gt;</code> — 任务 ID</li>
+</ul>
+<h2 id="zeroclaw-cron-update"><a class="header" href="#zeroclaw-cron-update"><code>zeroclaw cron update</code></a></h2>
+<p>更新现有计划任务的一个或多个字段。</p>
+<p>仅更改您指定的字段；其他字段保持不变。</p>
+<p>示例：zeroclaw cron update TASK_ID –expression ‘0 8 * * *’ zeroclaw cron update TASK_ID –tz Europe/London –name ‘Morning check’ zeroclaw cron update TASK_ID –command ‘Updated message’</p>
+<p><strong>用法：</strong> <code>zeroclaw cron update [OPTIONS] &lt;ID&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;ID&gt;</code> — 任务 ID</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--expression &lt;EXPRESSION&gt;</code> — 新的 cron 表达式</li>
+<li><code>--tz &lt;TZ&gt;</code> — 新的 IANA 时区</li>
+<li><code>--command &lt;COMMAND&gt;</code> — 要运行的新命令</li>
+<li><code>--name &lt;NAME&gt;</code> — 新作业名称</li>
+<li><code>--allowed-tool &lt;ALLOWED_TOOLS&gt;</code> — 使用指定的工具名称替换代理作业的允许工具列表（可重复）</li>
+</ul>
+<h2 id="zeroclaw-cron-pause"><a class="header" href="#zeroclaw-cron-pause"><code>zeroclaw cron pause</code></a></h2>
+<p>暂停计划任务</p>
+<p><strong>用法：</strong> <code>zeroclaw cron pause &lt;ID&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;ID&gt;</code> — 任务 ID</li>
+</ul>
+<h2 id="zeroclaw-cron-resume"><a class="header" href="#zeroclaw-cron-resume"><code>zeroclaw cron resume</code></a></h2>
+<p>恢复暂停的任务</p>
+<p><strong>用法：</strong> <code>zeroclaw cron resume &lt;ID&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;ID&gt;</code> — 任务 ID</li>
+</ul>
+<h2 id="zeroclaw-模型"><a class="header" href="#zeroclaw-模型"><code>zeroclaw 模型</code></a></h2>
+<p>管理提供程序模型目录</p>
+<p><strong>用法：</strong> <code>zeroclaw models &lt;COMMAND&gt;</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>refresh</code> — 刷新并缓存提供程序模型</li>
+<li><code>list</code> — 列出某个提供者的缓存模型</li>
+<li><code>set</code> — 在配置中设置默认模型</li>
+<li><code>status</code> — 显示当前模型配置和缓存状态</li>
+</ul>
+<h2 id="zeroclaw-models-refresh"><a class="header" href="#zeroclaw-models-refresh"><code>zeroclaw models refresh</code></a></h2>
+<p>刷新并缓存提供程序模型</p>
+<p><strong>用法：</strong> <code>zeroclaw models refresh [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--provider &lt;PROVIDER&gt;</code> — 提供程序名称（默认为配置的默认提供程序）</li>
+<li><code>--all</code> — 刷新所有支持实时模型发现功能的提供程序</li>
+<li><code>--force</code> — 强制实时刷新并忽略缓存</li>
+</ul>
+<h2 id="zeroclaw-models-list"><a class="header" href="#zeroclaw-models-list"><code>zeroclaw models list</code></a></h2>
+<p>列出提供商的缓存模型</p>
+<p><strong>用法：</strong> <code>zeroclaw models list [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--provider &lt;PROVIDER&gt;</code> — 提供程序名称（默认为配置的默认提供程序）</li>
+</ul>
+<h2 id="zeroclaw-models-set"><a class="header" href="#zeroclaw-models-set"><code>zeroclaw models set</code></a></h2>
+<p>在配置中设置默认模型</p>
+<p><strong>用法：</strong> <code>zeroclaw models set &lt;MODEL&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;MODEL&gt;</code> — 设置为默认值的模型名称</li>
+</ul>
+<h2 id="zeroclaw-模型状态"><a class="header" href="#zeroclaw-模型状态"><code>zeroclaw 模型状态</code></a></h2>
+<p>显示当前模型配置和缓存状态</p>
+<p><strong>用法：</strong> <code>zeroclaw models status</code></p>
+<h2 id="zeroclaw-providers"><a class="header" href="#zeroclaw-providers"><code>zeroclaw providers</code></a></h2>
+<p>列出支持的 AI 提供商</p>
+<p><strong>用法：</strong> <code>zeroclaw providers</code></p>
+<h2 id="zeroclaw-channel"><a class="header" href="#zeroclaw-channel"><code>zeroclaw channel</code></a></h2>
+<p>管理通信通道。</p>
+<p>添加、删除、列出、发送和健康检查连接 ZeroClaw 到消息平台的通道。支持的通道类型：telegram、discord、slack、whatsapp、matrix、imessage、email。</p>
+<p>示例：zeroclaw 频道列表 zeroclaw 频道医生 zeroclaw 频道添加 telegram ‘{“bot_token”:“…”,“name”:“my-bot”}’ zeroclaw 频道移除 my-bot zeroclaw 频道绑定-telegram zeroclaw_user zeroclaw 频道发送 ‘Alert!’ –channel-id telegram –recipient 123456789</p>
+<p><strong>用法：</strong> <code>zeroclaw channel &lt;COMMAND&gt;</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>list</code> — 列出所有已配置的通道</li>
+<li><code>start</code> — 启动所有配置的通道（在 main.rs 中处理异步）</li>
+<li><code>doctor</code> — 运行已配置通道的健康检查（在 main.rs 中处理异步逻辑）</li>
+<li><code>add</code> — 添加新的频道配置</li>
+<li><code>remove</code> — 移除频道配置</li>
+<li><code>bind-telegram</code> — 将 Telegram 身份（用户名或数字用户 ID）绑定到白名单中</li>
+<li><code>send</code> — 向配置的频道发送消息</li>
+</ul>
+<h2 id="zeroclaw-频道列表"><a class="header" href="#zeroclaw-频道列表"><code>zeroclaw 频道列表</code></a></h2>
+<p>列出所有已配置的频道</p>
+<p><strong>用法：</strong> <code>zeroclaw channel list</code></p>
+<h2 id="zeroclaw-channel-start"><a class="header" href="#zeroclaw-channel-start"><code>zeroclaw channel start</code></a></h2>
+<p>启动所有已配置的通道（在 main.rs 中处理异步）</p>
+<p><strong>用法：</strong> <code>zeroclaw channel start</code></p>
+<h2 id="zeroclaw-channel-doctor"><a class="header" href="#zeroclaw-channel-doctor"><code>zeroclaw channel doctor</code></a></h2>
+<p>为配置的通道运行健康检查（在 main.rs 中处理异步部分）</p>
+<p><strong>用法：</strong> <code>zeroclaw channel doctor</code></p>
+<h2 id="zeroclaw-channel-add"><a class="header" href="#zeroclaw-channel-add"><code>zeroclaw channel add</code></a></h2>
+<p>添加新的通道配置。</p>
+<p>提供通道类型以及该通道类型所需的配置键的 JSON 对象。</p>
+<p>支持的类型：telegram、discord、slack、whatsapp、matrix、imessage、email。</p>
+<p>示例：zeroclaw channel add telegram ‘{“bot_token”:“…”,“name”:“my-bot”}’ zeroclaw channel add discord ‘{“bot_token”:“…”,“name”:“my-discord”}’</p>
+<p><strong>用法：</strong> <code>zeroclaw channel add &lt;CHANNEL_TYPE&gt; &lt;CONFIG&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;CHANNEL_TYPE&gt;</code> — 通道类型（telegram、discord、slack、whatsapp、matrix、imessage、email）</li>
+<li><code>&lt;CONFIG&gt;</code> — 可选的 JSON 格式配置</li>
+</ul>
+<h2 id="zeroclaw-channel-remove"><a class="header" href="#zeroclaw-channel-remove"><code>zeroclaw channel remove</code></a></h2>
+<p>移除频道配置</p>
+<p><strong>用法：</strong> <code>zeroclaw channel remove &lt;NAME&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;NAME&gt;</code> — 要移除的频道名称</li>
+</ul>
+<h2 id="zeroclaw-频道绑定-telegram"><a class="header" href="#zeroclaw-频道绑定-telegram"><code>zeroclaw 频道绑定-telegram</code></a></h2>
+<p>将 Telegram 身份绑定到白名单中。</p>
+<p>将 Telegram 用户名（不带 ‘@’ 前缀）或数字用户 ID 添加到频道白名单中，以便代理能够响应来自该身份的消息。</p>
+<p>示例：zeroclaw 频道绑定-telegram zeroclaw_user zeroclaw 频道绑定-telegram 123456789</p>
+<p><strong>用法：</strong> <code>zeroclaw channel bind-telegram &lt;IDENTITY&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;IDENTITY&gt;</code> — 允许使用的 Telegram 身份标识（不含 ‘@’ 的用户名或数字用户 ID）</li>
+</ul>
+<h2 id="zeroclaw-channel-send"><a class="header" href="#zeroclaw-channel-send"><code>zeroclaw channel send</code></a></h2>
+<p>向配置的频道发送一次性消息。</p>
+<p>通过指定的通道发送文本消息，而无需启动完整的代理循环。适用于脚本化通知、硬件传感器警报和自动化流水线。</p>
+<p><code>--channel-id</code> 通过配置节名称（例如 ‘telegram’、‘discord’、‘slack’）选择通道。<code>--recipient</code> 是平台特定的目标地址（例如 Telegram 的聊天 ID）。</p>
+<p>示例：zeroclaw channel send ‘有人靠近你的设备。’ –channel-id telegram –recipient 123456789 zeroclaw channel send ‘构建成功！’ –channel-id discord –recipient 987654321</p>
+<p><strong>用法：</strong> <code>zeroclaw channel send --channel-id &lt;CHANNEL_ID&gt; --recipient &lt;RECIPIENT&gt; &lt;MESSAGE&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;MESSAGE&gt;</code> — 要发送的消息文本</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--channel-id &lt;CHANNEL_ID&gt;</code> — 通道配置名称（例如 telegram、discord、slack）</li>
+<li><code>--recipient &lt;RECIPIENT&gt;</code> — 接收者标识符（平台特定，例如 Telegram 聊天 ID）</li>
+</ul>
+<h2 id="zeroclaw-集成"><a class="header" href="#zeroclaw-集成"><code>zeroclaw 集成</code></a></h2>
+<p>浏览 50 多种集成</p>
+<p><strong>用法：</strong> <code>zeroclaw integrations &lt;COMMAND&gt;</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>info</code> — 显示特定集成的详细信息</li>
+</ul>
+<h2 id="zeroclaw-集成信息"><a class="header" href="#zeroclaw-集成信息"><code>zeroclaw 集成信息</code></a></h2>
+<p>显示特定集成的详细信息</p>
+<p><strong>用法：</strong> <code>zeroclaw integrations info &lt;NAME&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;NAME&gt;</code> — 集成名称</li>
+</ul>
+<h2 id="zeroclaw-skills"><a class="header" href="#zeroclaw-skills"><code>zeroclaw skills</code></a></h2>
+<p>管理技能（用户定义的能力）</p>
+<p><strong>用法：</strong> <code>zeroclaw skills &lt;COMMAND&gt;</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>list</code> — 列出所有已安装的技能</li>
+<li><code>audit</code> — 审计技能源目录或已安装的技能名称</li>
+<li><code>install</code> — 从 URL 或本地路径安装新技能</li>
+<li><code>remove</code> — 移除已安装的技能</li>
+<li><code>test</code> — 运行 TEST.sh 验证某个技能（或所有技能）</li>
+</ul>
+<h2 id="zeroclaw-skills-list"><a class="header" href="#zeroclaw-skills-list"><code>zeroclaw skills list</code></a></h2>
+<p>列出所有已安装的技能</p>
+<p><strong>用法：</strong> <code>zeroclaw skills list</code></p>
+<h2 id="zeroclaw-技能审计"><a class="header" href="#zeroclaw-技能审计"><code>zeroclaw 技能审计</code></a></h2>
+<p>审计技能源目录或已安装的技能名称</p>
+<p><strong>用法：</strong> <code>zeroclaw skills audit &lt;SOURCE&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;SOURCE&gt;</code> — 技能路径或已安装的技能名称</li>
+</ul>
+<h2 id="zeroclaw-skills-install"><a class="header" href="#zeroclaw-skills-install"><code>zeroclaw skills install</code></a></h2>
+<p>从 URL 或本地路径安装新技能</p>
+<p><strong>用法：</strong> <code>zeroclaw skills install &lt;SOURCE&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;SOURCE&gt;</code> — 源 URL 或本地路径</li>
+</ul>
+<h2 id="zeroclaw-skills-remove"><a class="header" href="#zeroclaw-skills-remove"><code>zeroclaw skills remove</code></a></h2>
+<p>移除已安装的技能</p>
+<p><strong>用法：</strong> <code>zeroclaw skills remove &lt;NAME&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;NAME&gt;</code> — 要移除的技能名称</li>
+</ul>
+<h2 id="zeroclaw-技能测试"><a class="header" href="#zeroclaw-技能测试"><code>zeroclaw 技能测试</code></a></h2>
+<p>运行 TEST.sh 验证某个技能（或所有技能）</p>
+<p><strong>用法：</strong> <code>zeroclaw skills test [OPTIONS] [NAME]</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;NAME&gt;</code> — 要测试的技能名称；省略表示所有技能</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--verbose</code> — 显示详细输出</li>
+</ul>
+<h2 id="zeroclaw-sop"><a class="header" href="#zeroclaw-sop"><code>zeroclaw sop</code></a></h2>
+<p>管理标准操作程序（SOP）</p>
+<p><strong>用法：</strong> <code>zeroclaw sop &lt;COMMAND&gt;</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>list</code> — 列出已加载的 SOP</li>
+<li><code>validate</code> — 验证 SOP 定义</li>
+<li><code>show</code> — 显示 SOP 的详细信息</li>
+</ul>
+<h2 id="zeroclaw-sop-list"><a class="header" href="#zeroclaw-sop-list"><code>zeroclaw sop list</code></a></h2>
+<p>列出已加载的 SOP</p>
+<p><strong>用法：</strong> <code>zeroclaw sop list</code></p>
+<h2 id="zeroclaw-sop-validate"><a class="header" href="#zeroclaw-sop-validate"><code>zeroclaw sop validate</code></a></h2>
+<p>验证SOP定义</p>
+<p><strong>用法：</strong> <code>zeroclaw sop validate [NAME]</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;NAME&gt;</code> — 要验证的 SOP 名称（如果省略，则验证所有 SOP）</li>
+</ul>
+<h2 id="zeroclaw-sop-show"><a class="header" href="#zeroclaw-sop-show"><code>zeroclaw sop show</code></a></h2>
+<p>显示 SOP 的详细信息</p>
+<p><strong>用法：</strong> <code>zeroclaw sop show &lt;NAME&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;NAME&gt;</code> — 要显示的SOP的名称</li>
+</ul>
+<h2 id="zeroclaw-migrate"><a class="header" href="#zeroclaw-migrate"><code>zeroclaw migrate</code></a></h2>
+<p>从其他代理运行时迁移数据</p>
+<p><strong>用法：</strong> <code>zeroclaw migrate &lt;COMMAND&gt;</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>openclaw</code> — 将 <code>OpenClaw</code> 工作区中的内存导入到当前 <code>ZeroClaw</code> 工作区</li>
+</ul>
+<h2 id="zeroclaw-migrate-openclaw"><a class="header" href="#zeroclaw-migrate-openclaw"><code>zeroclaw migrate openclaw</code></a></h2>
+<p>将 <code>OpenClaw</code> 工作区中的内存导入到当前 <code>ZeroClaw</code> 工作区</p>
+<p><strong>用法：</strong> <code>zeroclaw migrate openclaw [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--source &lt;SOURCE&gt;</code> — 可选的 <code>OpenClaw</code> 工作区路径（默认为 ~/.openclaw/workspace）</li>
+<li><code>--dry-run</code> — 验证并预览迁移，但不写入任何数据</li>
+</ul>
+<h2 id="zeroclaw-auth"><a class="header" href="#zeroclaw-auth"><code>zeroclaw auth</code></a></h2>
+<p>管理提供商订阅身份验证配置文件</p>
+<p><strong>用法：</strong> <code>zeroclaw auth &lt;COMMAND&gt;</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>login</code> — 使用 OAuth 登录（OpenAI Codex 或 Gemini）</li>
+<li><code>paste-redirect</code> — 通过粘贴重定向 URL 或授权码完成 OAuth</li>
+<li><code>paste-token</code> — 粘贴设置令牌 / 身份验证令牌（用于 Anthropic 订阅身份验证）</li>
+<li><code>setup-token</code> — <code>paste-token</code> 的别名（默认以交互模式运行）</li>
+<li><code>refresh</code> — 使用刷新令牌刷新 OpenAI Codex 访问令牌</li>
+<li><code>logout</code> — 移除认证配置文件</li>
+<li><code>use</code> — 为提供程序设置活动配置文件</li>
+<li><code>list</code> — 列出认证配置文件</li>
+<li><code>status</code> — 显示认证状态，包括当前配置的用户配置文件和令牌过期信息</li>
+</ul>
+<h2 id="zeroclaw-auth-login"><a class="header" href="#zeroclaw-auth-login"><code>zeroclaw auth login</code></a></h2>
+<p>使用 OAuth 登录（OpenAI Codex 或 Gemini）</p>
+<p><strong>用法：</strong> <code>zeroclaw auth login [OPTIONS] --provider &lt;PROVIDER&gt;</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li>
+<p><code>--provider &lt;PROVIDER&gt;</code> — 提供程序（<code>openai-codex</code> 或 <code>gemini</code>）</p>
+</li>
+<li>
+<p><code>--profile &lt;PROFILE&gt;</code> — 配置文件名称（默认值：default）</p>
+<p>默认值：<code>default</code></p>
+</li>
+<li>
+<p><code>--device-code</code> — 使用 OAuth 设备码流程</p>
+</li>
+<li>
+<p><code>--import &lt;PATH&gt;</code> — 导入现有的 auth.json 文件，而不是启动新的登录流程。目前仅支持 <code>openai-codex</code>；Codex 默认使用 <code>~/.codex/auth.json</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-auth-paste-redirect"><a class="header" href="#zeroclaw-auth-paste-redirect"><code>zeroclaw auth paste-redirect</code></a></h2>
+<p>通过粘贴重定向 URL 或授权码完成 OAuth</p>
+<p><strong>用法：</strong> <code>zeroclaw auth paste-redirect [OPTIONS] --provider &lt;PROVIDER&gt;</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li>
+<p><code>--provider &lt;PROVIDER&gt;</code> — 提供程序（<code>openai-codex</code>）</p>
+</li>
+<li>
+<p><code>--profile &lt;PROFILE&gt;</code> — 配置文件名称（默认值：default）</p>
+<p>默认值：<code>default</code></p>
+</li>
+<li>
+<p><code>--input &lt;INPUT&gt;</code> — 完整的重定向 URL 或原始 OAuth 代码</p>
+</li>
+</ul>
+<h2 id="zeroclaw-auth-paste-token"><a class="header" href="#zeroclaw-auth-paste-token"><code>zeroclaw auth paste-token</code></a></h2>
+<p>粘贴设置令牌 / 认证令牌（用于 Anthropic 订阅认证）</p>
+<p><strong>用法：</strong> <code>zeroclaw auth paste-token [OPTIONS] --provider &lt;PROVIDER&gt;</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li>
+<p><code>--provider &lt;PROVIDER&gt;</code> — 提供程序（<code>anthropic</code>）</p>
+</li>
+<li>
+<p><code>--profile &lt;PROFILE&gt;</code> — 配置文件名称（默认值：default）</p>
+<p>默认值：<code>default</code></p>
+</li>
+<li>
+<p><code>--token &lt;TOKEN&gt;</code> — Token 值（如果省略，则交互式读取）</p>
+</li>
+<li>
+<p><code>--auth-kind &lt;AUTH_KIND&gt;</code> — 身份验证类型覆盖（<code>authorization</code> 或 <code>api-key</code>）</p>
+</li>
+</ul>
+<h2 id="zeroclaw-auth-setup-token"><a class="header" href="#zeroclaw-auth-setup-token"><code>zeroclaw auth setup-token</code></a></h2>
+<p><code>paste-token</code> 的别名（默认以交互模式运行）</p>
+<p><strong>用法：</strong> <code>zeroclaw auth setup-token [OPTIONS] --provider &lt;PROVIDER&gt;</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li>
+<p><code>--provider &lt;PROVIDER&gt;</code> — 提供程序（<code>anthropic</code>）</p>
+</li>
+<li>
+<p><code>--profile &lt;PROFILE&gt;</code> — 配置文件名称（默认值：default）</p>
+<p>默认值：<code>default</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-auth-refresh"><a class="header" href="#zeroclaw-auth-refresh"><code>zeroclaw auth refresh</code></a></h2>
+<p>使用刷新令牌刷新 OpenAI Codex 访问令牌</p>
+<p><strong>用法：</strong> <code>zeroclaw auth refresh [OPTIONS] --provider &lt;PROVIDER&gt;</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--provider &lt;PROVIDER&gt;</code> — 提供程序（<code>openai-codex</code>）</li>
+<li><code>--profile &lt;PROFILE&gt;</code> — 配置文件名称或配置文件 ID</li>
+</ul>
+<h2 id="zeroclaw-auth-logout"><a class="header" href="#zeroclaw-auth-logout"><code>zeroclaw auth logout</code></a></h2>
+<p>移除身份验证配置文件</p>
+<p><strong>用法：</strong> <code>zeroclaw auth logout [OPTIONS] --provider &lt;PROVIDER&gt;</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li>
+<p><code>--provider &lt;PROVIDER&gt;</code> — 提供程序</p>
+</li>
+<li>
+<p><code>--profile &lt;PROFILE&gt;</code> — 配置文件名称（默认值：default）</p>
+<p>默认值：<code>default</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-auth-use"><a class="header" href="#zeroclaw-auth-use"><code>zeroclaw auth use</code></a></h2>
+<p>为提供商设置活动配置文件</p>
+<p><strong>用法：</strong> <code>zeroclaw auth use --provider &lt;PROVIDER&gt; --profile &lt;PROFILE&gt;</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--provider &lt;PROVIDER&gt;</code> — 提供程序</li>
+<li><code>--profile &lt;PROFILE&gt;</code> — 配置文件名称或完整的配置文件 ID</li>
+</ul>
+<h2 id="zeroclaw-auth-list"><a class="header" href="#zeroclaw-auth-list"><code>zeroclaw auth list</code></a></h2>
+<p>列出身份验证配置文件</p>
+<p><strong>用法：</strong> <code>zeroclaw auth list</code></p>
+<h2 id="zeroclaw-auth-status"><a class="header" href="#zeroclaw-auth-status"><code>zeroclaw auth status</code></a></h2>
+<p>显示具有活动配置文件的身份验证状态和令牌过期信息</p>
+<p><strong>用法：</strong> <code>zeroclaw auth status</code></p>
+<h2 id="zeroclaw-硬件"><a class="header" href="#zeroclaw-硬件"><code>zeroclaw 硬件</code></a></h2>
+<p>发现并检查 USB 硬件。</p>
+<p>枚举已连接的 USB 设备，识别已知的开发板（STM32 Nucleo、Arduino、ESP32），并通过 probe-rs / ST-Link 获取芯片信息。</p>
+<p>示例：zeroclaw 硬件发现 zeroclaw 硬件内省 /dev/ttyACM0 zeroclaw 硬件信息 –chip STM32F401RETx</p>
+<p><strong>用法：</strong> <code>zeroclaw hardware &lt;COMMAND&gt;</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>discover</code> — 枚举 USB 设备（VID/PID）并显示已知开发板</li>
+<li><code>introspect</code> — 通过路径（例如 /dev/ttyACM0）检查设备</li>
+<li><code>info</code> — 通过 USB 获取芯片信息（使用 probe-rs 通过 ST-Link 连接）。目标设备上无需固件</li>
+</ul>
+<h2 id="zeroclaw-硬件发现"><a class="header" href="#zeroclaw-硬件发现"><code>zeroclaw 硬件发现</code></a></h2>
+<p>枚举 USB 设备并显示已知开发板。</p>
+<p>通过 VID/PID 扫描已连接的 USB 设备，并将其与已知的开发板（STM32 Nucleo、Arduino、ESP32）进行匹配。</p>
+<p>示例：zeroclaw 硬件发现</p>
+<p><strong>用法：</strong> <code>zeroclaw hardware discover</code></p>
+<h2 id="zeroclaw-硬件自省"><a class="header" href="#zeroclaw-硬件自省"><code>zeroclaw 硬件自省</code></a></h2>
+<p>通过设备的序列号或设备路径进行自省。</p>
+<p>打开指定的设备路径，并查询板卡信息、固件版本以及支持的功能。</p>
+<p>示例：zeroclaw 硬件检查 /dev/ttyACM0 zeroclaw 硬件检查 COM3</p>
+<p><strong>用法：</strong> <code>zeroclaw hardware introspect &lt;PATH&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;PATH&gt;</code> — 串行或设备路径</li>
+</ul>
+<h2 id="zeroclaw-硬件信息"><a class="header" href="#zeroclaw-硬件信息"><code>zeroclaw 硬件信息</code></a></h2>
+<p>通过 ST-Link 使用 probe-rs 经由 USB 获取芯片信息。</p>
+<p>通过调试探针直接查询目标 MCU，无需在目标板上运行任何固件。</p>
+<p>示例：zeroclaw 硬件信息 zeroclaw 硬件信息 –chip STM32F401RETx</p>
+<p><strong>用法：</strong> <code>zeroclaw hardware info [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li>
+<p><code>--chip &lt;CHIP&gt;</code> — 芯片名称（例如 STM32F401RETx）。默认值：对于 Nucleo-F401RE 为 STM32F401RETx</p>
+<p>默认值：<code>STM32F401RETx</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-外围设备"><a class="header" href="#zeroclaw-外围设备"><code>zeroclaw 外围设备</code></a></h2>
+<p>管理硬件外设。</p>
+<p>添加、列出、刷新和配置向智能体暴露工具（GPIO、传感器、执行器）的硬件板。支持的板子包括：nucleo-f401re、rpi-gpio、esp32、arduino-uno。</p>
+<p>示例：zeroclaw 外设列表 zeroclaw 外设添加 nucleo-f401re /dev/ttyACM0 zeroclaw 外设添加 rpi-gpio 原生 zeroclaw 外设烧录 –端口 /dev/cu.usbmodem12345 zeroclaw 外设烧录-nucleo</p>
+<p><strong>用法：</strong> <code>zeroclaw peripheral &lt;COMMAND&gt;</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>list</code> — 列出已配置的外设</li>
+<li><code>add</code> — 添加外设（板子路径，例如 nucleo-f401re /dev/ttyACM0）</li>
+<li><code>flash</code> — 将 Flash ZeroClaw 固件刷写到 Arduino（生成 .ino 文件，按需安装 arduino-cli，并执行上传）</li>
+<li><code>setup-uno-q</code> — 设置 Arduino Uno Q 桥接应用（部署用于代理控制的 GPIO 桥接）</li>
+<li><code>flash-nucleo</code> — 将 ZeroClaw 固件烧录到 Nucleo-F401RE（构建 + probe-rs 运行）</li>
+</ul>
+<h2 id="zeroclaw-外围设备列表"><a class="header" href="#zeroclaw-外围设备列表"><code>zeroclaw 外围设备列表</code></a></h2>
+<p>列出已配置的外设</p>
+<p><strong>用法：</strong> <code>zeroclaw peripheral list</code></p>
+<h2 id="zeroclaw-peripheral-add"><a class="header" href="#zeroclaw-peripheral-add"><code>zeroclaw peripheral add</code></a></h2>
+<p>按主板类型和传输路径添加外围设备。</p>
+<p>注册硬件板，以便代理可以使用其工具（GPIO、传感器、执行器）。在树莓派等单板计算机上，使用“native”作为本地 GPIO 的路径。</p>
+<p>支持的板子：nucleo-f401re、rpi-gpio、esp32、arduino-uno。</p>
+<p>示例：zeroclaw peripheral add nucleo-f401re /dev/ttyACM0 zeroclaw peripheral add rpi-gpio native zeroclaw peripheral add esp32 /dev/ttyUSB0</p>
+<p><strong>用法：</strong> <code>zeroclaw peripheral add &lt;BOARD&gt; &lt;PATH&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;BOARD&gt;</code> — 开发板类型（nucleo-f401re、rpi-gpio、esp32）</li>
+<li><code>&lt;PATH&gt;</code> — 串行传输的路径（例如 /dev/ttyACM0）或用于本地 GPIO 的 “native”</li>
+</ul>
+<h2 id="zeroclaw-外围闪存"><a class="header" href="#zeroclaw-外围闪存"><code>zeroclaw 外围闪存</code></a></h2>
+<p>将 Flash ZeroClaw 固件刷写到 Arduino 开发板上。</p>
+<p>生成 .ino 草图，如果尚未安装则安装 arduino-cli，编译并上传固件。</p>
+<p>示例：zeroclaw 外围设备闪存 zeroclaw 外围设备闪存 –port /dev/cu.usbmodem12345 zeroclaw 外围设备闪存 -p COM3</p>
+<p><strong>用法：</strong> <code>zeroclaw peripheral flash [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>-p</code>, <code>--port &lt;PORT&gt;</code> — 串口（例如 /dev/cu.usbmodem12345）。如果省略，则使用配置中的第一个 arduino-uno</li>
+</ul>
+<h2 id="zeroclaw-外围设备-setup-uno-q"><a class="header" href="#zeroclaw-外围设备-setup-uno-q"><code>zeroclaw 外围设备 setup-uno-q</code></a></h2>
+<p>设置 Arduino Uno Q Bridge 应用（部署 GPIO 桥接器以进行代理控制）</p>
+<p><strong>用法：</strong> <code>zeroclaw peripheral setup-uno-q [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--host &lt;HOST&gt;</code> — Uno Q 的 IP 地址（例如 192.168.0.48）。如果省略此参数，则假定运行在 Uno Q 上。</li>
+</ul>
+<h2 id="zeroclaw-外围设备-flash-nucleo"><a class="header" href="#zeroclaw-外围设备-flash-nucleo"><code>zeroclaw 外围设备 flash-nucleo</code></a></h2>
+<p>将 ZeroClaw 固件刷写到 Nucleo-F401RE（构建 + probe-rs 运行）</p>
+<p><strong>用法：</strong> <code>zeroclaw peripheral flash-nucleo</code></p>
+<h2 id="zeroclaw-memory"><a class="header" href="#zeroclaw-memory"><code>zeroclaw memory</code></a></h2>
+<p>管理代理内存条目。</p>
+<p>列出、检查并清除代理存储的内存条目。支持按类别和会话进行过滤、分页以及带确认的批量清除。</p>
+<p>示例：zeroclaw 内存统计 zeroclaw 内存列表 zeroclaw 内存列表 –category core –limit 10 zeroclaw 内存获取 KEY zeroclaw 内存清除 –category conversation –yes</p>
+<p><strong>用法：</strong> <code>zeroclaw memory &lt;COMMAND&gt;</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>list</code> — 列出内存条目，支持可选的过滤条件</li>
+<li><code>get</code> — 根据键获取特定的内存条目</li>
+<li><code>stats</code> — 显示内存后端统计信息和健康状况</li>
+<li><code>clear</code> — 按类别、按键清除记忆，或清除所有记忆</li>
+<li><code>reindex</code> — Rebuild backend indexes: FTS tables + any missing embedding vectors</li>
+</ul>
+<h2 id="zeroclaw-memory-list"><a class="header" href="#zeroclaw-memory-list"><code>zeroclaw memory list</code></a></h2>
+<p>列出内存条目，并可选地应用过滤器</p>
+<p><strong>用法：</strong> <code>zeroclaw memory list [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li>
+<p><code>--category &lt;CATEGORY&gt;</code></p>
+</li>
+<li>
+<p><code>--session &lt;SESSION&gt;</code></p>
+</li>
+<li>
+<p><code>--limit &lt;LIMIT&gt;</code></p>
+<p>默认值：<code>50</code></p>
+</li>
+<li>
+<p><code>--offset &lt;OFFSET&gt;</code></p>
+<p>默认值：<code>0</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-memory-get"><a class="header" href="#zeroclaw-memory-get"><code>zeroclaw memory get</code></a></h2>
+<p>通过键获取特定的内存条目</p>
+<p><strong>用法：</strong> <code>zeroclaw memory get &lt;KEY&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;KEY&gt;</code></li>
+</ul>
+<h2 id="zeroclaw-内存统计"><a class="header" href="#zeroclaw-内存统计"><code>zeroclaw 内存统计</code></a></h2>
+<p>显示内存后端统计信息和健康状况</p>
+<p><strong>用法：</strong> <code>zeroclaw memory stats</code></p>
+<h2 id="zeroclaw-memory-clear"><a class="header" href="#zeroclaw-memory-clear"><code>zeroclaw memory clear</code></a></h2>
+<p>按类别、按键清除记忆，或清除所有记忆</p>
+<p><strong>用法：</strong> <code>zeroclaw memory clear [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--key &lt;KEY&gt;</code> — 按键删除单个条目（支持前缀匹配）</li>
+<li><code>--category &lt;CATEGORY&gt;</code></li>
+<li><code>--yes</code> — 跳过确认提示</li>
+</ul>
+<h2 id="zeroclaw-memory-reindex"><a class="header" href="#zeroclaw-memory-reindex"><code>zeroclaw memory reindex</code></a></h2>
+<p>Rebuild backend indexes: FTS tables + any missing embedding vectors.</p>
+<p>Run after <code>zeroclaw migrate openclaw</code> or other bulk writes that land rows with <code>embedding = NULL</code>. Safe to re-run; only touches entries whose vector is missing. No-op for backends without a vector index.</p>
+<p><strong>Usage:</strong> <code>zeroclaw memory reindex</code></p>
+<h2 id="zeroclaw-config"><a class="header" href="#zeroclaw-config"><code>zeroclaw config</code></a></h2>
+<p>管理 ZeroClaw 配置。</p>
+<p>通过点分路径查看、设置或初始化配置属性。使用 ‘schema’ 可导出配置文件完整的 JSON Schema。</p>
+<p>属性通过点分路径进行寻址（例如 channels.matrix.mention-only）。密钥字段（如 API 密钥、令牌）会自动使用掩码输入。当值省略时，枚举字段提供交互式选择。</p>
+<p>示例：zeroclaw config list                                  # 列出所有属性 zeroclaw config list –secrets                        # 仅列出密钥 zeroclaw config list –filter channels.matrix         # 按前缀过滤 zeroclaw config get channels.matrix.mention-only      # 获取一个值 zeroclaw config set channels.matrix.mention-only true # 设置一个值 zeroclaw config set channels.matrix.access-token      # 密钥：掩码输入 zeroclaw config set channels.matrix.stream-mode       # 枚举：交互式选择 zeroclaw config init channels.matrix                  # 使用默认值初始化部分 zeroclaw config schema                                # 将 JSON Schema 打印到标准输出 zeroclaw config schema &gt; schema.json</p>
+<p>属性路径的 Tab 补全功能已自动包含在 <code>zeroclaw completions &lt;shell&gt;</code> 中。</p>
+<p><strong>用法：</strong> <code>zeroclaw config &lt;COMMAND&gt;</code></p>
+<p><strong>子命令：</strong></p>
+<ul>
+<li><code>schema</code> — Dump the full configuration JSON Schema to stdout. With <code>--path</code>, returns the schema fragment for that property only — same payload <code>OPTIONS /api/config/prop?path=...</code> returns over HTTP</li>
+<li><code>list</code> — 列出所有配置属性及其当前值</li>
+<li><code>get</code> — 获取配置属性值</li>
+<li><code>set</code> — 设置配置属性（敏感字段会自动提示以掩码方式输入）</li>
+<li><code>init</code> — 使用默认值（enabled=false）初始化未配置的部分</li>
+<li><code>migrate</code> — 将 config.toml 迁移到磁盘上的当前 schema 版本（保留注释）</li>
+<li><code>patch</code> — Apply a JSON Patch (RFC 6902) document atomically. Mirrors <code>PATCH /api/config</code></li>
+<li><code>docs</code> — Print the API explorer URL (plus a hint if the daemon isn’t running)</li>
+</ul>
+<h2 id="zeroclaw-config-schema"><a class="header" href="#zeroclaw-config-schema"><code>zeroclaw config schema</code></a></h2>
+<p>Dump the full configuration JSON Schema to stdout. With <code>--path</code>, returns the schema fragment for that property only — same payload <code>OPTIONS /api/config/prop?path=...</code> returns over HTTP</p>
+<p><strong>Usage:</strong> <code>zeroclaw config schema [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--path &lt;PATH&gt;</code> — Property path to scope the schema dump (e.g. <code>providers.fallback</code>). Without it, dumps the whole-config schema</li>
+</ul>
+<h2 id="zeroclaw-config-list"><a class="header" href="#zeroclaw-config-list"><code>zeroclaw config list</code></a></h2>
+<p>列出所有配置属性及其当前值</p>
+<p><strong>用法：</strong> <code>zeroclaw config list [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>-f</code>, <code>--filter &lt;FILTER&gt;</code> — 按路径前缀进行过滤（例如 “channels.telegram”）</li>
+<li><code>--secrets</code> — 仅显示机密（加密）字段</li>
+</ul>
+<h2 id="zeroclaw-config-get"><a class="header" href="#zeroclaw-config-get"><code>zeroclaw config get</code></a></h2>
+<p>获取配置属性值</p>
+<p><strong>Usage:</strong> <code>zeroclaw config get [OPTIONS] &lt;PATH&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;PATH&gt;</code> — 属性路径（例如 channels.telegram.mention-only）</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--json</code> — Emit a structured JSON envelope ({path, value} or {path, populated}) instead of plain text</li>
+</ul>
+<h2 id="zeroclaw-config-set"><a class="header" href="#zeroclaw-config-set"><code>zeroclaw config set</code></a></h2>
+<p>设置配置属性（秘密字段自动提示以进行掩码输入）</p>
+<p><strong>用法：</strong> <code>zeroclaw config set [OPTIONS] &lt;PATH&gt; [VALUE]</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;PATH&gt;</code> — 属性路径</li>
+<li><code>&lt;VALUE&gt;</code> — 新值（对于密钥字段，省略此参数以获取掩码输入）</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--no-interactive</code> — 跳过交互式提示 — 要求在命令行上提供值，接受枚举的原始字符串</li>
+<li><code>--comment &lt;COMMENT&gt;</code> — Optional comment to write alongside the value in TOML (preserves through future edits)</li>
+<li><code>--json</code> — Emit a structured JSON envelope on success</li>
+</ul>
+<h2 id="zeroclaw-config-init"><a class="header" href="#zeroclaw-config-init"><code>zeroclaw config init</code></a></h2>
+<p>使用默认值（enabled=false）初始化未配置的节</p>
+<p><strong>Usage:</strong> <code>zeroclaw config init [OPTIONS] [SECTION]</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;SECTION&gt;</code> — 节前缀（例如 channels.matrix）。省略则初始化所有</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--json</code> — Emit a structured JSON envelope ({initialized: […]}) instead of plain text</li>
+</ul>
+<h2 id="zeroclaw-config-migrate"><a class="header" href="#zeroclaw-config-migrate"><code>zeroclaw config migrate</code></a></h2>
+<p>将 config.toml 迁移到磁盘上的当前架构版本（保留注释）</p>
+<p><strong>Usage:</strong> <code>zeroclaw config migrate [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--json</code> — Emit a structured JSON envelope ({migrated, backup_path?, schema_version}) instead of plain text</li>
+</ul>
+<h2 id="zeroclaw-config-patch"><a class="header" href="#zeroclaw-config-patch"><code>zeroclaw config patch</code></a></h2>
+<p>Apply a JSON Patch (RFC 6902) document atomically. Mirrors <code>PATCH /api/config</code>.</p>
+<p>Reads operations from the given file, or from stdin when path is <code>-</code> or omitted. Supported ops: <code>add</code>, <code>replace</code>, <code>remove</code>, <code>test</code>. <code>move</code> and <code>copy</code> are rejected.</p>
+<p><strong>Usage:</strong> <code>zeroclaw config patch [OPTIONS] [INPUT]</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li><code>&lt;INPUT&gt;</code> — Path to a JSON Patch document, or <code>-</code> for stdin (default)</li>
+</ul>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--json</code> — Print results as JSON (one object per applied op) instead of human-readable text</li>
+</ul>
+<h2 id="zeroclaw-config-docs"><a class="header" href="#zeroclaw-config-docs"><code>zeroclaw config docs</code></a></h2>
+<p>Print the API explorer URL (plus a hint if the daemon isn’t running)</p>
+<p><strong>Usage:</strong> <code>zeroclaw config docs</code></p>
+<h2 id="zeroclaw-update"><a class="header" href="#zeroclaw-update"><code>zeroclaw update</code></a></h2>
+<p>检查并应用 ZeroClaw 更新。</p>
+<p>默认情况下，下载并安装最新版本，采用 6 阶段流水线：预检、下载、备份、验证、切换和冒烟测试。失败时自动回滚。</p>
+<p>使用 <code>--check</code> 仅检查更新而不安装。使用 <code>--force</code> 跳过确认提示。使用 <code>--version</code> 指定目标版本，而非最新版本。</p>
+<p>示例：zeroclaw update                      # 下载并安装最新的 zeroclaw 更新 –check              # 仅检查，不安装 zeroclaw update –force              # 无需确认即安装 zeroclaw update –version 0.6.0      # 安装指定版本</p>
+<p><strong>用法：</strong> <code>zeroclaw update [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--check</code> — 仅检查更新，不安装</li>
+<li><code>--force</code> — 跳过确认提示</li>
+<li><code>--version &lt;VERSION&gt;</code> — 目标版本（默认：最新版本）</li>
+</ul>
+<h2 id="zeroclaw-自检"><a class="header" href="#zeroclaw-自检"><code>zeroclaw 自检</code></a></h2>
+<p>运行诊断自检以验证 ZeroClaw 的安装。</p>
+<p>默认情况下，运行完整的测试套件，包括网络检查（网关健康检查、内存往返测试）。使用 <code>--quick</code> 可跳过网络检查，以进行更快的离线验证。</p>
+<p>示例：zeroclaw self-test             # 完整套件 zeroclaw self-test –quick     # 仅快速检查（无网络）</p>
+<p><strong>用法：</strong> <code>zeroclaw self-test [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--quick</code> — 仅运行快速检查（无需网络）</li>
+</ul>
+<h2 id="zeroclaw-补全"><a class="header" href="#zeroclaw-补全"><code>zeroclaw 补全</code></a></h2>
+<p>为 <code>zeroclaw</code> 生成 shell 补全脚本。</p>
+<p>该脚本会输出到标准输出（stdout），以便可以直接通过 <code>source</code> 命令加载：</p>
+<p>Examples (Unix shells): source &lt;(zeroclaw completions bash) zeroclaw completions zsh &gt; ~/.zfunc/_zeroclaw zeroclaw completions fish &gt; ~/.config/fish/completions/zeroclaw.fish</p>
+<p>Examples (Windows PowerShell): zeroclaw completions powershell | Out-String | Invoke-Expression zeroclaw completions powershell &gt; $PROFILE.CurrentUserAllHosts</p>
+<p><strong>用法：</strong> <code>zeroclaw completions &lt;SHELL&gt;</code></p>
+<p><strong>参数：</strong></p>
+<ul>
+<li>
+<p><code>&lt;SHELL&gt;</code> — 目标 Shell</p>
+<p>可能的值：<code>bash</code>、<code>fish</code>、<code>zsh</code>、<code>powershell</code>、<code>elvish</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-桌面版"><a class="header" href="#zeroclaw-桌面版"><code>zeroclaw 桌面版</code></a></h2>
+<p>启动 ZeroClaw 伴侣桌面应用。</p>
+<p>配套应用是一个轻量级的菜单栏/系统托盘应用程序，它与 CLI 连接到同一个网关。它提供对仪表板、状态监控和设备配对的快速访问。</p>
+<p>使用 –install 下载适用于您平台的预构建的配套应用。</p>
+<p>示例：zeroclaw desktop              # 启动配套应用 zeroclaw desktop –install    # 下载并安装它</p>
+<p><strong>用法：</strong> <code>zeroclaw desktop [OPTIONS]</code></p>
+<p><strong>选项：</strong></p>
+<ul>
+<li><code>--install</code> — 下载并安装配套应用</li>
+</ul>
+<hr />
+<p><small><i> 本文档由 <a href="https://crates.io/crates/clap-markdown"><code>clap-markdown</code></a> 自动生成。 </i></small></p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../architecture/crates.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference/config.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../architecture/crates.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference/config.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

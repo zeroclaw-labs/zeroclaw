@@ -1,0 +1,598 @@
+<!DOCTYPE HTML>
+<html lang="ja" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>実践において妥協ゼロ - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-83844b35.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-69ff217c.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/foundations/fnd-006-zero-compromise-in-practice.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="fnd-006-実践におけるゼロコンプライズ--コードの健全性エラーの規律および本番環境の準備基準"><a class="header" href="#fnd-006-実践におけるゼロコンプライズ--コードの健全性エラーの規律および本番環境の準備基準">FND-006: 実践におけるゼロコンプライズ — コードの健全性、エラーの規律、および本番環境の準備基準</a></h1>
+<h3 id="v070-以降--タイプ-品質--rev-1"><a class="header" href="#v070-以降--タイプ-品質--rev-1">v0.7.0 以降 · タイプ: 品質 · Rev. 1</a></h3>
+<blockquote>
+<p><strong>正規の参照</strong> · チームによって承認済み · Rev. 1 議論スレッドおよび完全な改訂履歴: <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5653">#5653</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p>これを読む前にチームへの注意書き。</p>
+<p>これは、ZeroClaw の成熟度フレームワークにおける6番目のドキュメントです。それまでの5つのドキュメントは、アーキテクチャ、ドキュメント、ガバナンス、エンジニアリングインフラストラクチャ、コラボレーションについて取り上げ、プロジェクトの周囲にある構造的および人的な基盤について説明しました。それぞれが、私たちがどのようにこのプロジェクトを共同で構築するかという異なる問いに答えていました。これらすべてを読んだ方なら、どれにも答えられていない問いに気づいたかもしれません。つまり、「では、実際にどのようにして質の高いコードを書くのか？」という問いです。アーキテクチャの RFC は、どのような形で構築すべきかを教えてくれました。ドキュメントの RFC は、どのように記録すべきかを教えてくれました。ガバナンスの RFC は、どのように調整すべきかを教えてくれました。CI/CD の RFC は、どのようにゲートすべきかを教えてくれました。カルチャーの RFC は、周囲の人々とどのように連携すべきかを教えてくれました。しかし、それらのどれ一つとして、関数の内部や選択を行う瞬間といった文レベルでの品質がどのようなものかについては教えてくれませんでした。</p>
+<p>これがこの文書の目的です。</p>
+<p>ここで取り上げている具体的なトピック — エラーハンドリング、API ドキュメント、テスト設計、技術的負債 — は一見すると Rust の話題です。しかし、それらが育むスキルはそうではありません。技術は変化します。その変化の速度は、前回のイテレーションよりもさらに速くなっています。あなたが現在使用しているツール — この言語、このフレームワーク、この AI アシスタント — はいずれ置き換えられます。プロジェクトの存続期間内に置き換わるものもあるでしょう。このドキュメントがあなたに築いてほしい判断力は、決して置き換えられるものではありません。それは、あなたが下すあらゆる決定の背景で静かに蓄積され、あなたが書くあらゆる言語、構築するあらゆるシステム、さらにはソフトウェアとは無関係な仕事においても影響を与え続けます。これが、私たちがあなたに投資しているものです。Rust を書けることへの投資ではありません。品質、失敗、職人技について考える力、そしてその思考を、今日使っている AI ツールや、まだ存在しない未来のツールも含め、あなたが手にするあらゆるツールへと持ち込む力への投資です。</p>
+<p>焦らずに、ゆっくり進めてください。</p>
+</blockquote>
+<hr>
+<h2 id="成熟度フレームワークスイート"><a class="header" href="#成熟度フレームワークスイート">成熟度フレームワークスイート</a></h2>
+<p>このRFCは、ZeroClawの成熟度フレームワークを構成する一連の文書のうち6番目です。これらは全体として読むことを意図していますが、それぞれが独立して成立しています。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>RFC</th><th>スコープ</th><th>問題</th></tr>
+</thead>
+<tbody>
+<tr><td>意図的なアーキテクチャ — マイクロカーネルへの移行</td><td>私たちが構築しているものとその構造</td><td>#5574</td></tr>
+<tr><td>ドキュメントの標準化とナレッジアーキテクチャ</td><td>私たちが構築するものの文書化方法</td><td>#5576</td></tr>
+<tr><td>チーム編成とプロジェクトガバナンス</td><td>私たちの調整と意思決定の方法</td><td>#5577</td></tr>
+<tr><td>エンジニアリングインフラ — CI/CDパイプライン</td><td>信頼性の高いビルド、テスト、およびリリースの方法</td><td>#5579</td></tr>
+<tr><td>貢献文化 — 人間の協力、AIとのパートナーシップ、チームの成長</td><td>私たちの協力と成長</td><td>#5615</td></tr>
+<tr><td>実践におけるゼロコンプロミス — コードの健全性、エラーの規律、そして本番環境対応基準</td><td>永続するコードの書き方</td><td>このRFC</td></tr>
+</tbody>
+</table>
+</div>
+<p>最初の5つのRFCは、構造的および人的な問いに答えます。このRFCは、それらすべての中に潜む問いに答えます。すなわち、構造が与えられ、チームが与えられ、ツールが与えられたとき、コードをどのように書くことが「良い」と言えるのでしょうか？</p>
+<hr>
+<h2 id="目次"><a class="header" href="#目次">目次</a></h2>
+<ol>
+<li>開発哲学：判断への投資</li>
+<li>正直な評価：コードベースが私たちに教えていること
+<ul>
+<li>2.1 証拠</li>
+<li>2.2 数字が示さないもの</li>
+<li>2.3 すでに良い点</li>
+</ul>
+</li>
+<li>ゲートと基準：中核的な違い</li>
+<li>七つの原則
+<ul>
+<li>4.1 エラーハンドリングを設計上の課題として</li>
+<li>4.2 Promise としての公開 API 表面</li>
+<li>4.3 テストを設計フィードバックとして</li>
+<li>4.4 技術的負債の優先順位付け</li>
+<li>4.5 アプリケーションレイヤーのセキュリティ</li>
+<li>4.6 観測可能性としてのデバッグ性</li>
+<li>4.7 床面より上の作業</li>
+</ul>
+</li>
+<li>これがAI支援開発に与える影響</li>
+<li>クラフトの移植性</li>
+<li>これがコントリビューターに与える影響</li>
+</ol>
+<hr>
+<h2 id="改訂履歴"><a class="header" href="#改訂履歴">改訂履歴</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Rev</th><th>日付</th><th>目次</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>2026年4月12日</td><td>初期ドラフト</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="1-開発哲学判断への投資"><a class="header" href="#1-開発哲学判断への投資">1. 開発哲学：判断への投資</a></h2>
+<p>アーキテクチャ RFC では、このプロジェクトにおけるすべての決定がどのように流れるべきかを示す決定階層を導入しました。</p>
+<pre><code>Vision
+  └── Architecture
+        └── Design
+              └── Implementation
+                    └── Testing
+                          └── Documentation
+                                └── Release
+</code></pre>
+<p>その階層構造は、各レイヤーで「何を」構築するかという問いに答えます。このRFCは「実装」と「テスト」のレイヤー内に位置し、異なる問いを投げかけています：「どのくらいよく？」</p>
+<p>「どのくらい」に対する答えはチェックリストではありません。チェックリストは理解されずに満たされる可能性があり、ソフトウェアにおいて理解こそが持続的な成果を生み出します。ルールを暗記した貢献者は、状況が少し異なる場合にルールに従うことができなくなります。一方、ルールの背後にある判断を内面化した貢献者は、ルールが想定していない状況にも正しく適用できます。それは、誰が計画していなかった状況こそが最も重要であるためです。</p>
+<p>この区別は、このプロジェクトの文脈において特に重要です。ZeroClaw は、強力なツール群が揃った環境で運用されています。AI によるコード生成、広範な一般的なエラーを検出する CI のゲート、IDE のリンター、自動化されたセキュリティスキャナーなどです。これらのツールは確かに価値があります。これらは、コードがマージされるべき最低ライン — 以下ではコードをマージすべきではない — を定義します。しかし、それらにできるのは思考することではありません。エラーが運用上のものかプログラマーのエラーかを決めることはできません。テストが正しい振る舞いを検証しているかどうかを評価することもできません。公開 API が、将来の貢献者が正しく実装できるように十分に文書化されているかどうかを判断することもできません。それらができるのは、プログラムされたチェックのみです。</p>
+<p>「ツールが検証できること」と「ユーザー、コントリビューター、そしてプロジェクトに長期的に価値を提供する品質」の間のギャップは、判断によって埋められます。この判断こそが、この文書があなたに築いてほしいものです。ツールを置き換えるためではなく、ツールを導くために。</p>
+<hr>
+<h2 id="2-正直な評価コードベースが私たちに教えていること"><a class="header" href="#2-正直な評価コードベースが私たちに教えていること">2. 正直な評価：コードベースが私たちに教えていること</a></h2>
+<p>このセクションは批判ではありません。これは診断です。アーキテクチャ RFC で適用されたのと同じ枠組みがここにも適用されます：あなたは名前を付けれないものを改善することはできませんし、その詳細は、それらが具体的であるからこそ有用なのです。</p>
+<h3 id="21-証拠"><a class="header" href="#21-証拠">2.1 証拠</a></h3>
+<p>RFC §5574 のワークスペース分解は成功しました。クレートは存在し、トレイト境界は実在し、コンパイラが依存関係の方向を強制しています。これは本当に素晴らしい成果です。そして、これらの新しいクレート内では、元のモノリシックなコードベースを特徴づけていた同じパターンが引き継がれています。これは、チームが「実装レベルでの品質」がどのようなものかについて共有されたモデルを持っていないうちにコードベースが移動したためです。</p>
+<p>これらは測定された事実であり、推定値ではありません：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>メトリック</th><th>値</th><th>何を示しているか</th></tr>
+</thead>
+<tbody>
+<tr><td><code>zeroclaw-config/src/schema.rs</code></td><td>16,800行</td><td>現在、コードベースで最大のファイルです。元の <code>loop_.rs</code> はアーキテクチャ RFC で 9,500 行と指摘されていましたが、これを超えています。</td></tr>
+<tr><td><code>zeroclaw-channels/src/orchestrator/mod.rs</code></td><td>11,813行</td><td>2番目に大きなファイル; 集中した責任を担う単一モジュール</td></tr>
+<tr><td><code>zeroclaw-runtime/src/onboard/wizard.rs</code></td><td>7,988行</td><td>1つのファイルに1つのワークフロー</td></tr>
+<tr><td><code>zeroclaw-runtime/src/agent/loop_.rs</code></td><td>6,101行</td><td>モノリシックから約9,500に削減 — 実測可能な進捗；まだ大きい</td></tr>
+<tr><td><code>zeroclaw-channels/src/orchestrator/telegram.rs</code></td><td>5,122行</td><td>1つのチャンネル実装；1つのファイル</td></tr>
+<tr><td><code>crates</code> 内の <code>.unwrap()</code> / <code>.expect()</code> 呼び出し</td><td>5,630</td><td>それぞれがエラー処理に関する遅延評価の判断です — §4.1 を参照してください。</td></tr>
+<tr><td><code>src/</code> 内のレガシーな <code>.unwrap()</code> / <code>.expect()</code> 呼び出し</td><td>240</td><td>移行により、パターンが大規模に展開されました。</td></tr>
+<tr><td><code>zeroclaw-api</code> の公開関数</td><td>371</td><td>すべての基盤となるAPIの表面 — 他のすべてのクレートがこれに依存しています</td></tr>
+<tr><td><code>zeroclaw-api</code> のドキュメントコメント行</td><td>~27</td><td>文書化されていない公開APIの比率は約14:1です — §4.2を参照</td></tr>
+<tr><td><code>#[allow(unused_imports)]</code> / <code>#[allow(dead_code)]</code> in legacy <code>src/</code> modules</td><td>約30以上のインスタンス</td><td>コンパイラは使用されていないコードを検出しましたが、その旨を報告しないように指示されています。</td></tr>
+<tr><td><code>TODO</code> / <code>FIXME</code> / <code>todo!()</code> / <code>unimplemented!()</code> をコードベース全体で</td><td>20</td><td>特に低い — ほとんどの債務が明示されていないことを示唆</td></tr>
+</tbody>
+</table>
+</div>
+<p>最後の行には独自の注釈が必要です。この規模のコードベースにおいて、未完成の作業を示す明示的なマーカーが20個あることは、作業がほぼ完了したことを示すものではありません。それは、未完成の作業の大部分がそのようにラベル付けされていないことを示しています。ラベル付けされていない負債は、名前が付けられた負債よりも発見が難しく、優先順位付けが難しく、割り当てが困難です。沈黙は完了と同じではありません。</p>
+<h3 id="22-数字が示さないもの"><a class="header" href="#22-数字が示さないもの">2.2 数字が示さないもの</a></h3>
+<p>これらの数値は、計測可能なものを測定します。より重要な品質に関する質問は、数えることができません：</p>
+<ul>
+<li>5,630 個の <code>.unwrap()</code> 呼び出しがクリティカルパスにあるのか、テストユーティリティにあるのか</li>
+<li>既存のテストが動作をテストしているのか、実装の詳細をテストしているのか</li>
+<li><code>zeroclaw-api</code> の公開関数が、シグネチャと型のみを参照して正しく実装できるかどうか</li>
+<li>プロダクション障害中に出力されるログメッセージに、障害を診断するのに十分なコンテキストが含まれているかどうか</li>
+<li>セキュリティモジュールで作業しているコントリビューターが、どのデータが信頼境界を越えたか、そしてどのデータが越えていないかを理解しているかどうか</li>
+</ul>
+<p>これらは判断を要する質問です。CIゲートはありません。この文書が提案する基準と、私たちが一緒に築いていくレビューとメンターシップの文化があります。</p>
+<h3 id="23-すでに良い点"><a class="header" href="#23-すでに良い点">2.3 すでに良い点</a></h3>
+<p>診断が、本当に堅牢に構築されている部分を覆い隠してはならない。</p>
+<p><code>zeroclaw-api</code> のトレイトレイヤーは、適切なアーキテクチャです。<code>Provider</code>、<code>Channel</code>、<code>Tool</code>、<code>Memory</code>、<code>Observer</code>、<code>RuntimeAdapter</code>、<code>Peripheral</code> は、明確で論理的な抽象化であり、適切な分離点となっています。問題は設計そのものではなく、設計がまだドキュメント、テストカバレッジ、エラーハンドリングの規律において完全に表現されていないことにあります。この RFC は、このギャップを埋めることを目的としています。</p>
+<p>セキュリティモデルは考え抜かれたものです。ペアリングコード、自律レベル、サンドボックスレイヤー、ポリシーの強制は、明確な設計意図を示しています。この意図は、信頼境界の近くでコードを書くすべてのコントリビューターによって理解される必要があります。このRFCは、コントリビューターがこれらの境界を認識するための用語を提供するために部分的に存在します。</p>
+<p>観測可能性インフラは成熟しています。OpenTelemetry、Prometheus、DORA メトリクスはすべて、クリーンな <code>Observer</code> トレイトに対して実装されています。インフラは整っています。課題は、コントリビューターがこれをどのように使用して、問題が発生した際に実際に役立てるかという点にあります。</p>
+<p>テストスイートは欠如していません。既存のテスト投資は現実的なものです。このRFCで説明されている作業は、その投資の品質と配分、つまり何をどのようにテストするか、そしてテストが示すとおりに機能しているかどうかについてです。</p>
+<p><code>ADR-004-tool-shared-state-ownership.md</code> は優れたアーキテクチャ記録です。この文書は、期待値が明確であればチームが高品質な設計ドキュメントを生成できることを示しています。この RFC は、コード自体にも同様の期待値を提案するものです。</p>
+<hr>
+<h2 id="3-ゲートと基準中核的な違い"><a class="header" href="#3-ゲートと基準中核的な違い">3. ゲートと基準：中核的な違い</a></h2>
+<p>これは文書全体の核となる考え方です。§4の特定の手法よりも、これを明確に理解することが重要です。</p>
+<p><strong>ゲート</strong>はバイナリです。合格か不合格か。これは自動化され、ツールによって強制され、コードがマージされるための最小条件を定義します。CI/CD RFC がゲートを構築しました。それらは実際に動作しています。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ゲート</th><th>チェック対象</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cargo fmt --check</code></td><td>コードはワークスペース全体で一貫したフォーマットで記述されています。</td></tr>
+<tr><td><code>cargo clippy --workspace --all-targets -D warnings</code></td><td>Clippyが認識するアンチパターンはありません；ワークスペース全体</td></tr>
+<tr><td><code>cargo deny check</code></td><td>未確認のセキュリティアドバイザリなし；ライセンスおよびソースのコンプライアンス</td></tr>
+<tr><td><code>cargo nextest run --workspace</code></td><td>既存のテストはすべてパスします。</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>標準</strong>は理想を指します。それは、最低基準を上回る品質がどのようなものかを示します。標準は、判断、ピアレビュー、チームが一緒に築く習慣によって強制されます。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>標準</th><th>何を説明しているか</th></tr>
+</thead>
+<tbody>
+<tr><td>エラー処理の規律</td><td>障害はカテゴリ分けされ、運用上のエラーは適切なレイヤーでコンテキストとともに表示されます。</td></tr>
+<tr><td>API ドキュメント</td><td>すべての公開アイテムには、実装を読むことなく正しく使用するために十分なドキュメントがあります。</td></tr>
+<tr><td>テスト品質</td><td>テストは実装ではなく振る舞いを検証し、テストの難易度は設計フィードバックとして扱われます</td></tr>
+<tr><td>債務の優先順位付け</td><td>未対応の負債はラベル付けされ、特定され、リスク加重されます。高リスクの負債には所有者がいます。</td></tr>
+<tr><td>セキュリティ姿勢</td><td>信頼境界は、ポリシーレベルだけでなく、実装レベルでも明示的に定義されます。</td></tr>
+<tr><td>観測可能性の規律</td><td>ログメッセージは診断クエリに答えます。スパンは意味のある作業単位を束縛します。</td></tr>
+</tbody>
+</table>
+</div>
+<p>ゲートと基準は競合するものではありません。それらは補完的なレイヤーです。基準のないゲートは、すべてのチェックを通過するコードを生成しますが、ユーザーには失敗します。ゲートのない基準は強制できません。両方が必要です。現在、プロジェクトには適切なゲートと未熟な基準があります。</p>
+<blockquote>
+<p>コードベースはすべてのチェックを通過しても、次の開発者にとって理解不能なままになることがあります。エラーを表面化すべき場所で沈黙し、単体テストが不可能で、ユーザー入力とビジネスロジックが交差する境界で脆弱な状態になることもあります。緑のチェックマークは「このコードが私たちが定めたルールに適合したか」という問いには答えますが、「このコードが本当に良いか」という問いには答えません。これらは同じ問いではありません。</p>
+</blockquote>
+<p>これはゲートに対する批判ではありません。ゲートは、すべてのコントリビューターが従うべき共有かつ強制可能な基準を定義する点で非常に価値があります。この文書の目的は、その基準を超える「良い状態」を定義する共有の用語と判断力を構築し、なぜその判断をツールに委譲できないのかを明確に説明することです。</p>
+<hr>
+<h2 id="4-七つの規律"><a class="header" href="#4-七つの規律">4. 七つの規律</a></h2>
+<h3 id="41-エラーハンドリングを設計上の課題として"><a class="header" href="#41-エラーハンドリングを設計上の課題として">4.1 エラーハンドリングを設計上の課題として</a></h3>
+<p>すべての <code>.unwrap()</code> 呼び出しは一つの判断です。コードベースにある 5,630 個の <code>.unwrap()</code> の多くは、意識的に下された判断ではありませんでした。それらはデフォルトとして選択されたものでした。なぜなら、<code>Result</code> や <code>Option</code> から値を取り出して先に進みたい場合、<code>.unwrap()</code> は最も抵抗の少ない道だからです。デフォルトで下された判断の問題点は、それが本当の判断ではないということです。それらは先送りなのです。そして、先送りされているのは、本当に問われるべきこと、つまり「ここで失敗した場合、どうすべきか？」という問いです。</p>
+<p>答えは、あなたが直面している障害の種類によって異なります。障害には3つの種類があり、それぞれに異なる適切な対応が必要です。</p>
+<p><strong>プログラマーのエラー</strong>は、正しいコードではあり得ない不変条件の違反です。空でない <code>Vec</code> を必要とする関数に空の <code>Vec</code> を渡すこと。型システムが到達不能にするはずの分岐に到達する列挙型のマッチ。これらはバグを表しており、運用上の失敗ではなく、誤ったロジックです。<code>panic!</code> が適切な対応です。なぜなら、これらの問題はユーザーの前にランタイムで発生させるのではなく、開発時に発見することが目的だからです。<code>assert!</code> と <code>debug_assert!</code> が適切なツールです。この状態が不可能である理由を説明するメッセージ付きの <code>.expect()</code> も適切です。これにより、その理由が明示され、検索可能になるため、次のコードの読者はなぜパニックが意図的であったかを理解できます。</p>
+<p><strong>運用エラー</strong>は予期される失敗モードです。ネットワークのタイムアウト。存在しないファイル。期限切れのAPIキー。エラーステータスを含むプロバイダーのレスポンス。不正な入力を提供したユーザー。これらはバグではありません。これは、世界と相互作用するシステムの通常の運用条件です。正しい対応は <code>Result&lt;T, E&gt;</code> です。<code>?</code> 演算子は、失敗をより適切な判断ができる呼び出し元に伝播させます。運用エラーに対する <code>.unwrap()</code> は、延期されたパニックです。それは、最終的に、実際の条件下で、実際のユーザーの前で、有用なコンテキストもなく、回復の機会もなく、発生します。</p>
+<p><strong>構成エラー</strong>は、起動時に発見された不正な形式の構成または欠落した構成です。適切な対応は、迅速かつ具体的に失敗することです。スタックトレース付きのパニックや、曖昧な「無効な構成」メッセージではなく、特定のフィールドを指し示し、期待される値を説明し、オペレーターに何を設定すべきかを伝えるメッセージであるべきです。構成ミスにより ZeroClaw が起動できないユーザーは、正確に何を修正すべきかを明確に理解してプロセスを終了する必要があります。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>失敗の種類</th><th>これは何を意味するのか</th><th>正しい応答</th></tr>
+</thead>
+<tbody>
+<tr><td>プログラマーのエラー</td><td>不変条件違反; 正しいコードでは発生し得ない</td><td><code>panic!</code>、<code>assert!</code>、<code>.expect("この処理は安全である理由")</code></td></tr>
+<tr><td>運用エラー</td><td>予期される失敗モード：世界が協力していない</td><td><code>Result&lt;T, E&gt;</code>、<code>?</code>、コンテキスト付きの構造化エラー型</td></tr>
+<tr><td>設定エラー</td><td>無効または欠落した起動設定</td><td>具体的で実行可能なメッセージで迅速に失敗する</td></tr>
+</tbody>
+</table>
+</div>
+<p>すべての <code>.unwrap()</code> や <code>.expect()</code> の前に、この失敗の種別は何かと自問してください。答えが「プログラマーのエラー — 正しいコードではこの状態は発生し得ない」であれば、なぜその状態が起きないのかを説明するコメント付きの <code>.expect()</code> が適切であり、将来の読者にもその意図を伝えることができます。それ以外のケースでは、<code>?</code> を使うか、明示的に失敗を処理してください。</p>
+<p><code>?</code> 演算子の価値は、それが何をするかだけでなく、それが何を「示すか」を理解することにあります。<code>?</code> 演算子は、「この操作は失敗する可能性があることを認識しています。その失敗を、それに対応する判断を下すのに最も適した呼び出し元に明示的に伝播させます」と言っています。この認識はアーキテクチャ的に意味があります。エラーハンドリングの契約を呼び出し元で可視化し、最も多くのコンテキストを持つレイヤーに判断を委譲します。</p>
+<p>目標は <code>.unwrap()</code> の呼び出し数をゼロにすることではありません。中には適切な使用例もあります。目標は、すべての <code>.unwrap()</code> が明示的な判断に基づいており、コードを読む人なら誰でもその理由を理解できるようにすることです。<code>.unwrap()</code> と <code>.expect("this vec is guaranteed non-empty by the caller — see §4.2 of the SOP engine invariants")</code> の違いは、単なるスタイルの問題ではありません。それは「判断を先送りすること」と「判断を文書化すること」の違いです。</p>
+<h3 id="42-promise-としての公開-api-表面"><a class="header" href="#42-promise-としての公開-api-表面">4.2 Promise としての公開 API 表面</a></h3>
+<p><code>pub</code> はコントラクトです。</p>
+<p>関数、構造体、トレイト、またはモジュールを公開としてマークすると、すべての呼び出し元に約束をするということです。これには、あなたの元の意図を覚えていない状態で来月にこれに対して実装する貢献者も含まれます。これには、実装を生成するためにあなたのクレートを読むAIアシスタントも含まれます。これには、これが何を意図していたのかを理解する必要がある本番環境のインシデントをデバッグする人も含まれます。これには、2ヶ月間別の作業をした後にこのコードに戻ってくるあなた自身も含まれます。</p>
+<p>ドキュメントのない公開アイテムは、条件のない約束です。呼び出し元は、あなたがそれを書く際にどのような前提を置いたか、どのようなエラー条件をどのような状況で返すか、どのような副作用があるか、並行して呼び出すことが安全かどうか、あるいは類似した名前の2つの関数の微妙な違いが何かを知る方法がありません。彼らは、名前、型シグネチャ、そして実装本体から、あなたが3文で伝えることができたことを推測するしかありません。</p>
+<p><code>zeroclaw-api</code> の状況は、直接名指しするに値するほど特殊です。これは、アーキテクチャ全体が依存する唯一のクレートです。ワークスペース内のすべてのプロバイダー、チャンネル、ツール、メモリバックエンド、オブザーバー、ランタイムアダプター、および周辺実装は、これらのトレイトと型に対して構築されています。この基盤部分に文書化されていないインターフェースが存在すると、それを実装するすべてのクレート、それをテストするすべてのテスト、そしてそれと連携するすべての AI 生成コードに混乱が波及します。文書化されていないパブリック API の表面積が 14:1 という比率は、ドキュメントスタイルの好みではなく、アーキテクチャ RFC で最も重要なレイヤーとされたシステムの契約におけるギャップです。</p>
+<p>ここで言うAIの役割は実用的かつ直接的です。AIアシスタントにドキュメントがないトレイトの実装や関数の呼び出しを依頼すると、AIはその名前と型シグネチャから意図を推測します。その推測が正しい場合もありますが、より一般的には、型チェッカーを通過し、AIが予期しなかった特定の条件下で正しく動作しないコードを生成します。なぜなら、そのような条件を誰も文書化していなかったからです。ドキュメントは人間のためだけにあるのではありません。それは、あなたのコードと関わるあらゆるツール、そしてそれを依存するすべての人へ提供される仕様なのです。</p>
+<p>少なくとも、<code>zeroclaw-api</code> のすべての公開項目には以下が含まれている必要があります：</p>
+<ul>
+<li><strong>それが何をするのかを1文で説明する。</strong> それが何であるかではなく、何をするのかを。</li>
+<li><strong><code># Errors</code> セクション</strong> (返り値が <code>Result</code> の場合): この関数がどのような条件で失敗し、呼び出し元が処理すべきエラーバリアントは何か。</li>
+<li><strong><code># Panics</code> セクション</strong> (パニックを引き起こす可能性がある場合): どのような条件で、なぜパニックが発生するのか？</li>
+<li><strong>前提条件</strong>（明らかなもの以外）: この関数を呼び出す前に満たされていなければならない条件は何ですか？</li>
+</ul>
+<p>パブリックなトレイトメソッドに対する3文のドキュメントコメントは、説明のない実装の100行よりも、次の実装者に価値があります。実装はコードが何をするかを示しますが、ドキュメントはそれが何をするべきかを示します。この2つが乖離した際に重要なのは後者です。</p>
+<h3 id="43-テストを設計フィードバックとして"><a class="header" href="#43-テストを設計フィードバックとして">4.3 テストを設計フィードバックとして</a></h3>
+<p>テストの目的は、緑のチェックマークを生成することではありません。テストの目的は、あるコードが_すべきこと_の正確で実行可能な記録を作成し、その動作が変更された場合に明確に失敗する記録を作ることです。</p>
+<p>この区別が重要なのは、テストには根本的に異なる2つの種類があり、そのうち1つだけがその目標を達成するからです。</p>
+<p>構造体の内部状態に直接アクセスして値を設定し、メソッドを呼び出し、戻り値に対してアサーションを行うテストは、実装をテストしていることになります。実装が変更され、同じ挙動が異なるメカニズムで達成された場合、ユーザーにとって重要なことは何も変わっていないにもかかわらず、テストは失敗します。これは、安全性を確保することなくリファクタリングに対して摩擦を生み出します。また、テストが想定していない方法で挙動が間違っている場合でも、テストが通過してしまう傾向があります。</p>
+<p>パブリックインターフェースを通じて値を構築し、パブリックメソッドを通じて動作を実行し、観測可能な結果に対してアサーションを行うテストは、<strong>振る舞い</strong>をテストしています。実装が変更されても振る舞いが維持されていれば、テストは成功します。ユーザーにとって重要な振る舞いの変更が発生した場合、テストは失敗します。これにより、自信を持ってリファクタリングを行うことが可能になります。テストは、特定の手段で結果を得たかどうかではなく、正しい結果が得られたかどうかを確認しているからです。</p>
+<p>より重要な原則は、診断的なものです：</p>
+<blockquote>
+<p>テストの記述が難しい場合は、通常、設計に関する何らかの問題を示しています。</p>
+</blockquote>
+<p>関数のユニットテストを書く際に、データベース接続を確立し、6つの依存関係をモックし、完全な構成オブジェクトを構築し、非同期ランタイムを明示的に起動する必要がある場合、その関数はおそらく多くのことをしすぎている、多くのことに依存しすぎている、またはアーキテクチャの階層において不適切な位置にある可能性があります。この難しさは回避すべき厄介なものではなく、フィードバックです。テストは、コードがまだ正直に示していないことを正直に伝えているのです。</p>
+<p>これは、アーキテクチャ RFC で確立されたクレート構造に直接関連しています。クレートの分解の目的の一つは、個別にテスト可能なコンポーネントを作成することでした。<code>zeroclaw-tool-call-parser</code> は <code>&amp;str</code> 入力とランタイムなしでテスト可能であるべきです。<code>zeroclaw-config</code> は、構成構造体を直接構築することでテスト可能であるべきです。<code>zeroclaw-api</code> におけるトレイト実装は、本番環境のフルスタックではなく、トレイトのフェイク実装に対してテスト可能であるべきです。コンポーネントをその環境全体なしでテストできない場合、アーキテクチャが意図していない依存関係が実装に侵入していないか問いかけてください。テストが答えを教えてくれています。重要なのは、それに耳を傾けているかどうかです。</p>
+<p>テストの品質を時間とともに高めるための実践的なアプローチ：</p>
+<ul>
+<li>バグを修正する際には、そのバグを検出できるテストを作成してください。この習慣を一貫して実践することで、テストスイートは実際に重要な失敗モードに近づいていきます。</li>
+<li>振る舞いを追加する際は、その振る舞いが存在し、独立して検証できることを証明するテストを書いてください。</li>
+<li>テストを書くのが難しい場合は、モックを使う前に「なぜ」かを考える時間を設けましょう。その答えは、あなたが書こうとしていたテストよりも通常は価値があります。</li>
+</ul>
+<h3 id="44-技術的負債の優先順位付け"><a class="header" href="#44-技術的負債の優先順位付け">4.4 技術的負債の優先順位付け</a></h3>
+<p>「debt（負債）」という用語は、適切な含意を持っているため有用です。つまり、利息が累積するということです。コードベースの頻繁にアクセスされる領域で放置された負債は複利のように増大し、新しいコードはその存在に適応し、新しい前提が古い前提の上に積み重なり、その問題を解決するコストは、その上に追加される層ごとに増加していきます。</p>
+<p>技術的負債に対してチームが犯す最も一般的な誤りは、それを二元的に捉えることです。つまり、「すべてが負債であり、何も対処できない」か、「何も負債ではなく、時間を費やすべきではない」という立場です。どちらの立場も間違っています。有用な質問は、「現在、どの負債がどの場所で最も大きなリスクを伴っているか」です。</p>
+<p>優先順位は2つの軸によって決定されます。</p>
+<p><strong>信頼境界への近接性。</strong> ユーザー入力を処理する、セキュリティポリシーを適用する、ツールを実行する、認証を管理する、または外部ソースからのデータを処理するコードは、信頼境界の近くで動作しています。ここでの失敗は、悪用され、状態が静かに破損したり、セキュリティ上の影響を伴う誤った動作を引き起こしたりする可能性があります。信頼境界付近の負債は、その規模に対して不均衡なリスクを伴います。</p>
+<p><strong>影響範囲。</strong> <code>zeroclaw-api</code> の負債 — 他のすべてのものが依存する基盤 — は、単一チャンネルの実装における負債よりも大きな影響範囲を持ちます。基盤となる型での誤った前提は、その型が使用されるすべての箇所に波及します。リーフクレートにおける負債はそのクレートの消費者にのみ影響を与えます。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th>広範な影響範囲</th><th>低爆発半径</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>信頼境界の近く</strong></td><td>現在のサイクルのアドレス</td><td>次の計画されたサイクルで対応</td></tr>
+<tr><td><strong>信頼境界から遠く離れて</strong></td><td>計画されたリファクタリングで対応</td><td>隣接する作業が通過する際に、適宜対応する</td></tr>
+</tbody>
+</table>
+</div>
+<p>このフレームワークにより、セキュリティポリシーの適用パスにおける <code>.unwrap()</code> は、CLIの表示フォーマッターにおける <code>.unwrap()</code> とは異なる問題であることがわかります。どちらも 5,630 件のカウントに含まれます。このカウントは範囲を示し、トリアージは優先度を示します。</p>
+<p>ファイルの作業中に技術的負債（例えば、未処理の運用エラーを表す <code>.unwrap()</code>、4つの異なる関心事を処理するようになった関数、誰も呼び出していないものを黙らせる <code>#[allow(dead_code)]</code>）に気づいた場合、すべてを修正する必要はありません。ここで問うべきは、「これは高リスクの場所にあるか？」ということです。もし高リスクの場所であれば、このPRで対応するか、具体的な場所、リスク、提案された担当者を含むフォローアップの課題を作成してください。そうでない場合は、<code>// TODO(debt): &lt;description&gt;</code> コメントで目立たせることができますが、緊急性を持たせる必要はありません。やってはいけないのは、完全にマークせずに放置することです。なぜなら、沈黙こそが、5,630件の先送りされた決定が誰も傾向に気づかずに蓄積する原因となるからです。</p>
+<p>Strangler Fig パターンもこのレベルで適用されます。アーキテクチャ RFC では、このパターンをクレートレベルで適用しました。古い構造の周りに新しい構造を構築し、時間をかけて内側へと移行します。同じパターンを大きなファイル内でも使用できます。<code>schema.rs</code> を一度の PR で書き換えるわけではありません。信頼境界に最も近い、頻繁に変更される、またはテストが最も難しい関数を特定し、それらを最初に抽出して構造を段階的に改善し、残りの部分はチームが持続可能なペースで後から対応します。</p>
+<h3 id="45-アプリケーションレイヤーのセキュリティ"><a class="header" href="#45-アプリケーションレイヤーのセキュリティ">4.5 アプリケーションレイヤーのセキュリティ</a></h3>
+<p>CI/CD RFC は、サプライチェーンのセキュリティ姿勢を確立しました。<code>cargo deny</code> は依存関係の既知の脆弱性を検出し、ライセンスのコンプライアンスを強制し、依存関係が承認されたソースから来ることを保証します。これはプロジェクトに導入されるものの免疫システムです。このセクションでは、実行されるコードのセキュリティ姿勢について説明します。</p>
+<p><code>cargo deny</code> は、アプリケーションのロジックが引き起こす脆弱性を検出できません。ユーザー入力がビジネスロジックに到達する前に検証されているかどうかを判断することはできません。ツール実行が強制すべき自律レベルを遵守しているかどうかを判断することもできません。エラーパスがセキュリティチェックの失敗を静かに無視しているかどうかを判断することもできません。これらは、信頼境界がどこにあるか、そしてその両側で責任あるコードがどのようなものかを知っているコントリビューターに依存します。</p>
+<p>信頼境界の近くで書かれるすべてのコードを導くべき3つの原則：</p>
+<p><strong>信頼境界は明示的であり、暗黙的に想定されるものではありません。</strong> 信頼境界とは、直接の制御範囲外からデータが到着するあらゆる地点を指します。これには、あらゆるチャネルからのユーザー入力、プロバイダーからのAPIレスポンス、ファイルシステムからのファイル内容、プラグインの出力、ツールの結果、ハードウェアの読み取り値などが含まれます。信頼境界のすべてにおいて、データを処理する前に検証を行ってください。あなたが生成していないデータの形状、サイズ、型、内容については、何も想定しないでください。ZeroClawのセキュリティモデルでは、これらの境界をポリシーレベルで定義しています。実装においても、コードレベルでこれらを反映させるべきです。これはポリシーが失敗するからではなく、階層型防御（defense in depth）とは、システム内の各レイヤーがそれぞれの役割を果たすことであり、他のすべてのレイヤーが正しく機能することを信頼するものではないからです。</p>
+<p><strong>最小限のフットプリント。</strong> ファイルを読み取る必要がある関数は、それを書き込んではいけません。あるチャネルのメッセージを処理するトレイト実装は、他のチャネルの状態にアクセスしてはいけません。自律レベル1で動作するツールは、レベル3で必要な機能を実行する立場にあってはいけません。セキュリティモデルはすでにこれらの制約を定義しています。重要なのは、タスクに必要な以上の能力を取得しない実装を書くこと、そして実装が意図された範囲外のものに手を伸ばしていることに気づくことです。</p>
+<p><strong>セキュリティ境界付近では、エラーを明示的に通知する。</strong> セキュリティチェックにおけるエラー（ポリシー評価の失敗、署名検証の失敗、認可されていないツール呼び出しの試み、ペアリングコードの不一致など）は、決して黙って無視してはいけません。エラーはログに記録し、伝播させ、明示的に処理する必要があります。表示ヘルパーでのエラーは、ログメッセージとともに適切に回復できますが、認可パスでのエラーは回復できません。自分がどのような種類の関数を書いているかを理解し、その判断に基づいて、エラーをどの程度積極的に表面化させるかを決定してください。</p>
+<p>これらは高度なセキュリティの原則ではありません。これらは、ユーザーが影響を与えられる何かにアクセスするすべてのコードに適用される基本的な衛生管理です。アーキテクチャ RFC はセキュリティモデルを「慎重に設計された」と説明しています。この RFC で求められている作業は、その慎重さを実装レベルで明確にすることです。具体的には、入力を検証する関数、ポリシーの失敗を処理するエラーパス、システムに要求されたことと実際に実行されることの境界においてです。</p>
+<h3 id="46-観測可能性としてのデバッグ性"><a class="header" href="#46-観測可能性としてのデバッグ性">4.6 観測可能性としてのデバッグ性</a></h3>
+<p>観測インフラは成熟しています：OpenTelemetry トレース、Prometheus メトリクス、DORA 追跡、そしてクリーンな <code>Observer</code> トレイトがすべて整っています。これは本番環境品質の作業です。教育上のギャップは、インフラを持っていることと、実際に問題が発生した際に役立つ形でそれを使用すること、できれば何が問題なのかを知る前にそれを使用することの間にあります。</p>
+<p>2つのログメッセージを考慮します。どちらもコンパイルが成功し、CIをパスし、構文的に正しいです。</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>error!(リクエストに失敗しました);
+<span class="boring">}</span></code></pre>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>error!(
+    provider = %provider_name,
+    model    = %model_id,
+    user     = %sender_id,
+    tool     = %tool_name,
+    attempt  = attempt,
+    elapsed  = ?elapsed,
+    err      = %e,
+    プロバイダーのリクエストに失敗しました — リトライが尽きました
+);
+<span class="boring">}</span></code></pre>
+<p>最初のものはレコードです。これは何かがうまくいかなかったことを確認します。2番目のものは診断です。それは重要な質問に答えます：私たちは何をしようとしていたのか、どのような文脈で、どのようなパラメータで、そして具体的に何がうまくいかなかったのか。それらの違いは技術的な洗練度ではなく、メッセージを書いた人が、いつかそれを読む必要のある人を考えていたかどうかにかかっています。</p>
+<p><code>warn</code> 以上のレベルでログメッセージを出力する前に問うべき質問は：</p>
+<blockquote>
+<p>この失敗を最も重要な瞬間に診断する必要がある人が知るべきことは何ですか？</p>
+</blockquote>
+<p>その人物は、このコードを書いたことを忘れてしまった6ヶ月後のあなたかもしれません。このモジュールを一度も見たことがない別のコントリビューターかもしれません。ターミナルからコピーしたログの抜粋を添えてバグレポートを提出するユーザーかもしれません。彼らのために書いてください。ほぼ常に重要なフィールドは、何を目指していたのか、その時点でどのような文脈が考慮されていたのか、そして具体的に何が間違っていたのかです。</p>
+<p>同じ原則がトレーススパンの設計にも適用されます。スパンは意味のある作業単位を表し、その作業を理解するために必要なコンテキストを含み、フラムグラフやトレースビューアで読んだときに意味のある名前を持つべきです。</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// レコード
+let _span = span!(Level::INFO, プロセス);
+
+// 診断情報
+let _span = span!(
+    Level::INFO,
+    "エージェントのツール呼び出し",
+    tool = %tool_name,
+    turn = turn_number,
+    sender = %sender_id,
+);
+<span class="boring">}</span></code></pre>
+<p>構造化されたログ出力と意味のあるスパン設計は、単なるスタイルの好みではありません。これらは、あなたが構築した観測インフラストラクチャを、開発時だけでなく、あなたが決して見ることのないハードウェア上で、あなたが想定していない構成で、あなたが計画していなかったエラーに直面しながら ZeroClaw を実行するユーザーの手元でも、実際に有用なものにするものです。インフラストラクチャは能力を生み出します。その能力が診断可能なシステムへと結びつくかどうかは、コントリビューターがそれをどのように使用するかの規律によって決まります。</p>
+<h3 id="47-床面より上の作業"><a class="header" href="#47-床面より上の作業">4.7 床面より上の作業</a></h3>
+<p>前述の6つの分野はそれぞれ特定の領域を扱っています。このセクションでは、それらを統合し、このRFCで説明されている基準を満たすコードにレビューアー、将来の貢献者、またはユーザーが遭遇した際に実際にどのような体験をするのか、つまり「フロアの上」が実践的にどのように見えるのかを一つの図として示します。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>次元</th><th>フロアで — ゲートが通過</th><th>床の上 — 標準メタ</th></tr>
+</thead>
+<tbody>
+<tr><td>エラー処理</td><td>コードはコンパイル済みで、Clippyの警告はありません。</td><td>失敗はカテゴリ分けされ、運用上のエラーはコンテキスト付きで表示され、パニックは意図的かつ文書化されています。</td></tr>
+<tr><td>ドキュメント</td><td>ドキュメントテストが存在する場合は、それらがパスします。</td><td>すべての公開アイテムは、実装を読むことなく正しく理解し、使用することができます。</td></tr>
+<tr><td>テスト</td><td>存在するテストはすべてパスします</td><td>テストは振る舞いを検証します。テストの難易度は設計フィードバックとして扱われ、重要な失敗モードがカバーされます。</td></tr>
+<tr><td>負債</td><td>コンパイラのエラーや警告なし（残りは <code>#[allow]</code> で抑制済み）</td><td>負債はラベル付けされ、配置され、リスク加重されます。高リスクの負債には所有者とタイムラインがあります。</td></tr>
+<tr><td>セキュリティ</td><td><code>cargo deny</code> が成功しました</td><td>信頼境界は明示的であり、セキュリティ上の失敗は明確に表面化し、実装は意図された範囲を尊重します。</td></tr>
+<tr><td>観測性</td><td>コードが実行され、何かを出力する</td><td>ログメッセージは診断クエリに答えるものであり、スパンは有用なコンテキスト付きで意味のある作業単位を束縛します。</td></tr>
+<tr><td>コードの構成</td><td>ファイルはコンパイル済みです。モジュール構造が存在します。</td><td>関数は1つのことを行い、ファイルは関連する懸念事項をグループ化します。大きなファイルは抽出の候補となりますが、それが通常ではありません。</td></tr>
+</tbody>
+</table>
+</div>
+<p>これらすべてを完全に自動化で実現することはできません。すべては、なぜそれが重要なのかを理解し、一貫して適用するための判断力を備えたコントリビューターによって実現可能です。この文書はまさにその目標に向かって進んでいます。</p>
+<hr>
+<h2 id="5-ai支援開発が意味すること"><a class="header" href="#5-ai支援開発が意味すること">5. AI支援開発が意味すること</a></h2>
+<p>文化に関するRFCでは、共同チームの一員としてAIツールとどのように連携するかについて取り上げました。このセクションでは、より具体的な内容として、AI生成コードが上記で述べた基準にどのように対応するか、そしてその基準を満たしていない場合にギャップを認識し、埋めるために何が必要かについて説明します。</p>
+<p>AIツールは、実際には「通過」に非常に優れています。コンパイルが成功し、型チェッカーを満たし、Clippyのチェックをパスし、実装とともにテストも生成します。これは確かに価値あることであり、このセクションはその価値を軽視するものではありません。問題は、AIツールが信頼できないことではありません。問題は、AIツールが「チェックを通過するコード」を生成するという「間違ったこと」に対して信頼できる点にあります。</p>
+<p>その理由は構造的なものです。AI は推論可能な情報に基づいてコードを生成します。関数にドキュメントがない場合、AI は名前とシグネチャから意図を推論しますが、その推論が正しい場合もあれば、誰もテストしていない条件下で初めて表面化する微妙に間違った動作を生む場合もあります。エラー型にいつ返されるかのドキュメントがない場合、AI はバリアントの名前に基づいてそれを処理します。テストスイートが振る舞いではなく実装をテストしている場合、AI はそのテストに一致する実装を生成しますが、それがテストが捉えるべき意図された振る舞いと一致するかどうかは定かではありません。AI 出力の品質の上限は、あなたが提供するコンテキストの品質によって決まります。より良いコンテキスト（より明確なドキュメント、より具体的なエラー型、振る舞いに焦点を当てたテスト）は、より良い出力を生み出します。不十分なコンテキストは、チェックポイントを通過する出力を生み、次のレビュー担当者に判断を委ねることになります。</p>
+<p>これは、AI ツールを利用するコントリビューターにとって、具体的かつ必須の責任を生み出します。</p>
+<p><strong>AI がコードを生成したため、レビューは必須です。</strong> 文化に関する RFC で明確に示されており、具体的な内容で繰り返す価値があります。AI が生成したコードをレビューする際、コンパイルできるか、テストがパスするかといった基本的な確認事項は、レビューの「始まり」であって「終わり」ではありません。標準的な確認事項には以下が含まれます：</p>
+<ul>
+<li>運用上のエラーを適切に処理しているか、それとも <code>.unwrap()</code> で無視しているか</li>
+<li>新しい公開 API が文書化されているか</li>
+<li>テストが振る舞いを検証しているか、それとも実装の詳細を検証しているか</li>
+<li>信頼境界の近くにある場合、入力を検証しているか</li>
+</ul>
+<p>これらの質問に対する責任は、コードの作成者や使用されたツールに関わらず、あなたにあります。</p>
+<p><strong>AIはあなたの判断を補強するものであり、判断の欠如を代弁するものではありません。</strong> 良いエラーハンドリングの姿についてメンタルモデルをまだ持っていないコントリビューターは、AIが生成したエラーハンドリングをそのまま受け入れてしまうでしょう。<code>.unwrap()</code> も含めてです。§4.1 の内容を内面化したコントリビューターであれば、同じ出力を見てツールに指示を出すことができます。「これは運用上のエラーパスです。<code>?</code> を使用し、コンテキストを付与して呼び出し元に失敗を伝播させてください」と。ツールは修正されたバージョンを生成します。このパターンは §4 に記載されているすべての分野に適用されます。何を求めるべきかを知っている人の手において、ツールは強力な力を発揮します。そのような指示がない場合、ツールはコンパイラを満たすコードを生成しますが、本質的な判断は次の工程の担当者に委ねることになります。</p>
+<p><strong>この関係性は双方向に増幅します。</strong> 基準を理解しているチームは、ツールが改善されるにつれて、AI ツールからより大きな価値を得ます。なぜなら、彼らはより高度なツールをより正確に指示できるからです。「ツールが生成した内容」と「基準が要求する内容」のギャップは、手動で書き直すのではなく、適切な指示によって埋めることができるようになります。一方、その判断力を築かないチームは、同じ品質の床（floor）に到達するまでの時間を短縮できますが、それを上回る品質を引き出すことはできません。この文書全体で説明されている投資は、チームが今後使用するすべての AI ツールの長期的な有効性への直接的な投資でもあります。なぜなら、これらのツールの価値は、それらを導く判断の明確さに比例して拡大するからです。</p>
+<hr>
+<h2 id="6-クラフトの移植性"><a class="header" href="#6-クラフトの移植性">6. クラフトの移植性</a></h2>
+<p>テクノロジーは変化します。その変化の速度は、各イテレーションごとに前よりも速くなり、その加速はさらに進んでいます。このドキュメントで言及されている具体的なツール — Rust、<code>cargo</code>、<code>clippy</code>、OpenTelemetry SDK、チームが現在使用しているAIアシスタント — はいずれかの時点で置き換えられるでしょう。プロジェクトの存続期間内に置き換わるものもあるかもしれません。プラットフォームは変化し、言語は進化します。ツールエコシステムは5年後には今日とは異なるものになり、10年後にはさらに異なるものになるでしょう。</p>
+<p>この文書内のメンタルモデルは変更されません。</p>
+<p>「ここで失敗した場合に何が起きるべきか、そして誰がそれを把握する必要があるか」という問いは、言語が変わっても消えるものではありません。次に学ぶ言語でもこの問いを投げかけます。ワイヤープロトコルが「言語」となる分散システムを設計する際にも、また、あなたが個人的に監視できないが他者が依存するものを作り上げる際にも、この問いを投げかけます。この問いに答えるための具体的な Rust の仕組み — <code>Result&lt;T, E&gt;</code>、<code>?</code> 演算子、コンテキスト付き構造化エラー型 — は、いたるところに存在する問いに対する一つの答えに過ぎません。</p>
+<p>「私が約束しているパブリックインターフェースとは何か、そしてそのドキュメントがその約束を反映しているか」という問いは、APIを設計する際、技術仕様書を作成する際、チームの責任範囲を定義する際、他チームやAIツール、クライアント、請負業者に要件を伝える際に自問することになります。パブリックインターフェースの「約束と条件」モデルは、Rustやソフトウェアの分野を超えて、はるかに広い範囲に適用されます。</p>
+<p>「テストが実際に何を証明しているのか？」という問いは、ソフトウェアの分野を超え、システムが意図した通りに動作することを検証する必要があるあらゆる領域に当てはまります。この問いを投げかける本能 — つまり、実装が存在することの証拠と、正しいことが起こっていることの証拠を区別する能力 — がスキルです。これを Rust で表現するための構文は付随的なものです。</p>
+<p>「この障害を診断する必要がある人は何を知る必要があるのか？」という問いは、他の人々が依存するものを構築する際に適用されるエンジニアリングの問いです。さらに深く言えば、これは共感に関する問いでもあります。あなたの作業の向こう側にいる人が、予測できない瞬間に、あなたが提供できない文脈の中で、現実の問題を抱えた現実の人間であることを忘れないようにすることです。</p>
+<blockquote>
+<p>あなたは Rust を学んでいるのではありません。Rust を通じて、信頼できるものを作り方を学んでいるのです。これはポータブルです。あなたがそれを練習する限り、あらゆる言語、システム、チーム、ドメインで複利のように成長します。</p>
+</blockquote>
+<p>これは、プロジェクトがあなたに対して行う投資です。特定の技術スキルではなく、次にあなたが作るものに対して判断力、技術力、そして細部へのこだわりをどのように発揮するかという能力に対する投資です。そしてそれは、やがてあなたが作ったものによって支えられる人々一人ひとりに対する、あなた自身の投資でもあります。</p>
+<hr>
+<h2 id="7-貢献者にとっての意味"><a class="header" href="#7-貢献者にとっての意味">7. 貢献者にとっての意味</a></h2>
+<p><strong>Rust やソフトウェア開発が初めての方へ:</strong></p>
+<p>§4の7つの分野は、貢献する前に習得すべき要件ではありません。これらは、あなたが作業する中で遭遇するものの地図であり、それらを見たときに何を見ているかが明確に分かるように、十分に明確に名前が付けられています。</p>
+<p>§4.1 から始めましょう。エラーハンドリングのメンタルモデルは、早期に内面化できる最も効果的な概念の一つであり、これは Rust に限定されたものではありません。既存のコードを読み、<code>.unwrap()</code> に遭遇した際には、それがどのカテゴリに該当するかを自問してください。新しいコードを書く際にも、同様に自分の選択について自問しましょう。この習慣を一貫して実践することで、影響を受けるすべてのファイルが改善され、その判断力はあなたのキャリアを通じて役立つようになります。</p>
+<p>これらの基準を適用する準備が整うまで待たないでください。完璧でなくても構いません。何に該当するか分からない場合は質問し、レビューで受け取るフィードバックを、それが意図している通り学習の機会として捉えてください。こうしたことを最初から知っている人なんていません。ここであなたが行っているような作業を通じて、ゆっくりと学んでいったのです。</p>
+<p><strong>AIツールを使用して貢献する場合は:</strong></p>
+<p>この文書に記載されている基準は、慎重なレビューによってAI生成コードが評価される基準となります。また、実質的には、レビューが行われる前にAIの出力をより正確なものにするための文脈としても機能します。AIに何かを実装させる前に、実装対象のインターフェースが文書化されているか確認してください。文書化されていない場合は、まずそれらを文書化するか、AIに求める作業の一部として文書化を含めてください。これにより、出力の正確性が向上し、基盤となる部分の重要なギャップを埋めることができ、後から参加する開発者も恩恵を受けることになります。</p>
+<p>AI生成のコードに対するレビューフィードバックは、AIの使用に関するフィードバックではなく、コード自体に対するフィードバックとして受け取ってください。基準は著作者に関係なく一律に適用されます。常に問われるべきは、このコードが基準を満たしているかどうかです。もし満たしていない場合、何がどう変わるべきで、その理由は何でしょうか？</p>
+<p><strong>プルリクエストをレビューする場合:</strong></p>
+<p>ゲートとなる質問——コンパイルできるか、テストがパスするか、Clippy が許容するか——は基礎であって上限ではありません。これらの質問にのみ答えるレビューは不十分です。§3 のフレームワークと §4 の規律を用いて観察を構造化してください。適用している基準を明記し、それがなぜ重要かを説明し、ブロックする懸念事項とブロックしない提案を明確に区別してください。</p>
+<p>レビューの目的は欠点を見つけることではありません。それは理解を伝えることです。説明を含む具体的なフィードバックのすべて — 「これは運用上のエラーパスです。<code>.unwrap()</code> がここでなぜ生産リスクを生むのか、そして代わりに何を使うべきか」 — は、あなたがレビューしているコントリビューターへの投資です。この投資は複利のように増えます。原則を理解したコントリビューターは、それが重要になる次の10の状況でそれを正しく適用し、再度指示される必要がなくなります。</p>
+<p><strong>メンテナーまたは経験豊富なコントリビューターの場合:</strong></p>
+<p>これらの基準を実践に移すのに最も適した立場にいるのはあなたです。トップダウンで強制するのではなく、自分のコードで基準を実践し、レビューでその名前を明示的に呼び出すことで実現できます。オープンソースプロジェクトにおいて最も効果的な教育は、ドキュメントではなく、PRのディスカッションやコードコメントの中で行われます。このドキュメントは、そのための用語集を提供します。日常的なレビューでこれを一貫して使用することで、単なる紙上の言葉から共有された実践へと変化させます。</p>
+<p>運用エラーのパスで <code>.unwrap()</code> を見つけたら、それを運用エラーとして命名してください。ドキュメントがない公開関数を見つけたら、将来の実装者がここで知る必要があることは何かと自問してください。有効なリファクタリングで壊れてしまうテストを見つけたら、それがなぜ重要なのかを説明してください。これらは修正ではなく、文化 RFC が最も重要なものの一つとして特定した、より経験豊富なコントリビューターが提供できる継続的なメンターシップです。</p>
+<hr>
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-005-contribution-culture.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../contributing/how-to.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-005-contribution-culture.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../contributing/how-to.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

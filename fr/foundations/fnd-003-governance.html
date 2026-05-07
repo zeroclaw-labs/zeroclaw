@@ -1,0 +1,1211 @@
+<!DOCTYPE HTML>
+<html lang="fr" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Gouvernance - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-141176d3.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-4a111ca2.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/foundations/fnd-003-governance.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="fnd-003--organisation-de-léquipe-gouvernance-du-projet-et-pipeline-de-contribution"><a class="header" href="#fnd-003--organisation-de-léquipe-gouvernance-du-projet-et-pipeline-de-contribution">FND-003 : Organisation de l’équipe, gouvernance du projet et pipeline de contribution</a></h1>
+<h3 id="à-partir-de-la-version-070--type--gouvernance--rév-2"><a class="header" href="#à-partir-de-la-version-070--type--gouvernance--rév-2">À partir de la version 0.7.0 · Type : Gouvernance · Rév. 2</a></h3>
+<blockquote>
+<p><strong>Référence canonique</strong> · Ratifié par l’équipe · Rév. 2 Fil de discussion et historique complet des révisions : <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5577">#5577</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>Une note à l’équipe avant que vous lisiez ceci.</strong></p>
+<p>Les projets logiciels ne échouent pas parce que le code est mauvais. Ils échouent parce que les personnes qui écrivent le code ne peuvent pas se coordonner. Les fonctionnalités sont développées deux fois. Les bugs sont perdus. Les bonnes idées s’évaporent parce que personne ne les a notées. Les nouveaux contributeurs arrivent en voulant aider et ne trouvent pas par où commencer. Cette RFC vise à mettre en place un cadre léger qui empêche ces échecs — non pas pour que le projet semble organisé, mais pour que l’équipe puisse avancer plus rapidement, avec plus de confiance et moins de friction. Chaque recommandation ici est spécifiquement choisie pour une petite équipe open source en croissance, dirigée par des étudiants. Rien ici ne nécessite de chef de projet, de Scrum Master ou de comité formel.</p>
+</blockquote>
+<hr>
+<h2 id="historique-des-révisions"><a class="header" href="#historique-des-révisions">Historique des révisions</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Rév</th><th>Date</th><th>Résumé</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>2026-04-09</td><td>Brouillon initial</td></tr>
+<tr><td>2</td><td>2026-04-09</td><td>Ajout du §6.4 Conformité architecturale : examen humain, assistance IA ; ajout d’une question de discussion sur l’automatisation des revues d’architecture par l’IA</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="table-des-matières"><a class="header" href="#table-des-matières">Table des matières</a></h2>
+<ol>
+<li><a href="#1-the-coordination-problem">Le problème de coordination</a></li>
+<li><a href="#2-le-système-en-trois-parties">Le système en trois parties</a></li>
+<li><a href="#3-github-projects-the-work-pipeline">Projets GitHub : Le pipeline de travail</a></li>
+<li><a href="#4-github-discussions-the-ideas-parking-lot">Discussions GitHub : Le parking des idées</a></li>
+<li><a href="#5-team-tiers-and-contribution-authority">Paliers d’équipe et autorité de contribution</a></li>
+<li><a href="#6-codeowners-and-branch-protection">CODEOWNERS et Protection des branches</a>
+<ul>
+<li><a href="#64-architectural-compliance-human-review-ai-support">6.4 Conformité architecturale : revue humaine, assistance IA</a></li>
+</ul>
+</li>
+<li><a href="#7-issue-templates">Modèles d’incidents</a></li>
+<li><a href="#8-la-boucle-de-gouvernance-des-rfc">La boucle de gouvernance des RFC</a></li>
+<li><a href="#9-label-taxonomy">Taxonomie des étiquettes</a></li>
+<li><a href="#10-definition-of-done">Definition of Done</a></li>
+<li><a href="#11-automatisation">Automatisation</a></li>
+<li><a href="#12-déploiement-progressif">Déploiement progressif</a></li>
+</ol>
+<hr>
+<h2 id="1-le-problème-de-coordination"><a class="header" href="#1-le-problème-de-coordination">1. Le problème de coordination</a></h2>
+<p>Chaque projet sans un système de coordination intentionnel développe un système accidentel. Le système accidentel pour la plupart des projets open source ressemble à ceci :</p>
+<ul>
+<li>Les idées résident dans la tête de quelqu’un, ou dans un message de chat qui défile hors de l’écran.</li>
+<li>Les problèmes s’accumulent dans le tracker sans priorité, sans propriétaire et sans définition claire de ce qui constitue un travail terminé.</li>
+<li>Les contributeurs ouvrent des PRs pour des choses que personne n’a demandées, ou demandent à aider et ne reçoivent aucune réponse.</li>
+<li>L’équipe travaille de manière réactive : celui qui crie le plus fort attire l’attention, ce qui casse est réparé, rien n’est planifié plus d’une semaine à l’avance.</li>
+<li>Les décisions architecturales sont prises dans les commentaires des PR et ne sont jamais enregistrées nulle part.</li>
+</ul>
+<p>Il ne s’agit pas de critiquer les efforts de quiconque. Il s’agit de décrire ce qui se produit par défaut. La solution n’est pas d’ajouter plus de processus, mais d’appliquer le bon processus au bon niveau, en fonction de la taille et de la maturité de l’équipe.</p>
+<p>ZeroClaw a besoin de trois choses :</p>
+<ol>
+<li><strong>Un pipeline</strong> pour transformer les idées en code déployé, avec des étapes visibles et des portes claires à chaque transition.</li>
+<li><strong>Un parking à idées</strong> pour capturer des idées qui ne sont pas encore prêtes à être intégrées dans le pipeline, sans les perdre ni encombrer le travail actif.</li>
+<li><strong>Un modèle de gouvernance</strong> qui définit qui peut décider de quoi, comment les décisions architecturales sont prises et comment l’équipe évolue.</li>
+</ol>
+<p>Il s’agit de trois préoccupations distinctes. Les confondre — en mettant tout dans un seul tableau, ou en s’appuyant sur des discussions informelles pour prendre des décisions — est ce qui crée le chaos que l’équipe cherche à éviter.</p>
+<hr>
+<h2 id="2-le-système-à-trois-parties"><a class="header" href="#2-le-système-à-trois-parties">2. Le système à trois parties</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Inquiétude</th><th>Outil</th><th>Pourquoi cet outil</th></tr>
+</thead>
+<tbody>
+<tr><td>Pipeline de travail (backlog → release)</td><td><strong>Projets GitHub v2</strong></td><td>Champs personnalisés, vues multiples, Kanban + feuille de route, automatisation intégrée, suivi des jalons</td></tr>
+<tr><td>Espace de stationnement des idées</td><td><strong>Discussions GitHub</strong></td><td>Voté par la communauté, sans PR requis, sépare le « peut-être un jour » du travail engagé, et convertit en tickets lorsque prêt.</td></tr>
+<tr><td>Gouvernance et autorité de décision</td><td><strong>Processus RFC + Niveaux d’équipe + CODEOWNERS</strong></td><td>Déjà partiellement établi via <code>docs/proposals/</code> ; nécessite une formalisation et une clôture</td></tr>
+</tbody>
+</table>
+</div>
+<p>Le principe clé : <strong>le tableau du projet ne contient que le travail que l’équipe s’est engagée à examiner.</strong> Les idées qui n’ont pas été évaluées sont conservées dans les Discussions. Le travail qui a été évalué, accepté et défini se trouve dans le projet. Cette distinction est ce qui rend le tableau utile.</p>
+<hr>
+<h2 id="3-projets-github--le-pipeline-de-travail"><a class="header" href="#3-projets-github--le-pipeline-de-travail">3. Projets GitHub : Le pipeline de travail</a></h2>
+<h3 id="31-les-étapes-du-pipeline"><a class="header" href="#31-les-étapes-du-pipeline">3.1 Les étapes du pipeline</a></h3>
+<p>Le tableau de projet possède un seul champ <strong>Statut</strong> avec sept valeurs. Chaque valeur correspond à une étape du pipeline. La séquence est linéaire, mais les éléments peuvent être déplacés vers l’arrière :</p>
+<pre><code>💡 Idea
+    ↓  Gate: Vision alignment check
+📋 Backlog
+    ↓  Gate: Architecture fit + acceptance criteria
+🎯 Defined
+    ↓  Gate: Assignee, size, risk tier confirmed
+🚧 In Progress
+    ↓  Gate: Tests written, CI passing
+👀 In Review
+    ↓  Gate: Correct reviewer tier approved, docs updated
+✅ Done
+</code></pre>
+<p>Plus un état terminal qui peut être atteint depuis n’importe où :</p>
+<pre><code>🚫 Won't Do  ← explicit decision not to pursue; never silently closed
+</code></pre>
+<h3 id="32-les-questions-de-la-porte"><a class="header" href="#32-les-questions-de-la-porte">3.2 Les questions de la porte</a></h3>
+<p>Chaque transition comporte une question de validation. La réponse à cette question doit être « oui » avant que l’élément ne puisse passer à l’étape suivante. C’est ainsi que le tableau de projet devient opérationnel : la hiérarchie Vision → Architecture → Conception → Implémentation → Tests → Documentation se transforme en liste de contrôle à chaque étape.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Transition</th><th>Question de porte</th><th>Qui vérifie</th></tr>
+</thead>
+<tbody>
+<tr><td>Idée → Backlog</td><td>Cela est-il aligné avec la déclaration de vision ? Cela correspond-il à l’architecture cible ?</td><td>Triage de l’équipe principale</td></tr>
+<tr><td>Backlog → Défini</td><td>Y a-t-il des critères d’acceptation clairs ? Faut-il rédiger une ADR ou une note de conception ? Le niveau de risque a-t-il été attribué ?</td><td>Assigné + réviseur</td></tr>
+<tr><td>Défini → En cours</td><td>Y a-t-il un responsable ? L’élément est-il dimensionné ? Les ADR ou documents associés sont-ils identifiés ?</td><td>Assigné</td></tr>
+<tr><td>En cours → En révision</td><td>Les tests existent-ils pour le nouveau comportement ? La CI est-elle en cours de réussite ? La description de la PR est-elle complète ?</td><td>Auteur (auto-vérification)</td></tr>
+<tr><td>En révision → Terminé</td><td>Le niveau de réviseur approprié a-t-il approuvé ? La documentation a-t-elle été mise à jour ? L’entrée du CHANGELOG a-t-elle été rédigée ?</td><td>Relecteur</td></tr>
+<tr><td>Aucun → Ne sera pas fait</td><td>La décision de ne pas poursuivre a-t-elle été expliquée dans les commentaires de l’élément ?</td><td>Équipe principale</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Pourquoi les portes explicites sont importantes pour une équipe étudiante :</strong> Sans portes, les cartes avancent parce que quelqu’un estime avoir terminé, et non parce que « terminé » a une définition claire. C’est la source la plus courante de travail considéré comme « terminé » alors qu’il ne l’est pas. Les portes rendent la définition visible et partagée.</p>
+<h3 id="33-champs-personnalisés"><a class="header" href="#33-champs-personnalisés">3.3 Champs personnalisés</a></h3>
+<p>Créez ces champs dans les paramètres du projet GitHub :</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Champ</th><th>Type</th><th>Valeurs</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Statut</strong></td><td>Sélection unique</td><td>💡 Idée · 📋 Backlog · 🎯 Défini · 🚧 En cours · 👀 En revue · ✅ Terminé · 🚫 Ne sera pas fait</td></tr>
+<tr><td><strong>Type</strong></td><td>Sélection unique</td><td>Fonctionnalité · Correction de bug · Refactorisation · ADR · Documentation · Sécurité · Infrastructure · RFC</td></tr>
+<tr><td><strong>Priorité</strong></td><td>Sélection unique</td><td>🔴 Critique · 🟠 Élevée · 🟡 Moyenne · 🟢 Faible</td></tr>
+<tr><td><strong>Taille</strong></td><td>Sélection unique</td><td>XS · S · M · L · XL</td></tr>
+<tr><td><strong>Niveau de risque</strong></td><td>Sélection unique</td><td>Faible · Moyen · Élevé (correspond aux niveaux de risque de <code>AGENTS.md</code>)</td></tr>
+<tr><td><strong>Composant</strong></td><td>Sélection unique</td><td>Noyau · Passerelle · Canaux · Outils · Mémoire · Sécurité · Matériel · Documentation · Infrastructure</td></tr>
+<tr><td><strong>Jalon</strong></td><td>Jalon</td><td>v0.7.0 · v0.8.0 · v0.9.0 · v1.0.0 · Icebox</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Pour le dimensionnement (tailles de T-shirt) :</strong> Les story points nécessitent une calibration et des données historiques que l’équipe n’a pas encore. Les tailles de T-shirt sont immédiatement intuitives et suffisantes pour une équipe à ce stade :</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Taille</th><th>Ce que cela signifie</th><th>Portée approximative</th></tr>
+</thead>
+<tbody>
+<tr><td>XS</td><td>Moins de 2 heures</td><td>Une correction de faute de frappe, un ajustement de configuration, une modification en une seule ligne</td></tr>
+<tr><td>S</td><td>Demi-journée</td><td>Une petite correction de bug, une ajout mineur de fonctionnalité, une mise à jour de la documentation</td></tr>
+<tr><td>M</td><td>1 à 3 jours</td><td>Une fonctionnalité significative, une refonte d’un module, une nouvelle suite de tests</td></tr>
+<tr><td>L</td><td>1 à 2 semaines</td><td>Une fonctionnalité importante, une nouvelle extraction de crate, un changement transversal</td></tr>
+<tr><td>XL</td><td>Plus de 2 semaines</td><td>Une modification architecturale ; devrait être divisée en éléments plus petits</td></tr>
+</tbody>
+</table>
+</div>
+<p>Les éléments XL doivent presque toujours être décomposés avant qu’ils n’entrent dans la phase « En cours ». Si vous ne pouvez pas les décomposer, c’est que la conception n’est pas suffisamment aboutie.</p>
+<h3 id="34-vues"><a class="header" href="#34-vues">3.4 Vues</a></h3>
+<p>Créez quatre vues nommées dans le projet :</p>
+<p><strong>Vue 1 : Feuille de route</strong></p>
+<ul>
+<li>Type : Feuille de route (chronologie)</li>
+<li>Regroupé par : Jalon</li>
+<li>Champs visibles : Titre, Type, Taille, Composant, Assigné</li>
+<li>Objectif : Public. « Voici ce qui arrive et quand. » Partagez ce lien dans le README et avec la communauté. Maintenez-le à jour.</li>
+</ul>
+<p><strong>Vue 2 : Tableau de bord</strong></p>
+<ul>
+<li>Type : Tableau (Kanban)</li>
+<li>Colonnes : Valeurs du champ Statut</li>
+<li>Filtré pour : uniquement le jalon actuel</li>
+<li>Champs visibles : Titre, Assigné, Taille, Niveau de risque</li>
+<li>Objectif : Visibilité sur le travail quotidien. Sur quoi travaille tout le monde en ce moment ? Qui est bloqué ?</li>
+</ul>
+<p><strong>Vue 3 : Backlog</strong></p>
+<ul>
+<li>Type : Tableau</li>
+<li>Trié par : Priorité (décroissant), puis Taille (croissant)</li>
+<li>Filtré par : Statut = Backlog OU Défini</li>
+<li>Champs visibles : Titre, Type, Priorité, Taille, Composant, Jalon, Niveau de risque</li>
+<li>Objectif : Utilisé lors des séances de préparation. Qu’est-ce qui doit être travaillé ensuite ? Qu’est-ce qui est dimensionné et prêt à être pris en charge ?</li>
+</ul>
+<p><strong>Vue 4 : Mon travail</strong></p>
+<ul>
+<li>Type : Carte</li>
+<li>Filtré par : Assigné = @moi</li>
+<li>Objectif : Tableau de bord personnel. Chaque contributeur peut voir ses propres éléments sans bruit.</li>
+</ul>
+<h3 id="35-éléments-épinglés"><a class="header" href="#35-éléments-épinglés">3.5 Éléments épinglés</a></h3>
+<p>GitHub permet jusqu’à six éléments épinglés par dépôt. Utilisez-les pour une communication à fort signal, toujours visible :</p>
+<ol>
+<li>Le RFC actuellement actif en cours de discussion</li>
+<li>La fonctionnalité communautaire la plus demandée (Discussion la plus votée)</li>
+<li>Le prochain jalon de version suivi par ce problème</li>
+<li>L’index good-first-issue (une issue qui pointe vers tous les éléments <code>good-first-issue</code> actuels)</li>
+</ol>
+<p>Les problèmes épinglés sont une promesse faite à la communauté : ce sont les éléments qui comptent le plus en ce moment. Mettez-les à jour lorsque les priorités changent.</p>
+<hr>
+<h2 id="4-discussions-github--le-parking-des-idées"><a class="header" href="#4-discussions-github--le-parking-des-idées">4. Discussions GitHub : Le parking des idées</a></h2>
+<h3 id="41-activer-les-discussions-et-créer-des-catégories"><a class="header" href="#41-activer-les-discussions-et-créer-des-catégories">4.1 Activer les discussions et créer des catégories</a></h3>
+<p>Activez les Discussions GitHub sur le dépôt. Créez les catégories suivantes :</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Catégorie</th><th>Format</th><th>Objectif</th></tr>
+</thead>
+<tbody>
+<tr><td>📣 <strong>Annonces</strong></td><td>Annonce</td><td>Les publications de l’équipe principale ; la communauté ne peut que réagir et commenter</td></tr>
+<tr><td>💡 <strong>Idées</strong></td><td>Discussion ouverte</td><td>Demandes de fonctionnalités et suggestions de la communauté ; le parking à idées</td></tr>
+<tr><td>🏗️ <strong>Architecture</strong></td><td>Discussion ouverte</td><td>Questions et propositions concernant la conception du système ; alimente le processus de RFC</td></tr>
+<tr><td>❓ <strong>FAQ</strong></td><td>Question/Réponse</td><td>Comment faire X ? Réponses des contributeurs et de l’équipe principale</td></tr>
+<tr><td>🐛 <strong>Signalements de bogues (pré-triage)</strong></td><td>Discussion ouverte</td><td>Pour les rapports de bogues nécessitant plus d’informations avant de devenir des problèmes</td></tr>
+<tr><td>🌐 <strong>Traductions</strong></td><td>Discussion ouverte</td><td>Traductions et coordination de la localisation maintenues par la communauté</td></tr>
+<tr><td>🎉 <strong>Présentation et discussion</strong></td><td>Discussion ouverte</td><td>Qu’est-ce que vous construisez avec ZeroClaw ? Exemples de la communauté</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="42-le-processus-de-promotion-des-idées-en-tickets"><a class="header" href="#42-le-processus-de-promotion-des-idées-en-tickets">4.2 Le processus de promotion des idées en tickets</a></h3>
+<p>Les discussions dans la catégorie <strong>Idées</strong> suivent un processus de promotion léger :</p>
+<pre><code>Un membre de la communauté publie une idée dans Discussions → Idées
+         ↓
+La communauté vote avec des réactions 👍
+         ↓
+Seuil : 5 👍 de contributeurs ou de membres de l'équipe principale
+         ↓
+Un membre de l'équipe principale convertit en Issue en utilisant la fonctionnalité GitHub "Créer une issue depuis une discussion"
+         ↓
+L'issue entre dans le tableau de projet avec le statut 💡 Idée
+         ↓
+La discussion est marquée comme "Répondue" avec un lien vers la nouvelle issue
+</code></pre>
+<p>Le seuil de cinq votes provenant des contributeurs ou de l’équipe principale (et non des membres anonymes de la communauté) permet d’éviter que des demandes à faible pertinence n’inondent le backlog, tout en offrant à la communauté une réelle voix. Les réactions des comptes non affiliés comptent comme des données de sentiment de la communauté, mais ne sont pas prises en compte pour le seuil.</p>
+<p><strong>Pourquoi ce processus est important :</strong> Il permet de distinguer le signal du bruit. Toutes les idées ne sont pas de bonnes idées, et toutes les bonnes idées ne sont pas nécessairement les bonnes à mettre en œuvre pour le moment. La couche Discussions permet à la communauté d’exprimer ses souhaits sans créer la fausse attente que chaque demande deviendra automatiquement un ticket.</p>
+<h3 id="43-idées-qui-ne-devraient-pas-attendre-les-votes"><a class="header" href="#43-idées-qui-ne-devraient-pas-attendre-les-votes">4.3 Idées qui ne devraient pas attendre les votes</a></h3>
+<p>Certains éléments contournent le processus de promotion des discussions et sont directement ajoutés à la file d’attente :</p>
+<ul>
+<li>Vulnérabilités de sécurité (via un rapport de sécurité privé, jamais public)</li>
+<li>Bugs confirmés avec des étapes de reproduction (accédez directement au modèle de rapport de bug)</li>
+<li>Éléments d’architecture acceptés par la RFC (générés directement à partir de la boucle de clôture de la RFC)</li>
+<li>Éléments du calendrier du projet (ajoutés directement par l’équipe principale)</li>
+</ul>
+<h3 id="44-la-catégorie-darchitecture"><a class="header" href="#44-la-catégorie-darchitecture">4.4 La catégorie d’architecture</a></h3>
+<p>La catégorie <strong>Architecture</strong> des Discussions est spécifiquement destinée aux questions et propositions qui ne sont pas encore prêtes à devenir des RFC formelles. Un contributeur qui remarque un problème avec la conception actuelle ou souhaite explorer une idée peut ouvrir une discussion sur l’architecture avant de s’engager à rédiger une RFC complète. Cela abaisse la barrière pour soulever des préoccupations.</p>
+<p>Si une discussion sur l’architecture atteint un niveau de détail et de consensus suffisant, un membre de l’équipe principale peut la promouvoir au statut de RFC formel en déplaçant le contenu vers <code>docs/proposals/</code> et en ouvrant une issue de type RFC.</p>
+<hr>
+<h2 id="5-niveaux-déquipe-et-autorité-de-contribution"><a class="header" href="#5-niveaux-déquipe-et-autorité-de-contribution">5. Niveaux d’équipe et autorité de contribution</a></h2>
+<h3 id="51-les-trois-niveaux"><a class="header" href="#51-les-trois-niveaux">5.1 Les trois niveaux</a></h3>
+<p>Les projets open source fonctionnent selon une <strong>méritocratie</strong> — l’influence et l’autorité découlent de contributions démontrées, et non de l’ancienneté, du titre ou des relations personnelles. C’est l’une des choses qui différencient l’open source des logiciels corporatifs, et il est important de l’enseigner explicitement.</p>
+<p>Les trois niveaux reflètent un engagement croissant envers le projet :</p>
+<hr>
+<p><strong>Niveau 1 : Communauté</strong></p>
+<p>Tout le monde. Aucune approbation requise.</p>
+<p><em>Ce qu’ils peuvent faire :</em></p>
+<ul>
+<li>Ouvrir des problèmes en utilisant les modèles de problème</li>
+<li>Commentez sur n’importe quelle issue ou PR</li>
+<li>Réagissez aux discussions et votez pour les idées</li>
+<li>Soumettez des pull requests (qui seront examinées avant la fusion)</li>
+<li>Modifier le Wiki GitHub</li>
+</ul>
+<p><em>Ce qu’ils ne peuvent pas faire :</em></p>
+<ul>
+<li>Être assigné des tâches (peut demander à être assigné)</li>
+<li>Approuver les PR</li>
+<li>Fusionner les PR</li>
+<li>Votez sur les RFCs ayant une autorité contraignante</li>
+</ul>
+<hr>
+<p><strong>Niveau 2 : Contributeur</strong></p>
+<p>Les membres de la communauté qui ont eu au moins deux PR fusionnées dans la branche <code>master</code>.</p>
+<p><em>Pour devenir contributeur :</em> Deux PRs doivent être fusionnées. Un membre de l’équipe principale vous ajoute à l’équipe des contributeurs sur GitHub et à <code>CONTRIBUTORS.md</code>.</p>
+<p><em>Ce qu’ils gagnent au-delà de la communauté :</em></p>
+<ul>
+<li>Peut être assigné des tâches</li>
+<li>Peut être demandé comme réviseur sur les PRs (révision non obligatoire)</li>
+<li>Les votes sur les idées dans les discussions comptent pour le seuil de promotion.</li>
+<li>Peut demander des discussions RFC sans passer par Discussions en premier</li>
+</ul>
+<p><em>Ce qu’ils ne peuvent toujours pas faire :</em></p>
+<ul>
+<li>Approuvez les PR pour les chemins à haut risque</li>
+<li>Fusionner les PR</li>
+<li>Exprimer les votes pour les propositions RFC</li>
+</ul>
+<p><em>Pourquoi ce niveau existe-t-il</em> : Il établit un premier objectif visible et atteignable pour les nouveaux contributeurs. « Comment puis-je m’impliquer davantage ? » a une réponse claire : obtenir deux PR fusionnées. Cela motive les premières contributions de qualité et offre à l’équipe un moyen de reconnaître publiquement les contributeurs.</p>
+<hr>
+<p><strong>Niveau 3 : Équipe principale</strong></p>
+<p>Les contributeurs qui ont démontré des contributions constantes et de haute qualité au fil du temps et qui ont été invités par des membres existants de l’équipe principale.</p>
+<p><strong>Comment devenir membre :</strong> Une invitation des membres actuels de l’équipe Core, annoncée publiquement dans les Discussions. Il n’y a pas de seuil formel — cela repose sur un jugement basé sur la qualité, la régularité et l’alignement des contributions passées.</p>
+<p><em>Ce qu’ils gagnent au-delà de Contributor :</em></p>
+<ul>
+<li>Accès en écriture au dépôt</li>
+<li>Peut fusionner les PR qui ont satisfait aux exigences de revue.</li>
+<li>Peut approuver les PR pour les chemins à haut risque (sous réserve des exigences de CODEOWNERS)</li>
+<li>Exprimer des votes sur les RFC</li>
+<li>Peut déplacer des éléments à travers le pipeline du projet</li>
+<li>Peut couper les versions</li>
+<li>Participer aux décisions de gouvernance (discussions de l’équipe principale)</li>
+</ul>
+<p><em>Résponsabilités :</em></p>
+<ul>
+<li>Triagez les nouveaux problèmes dans un délai de 3 jours ouvrables.</li>
+<li>Examinez les PR dans leur domaine d’expertise dans les 5 jours ouvrables.</li>
+<li>Participer aux votes des RFC</li>
+<li>Respectez le Code de conduite du projet</li>
+</ul>
+<hr>
+<h3 id="52-la-règle-du-consensus-paresseux"><a class="header" href="#52-la-règle-du-consensus-paresseux">5.2 La règle du consensus paresseux</a></h3>
+<p>Pour les décisions courantes — ajouter une étiquette, clôturer une issue périmée, mettre à jour la documentation — les membres de l’équipe principale opèrent selon le principe du <strong>consensus par défaut</strong> : si vous annoncez votre intention dans l’issue concernée et qu’aucun membre de l’équipe principale ne s’y oppose dans les 48 heures, vous pouvez procéder. Cela évite la paralysie due à l’exigence d’une approbation explicite pour chaque action, tout en maintenant la visibilité du processus.</p>
+<p>Le consensus paresseux ne s’applique pas à :</p>
+<ul>
+<li>Acceptation ou rejet de la RFC</li>
+<li>Releases</li>
+<li>Modifications apportées aux fichiers CODEOWNERS ou aux règles de protection des branches</li>
+<li>Modifications apportées à ce document de gouvernance</li>
+<li>Ajouts à l’équipe principale</li>
+</ul>
+<p>Ces éléments nécessitent toujours des votes explicites de l’équipe Core.</p>
+<h3 id="53-enregistrement-de-lappartenance-à-léquipe"><a class="header" href="#53-enregistrement-de-lappartenance-à-léquipe">5.3 Enregistrement de l’appartenance à l’équipe</a></h3>
+<p>L’appartenance à une équipe est enregistrée à deux endroits :</p>
+<p><strong><code>CONTRIBUTORS.md</code></strong> à la racine du dépôt — un registre public de tous les contributeurs, organisé par niveau. Mis à jour par les membres de l’équipe principale lorsque les contributeurs sont reconnus.</p>
+<p><strong>GitHub Teams</strong> dans les paramètres de l’organisation — les équipes <code>zeroclaw-core</code> et <code>zeroclaw-contributors</code>, référencées dans CODEOWNERS et utilisées pour le routage des notifications.</p>
+<hr>
+<h2 id="6-codeowners-et-protection-des-branches"><a class="header" href="#6-codeowners-et-protection-des-branches">6. CODEOWNERS et protection des branches</a></h2>
+<h3 id="61-codeowners"><a class="header" href="#61-codeowners">6.1 CODEOWNERS</a></h3>
+<p>Le fichier <code>CODEOWNERS</code> automatise la gouvernance. Il définit quels chemins nécessitent une revue de la part de quelle équipe avant qu’une PR puisse être fusionnée. GitHub applique cela comme une revue obligatoire — la PR ne peut pas être fusionnée tant que la condition n’est pas satisfaite.</p>
+<p>Créez <code>.github/CODEOWNERS</code> :</p>
+<pre><code># CODEOWNERS — Automatic review routing by risk tier
+# See AGENTS.md for risk tier definitions.
+# See docs/proposals/project-governance.md for team tier definitions.
+
+# ── High Risk: requires Core Team approval ──────────────────────────────────
+
+src/security/**                 @zeroclaw-labs/zeroclaw-core
+src/gateway/**                  @zeroclaw-labs/zeroclaw-core
+src/runtime/**                  @zeroclaw-labs/zeroclaw-core
+src/tools/shell.rs              @zeroclaw-labs/zeroclaw-core
+src/tools/file_write.rs         @zeroclaw-labs/zeroclaw-core
+src/tools/security_ops.rs       @zeroclaw-labs/zeroclaw-core
+
+# ── Governance and configuration: requires Core Team approval ───────────────
+
+.github/**                      @zeroclaw-labs/zeroclaw-core
+CODEOWNERS                      @zeroclaw-labs/zeroclaw-core
+Cargo.toml                      @zeroclaw-labs/zeroclaw-core
+deny.toml                       @zeroclaw-labs/zeroclaw-core
+
+# ── Architecture documents: requires Core Team review ───────────────────────
+
+docs/proposals/**               @zeroclaw-labs/zeroclaw-core
+docs/architecture/decisions/**  @zeroclaw-labs/zeroclaw-core
+AGENTS.md                       @zeroclaw-labs/zeroclaw-core
+
+# ── Default: any Contributor or Core Team member can review ─────────────────
+
+*                               @zeroclaw-labs/zeroclaw-contributors
+</code></pre>
+<p>Lorsque des membres spécifiques de l’équipe Core prennent en charge des composants, ajoutez leurs identifiants individuels à côté de l’identifiant de l’équipe. La spécificité prime dans CODEOWNERS : une règle de chemin plus spécifique remplace une règle plus générale.</p>
+<h3 id="62-règles-de-protection-des-branches"><a class="header" href="#62-règles-de-protection-des-branches">6.2 Règles de protection des branches</a></h3>
+<p>Configurez les règles de protection de branche suivantes pour <code>master</code> :</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Règle</th><th>Paramètre</th><th>Raison</th></tr>
+</thead>
+<tbody>
+<tr><td>Exiger une pull request avant la fusion</td><td>Activé</td><td>Aucune poussée directe vers master — jamais</td></tr>
+<tr><td>Exiger des approbations</td><td>1 pour les risques Faibles/Moyens ; 2 pour les risques Élevés</td><td>Le respect des CODEOWNERS gère la question du « qui ».</td></tr>
+<tr><td>Exiger que les vérifications d’état soient validées</td><td><code>cargo fmt</code>, <code>cargo clippy</code>, <code>cargo test</code></td><td>Le CI doit être vert avant la fusion.</td></tr>
+<tr><td>Exiger que les branches soient à jour</td><td>Activé</td><td>Empêche la fusion de code obsolète</td></tr>
+<tr><td>Exiger la résolution de la conversation</td><td>Activé</td><td>Tous les commentaires de revue doivent être résolus.</td></tr>
+<tr><td>Ne pas autoriser le contournement des paramètres ci-dessus</td><td>Activé</td><td>S’applique à tous, y compris aux administrateurs</td></tr>
+<tr><td>Autoriser les poussées forcées</td><td>Désactivé</td><td>Conserver l’historique des commits</td></tr>
+<tr><td>Autoriser les suppressions</td><td>Désactivé</td><td>Protéger la branche</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Pourquoi les administrateurs ne peuvent pas contourner la règle :</strong> L’une des erreurs les plus courantes dans les projets de petites équipes est de considérer la protection des branches comme étant « pour les autres ». Lorsqu’un administrateur peut contourner la règle, il le fera — sous la pression du temps, en cas d’urgence, « juste cette fois-ci ». Puis cela devient la norme. La règle doit s’appliquer à tous pour avoir du sens. S’il y a une véritable urgence, la bonne réponse est de suivre le processus plus rapidement, et non de le contourner.</p>
+<h3 id="63-vérifications-détat-requises"><a class="header" href="#63-vérifications-détat-requises">6.3 Vérifications d’état requises</a></h3>
+<p>Les vérifications CI qui doivent réussir avant qu’une PR puisse être fusionnée :</p>
+<pre><code>build (stable)          ← cargo build --release
+test                    ← cargo test
+fmt                     ← cargo fmt --all -- --check
+clippy                  ← cargo clippy --all-targets -- -D warnings
+</code></pre>
+<p>À mesure que l’espace de travail se décompose en crates (conformément à la RFC sur l’architecture), ajoutez des vérifications par crate. Une modification dans <code>crates/zeroclaw-api</code> doit exécuter la suite de tests de cette crate de manière indépendante.</p>
+<h3 id="64-conformité-architecturale--revue-humaine-assistance-ia"><a class="header" href="#64-conformité-architecturale--revue-humaine-assistance-ia">6.4 Conformité architecturale : revue humaine, assistance IA</a></h3>
+<p>Cette section existe parce que la question se posera — elle l’a déjà fait — et mérite une réponse claire et documentée plutôt qu’un débat à chaque PR.</p>
+<p><strong>La question :</strong> Devrions-nous ajouter un filtre automatisé qui vérifie si une PR est conforme à l’architecture et aux modèles de conception définis dans les RFC ?</p>
+<p><strong>La réponse :</strong> Non. Et comprendre pourquoi est important.</p>
+<hr>
+<p><strong>Il existe deux types fondamentalement différents de contrôle de la qualité, et ils nécessitent des mécanismes différents.</strong></p>
+<p>Le premier type est la <em>conformité structurelle</em> : ce code enfreint-il une règle mécanique ? <code>zeroclaw-kernel</code> importe-t-il <code>TelegramChannel</code> ? Les arêtes du graphe de dépendances pointent-elles dans la mauvaise direction ? Y a-t-il des avertissements de <code>clippy</code> ? Il s’agit de questions binaires. Soit le code enfreint la règle, soit il ne l’enfreint pas. Le compilateur, <code>cargo deny</code> et <code>cargo clippy --workspace</code> imposent déjà cette conformité. Aucun humain n’est nécessaire. Aucune IA n’est nécessaire. La machine est autoritaire, rapide et ne se trompe jamais sur une violation factuelle.</p>
+<p>Le deuxième type est l’<em>intention architecturale</em> : cette décision appartient-elle à cet endroit ? Cette abstraction se trouve-t-elle à la bonne couche ? Ce compromis est-il cohérent avec la vision ? Ce couplage sera-t-il problématique dans la Phase 3 ? Cette PR va-t-elle créer une charge de maintenance qui n’est pas visible dans le diff actuel ? Ces questions exigent du jugement, du contexte et une compréhension du <em>pourquoi</em> de l’architecture — et non seulement des règles. Aucun outil automatisé ne peut y répondre de manière fiable, car la réponse dépend d’informations qui ne figurent pas dans le diff : la feuille de route, les priorités actuelles de l’équipe, l’intention du contributeur et le coût à long terme de la décision.</p>
+<p><strong>Les modes de défaillance de l’automatisation du jugement architectural sont tous deux problématiques.</strong></p>
+<p>Une porte qui laisse passer de subtiles violations architecturales engendre une fausse confiance. Le développeur voit ✅ et suppose que sa décision a été validée. La dérive architecturale la plus dommageable — celle qui prend des années à dénouer — semble structurellement correcte. Elle compile. Elle passe les vérifications de lint. Le graphe des dépendances est sain. Le problème est qu’elle a violé l’esprit du design d’une manière qui ne devient apparente que plus tard, lorsque le coût pour la défaire est élevé.</p>
+<p>Une porte qui signale des décisions architecturales valides parce que l’outil a mal interprété le contexte apprend aux développeurs à ignorer complètement cette porte. Une fois qu’une équipe a appris à cliquer au-delà d’un contrôle automatisé bruyant, ce contrôle devient inefficace en pratique, même s’il est toujours exécuté dans CI. Le projet a dépensé des minutes CI pour obtenir une valeur négative.</p>
+<p><strong>CODEOWNERS est la porte de conformité architecturale. Le réviseur est l’outil.</strong></p>
+<p>La configuration <code>CODEOWNERS</code> de la section 6.1 impose déjà que les PRs modifiant des chemins à haut risque — limites des crates, définitions de traits, graphe des dépendances, <code>src/security/</code>, <code>.github/</code> — soient examinées par un membre de l’équipe Core. Ce membre de l’équipe Core, qui dispose des RFC comme cadre de référence, constitue le contrôle de conformité architecturale. Il apporte un jugement contextuel qu’aucune automatisation ne peut reproduire.</p>
+<p>C’est pourquoi les RFC, les fichiers AGENTS.md et les normes de documentation existent : non pas pour qu’une machine puisse les analyser et produire un score, mais pour qu’un réviseur humain dispose d’un cadre cohérent et documenté à appliquer. La RFC répond à la question « pourquoi cette architecture existe-t-elle ? ». Le réviseur répond à la question « cette PR sert-elle ou affaiblit-elle cet objectif ? ».</p>
+<p><strong>L’IA doit faire partie du cycle de développement, pas de la porte de fusion.</strong></p>
+<p>Les outils d’IA — Claude, Copilot, Cursor, et ceux qui suivront — sont véritablement utiles pour les travaux d’architecture lorsqu’ils sont utilisés au bon endroit. Le bon endroit est <em>pendant le développement</em>, et non <em>pendant la phase de fusion</em>.</p>
+<p>Pendant le développement, un assistant IA équipé de la RFC et du fichier AGENTS.md du crate peut aider un contributeur à comprendre dans quel crate une nouvelle fonctionnalité doit être intégrée avant même de la coder, signaler une inversion potentielle de dépendance pendant que le code est encore en cours de conception, expliquer pourquoi un motif de conception existe, et suggérer si une nouvelle abstraction se situe au bon niveau. Cela constitue une amélioration additive. Cela rend les contributeurs plus compétents.</p>
+<p>Lors d’une revue, un assistant IA peut aider un réviseur humain à rédiger des commentaires structurés, à croiser une modification avec la RFC et à identifier les questions de discussion de la RFC pertinentes pour la PR. Cette approche est également additive. Le réviseur apporte son jugement ; l’IA apporte rapidité et mémoire.</p>
+<p>Ce que l’IA ne peut pas faire, c’est remplacer le jugement. « L’IA m’aide à évaluer cette PR » et « L’IA applique automatiquement un contrôle sur cette PR » sont deux concepts fondamentalement différents, et seul le premier est pertinent pour les décisions architecturales. Le jour où un projet confie la conformité architecturale à un contrôle automatisé — aussi sophistiqué soit-il —, l’architecture commencera à dériver de manière imperceptible jusqu’à ce qu’il soit trop tard.</p>
+<p><strong>La politique pratique, énoncée clairement :</strong></p>
+<ul>
+<li>La conformité structurelle (direction d’importation, graphe de dépendances, lint, format) est imposée par CI. Cela est non négociable et automatisé.</li>
+<li>La conformité à l’intention architecturale est assurée par le routage via CODEOWNERS vers un réviseur de l’équipe Core. Cela est non négociable et manuel.</li>
+<li>Les outils d’IA accompagnent les contributeurs pendant le développement et aident les relecteurs lors de la revue. Ils ne bloquent pas les fusions par leur propre autorité.</li>
+<li>Si l’équipe souhaite évaluer des outils de revue assistés par l’IA à l’avenir, cette évaluation doit d’abord passer par le processus RFC. Elle ne sera pas ajoutée à <code>.github/workflows/</code> sans une décision documentée.</li>
+</ul>
+<p>Cette politique ne constitue pas une limitation de l’IA ou de l’automatisation. Elle reconnaît que différents problèmes nécessitent des outils différents, et utiliser le bon outil au bon endroit est exactement ce que la RFC d’architecture demande au codebase.</p>
+<hr>
+<h2 id="7-modèles-démission"><a class="header" href="#7-modèles-démission">7. Modèles d’émission</a></h2>
+<p>Les modèles d’issue redirigent les rapports entrants vers le bon processus avant qu’ils n’atteignent un humain. Un modèle bien rédigé recueille automatiquement les informations nécessaires au tri. Un modèle manquant ou ignoré entraîne des issues qui nécessitent trois échanges de commentaires pour être comprises.</p>
+<p>Créez les modèles suivants dans <code>.github/ISSUE_TEMPLATE/</code> :</p>
+<h3 id="modèle-1--rapport-de-bug-bug_reportyml"><a class="header" href="#modèle-1--rapport-de-bug-bug_reportyml">Modèle 1 : Rapport de bug (<code>bug_report.yml</code>)</a></h3>
+<pre><code class="language-yaml">nom: Rapport de bug
+description: Quelque chose ne fonctionne pas comme prévu.
+étiquettes: ["type:bug", "status:besoin-de-triage"]
+corps:
+  - type: markdown
+    attributs:
+      valeur: |
+        Before submitting: search existing issues to avoid duplicates.
+        For security vulnerabilities, use the private security report
+        process described in SECURITY.md — do not open a public issue.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: The exact steps to reproduce the bug.
+      placeholder: |
+        1. Run `zeroclaw ...`
+        2. With config `...`
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: |
+        - ZeroClaw version:
+        - OS and version:
+        - Rust version (if built from source):
+        - Provider:
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Does this bug have security implications?
+      options:
+        - "No"
+        - "Yes — I have already filed a private security report"
+        - "I am not sure"
+    validations:
+      required: true
+</code></pre>
+<h3 id="modèle-2--demande-de-fonctionnalité-feature_requestyml"><a class="header" href="#modèle-2--demande-de-fonctionnalité-feature_requestyml">Modèle 2 : Demande de fonctionnalité (<code>feature_request.yml</code>)</a></h3>
+<pre><code class="language-yaml">nom: Demande de fonctionnalité
+description: Suggérez une nouvelle fonctionnalité ou une amélioration
+étiquettes: ["type:feature", "status:besoin-de-triage"]
+corps:
+  - type: markdown
+    attributs:
+      valeur: |
+        Feature requests that have been discussed and upvoted in GitHub
+        Discussions → Ideas are more likely to be prioritized. Consider
+        posting there first if you want community feedback before filing.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the problem or limitation you are experiencing.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would you like to happen?
+      description: Describe the feature or change you are proposing.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What alternatives have you considered?
+      description: Other ways to solve the problem, including doing nothing.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which component does this affect?
+      options:
+        - Kernel / Agent Loop
+        - Gateway / Web UI
+        - Channels
+        - Tools
+        - Memory
+        - Security
+        - Hardware / Peripherals
+        - Documentation
+        - Infrastructure / CI
+        - Not sure
+    validations:
+      required: true
+</code></pre>
+<h3 id="modèle-3--proposition-de-rfc--architecture-rfcyml"><a class="header" href="#modèle-3--proposition-de-rfc--architecture-rfcyml">Modèle 3 : Proposition de RFC / Architecture (<code>rfc.yml</code>)</a></h3>
+<pre><code class="language-yaml">nom: RFC / Proposition d'architecture
+description: Proposez un changement architectural ou comportemental significatif
+étiquettes: ["type:rfc", "statut:discussion"]
+corps:
+  - type: markdown
+    attributs:
+      valeur: |
+        RFCs are for significant changes that affect architecture, public
+        interfaces, or project direction. Before filing an RFC issue:
+        1. Write the proposal document and add it to `docs/proposals/`
+        2. Open a PR with that document
+        3. Then open this issue to start the formal discussion period
+
+        For smaller changes, open a regular feature request or just a PR.
+  - type: input
+    id: proposal-pr
+    attributes:
+      label: Link to the proposal document PR
+      placeholder: "https://github.com/zeroclaw-labs/zeroclaw/pull/..."
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: One-paragraph summary
+      description: What is being proposed and why?
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact and tradeoffs
+      description: What does this change affect? What are the tradeoffs?
+    validations:
+      required: true
+  - type: dropdown
+    id: breaking
+    attributes:
+      label: Is this a breaking change?
+      options:
+        - "No"
+        - "Yes — existing configurations or APIs change"
+        - "Potentially — needs investigation"
+    validations:
+      required: true
+</code></pre>
+<h3 id="modèle-4--problème-de-documentation-docs_issueyml"><a class="header" href="#modèle-4--problème-de-documentation-docs_issueyml">Modèle 4 : Problème de documentation (<code>docs_issue.yml</code>)</a></h3>
+<pre><code class="language-yaml">nom: Problème de documentation
+description: Il manque quelque chose dans la documentation, ou bien il y a une erreur ou une confusion.
+étiquettes: ["type:docs", "status:besoin-de-triage"]
+corps:
+  - type: entrée
+    id: emplacement
+    attributs:
+      libellé: Où se trouve le problème de documentation ?
+      placeholder: "URL ou chemin de fichier (par ex. docs/reference/api/config-reference.md)"
+    validations:
+      obligatoire: true
+  - type: menu déroulant
+    id: type-d
+    attributs:
+      libellé: Type de problème
+      options:
+        - Documentation manquante
+        - Informations incorrectes
+        - Confusant ou peu clair
+        - Obsolète (le code a changé)
+        - Lien brisé
+    validations:
+      obligatoire: true
+  - type: zone de texte
+    id: description
+    attributs:
+      libellé: Décrivez le problème
+    validations:
+      obligatoire: true
+  - type: zone de texte
+    id: suggestion
+    attributs:
+      libellé: Amélioration suggérée (facultatif)
+      description: Si vous savez quel devrait être le contenu correct, partagez-le ici.
+</code></pre>
+<h3 id="modèle-5--redirection-du-rapport-de-sécurité"><a class="header" href="#modèle-5--redirection-du-rapport-de-sécurité">Modèle 5 : Redirection du rapport de sécurité</a></h3>
+<p>Créez <code>.github/ISSUE_TEMPLATE/security.md</code> en tant que redirection — GitHub l’affichera comme une option de modèle, mais le contenu redirigera au lieu de créer un ticket :</p>
+<pre><code class="language-yaml">nom: Vulnérabilité de sécurité
+description: ⚠️ N'utilisez pas ce modèle. Consultez SECURITY.md pour le signalement privé.
+étiquettes: []
+corps:
+  - type: markdown
+    attributs:
+      valeur: |
+        ## ⚠️ Ne signalez pas les vulnérabilités de sécurité en tant que problèmes publics.
+
+        Security vulnerabilities disclosed publicly before a fix is available
+        put all ZeroClaw users at risk. Please follow the private disclosure
+        process described in [SECURITY.md](https://github.com/zeroclaw-labs/zeroclaw/blob/master/SECURITY.md).
+
+        If you have already filed this as a public issue by mistake, please
+        delete it and re-report privately. A Core Team member will contact
+        you to confirm receipt.
+</code></pre>
+<h3 id="modèle-6--bonne-première-contribution-good_first_issueyml"><a class="header" href="#modèle-6--bonne-première-contribution-good_first_issueyml">Modèle 6 : Bonne première contribution (<code>good_first_issue.yml</code>)</a></h3>
+<pre><code class="language-yaml">nom: Bonne première issue (équipe principale uniquement)
+description: Marquer une issue comme un bon point d'entrée pour les nouveaux contributeurs
+étiquettes: ["good-first-issue", "status:besoin-de-triage"]
+corps:
+  - type: markdown
+    attributs:
+      valeur: |
+        This template is for Core Team members identifying good entry
+        points for new contributors. A good first issue must have:
+        - A clear, self-contained scope (no cross-cutting changes)
+        - Size of XS or S
+        - Links to the relevant code files
+        - A named mentor the new contributor can ping for help
+  - type: textarea
+    id: description
+    attributes:
+      label: What needs to be done?
+      description: Be specific. Include file paths and function names where known.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and background
+      description: What does a new contributor need to understand to work on this?
+    validations:
+      required: true
+  - type: input
+    id: mentor
+    attributes:
+      label: Mentor / point of contact
+      placeholder: "@username"
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How will we know when this is done?
+    validations:
+      required: true
+</code></pre>
+<hr>
+<h2 id="8-la-boucle-de-gouvernance-rfc"><a class="header" href="#8-la-boucle-de-gouvernance-rfc">8. La boucle de gouvernance RFC</a></h2>
+<p>Le processus RFC a été établi dans la documentation RFC et l’architecture RFC. Cette section définit la boucle de clôture — comment une RFC passe de la proposition à la décision, puis à l’action.</p>
+<h3 id="81-le-cycle-de-vie-complet-de-la-rfc"><a class="header" href="#81-le-cycle-de-vie-complet-de-la-rfc">8.1 Le cycle de vie complet de la RFC</a></h3>
+<pre><code>1. AUTHOR writes proposal → docs/proposals/&lt;slug&gt;.md
+           ↓
+2. AUTHOR opens PR with the proposal document
+           ↓
+3. AUTHOR opens RFC issue using the RFC issue template
+   linking to the PR
+           ↓
+4. DISCUSSION PERIOD — minimum 7 days
+   Anyone can comment. Core Team members engage substantively.
+   Discussions happen on the issue, not the PR.
+           ↓
+5. CORE TEAM VOTE on the issue
+   Format: comment with one of:
+     ✅ APPROVE — with brief rationale
+     ❌ REJECT — with specific objections
+     🔄 REVISE — with specific requests
+           ↓
+   ┌── Majority APPROVE ──────────────────────────────────────┐
+   │  RFC is accepted                                          │
+   │  PR is merged                                            │
+   │  Issue labeled rfc:accepted                              │
+   │  Author writes ADR(s) in docs/architecture/decisions/    │
+   │  ADR issue(s) linked back to RFC issue                   │
+   │  RFC issue closed                                        │
+   └──────────────────────────────────────────────────────────┘
+           ↓
+   ┌── Any REJECT ────────────────────────────────────────────┐
+   │  RFC is rejected                                          │
+   │  PR is closed (not merged)                               │
+   │  Issue labeled rfc:rejected                              │
+   │  Rejecting members document specific objections          │
+   │  RFC issue closed with rejection summary comment         │
+   └──────────────────────────────────────────────────────────┘
+           ↓
+   ┌── REVISE requested ──────────────────────────────────────┐
+   │  RFC is not voted on until revisions are complete        │
+   │  Issue labeled rfc:revision-requested                    │
+   │  Author revises proposal document                        │
+   │  Author re-requests review via issue comment             │
+   │  Process returns to step 4                               │
+   └──────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="82-seuils-de-vote"><a class="header" href="#82-seuils-de-vote">8.2 Seuils de vote</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Type de changement</th><th>Vote requis</th><th>Raison</th></tr>
+</thead>
+<tbody>
+<tr><td>Documentation, outillage, fonctionnalités non cassantes</td><td>Majorité simple des membres actifs de l’équipe Core</td><td>Faible enjeu, itération rapide</td></tr>
+<tr><td>Modifications de l’API, nouveaux sous-systèmes, changements de comportement</td><td>Majorité des deux tiers de l’équipe Core</td><td>Enjeux modérés, nécessitent un réel consensus</td></tr>
+<tr><td>Modifications de l’architecture, modifications du modèle de sécurité, modifications incompatibles</td><td>Accord unanime de tous les membres de l’équipe principale</td><td>Enjeux élevés, cela affecte tout le monde</td></tr>
+</tbody>
+</table>
+</div>
+<p>Les membres de l’<strong>équipe principale</strong> (« Core Team ») <strong>actifs</strong> sont ceux qui ont participé à au moins un vote au cours des 90 derniers jours. Les membres inactifs ne sont pas pris en compte dans les seuils de majorité, mais sont informés des votes.</p>
+<h3 id="83-la-connexion-adr"><a class="header" href="#83-la-connexion-adr">8.3 La connexion ADR</a></h3>
+<p>Chaque RFC acceptée doit produire au moins une ADR avant que la mise en œuvre correspondante puisse commencer. L’ADR n’est pas un résumé de la RFC — c’est l’enregistrement permanent de la décision spécifique prise, au format Nygard défini dans la documentation de la RFC. La RFC peut être longue et exploratoire. L’ADR est courte et définitive.</p>
+<p>Les RFC sont des propositions. Les ADR sont des décisions. Les deux sont nécessaires. Aucun ne remplace l’autre.</p>
+<h3 id="84-rfc-existants-dans-ce-dépôt"><a class="header" href="#84-rfc-existants-dans-ce-dépôt">8.4 RFC existants dans ce dépôt</a></h3>
+<p>Les RFC suivantes ont été soumises à ce jour et doivent être converties en problèmes RFC formels immédiatement :</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Document RFC</th><th>Problème à créer</th><th>Priorité</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs/proposals/microkernel-architecture.md</code></td><td>RFC sur l’architecture microkernel (v0.7.0+)</td><td>Élevé</td></tr>
+<tr><td><code>docs/proposals/documentation-standards.md</code></td><td>Normes de documentation et RFC i18n</td><td>Élevé</td></tr>
+<tr><td><code>docs/proposals/project-governance.md</code></td><td>RFC sur l’organisation et la gouvernance de l’équipe</td><td>Moyen</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="9-taxonomie-des-étiquettes"><a class="header" href="#9-taxonomie-des-étiquettes">9. Taxonomie des étiquettes</a></h2>
+<p>Les étiquettes constituent la couche de métadonnées sur les tickets et les PR. Un système d’étiquettes cohérent et bien conçu permet le filtrage, la génération de rapports et l’automatisation. Un système d’étiquettes incohérent (le cas le plus courant — étiquettes ajoutées de manière ad hoc par quiconque crée un ticket) crée du bruit.</p>
+<p>Utilisez un système d’étiquettes <strong>nommées</strong>. Chaque étiquette possède un préfixe qui identifie sa catégorie :</p>
+<h3 id="type--quel-type-de-travail-sagit-il-"><a class="header" href="#type--quel-type-de-travail-sagit-il-"><code>type:</code> — Quel type de travail s’agit-il ?</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Couleur</th><th>Utiliser</th></tr>
+</thead>
+<tbody>
+<tr><td><code>type:feature</code></td><td><code>#0075ca</code> Bleu</td><td>Nouvelle fonctionnalité ou amélioration</td></tr>
+<tr><td><code>type:bug</code></td><td><code>#d73a4a</code> Rouge</td><td>Quelque chose ne fonctionne pas correctement.</td></tr>
+<tr><td><code>type:refactor</code></td><td><code>#e4e669</code> Jaune</td><td>Restructuration du code sans changement de comportement</td></tr>
+<tr><td><code>type:docs</code></td><td><code>#0075ca</code> Bleu</td><td>Modifications de la documentation uniquement</td></tr>
+<tr><td><code>type:security</code></td><td><code>#e11d48</code> Rouge foncé</td><td>Modifications liées à la sécurité</td></tr>
+<tr><td><code>type:infrastructure</code></td><td><code>#6366f1</code> Violet</td><td>CI, outillage, système de construction</td></tr>
+<tr><td><code>type:adr</code></td><td><code>#a855f7</code> Violet clair</td><td>Enregistrement de décision d’architecture</td></tr>
+<tr><td><code>type:rfc</code></td><td><code>#f59e0b</code> Ambre</td><td>Demande de commentaires / proposition</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="priority--quelle-est-lurgence-de-cette-tâche-"><a class="header" href="#priority--quelle-est-lurgence-de-cette-tâche-"><code>priority:</code> — Quelle est l’urgence de cette tâche ?</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Couleur</th><th>Utiliser</th></tr>
+</thead>
+<tbody>
+<tr><td><code>priorité : critique</code></td><td><code>#b91c1c</code> Rouge foncé</td><td>Bloquer la publication ou entraîner une perte de données</td></tr>
+<tr><td><code>priority:high</code></td><td><code>#f97316</code> Orange</td><td>Important, doit être dans le prochain jalon</td></tr>
+<tr><td><code>priorité : moyenne</code></td><td><code>#eab308</code> Jaune</td><td>Priorité normale</td></tr>
+<tr><td><code>priorité : basse</code></td><td><code>#22c55e</code> Vert</td><td>Souhaitable, faible priorité</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="size--quelle-est-la-taille-de-cet-élément-de-travail-"><a class="header" href="#size--quelle-est-la-taille-de-cet-élément-de-travail-"><code>size:</code> — Quelle est la taille de cet élément de travail ?</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Couleur</th><th>Utiliser</th></tr>
+</thead>
+<tbody>
+<tr><td><code>size:xs</code></td><td><code>#dcfce7</code> Vert clair</td><td>Moins de 2 heures</td></tr>
+<tr><td><code>taille:s</code></td><td><code>#bbf7d0</code> Vert</td><td>Demi-journée</td></tr>
+<tr><td><code>taille:m</code></td><td><code>#86efac</code> Vert moyen</td><td>1 à 3 jours</td></tr>
+<tr><td><code>taille:l</code></td><td><code>#4ade80</code> Vert foncé</td><td>1 à 2 semaines</td></tr>
+<tr><td><code>taille:xl</code></td><td><code>#16a34a</code> Vert foncé</td><td>Plus de 2 semaines ; doit être décomposé</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="composant--quelle-partie-du-système-"><a class="header" href="#composant--quelle-partie-du-système-"><code>composant:</code> — Quelle partie du système ?</a></h3>
+<p><code>composant:kernel</code> · <code>composant:gateway</code> · <code>composant:channels</code> · <code>composant:tools</code> · <code>composant:memory</code> · <code>composant:security</code> · <code>composant:hardware</code> · <code>composant:docs</code> · <code>composant:infra</code></p>
+<p>Utilisez <code>#f1f5f9</code> (gris clair) pour toutes les étiquettes de composants afin de les distinguer visuellement des autres catégories.</p>
+<h3 id="risk--quel-est-le-niveau-de-risque--correspond-à-agentsmd"><a class="header" href="#risk--quel-est-le-niveau-de-risque--correspond-à-agentsmd"><code>risk:</code> — Quel est le niveau de risque ? (correspond à <code>AGENTS.md</code>)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Couleur</th><th>Utiliser</th></tr>
+</thead>
+<tbody>
+<tr><td><code>risque:faible</code></td><td><code>#dcfce7</code></td><td>Docs, tests, modifications mineures</td></tr>
+<tr><td><code>risque:moyen</code></td><td><code>#fef9c3</code></td><td>La plupart des modifications dans <code>src/**</code></td></tr>
+<tr><td><code>risque:élevé</code></td><td><code>#fee2e2</code></td><td>Sécurité, passerelle, environnement d’exécution, CI</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="status--où-en-est-on-dans-le-processus-"><a class="header" href="#status--où-en-est-on-dans-le-processus-"><code>status:</code> — Où en est-on dans le processus ?</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Couleur</th><th>Utiliser</th></tr>
+</thead>
+<tbody>
+<tr><td><code>status:besoin-de-triage</code></td><td><code>#f8fafc</code> Blanc</td><td>Nouveau, pas encore examiné</td></tr>
+<tr><td><code>status:bloqué</code></td><td><code>#dc2626</code> Rouge</td><td>En attente d’un élément externe</td></tr>
+<tr><td><code>status:besoin-d-aide</code></td><td><code>#059669</code> Vert</td><td>À la recherche d’un contributeur</td></tr>
+<tr><td><code>status:bonne-première-problématique</code></td><td><code>#059669</code> Vert</td><td>Convient aux nouveaux contributeurs</td></tr>
+<tr><td><code>status:discussion</code></td><td><code>#a78bfa</code> Violet</td><td>Nécessite une discussion d’équipe avant le début du travail</td></tr>
+<tr><td><code>status:wont-fix</code></td><td><code>#9ca3af</code> Gris</td><td>Décidé explicitement de ne pas poursuivre</td></tr>
+<tr><td><code>status:duplicate</code></td><td><code>#9ca3af</code> Gris</td><td>Duplique d’un autre problème</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="rfc--statut-spécifique-à-la-rfc"><a class="header" href="#rfc--statut-spécifique-à-la-rfc"><code>rfc:</code> — Statut spécifique à la RFC</a></h3>
+<p><code>rfc:accepté</code> · <code>rfc:rejeté</code> · <code>rfc:révision-demandée</code></p>
+<hr>
+<h2 id="10-définition-de-terminé"><a class="header" href="#10-définition-de-terminé">10. Définition de terminé</a></h2>
+<p><strong>« Terminé »</strong> a une signification précise. Si vous ne la définissez pas, chacun aura sa propre interprétation, et les désaccords surgiront au pire moment — lors de la revue, lors de la mise en production, ou après qu’un utilisateur a signalé un bug.</p>
+<p>Un élément est <strong>Terminé</strong> lorsque toutes les conditions suivantes sont remplies :</p>
+<h3 id="pour-les-modifications-de-code-"><a class="header" href="#pour-les-modifications-de-code-">Pour les modifications de code :</a></h3>
+<ul>
+<li><input disabled="" type="checkbox"> La PR a été examinée et approuvée par le niveau de réviseur requis (selon CODEOWNERS et le niveau de risque).</li>
+<li><input disabled="" type="checkbox"> Tous les contrôles CI sont validés : <code>cargo fmt</code>, <code>cargo clippy</code>, <code>cargo test</code></li>
+<li><input disabled="" type="checkbox"> Des tests existent pour le nouveau comportement ou les modifications apportées (tests unitaires au minimum ; tests d’intégration pour les fonctionnalités visibles par l’utilisateur).</li>
+<li><input disabled="" type="checkbox"> Aucune couverture de test qui passait avant la PR n’a été perdue.</li>
+<li><input disabled="" type="checkbox"> La description de la PR explique <em>ce qui</em> a changé et <em>pourquoi</em> (pas seulement « bug corrigé » — quel bug, ce qui était incorrect, ce qui a été modifié).</li>
+<li><input disabled="" type="checkbox"> Si le changement affecte le comportement visible par l’utilisateur, la documentation de référence correspondante est mise à jour dans la même PR.</li>
+<li><input disabled="" type="checkbox"> Si le changement est important : une entrée est ajoutée dans le fichier CHANGELOG.md sous la section de la version concernée.</li>
+<li><input disabled="" type="checkbox"> Si le changement nécessite un ADR : l’ADR est rédigé, lié et fusionné avant ou avec la PR d’implémentation.</li>
+</ul>
+<h3 id="pour-les-modifications-de-la-documentation-"><a class="header" href="#pour-les-modifications-de-la-documentation-">Pour les modifications de la documentation :</a></h3>
+<ul>
+<li><input disabled="" type="checkbox"> Le frontmatter YAML est présent et valide.</li>
+<li><input disabled="" type="checkbox"> Tous les liens internes sont correctement résolus.</li>
+<li><input disabled="" type="checkbox"> Si le document décrit un comportement actuel : il est conforme à la branche <code>master</code> actuelle.</li>
+<li><input disabled="" type="checkbox"> Si le document est un ADR : il suit le format de Nygard et possède un champ <code>status</code>.</li>
+</ul>
+<h3 id="pour-les-versions-"><a class="header" href="#pour-les-versions-">Pour les versions :</a></h3>
+<ul>
+<li><input disabled="" type="checkbox"> Tous les éléments du jalon sont au statut <code>Terminé</code> ou ont été explicitement déplacés vers le jalon suivant avec un commentaire expliquant la raison.</li>
+<li><input disabled="" type="checkbox"> L’entrée du CHANGELOG.md pour la version est complète.</li>
+<li><input disabled="" type="checkbox"> Tous les ADR générés par les RFC acceptées dans cette version sont rédigés et acceptés.</li>
+<li><input disabled="" type="checkbox"> La version a été testée sur au moins une plateforme (Linux x86_64 au minimum).</li>
+<li><input disabled="" type="checkbox"> Le tag de version suit la spécification Semantic Versioning.</li>
+</ul>
+<h3 id="la-règle--terminé-terminé-"><a class="header" href="#la-règle--terminé-terminé-">La règle « Terminé Terminé »</a></h3>
+<p>Il existe un concept dans les équipes logicielles concernant le travail qui est « terminé » mais pas « complètement terminé ». « Terminé » signifie que le code a été écrit. « Complètement terminé » signifie qu’il a été testé, documenté, revu, fusionné et publié. La définition de « terminé » ci-dessus décrit ce qui est « complètement terminé ». Rien ne doit être considéré comme terminé tant qu’il ne respecte pas la définition complète.</p>
+<hr>
+<h2 id="11-automatisation"><a class="header" href="#11-automatisation">11. Automatisation</a></h2>
+<p>GitHub Projects v2 et GitHub Actions permettent ensemble une automatisation significative qui réduit la charge de coordination manuelle. Voici ce qu’il faut mettre en œuvre, classé par rapport valeur/effort.</p>
+<h3 id="111-automatisation-du-tableau-de-projet-intégré-aucune-action-requise"><a class="header" href="#111-automatisation-du-tableau-de-projet-intégré-aucune-action-requise">11.1 Automatisation du tableau de projet (intégré, aucune action requise)</a></h3>
+<p>Configurez ces paramètres dans les paramètres d’automatisation intégrés du projet :</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Déclencheur</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td>Problème ouvert</td><td>Ajouter au projet ; définir le statut = 💡 Idée</td></tr>
+<tr><td>Étiqueté <code>type:bug</code></td><td>Définir la priorité = 🟠 Haute (si aucune priorité n’est définie)</td></tr>
+<tr><td>PR ouverte qui fait référence à un problème</td><td>Définir le statut de l’issue liée = 👀 En revue</td></tr>
+<tr><td>PR fusionnée</td><td>Définir le statut de l’issue liée = ✅ Terminée ; fermer l’issue liée</td></tr>
+<tr><td>Problème fermé car non prévu</td><td>Définir le statut = 🚫 Ne sera pas fait</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="112-workflows-github-actions"><a class="header" href="#112-workflows-github-actions">11.2 Workflows GitHub Actions</a></h3>
+<p><strong>Étiquetage automatique par fichiers modifiés (<code>.github/workflows/label-by-path.yml</code>) :</strong></p>
+<p>Ajoute automatiquement les étiquettes de composant et de risque aux PRs en fonction des fichiers modifiés. Une PR touchant <code>src/security/</code> reçoit <code>component:security</code> et <code>risk:high</code>. Une PR touchant <code>docs/</code> reçoit <code>type:docs</code> et <code>risk:low</code>. Cela élimine la nécessité pour les auteurs de PR de se souvenir d’étiqueter leurs propres PRs et donne aux réviseurs un contexte immédiat.</p>
+<p><strong>Demande automatique de revue CODEOWNERS (intégrée à CODEOWNERS — aucune Action requise) :</strong></p>
+<p>GitHub applique automatiquement CODEOWNERS lorsque le fichier existe et que la protection de branche l’exige. Aucune action requise.</p>
+<p><strong>Gestion des issues périmées (<code>.github/workflows/stale.yml</code>) :</strong></p>
+<p>Les problèmes sans activité pendant 45 jours sont étiquetés <code>status:stale</code> et un commentaire est publié pour demander si le problème est toujours pertinent. Les problèmes sans activité pendant 15 jours après l’application de l’étiquette stale sont fermés. Cela empêche le backlog de s’accumuler avec des centaines de problèmes vieux de plusieurs mois et plus pertinents. Exclure <code>status:blocked</code>, <code>priority:critical</code> et <code>type:rfc</code> du processus de stale.</p>
+<p><strong>Étiquetage de la taille des PR (<code>.github/workflows/pr-size.yml</code>) :</strong></p>
+<p>Étiquetez automatiquement les PR avec <code>size:xs</code> à <code>size:xl</code> en fonction du nombre de lignes modifiées. Cela donne aux réviseurs et aux mainteneurs une idée immédiate de l’étendue sans avoir à ouvrir le diff. Utilisez ces seuils comme point de départ : XS &lt; 10 lignes, S &lt; 50, M &lt; 250, L &lt; 1000, XL ≥ 1000.</p>
+<p><strong>Vérification de l’étape clé lors de la fusion de la PR (<code>.github/workflows/milestone-check.yml</code>) :</strong></p>
+<p>Avertissement (sans blocage) si une PR est fusionnée sans une issue liée ayant un jalon assigné. Il s’agit d’un rappel discret, pas d’une restriction stricte — l’objectif est d’éviter que des travaux soient réalisés sans être suivis pour une version.</p>
+<h3 id="113-ce-quil-ne-faut-pas-encore-automatiser"><a class="header" href="#113-ce-quil-ne-faut-pas-encore-automatiser">11.3 Ce qu’il ne faut PAS encore automatiser</a></h3>
+<ul>
+<li><strong>Brouillons de version automatisés :</strong> Le release-drafter de GitHub est utile, mais il ajoute une surcharge de configuration. Ajoutez-le une fois que l’équipe aura établi un rythme de publication stable.</li>
+<li><strong>Mises à jour automatisées des dépendances (PRs Dependabot) :</strong> Activez les mises à jour de sécurité Dependabot (gratuit, faible niveau de bruit), mais reportez les incréments de version automatisés jusqu’à ce que l’équipe dispose d’une stabilité CI. L’incrémentation des versions crée du bruit avant que les fondations CI ne soient solides.</li>
+<li><strong>Automatisation de la planification de sprint :</strong> Ne pas automatiser la planification de sprint. Elle nécessite un jugement humain concernant la capacité, la priorité et le contexte de l’équipe, qu’aucune automatisation ne peut remplacer à cette taille d’équipe.</li>
+</ul>
+<hr>
+<h2 id="12-déploiement-par-phases"><a class="header" href="#12-déploiement-par-phases">12. Déploiement par phases</a></h2>
+<p>La gouvernance et les outils doivent être introduits de manière incrémentale. Tout introduire en même temps crée une surcharge avant que l’équipe ne comprenne pourquoi chaque élément existe.</p>
+<hr>
+<h3 id="phase-1--cette-semaine---fondations-"><a class="header" href="#phase-1--cette-semaine---fondations-">Phase 1 · Cette semaine — « Fondations »</a></h3>
+<p>La configuration de gouvernance minimale viable. Permet à l’équipe de se coordonner immédiatement.</p>
+<ul>
+<li><input disabled="" type="checkbox"> Créez le projet GitHub avec les champs Statut, Type, Priorité et Jalon.</li>
+<li><input disabled="" type="checkbox"> Créez les quatre vues de projet (Feuille de route, Tableau, Backlog, Mon travail)</li>
+<li><input disabled="" type="checkbox"> Activer les Discussions GitHub avec les sept catégories définies dans la section 4.1</li>
+<li><input disabled="" type="checkbox"> Créez les trois problèmes RFC pour les propositions existantes (Section 8.4)</li>
+<li><input disabled="" type="checkbox"> Ajoutez les six modèles de problème (Section 7)</li>
+<li><input disabled="" type="checkbox"> Créez le fichier <code>CODEOWNERS</code> (Section 6.1)</li>
+<li><input disabled="" type="checkbox"> Activer les règles de protection de branche sur <code>master</code> (Section 6.2)</li>
+<li><input disabled="" type="checkbox"> Ajouter la taxonomie des étiquettes restantes (Section 9) au dépôt</li>
+<li><input disabled="" type="checkbox"> Épingler les trois problèmes liés aux RFC et le problème de la prochaine version</li>
+</ul>
+<p><strong>Signal de succès :</strong> Les nouveaux problèmes apparaissent automatiquement dans le projet. L’équipe sait où chercher le travail actif et où publier des idées.</p>
+<hr>
+<h3 id="phase-2--v070-jalon---le-pipeline-"><a class="header" href="#phase-2--v070-jalon---le-pipeline-">Phase 2 · v0.7.0 Jalon — « Le Pipeline »</a></h3>
+<p>Établissez le flux de travail complet et remplissez le backlog à partir des RFC acceptées.</p>
+<ul>
+<li><input disabled="" type="checkbox"> Ajoutez les champs Taille, Niveau de risque et Composant au projet.</li>
+<li><input disabled="" type="checkbox"> Remplissez le Backlog avec les livrables de la RFC sur l’architecture du micro-noyau.</li>
+<li><input disabled="" type="checkbox"> Remplissez le Backlog avec les livrables issus de la RFC sur les normes de documentation.</li>
+<li><input disabled="" type="checkbox"> Effectuer les premiers votes formels de la RFC sur les trois propositions existantes</li>
+<li><input disabled="" type="checkbox"> Rédigez les ADR pour les RFC acceptées (ADR-001 à ADR-007 selon la documentation RFC)</li>
+<li><input disabled="" type="checkbox"> Ajoutez le fichier <code>CONTRIBUTORS.md</code> avec les membres actuels de l’équipe dans leurs paliers</li>
+<li><input disabled="" type="checkbox"> Implémentez le workflow Actions de l’étiquetage automatique par chemin</li>
+<li><input disabled="" type="checkbox"> Mettez en œuvre le workflow de gestion des problèmes obsolètes</li>
+<li><input disabled="" type="checkbox"> Créez les équipes GitHub <code>zeroclaw-core</code> et <code>zeroclaw-contributors</code></li>
+</ul>
+<p><strong>Signal de réussite :</strong> L’équipe utilise le tableau quotidiennement. Les éléments progressent à travers les étapes avec des vérifications de passage visibles. Le RFC relatif à l’architecture du micro-noyau comporte un résultat de vote enregistré.</p>
+<hr>
+<h3 id="phase-3--v080-milestone---développement-de-la-communauté-"><a class="header" href="#phase-3--v080-milestone---développement-de-la-communauté-">Phase 3 · v0.8.0 Milestone — « Développement de la Communauté »</a></h3>
+<p>À mesure que le système de plugins devient utilisable, des contributeurs externes commenceront à arriver. L’infrastructure de contribution doit être prête.</p>
+<ul>
+<li><input disabled="" type="checkbox"> Mettre en œuvre le workflow d’étiquetage de la taille des PR</li>
+<li><input disabled="" type="checkbox"> Créez le premier lot d’éléments <code>good-first-issue</code> (au moins 5) pour les travaux liés au SDK du plugin.</li>
+<li><input disabled="" type="checkbox"> Ajoutez l’index « Good First Issue » en tant qu’issue épinglée avec des liens vers les bonnes premières issues actuelles.</li>
+<li><input disabled="" type="checkbox"> Définir le seuil de promotion des idées et promouvoir la première idée de discussion en tant qu’issue</li>
+<li><input disabled="" type="checkbox"> Documenter le processus d’expansion de l’équipe principale — critères pour inviter de nouveaux membres de l’équipe principale</li>
+</ul>
+<p><strong>Signal de succès :</strong> Au moins un contributeur externe (ne faisant pas partie de l’équipe actuelle) soumet une PR via un bon premier problème. La catégorie Discussions Ideas connaît une participation active de la communauté.</p>
+<hr>
+<h3 id="phase-4--v100---gouvernance-durable-"><a class="header" href="#phase-4--v100---gouvernance-durable-">Phase 4 · v1.0.0 — « Gouvernance durable »</a></h3>
+<p>D’ici la version 1.0.0, le modèle de gouvernance devrait être autosuffisant — l’équipe ne devrait pas avoir à s’en soucier, il devrait simplement fonctionner.</p>
+<ul>
+<li><input disabled="" type="checkbox"> Examinez et mettez à jour le document de gouvernance en fonction de ce qui a fonctionné et de ce qui n’a pas fonctionné.</li>
+<li><input disabled="" type="checkbox"> Établir la fréquence des versions (à quelle fréquence les versions sont publiées, qui les publie)</li>
+<li><input disabled="" type="checkbox"> Publiez le document de gouvernance du registre des plugins (conformément à la RFC d’architecture)</li>
+<li><input disabled="" type="checkbox"> Envisagez l’introduction de cycles à durée limitée (deux ou quatre semaines) si la planification uniquement par jalons semble trop lâche.</li>
+<li><input disabled="" type="checkbox"> Documentez le processus pour qu’un membre de l’équipe principale puisse se retirer ou devenir inactif.</li>
+</ul>
+<p><strong>Signal de succès :</strong> Les six derniers mois d’historique de développement montrent une utilisation cohérente du pipeline. Les problèmes sont triés en moins de 3 jours. Les PR sont examinées en moins de 5 jours. Le CHANGELOG est mis à jour à chaque fusion.</p>
+<hr>
+<h2 id="annexe-a--glossaire"><a class="header" href="#annexe-a--glossaire">Annexe A : Glossaire</a></h2>
+<p><strong>Affinement du backlog</strong> — Une activité régulière de l’équipe (généralement hebdomadaire ou bihebdomadaire) au cours de laquelle l’équipe examine le backlog, réorganise les éléments, ferme ceux qui sont obsolètes et s’assure que les éléments prioritaires sont « définis » et prêts à être pris en charge.</p>
+<p><strong>Protection des branches</strong> — Une fonctionnalité de GitHub qui empêche les poussées directes vers les branches protégées et impose des exigences (relectures, vérifications CI) avant la fusion.</p>
+<p><strong>CODEOWNERS</strong> — Un fichier GitHub qui demande automatiquement des revues à des personnes ou des équipes spécifiées lorsque les fichiers qu’elles gèrent sont modifiés dans une PR.</p>
+<p><strong>Définition de fait</strong> — Une liste de contrôle partagée qui spécifie exactement ce que signifie « fait » pour un élément de travail. Sans une définition commune, « fait » a une signification différente pour chacun.</p>
+<p><strong>Consensus paresseux</strong> — Une approche de prise de décision dans laquelle une proposition est mise en œuvre à moins qu’une objection ne soit formulée dans un délai défini. Réduit la charge liée à l’obtention d’une approbation explicite pour les décisions courantes.</p>
+<p><strong>Méritocratie</strong> — Un modèle de gouvernance dans lequel l’autorité et l’influence sont acquises grâce à des contributions démontrées, et non par l’ancienneté ou le titre. Standard dans les projets open source.</p>
+<p><strong>Jalon</strong> — Une fonctionnalité de GitHub qui regroupe les problèmes et les demandes de tirage (PR) en fonction de la cible de version. Un jalon représente une version du logiciel.</p>
+<p><strong>Évaluation par taille de T-shirt</strong> — Une technique d’estimation qui utilise des tailles abstraites (XS, S, M, L, XL) plutôt que des points d’histoire numériques. Plus facile à utiliser sans données de calibration historiques et suffisante pour les équipes à un stade précoce.</p>
+<p><strong>Triage</strong> — Le processus de révision des nouvelles demandes pour confirmer leur validité, attribuer des étiquettes et une priorité, les associer à des jalons, et déterminer si elles doivent être ajoutées au backlog ou fermées.</p>
+<hr>
+<h2 id="annexe-b--lectures-complémentaires"><a class="header" href="#annexe-b--lectures-complémentaires">Annexe B : Lectures complémentaires</a></h2>
+<ul>
+<li><strong>Documentation des projets GitHub</strong> — https://docs.github.com/fr/issues/planning-and-tracking-with-projects — Référence complète des fonctionnalités de GitHub Projects v2.</li>
+<li><strong>Documentation sur les Discussions GitHub</strong> — https://docs.github.com/fr/discussions — Guide de configuration et options de gouvernance pour les Discussions GitHub.</li>
+<li><strong>Référence de la syntaxe CODEOWNERS</strong> — https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners — La syntaxe complète des fichiers CODEOWNERS.</li>
+<li><strong>“Producing Open Source Software”</strong> — Karl Fogel — Le livre de référence sur la gestion d’un projet open source. Disponible gratuitement en ligne à l’adresse https://producingoss.com. Les chapitres sur la gouvernance, la gestion des contributeurs et la communication sont directement applicables.</li>
+<li><strong>« Une introduction aux modèles de gouvernance open source »</strong> — La documentation de gouvernance de la Fondation Apache est un bon exemple de la manière dont un projet open source mature formalise l’autorité et la prise de décision : https://www.apache.org/foundation/governance/</li>
+<li><strong>Vale prose linter</strong> — https://vale.sh — Mentionné dans la documentation RFC ; s’intègre au workflow d’amélioration de la documentation <code>good-first-issue</code>.</li>
+</ul>
+<hr>
+<p><em>Cette proposition a été développée dans le contexte de ZeroClaw v0.6.8 et des deux RFC précédents sur l’architecture et la documentation. Le modèle de gouvernance proposé ici est intentionnellement léger pour un projet dirigé par des étudiants à un stade précoce de la croissance de la communauté. Il est conçu pour évoluer — en ajoutant des processus au fur et à mesure que l’équipe grandit, et non tous en même temps.</em></p>
+<p>Le meilleur modèle de gouvernance est le plus simple que l’équipe sera effectivement en mesure de suivre. Commencez par là. Ajustez-le en fonction de ce que vous apprenez.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-002-documentation-standards.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-004-engineering-infrastructure.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-002-documentation-standards.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-004-engineering-infrastructure.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

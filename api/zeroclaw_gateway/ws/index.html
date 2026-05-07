@@ -1,0 +1,47 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="WebSocket agent chat handler."><title>zeroclaw_gateway::ws - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-b7b9f40b.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="zeroclaw_gateway" data-themes="" data-resource-suffix="" data-rustdoc-version="1.95.0 (59807616e 2026-04-14)" data-channel="1.95.0" data-search-js="search-63369b7b.js" data-stringdex-js="stringdex-b897f86f.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module ws</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../zeroclaw_gateway/index.html">zeroclaw_<wbr>gateway</a><span class="version">0.7.5</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module ws</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#tool-approvals" title="Tool approvals">Tool approvals</a><ul><li><a href="#arguments_summary-security-boundary" title="`arguments_summary` security boundary"><code>arguments_summary</code> security boundary</a></li></ul></li></ul><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate zeroclaw_<wbr>gateway</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">zeroclaw_gateway</a></div><h1>Module <span>ws</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/zeroclaw_gateway/ws.rs.html#1-1202">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>WebSocket agent chat handler.</p>
+<p>Connect: <code>ws://host:port/ws/chat?session_id=ID&amp;name=My+Session</code></p>
+<p>Protocol:</p>
+<div class="example-wrap"><pre class="language-text"><code>Server -&gt; Client: {&quot;type&quot;:&quot;session_start&quot;,&quot;session_id&quot;:&quot;...&quot;,&quot;name&quot;:&quot;...&quot;,&quot;resumed&quot;:true,&quot;message_count&quot;:42}
+Client -&gt; Server: {&quot;type&quot;:&quot;message&quot;,&quot;content&quot;:&quot;Hello&quot;}
+Server -&gt; Client: {&quot;type&quot;:&quot;chunk&quot;,&quot;content&quot;:&quot;Hi! &quot;}
+Server -&gt; Client: {&quot;type&quot;:&quot;tool_call&quot;,&quot;name&quot;:&quot;shell&quot;,&quot;args&quot;:{...}}
+Server -&gt; Client: {&quot;type&quot;:&quot;tool_result&quot;,&quot;name&quot;:&quot;shell&quot;,&quot;output&quot;:&quot;...&quot;}
+Server -&gt; Client: {&quot;type&quot;:&quot;done&quot;,&quot;full_response&quot;:&quot;...&quot;}</code></pre></div><h3 id="tool-approvals"><a class="doc-anchor" href="#tool-approvals">§</a>Tool approvals</h3>
+<p>When supervised-mode tool calls hit the <code>ApprovalManager</code>, the server
+emits an <code>approval_request</code> and pauses the tool loop until the client
+responds. Mirrors the Telegram inline-keyboard / CLI Y/N/A pattern,
+over the WS frame transport.</p>
+<div class="example-wrap"><pre class="language-text"><code>Server -&gt; Client: {
+    &quot;type&quot;: &quot;approval_request&quot;,
+    &quot;request_id&quot;: &quot;&lt;uuid&gt;&quot;,
+    &quot;tool&quot;: &quot;shell&quot;,
+    &quot;arguments_summary&quot;: &quot;command: git status&quot;,
+    &quot;timeout_secs&quot;: 120
+}
+Client -&gt; Server: {
+    &quot;type&quot;: &quot;approval_response&quot;,
+    &quot;request_id&quot;: &quot;&lt;uuid&gt;&quot;,
+    &quot;decision&quot;: &quot;approve&quot; | &quot;deny&quot; | &quot;always&quot;
+}</code></pre></div>
+<p><code>approve</code> runs the tool once, <code>always</code> adds the tool to the session
+allowlist for the rest of the conversation, <code>deny</code> returns a structured
+error to the model. When no client is connected, or the client
+disconnects mid-prompt, the tool call is auto-denied after <code>timeout_secs</code>.</p>
+<h4 id="arguments_summary-security-boundary"><a class="doc-anchor" href="#arguments_summary-security-boundary">§</a><code>arguments_summary</code> security boundary</h4>
+<p><code>arguments_summary</code> is a human-readable string the runtime synthesises
+for the operator (e.g. <code>"command: git status"</code>, <code>"path: /etc/hosts"</code>).
+It is render-only; the operator’s approve/deny choice attaches to the
+<code>request_id</code>, never to the summary string. The runtime must not echo
+any <code>#[secret]</code> or <code>#[derived_from_secret]</code> field (auth tokens, API
+keys, OAuth secrets) into the summary. The agent’s tool loop runs
+tool args through <code>zeroclaw_runtime::approval::summarize_args</code> before
+the request reaches this transport; do not stringify raw args here.</p>
+<p>Query params:</p>
+<ul>
+<li><code>session_id</code> — resume or create a session (default: new UUID)</li>
+<li><code>name</code> — optional human-readable label for the session</li>
+<li><code>token</code> — bearer auth token (alternative to Authorization header)</li>
+</ul>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.WsQuery.html" title="struct zeroclaw_gateway::ws::WsQuery">WsQuery</a></dt></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.handle_ws_chat.html" title="fn zeroclaw_gateway::ws::handle_ws_chat">handle_<wbr>ws_<wbr>chat</a></dt><dd>GET /ws/chat — WebSocket upgrade for agent chat</dd></dl></section></div></main></body></html>

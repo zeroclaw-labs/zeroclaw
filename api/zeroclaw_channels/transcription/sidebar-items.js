@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["transcribe_audio"],"struct":["AssemblyAiProvider","DeepgramProvider","GoogleSttProvider","GroqProvider","LocalWhisperProvider","OpenAiWhisperProvider","TranscriptionManager"],"trait":["TranscriptionProvider"]};

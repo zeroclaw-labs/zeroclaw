@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ObserverEvent"],"fn":["create_observer"],"mod":["dora","log","multi","noop","prometheus","runtime_trace","traits","verbose"],"trait":["Observer"]};

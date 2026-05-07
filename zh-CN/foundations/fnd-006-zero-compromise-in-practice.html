@@ -1,0 +1,591 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>实践中零妥协 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-53bbdbb2.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-088a9fdb.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/foundations/fnd-006-zero-compromise-in-practice.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="fnd-006实践中的零妥协代码健康错误纪律与生产就绪标准"><a class="header" href="#fnd-006实践中的零妥协代码健康错误纪律与生产就绪标准">FND-006：实践中的零妥协——代码健康、错误纪律与生产就绪标准</a></h1>
+<h3 id="从-v070-开始--类型质量--修订版-1"><a class="header" href="#从-v070-开始--类型质量--修订版-1">从 v0.7.0 开始 · 类型：质量 · 修订版 1</a></h3>
+<blockquote>
+<p><strong>规范参考</strong> · 团队已批准 · 修订版 1 讨论线程及完整修订历史：<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5653">#5653</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p>在阅读此内容之前，给团队的一条提示。</p>
+<p>这是 ZeroClaw 成熟度框架的第六份文档。前五份文档分别涉及架构、文档、治理、工程基础设施和协作——这些是围绕工作展开的结构性和人文支撑。每一篇都回答了关于如何共同构建这个项目的一个不同问题。如果你已经阅读了所有这些文档，你可能会注意到一个问题：它们都没有回答——是的，但我们如何真正把它写好？架构 RFC 告诉你应该构建的形状。文档 RFC 告诉你如何记录它。治理 RFC 告诉你如何协调。CI/CD RFC 告诉你如何设置关卡。文化 RFC 告诉你如何与周围的人合作。它们都没有告诉你句子层面的质量是什么样的——在函数内部，在你做出选择的那一刻。</p>
+<p>这就是本文档的目的。</p>
+<p>这里涉及的具体主题——错误处理、API 文档、测试设计、技术债务——表面上是 Rust 相关的主题，但它们所培养的技能并非如此。技术会不断变化，且每一次迭代的变化速度都比前一次更快。你今天所使用的工具——这门语言、这个框架、这个 AI 助手——都将被取代。其中一些甚至可能在这个项目的生命周期内就会被淘汰。而本文档试图帮助你建立的判断力却不会被取代。它将在你做出的每一个决策中、在你未来编写的每一种语言中、在你构建的每一个系统中，以及在与软件完全无关的工作中，悄然积累复利。这正是我们对你所做的投资。不是投资你编写 Rust 的能力，而是投资你思考质量、失败和技艺的能力——并将这种思维方式带入你未来使用的每一个工具中，包括你今天正在使用的 AI 工具以及尚未诞生的工具。</p>
+<p>慢慢来。</p>
+</blockquote>
+<hr>
+<h2 id="成熟度框架套件"><a class="header" href="#成熟度框架套件">成熟度框架套件</a></h2>
+<p>本 RFC 是构成 ZeroClaw 成熟度框架的一组文档中的第六篇。这些文档设计为整体阅读，但每篇也可独立阅读。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>RFC</th><th>范围</th><th>问题</th></tr>
+</thead>
+<tbody>
+<tr><td>有意架构 — 微内核过渡</td><td>我们正在构建的内容及其结构</td><td>#5574</td></tr>
+<tr><td>文档标准与知识架构</td><td>我们如何记录我们所构建的内容</td><td>#5576</td></tr>
+<tr><td>团队组织与项目治理</td><td>我们如何协调和做出决策</td><td>#5577</td></tr>
+<tr><td>工程基础设施 — CI/CD 流水线</td><td>我们如何可靠地构建、测试和发布</td><td>#5579</td></tr>
+<tr><td>贡献文化 — 人类协作、AI 伙伴关系与团队成长</td><td>我们如何协作与成长</td><td>#5615</td></tr>
+<tr><td>实践中的零妥协——代码健康、错误纪律与生产就绪标准</td><td>如何编写持久化的代码</td><td>此 RFC</td></tr>
+</tbody>
+</table>
+</div>
+<p>前五个 RFC 回答了结构和人类方面的问题。这个 RFC 回答了所有问题中核心的一个问题：在给定结构、团队和工具的情况下，如何写出高质量的代码？</p>
+<hr>
+<h2 id="目录"><a class="header" href="#目录">目录</a></h2>
+<ol>
+<li>一种开发哲学：对判断力的投资</li>
+<li>诚实评估：代码库在告诉我们什么
+<ul>
+<li>2.1 证据</li>
+<li>2.2 数字未显示的内容</li>
+<li>2.3 已经做得好的部分</li>
+</ul>
+</li>
+<li>门控与标准：核心区别</li>
+<li>七大纪律
+<ul>
+<li>4.1 错误处理作为设计考量</li>
+<li>4.2 公共 API 表面作为 Promise</li>
+<li>4.3 测试作为设计反馈</li>
+<li>4.4 技术债务分类</li>
+<li>4.5 应用层安全</li>
+<li>4.6 可观测性即可调试性</li>
+<li>4.7 在地板上方工作</li>
+</ul>
+</li>
+<li>这对 AI 辅助开发意味着什么</li>
+<li>工艺的便携性</li>
+<li>这对贡献者意味着什么</li>
+</ol>
+<hr>
+<h2 id="修订历史"><a class="header" href="#修订历史">修订历史</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>修订</th><th>日期</th><th>摘要</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>2026年4月12日</td><td>初始草稿</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="1-开发理念对判断力的投资"><a class="header" href="#1-开发理念对判断力的投资">1. 开发理念：对判断力的投资</a></h2>
+<p>架构 RFC 引入了一个决策层级结构，用于描述该项目中的每一项决策应如何流转：</p>
+<pre><code>Vision
+  └── Architecture
+        └── Design
+              └── Implementation
+                    └── Testing
+                          └── Documentation
+                                └── Release
+</code></pre>
+<p>该层级结构回答了在每个层级上构建<strong>什么</strong>的问题。本 RFC 位于实现和测试层级内，并提出一个不同的问题：<strong>构建得有多好？</strong></p>
+<p>“做得好不好”的答案并不是一份检查清单。检查清单可以在未被理解的情况下被满足，而在软件领域，理解才是产生持久成果的关键。一个死记硬背规则的人会在情况稍有变化时不知所措；而一个内化了规则背后判断逻辑的人，则能正确应对规则未曾预见的情形——尤其是那些最重要的、永远无人预料到的情形。</p>
+<p>在该项目背景下，这一区分尤为重要。ZeroClaw 运行于强大工具的环境中：AI 代码生成、能够捕获广泛常见错误的 CI 门禁、IDE 代码检查器以及自动化安全扫描器。这些工具确实极具价值。它们设定了底线——即代码合并的最低标准。但它们无法进行思考。它们无法判断错误是运行时的还是程序员的。它们无法评估测试是否断言了正确的行为。它们无法判断公共 API 的文档是否足够清晰，以便未来的贡献者能够正确实现。它们只能检查其被编程设定的内容。</p>
+<p>“工具能够验证的内容”与“长期服务于用户、贡献者和项目的质量”之间的差距，需要通过判断力来弥补。这份文档旨在帮助你培养这种判断力——不是为了取代工具，而是为了引导它们。</p>
+<hr>
+<h2 id="2-诚实评估代码库在告诉我们什么"><a class="header" href="#2-诚实评估代码库在告诉我们什么">2. 诚实评估：代码库在告诉我们什么</a></h2>
+<p>本节并非批评，而是诊断。此处适用的框架与架构 RFC 中所述相同：无法命名就无法改进，而具体细节之所以有价值，正是因为它们具体。</p>
+<h3 id="21-证据"><a class="header" href="#21-证据">2.1 证据</a></h3>
+<p>来自 RFC §5574 的工作区分解已成功完成。这些 crate 已经存在，trait 边界是真实的，编译器也强制执行了依赖方向。这确实是出色的工作。然而，在这些新的 crate 中，原本单体项目中体现出的模式被延续了下来——因为代码库在团队尚未就“实现层面的质量”形成共识之前就进行了迁移。</p>
+<p>这些是实测数据，而非估算值：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>指标</th><th>值</th><th>它表示</th></tr>
+</thead>
+<tbody>
+<tr><td><code>zeroclaw-config/src/schema.rs</code></td><td>16,800 行</td><td>现在这是代码库中最大的文件；在架构 RFC 中，原始的 <code>loop_.rs</code> 有 9,500 行——这已经超过了它</td></tr>
+<tr><td><code>zeroclaw-channels/src/orchestrator/mod.rs</code></td><td>11,813 行</td><td>第二大文件；一个承担集中责任的单一模块</td></tr>
+<tr><td><code>zeroclaw-runtime/src/onboard/wizard.rs</code></td><td>7,988 行</td><td>单个文件中的单个工作流</td></tr>
+<tr><td><code>zeroclaw-runtime/src/agent/loop_.rs</code></td><td>6,101 行</td><td>从单体架构中的约 9,500 减少——这是真实且可衡量的进展；仍然较大</td></tr>
+<tr><td><code>zeroclaw-channels/src/orchestrator/telegram.rs</code></td><td>5,122 行</td><td>一个通道实现；一个文件</td></tr>
+<tr><td><code>crates</code> 中的 <code>.unwrap()</code> / <code>.expect()</code> 调用</td><td>5,630</td><td>每一个都是关于错误处理的延迟判断调用——参见 §4.1</td></tr>
+<tr><td>遗留 <code>src/</code> 目录中的 <code>.unwrap()</code> / <code>.expect()</code> 调用</td><td>240</td><td>该迁移将模式大规模地延续下去。</td></tr>
+<tr><td><code>zeroclaw-api</code> 中的公共函数</td><td>371</td><td>整个基础 API 表面——其他所有 crate 都依赖于它</td></tr>
+<tr><td><code>zeroclaw-api</code> 中的文档注释行</td><td>~27</td><td>未记录的公共 API 比例约为 14:1 — 参见 §4.2</td></tr>
+<tr><td><code>#[allow(unused_imports)]</code> / <code>#[allow(dead_code)]</code> 在遗留 <code>src/</code> 模块中</td><td>约 30 多个实例</td><td>编译器已识别出不再使用的代码；已要求它不要提示</td></tr>
+<tr><td>整个代码库中的 <code>TODO</code> / <code>FIXME</code> / <code>todo!()</code> / <code>unimplemented!()</code></td><td>20</td><td>显著偏低——表明大多数债务是隐性的，而非标记的</td></tr>
+</tbody>
+</table>
+</div>
+<p>最后一行值得单独说明。在一个如此规模的代码库中，存在二十个明确标记的不完整工作项，这并不意味着工作即将完成。它表明大多数未完成的工作并未被正确标记。未标记的技术债务更难发现、更难优先级排序、更难分配。沉默并不等同于完成。</p>
+<h3 id="22-数字未显示的内容"><a class="header" href="#22-数字未显示的内容">2.2 数字未显示的内容</a></h3>
+<p>这些数字衡量的是可量化的内容。而更具影响力的质量问题是无法计数的：</p>
+<ul>
+<li>这 5,630 个 <code>.unwrap()</code> 调用是位于关键路径中，还是位于测试工具中</li>
+<li>现有的测试是在测试行为还是测试实现细节</li>
+<li>仅通过签名和类型，能否正确实现 <code>zeroclaw-api</code> 中的公共函数</li>
+<li>在生产故障期间发出的日志消息是否包含足够的上下文以诊断该故障</li>
+<li>安全模块中的贡献者是否了解哪些数据跨越了信任边界，哪些没有。</li>
+</ul>
+<p>这些是判断性问题。它们没有 CI 门禁。它们具有本文件提议命名的标准，以及我们共同构建的审查和导师文化。</p>
+<h3 id="23-已经做得好的部分"><a class="header" href="#23-已经做得好的部分">2.3 已经做得好的部分</a></h3>
+<p>诊断不应掩盖真正构建良好的部分。</p>
+<p><code>zeroclaw-api</code> 中的 trait 层是合理的架构设计。<code>Provider</code>、<code>Channel</code>、<code>Tool</code>、<code>Memory</code>、<code>Observer</code>、<code>RuntimeAdapter</code> 和 <code>Peripheral</code> 是清晰且经过深思熟虑的抽象，它们构成了正确的扩展点。问题不在于设计本身，而在于该设计尚未在文档、测试覆盖率和错误处理规范中得到充分表达。本 RFC 旨在弥补这一差距。</p>
+<p>该安全模型经过深思熟虑。配对码、自主性级别、沙箱层以及策略执行机制体现了明确的设计意图。每一位在信任边界附近编写代码的贡献者都必须理解这一意图——本 RFC 的存在部分目的，正是为贡献者提供识别这些边界的术语。</p>
+<p>可观测性基础设施已经成熟。OpenTelemetry、Prometheus 和 DORA 指标均已基于一个清晰的 <code>Observer</code> trait 实现。基础设施已就绪，当前的教学差距在于贡献者如何使用它，以便在出现问题时真正发挥作用。</p>
+<p>测试套件并非不存在。现有的测试投入是实实在在的。本 RFC 所描述的工作关乎这些投入的质量与分布——即测试什么、如何测试，以及测试是否真能证明其表面所声称的内容。</p>
+<p><code>ADR-004-tool-shared-state-ownership.md</code> 是一份出色的架构记录文档。它证明了团队在期望明确的情况下，能够产出高质量的架构设计文档。此 RFC 提议对代码本身也提出同等要求。</p>
+<hr>
+<h2 id="3-门控与标准核心区别"><a class="header" href="#3-门控与标准核心区别">3. 门控与标准：核心区别</a></h2>
+<p>这是整个文档的核心思想。清晰地理解它比掌握第 4 节中的任何具体技术都更为重要。</p>
+<p><strong>门禁</strong>是二元的：通过或不通过。它是自动化的，由工具强制执行，并定义了代码合并的最低标准。CI/CD RFC 构建了这些门禁。它们是真实且可工作的。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>门</th><th>它检查什么</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cargo fmt --check</code></td><td>代码在工作区中保持一致的格式</td></tr>
+<tr><td><code>cargo clippy --workspace --all-targets -D warnings</code></td><td>无 Clippy 已知的反模式；工作区范围</td></tr>
+<tr><td><code>cargo deny check</code></td><td>无未确认的安全公告；许可证和源代码合规</td></tr>
+<tr><td><code>cargo nextest run --workspace</code></td><td>存在的测试通过</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>标准</strong>是理想化的。它描述了质量在最低要求之上的表现。它通过判断、同行评审以及团队共同养成的习惯来执行。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标准</th><th>它描述了什么</th></tr>
+</thead>
+<tbody>
+<tr><td>错误处理规范</td><td>故障被分类；操作错误会在正确的层级上以上下文形式呈现</td></tr>
+<tr><td>API 文档</td><td>每个公开项都有足够的文档，以便在不阅读实现的情况下正确使用</td></tr>
+<tr><td>测试质量</td><td>测试断言行为，而非实现；测试难度被视为设计反馈</td></tr>
+<tr><td>债务分类</td><td>未清偿债务会被标记、定位并进行风险加权；高风险债务有明确的所有者</td></tr>
+<tr><td>安全态势</td><td>信任边界在实现层面是明确的，而不仅仅是在策略层面。</td></tr>
+<tr><td>可观测性规范</td><td>日志消息回答诊断问题；跨度绑定有意义的单元工作</td></tr>
+</tbody>
+</table>
+</div>
+<p>门禁（Gates）与标准并非对立关系，而是互补的层次。仅有门禁而无标准，会导致代码通过所有检查，但仍无法满足用户需求；仅有标准而无门禁，则标准无法强制执行。两者缺一不可。目前项目具备良好的门禁机制，但标准体系尚不完善。</p>
+<blockquote>
+<p>一个代码库可能通过所有检查，但对后续贡献者来说仍然难以理解；在应该暴露错误时保持沉默；无法独立测试；并且在用户输入与业务逻辑交汇的边界处存在安全隐患。绿色对勾回答的问题是“这段代码是否通过了我们制定的规则？”但它并不能回答“这段代码是否优质？”这两个问题并不相同。</p>
+</blockquote>
+<p>这并非对门禁机制的批评。门禁机制之所以有价值，恰恰在于它们定义了一个共享且可执行的基线，所有贡献者都在此基线范围内工作。本文档的目标是构建共享词汇和判断力，以明确基线之上何为优秀，并清晰解释为何这种判断力无法委托给工具。</p>
+<hr>
+<h2 id="4-七大纪律"><a class="header" href="#4-七大纪律">4. 七大纪律</a></h2>
+<h3 id="41-错误处理作为设计考量"><a class="header" href="#41-错误处理作为设计考量">4.1 错误处理作为设计考量</a></h3>
+<p>每一个 <code>.unwrap()</code> 调用都是一种决策。代码库中的 5,630 个 <code>.unwrap()</code> 调用大多并非经过深思熟虑的结果——它们只是默认选择，因为当你需要从 <code>Result</code> 或 <code>Option</code> 中获取值并希望继续执行时，<code>.unwrap()</code> 是最省力的路径。默认做出的决策的问题在于，它们实际上并不是决策，而是延迟。而它们所延迟的是一个真正的问题：<em>当这里失败时，应该发生什么？</em></p>
+<p>答案取决于你正在处理哪种类型的故障。有三种类型的故障，每种都有三种不同的正确应对方法。</p>
+<p><strong>程序员错误</strong> 是违反了在正确代码中绝不应出现的不变量。例如，一个要求非空 <code>Vec</code> 的函数，却传入了一个空向量；或者一个枚举匹配到达了类型系统本应使其不可达的分支。这些代表的是 bug —— 不是运行时故障，而是逻辑错误。<code>panic!</code> 是正确的处理方式，因为目标是在开发阶段发现这些问题，而不是在运行时让用户面对。<code>assert!</code> 和 <code>debug_assert!</code> 是合适的工具。使用 <code>.expect()</code> 并附带解释为何该状态不可能出现的消息也是恰当的 —— 它使推理过程显式化且可搜索，让后续阅读代码的人理解该 panic 是有意为之。</p>
+<p><strong>操作错误</strong>是预期的故障模式。网络超时。不存在的文件。过期的 API 密钥。带有错误状态的提供者响应。用户提供格式错误的输入。这些都不是 bug——它们是系统与外部世界交互时的正常操作条件。正确的响应方式是 <code>Result&lt;T, E&gt;</code>。<code>?</code> 操作符将故障传播给更有能力决定如何处理它的调用者。对操作错误使用 <code>.unwrap()</code> 是一种延迟的 panic：它最终会在真实条件下触发，面对真实用户，且没有有用的上下文和恢复机会。</p>
+<p><strong>配置错误</strong>是在启动时发现的结构错误或缺失的配置。正确的做法是快速失败——但要有针对性。不要抛出带有堆栈跟踪的 panic，也不要给出模糊的“配置无效”提示。应该提供一条明确指出具体字段、说明预期内容，并告知操作者应提供什么信息的消息。如果用户因配置错误而无法启动 ZeroClaw，他们应该能够清楚地了解需要修复的具体内容。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>失败类型</th><th>这是什么意思</th><th>正确的响应</th></tr>
+</thead>
+<tbody>
+<tr><td>程序员错误</td><td>违反了不变量；在正确的代码中不应出现此情况</td><td><code>panic!</code>、<code>assert!</code>、<code>.expect("reason this is safe")</code></td></tr>
+<tr><td>操作错误</td><td>预期失败模式；世界不配合</td><td><code>Result&lt;T, E&gt;</code>、<code>?</code>、带有上下文的结构化错误类型</td></tr>
+<tr><td>配置错误</td><td>无效或缺失的启动配置</td><td>快速失败，并提供具体、可操作的提示</td></tr>
+</tbody>
+</table>
+</div>
+<p>在每次调用 <code>.unwrap()</code> 或 <code>.expect()</code> 之前，先问自己：这种失败属于哪种类型？如果答案是“程序员错误——在正确的代码中这种情况不可能发生”，那么使用 <code>.expect()</code> 并附上解释原因的注释是合适的选择，这能让未来的读者理解你的推理。如果答案不是这样，请使用 <code>?</code> 或显式处理该失败情况。</p>
+<p>理解 <code>?</code> 运算符的价值，不仅在于它做了什么，更在于它表达了什么。它表达的是：我承认这个操作可能会失败，并且我明确地将该失败传播给我的调用者，由他们根据上下文做出更合适的决策。这种承认在架构上具有重要意义——它使得错误处理契约在调用点变得可见，并将决策权推给拥有最多上下文的层级。</p>
+<p>目标不是消除所有的 <code>.unwrap()</code> 调用。有些 <code>.unwrap()</code> 是正确的。目标是让每一个 <code>.unwrap()</code> 都代表一个经过深思熟虑的决策，并且其推理过程对任何阅读代码的人都是可见的。<code>.unwrap()</code> 与 <code>.expect("此向量由调用者保证非空——参见 SOP 引擎不变量中的 §4.2")</code> 之间的区别不仅仅是风格问题。它是“延迟判断”与“文档化判断”之间的区别。</p>
+<h3 id="42-公共-api-表面作为-promise"><a class="header" href="#42-公共-api-表面作为-promise">4.2 公共 API 表面作为 Promise</a></h3>
+<p><code>pub</code> 是一个合约。</p>
+<p>当你将函数、结构体、特征或模块标记为公开（public）时，你是在向每个调用者做出承诺。这包括下个月实现该接口且已不记得你最初意图的贡献者。这包括读取你的 crate 以生成实现的 AI 助手。这包括需要理解此代码原本意图的生产环境故障排查人员。这也包括你在两个月后处理其他任务时重新回到这段代码。</p>
+<p>没有文档的公开项就像一份没有条款的承诺。调用者无法得知你在编写它时所做的假设、它可能返回的错误条件及其触发场景、它的副作用、是否可安全地并发调用，或者两个名称相似的函数之间的细微差别。他们只能从名称、类型签名和实现代码中推断出一些你本可以用三句话说明白的事情。</p>
+<p><code>zeroclaw-api</code> 的情况特殊到需要直接点名。这是整个架构所依赖的唯一一个 crate。工作区中的每个 provider、channel、tool、memory backend、observer、runtime adapter 以及 peripheral 实现都是基于这些 trait 和类型构建的。这个基础层中未记录的接口会将混乱传播到所有实现它的 crate、所有测试它的工作区以及所有与之交互的 AI 生成代码中。未记录的公共 API 表面与已记录部分的比例为 14:1，这并非文档风格偏好问题，而是架构 RFC 中明确指出为系统最重要层的契约存在缺失。</p>
+<p>这里的 AI 维度是实用且直接的：当你要求 AI 助手实现一个没有文档的 trait 或调用一个没有文档的函数时，AI 会从名称和类型签名中推断意图。有时这种推断是正确的。但更常见的是，它生成的代码虽然可以编译并通过类型检查器，但在 AI 未曾预见的特定条件下行为不正确——因为没有人将这些条件记录下来。文档不仅是为了人类。它是你提供给所有与你代码交互的工具以及所有依赖你代码的人的规范。</p>
+<p>至少，<code>zeroclaw-api</code> 中的每个公开项都应包含：</p>
+<ul>
+<li><strong>一句话描述其功能。</strong> 不是描述它是什么，而是描述它能做什么。</li>
+<li><strong>一个 <code># Errors</code> 部分</strong>（如果返回 <code>Result</code>）：在什么条件下会失败，调用者需要处理哪些错误变体？</li>
+<li><strong><code># Panics</code> 章节</strong>（如果可能触发 panic）：在什么条件下，以及为什么？</li>
+<li><strong>前置条件</strong>（如果有任何非显而易见的条件）：在调用此函数之前，必须满足哪些条件？</li>
+</ul>
+<p>对于公共 trait 方法的文档注释，三句话的价值胜过一百行没有解释的实现代码。实现代码告诉开发者代码实际做了什么，而文档则说明它本应做什么——当两者出现分歧时，后者才是关键。</p>
+<h3 id="43-测试作为设计反馈"><a class="header" href="#43-测试作为设计反馈">4.3 测试作为设计反馈</a></h3>
+<p>测试的目标不是生成一个绿色的对勾。测试的目标是创建一份精确、可执行的记录，描述某段代码_应该做什么_——如果该行为发生任何变化，这份记录会立即失败。</p>
+<p>这种区分很重要，因为存在两种根本不同的测试类型，而只有一种能够实现该目标。</p>
+<p>一个直接访问结构体内部状态、直接设置值、调用方法并断言返回值的测试，实际上是在测试<strong>实现细节</strong>。如果实现方式发生变化——即使通过不同的机制实现了相同的行为——测试也会失败，尽管用户关心的行为并未改变。这种做法会阻碍重构，同时并未提供应有的安全保障。此外，这类测试往往会在行为存在测试未预料到的错误时仍然通过。</p>
+<p>通过公开接口构造值、通过公开方法执行行为，并对可观察结果进行断言的测试，是在测试<strong>行为</strong>。如果实现方式发生变化但行为保持不变，测试就会通过。如果行为发生了对用户重要的变化，测试就会失败。这正是能够自信地进行重构的原因：测试检查的是你是否得到了正确的结果，而不是你是否以某种特定方式得到了结果。</p>
+<p>更为重要的原则是诊断性原则：</p>
+<blockquote>
+<p>一个难以编写的测试通常是在告诉你关于设计的一些问题。</p>
+</blockquote>
+<p>如果为某个函数编写单元测试需要建立数据库连接、模拟六个依赖项、构建完整的配置对象，并显式启动异步运行时——那么该函数可能职责过多、依赖过深，或处于架构中的错误层级。这种困难并非需要绕过的麻烦，而是一种反馈。测试正在诚实地揭示代码尚未诚实面对的问题。</p>
+<p>这直接关联到架构 RFC 所确立的 crate 结构。crate 分解的目的之一是创建可以独立测试的组件。<code>zeroclaw-tool-call-parser</code> 应能通过 <code>&amp;str</code> 输入且无需运行时即可进行测试。<code>zeroclaw-config</code> 应能通过直接构造配置结构体来进行测试。<code>zeroclaw-api</code> 中的 trait 实现应针对该 trait 的伪造实现进行测试，而不是针对完整的生产环境栈进行测试。当你发现自己无法在不依赖整个环境的情况下测试某个组件时，请思考是否有一个依赖项以架构未预期的方式进入了实现。测试正在给你答案；问题在于你是否在倾听它。</p>
+<p>一种在实践中逐步提升测试质量的方法：</p>
+<ul>
+<li>当你修复一个 bug 时，编写一个能够捕获该问题的测试。这一习惯若能持续践行，将使测试套件逐步覆盖那些真正重要的失败场景。</li>
+<li>当你添加行为时，编写一个测试来证明该行为存在并且可以独立验证。</li>
+<li>当测试难以编写时，在考虑使用 mock 之前，先花时间思考 <em>为什么</em>。这个问题的答案通常比你即将编写的测试更有价值。</li>
+</ul>
+<h3 id="44-技术债务分类"><a class="header" href="#44-技术债务分类">4.4 技术债务分类</a></h3>
+<p>“债务”这个词很有用，因为它带有正确的暗示：它会累积利息。在代码库中高频使用的区域中，未被审视的债务会不断累积——新代码会适应它的存在，新的假设会建立在旧假设之上，而解决它的成本会随着每一层新代码的添加而增加。</p>
+<p>团队在技术债务方面最常见的错误是将其视为二元问题：要么一切都是债务，且无法采取任何措施；要么没有任何债务，也不应花费任何时间。这两种观点都是错误的。更有用的问题是：<em>目前，哪些债务在哪些位置带来了最大的风险？</em></p>
+<p>两个轴确定优先级。</p>
+<p><strong>靠近信任边界。</strong> 处理用户输入、执行安全策略、运行工具、管理身份验证或处理来自外部源的数据的代码，都位于靠近信任边界的位置。此处的故障可能被利用、静默地破坏状态，或导致具有安全后果的错误行为。靠近信任边界的债务相对于其规模而言，风险不成比例地高。</p>
+<p><strong>爆炸半径。</strong> <code>zeroclaw-api</code> 中的债务——它是其他所有模块所依赖的基础——其爆炸半径比单个通道实现中的债务更大。基础类型中的错误假设会在该类型被使用的任何地方传播。而叶子 crate 中的债务仅影响该 crate 的消费者。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th>高爆炸半径</th><th>低爆炸半径</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>靠近信任边界</strong></td><td>当前周期中的地址</td><td>在下一个计划周期中处理</td></tr>
+<tr><td><strong>远离信任边界</strong></td><td>在计划的重构中处理</td><td>在相邻工作流经过时，适时处理</td></tr>
+</tbody>
+</table>
+</div>
+<p>该框架意味着，在安全策略执行路径中的 <code>.unwrap()</code> 与在 CLI 显示格式化器中的 <code>.unwrap()</code> 并非相同的问题。两者都出现在 5,630 的计数中。该计数告诉我们范围，而分类则告诉我们优先级。</p>
+<p>当你在处理文件时发现技术债务——例如一个表示未处理运行时错误的 <code>.unwrap()</code>、一个承担了四个不同职责的函数、或一个用 <code>#[allow(dead_code)]</code> 抑制了无人调用代码的注释——你不需要修复所有问题。你需要问自己：这是否位于高风险区域？如果是，请在本 PR 中处理它，或创建一个后续问题，明确标注具体位置、风险以及建议的负责人。如果不是，你可以用 <code>// TODO(debt): &lt;描述&gt;</code> 注释标记它，使其可见但不紧急。你不应该做的是完全不做标记——因为沉默正是导致 5,630 个延迟决策悄然累积、无人察觉趋势的原因。</p>
+<p>绞杀榕模式同样适用于这一层级。架构 RFC 在 crate 层面应用了该模式：围绕旧结构构建新结构，并随时间逐步向内迁移。该模式同样适用于大型文件内部。你不需要在一个 PR 中一次性重写 <code>schema.rs</code>。你应该首先识别那些最接近信任边界、变更最频繁或最难测试的函数，并将它们提取出来，逐步改进结构，其余部分则以团队能够持续维持的节奏逐步迁移。</p>
+<h3 id="45-应用层安全"><a class="header" href="#45-应用层安全">4.5 应用层安全</a></h3>
+<p>CI/CD RFC 为 <em>供应链</em> 的安全态势奠定了基础：<code>cargo deny</code> 能够发现依赖项中的已知漏洞、强制执行许可证合规性，并确保依赖项来自已批准的来源。这相当于项目的“免疫系统”，用于保护进入项目的内容。本节关注的是运行代码的安全态势。</p>
+<p><code>cargo deny</code> 无法发现你的应用程序逻辑所引入的漏洞。它无法判断用户输入在到达业务逻辑之前是否经过了验证。它无法判断工具执行是否遵守了其应强制执行的自主级别。它也无法判断错误路径是否静默地吞掉了安全检查的失败。这些都需要由理解信任边界以及两侧代码应如何正确编写的贡献者来完成。</p>
+<p>在靠近信任边界编写的任何代码都应遵循以下三个原则：</p>
+<p><strong>信任边界是显式的，而非假设的。</strong> 信任边界是指任何从你直接控制范围之外接收数据的位置：来自任何渠道的用户输入、来自提供者的 API 响应、来自文件系统的文件内容、插件输出、工具结果、硬件读数。在每个信任边界处，在处理之前先进行验证。不要假设你未产生的数据的形状、大小、类型或内容。ZeroClaw 安全模型在策略层面定义了这些边界。实现应在代码层面反映这些边界——不是因为策略会失败，而是因为纵深防御意味着系统的每一层都在履行其职责，而不是依赖其他每一层都完成了它们的工作。</p>
+<p><strong>最小权限原则</strong>。需要读取文件的函数不应具备写入文件的权限。处理某个通道消息的 trait 实现不应访问其他通道的状态。处于自主级别 1 的工具不应具备需要自主级别 3 才能行使的能力。安全模型已经定义了这些约束。关键在于编写仅获取完成任务所需权限的实现，并留意实现是否超出了其预期范围。</p>
+<p><strong>在安全边界附近严格失败。</strong> 安全检查中的错误——例如策略评估失败、签名验证失败、未授权的工具调用尝试、配对码不匹配——绝不应被静默吞没。这些错误应当被记录、传播并显式处理。而显示辅助函数中的错误则可以通过日志消息优雅地恢复。授权路径中的错误则不能如此处理。明确你所编写的函数类型，并据此决定你应如何积极地暴露其失败情况。</p>
+<p>这些并非高级安全原则，而是适用于任何涉及用户可影响内容的基础性安全规范。该架构 RFC 将安全模型描述为“深思熟虑的”。本 RFC 所要求的工作，是将这种深思熟虑在实现层面变得清晰可辨——体现在验证输入的功能、处理策略失败错误的路径，以及系统被要求执行的操作与实际执行操作之间的边界上。</p>
+<h3 id="46-可观测性即可调试性"><a class="header" href="#46-可观测性即可调试性">4.6 可观测性即可调试性</a></h3>
+<p>可观测性基础设施已成熟：OpenTelemetry 追踪、Prometheus 指标、DORA 跟踪以及一个清晰的 <code>Observer</code> 特质均已就位。这是生产级别的工作。教学上的差距在于拥有基础设施与以实际帮助的方式使用它之间——理想情况下，是在你意识到出现问题之前就能提供帮助。</p>
+<p>考虑两条日志消息。它们都能编译通过，都能通过 CI 检查，且语法均正确。</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>error!(请求失败);
+<span class="boring">}</span></code></pre>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>error!(
+    provider = %provider_name,
+    model    = %model_id,
+    user     = %sender_id,
+    tool     = %tool_name,
+    attempt  = attempt,
+    elapsed  = ?elapsed,
+    err      = %e,
+    “提供程序请求失败 — 重试次数已耗尽”
+);
+<span class="boring">}</span></code></pre>
+<p>第一条是记录。它确认了某些事情出了问题。第二条是_诊断信息_。它回答了那些关键的问题：我们试图做什么，在什么上下文中，使用了哪些参数，以及具体出了什么问题。它们之间的区别不在于技术上的复杂性，而在于撰写消息的人是否在考虑未来需要阅读它的人。</p>
+<p>在编写任何 <code>warn</code> 级别或更高级别的日志消息之前，需要问的问题是：</p>
+<blockquote>
+<p>在最糟糕的时刻需要诊断此故障的人需要知道什么？</p>
+</blockquote>
+<p>六个月后的你，可能已经忘记了这段代码的编写过程，而那个人或许就是你。也可能是从未见过这个模块的其他贡献者，或者是从终端复制了日志片段来提交 bug 报告的用户。请为他们而写。几乎总是重要的字段包括：我们当时试图做什么、当时的上下文范围是什么，以及具体出了什么问题。</p>
+<p>追踪跨度（span）的设计遵循同样的原则。一个跨度应代表一个有意义的工作单元，携带理解该工作所需的上下文，并且其名称在火焰图或追踪查看器中阅读时具有意义。</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// 一条记录
+let _span = span!(Level::INFO, 进程);
+
+// 诊断信息
+let _span = span!(
+    Level::INFO,
+    "agent.tool_call",
+    tool = %tool_name,
+    turn = turn_number,
+    sender = %sender_id,
+);
+<span class="boring">}</span></code></pre>
+<p>结构化日志记录和有意义的 Span 设计并非风格偏好。它们才是让你的可观测性基础设施真正发挥作用的关键——不仅是在开发阶段，更在于那些运行着你从未见过的硬件、处于你未曾预料到的配置中、并遭遇你未曾计划过的错误的 ZeroClaw 用户手中。基础设施创造了能力，而贡献者如何使用它，则决定了这种能力能否转化为可诊断的系统。</p>
+<h3 id="47-在地板上方工作"><a class="header" href="#47-在地板上方工作">4.7 在地板上方工作</a></h3>
+<p>前六个学科各自针对一个特定的领域。本节将它们综合为一个整体，展示“高于地板”在实际中是什么样的——当审查者、未来的贡献者或用户遇到符合本 RFC 所述标准的代码时，他们实际体验到的内容。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>维度</th><th>在楼层中——门通过</th><th>地板上方 — 标准元</th></tr>
+</thead>
+<tbody>
+<tr><td>错误处理</td><td>代码编译成功；无 Clippy 警告</td><td>错误被分类；操作错误会附带上下文信息；恐慌（panic）是有意为之且已记录在案</td></tr>
+<tr><td>文档</td><td>如果存在文档测试，则通过</td><td>每个公开项都可以在不阅读实现的情况下被正确理解和正确使用</td></tr>
+<tr><td>测试</td><td>存在的测试通过</td><td>测试断言行为；测试难度被视为设计反馈；关键故障模式已覆盖</td></tr>
+<tr><td>债务</td><td>没有编译器错误或警告（其余的通过 <code>#[allow]</code> 抑制）</td><td>债务被标记、定位并进行风险加权；高风险债务具有所有者和时间线。</td></tr>
+<tr><td>安全</td><td><code>cargo deny</code> 检查通过</td><td>信任边界是明确的；安全故障会明显暴露；实现尊重其预期范围</td></tr>
+<tr><td>可观测性</td><td>代码运行并输出了某些内容</td><td>日志消息用于回答诊断问题；跨度将具有有用上下文的工作单元绑定在一起。</td></tr>
+<tr><td>代码组织</td><td>文件编译成功；模块结构存在</td><td>函数只做一件事；文件用于组织相关关注点；大文件是提取的候选对象，而非常态</td></tr>
+</tbody>
+</table>
+</div>
+<p>这些目标都无法完全通过自动化实现。它们都需要由理解其重要性并具备一致应用判断力的贡献者来完成。这正是本文档所努力的方向。</p>
+<hr>
+<h2 id="5-这对-ai-辅助开发意味着什么"><a class="header" href="#5-这对-ai-辅助开发意味着什么">5. 这对 AI 辅助开发意味着什么</a></h2>
+<p>文化 RFC 探讨了作为协作团队的一部分，如何与 AI 工具协同工作。本节则聚焦于更具体的问题：当 AI 生成的代码遇到上述标准时会发生什么——以及当出现偏差时，如何识别并弥合这一差距。</p>
+<p>AI 工具在通过检查方面确实表现出色。它们能够生成可编译的代码，满足类型检查器的要求，通过 Clippy 检查，并且通常还会在实现的同时生成测试。这确实具有实际价值，而本节的目的并非贬低这一点。问题不在于 AI 工具不可靠，而在于它们在错误的地方表现得过于可靠：它们擅长生成能够通过检查的代码，而不是符合标准的代码。</p>
+<p>原因在于结构层面。AI 会根据它能推断出的信息来生成代码。如果一个函数没有文档，AI 会从函数名和签名中推断其意图——有时这种推断是正确的，有时则会产生微妙的错误行为，而这些行为只有在无人测试过的条件下才会暴露出来。如果一个错误类型没有文档说明其返回条件，AI 会基于变体名称来处理它。如果测试套件测试的是实现而非行为，AI 会生成与这些测试相匹配的实现——这些实现可能与测试原本意图捕获的预期行为相符，也可能不相符。AI 输出的质量上限由你提供的上下文质量决定。更好的上下文——更清晰的文档、更具体的错误类型、以行为为中心的测试——会产生更好的输出。不完善的上下文则会产生通过检查但将判断推迟给后续审查者的输出。</p>
+<p>这为使用 AI 工具的贡献者带来了一项具体且不可推卸的责任。</p>
+<p><strong>审查不是可选项，因为代码是由 AI 编写的。</strong> 该文化 RFC 已明确指出这一点，并需要再次强调具体细节：在审查 AI 生成的代码时，审查的起点是“代码能否编译、测试是否通过”，而非终点。标准的审查问题包括：代码是否正确处理了运行时错误，还是直接使用了 <code>.unwrap()</code> 忽略了错误？新的公共 API 是否已文档化？测试断言的是行为还是实现细节？该代码是否靠近信任边界，如果是，是否对输入进行了验证？无论代码由谁编写、使用何种工具生成，这些问题都是你的责任。</p>
+<p><strong>AI 增强的是你的判断力，而非你的判断缺失。</strong> 一个尚未建立良好错误处理心智模型的贡献者，会不加甄别地接受 AI 生成的错误处理代码——包括那些 <code>.unwrap()</code> 的使用。而一个已经内化 §4.1 内容的贡献者，则能审视相同的输出并指导工具：“这是一个操作错误路径；请使用 <code>?</code> 操作符，并将带有上下文的失败传播给调用者。” 工具随后会生成修正后的版本。§4 中的每一项纪律都遵循这一模式。当使用者清楚自己需要什么样的结果时，工具将变得强大无比。若缺乏这种方向性指导，它生成的代码虽然能通过编译器检查，却将真正的决策推迟给了链条中的下一个人。</p>
+<p><strong>这种关系在两个方向上都会产生复利效应。</strong> 一个理解标准的团队，会随着工具的改进而获得越来越多的价值，因为他们可以更精确地指导更强大的工具。他们能够将“工具生成的内容”与“标准要求”之间的差距，通过指导而非手动重写来弥补。而一个没有建立这种判断力的团队，虽然能更快地达到相同的质量底线，却无法突破它。本文档中描述的投入，也直接是对团队未来使用的每一个 AI 工具长期有效性的投资——因为这些工具的价值会随着指导它们的判断力的清晰度而放大。</p>
+<hr>
+<h2 id="6-工艺的便携性"><a class="header" href="#6-工艺的便携性">6. 工艺的便携性</a></h2>
+<p>技术在不断变化。每一次迭代的变化速度都比前一次更快，而且这种加速趋势仍在持续。本文档中提到的具体工具——Rust、<code>cargo</code>、<code>clippy</code>、OpenTelemetry SDK 以及团队当前使用的 AI 助手——都将被取代。其中一些工具甚至会在本项目的生命周期内被淘汰。平台会发生变化，编程语言会不断演进。五年后的工具生态将与今天不同，十年后又将再次不同。</p>
+<p>本文档中的心智模型不会改变。</p>
+<p>“当此处失败时应该发生什么，以及谁需要知道？”这个问题并不会因为语言的变化而过时。当你学习下一门语言时，你仍然会问这个问题。在设计分布式系统时，如果“语言”是网络协议，你同样会问这个问题。在构建任何他人依赖且你无法亲自监督的系统时，你也会问这个问题。用于回答这个问题的具体 Rust 机制——<code>Result&lt;T, E&gt;</code>、<code>?</code> 运算符、带有上下文的结构化错误类型——只是对这一普遍存在问题的一个解答。</p>
+<p>“我承诺的公共接口是什么，我的文档是否反映了这一承诺？”——在设计 API、编写技术规格、定义团队职责范围、向其他团队、AI 工具、客户或承包商传达需求时，你都会提出这个问题。公共接口的“承诺与条款”模型不仅适用于 Rust，也远远超出了软件领域。</p>
+<p>问题“我的测试究竟证明了什么？”不仅适用于软件领域，也适用于任何需要验证系统是否按预期运行的领域。提出这一问题的本能——区分“实现存在”的证据与“正确行为发生”的证据——才是关键技能。在 Rust 中表达它的语法只是次要的。</p>
+<p>“需要诊断此故障的人应该知道什么？”这是一个工程问题，适用于你构建的任何其他人依赖的事物。更深层次上，这也是一个关于同理心的问题——要记住，你的工作另一端的是一位真实的人，他/她正面临一个真实的问题，而这个问题发生在你无法预测的时刻，且你无法提供当时的背景信息。</p>
+<blockquote>
+<p>你并非在学习 Rust。你是在借助 Rust 学习构建可信赖的系统。这种能力是可迁移的。只要你持续实践，它将在你未来涉足的每一种语言、每一个系统、每一支团队以及每一个领域中不断积累价值。</p>
+</blockquote>
+<p>这是项目对你的投资。不是针对你特定的技术技能，而是针对你未来构建任何事物时所展现的判断力、工艺和用心程度。同时，这也是你对未来将依赖你所构建之物的每个人的投资。</p>
+<hr>
+<h2 id="7-这对贡献者意味着什么"><a class="header" href="#7-这对贡献者意味着什么">7. 这对贡献者意味着什么</a></h2>
+<p><strong>如果您是 Rust 新手或软件开发新手：</strong></p>
+<p>第 4 节中的七个学科并不是在你能做出贡献之前必须掌握的要求。它们是这片领域的地图——你在工作中将会遇到的事物，名称足够清晰，以便你在看到它们时知道自己在看什么。</p>
+<p>从第 4.1 节开始。错误处理的思维模型是你早期可以内化的最具杠杆效应的概念，它并不局限于 Rust。当你阅读现有代码并遇到 <code>.unwrap()</code> 时，问自己它属于哪一类。当你编写新代码时，对你的选择也问同样的问题。这个习惯若能持续实践，将提升它所触及的每一行代码，并培养一种将伴随你整个职业生涯的判断力。</p>
+<p>不要等到觉得自己准备好了才去应用这些标准。不完美地应用它们，在不确定某项内容属于哪个类别时提出问题，并将审查中收到的反馈视为其本意所是的教学。没有人一开始就知道这些知识。它们是通过你正在做的这类工作，慢慢学到的。</p>
+<p><strong>如果您正在使用 AI 工具来帮助您贡献：</strong></p>
+<p>本文档中的标准是仔细审查时将评估 AI 生成代码的依据。实际上，它们也是使 AI 输出在到达审查之前更加正确的上下文。在要求 AI 实现某项功能之前，请检查其将要实现的接口是否已记录。如果尚未记录，请先对其进行文档化——或将文档作为你要求 AI 生成的内容的一部分。这样，输出将更加准确，你也将弥补基础中的一个重要缺口，后续贡献者也将从中受益。</p>
+<p>当你收到对 AI 生成代码的审查反馈时，请将其视为对代码本身的反馈，而不是对你使用 AI 这一选择的反馈。无论代码由谁编写，适用的标准都是一致的。关键问题始终是：这段代码是否符合标准？如果不符合，需要做出哪些更改，以及原因是什么？</p>
+<p><strong>如果您正在审查拉取请求：</strong></p>
+<p>门槛问题——代码能否编译通过、测试是否全部通过、Clippy 是否接受——只是基础，而非上限。仅回答这些问题的审查是不完整的。请使用第 3 节中的框架和第 4 节中的规范来组织你的观察结果。明确指出你所依据的标准，解释其重要性，并清晰地区分阻塞性问题与非阻塞性建议。</p>
+<p>审查的目的不是挑错，而是传递理解。每一条包含解释的具体反馈——例如“这是一个运行时错误路径；这里解释为什么 <code>.unwrap()</code> 会带来生产环境风险，以及应该使用什么替代方案”——都是对被你审查的贡献者的投资。这种投资会产生复利效应。理解了这一原则的贡献者，将在未来十个相关场景中正确应用它，而无需再次被提醒。</p>
+<p><strong>如果您是维护者或更资深的贡献者：</strong></p>
+<p>你最有能力让这些标准落地——不是通过自上而下的强制推行，而是通过在代码中践行这些标准，并在代码审查中明确提及它们。在开源项目中，最有效的教学发生在 PR 讨论和代码注释中，而不是在文档里。本文档提供了相应的术语。在日常审查中一致地使用这些术语，才能将其从纸面上的文字转化为团队共享的实践。</p>
+<p>当你在操作错误路径上看到 <code>.unwrap()</code> 时，应将其命名为操作错误。当看到没有文档的公共函数时，应提出这样的问题：未来的实现者在这里需要了解什么？当看到在合理重构时会失败的测试时，应解释这为何重要。这些不是修正——它们是持续性的指导，而文化 RFC 指出，这是更有经验的贡献者能够提供的最重要的事情之一。</p>
+<hr>
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-005-contribution-culture.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../contributing/how-to.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-005-contribution-culture.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../contributing/how-to.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

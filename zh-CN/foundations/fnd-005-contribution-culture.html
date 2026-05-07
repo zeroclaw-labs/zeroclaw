@@ -1,0 +1,491 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>贡献文化 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-53bbdbb2.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-088a9fdb.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/foundations/fnd-005-contribution-culture.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="fnd-005贡献文化人类协作ai-伙伴关系与团队成长"><a class="header" href="#fnd-005贡献文化人类协作ai-伙伴关系与团队成长">FND-005：贡献文化——人类协作、AI 伙伴关系与团队成长</a></h1>
+<h3 id="从-v070-开始--类型文化--修订版-1"><a class="header" href="#从-v070-开始--类型文化--修订版-1">从 v0.7.0 开始 · 类型：文化 · 修订版 1</a></h3>
+<blockquote>
+<p><strong>规范参考</strong> · 团队已批准 · 修订版 1 讨论线程及完整修订历史：<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5615">#5615</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>在你们阅读此内容之前，给团队的一条提示。</strong></p>
+<p>这是 ZeroClaw 成熟度框架的第五份文档。其余四份分别涉及架构、文档、治理和工程基础设施——这些是使项目得以运行的结构层。本份文档则聚焦于前四份文档所默认假设但从未明确教授的内容：如何协作。</p>
+<p>其他 RFC 中的工具和流程的效果，完全取决于使用它们的团队。一个完美的 CI 流水线无法帮助那些无法提供诚实反馈的团队。一个清晰的架构无法在无法进行建设性分歧的团队中存活。一个治理模型也无法在从未被教导过“所有权”含义的人中建立主人翁意识。</p>
+<p>本文档旨在打造这样一支团队——不仅具备技术能力，还要懂得如何给予和接受反馈、如何寻求帮助、如何负责任地使用强大的工具，以及如何随着时间共同成长。这些都是可以学习的技能。没有人天生就完全具备这些能力。本文档清晰地列出了这些技能，让你能够在有意义的实际工作场景中，开始有意识地练习它们。</p>
+<p>本文档中的内容并非对您个人身份或起点的批评，而是我们共同致力于实现的目标的路线图。</p>
+</blockquote>
+<hr>
+<h2 id="成熟度框架套件"><a class="header" href="#成熟度框架套件">成熟度框架套件</a></h2>
+<p>本 RFC 是五份文档中的第五份，这五份文档共同构成了 ZeroClaw 的成熟度框架。它们设计为整体阅读，但每份文档也可独立阅读。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>RFC</th><th>范围</th><th>问题</th></tr>
+</thead>
+<tbody>
+<tr><td>有意架构 — 微内核过渡</td><td>我们正在构建的内容及其结构</td><td>#5574</td></tr>
+<tr><td>文档标准与知识架构</td><td>我们如何记录我们所构建的内容</td><td>#5576</td></tr>
+<tr><td>团队组织与项目治理</td><td>我们如何协调和做出决策</td><td>#5577</td></tr>
+<tr><td>工程基础设施 — CI/CD 流水线</td><td>我们如何可靠地构建、测试和发布</td><td>#5579</td></tr>
+<tr><td><strong>贡献文化——人类协作与 AI 伙伴关系</strong></td><td><strong>我们如何协作与成长</strong></td><td><strong>FND-005</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>前四个 RFC 回答了结构性的问题。本文回答的是一个关于人的问题：在既定结构下，其中的人如何彼此互动，以及如何对待他们的工具？这个问题没有编译器、代码检查器或 CI 门禁来约束。它只依赖于我们养成的习惯、树立的榜样，以及我们对此投入的用心。</p>
+<hr>
+<h2 id="目录"><a class="header" href="#目录">目录</a></h2>
+<ol>
+<li><a href="#1-why-this-document-exists">为什么需要此文档</a></li>
+<li><a href="#2-the-work-before-the-work">前面的工作</a></li>
+<li><a href="#3-working-with-people">与人员协作</a>
+<ul>
+<li><a href="#giving-feedback">提供反馈</a></li>
+<li><a href="#receiving-feedback">接收反馈</a></li>
+<li><a href="#asking-for-help">寻求帮助</a></li>
+<li><a href="#disagreeing-productively">建设性地表达不同意见</a></li>
+<li><a href="#ownership">所有权</a></li>
+<li><a href="#supporting-someone-who-is-struggling">支持正在挣扎的人</a></li>
+</ul>
+</li>
+<li><a href="#4-working-with-ai">与 AI 协作</a>
+<ul>
+<li><a href="#the-delegation-mental-model">委派心智模型</a></li>
+<li><a href="#ai-works-at-the-implementation-layer">AI 在实现层工作</a></li>
+<li><a href="#amplification-is-not-magic">放大并非魔法</a></li>
+<li><a href="#the-review-discipline">审查纪律</a></li>
+<li><a href="#what-this-means-for-your-career">这对你的职业生涯意味着什么</a></li>
+</ul>
+</li>
+<li><a href="#5-the-feedback-taxonomy">反馈分类法</a></li>
+<li><a href="#6-a-note-to-reviewers-and-mentors">给评审者和导师的说明</a></li>
+</ol>
+<hr>
+<h2 id="1-本文档的存在原因"><a class="header" href="#1-本文档的存在原因">1. 本文档的存在原因</a></h2>
+<p>大多数贡献指南会告诉你如何提交 PR。它们会说明使用哪些标签、如何运行测试套件，以及提交信息中应包含的内容。这些都很重要，我们也有相关的文档来涵盖这些内容。</p>
+<p>本文档涵盖的是另一方面的内容：那些决定一群有才华的人能否成为一个高效团队，还是仅仅成为共享同一个代码库的个体集合的技能。</p>
+<p>这些是可学习的技能。它们不是非有即无的人格特质，也不是随着技术能力自动获得的东西。它们需要通过实践——在反馈中，随着时间的推移——来学习，就像学习任何其他技能一样。大多数软件工程教育几乎完全专注于技术层面，而将人际层面留给偶然。结果是，许多具备技术能力的人最终加入了协作不佳的团队，却不清楚缺失了什么，也不知道如何改进。</p>
+<p>本文档的目标是清晰地命名这些技能，以便你能够在重要的实际工作背景下，开始有意识地练习它们。</p>
+<hr>
+<h2 id="2-工作前的工作"><a class="header" href="#2-工作前的工作">2. 工作前的工作</a></h2>
+<p>在编写代码、提交 PR 或要求 AI 生成任何内容之前，你应该能够回答一组问题。本项目使用决策层级来描述这些问题：</p>
+<pre><code>Vision
+  └── Architecture
+        └── Design
+              └── Implementation
+                    └── Testing
+                          └── Documentation
+                                └── Release
+</code></pre>
+<p>该层次结构在架构 RFC（#5574）中有完整描述。这里重要的是其背后的原则：<strong>你做出的每一个决策都应该能够追溯至顶层。</strong></p>
+<p>在实践中，这意味着在开始构建之前，先问自己：</p>
+<ul>
+<li><strong>我在解决什么问题？</strong> 不是“我在关闭哪个工单”，而是这个问题对某人来说实际解决了什么？</li>
+<li><strong>这是否符合架构要求？</strong> 如果你无法描述它在系统结构中的位置，说明你对系统的理解还不够深入，不足以对其进行修改。</li>
+<li><strong>完成的标准是什么？</strong> 在编写代码之前，先写出验收标准。“它能运行”不是一个验收标准。“用户无需 Rust 工具链即可安装插件并正常运行”才是。</li>
+<li><strong>谁需要了解这些信息？</strong> 那些会影响他人工作，或需要团队共同做出决策的变更，在实施前就需要让相关人员知晓，而不是事后才告知。</li>
+</ul>
+<p>这不是官僚主义，而是“构建某物”与“构建正确之物”之间的区别。这也直接适用于你如何使用 AI 工具，我们将在第 4 节中详细讨论。</p>
+<p>跳过这一步的真实情况是：你构建了一个能运行的东西，提交了一个 PR，然后在代码审查中发现它解决的是错误的问题，或者以与之前其他地方的决策相冲突的方式解决了正确的问题。这会浪费你的时间、审查者的时间，并延迟依赖于此工作的人。前期工作不是多余的——它是保护你自己努力的方式。</p>
+<hr>
+<h2 id="3-与人协作"><a class="header" href="#3-与人协作">3. 与人协作</a></h2>
+<h3 id="提供反馈"><a class="header" href="#提供反馈">提供反馈</a></h3>
+<p>反馈是你能为其他工程师做的最有影响力的事情之一。一条写得好的评审评论可以教会别人多年才能自己学到的东西。而一条写得差的评论则可能让某人不再愿意贡献代码。</p>
+<p><strong>具体说明。</strong> 模糊的反馈只会带来焦虑，却缺乏明确的方向。</p>
+<blockquote>
+<p>❌ “这很难阅读。”</p>
+<p>✅ “此函数处理了三个不同的关注点——输入验证、业务逻辑和格式化响应。建议将它们拆分，使每个函数只负责一件事。这样更易于测试各个部分，也能一目了然地了解每个函数的作用。”</p>
+</blockquote>
+<p>第二个版本更长，但它教会了读者一些东西。读者现在知道了问题是什么、为什么重要以及该如何解决。</p>
+<p><strong>解释原理，而不仅仅是结论。</strong> 如果你要求某人做出更改，请告诉他们原因。“将 X 更改为 Y”只能产生修复效果；而“将 X 更改为 Y，因为 Z”则能产生理解，这种理解会在接下来十个适用相同原理的情境中发挥作用。</p>
+<p><strong>将工作与人分开。</strong> “这个方法有问题”和“你犯了一个错误”并不是同一回事。前者是关于代码的，后者则是针对个人的。请确保你的反馈集中在工作上。</p>
+<p><strong>指出做得好的地方。</strong> 这并非关于客气，而是关于有用。当你告诉某人他们做对了什么，并解释为什么正确时，你是在教他们重复哪些模式。泛泛的赞美（“做得好！”）毫无教育意义。具体的赞美（“将其提取到独立的 crate 中是正确的决定，因为这意味着我们现在可以独立测试这段逻辑，而无需启动整个 agent 循环”）则传授了原则并强化了该决策。</p>
+<p><strong>使用反馈分类法。</strong> 第 5 节中的四象限模型为每条评论赋予了明确的权重。评审者若将阻塞性问题与次要建议混为一谈而不加以区分，就会迫使作者去猜测哪些内容真正需要修改。不要让别人去猜测。</p>
+<hr>
+<h3 id="接收反馈"><a class="header" href="#接收反馈">接收反馈</a></h3>
+<p>这对大多数人来说比提供反馈更难，而且诚实地说明原因很有价值。</p>
+<p>当你花几个小时在某件事上——解决问题、做出决策、编写代码——而有人告诉你它有问题时，自然的反应是觉得批评是针对你个人的。其实不是。批评针对的是工作本身。学会将这两者区分开来是一项技能，需要不断练习。</p>
+<p>以下是一些有帮助的事项：</p>
+<p><strong>在回复反馈之前，请先阅读反馈内容。</strong> 不仅仅是摘要行——而是整个评论，包括解释部分。许多反馈回复是在人们尚未充分理解原因的情况下，针对结论做出的反应。在决定你对“是什么”的感受之前，请先理解“为什么”。</p>
+<p><strong>区分“我不同意”和“我不理解”。</strong> 这两种情况需要不同的回应方式。如果你不理解反馈内容，请提出澄清性问题；如果你理解反馈但不同意，请提供证据明确表达你的观点。这两种情况都是良好的结果。而当你有疑问时保持沉默，或者明明不同意却只说“好吧，行”，则毫无帮助。</p>
+<p><strong>你不必同意每一条反馈才能从中学习。</strong> 有时反馈是错误的。有时它反映的权衡取舍与你所优化的不同。你可以提出反对意见——详见“建设性地不同意”部分。但即使你最终拒绝的反馈，也值得在决定拒绝之前充分理解。</p>
+<p><strong>闭环沟通。</strong> 当有人花时间审查你的工作时，请在他们提出反馈后告知他们你已根据反馈进行了修改。你不必过度感谢——只需简单说明“已在最新提交中处理”即可。这能让他们感到自己的时间没有白费，并推动 PR 继续推进。</p>
+<p><strong>对你的代码的反馈并不反映你的价值。</strong> 这听起来显而易见。但当你身处其中时，却并不明显。每一位经验丰富的工程师都会接受更有经验的人的代码审查，而这个过程每次都会让人感到不适。这种不适感正是学习的感觉。它不会消失；你只是逐渐学会与之共处。</p>
+<hr>
+<h3 id="请求帮助"><a class="header" href="#请求帮助">请求帮助</a></h3>
+<p>在学校里，寻求帮助可能会让人觉得你落后于人，或者你不属于这个群体。而在团队中，寻求帮助是你所能做的最专业的事情之一。</p>
+<p><strong>陷入困境而不求助的代价，几乎总是高于求助的代价。</strong> 花三个小时在一个只需五分钟对话就能解决的问题上打转，意味着你和团队的时间白白浪费了。知道何时求助是一种技能，而不是弱点。</p>
+<p>一个良好的帮助请求包含三个部分：</p>
+<ol>
+<li><strong>你正在尝试做什么。</strong> 不仅仅是“它坏了”——你的目标是什么？</li>
+<li><strong>你已经尝试过的操作。</strong> 这表明你已投入精力解决问题，并为提供帮助的人提供了一个非零的起点。</li>
+<li><strong>你具体卡在哪里。</strong> “我不知道哪里出了问题”与“我知道哪里出了问题，但不知道如何修复”以及“我修复了问题，但不知道为什么我的修复有效”是不同的问题。</li>
+</ol>
+<p>包含这三个部分的问题求助会得到更快的解答，并且能让你学到更多，因为提供帮助的人可以准确地了解你当前的情况。</p>
+<p><strong>在可以公开提问时，请公开提问。</strong> 在共享频道或 PR 中提出的问题，能让所有有相同疑问的人受益。而私下提问仅对你个人有益。当然，有些情况下私下沟通是合适的——比如敏感反馈、个人情况等——但关于代码库的技术问题，几乎总是更适合公开提问。</p>
+<p><strong>不知道某件事并不丢人。</strong> 没有人无所不知。那些看似无所不知的工程师，是在漫长的时间里不断提问，才积累了这些答案。而通往这一境界的唯一途径，就是开始提问。</p>
+<hr>
+<h3 id="建设性地表达不同意见"><a class="header" href="#建设性地表达不同意见">建设性地表达不同意见</a></h3>
+<p>架构上的分歧是健康的。它意味着人们关心系统的构建方式，并且正在关注所做出的决策。一个没有人提出异议的团队，并不是一个所有人都同意的团队，而是一个人们不再积极参与的团队。</p>
+<p>建设性分歧与无建设性分歧之间的差异通常在于表述方式。</p>
+<p><strong>先提出关切，而非结论。</strong></p>
+<blockquote>
+<p>❌ “这种方法是不正确的。”</p>
+<p>✅ “我对这种方法有一个顾虑——具体来说，如果我们将网关直接连接到这里的运行时，就会违反 RFC §4.2 中的依赖规则。我们可以讨论一下是否有办法在不产生这种耦合的情况下实现相同的结果吗？”</p>
+</blockquote>
+<p>第二个版本会打开一个对话。第一个版本会关闭一个对话。</p>
+<p><strong>提供证据。</strong> 基于测量事实、特定 RFC 章节或具体故障场景的架构分歧是一种贡献。而基于“我就是觉得”的架构分歧则是一种观点。两者都值得表达，但只有一种能推动对话快速进展。</p>
+<p><strong>真正愿意承认自己可能是错的。</strong> 如果你带着“自己一定是对的”这种心态去参与争论，那就不算是在交流——而是在游说。人们能分辨出其中的差别，这会让对方更不愿意认真对待你的观点。我们的目标是为项目争取最好的结果，而不是为了证明自己是对的。</p>
+<p><strong>当团队做出决定时，与团队保持一致。</strong> 你可以在记录中注明你的异议——在 issue、RFC 评论或 PR 讨论中——然后按照已决定的方案进行开发。这不是妥协，而是团队运作的方式。一个不断重新争论已决事项的团队是无法交付成果的。</p>
+<p><strong>有些决策是可逆的，有些则不可逆。</strong> 明确你正在讨论的是哪一类决策。命名决策是可逆的，而一旦写入生产环境二进制文件并持续使用两年的协议决策则不可逆。请据此合理分配你的精力。</p>
+<hr>
+<h3 id="所有权"><a class="header" href="#所有权">所有权</a></h3>
+<p>“所有权”是一个经常被使用但缺乏明确定义的词。以下是它在该项目中的实际含义：</p>
+<p><strong>拥有者意味着你在被要求之前就能看到问题。</strong> 这意味着阅读涉及你负责区域的 PR，并注意到作者未察觉的副作用。这意味着看到一个没有分配负责人的后续问题并主动接手。这意味着不等待被指示。</p>
+<p><strong>所有权意味着你的承诺具有分量。</strong> 如果你以个人名义提交一个后续问题，那么这个问题就是你的承诺。不是“有人应该做这件事”，而是“你会去做”。如果情况发生变化，你无法继续，你要尽早说明，并找到交接人。一个充斥着已提交却被遗忘、且附有姓名的问题的跟踪系统，是一个失效的信任记录。</p>
+<p><strong>所有权不是“我完成了我的部分”。</strong> 而是“我关心整个系统是否正常运行”。你可以拥有一个 crate，同时并不对运行该 crate 的系统是否健康漠不关心。你可以负责一个功能，同时并不对用户能否真正使用它漠不关心。狭隘的所有权——“我完成了我的部分，其余的问题归别人管”——会导致系统虽然在技术上有每个部分的负责人，但在功能上却没有任何人对整体负责。</p>
+<p><strong>所有权包括后续跟进。</strong> 发布代码并不是所有权的终点，而是责任的开始——确保代码正常运行、修复出现的问题，并教会接下来在该领域工作的人你所学到的经验。</p>
+<hr>
+<h3 id="支持正在挣扎的人"><a class="header" href="#支持正在挣扎的人">支持正在挣扎的人</a></h3>
+<p>在这个项目的某个阶段，你可能会比线程中的其他人更有经验。也许你在这里的时间更长，也许你恰好了解他们正在处理的代码部分，也许你之前见过这种特定的故障模式。</p>
+<p>你如何使用这个职位很重要。</p>
+<p><strong>不要只是替他们修复问题。</strong> 在不解释问题所在或你的解决方案为何有效的前提下，直接给出一段可运行的代码，虽然能促成 PR 合并，但无法带来任何学习价值。下次他们遇到类似问题时，依然会陷入同样的困境。请多花五分钟时间，说明你发现的问题以及修复方案背后的原理。</p>
+<p><strong>以教学为目的进行审查。</strong> 一个糟糕的 PR 不仅仅是一个需要关闭的问题——它是一个教学机会。一个轻率的审查（“这不符合架构”）不如一个指出遗漏内容、解释其违反的原则，并引导贡献者进一步学习的审查有用。额外的努力是对贡献者的投资，使他们从那时起写出更好的 PR。</p>
+<p><strong>如果有人被卡住且没有寻求帮助，请主动说些什么。</strong> 有时人们不求助是因为他们不想显得自己遇到了困难；有时他们不确定该向谁请教；有时他们卡得太久，以至于已经没意识到自己有多卡。一句轻声的“这个看起来已经打开有一段时间了——有什么我可以帮忙解决的吗？”几乎不费什么力气，却可能对正在原地打转的人意义重大。</p>
+<p><strong>营造“不知道也没关系”的安全感。</strong> 如果团队成员因为不了解某些事情而感到被评判，他们就会假装自己知道。这会导致更糟糕的决策，而不是更好的决策。那些能够让大家安心地说“我不知道，让我去查一下”的团队，会比那些每个人都表现得自信满满的团队做出更好的决策。</p>
+<hr>
+<h2 id="4-使用-ai"><a class="header" href="#4-使用-ai">4. 使用 AI</a></h2>
+<p>本节涉及大多数贡献指南未涵盖的内容：如何以使你变得更强，而不仅仅是更快的方式使用 AI 编码工具。</p>
+<h3 id="委派心智模型"><a class="header" href="#委派心智模型">委派心智模型</a></h3>
+<p>以下是与 AI 高效协作的最实用思维框架：</p>
+<p><strong>与 AI 协作的技能与向人委派任务相同。</strong></p>
+<p>当你将工作委托给同事或初级工程师时，你会提供上下文。你会解释目标、约束条件、什么是好的标准以及边界在哪里。你不会只是说“给我做一个功能”，而是会说：这是用户想要做的事情，这是它如何与系统契合，我们将如何知道它已经完成，以及你不应该做的事情。</p>
+<p>然后——至关重要地——你要审查返回的内容。你不能在不阅读的情况下接受初级工程师的 PR。你要检查它是否完成了要求的工作，是否符合架构，是否有测试覆盖，错误处理是否正确。你要提供反馈。你可能需要多次迭代。</p>
+<p>AI 工具的工作原理完全相同。你得到的结果质量几乎完全取决于你输入的内容质量。模糊的提示词会产生模糊的输出。而包含清晰上下文、具体约束条件和明确验收标准的提示词，则能生成真正有用的、可作为起点的输出。</p>
+<p>那些在使用 AI 工具时遇到困难的人，通常还在努力学会如何向任何人——无论是人类还是 AI——给出清晰的指令。而那些能够充分利用 AI 工具的人，往往在提出需求之前就已经清楚自己想要什么。</p>
+<p>这种心智模型也意味着输出结果由你负责。你不能提交 PR 并说“是 AI 写的”。你审核了它，你提交了 PR。这是你的工作。</p>
+<hr>
+<h3 id="ai-在实现层工作"><a class="header" href="#ai-在实现层工作">AI 在实现层工作</a></h3>
+<p>这是需要理解的最重要的技术限制。</p>
+<p>AI 代码生成工作在决策层级的<strong>实现层</strong>：</p>
+<pre><code>Vision          ← AI cannot set this. You must.
+Architecture    ← AI cannot make these decisions. You must.
+Design          ← AI will sometimes guess. You must verify.
+Implementation  ← AI can help here.
+Testing         ← AI can help, but you define what to test.
+Documentation   ← AI can draft. You must review for accuracy.
+Release         ← Human judgment required.
+</code></pre>
+<p>一个 AI 工具会生成一个实现你所描述功能的函数。但它不会告诉你该函数应该属于当前 crate 还是另一个 crate。它不会指出该方法与三个月前做出的架构决策相矛盾。它不会询问你是否考虑过安全影响。它也不会注意到你正在解决的是一个错误的问题。</p>
+<p>ZeroClaw 本身就是一个有用的例子。其初始代码库是通过 AI 辅助引导生成的。正如架构 RFC 所述，结果是“功能令人印象深刻，但架构是偶然形成的”。代码在今天确实能完成它需要完成的任务——但它并非经过设计，而是逐渐累积而成的。这并不是 AI 工具的失败，而是使用实现层工具却未先完成赋予实现方向所需的愿景、架构和设计工作所导致的可预见结果。</p>
+<p>解决方案不是少用 AI，而是始终在要求 AI 构建任何内容之前，自己完成顶层层级的工作。</p>
+<hr>
+<h3 id="放大不是魔法"><a class="header" href="#放大不是魔法">放大不是魔法</a></h3>
+<p>AI 工具放大了你现有的能力。这是对其作用的诚实描述。</p>
+<p>如果你拥有清晰的愿景、明确的架构、可以明确表述的质量标准，以及批判性地评估输出的能力——AI 就是一个真正的力量倍增器。你会更快地推进工作，探索更多的选项，编写更多的测试，起草更多的文档。</p>
+<p>如果你不具备这些能力——AI 会生成大量看似合理但无法自洽的代码。它会生成通过测试但并未验证任何有意义内容的测试用例。它会生成描述代码而非意图的文档。它会生成本地一致但全局不连贯的架构。</p>
+<p>这种放大是中性化的。它以同样的热情放大好的输入和坏的输入。</p>
+<p>这意味着在 AI 辅助工作流中，最有价值的技能不是提示工程，而是评估输出的能力。这要求你在提出任何请求之前，就清楚什么是好的结果。而这又让你一次次回到决策层级的顶端。</p>
+<p>在使用 AI 工具实现某个功能之前，一个有用的自检步骤是：</p>
+<ul>
+<li>可以，用一句话描述问题而不提及实现细节是完全可行的。</li>
+<li>我可以为这个实现所服务的 RFC 章节或设计决策命名吗？</li>
+<li>我可以在看到正确的实现之前，先描述一下它应该是什么样的吗？</li>
+<li>在查看生成的实现后，我可以解释它是否正确或不正确吗？</li>
+</ul>
+<p>如果其中任何一个问题的答案是否定的，那么您尚未准备好实施。您仍处于设计阶段。</p>
+<hr>
+<h3 id="审查纪律"><a class="header" href="#审查纪律">审查纪律</a></h3>
+<p>AI 生成的代码需要与人工编写的代码相同的审查纪律。在某些方面，它甚至需要更多的审查，因为你需要检查的问题范围更广。</p>
+<p>在审查 AI 生成的输出（无论是你自己的还是他人的）时，请检查以下内容：</p>
+<p><strong>架构契合度。</strong> 这是否遵循了依赖规则？它是否位于正确的 crate 中？它是否引入了设计明确避免的耦合？</p>
+<p><strong>边界情况的正确性。</strong> AI 模型在常见情况下表现良好，但在边界情况下经常出错。检查当输入为空、为 null、格式错误或达到最大预期大小时会发生什么。检查当依赖项不可用时会发生什么。</p>
+<p><strong>安全影响。</strong> AI 工具默认不具备安全思维。它们会生成接受未验证用户输入的代码、记录敏感值、使用已弃用的密码学原语、以及在不检查文件路径的情况下打开文件路径。你必须明确引入安全视角。</p>
+<p><strong>测试质量。</strong> AI 生成的测试经常测试的是实现细节，而非行为。一个断言函数返回特定内部结构体值的测试并不是行为测试——它只是实现的一个快照，一旦实现发生变化，该测试就会失败。请问：这个测试验证的是系统是否满足了用户或调用者的需求，还是仅仅验证了代码当前是如何实现的？</p>
+<p><strong>完整性。</strong> AI 工具倾向于优化看似完整的代码。它们会生成详尽处理正常路径的代码，而对错误路径的处理则较为表面。请检查错误是否以真正对调用者有用的方式被传播、处理或暴露出来。</p>
+<hr>
+<h3 id="这对你的职业生涯意味着什么"><a class="header" href="#这对你的职业生涯意味着什么">这对你的职业生涯意味着什么</a></h3>
+<p>这里所描述的技能——清晰地给出方向、批判性地评估输出、理解某个组件在更大系统中的作用、在构建之前知道什么是好的——这些并不是 AI 特有的技能。它们是让一个人成为高效工程师、高效技术负责人，并最终成为高效工程经理的技能。</p>
+<p>在一个被 AI 生成代码充斥的世界里，最有价值的工程师并不是那些能够最快编写最多代码的人，而是那些能够判断代码是否正确的人。这需要系统思维、架构判断力，以及根据内化的标准来评估工作的能力。</p>
+<p>你在这里练习的一切——在实现之前理解 RFC，在构建之前问“为什么”，以审查初级工程师 PR 的同样眼光来审查 AI 的输出——都是对这种判断力的练习。它会不断积累。每一次你认真参与架构的 PR，都是一个数据点，让下一次架构决策变得更加容易。</p>
+<p>本项目的贡献者拥有一个独特的优势：你正在一个真实的系统上构建这些习惯，面对真实的架构约束，并且会有人审查你的工作并解释原因。这种组合非常罕见，值得认真对待。</p>
+<hr>
+<h2 id="5-反馈分类法"><a class="header" href="#5-反馈分类法">5. 反馈分类法</a></h2>
+<p>此项目中的每条评审意见都带有四种权重之一。一致地使用这些权重意味着评审者可以清晰地沟通，而作者则确切地知道哪些内容需要采取行动。</p>
+<hr>
+<h3 id="-表彰"><a class="header" href="#-表彰">✅ 表彰</a></h3>
+<p>作者做对的一件事，具体命名并加以解释，以便该模式得以重复。</p>
+<p>这不是礼貌。泛泛的赞美（如“做得好！”）无法带来任何学习。具体的赞美并附带解释，能够阐明做得好的地方背后的原则，这些原则适用于未来同一类别的每一个决策。</p>
+<p><strong>表彰不需要任何操作。</strong> 其目的是强化。</p>
+<blockquote>
+<p>示例：“将工具调用解析器提取到其自己的 crate 中是正确的决定——这段代码对代理状态没有任何依赖，现在可以独立测试。你添加的 91 个测试正是那种当此逻辑位于 <code>loop_.rs</code> 内部时无法实现的覆盖范围。”</p>
+</blockquote>
+<hr>
+<h3 id="-阻塞"><a class="header" href="#-阻塞">🔴 阻塞</a></h3>
+<p>在 PR 合并之前必须解决的问题。阻塞项分为两类：</p>
+<ul>
+<li><strong>架构违规</strong>：代码违反了设计中明确禁止的依赖边界，或与 RFC 或 ADR 中记录的决策相矛盾。</li>
+<li><strong>质量回退</strong>：新行为缺少测试覆盖、安全问题、契约兼容性破坏，或引入缺陷的代码。</li>
+</ul>
+<p>阻塞性评论解释了问题是什么、为什么重要，以及在可能的情况下，解决路径是什么样的。阻塞性评论不是对作者的评判。它是代码库及其依赖者的责任。</p>
+<p><strong>作者不应将阻塞性评论视为拒绝。</strong> 这是一个具体且可解决的问题。解决它并继续前进。</p>
+<hr>
+<h3 id="-条件"><a class="header" href="#-条件">🟡 条件</a></h3>
+<p>可以接受推迟处理，但前提是必须有一个已跟踪的问题（tracked issue）并指定了负责人。这种条件性要求是审查者所说的：“我相信这个问题会得到解决，但在合并之前，我需要这个承诺有记录。”</p>
+<p>阻塞式与条件式的区别通常在于时机和风险。下一个 PR 中将交付的缺失功能是条件式。而存在安全漏洞的缺失功能则是阻塞式。</p>
+<p><strong>没有指定负责人的条件性延期并不是延期，而是一种愿望。</strong> 没有明确负责人的已跟踪问题往往会无限期地保持开放状态。当评审者将某项任务标记为条件性延期时，他们是在要求一个明确的承诺，而不是一个理论上的未来意图。</p>
+<hr>
+<h3 id="-团队决策"><a class="header" href="#-团队决策">🔵 团队决策</a></h3>
+<p>该 PR 引出了一个应由团队共同决策的问题，而非由单个审查者或作者单方面回答。团队决策涉及影响项目方向、架构或用户的权衡，这些决策属于团队整体。</p>
+<p>使用此标签是评审者避免让个别贡献者因涉及共同方向的问题而受阻的方法。它使决策浮出水面，框定权衡取舍，并邀请团队参与评估——同时不会让作者觉得他们的 PR 因超出其控制范围的事项而被阻塞。</p>
+<p><strong>团队决策应在 PR 线程中以书面形式记录，并由需要对结果负责的人员作出。</strong> 任何未在 PR 线程中体现的私下讨论，对于后续查阅历史记录的人来说，都不存在。</p>
+<hr>
+<h2 id="6-给评审者和导师的说明"><a class="header" href="#6-给评审者和导师的说明">6. 给评审者和导师的说明</a></h2>
+<p>如果你处于审查他人工作的位置——无论是作为代码所有者、更有经验的贡献者，还是仅仅因为在这里待得更久——这一节就是为你准备的。</p>
+<p><strong>你正在塑造协作的样貌。</strong> 你写的每一次评审都在教导作者如何开展评审。你在 PR 讨论中提出的每一个问题都在向新贡献者展示哪些问题值得提出。你无法置身事外——唯一的选择是有意为之还是无意为之。</p>
+<p><strong>细致是对作者的尊重。</strong> 一份详尽且阐明其推理过程的审查，比草率的批准更能体现对作者付出的尊重。作者为这项工作投入了时间，他们理应了解代码为何尚未达到合并标准，以及可以从这次审查中获得哪些改进方向。</p>
+<p><strong>每次代码审查的目标，是让作者比审查前获得更强的能力。</strong> 不仅仅是为了合并一个 PR，不是为了展示你自身的知识，也不是为了强制执行规则。而是让作者带走一些可以实际使用的东西——一个原则、一种模式、对某个权衡的理解——这些都能应用到当前 PR 之外的情境中。</p>
+<p><strong>命名模式，而不仅仅是实例。</strong> 当你提出修改请求时，请解释其背后的原则。“将此变量重命名为描述其内容的名称”不如“变量名应从调用者的角度描述其目的，而非实现细节——该函数的调用者真正关心的是这个值代表什么？”第二种方式适用于作者将来编写的每一个函数中的每一个变量。</p>
+<p><strong>诚实地说明你的偏好和硬性要求。</strong> “我会这样写”并不等同于“必须修改”。如果你是在表达偏好，请明确说明。如果你是在引用硬性要求——例如架构、安全性或兼容性——请指出具体原因。无法区分审稿人偏好与架构必要性的作者，要么会修改所有内容，要么什么都不改。这两种情况对他们都没有好处。</p>
+<p><strong>你正在帮助构建的团队，就是你将加入的团队。</strong> 你今天投入的细致、教育性的审查工作，会逐步培养出一个能写出更优质代码、提出更高质量 PR，并对他人进行更深思熟虑审查的贡献者。这会让整个项目变得更好。同时，它也会让你的工作更轻松，因为你身边的同事都在不断成长。</p>
+<p>这不是软技能，而是工程工作。</p>
+<hr>
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-004-engineering-infrastructure.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-006-zero-compromise-in-practice.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-004-engineering-infrastructure.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-006-zero-compromise-in-practice.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

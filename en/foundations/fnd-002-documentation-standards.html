@@ -1,0 +1,921 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Documentation standards - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-c5ad0191.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-425f4b80.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/foundations/fnd-002-documentation-standards.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="fnd-002-intentional-documentation--standards-structure-and-i18n-strategy"><a class="header" href="#fnd-002-intentional-documentation--standards-structure-and-i18n-strategy">FND-002: Intentional Documentation — Standards, Structure, and i18n Strategy</a></h1>
+<h3 id="starting-v070--type-documentation--rev-1"><a class="header" href="#starting-v070--type-documentation--rev-1">Starting v0.7.0 · Type: Documentation · Rev. 1</a></h3>
+<blockquote>
+<p><strong>Canonical reference</strong> · Ratified by the team · Rev. 1
+Discussion thread and full revision history: <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5576">#5576</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>A note to the team before you read this.</strong></p>
+<p>Documentation is not what you write after the code is done. It is a product surface in its own right — the interface between the project and every person who will ever contribute to it, use it, or build on it. A codebase with no documentation forces every new person to rediscover everything from scratch. A codebase with bad documentation is often worse, because it gives people false confidence. This RFC proposes treating documentation with the same intentionality we are applying to the architecture: Vision first, then structure, then content.</p>
+</blockquote>
+<hr>
+<h2 id="table-of-contents"><a class="header" href="#table-of-contents">Table of Contents</a></h2>
+<ol>
+<li><a href="#1-the-documentation-philosophy">The Documentation Philosophy</a></li>
+<li><a href="#2-honest-assessment-where-we-are-today">Honest Assessment: Where We Are Today</a></li>
+<li><a href="#3-a-classification-framework-ea-artifacts-on-a-page">A Classification Framework: EA Artifacts on a Page</a></li>
+<li><a href="#4-the-i18n-problem">The i18n Problem</a></li>
+<li><a href="#5-the-repo--wiki-split">The Repo / Wiki Split</a></li>
+<li><a href="#6-adr-standards">ADR Standards</a></li>
+<li><a href="#7-agentsmd-as-the-ai-development-layer">AGENTS.md as the AI Development Layer</a></li>
+<li><a href="#8-the-target-structure">The Target Structure</a></li>
+<li><a href="#9-the-replacement-docs-contract">The Replacement docs-contract</a></li>
+<li><a href="#10-standards-we-should-adopt">Standards We Should Adopt</a></li>
+<li><a href="#11-phased-roadmap">Phased Roadmap</a></li>
+</ol>
+<hr>
+<h2 id="1-the-documentation-philosophy"><a class="header" href="#1-the-documentation-philosophy">1. The Documentation Philosophy</a></h2>
+<p>Documentation problems almost always come from skipping a question that should have been asked before writing the first sentence: <strong>what kind of document is this, and who is it for?</strong></p>
+<p>Without an answer to that question, documentation accumulates as a pile of pages that are all slightly different shapes of the same vague category: “stuff about the project.” Setup guides live next to architecture decisions. User-facing how-tos sit alongside internal coding standards. Thirty language translations of the README compete for space with the single security policy document. Nobody can find anything, everything goes stale at a different rate, and every PR that touches documentation becomes a negotiation about which pages need updating.</p>
+<p>The fix is not to write more documentation. The fix is to decide, before writing anything, what type of artifact you are creating. Type determines format, audience, location, lifecycle, and who is responsible for keeping it current. Once type is established, the rest follows naturally.</p>
+<p>This RFC adopts the <strong>EA Artifacts on a Page</strong> framework by Svyatoslav Kotusev (https://eaonapage.com) as the classification lens for all ZeroClaw documentation. The framework is evidence-based, deliberately non-prescriptive, and maps directly onto the kinds of documents an open source infrastructure project actually needs.</p>
+<p>The core principle, borrowed from the broader development philosophy this team is adopting:</p>
+<blockquote>
+<p><strong>Documents, like code, should trace a line upward through Vision → Architecture → Design → Implementation. If you cannot name the artifact type and its audience before writing, you are not ready to write.</strong></p>
+</blockquote>
+<hr>
+<h2 id="2-honest-assessment-where-we-are-today"><a class="header" href="#2-honest-assessment-where-we-are-today">2. Honest Assessment: Where We Are Today</a></h2>
+<h3 id="21-the-i18n-footprint"><a class="header" href="#21-the-i18n-footprint">2.1 The i18n Footprint</a></h3>
+<p>The most immediately measurable problem in the current documentation is the localization system:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Value</th></tr>
+</thead>
+<tbody>
+<tr><td>Non-English README files at repo root</td><td>31</td></tr>
+<tr><td>Files in <code>docs/i18n/</code></td><td>169</td></tr>
+<tr><td>Disk space consumed by <code>docs/i18n/</code></td><td>2.2 MB</td></tr>
+<tr><td>Actively “supported” locales per <code>docs-contract.md</code></td><td>6 (<code>en</code>, <code>zh-CN</code>, <code>ja</code>, <code>ru</code>, <code>fr</code>, <code>vi</code>)</td></tr>
+<tr><td>Locales with README files at root</td><td>31</td></tr>
+</tbody>
+</table>
+</div>
+<p>The i18n system creates a <strong>contributor tax on every documentation PR</strong>. The current <code>docs-contract.md</code> contains this requirement:</p>
+<blockquote>
+<p><em>If a change touches docs IA, runtime-contract references, or user-facing wording in shared docs, perform i18n follow-through for supported locales in the same PR.</em></p>
+</blockquote>
+<p>This means a contributor fixing a typo in a setup guide must update up to six language versions of that document, or the PR fails review. This is a significant barrier to contribution, particularly for the students and early-career engineers who make up most of this project’s contributor base.</p>
+<h3 id="22-the-structure-problem"><a class="header" href="#22-the-structure-problem">2.2 The Structure Problem</a></h3>
+<p>The current <code>docs/</code> hierarchy mixes three fundamentally different document types at the same level:</p>
+<ul>
+<li><strong>Code-adjacent documents</strong> that must version with the codebase (ADRs, API specs, security policy, contribution process)</li>
+<li><strong>User-facing operational documents</strong> that should update independently of code releases (setup guides, troubleshooting, deployment how-tos)</li>
+<li><strong>Community documents</strong> that should be community-maintained and need no formal review process (translations, FAQ, community guides)</li>
+</ul>
+<p>All three live in <code>docs/</code> with no structural distinction between them. The result is a flat pile with a hand-maintained <code>SUMMARY.md</code> that someone has to update every time anything changes.</p>
+<h3 id="23-the-adr-gap"><a class="header" href="#23-the-adr-gap">2.3 The ADR Gap</a></h3>
+<p>The project has exactly one Architecture Decision Record: <code>ADR-004-tool-shared-state-ownership.md</code>. It is excellent — well-structured, code-referenced, specific. But the project has made at least five or six architectural decisions of equal or greater consequence that have never been recorded:</p>
+<ul>
+<li>The choice of Rust over TypeScript</li>
+<li>The trait-driven extensibility model</li>
+<li>The WASM plugin system design</li>
+<li>The choice of SQLite and Markdown as the two memory backends</li>
+<li>The security model (pairing codes, autonomy levels, sandbox layers)</li>
+</ul>
+<p>Without these records, every new contributor must rediscover the reasoning through code archaeology. Every AI coding assistant that reads the codebase gets the <em>what</em> but not the <em>why</em>. This is one of the most expensive forms of undocumented technical debt.</p>
+<h3 id="24-what-is-already-good"><a class="header" href="#24-what-is-already-good">2.4 What Is Already Good</a></h3>
+<p>The <code>docs-contract.md</code> concept — treating documentation as a governed product surface — is the right instinct. It just needs the right rules. The <code>AGENTS.md</code> at the root is excellent and sets the right precedent for AI-assisted development. ADR-004 proves the team can write high-quality architectural records.</p>
+<hr>
+<h2 id="3-a-classification-framework-ea-artifacts-on-a-page"><a class="header" href="#3-a-classification-framework-ea-artifacts-on-a-page">3. A Classification Framework: EA Artifacts on a Page</a></h2>
+<p>The <strong>EA Artifacts on a Page</strong> framework defines five families of architecture artifacts. Every document in the ZeroClaw repository should belong to one of these families, and that family determines everything about where it lives, how it is formatted, and when it becomes stale.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>EA Artifact Family</th><th>The Question It Answers</th><th>Examples in ZeroClaw</th><th>Location</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Considerations</strong></td><td>What principles and standards guide our decisions?</td><td><code>AGENTS.md</code> files, coding standards, security policy, this doc</td><td><code>docs/book/src/contributing/</code> or per-crate</td></tr>
+<tr><td><strong>Landscapes</strong></td><td>What does the system look like right now?</td><td>Component maps, crate topology, dependency diagrams</td><td><code>docs/book/src/architecture/</code></td></tr>
+<tr><td><strong>Outlines</strong></td><td>Where are we going?</td><td>RFCs and roadmap proposals</td><td>GitHub Issues with <code>type:rfc</code></td></tr>
+<tr><td><strong>Designs</strong></td><td>How exactly are we doing this specific thing?</td><td>ADRs, OpenAPI specs, WIT interface files</td><td><code>docs/book/src/architecture/</code> (ADR section)</td></tr>
+<tr><td><strong>Standards</strong></td><td>What are the specific rules for how we build?</td><td>PR workflow, testing standards, release process</td><td><code>docs/book/src/contributing/</code> and <code>docs/book/src/maintainers/</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>What is notably absent from this table:</strong> user guides, setup instructions, channel-specific how-tos, troubleshooting, FAQ. These are <strong>operational content</strong>, not EA artifacts. They do not version with the code. They belong on the GitHub Wiki.</p>
+<h3 id="using-the-framework"><a class="header" href="#using-the-framework">Using the Framework</a></h3>
+<p>Before writing any document, ask and answer these two questions:</p>
+<ol>
+<li><strong>What artifact family is this?</strong> If you cannot answer this, you are not ready to write.</li>
+<li><strong>Does it need to version with the code?</strong> If yes, it goes in the repository. If no, it goes on the Wiki.</li>
+</ol>
+<p>A useful test for the second question: <em>would this document become wrong or misleading if someone read it against a different version of the codebase?</em> If yes, it lives in the repo, versioned with the code. If no, it lives on the Wiki.</p>
+<hr>
+<h2 id="4-the-i18n-problem"><a class="header" href="#4-the-i18n-problem">4. The i18n Problem</a></h2>
+<h3 id="41-the-argument-for-removal"><a class="header" href="#41-the-argument-for-removal">4.1 The Argument for Removal</a></h3>
+<p>The case for removing all non-English content from the repository rests on four pillars:</p>
+<p><strong>1. The audience has on-demand translation.</strong> ZeroClaw’s primary users are people running an AI assistant. Every such person has access to instant, high-quality machine translation — either through the agent they are running, through their browser, or through any of dozens of free translation services. The practical benefit of shipping translations in the repository is marginal.</p>
+<p><strong>2. The translations are almost certainly stale.</strong> Machine-translated content was likely generated once and has not been kept synchronised with the English source. Stale documentation is worse than no documentation for AI-assisted development, because language models will confidently derive incorrect conclusions from outdated information.</p>
+<p><strong>3. The contributor tax is real and measurable.</strong> The <code>docs-contract.md</code> parity requirement means every documentation PR must touch up to six language versions. This makes documentation contributions expensive and discourages exactly the kind of small, incremental improvements (fixing a typo, clarifying a step, updating a stale reference) that keep documentation healthy.</p>
+<p><strong>4. Localization is community work, not core project work.</strong> The communities best positioned to maintain Japanese documentation are Japanese-speaking contributors. Putting localized content in the main repository with a parity requirement places the burden on the core maintainers instead of the communities who benefit. The GitHub Wiki inverts this correctly: community members can edit and maintain their language’s pages without opening PRs.</p>
+<h3 id="42-what-stays"><a class="header" href="#42-what-stays">4.2 What Stays</a></h3>
+<p>One thing worth preserving: the <em>structure</em> of the i18n approach. The idea of making ZeroClaw accessible in multiple languages is right. Only the <em>location</em> and <em>ownership model</em> is wrong.</p>
+<h3 id="43-the-replacement-strategy"><a class="header" href="#43-the-replacement-strategy">4.3 The Replacement Strategy</a></h3>
+<ol>
+<li>
+<p><strong>Remove</strong> all <code>README.*.md</code> files from the repository root, except <code>README.md</code></p>
+</li>
+<li>
+<p><strong>Remove</strong> <code>docs/i18n/</code> entirely</p>
+</li>
+<li>
+<p><strong>Remove</strong> all non-English hub files from <code>docs/</code> (e.g. <code>docs/README.zh-CN.md</code>)</p>
+</li>
+<li>
+<p><strong>Add</strong> a <code>Languages</code> section to the main <code>README.md</code>:</p>
+<blockquote>
+<p><strong>Translations:</strong> Community-maintained translations are available in the <a href="https://github.com/zeroclaw-labs/zeroclaw/wiki">GitHub Wiki</a>. To contribute a translation or improve an existing one, edit the Wiki directly. All languages are welcome.</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Create</strong> a <code>Translations</code> page on the GitHub Wiki with a table of available languages, their completeness, and the contributors maintaining them</p>
+</li>
+<li>
+<p><strong>Optionally:</strong> add a <code>zeroclaw docs --translate</code> CLI feature that uses the configured LLM provider to translate any doc page on demand — a natural fit for a product whose entire purpose is AI assistance</p>
+</li>
+</ol>
+<h3 id="44-the-agentsmd-impact"><a class="header" href="#44-the-agentsmd-impact">4.4 The AGENTS.md Impact</a></h3>
+<p>Remove the i18n follow-through requirement from <code>docs-contract.md</code>. Replace it with: <em>Documentation PRs are reviewed in English only. Translations are community-maintained on the Wiki and are not subject to PR review.</em></p>
+<hr>
+<h2 id="5-the-repo--wiki-split"><a class="header" href="#5-the-repo--wiki-split">5. The Repo / Wiki Split</a></h2>
+<h3 id="51-the-decision-rule"><a class="header" href="#51-the-decision-rule">5.1 The Decision Rule</a></h3>
+<blockquote>
+<p><strong>A document lives in the repository if it would become wrong when the code changes. It lives on the Wiki if it would not.</strong></p>
+</blockquote>
+<p>This is not a fuzzy rule. Apply it literally.</p>
+<p>An ADR records why a specific architectural decision was made at a specific point in time. If the code changes, the ADR still accurately describes what was decided and when. The code may have evolved away from it, but the record remains accurate. → <strong>Repository.</strong></p>
+<p>A setup guide for configuring the Telegram channel describes steps a user takes against the current version of the software. If the configuration format changes, the guide becomes wrong. → <strong>This sounds like it should be in the repo — but it shouldn’t.</strong> Setup guides should update on their own timeline, not be coupled to code commits. The right model is: the API reference (which maps directly to configuration structs) lives in the repo, and the setup guide that walks a user through using that API lives on the Wiki, updated by anyone when the steps change.</p>
+<h3 id="52-the-split-in-practice"><a class="header" href="#52-the-split-in-practice">5.2 The Split in Practice</a></h3>
+<p><strong>Stays in the repository (<code>docs/book/src/</code>):</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Current location</th><th>Artifact family</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs/book/src/architecture/</code></td><td>Landscapes + Designs</td><td>Component diagrams, ADRs, crate topology</td></tr>
+<tr><td><code>docs/book/src/contributing/</code></td><td>Considerations + Standards</td><td>PR workflow, testing, coding standards</td></tr>
+<tr><td><code>docs/book/src/maintainers/</code></td><td>Considerations + Standards</td><td>Release runbook, reviewer playbook, label policy</td></tr>
+<tr><td><code>docs/book/src/security/</code></td><td>Considerations + Designs</td><td>Security policy, sandboxing design, audit logging</td></tr>
+<tr><td><code>docs/book/src/hardware/</code></td><td>Designs</td><td>Peripheral design docs, datasheets</td></tr>
+<tr><td><code>docs/book/src/reference/config.md</code></td><td>Designs</td><td>Config reference (generated from code)</td></tr>
+<tr><td><code>docs/book/src/reference/cli.md</code></td><td>Designs</td><td>CLI reference (generated from code)</td></tr>
+<tr><td><code>docs/book/src/foundations/</code></td><td>Considerations</td><td>Ratified RFCs that shape everything else</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Moves to the GitHub Wiki (proposed; not yet executed):</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Current location</th><th>Reason for moving</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs/book/src/setup/</code></td><td>User-facing how-tos that change independently of code</td></tr>
+<tr><td><code>docs/book/src/ops/service.md</code></td><td>Operational, user-maintained</td></tr>
+<tr><td><code>docs/book/src/ops/troubleshooting.md</code></td><td>Operational, changes frequently</td></tr>
+<tr><td><code>docs/book/src/ops/network-deployment.md</code></td><td>Operational, deployment-specific</td></tr>
+<tr><td>Per-channel setup pages under <code>docs/book/src/channels/</code></td><td>User-facing, change with upstream platform APIs</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Deleted (i18n removal):</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Item</th><th>Size impact</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs/i18n/</code> (169 files)</td><td>−2.2 MB from repo</td></tr>
+<tr><td>31 × <code>README.*.md</code> at root</td><td>−significant root clutter</td></tr>
+<tr><td>Non-English hub files in <code>docs/</code></td><td>−31 files</td></tr>
+<tr><td>i18n coverage map, i18n index</td><td>−2 files</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="53-the-wiki-structure"><a class="header" href="#53-the-wiki-structure">5.3 The Wiki Structure</a></h3>
+<pre><code>Home
+│
+├── Getting Started
+│     ├── Installation
+│     ├── Quick Start (TL;DR)
+│     ├── Migrating from OpenClaw
+│     └── Onboarding Walkthrough
+│
+├── Configuration
+│     ├── Providers
+│     ├── Channels
+│     ├── Memory
+│     ├── Security &amp; Pairing
+│     └── Tunnels
+│
+├── Channels
+│     ├── Telegram
+│     ├── Discord
+│     ├── Slack
+│     ├── WhatsApp
+│     └── ... (one page per channel)
+│
+├── Operations
+│     ├── Troubleshooting
+│     ├── Deployment
+│     ├── Network Setup
+│     └── Performance Tuning
+│
+├── Hardware
+│     ├── Getting Started with Peripherals
+│     ├── ESP32 Setup
+│     ├── STM32 Nucleo Setup
+│     └── Arduino Setup
+│
+└── Community
+      ├── FAQ
+      ├── Translations
+      └── How to Contribute
+</code></pre>
+<hr>
+<h2 id="6-adr-standards"><a class="header" href="#6-adr-standards">6. ADR Standards</a></h2>
+<h3 id="61-the-format"><a class="header" href="#61-the-format">6.1 The Format</a></h3>
+<p>All Architecture Decision Records use the <strong>Nygard format</strong>, extended with YAML frontmatter for machine readability. ADR-004 is the existing model — this section formalizes it.</p>
+<p>Every ADR has three sections and five frontmatter fields:</p>
+<pre><code>---
+id: ADR-NNN
+title: Short imperative sentence describing the decision
+date: YYYY-MM-DD
+status: proposed | accepted | deprecated | superseded-by-ADR-NNN
+relates-to:
+  - ADR-XXX (optional, list of related decisions)
+  - crates/zeroclaw-api (optional, affected code paths)
+---
+
+# ADR-NNN: Title
+
+## Context
+
+What is the situation, constraint, or problem that required a decision?
+What forces were at play? What options were considered?
+
+## Decision
+
+What was decided? State it in the active voice.
+"We will..." not "It was decided that..."
+
+## Consequences
+
+What are the results of this decision?
+List both positive consequences and negative ones — every decision has tradeoffs.
+Note any follow-up decisions or actions this creates.
+
+## References
+
+Links to the relevant code files, issues, and external resources.
+</code></pre>
+<h3 id="62-adr-lifecycle-rules"><a class="header" href="#62-adr-lifecycle-rules">6.2 ADR Lifecycle Rules</a></h3>
+<ul>
+<li><strong>ADRs are immutable once accepted.</strong> If a decision changes, the old ADR is marked <code>superseded-by-ADR-NNN</code> and a new ADR is written describing the new decision and why it superseded the old one.</li>
+<li><strong>ADRs are numbered sequentially and never renumbered.</strong> Gaps in the sequence are acceptable (a proposed ADR that was rejected can be withdrawn, leaving a gap).</li>
+<li><strong>ADRs live in <code>docs/architecture/decisions/</code>.</strong> They are named <code>ADR-NNN-short-slug.md</code>.</li>
+<li><strong>Significant architectural changes require an ADR.</strong> “Significant” means: a decision that would be surprising to a new contributor, a decision that constrains future choices, or a decision that involves a non-obvious tradeoff.</li>
+</ul>
+<h3 id="63-retroactive-adrs"><a class="header" href="#63-retroactive-adrs">6.3 Retroactive ADRs</a></h3>
+<p>The following key decisions should be documented retroactively. They represent the foundational reasoning a new contributor or AI tool needs to understand the codebase:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Proposed ADR</th><th>Decision to record</th></tr>
+</thead>
+<tbody>
+<tr><td>ADR-001</td><td>Rust as the implementation language (replacing TypeScript/OpenClaw)</td></tr>
+<tr><td>ADR-002</td><td>Trait-driven extensibility as the primary architectural pattern</td></tr>
+<tr><td>ADR-003</td><td>WASM + Extism as the plugin execution model</td></tr>
+<tr><td>ADR-004</td><td>Tool shared state ownership contract <em>(already exists)</em></td></tr>
+<tr><td>ADR-005</td><td>SQLite + Markdown as the two memory backends</td></tr>
+<tr><td>ADR-006</td><td>CLI as the only built-in channel; all others as plugins</td></tr>
+<tr><td>ADR-007</td><td>Gateway extraction as a separate optional binary</td></tr>
+</tbody>
+</table>
+</div>
+<p>Retroactive ADRs should be marked with a note:</p>
+<blockquote>
+<p><em>This is a retroactive record of a decision made prior to the formal ADR process. The date reflects when the decision was made, not when this record was written.</em></p>
+</blockquote>
+<h3 id="64-why-this-matters-for-ai-assisted-development"><a class="header" href="#64-why-this-matters-for-ai-assisted-development">6.4 Why This Matters for AI-Assisted Development</a></h3>
+<p>When an AI coding assistant reads a repository, it sees the code as it is now. It does not see the choices that were rejected, the tradeoffs that were weighed, or the reasons a particular structure was chosen over alternatives. Without ADRs, the AI will suggest changes that violate architectural constraints it has no way of knowing about. With ADRs, the reasoning is explicit and machine-readable. The frontmatter makes ADRs queryable: an AI tool can find all ADRs related to <code>zeroclaw-api</code> and load them as context before editing that crate.</p>
+<hr>
+<h2 id="7-agentsmd-as-the-ai-development-layer"><a class="header" href="#7-agentsmd-as-the-ai-development-layer">7. AGENTS.md as the AI Development Layer</a></h2>
+<h3 id="71-the-pattern"><a class="header" href="#71-the-pattern">7.1 The Pattern</a></h3>
+<p>The root <code>AGENTS.md</code> is the project’s strongest existing contribution to AI-assisted development. It tells AI coding assistants the commands to run, the architecture to respect, the risk tiers to apply, and the anti-patterns to avoid. It works because it is specific, opinionated, and short.</p>
+<p>As the workspace decomposes into crates (per the microkernel architecture RFC), each crate should have its own <code>AGENTS.md</code>. This is the mechanism by which architectural boundaries become enforceable at the AI-assistance layer — not just at compile time through crate dependencies, but at the reasoning layer before any code is written.</p>
+<h3 id="72-what-each-crate-agentsmd-contains"><a class="header" href="#72-what-each-crate-agentsmd-contains">7.2 What Each Crate AGENTS.md Contains</a></h3>
+<p>Keep them short. An <code>AGENTS.md</code> that is longer than 60 lines will not be read. Each file answers five questions:</p>
+<pre><code class="language-markdown"># &lt;crate-name&gt;
+
+## What this crate is
+One or two sentences. What problem does this crate solve?
+
+## What this crate is allowed to depend on
+List the crates this crate may import. Be explicit.
+If a dependency is not listed here, do not add it without an ADR.
+
+## Extension points
+Where can new implementations be added? What trait do they implement?
+Link to the relevant traits.
+
+## What does NOT belong here
+Explicit anti-patterns. What would be a mistake to add to this crate?
+
+## Related ADRs
+- ADR-NNN: Short title
+</code></pre>
+<h3 id="73-examples"><a class="header" href="#73-examples">7.3 Examples</a></h3>
+<p><strong>For <code>crates/zeroclaw-api</code> (once extracted):</strong></p>
+<pre><code class="language-markdown"># zeroclaw-api
+
+## What this crate is
+Trait definitions and shared data types for the ZeroClaw plugin and kernel
+interfaces. This is the contract layer. Everything else depends on it.
+
+## What this crate is allowed to depend on
+- serde, serde_json (serialization)
+- async-trait (async trait support)
+- anyhow (error types)
+- tokio (async runtime types, minimal)
+Nothing else. No HTTP clients. No database drivers. No external services.
+
+## Extension points
+All traits in this crate are extension points:
+- `Provider` (src/providers/traits.rs) — LLM provider implementations
+- `Channel` (src/channels/traits.rs) — messaging platform integrations
+- `Tool` (src/tools/traits.rs) — agent tool implementations
+- `Memory` (src/memory/traits.rs) — persistence backends
+- `Observer` (src/observability/traits.rs) — observability backends
+- `RuntimeAdapter` (src/runtime/traits.rs) — execution environments
+- `Peripheral` (src/peripherals/traits.rs) — hardware integrations
+
+## What does NOT belong here
+- Any concrete implementation of any trait
+- Any dependency on a specific messaging platform, LLM provider, or database
+- Any network I/O or filesystem access
+- Any binary or executable target
+
+## Related ADRs
+- ADR-002: Trait-driven extensibility
+</code></pre>
+<p><strong>For <code>crates/zeroclaw-kernel</code> (once extracted):</strong></p>
+<pre><code class="language-markdown"># zeroclaw-kernel
+
+## What this crate is
+The orchestration engine. Runs the agent loop, manages the service registry,
+exposes the local IPC API. The kernel knows nothing about specific channels,
+providers, or tools — only their abstract interfaces.
+
+## What this crate is allowed to depend on
+- zeroclaw-api (traits only)
+- zeroclaw-tool-call-parser (parsing, no agent state)
+- Standard async/runtime crates (tokio, anyhow, tracing)
+- Config and storage crates (toml, serde, rusqlite for core memory)
+NOT: any specific channel, provider, or tool implementation crate.
+
+## Extension points
+- `Registry::register_channel()` — add a channel at startup
+- `Registry::register_tool()` — add a tool at startup
+- `Registry::set_provider()` — set the active provider at startup
+Implementations are registered by the binary crate, not by the kernel.
+
+## What does NOT belong here
+- Any import of TelegramChannel, DiscordChannel, or any named channel
+- Any import of AnthropicProvider, OpenAIProvider, or any named provider
+- Any tool implementation beyond the 10-12 designated core tools
+- The gateway HTTP server or any web serving code
+
+## Related ADRs
+- ADR-002: Trait-driven extensibility
+- ADR-006: CLI as the only built-in channel
+- ADR-007: Gateway extraction
+</code></pre>
+<h3 id="74-the-agentsmd-hierarchy"><a class="header" href="#74-the-agentsmd-hierarchy">7.4 The AGENTS.md Hierarchy</a></h3>
+<p>The root <code>AGENTS.md</code> sets project-wide policy. Crate-level <code>AGENTS.md</code> files narrow that policy for their specific scope. When an AI tool reads a file in <code>crates/zeroclaw-api/</code>, it should read both the root <code>AGENTS.md</code> (project policy) and <code>crates/zeroclaw-api/AGENTS.md</code> (crate policy). Crate policy is more specific and takes precedence where they conflict.</p>
+<hr>
+<h2 id="8-the-target-structure"><a class="header" href="#8-the-target-structure">8. The Target Structure</a></h2>
+<p>After the changes proposed in this RFC, the repository’s documentation layout becomes:</p>
+<pre><code>docs/
+│
+├── README.md                    ← Hub: links to wiki for user guides,
+│                                  to proposals/ for roadmap, to
+│                                  architecture/ for decisions
+├── SUMMARY.md                   ← Canonical TOC (English only, repo docs only)
+│
+├── architecture/
+│   ├── README.md                ← Overview: what decisions have been made,
+│   │                              current system landscape
+│   ├── decisions/               ← ADRs (immutable once accepted)
+│   │   ├── ADR-001-rust-first.md
+│   │   ├── ADR-002-trait-driven-extensibility.md
+│   │   ├── ADR-003-wasm-plugin-model.md
+│   │   ├── ADR-004-tool-shared-state-ownership.md  (already exists)
+│   │   ├── ADR-005-memory-backends.md
+│   │   ├── ADR-006-cli-only-built-in-channel.md
+│   │   └── ADR-007-gateway-extraction.md
+│   └── diagrams/
+│       ├── component-map.md     ← Mermaid: crate topology
+│       └── data-flow.md         ← Mermaid: message lifecycle
+│
+├── proposals/                   ← RFCs (living until accepted/rejected)
+│   ├── microkernel-architecture.md    (already exists)
+│   └── documentation-standards.md    (this document)
+│
+├── contributing/
+│   ├── README.md
+│   ├── docs-contract.md         ← Replaced (see Section 9)
+│   ├── pr-workflow.md
+│   ├── reviewer-playbook.md
+│   ├── ci-map.md
+│   ├── actions-source-policy.md
+│   ├── testing.md
+│   ├── extension-examples.md
+│   ├── change-playbooks.md
+│   └── pr-discipline.md
+│
+├── reference/
+│   ├── README.md
+│   ├── api/
+│   │   ├── config-reference.md
+│   │   ├── providers-reference.md
+│   │   └── channels-reference.md
+│   └── cli/
+│       └── commands-reference.md
+│
+├── security/
+│   ├── README.md
+│   ├── agnostic-security.md
+│   ├── frictionless-security.md
+│   ├── sandboxing.md
+│   ├── audit-logging.md
+│   └── security-roadmap.md
+│
+└── hardware/
+    ├── README.md
+    ├── hardware-peripherals-design.md
+    ├── adding-boards-and-tools.md
+    └── datasheets/
+        ├── nucleo-f401re.md
+        ├── arduino-uno.md
+        └── esp32.md
+</code></pre>
+<p><strong>Deleted from current structure:</strong></p>
+<pre><code>docs/i18n/                       ← 169 files, 2.2 MB — removed entirely
+docs/maintainers/                ← project snapshots and i18n coverage maps
+                                   moved to Wiki (operational, not code-adjacent)
+docs/setup-guides/               ← moved to Wiki
+docs/ops/                        ← moved to Wiki
+README.ar.md (and 30 others)     ← removed from repo root
+docs/README.ar.md (and 30 others)← removed
+</code></pre>
+<p>The root of the repository becomes clean:</p>
+<pre><code>README.md
+AGENTS.md
+CHANGELOG.md
+CLAUDE.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+SECURITY.md
+LICENSE-APACHE
+LICENSE-MIT
+NOTICE
+Cargo.toml
+Cargo.lock
+... (build and config files)
+</code></pre>
+<p>No language variants. No duplicated READMEs. One authoritative English README that links to the Wiki for user guides and the docs/ tree for technical reference.</p>
+<hr>
+<h2 id="9-the-replacement-docs-contract"><a class="header" href="#9-the-replacement-docs-contract">9. The Replacement docs-contract</a></h2>
+<p>The legacy <code>docs/contributing/docs-contract.md</code> encoded an i18n parity requirement and a directory structure that this RFC supersedes. It has been removed; this section is its replacement.</p>
+<p>The replacement governs three things: artifact classification, the repo/wiki split, and ADR governance. It says nothing about i18n — locale parity is now handled by the <a href="../maintainers/docs-and-translations.html">Maintainers → Docs &amp; Translations</a> page.</p>
+<p><strong>Replacement docs-contract:</strong></p>
+<pre><code class="language-markdown"># Documentation Contract
+
+## Document Classification
+
+Every document in `docs/` belongs to one artifact family:
+
+- **Considerations** — principles and standards that guide decisions
+- **Landscapes** — descriptions of the current system state
+- **Outlines** — proposals and roadmaps for future work
+- **Designs** — ADRs, API specs, and detailed technical decisions
+- **Standards** — specific rules for how we build and operate
+
+If you cannot name the family before writing, do not write yet.
+
+## The Repo / Wiki Rule
+
+A document lives in the repository if it would become wrong when the
+code changes. It lives on the Wiki if it would not.
+
+Reference documentation (config reference, CLI reference) lives in the
+repository because it maps directly to code structures.
+
+User guides, setup instructions, and operational how-tos live on the Wiki
+because they update on their own timeline.
+
+## ADR Governance
+
+See docs/architecture/decisions/ for the ADR format and lifecycle rules.
+
+Major architectural changes require an ADR before implementation begins,
+not after.
+
+## Language
+
+All documents in this repository are written in English.
+Community-maintained translations live on the GitHub Wiki.
+Documentation PRs are reviewed in English only.
+
+## Freshness
+
+Documents should be updated in the same PR as the code change that makes
+them stale. A PR that changes a configuration format must update the
+config reference. A PR that adds a new command must update the CLI reference.
+
+Proposals in docs/proposals/ are exempt — they describe intent and may
+precede implementation by multiple releases.
+</code></pre>
+<hr>
+<h2 id="10-standards-we-should-adopt"><a class="header" href="#10-standards-we-should-adopt">10. Standards We Should Adopt</a></h2>
+<p>These documentation-specific standards complement the broader standards proposed in the architecture RFC.</p>
+<h3 id="diátaxis-framework-documentation-structure"><a class="header" href="#diátaxis-framework-documentation-structure">Diátaxis Framework (Documentation Structure)</a></h3>
+<p><strong>What it is:</strong> Diátaxis (https://diataxis.fr) is a systematic framework for technical documentation that divides content into four types: tutorials, how-to guides, reference, and explanation. It is the documentation framework behind the Python documentation, Django docs, and many others. It is highly compatible with the EA Artifacts approach — they answer different questions (Diátaxis: how to structure the content of a document; EA Artifacts: what type of document is this and where does it live).</p>
+<p><strong>How it applies:</strong> User-facing documentation on the Wiki should follow Diátaxis structure. Code-adjacent documentation in the repository follows EA Artifacts. The two frameworks operate at different levels and do not conflict.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Diátaxis Type</th><th>Purpose</th><th>Example in ZeroClaw</th><th>Location</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Tutorial</strong></td><td>Learning-oriented, leads through an experience</td><td>“Build your first tool plugin”</td><td>Wiki</td></tr>
+<tr><td><strong>How-to Guide</strong></td><td>Goal-oriented, solves a specific problem</td><td>“Set up Telegram integration”</td><td>Wiki</td></tr>
+<tr><td><strong>Reference</strong></td><td>Information-oriented, describes the machinery</td><td>Config reference, CLI reference</td><td>Repo</td></tr>
+<tr><td><strong>Explanation</strong></td><td>Understanding-oriented, explains why</td><td>ADRs, architecture docs</td><td>Repo</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="markdown-frontmatter-for-machine-readability"><a class="header" href="#markdown-frontmatter-for-machine-readability">Markdown Frontmatter for Machine Readability</a></h3>
+<p>All documents in <code>docs/</code> should include YAML frontmatter. This makes them queryable by AI tools, CI checks, and future tooling:</p>
+<pre><code class="language-yaml">---
+type: adr | proposal | reference | contributing | security | hardware
+status: draft | proposed | accepted | deprecated | superseded
+last-reviewed: YYYY-MM-DD
+relates-to:
+  - ADR-NNN
+  - crates/zeroclaw-api
+---
+</code></pre>
+<p>A CI check should verify that all documents in <code>docs/</code> have valid frontmatter. This prevents documents from being written without first declaring their type and status — enforcing the classification discipline at the tooling level.</p>
+<h3 id="commonmark--github-flavored-markdown"><a class="header" href="#commonmark--github-flavored-markdown">CommonMark + GitHub Flavored Markdown</a></h3>
+<p>All documentation uses CommonMark (the standardized Markdown specification) with GitHub Flavored Markdown extensions (tables, task lists, fenced code blocks, Mermaid diagrams). No custom extensions, no MDX, no ReStructuredText. Mermaid diagrams are preferred over image files for architecture diagrams because they version cleanly with the code.</p>
+<h3 id="vale-for-prose-linting"><a class="header" href="#vale-for-prose-linting">Vale for Prose Linting</a></h3>
+<p><strong>What it is:</strong> Vale (https://vale.sh) is a prose linter — it checks writing style, consistency, and readability using configurable rules. It can enforce things like: always use “you” not “the user”, avoid passive voice in imperative sections, use consistent terminology (“plugin” not “extension” not “module”).</p>
+<p><strong>Why it matters:</strong> The current documentation is inconsistent in tone, terminology, and style. Some pages say “plugin”, some say “module”, some say “extension”. Vale makes these rules automatic and enforces them at CI time, the same way Clippy enforces code quality.</p>
+<hr>
+<h2 id="11-phased-roadmap"><a class="header" href="#11-phased-roadmap">11. Phased Roadmap</a></h2>
+<p>The documentation migration follows the same Strangler Fig pattern as the architecture migration: incremental, always in a working state, no big-bang rewrites.</p>
+<hr>
+<h3 id="phase-1--v070--clean-the-root"><a class="header" href="#phase-1--v070--clean-the-root">Phase 1 · v0.7.0 — “Clean the Root”</a></h3>
+<p><strong>Deliverables:</strong></p>
+<ul>
+<li><input disabled="" type="checkbox"> Remove all <code>README.*.md</code> files from the repo root (keep only <code>README.md</code>)</li>
+<li><input disabled="" type="checkbox"> Remove <code>docs/i18n/</code> entirely</li>
+<li><input disabled="" type="checkbox"> Remove all non-English hub files from <code>docs/</code></li>
+<li><input disabled="" type="checkbox"> Add the <code>Languages</code> section to <code>README.md</code> with Wiki link</li>
+<li><input disabled="" type="checkbox"> Create the GitHub Wiki with the structural skeleton (Home + top-level pages, content stubs)</li>
+<li><input disabled="" type="checkbox"> Remove the i18n parity requirement from <code>docs-contract.md</code></li>
+<li><input disabled="" type="checkbox"> Add YAML frontmatter to all existing <code>docs/</code> files</li>
+<li><input disabled="" type="checkbox"> Create <code>docs/architecture/decisions/</code> directory and move ADR-004 into it as <code>ADR-004-tool-shared-state-ownership.md</code></li>
+</ul>
+<p><strong>Success metrics:</strong></p>
+<ul>
+<li>Repo root contains exactly one README file</li>
+<li><code>docs/i18n/</code> does not exist</li>
+<li>All <code>docs/</code> files have valid YAML frontmatter (CI-enforced)</li>
+<li>GitHub Wiki is live and publicly linked from README</li>
+</ul>
+<hr>
+<h3 id="phase-2--v070v080--write-the-missing-adrs"><a class="header" href="#phase-2--v070v080--write-the-missing-adrs">Phase 2 · v0.7.0–v0.8.0 — “Write the Missing ADRs”</a></h3>
+<p><strong>Deliverables:</strong></p>
+<ul>
+<li><input disabled="" type="checkbox"> Write ADR-001 through ADR-003 and ADR-005 through ADR-007 (retroactive, see Section 6.3)</li>
+<li><input disabled="" type="checkbox"> Add a Vale configuration (<code>.vale.ini</code> + style rules) and CI check</li>
+<li><input disabled="" type="checkbox"> Replace <code>docs-contract.md</code> in full with the version specified in Section 9</li>
+<li><input disabled="" type="checkbox"> Migrate <code>docs/setup-guides/</code> content to the GitHub Wiki</li>
+<li><input disabled="" type="checkbox"> Migrate <code>docs/ops/</code> content to the GitHub Wiki</li>
+<li><input disabled="" type="checkbox"> Update <code>SUMMARY.md</code> to reflect the new structure (repo-only content)</li>
+<li><input disabled="" type="checkbox"> Write root-level <code>AGENTS.md</code> for <code>crates/zeroclaw-api</code> (in anticipation of extraction)</li>
+</ul>
+<p><strong>Success metrics:</strong></p>
+<ul>
+<li>ADR-001 through ADR-007 exist and are accepted</li>
+<li>Vale CI check passes on all docs</li>
+<li>Wiki has complete content for all migrated sections</li>
+<li>No dead links in <code>docs/</code></li>
+</ul>
+<hr>
+<h3 id="phase-3--v080v090--the-ai-layer"><a class="header" href="#phase-3--v080v090--the-ai-layer">Phase 3 · v0.8.0–v0.9.0 — “The AI Layer”</a></h3>
+<p><strong>Deliverables:</strong></p>
+<ul>
+<li><input disabled="" type="checkbox"> Write <code>AGENTS.md</code> for each new crate as the workspace decomposes (per architecture RFC phases)</li>
+<li><input disabled="" type="checkbox"> Write <code>docs/architecture/diagrams/component-map.md</code> (Mermaid, reflects target crate topology)</li>
+<li><input disabled="" type="checkbox"> Write <code>docs/architecture/diagrams/data-flow.md</code> (Mermaid, message lifecycle)</li>
+<li><input disabled="" type="checkbox"> Write the plugin SDK documentation in <code>docs/book/src/developing/plugin-sdk.md</code></li>
+<li><input disabled="" type="checkbox"> Write the WIT interface documentation alongside the <code>wit/</code> files (generated from WIT + hand-written explanation)</li>
+<li><input disabled="" type="checkbox"> Update the OpenAPI spec documentation as the kernel IPC API stabilizes</li>
+</ul>
+<p><strong>Success metrics:</strong></p>
+<ul>
+<li>Every crate in the workspace has an <code>AGENTS.md</code></li>
+<li>Architecture diagrams are Mermaid (no binary image files in docs/)</li>
+<li>Plugin SDK documentation is sufficient for an external contributor to write a working tool plugin</li>
+</ul>
+<hr>
+<h3 id="phase-4--v100--the-stable-platform"><a class="header" href="#phase-4--v100--the-stable-platform">Phase 4 · v1.0.0 — “The Stable Platform”</a></h3>
+<p><strong>Deliverables:</strong></p>
+<ul>
+<li><input disabled="" type="checkbox"> Mark ADR-001 through ADR-007 as <code>accepted</code> (not <code>proposed</code>) once the corresponding code is shipped</li>
+<li><input disabled="" type="checkbox"> Version the kernel IPC API documentation at <code>v1</code> with a stability guarantee</li>
+<li><input disabled="" type="checkbox"> Write the Plugin Registry governance document (who controls the registry, how plugins are reviewed, how compromised plugins are revoked)</li>
+<li><input disabled="" type="checkbox"> Publish the plugin SDK as a standalone document site (from <code>docs/book/src/developing/plugin-sdk.md</code>)</li>
+<li><input disabled="" type="checkbox"> Establish the Wiki translation coordinator role (a community member who maintains the Translations page and coordinates volunteer translators)</li>
+</ul>
+<p><strong>Success metrics:</strong></p>
+<ul>
+<li>All foundational ADRs are accepted</li>
+<li>Plugin SDK is complete and externally linked from the README</li>
+<li>Wiki has active community-maintained translations in at least two languages</li>
+<li>Documentation CI (frontmatter check + Vale) passes on every PR</li>
+</ul>
+<hr>
+<h2 id="appendix-a-glossary"><a class="header" href="#appendix-a-glossary">Appendix A: Glossary</a></h2>
+<p><strong>ADR (Architecture Decision Record)</strong> — An immutable record of a significant architectural decision: the context that prompted it, what was decided, and the consequences. ADRs do not change once accepted; superseded decisions are recorded as new ADRs.</p>
+<p><strong>Diátaxis</strong> — A systematic framework for technical documentation structure that divides content into tutorials (learning), how-to guides (goal-oriented), reference (information), and explanation (understanding). See https://diataxis.fr.</p>
+<p><strong>EA Artifacts on a Page</strong> — A classification framework for enterprise architecture documents developed by Svyatoslav Kotusev. Classifies artifacts into five families: Considerations, Landscapes, Outlines, Designs, and Standards. See https://eaonapage.com.</p>
+<p><strong>Frontmatter</strong> — YAML metadata at the top of a Markdown file, delimited by <code>---</code>. Makes documents machine-readable and queryable by tools, CI checks, and AI assistants.</p>
+<p><strong>Nygard Format</strong> — The ADR format introduced by Michael Nygard: three sections (Context, Decision, Consequences) that capture the essential reasoning without unnecessary ceremony.</p>
+<p><strong>Strangler Fig Pattern</strong> — A migration strategy in which new structure is built incrementally around the old, replacing it piece by piece rather than all at once. The system remains functional throughout the migration.</p>
+<p><strong>Vale</strong> — A prose linter for technical documentation. Enforces style, consistency, and readability rules at CI time, the way Clippy enforces Rust code quality. See https://vale.sh.</p>
+<hr>
+<h2 id="appendix-b-further-reading"><a class="header" href="#appendix-b-further-reading">Appendix B: Further Reading</a></h2>
+<ul>
+<li><strong>Diátaxis documentation framework</strong> — https://diataxis.fr — The definitive reference for structuring technical documentation by type.</li>
+<li><strong>EA Artifacts on a Page (v2.2)</strong> — https://eaonapage.com — The classification framework used in Section 3.</li>
+<li><strong>“Docs for Developers”</strong> — Jared Bhatti et al. — A practical guide to technical documentation written by engineers who have maintained large documentation systems.</li>
+<li><strong>Vale documentation</strong> — https://vale.sh/docs — Setup guide and configuration reference for the prose linter proposed in Section 10.</li>
+<li><strong>Michael Nygard on ADRs</strong> — https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions — The original post that introduced the ADR format used in Section 6.</li>
+<li><strong>GitHub Wikis documentation</strong> — https://docs.github.com/en/communities/documenting-your-project-with-wikis — Reference for setting up and governing the GitHub Wiki proposed in Section 5.</li>
+</ul>
+<hr>
+<p><em>This proposal was developed from direct analysis of the ZeroClaw documentation system at v0.6.8. The metrics cited (169 i18n files, 2.2 MB, 31 language README variants) are based on direct measurement. The recommendations reflect established practices in technical documentation for open source infrastructure projects, adapted to the specific constraints and goals of ZeroClaw.</em></p>
+<p><em>Feedback, corrections, and counterproposals are welcome. Good documentation is a community effort, and the best structure is the one the team will actually maintain.</em></p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-001-intentional-architecture.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-003-governance.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-001-intentional-architecture.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-003-governance.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

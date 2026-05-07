@@ -1,0 +1,342 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Core channel trait — implement for any messaging platform"><title>Channel in zeroclaw_api::channel - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-b7b9f40b.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="zeroclaw_api" data-themes="" data-resource-suffix="" data-rustdoc-version="1.95.0 (59807616e 2026-04-14)" data-channel="1.95.0" data-search-js="search-63369b7b.js" data-stringdex-js="stringdex-b897f86f.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc trait"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Channel</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../zeroclaw_api/index.html">zeroclaw_<wbr>api</a><span class="version">0.7.5</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Channel</a></h2><h3><a href="#required-methods">Required Methods</a></h3><ul class="block"><li><a href="#tymethod.listen" title="listen">listen</a></li><li><a href="#tymethod.name" title="name">name</a></li><li><a href="#tymethod.send" title="send">send</a></li></ul><h3><a href="#provided-methods">Provided Methods</a></h3><ul class="block"><li><a href="#method.add_reaction" title="add_reaction">add_reaction</a></li><li><a href="#method.cancel_draft" title="cancel_draft">cancel_draft</a></li><li><a href="#method.finalize_draft" title="finalize_draft">finalize_draft</a></li><li><a href="#method.health_check" title="health_check">health_check</a></li><li><a href="#method.multi_message_delay_ms" title="multi_message_delay_ms">multi_message_delay_ms</a></li><li><a href="#method.pin_message" title="pin_message">pin_message</a></li><li><a href="#method.redact_message" title="redact_message">redact_message</a></li><li><a href="#method.remove_reaction" title="remove_reaction">remove_reaction</a></li><li><a href="#method.request_approval" title="request_approval">request_approval</a></li><li><a href="#method.request_choice" title="request_choice">request_choice</a></li><li><a href="#method.send_draft" title="send_draft">send_draft</a></li><li><a href="#method.start_typing" title="start_typing">start_typing</a></li><li><a href="#method.stop_typing" title="stop_typing">stop_typing</a></li><li><a href="#method.supports_draft_updates" title="supports_draft_updates">supports_draft_updates</a></li><li><a href="#method.supports_free_form_ask" title="supports_free_form_ask">supports_free_form_ask</a></li><li><a href="#method.supports_multi_message_streaming" title="supports_multi_message_streaming">supports_multi_message_streaming</a></li><li><a href="#method.unpin_message" title="unpin_message">unpin_message</a></li><li><a href="#method.update_draft" title="update_draft">update_draft</a></li><li><a href="#method.update_draft_progress" title="update_draft_progress">update_draft_progress</a></li></ul><h3><a href="#implementors">Implementors</a></h3></section><div id="rustdoc-modnav"><h2><a href="index.html">In zeroclaw_<wbr>api::<wbr>channel</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">zeroclaw_api</a>::<wbr><a href="index.html">channel</a></div><h1>Trait <span class="trait">Channel</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/zeroclaw_api/channel.rs.html#117-287">Source</a> </span></div><pre class="rust item-decl"><code>pub trait Channel: <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Sync.html" title="trait core::marker::Sync">Sync</a> {
+<details class="toggle type-contents-toggle"><summary class="hideme"><span>Show 22 methods</span></summary>    // Required methods
+    fn <a href="#tymethod.name" class="fn">name</a>(&amp;self) -&gt; &amp;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.send" class="fn">send</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        message: &amp;'life1 <a class="struct" href="struct.SendMessage.html" title="struct zeroclaw_api::channel::SendMessage">SendMessage</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait</span>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.listen" class="fn">listen</a>&lt;'life0, 'async_trait&gt;(
+        &amp;'life0 self,
+        tx: Sender&lt;<a class="struct" href="struct.ChannelMessage.html" title="struct zeroclaw_api::channel::ChannelMessage">ChannelMessage</a>&gt;,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait</span>;
+
+    // Provided methods
+    fn <a href="#method.health_check" class="fn">health_check</a>&lt;'life0, 'async_trait&gt;(
+        &amp;'life0 self,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.bool.html">bool</a>&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.start_typing" class="fn">start_typing</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        _recipient: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.stop_typing" class="fn">stop_typing</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        _recipient: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.supports_draft_updates" class="fn">supports_draft_updates</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.bool.html">bool</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.supports_multi_message_streaming" class="fn">supports_multi_message_streaming</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.bool.html">bool</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.multi_message_delay_ms" class="fn">multi_message_delay_ms</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.u64.html">u64</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.send_draft" class="fn">send_draft</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        _message: &amp;'life1 <a class="struct" href="struct.SendMessage.html" title="struct zeroclaw_api::channel::SendMessage">SendMessage</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.95.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.update_draft" class="fn">update_draft</a>&lt;'life0, 'life1, 'life2, 'life3, 'async_trait&gt;(
+        &amp;'life0 self,
+        _recipient: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _text: &amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             'life3: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.update_draft_progress" class="fn">update_draft_progress</a>&lt;'life0, 'life1, 'life2, 'life3, 'async_trait&gt;(
+        &amp;'life0 self,
+        _recipient: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _text: &amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             'life3: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.finalize_draft" class="fn">finalize_draft</a>&lt;'life0, 'life1, 'life2, 'life3, 'async_trait&gt;(
+        &amp;'life0 self,
+        _recipient: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _text: &amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             'life3: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.cancel_draft" class="fn">cancel_draft</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        _recipient: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.add_reaction" class="fn">add_reaction</a>&lt;'life0, 'life1, 'life2, 'life3, 'async_trait&gt;(
+        &amp;'life0 self,
+        _channel_id: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _emoji: &amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             'life3: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.remove_reaction" class="fn">remove_reaction</a>&lt;'life0, 'life1, 'life2, 'life3, 'async_trait&gt;(
+        &amp;'life0 self,
+        _channel_id: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _emoji: &amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             'life3: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.pin_message" class="fn">pin_message</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        _channel_id: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.unpin_message" class="fn">unpin_message</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        _channel_id: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.redact_message" class="fn">redact_message</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        _channel_id: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _reason: <a class="enum" href="https://doc.rust-lang.org/1.95.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.request_approval" class="fn">request_approval</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        _recipient: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _request: &amp;'life2 <a class="struct" href="struct.ChannelApprovalRequest.html" title="struct zeroclaw_api::channel::ChannelApprovalRequest">ChannelApprovalRequest</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.95.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="enum" href="enum.ChannelApprovalResponse.html" title="enum zeroclaw_api::channel::ChannelApprovalResponse">ChannelApprovalResponse</a>&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.request_choice" class="fn">request_choice</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        _question: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        _choices: &amp;'life2 [<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>],
+        _timeout: <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/time/struct.Duration.html" title="struct core::time::Duration">Duration</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.95.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.supports_free_form_ask" class="fn">supports_free_form_ask</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.bool.html">bool</a> { ... }
+</details>}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Core channel trait — implement for any messaging platform</p>
+</div></details><h2 id="required-methods" class="section-header">Required Methods<a href="#required-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="tymethod.name" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#119">Source</a><h4 class="code-header">fn <a href="#tymethod.name" class="fn">name</a>(&amp;self) -&gt; &amp;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a></h4></section></summary><div class="docblock"><p>Human-readable channel name</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.send" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#122">Source</a><h4 class="code-header">fn <a href="#tymethod.send" class="fn">send</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    message: &amp;'life1 <a class="struct" href="struct.SendMessage.html" title="struct zeroclaw_api::channel::SendMessage">SendMessage</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Send a message through this channel</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.listen" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#125">Source</a><h4 class="code-header">fn <a href="#tymethod.listen" class="fn">listen</a>&lt;'life0, 'async_trait&gt;(
+    &amp;'life0 self,
+    tx: Sender&lt;<a class="struct" href="struct.ChannelMessage.html" title="struct zeroclaw_api::channel::ChannelMessage">ChannelMessage</a>&gt;,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Start listening for incoming messages (long-running)</p>
+</div></details></div><h2 id="provided-methods" class="section-header">Provided Methods<a href="#provided-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="method.health_check" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#128-130">Source</a><h4 class="code-header">fn <a href="#method.health_check" class="fn">health_check</a>&lt;'life0, 'async_trait&gt;(
+    &amp;'life0 self,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.bool.html">bool</a>&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Check if channel is healthy</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.start_typing" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#133-135">Source</a><h4 class="code-header">fn <a href="#method.start_typing" class="fn">start_typing</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    _recipient: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Signal that the bot is processing a response (e.g. “typing” indicator).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.stop_typing" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#138-140">Source</a><h4 class="code-header">fn <a href="#method.stop_typing" class="fn">stop_typing</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    _recipient: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Stop any active typing indicator.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.supports_draft_updates" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#143-145">Source</a><h4 class="code-header">fn <a href="#method.supports_draft_updates" class="fn">supports_draft_updates</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether this channel supports progressive message updates via draft edits.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.supports_multi_message_streaming" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#148-150">Source</a><h4 class="code-header">fn <a href="#method.supports_multi_message_streaming" class="fn">supports_multi_message_streaming</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether this channel supports multi-message streaming delivery.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.multi_message_delay_ms" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#153-155">Source</a><h4 class="code-header">fn <a href="#method.multi_message_delay_ms" class="fn">multi_message_delay_ms</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.u64.html">u64</a></h4></section></summary><div class="docblock"><p>Minimum delay (ms) between sending each paragraph in multi-message mode.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.send_draft" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#158-160">Source</a><h4 class="code-header">fn <a href="#method.send_draft" class="fn">send_draft</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    _message: &amp;'life1 <a class="struct" href="struct.SendMessage.html" title="struct zeroclaw_api::channel::SendMessage">SendMessage</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.95.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Send an initial draft message. Returns a platform-specific message ID for later edits.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.update_draft" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#163-170">Source</a><h4 class="code-header">fn <a href="#method.update_draft" class="fn">update_draft</a>&lt;'life0, 'life1, 'life2, 'life3, 'async_trait&gt;(
+    &amp;'life0 self,
+    _recipient: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _text: &amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    'life3: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Update a previously sent draft message with new accumulated content.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.update_draft_progress" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#173-180">Source</a><h4 class="code-header">fn <a href="#method.update_draft_progress" class="fn">update_draft_progress</a>&lt;'life0, 'life1, 'life2, 'life3, 'async_trait&gt;(
+    &amp;'life0 self,
+    _recipient: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _text: &amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    'life3: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Show a progress/status update (e.g. tool execution status).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.finalize_draft" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#183-190">Source</a><h4 class="code-header">fn <a href="#method.finalize_draft" class="fn">finalize_draft</a>&lt;'life0, 'life1, 'life2, 'life3, 'async_trait&gt;(
+    &amp;'life0 self,
+    _recipient: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _text: &amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    'life3: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Finalize a draft with the complete response (e.g. apply Markdown formatting).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.cancel_draft" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#193-195">Source</a><h4 class="code-header">fn <a href="#method.cancel_draft" class="fn">cancel_draft</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    _recipient: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Cancel and remove a previously sent draft message if the channel supports it.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.add_reaction" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#198-205">Source</a><h4 class="code-header">fn <a href="#method.add_reaction" class="fn">add_reaction</a>&lt;'life0, 'life1, 'life2, 'life3, 'async_trait&gt;(
+    &amp;'life0 self,
+    _channel_id: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _emoji: &amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    'life3: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Add a reaction (emoji) to a message.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.remove_reaction" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#208-215">Source</a><h4 class="code-header">fn <a href="#method.remove_reaction" class="fn">remove_reaction</a>&lt;'life0, 'life1, 'life2, 'life3, 'async_trait&gt;(
+    &amp;'life0 self,
+    _channel_id: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _emoji: &amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    'life3: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Remove a reaction (emoji) from a message previously added by this bot.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.pin_message" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#218-220">Source</a><h4 class="code-header">fn <a href="#method.pin_message" class="fn">pin_message</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    _channel_id: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Pin a message in the channel.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.unpin_message" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#223-225">Source</a><h4 class="code-header">fn <a href="#method.unpin_message" class="fn">unpin_message</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    _channel_id: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Unpin a previously pinned message.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.redact_message" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#228-235">Source</a><h4 class="code-header">fn <a href="#method.redact_message" class="fn">redact_message</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    _channel_id: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _message_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _reason: <a class="enum" href="https://doc.rust-lang.org/1.95.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.unit.html">()</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Redact (delete) a message from the channel.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.request_approval" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#252-258">Source</a><h4 class="code-header">fn <a href="#method.request_approval" class="fn">request_approval</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    _recipient: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _request: &amp;'life2 <a class="struct" href="struct.ChannelApprovalRequest.html" title="struct zeroclaw_api::channel::ChannelApprovalRequest">ChannelApprovalRequest</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.95.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="enum" href="enum.ChannelApprovalResponse.html" title="enum zeroclaw_api::channel::ChannelApprovalResponse">ChannelApprovalResponse</a>&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Request interactive tool-call approval from the channel operator.</p>
+<p>Returns <code>Ok(Some(response))</code> when the operator answers within the
+channel’s configured <code>approval_timeout_secs</code>; timeouts are surfaced
+as <code>Deny</code>. Returns <code>Ok(None)</code> only for channels that do not implement
+the prompt at all — the caller should fall back to its default policy
+(typically auto-deny).</p>
+<p>Surface varies by channel:</p>
+<ul>
+<li><strong>Telegram</strong> uses inline keyboard buttons.</li>
+<li><strong>Slack</strong> Socket Mode uses Block Kit buttons; webhook fallback and
+non–Socket Mode deployments use a token text reply.</li>
+<li><strong>Discord, Signal, Matrix, WhatsApp</strong> embed a 6-character
+alphanumeric token in the prompt and wait for a
+<code>&lt;token&gt; approve|deny|always</code> reply on the same conversation.</li>
+</ul>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.request_choice" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#269-276">Source</a><h4 class="code-header">fn <a href="#method.request_choice" class="fn">request_choice</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    _question: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    _choices: &amp;'life2 [<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>],
+    _timeout: <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/time/struct.Duration.html" title="struct core::time::Duration">Duration</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="https://docs.rs/anyhow/1.0.102/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.95.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Ask the user a multiple-choice question and return the chosen option’s text.</p>
+<p>Returns <code>Ok(Some(answer))</code> if the channel handled the question natively
+(e.g. ACP <code>session/request_permission</code>, Telegram inline keyboard).
+Returns <code>Ok(None)</code> to signal the caller should fall back to the
+generic <code>send</code> + <code>listen</code> flow. Default impl returns <code>None</code>.</p>
+<p>Free-form questions (no choices) are not modeled here yet — they
+require the ACP elicitation RFD to land for a clean cross-channel API.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.supports_free_form_ask" class="method"><a class="src rightside" href="../../src/zeroclaw_api/channel.rs.html#284-286">Source</a><h4 class="code-header">fn <a href="#method.supports_free_form_ask" class="fn">supports_free_form_ask</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether this channel can answer free-form (no-choices) <code>ask_user</code>
+questions via the standard <code>send</code> + <code>listen</code> flow.</p>
+<p>Channels that can only handle structured choices (e.g. ACP today, until
+the elicitation RFD lands) should return <code>false</code> so callers can fail
+fast with a useful error instead of timing out on <code>listen</code>.</p>
+</div></details></div><h2 id="implementors" class="section-header">Implementors<a href="#implementors" class="anchor">§</a></h2><div id="implementors-list"></div><script src="../../trait.impl/zeroclaw_api/channel/trait.Channel.js" async></script></section></div></main></body></html>

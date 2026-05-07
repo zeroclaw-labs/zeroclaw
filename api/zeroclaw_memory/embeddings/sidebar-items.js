@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["create_embedding_provider"],"struct":["NoopEmbedding","OpenAiEmbedding"],"trait":["EmbeddingProvider"]};

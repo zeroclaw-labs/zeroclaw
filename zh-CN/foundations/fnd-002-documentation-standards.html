@@ -1,0 +1,1231 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>文档规范 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-53bbdbb2.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-088a9fdb.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/foundations/fnd-002-documentation-standards.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="fnd-002有意文档化--标准结构和国际化策略"><a class="header" href="#fnd-002有意文档化--标准结构和国际化策略">FND-002：有意文档化 — 标准、结构和国际化策略</a></h1>
+<h3 id="自-v070-起--类型文档--修订版-1"><a class="header" href="#自-v070-起--类型文档--修订版-1">自 v0.7.0 起 · 类型：文档 · 修订版 1</a></h3>
+<blockquote>
+<p><strong>规范参考</strong> · 团队已批准 · 修订版 1 讨论线程及完整修订历史：<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5576">#5576</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>在你们阅读此内容之前，给团队的一条提示。</strong></p>
+<p>文档并非在代码完成后才去编写的内容。它本身就是一个产品界面——是项目与所有未来贡献者、使用者或基于其构建的人之间的接口。没有文档的代码库会迫使每个新人从零开始重新发现一切；而文档糟糕的代码库往往更糟，因为它会给人虚假的信心。本 RFC 提议以我们应用于架构的同样意图来对待文档：先确立愿景，再构建结构，最后填充内容。</p>
+</blockquote>
+<hr>
+<h2 id="目录"><a class="header" href="#目录">目录</a></h2>
+<ol>
+<li><a href="#1-the-documentation-philosophy">文档理念</a></li>
+<li><a href="#2-honest-assessment-where-we-are-today">诚实评估：我们目前的状况</a></li>
+<li><a href="#3-a-classification-framework-ea-artifacts-on-a-page">分类框架：EA 工件在页面上</a></li>
+<li><a href="#4-the-i18n-problem">国际化问题</a></li>
+<li><a href="#5-the-repo--wiki-split">仓库 / Wiki 分离</a></li>
+<li><a href="#6-adr-standards">ADR 标准</a></li>
+<li><a href="#7-agentsmd-as-the-ai-development-layer">AGENTS.md 作为 AI 开发层</a></li>
+<li><a href="#8-the-target-structure">目标结构</a></li>
+<li><a href="#9-the-replacement-docs-contract">替换文档契约</a></li>
+<li><a href="#10-standards-we-should-adopt">我们应采用的标准</a></li>
+<li><a href="#11-phased-roadmap">分阶段路线图</a></li>
+</ol>
+<hr>
+<h2 id="1-文档哲学"><a class="header" href="#1-文档哲学">1. 文档哲学</a></h2>
+<p>文档问题几乎总是源于在撰写第一句话之前跳过了一个本应提出的问题：<strong>这份文档是什么类型，它的目标读者是谁？</strong></p>
+<p>如果没有对这一问题的解答，文档就会堆积成一大堆页面，它们都属于同一个模糊类别的不同变体：“关于项目的资料”。设置指南与架构决策并列，面向用户的使用指南与内部编码规范并存。README 的三十种语言翻译与安全策略文档争夺空间。没有人能找到任何东西，所有内容以不同的速度过时，每一个涉及文档的 PR 都变成了一场关于哪些页面需要更新的谈判。</p>
+<p>修复方法不是编写更多文档。修复方法是，在编写任何内容之前，先确定你要创建的工件类型。类型决定了格式、受众、位置、生命周期以及谁负责保持其最新状态。一旦确定了类型，其余部分自然会随之而来。</p>
+<p>本 RFC 采用 Svyatoslav Kotusev 的 <strong>EA Artifacts on a Page</strong> 框架（https://eaonapage.com）作为所有 ZeroClaw 文档的分类视角。该框架基于证据，刻意不具规定性，并且直接映射到开源基础设施项目实际需要的文档类型。</p>
+<p>该团队正在采用的更广泛开发哲学中借用的核心原则：</p>
+<blockquote>
+<p><strong>文档和代码一样，应该沿着“愿景 → 架构 → 设计 → 实现”这条路径向上追溯。如果在动笔之前无法明确文档的类型及其目标读者，说明你尚未准备好开始撰写。</strong></p>
+</blockquote>
+<hr>
+<h2 id="2-诚实评估我们目前的状况"><a class="header" href="#2-诚实评估我们目前的状况">2. 诚实评估：我们目前的状况</a></h2>
+<h3 id="21-i18n-的影响范围"><a class="header" href="#21-i18n-的影响范围">2.1 i18n 的影响范围</a></h3>
+<p>当前文档中最容易衡量的问题是本地化系统：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>指标</th><th>值</th></tr>
+</thead>
+<tbody>
+<tr><td>仓库根目录下的非英文 README 文件</td><td>31</td></tr>
+<tr><td><code>docs/i18n/</code> 目录中的文件</td><td>169</td></tr>
+<tr><td><code>docs/i18n/</code> 占用的磁盘空间</td><td>2.2 MB</td></tr>
+<tr><td>根据 <code>docs-contract.md</code> 积极支持的区域设置</td><td>6（英文、简体中文、日文、俄文、法文、越南文）</td></tr>
+<tr><td>根目录中包含 README 文件的区域设置</td><td>31</td></tr>
+</tbody>
+</table>
+</div>
+<p>i18n 系统会在每篇文档 PR 中产生<strong>贡献者税</strong>。当前的 <code>docs-contract.md</code> 包含此要求：</p>
+<blockquote>
+<p><em>如果某项更改涉及文档 IA、运行时契约引用或共享文档中面向用户的措辞，请在同一 PR 中为受支持的本地化语言执行 i18n 跟进。</em></p>
+</blockquote>
+<p>这意味着，修复安装指南中拼写错误的贡献者必须更新多达六种语言版本的文档，否则该 PR 将无法通过审查。这对贡献者来说是一个显著的障碍，尤其是对于构成该项目贡献者主体的学生和初级工程师而言。</p>
+<h3 id="22-结构问题"><a class="header" href="#22-结构问题">2.2 结构问题</a></h3>
+<p>当前的 <code>docs/</code> 目录结构在同一层级中混合了三种本质上不同的文档类型：</p>
+<ul>
+<li><strong>与代码相关的文档</strong>，必须与代码库同步版本控制（架构决策记录 ADR、API 规范、安全策略、贡献流程）</li>
+<li><strong>用户可见的操作文档</strong>，应与代码发布独立更新（安装指南、故障排除、部署指南等）</li>
+<li><strong>社区文档</strong>：由社区维护，无需正式审核流程（翻译、常见问题解答、社区指南）</li>
+</ul>
+<p>这三个文件都位于 <code>docs/</code> 目录下，它们之间没有结构上的区分。结果是一个扁平的堆，其中包含一个手动维护的 <code>SUMMARY.md</code>，每次发生任何更改时都需要有人去更新它。</p>
+<h3 id="23-adr-差距"><a class="header" href="#23-adr-差距">2.3 ADR 差距</a></h3>
+<p>该项目仅包含一份架构决策记录（ADR）：<code>ADR-004-tool-shared-state-ownership.md</code>。这份记录非常出色——结构清晰、引用了代码、内容具体。然而，该项目至少还做出了五项或六项同等重要甚至更重要的架构决策，却从未被记录下来：</p>
+<ul>
+<li>选择 Rust 而非 TypeScript</li>
+<li>基于特性的可扩展性模型</li>
+<li>WASM 插件系统设计</li>
+<li>选择 SQLite 和 Markdown 作为两种内存后端</li>
+<li>安全模型（配对码、自主级别、沙盒层）</li>
+</ul>
+<p>如果没有这些记录，每位新贡献者都必须通过代码考古来重新发现背后的原因。每个读取代码库的 AI 编程助手都只能知道“是什么”，而无法了解“为什么”。这是未记录的技术债务中最昂贵的一种形式。</p>
+<h3 id="24-已经做得好的部分"><a class="header" href="#24-已经做得好的部分">2.4 已经做得好的部分</a></h3>
+<p><code>docs-contract.md</code> 的理念——将文档视为受治理的产品表面——是正确的直觉。它只需要合适的规则。根目录下的 <code>AGENTS.md</code> 非常出色，为 AI 辅助开发树立了良好的先例。ADR-004 证明了团队能够编写高质量的架构记录。</p>
+<hr>
+<h2 id="3-分类框架ea-工件在一页上"><a class="header" href="#3-分类框架ea-工件在一页上">3. 分类框架：EA 工件在一页上</a></h2>
+<p><strong>EA 页面工件</strong>框架定义了五类架构工件。ZeroClaw 仓库中的每份文档都应归属于其中一类，而该类别决定了其存放位置、格式以及何时失效。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>EA 工件系列</th><th>它回答的问题</th><th>ZeroClaw 中的示例</th><th>位置</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>注意事项</strong></td><td>我们的决策遵循哪些原则和标准？</td><td><code>AGENTS.md</code> 文件、编码规范、安全策略、本文档</td><td><code>docs/book/src/contributing/</code> 或每个 crate</td></tr>
+<tr><td><strong>景观</strong></td><td>目前系统是什么样的？</td><td>组件映射、crate 拓扑结构、依赖关系图</td><td><code>docs/book/src/architecture/</code></td></tr>
+<tr><td><strong>大纲</strong></td><td>我们要去哪里？</td><td>RFC 和路线图提案</td><td>带有 <code>type:rfc</code> 标签的 GitHub Issues</td></tr>
+<tr><td><strong>设计</strong></td><td>我们具体是如何做这件事的？</td><td>ADR、OpenAPI 规范、WIT 接口文件</td><td><code>docs/book/src/architecture/</code>（ADR 部分）</td></tr>
+<tr><td><strong>标准</strong></td><td>构建的具体规则是什么？</td><td>PR 工作流、测试标准和发布流程</td><td><code>docs/book/src/contributing/</code> 和 <code>docs/book/src/maintainers/</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>该表格中明显缺失的内容包括：</strong> 用户指南、安装说明、特定频道的操作指南、故障排除、常见问题解答。这些属于<strong>操作内容</strong>，而非 EA 产物。它们不会随代码一起进行版本控制，应放置在 GitHub Wiki 上。</p>
+<h3 id="使用框架"><a class="header" href="#使用框架">使用框架</a></h3>
+<p>在编写任何文档之前，请先回答以下两个问题：</p>
+<ol>
+<li><strong>这是什么制品家族？</strong> 如果你无法回答这个问题，说明你还没有准备好进行编写。</li>
+<li><strong>是否需要与代码一起进行版本控制？</strong> 如果是，则将其放入代码仓库中。如果不是，则将其放在 Wiki 上。</li>
+</ol>
+<p>一个有用的测试标准是：<em>如果读者对照代码库的不同版本阅读此文档，该文档是否会变得错误或产生误导？</em> 如果是，则文档应存放在代码仓库中，并与代码一起进行版本管理；如果否，则文档应存放在 Wiki 上。</p>
+<hr>
+<h2 id="4-i18n-问题"><a class="header" href="#4-i18n-问题">4. i18n 问题</a></h2>
+<h3 id="41-移除参数的理由"><a class="header" href="#41-移除参数的理由">4.1 移除参数的理由</a></h3>
+<p>从仓库中移除所有非英文内容的理由基于以下四个支柱：</p>
+<p><strong>1. 受众具备按需翻译能力。</strong> ZeroClaw 的主要用户是运行 AI 助手的人。每个这样的人都可以访问即时、高质量机器翻译——无论是通过他们正在运行的代理、浏览器，还是通过数十种免费翻译服务之一。在仓库中提供翻译的实际收益微乎其微。</p>
+<p><strong>2. 翻译内容几乎肯定已过时。</strong> 机器翻译的内容可能只生成过一次，且未与英文源文件保持同步。对于 AI 辅助开发而言，过时的文档比没有文档更糟糕，因为语言模型会基于过时信息自信地得出错误结论。</p>
+<p><strong>3. 贡献者税是真实且可衡量的。</strong> <code>docs-contract.md</code> 的对等性要求意味着每个文档 PR 都必须涉及多达六种语言版本。这使得文档贡献变得昂贵，并阻碍了那些保持文档健康的小幅、增量改进（例如修复拼写错误、澄清步骤、更新过时的引用）。</p>
+<p><strong>4. 本地化是社区工作，而非核心项目工作。</strong> 最有能力维护日语文档的是日语贡献者。将本地化内容放在主仓库中并要求保持同步，会将负担转嫁给核心维护者，而不是受益的社区。GitHub Wiki 正确地反转了这一点：社区成员可以编辑和维护他们语言的页面，而无需提交 PR。</p>
+<h3 id="42-保持不变"><a class="header" href="#42-保持不变">4.2 保持不变</a></h3>
+<p>值得保留的一点是：i18n 方法的<strong>结构</strong>。使 ZeroClaw 支持多种语言的理念是正确的。但<strong>位置</strong>和<strong>所有权模型</strong>是错误的。</p>
+<h3 id="43-替换策略"><a class="header" href="#43-替换策略">4.3 替换策略</a></h3>
+<ol>
+<li>
+<p>从仓库根目录中<strong>删除</strong>所有 <code>README.*.md</code> 文件，除了 <code>README.md</code></p>
+</li>
+<li>
+<p><strong>完全删除</strong> <code>docs/i18n/</code></p>
+</li>
+<li>
+<p>从 <code>docs/</code> 中移除所有非英文的 hub 文件（例如 <code>docs/README.zh-CN.md</code>）</p>
+</li>
+<li>
+<p>在主要的 <code>README.md</code> 中添加一个 <code>Languages</code> 部分：</p>
+<blockquote>
+<p>社区维护的翻译可在 <a href="https://github.com/zeroclaw-labs/zeroclaw/wiki">GitHub Wiki</a> 中找到。要贡献翻译或改进现有翻译，请直接编辑 Wiki。欢迎所有语言参与。</p>
+</blockquote>
+</li>
+<li>
+<p>在 GitHub Wiki 上<strong>创建</strong>一个 <code>Translations</code> 页面，其中包含可用语言列表、它们的完成度以及负责维护的贡献者</p>
+</li>
+<li>
+<p><strong>可选：</strong> 添加一个 <code>zeroclaw docs --translate</code> CLI 功能，该功能使用配置的 LLM 提供商按需翻译任何文档页面——这对于一个以 AI 辅助为核心目的的产品来说，是一个自然的选择。</p>
+</li>
+</ol>
+<h3 id="44-agentsmd-的影响"><a class="header" href="#44-agentsmd-的影响">4.4 AGENTS.md 的影响</a></h3>
+<p>从 <code>docs-contract.md</code> 中移除 i18n 后续处理要求。替换为：<em>文档 PR 仅以英文进行审查。翻译由社区在 Wiki 上维护，不受 PR 审查约束。</em></p>
+<hr>
+<h2 id="5-仓库与-wiki-分离"><a class="header" href="#5-仓库与-wiki-分离">5. 仓库与 Wiki 分离</a></h2>
+<h3 id="51-决策规则"><a class="header" href="#51-决策规则">5.1 决策规则</a></h3>
+<blockquote>
+<p><strong>如果代码更改会导致文档内容过时，则该文档应位于仓库中；否则，应位于 Wiki 上。</strong></p>
+</blockquote>
+<p>这不是一个模糊规则。请逐字应用它。</p>
+<p><strong>仓库。</strong> ADR 记录了在特定时间点做出某项具体架构决策的原因。即使代码发生变化，ADR 仍能准确描述当时所做出的决策及其时间。代码可能已偏离该决策，但记录本身依然准确。</p>
+<p>配置 Telegram 频道的设置指南描述了用户针对当前软件版本所执行的步骤。如果配置格式发生变化，该指南就会失效。→ <strong>这听起来应该放在仓库中——但实际上不应该。</strong> 设置指南应遵循其自身的时间线进行更新，而不应与代码提交耦合。正确的模型是：API 参考文档（直接映射到配置结构体）位于仓库中，而引导用户使用该 API 的设置指南则放在 Wiki 上，由任何人在步骤发生变化时进行更新。</p>
+<h3 id="52-实践中的拆分"><a class="header" href="#52-实践中的拆分">5.2 实践中的拆分</a></h3>
+<p><strong>保留在仓库中（<code>docs/book/src/</code>）：</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>当前位置</th><th>制品族</th><th>备注</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs/book/src/architecture/</code></td><td>景观 + 设计</td><td>组件图、架构决策记录（ADR）、crate 拓扑结构</td></tr>
+<tr><td><code>docs/book/src/contributing/</code></td><td>考虑因素 + 标准</td><td>PR 工作流、测试、编码规范</td></tr>
+<tr><td><code>docs/book/src/maintainers/</code></td><td>考虑因素 + 标准</td><td>发布运行手册、审查员指南、标签策略</td></tr>
+<tr><td><code>docs/book/src/security/</code></td><td>考虑因素与设计</td><td>安全策略、沙箱设计、审计日志</td></tr>
+<tr><td><code>docs/book/src/hardware/</code></td><td>设计</td><td>外围设计文档、数据手册</td></tr>
+<tr><td><code>docs/book/src/reference/config.md</code></td><td>设计</td><td>配置参考（由代码生成）</td></tr>
+<tr><td><code>docs/book/src/reference/cli.md</code></td><td>设计</td><td>CLI 参考文档（由代码生成）</td></tr>
+<tr><td><code>docs/book/src/foundations/</code></td><td>注意事项</td><td>已批准的 RFC，它们塑造了其他所有内容</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>移至 GitHub Wiki（提议中；尚未执行）：</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>当前位置</th><th>移动原因</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs/book/src/setup/</code></td><td>独立于代码的用户可见操作指南</td></tr>
+<tr><td><code>docs/book/src/ops/service.md</code></td><td>操作性的，由用户维护的</td></tr>
+<tr><td><code>docs/book/src/ops/troubleshooting.md</code></td><td>操作频繁，变化较多</td></tr>
+<tr><td><code>docs/book/src/ops/network-deployment.md</code></td><td>操作相关的、部署特定的</td></tr>
+<tr><td>位于 <code>docs/book/src/channels/</code> 下的各通道设置页面</td><td>面向用户，与上游平台 API 同步</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>已删除（i18n 移除）：</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>项目</th><th>大小影响</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs/i18n/</code>（169 个文件）</td><td>从仓库中减少了 2.2 MB</td></tr>
+<tr><td>31 × <code>README.*.md</code> 位于根目录</td><td>- 显著根杂波</td></tr>
+<tr><td><code>docs/</code> 中的非英文中心文件</td><td>−31 个文件</td></tr>
+<tr><td>i18n 覆盖率地图，i18n 索引</td><td>−2 个文件</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="53-wiki-结构"><a class="header" href="#53-wiki-结构">5.3 Wiki 结构</a></h3>
+<pre><code>Home
+│
+├── Getting Started
+│     ├── Installation
+│     ├── Quick Start (TL;DR)
+│     ├── Migrating from OpenClaw
+│     └── Onboarding Walkthrough
+│
+├── Configuration
+│     ├── Providers
+│     ├── Channels
+│     ├── Memory
+│     ├── Security &amp; Pairing
+│     └── Tunnels
+│
+├── Channels
+│     ├── Telegram
+│     ├── Discord
+│     ├── Slack
+│     ├── WhatsApp
+│     └── ... (one page per channel)
+│
+├── Operations
+│     ├── Troubleshooting
+│     ├── Deployment
+│     ├── Network Setup
+│     └── Performance Tuning
+│
+├── Hardware
+│     ├── Getting Started with Peripherals
+│     ├── ESP32 Setup
+│     ├── STM32 Nucleo Setup
+│     └── Arduino Setup
+│
+└── Community
+      ├── FAQ
+      ├── Translations
+      └── How to Contribute
+</code></pre>
+<hr>
+<h2 id="6-adr-标准"><a class="header" href="#6-adr-标准">6. ADR 标准</a></h2>
+<h3 id="61-格式"><a class="header" href="#61-格式">6.1 格式</a></h3>
+<p>所有架构决策记录均采用 <strong>Nygard 格式</strong>，并扩展了 YAML frontmatter 以支持机器可读性。ADR-004 是现有的模型——本节对其进行了形式化定义。</p>
+<p>每个 ADR 包含三个部分和五个前置元数据字段：</p>
+<pre><code>---
+id: ADR-NNN
+title: 描述决策的简短祈使句
+date: YYYY-MM-DD
+status: proposed | accepted | deprecated | superseded-by-ADR-NNN
+relates-to:
+  - ADR-XXX (可选，相关决策列表)
+  - crates/zeroclaw-api (可选，受影响的代码路径)
+---
+
+# ADR-NNN: 标题
+
+## 背景
+
+导致需要做出决策的情况、约束或问题是什么？
+当时存在哪些影响因素？考虑了哪些选项？
+
+## 决策
+
+做出了什么决定？使用主动语态陈述。
+“我们将……”而不是“决定是……”
+
+## 后果
+
+该决策会带来哪些结果？
+列出正面和负面的后果——每个决策都有权衡。
+注明由此产生的任何后续决策或行动。
+
+## 参考
+
+相关代码文件、问题和外部资源的链接。
+</code></pre>
+<h3 id="62-adr-生命周期规则"><a class="header" href="#62-adr-生命周期规则">6.2 ADR 生命周期规则</a></h3>
+<ul>
+<li><strong>ADR 一旦被接受就不可更改。</strong> 如果决策发生变化，旧的 ADR 会被标记为 <code>superseded-by-ADR-NNN</code>，并编写一个新的 ADR 来描述新决策以及它为何取代了旧决策。</li>
+<li><strong>ADR 按顺序编号，且永不重新编号。</strong> 序列中出现空缺是可以接受的（被拒绝的提议 ADR 可以撤回，从而留下空缺）。</li>
+<li><strong>ADR 位于 <code>docs/architecture/decisions/</code> 目录中。</strong> 它们以 <code>ADR-NNN-short-slug.md</code> 命名。</li>
+<li><strong>重大的架构变更需要一份架构决策记录（ADR）。</strong>“重大”意味着：对新手贡献者而言令人意外的决策、对未来选择产生约束的决策，或涉及非直观权衡的决策。</li>
+</ul>
+<h3 id="63-追溯性-adr"><a class="header" href="#63-追溯性-adr">6.3 追溯性 ADR</a></h3>
+<p>以下关键决策应进行回溯性文档记录。它们代表了新贡献者或 AI 工具理解代码库所需的基础推理依据：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>提议的 ADR</th><th>决定记录</th></tr>
+</thead>
+<tbody>
+<tr><td>ADR-001</td><td>Rust 作为实现语言（替代 TypeScript/OpenClaw）</td></tr>
+<tr><td>ADR-002</td><td>以特性驱动扩展性作为主要的架构模式</td></tr>
+<tr><td>ADR-003</td><td>WASM + Extism 作为插件执行模型</td></tr>
+<tr><td>ADR-004</td><td>工具共享状态所有权契约（已存在）</td></tr>
+<tr><td>ADR-005</td><td>SQLite 和 Markdown 作为两种内存后端</td></tr>
+<tr><td>ADR-006</td><td>CLI 作为唯一的内置通道；其他所有通道作为插件</td></tr>
+<tr><td>ADR-007</td><td>将网关提取为单独的可选二进制文件</td></tr>
+</tbody>
+</table>
+</div>
+<p>事后 ADR 应添加备注：</p>
+<blockquote>
+<p><em>这是一份对正式 ADR 流程之前做出的决策的追溯性记录。日期反映的是决策做出的时间，而非本记录撰写的时间。</em></p>
+</blockquote>
+<h3 id="64-为什么这对-ai-辅助开发很重要"><a class="header" href="#64-为什么这对-ai-辅助开发很重要">6.4 为什么这对 AI 辅助开发很重要</a></h3>
+<p>当 AI 编程助手读取一个仓库时，它看到的是当前的代码状态。它无法看到被拒绝的选择、权衡过的利弊，或是为何选择某种特定结构而非其他替代方案的原因。如果没有架构决策记录（ADRs），AI 会提出违反其无法获知的架构约束的更改建议。而有了 ADRs，推理过程变得明确且机器可读。通过 frontmatter，ADRs 变得可查询：AI 工具可以找到所有与 <code>zeroclaw-api</code> 相关的 ADRs，并在编辑该 crate 之前将其作为上下文加载。</p>
+<hr>
+<h2 id="7-agentsmd-作为-ai-开发层"><a class="header" href="#7-agentsmd-作为-ai-开发层">7. AGENTS.md 作为 AI 开发层</a></h2>
+<h3 id="71-模式"><a class="header" href="#71-模式">7.1 模式</a></h3>
+<p>根目录下的 <code>AGENTS.md</code> 是该项目对 AI 辅助开发最有力的现有贡献。它向 AI 编码助手说明了需要执行的命令、需要遵循的架构、需要应用的风险层级以及需要避免的反模式。它之所以有效，是因为它具体、有主见且简洁。</p>
+<p>随着工作区按照微内核架构 RFC 分解为多个 crate，每个 crate 都应拥有自己的 <code>AGENTS.md</code>。这是使架构边界在 AI 辅助层得以强制执行的一种机制——不仅通过 crate 依赖在编译时实现，更在编写任何代码之前的推理层实现。</p>
+<h3 id="72-每个-crate-的-agentsmd-包含的内容"><a class="header" href="#72-每个-crate-的-agentsmd-包含的内容">7.2 每个 crate 的 AGENTS.md 包含的内容</a></h3>
+<p>保持简短。超过 60 行的 <code>AGENTS.md</code> 将不会被阅读。每个文件回答五个问题：</p>
+<pre><code class="language-markdown"># &lt;crate-name&gt;
+
+## What this crate is
+One or two sentences. What problem does this crate solve?
+
+## What this crate is allowed to depend on
+List the crates this crate may import. Be explicit.
+If a dependency is not listed here, do not add it without an ADR.
+
+## Extension points
+Where can new implementations be added? What trait do they implement?
+Link to the relevant traits.
+
+## What does NOT belong here
+Explicit anti-patterns. What would be a mistake to add to this crate?
+
+## Related ADRs
+- ADR-NNN: Short title
+</code></pre>
+<h3 id="73-示例"><a class="header" href="#73-示例">7.3 示例</a></h3>
+<p><strong>对于 <code>crates/zeroclaw-api</code>（提取后）：</strong></p>
+<pre><code class="language-markdown"># zeroclaw-api
+
+## What this crate is
+Trait definitions and shared data types for the ZeroClaw plugin and kernel
+interfaces. This is the contract layer. Everything else depends on it.
+
+## What this crate is allowed to depend on
+- serde, serde_json (serialization)
+- async-trait (async trait support)
+- anyhow (error types)
+- tokio (async runtime types, minimal)
+Nothing else. No HTTP clients. No database drivers. No external services.
+
+## Extension points
+All traits in this crate are extension points:
+- `Provider` (src/providers/traits.rs) — LLM provider implementations
+- `Channel` (src/channels/traits.rs) — messaging platform integrations
+- `Tool` (src/tools/traits.rs) — agent tool implementations
+- `Memory` (src/memory/traits.rs) — persistence backends
+- `Observer` (src/observability/traits.rs) — observability backends
+- `RuntimeAdapter` (src/runtime/traits.rs) — execution environments
+- `Peripheral` (src/peripherals/traits.rs) — hardware integrations
+
+## What does NOT belong here
+- Any concrete implementation of any trait
+- Any dependency on a specific messaging platform, LLM provider, or database
+- Any network I/O or filesystem access
+- Any binary or executable target
+
+## Related ADRs
+- ADR-002: Trait-driven extensibility
+</code></pre>
+<p><strong>对于 <code>crates/zeroclaw-kernel</code>（提取后）：</strong></p>
+<pre><code class="language-markdown"># zeroclaw-kernel
+
+## What this crate is
+The orchestration engine. Runs the agent loop, manages the service registry,
+exposes the local IPC API. The kernel knows nothing about specific channels,
+providers, or tools — only their abstract interfaces.
+
+## What this crate is allowed to depend on
+- zeroclaw-api (traits only)
+- zeroclaw-tool-call-parser (parsing, no agent state)
+- Standard async/runtime crates (tokio, anyhow, tracing)
+- Config and storage crates (toml, serde, rusqlite for core memory)
+NOT: any specific channel, provider, or tool implementation crate.
+
+## Extension points
+- `Registry::register_channel()` — add a channel at startup
+- `Registry::register_tool()` — add a tool at startup
+- `Registry::set_provider()` — set the active provider at startup
+Implementations are registered by the binary crate, not by the kernel.
+
+## What does NOT belong here
+- Any import of TelegramChannel, DiscordChannel, or any named channel
+- Any import of AnthropicProvider, OpenAIProvider, or any named provider
+- Any tool implementation beyond the 10-12 designated core tools
+- The gateway HTTP server or any web serving code
+
+## Related ADRs
+- ADR-002: Trait-driven extensibility
+- ADR-006: CLI as the only built-in channel
+- ADR-007: Gateway extraction
+</code></pre>
+<h3 id="74-agentsmd-层级结构"><a class="header" href="#74-agentsmd-层级结构">7.4 AGENTS.md 层级结构</a></h3>
+<p>根目录下的 <code>AGENTS.md</code> 设定了项目范围的政策。各 crate 级别的 <code>AGENTS.md</code> 文件则针对其特定范围细化该政策。当 AI 工具读取 <code>crates/zeroclaw-api/</code> 中的文件时，应同时读取根目录下的 <code>AGENTS.md</code>（项目政策）和 <code>crates/zeroclaw-api/AGENTS.md</code>（crate 政策）。当两者发生冲突时，更具体的 crate 政策优先。</p>
+<hr>
+<h2 id="8-目标结构"><a class="header" href="#8-目标结构">8. 目标结构</a></h2>
+<p>经过本 RFC 中提议的更改后，仓库的文档布局将变为：</p>
+<pre><code>docs/
+│
+├── README.md                    ← Hub: links to wiki for user guides,
+│                                  to proposals/ for roadmap, to
+│                                  architecture/ for decisions
+├── SUMMARY.md                   ← Canonical TOC (English only, repo docs only)
+│
+├── architecture/
+│   ├── README.md                ← Overview: what decisions have been made,
+│   │                              current system landscape
+│   ├── decisions/               ← ADRs (immutable once accepted)
+│   │   ├── ADR-001-rust-first.md
+│   │   ├── ADR-002-trait-driven-extensibility.md
+│   │   ├── ADR-003-wasm-plugin-model.md
+│   │   ├── ADR-004-tool-shared-state-ownership.md  (already exists)
+│   │   ├── ADR-005-memory-backends.md
+│   │   ├── ADR-006-cli-only-built-in-channel.md
+│   │   └── ADR-007-gateway-extraction.md
+│   └── diagrams/
+│       ├── component-map.md     ← Mermaid: crate topology
+│       └── data-flow.md         ← Mermaid: message lifecycle
+│
+├── proposals/                   ← RFCs (living until accepted/rejected)
+│   ├── microkernel-architecture.md    (already exists)
+│   └── documentation-standards.md    (this document)
+│
+├── contributing/
+│   ├── README.md
+│   ├── docs-contract.md         ← Replaced (see Section 9)
+│   ├── pr-workflow.md
+│   ├── reviewer-playbook.md
+│   ├── ci-map.md
+│   ├── actions-source-policy.md
+│   ├── testing.md
+│   ├── extension-examples.md
+│   ├── change-playbooks.md
+│   └── pr-discipline.md
+│
+├── reference/
+│   ├── README.md
+│   ├── api/
+│   │   ├── config-reference.md
+│   │   ├── providers-reference.md
+│   │   └── channels-reference.md
+│   └── cli/
+│       └── commands-reference.md
+│
+├── security/
+│   ├── README.md
+│   ├── agnostic-security.md
+│   ├── frictionless-security.md
+│   ├── sandboxing.md
+│   ├── audit-logging.md
+│   └── security-roadmap.md
+│
+└── hardware/
+    ├── README.md
+    ├── hardware-peripherals-design.md
+    ├── adding-boards-and-tools.md
+    └── datasheets/
+        ├── nucleo-f401re.md
+        ├── arduino-uno.md
+        └── esp32.md
+</code></pre>
+<p><strong>从当前结构中删除：</strong></p>
+<pre><code>docs/i18n/                       ← 169 files, 2.2 MB — removed entirely
+docs/maintainers/                ← project snapshots and i18n coverage maps
+                                   moved to Wiki (operational, not code-adjacent)
+docs/setup-guides/               ← moved to Wiki
+docs/ops/                        ← moved to Wiki
+README.ar.md (and 30 others)     ← removed from repo root
+docs/README.ar.md (and 30 others)← removed
+</code></pre>
+<p>仓库根目录变为干净状态：</p>
+<pre><code>README.md
+AGENTS.md
+CHANGELOG.md
+CLAUDE.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+SECURITY.md
+LICENSE-APACHE
+LICENSE-MIT
+NOTICE
+Cargo.toml
+Cargo.lock
+... (build and config files)
+</code></pre>
+<p>不包含语言变体，不重复 README 文件。一个权威的英文 README 链接到用户指南的 Wiki 和技术参考的 docs/ 目录。</p>
+<hr>
+<h2 id="9-替换文档合同"><a class="header" href="#9-替换文档合同">9. 替换文档合同</a></h2>
+<p>旧的 <code>docs/contributing/docs-contract.md</code> 编码了 i18n 对等性要求和目录结构，本 RFC 已取代这些内容。该文件已被移除；本节是其替代内容。</p>
+<p>该替代方案涉及三项内容：工件分类、仓库/维基拆分以及 ADR 治理。它未提及 i18n——区域设置一致性现在由 <a href="../maintainers/docs-and-translations.html">维护者 → 文档与翻译</a> 页面处理。</p>
+<p><strong>替换文档契约：</strong></p>
+<pre><code class="language-markdown"># Documentation Contract
+
+## Document Classification
+
+Every document in `docs/` belongs to one artifact family:
+
+- **Considerations** — principles and standards that guide decisions
+- **Landscapes** — descriptions of the current system state
+- **Outlines** — proposals and roadmaps for future work
+- **Designs** — ADRs, API specs, and detailed technical decisions
+- **Standards** — specific rules for how we build and operate
+
+If you cannot name the family before writing, do not write yet.
+
+## The Repo / Wiki Rule
+
+A document lives in the repository if it would become wrong when the
+code changes. It lives on the Wiki if it would not.
+
+Reference documentation (config reference, CLI reference) lives in the
+repository because it maps directly to code structures.
+
+User guides, setup instructions, and operational how-tos live on the Wiki
+because they update on their own timeline.
+
+## ADR Governance
+
+See docs/architecture/decisions/ for the ADR format and lifecycle rules.
+
+Major architectural changes require an ADR before implementation begins,
+not after.
+
+## Language
+
+All documents in this repository are written in English.
+Community-maintained translations live on the GitHub Wiki.
+Documentation PRs are reviewed in English only.
+
+## Freshness
+
+Documents should be updated in the same PR as the code change that makes
+them stale. A PR that changes a configuration format must update the
+config reference. A PR that adds a new command must update the CLI reference.
+
+Proposals in docs/proposals/ are exempt — they describe intent and may
+precede implementation by multiple releases.
+</code></pre>
+<hr>
+<h2 id="10-我们应该采用的标准"><a class="header" href="#10-我们应该采用的标准">10. 我们应该采用的标准</a></h2>
+<p>这些文档特定的标准补充了架构 RFC 中提出的更广泛的标准。</p>
+<h3 id="diátaxis-框架文档结构"><a class="header" href="#diátaxis-框架文档结构">Diátaxis 框架（文档结构）</a></h3>
+<p><strong>它是什么：</strong> Diátaxis（https://diataxis.fr）是一种系统化的技术文档框架，将内容分为四种类型：教程、操作指南、参考文档和解释性文档。它是 Python 文档、Django 文档等所使用的文档框架。它与 EA Artifacts 方法高度兼容——两者回答的问题不同（Diátaxis：如何组织文档的内容；EA Artifacts：这是什么类型的文档，它位于何处）。</p>
+<p><strong>如何应用：</strong> 面向用户维基上的文档应遵循 Diátaxis 结构。代码相关的仓库文档遵循 EA Artifacts。这两个框架在不同的层面上运作，并不冲突。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Diátaxis 类型</th><th>目的</th><th>ZeroClaw 中的示例</th><th>位置</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>教程</strong></td><td>以学习为导向，通过体验引导</td><td>“构建你的第一个工具插件”</td><td>维基</td></tr>
+<tr><td><strong>操作指南</strong></td><td>目标导向，解决特定问题</td><td>设置 Telegram 集成</td><td>维基</td></tr>
+<tr><td><strong>参考</strong></td><td>面向信息，描述机械结构</td><td>配置参考，CLI 参考</td><td>仓库</td></tr>
+<tr><td><strong>说明</strong></td><td>理解导向，解释原因</td><td>架构决策记录（ADR）、架构文档</td><td>仓库</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="用于机器可读性的-markdown-frontmatter"><a class="header" href="#用于机器可读性的-markdown-frontmatter">用于机器可读性的 Markdown Frontmatter</a></h3>
+<p><code>docs/</code> 目录中的所有文档都应包含 YAML frontmatter。这使得它们可以被 AI 工具、CI 检查以及未来的工具查询：</p>
+<pre><code class="language-yaml">---
+类型: adr | 提案 | 参考 | 贡献 | 安全 | 硬件
+状态: 草稿 | 提议 | 已接受 | 已弃用 | 已取代
+上次审查: YYYY-MM-DD
+relates-to:
+  - ADR-NNN
+  - crates/zeroclaw-api
+---
+</code></pre>
+<p>CI 检查应验证 <code>docs/</code> 中的所有文档是否具有有效的前置元数据（frontmatter）。这可以防止文档在未声明其类型和状态的情况下被编写，从而在工具层面强制执行分类规范。</p>
+<h3 id="commonmark--github-风格-markdown"><a class="header" href="#commonmark--github-风格-markdown">CommonMark + GitHub 风格 Markdown</a></h3>
+<p>所有文档均使用 CommonMark（标准化的 Markdown 规范）以及 GitHub Flavored Markdown 扩展（包括表格、任务列表、围栏代码块和 Mermaid 图表）。不使用任何自定义扩展、MDX 或 ReStructuredText。对于架构图，推荐使用 Mermaid 图表而非图像文件，因为它们能够与代码一起进行版本控制。</p>
+<h3 id="用于-prose-linting-的-vale"><a class="header" href="#用于-prose-linting-的-vale">用于 Prose Linting 的 Vale</a></h3>
+<p><strong>它是什么：</strong> Vale（https://vale.sh）是一个文本风格检查工具——它通过可配置的规则来检查写作风格、一致性和可读性。它可以强制执行诸如：始终使用“你”而不是“用户”，在命令式部分避免使用被动语态，使用一致的术语（如“插件”而不是“扩展”或“模块”）等要求。</p>
+<p><strong>为什么重要：</strong> 当前文档在语气、术语和风格上不一致。有些页面使用“插件”，有些使用“模块”，还有些使用“扩展”。Vale 使这些规则自动化，并在 CI 阶段强制执行，就像 Clippy 强制执行代码质量一样。</p>
+<hr>
+<h2 id="11-分阶段路线图"><a class="header" href="#11-分阶段路线图">11. 分阶段路线图</a></h2>
+<p>文档迁移遵循与架构迁移相同的绞杀榕模式：增量式、始终处于可用状态，避免一次性重写。</p>
+<hr>
+<h3 id="第一阶段--v070--清理根目录"><a class="header" href="#第一阶段--v070--清理根目录">第一阶段 · v0.7.0 — “清理根目录”</a></h3>
+<p><strong>交付物：</strong></p>
+<ul>
+<li><input disabled="" type="checkbox"> 从仓库根目录移除所有 <code>README.*.md</code> 文件（仅保留 <code>README.md</code>）</li>
+<li><input disabled="" type="checkbox"> 完全移除 <code>docs/i18n/</code></li>
+<li><input disabled="" type="checkbox"> 从 <code>docs/</code> 中移除所有非英文的 hub 文件</li>
+<li><input disabled="" type="checkbox"> 在 <code>README.md</code> 中添加 <code>Languages</code> 部分，并附上 Wiki 链接</li>
+<li><input disabled="" type="checkbox"> 创建 GitHub Wiki，包含结构骨架（主页 + 顶级页面、内容占位符）</li>
+<li><input disabled="" type="checkbox"> 从 <code>docs-contract.md</code> 中移除 i18n 对等性要求</li>
+<li><input disabled="" type="checkbox"> 为所有现有的 <code>docs/</code> 文件添加 YAML 前置元数据</li>
+<li><input disabled="" type="checkbox"> 创建 <code>docs/architecture/decisions/</code> 目录，并将 ADR-004 移动至该目录下，文件名为 <code>ADR-004-tool-shared-state-ownership.md</code>。</li>
+</ul>
+<p><strong>成功指标：</strong></p>
+<ul>
+<li>仓库根目录仅包含一个 README 文件</li>
+<li><code>docs/i18n/</code> 目录不存在</li>
+<li>所有 <code>docs/</code> 文件均包含有效的 YAML frontmatter（由 CI 强制执行）</li>
+<li>GitHub Wiki 已上线，并从 README 中公开链接</li>
+</ul>
+<hr>
+<h3 id="第二阶段--v070v080--编写缺失的-adr"><a class="header" href="#第二阶段--v070v080--编写缺失的-adr">第二阶段 · v0.7.0–v0.8.0 — “编写缺失的 ADR”</a></h3>
+<p><strong>交付物：</strong></p>
+<ul>
+<li>
+<p><input disabled="" type="checkbox"> 编写 ADR-001 至 ADR-003 以及 ADR-005 至 ADR-007（追溯性，参见第 6.3 节）</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> 添加 Vale 配置（<code>.vale.ini</code> + 样式规则）和 CI 检查</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> 用第 9 节中指定的版本完整替换 <code>docs-contract.md</code></p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> 将 <code>docs/setup-guides/</code> 的内容迁移到 GitHub Wiki</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> 将 <code>docs/ops/</code> 的内容迁移到 GitHub Wiki</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> 更新 <code>SUMMARY.md</code> 以反映新的结构（仅仓库内容）</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> # <code>crates/zeroclaw-api</code></p>
+<h2 id="概述"><a class="header" href="#概述">概述</a></h2>
+<p><code>zeroclaw-api</code> 是 ZeroClaw 项目的核心 API 层，负责处理与外部客户端的交互。它提供了 RESTful 和 WebSocket 接口，用于管理任务、查询状态以及接收实时事件。</p>
+<h2 id="架构"><a class="header" href="#架构">架构</a></h2>
+<h3 id="核心组件"><a class="header" href="#核心组件">核心组件</a></h3>
+<ul>
+<li><strong><code>Server</code></strong>: 主服务器结构，管理监听端口、中间件和路由。</li>
+<li><strong><code>Router</code></strong>: 定义 API 端点及其处理逻辑。</li>
+<li><strong><code>Middleware</code></strong>: 处理认证、日志记录和速率限制。</li>
+<li><strong><code>Handlers</code></strong>: 具体处理每个 API 端点请求的逻辑。</li>
+<li><strong><code>Models</code></strong>: 定义请求和响应的数据结构。</li>
+</ul>
+<h3 id="依赖关系"><a class="header" href="#依赖关系">依赖关系</a></h3>
+<ul>
+<li><code>axum</code>: Web 框架</li>
+<li><code>tokio</code>: 异步运行时</li>
+<li><code>serde</code>: 序列化/反序列化</li>
+<li><code>zeroclaw-core</code>: 核心业务逻辑</li>
+</ul>
+<h2 id="目录结构"><a class="header" href="#目录结构">目录结构</a></h2>
+<pre><code>crates/zeroclaw-api/
+├── src/
+│   ├── main.rs          # 入口点
+│   ├── server.rs        # 服务器配置和启动
+│   ├── router.rs        # 路由定义
+│   ├── middleware/      # 中间件
+│   │   ├── auth.rs      # 认证中间件
+│   │   └── logging.rs   # 日志中间件
+│   ├── handlers/        # 请求处理器
+│   │   ├── tasks.rs     # 任务相关端点
+│   │   └── events.rs    # 事件相关端点
+│   └── models/          # 数据模型
+│       ├── request.rs   # 请求结构
+│       └── response.rs  # 响应结构
+├── Cargo.toml
+└── tests/               # 集成测试
+</code></pre>
+<h2 id="开发指南"><a class="header" href="#开发指南">开发指南</a></h2>
+<h3 id="本地运行"><a class="header" href="#本地运行">本地运行</a></h3>
+<ol>
+<li>
+<p>确保已安装 Rust 和 Cargo。</p>
+</li>
+<li>
+<p>克隆仓库并进入 <code>crates/zeroclaw-api</code> 目录。</p>
+</li>
+<li>
+<p>运行以下命令启动服务器：</p>
+<pre><code class="language-bash">cargo run
+</code></pre>
+</li>
+<li>
+<p>服务器将在 <code>http://localhost:8080</code> 上监听。</p>
+</li>
+</ol>
+<h3 id="测试"><a class="header" href="#测试">测试</a></h3>
+<p>运行单元测试：</p>
+<pre><code class="language-bash">cargo test
+</code></pre>
+<p>运行集成测试：</p>
+<pre><code class="language-bash">cargo test --test integration_tests
+</code></pre>
+<h3 id="代码风格"><a class="header" href="#代码风格">代码风格</a></h3>
+<ul>
+<li>遵循 <a href="https://rust-lang.github.io/api-guidelines/">Rust API Guidelines</a>。</li>
+<li>使用 <code>rustfmt</code> 格式化代码。</li>
+<li>使用 <code>clippy</code> 检查代码质量。</li>
+</ul>
+<h2 id="贡献"><a class="header" href="#贡献">贡献</a></h2>
+<ol>
+<li>Fork 仓库。</li>
+<li>创建功能分支 (<code>git checkout -b feature/your-feature</code>)。</li>
+<li>提交更改 (<code>git commit -m 'Add some feature'</code>)。</li>
+<li>推送到分支 (<code>git push origin feature/your-feature</code>)。</li>
+<li>创建 Pull Request。</li>
+</ol>
+<h2 id="许可证"><a class="header" href="#许可证">许可证</a></h2>
+<p><a href="../../LICENSE">MIT License</a></p>
+</li>
+</ul>
+<p><strong>成功指标：</strong></p>
+<ul>
+<li>ADR-001 到 ADR-007 已存在并被接受</li>
+<li>Vale CI 检查在所有文档中均通过</li>
+<li>Wiki 包含所有迁移部分的完整内容</li>
+<li><code>docs/</code> 中无死链</li>
+</ul>
+<hr>
+<h3 id="阶段-3--v080v090--ai-层"><a class="header" href="#阶段-3--v080v090--ai-层">阶段 3 · v0.8.0–v0.9.0 — “AI 层”</a></h3>
+<p><strong>交付物：</strong></p>
+<ul>
+<li>
+<p><input disabled="" type="checkbox"> 为工作区中的每个新 crate 编写 <code>AGENTS.md</code> 文件（按照架构 RFC 的各个阶段逐步分解）。</p>
+</li>
+<li><input disabled="" type="checkbox"> 
+<pre><code class="language-markdown"># 组件映射图
+
+本文件描述了目标 crate 的拓扑结构。
+
+## 架构图
+
+```mermaid
+graph TD
+    A[crate_a] --&gt; B[crate_b]
+    A --&gt; C[crate_c]
+    B --&gt; D[crate_d]
+    C --&gt; D
+</code></pre>
+<h2 id="说明"><a class="header" href="#说明">说明</a></h2>
+<ul>
+<li><code>crate_a</code> 是核心 crate，依赖于 <code>crate_b</code> 和 <code>crate_c</code>。</li>
+<li><code>crate_b</code> 和 <code>crate_c</code> 都依赖于 <code>crate_d</code>。</li>
+</ul>
+<pre><code></code></pre>
+</li>
+<li><input disabled="" type="checkbox"> 
+<pre><code class="language-markdown"># 数据流
+
+本文档描述了消息在系统中的生命周期。
+
+## 消息生命周期
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API
+    participant Queue
+    participant Worker
+    participant Database
+
+    User-&gt;&gt;API: 发送消息
+    API-&gt;&gt;Queue: 将消息入队
+    Queue-&gt;&gt;Worker: 传递消息
+    Worker-&gt;&gt;Database: 存储消息
+    Worker-&gt;&gt;User: 返回确认
+</code></pre>
+<h3 id="步骤说明"><a class="header" href="#步骤说明">步骤说明</a></h3>
+<ol>
+<li><strong>用户发送消息</strong>：用户通过 API 发送消息。</li>
+<li><strong>API 接收消息</strong>：API 接收消息并将其放入消息队列。</li>
+<li><strong>消息入队</strong>：消息被添加到消息队列中等待处理。</li>
+<li><strong>Worker 处理消息</strong>：Worker 从队列中取出消息并进行处理。</li>
+<li><strong>存储消息</strong>：处理后的消息被存储到数据库中。</li>
+<li><strong>返回确认</strong>：Worker 向用户返回处理完成的确认信息。</li>
+</ol>
+<pre><code></code></pre>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> 在 <code>docs/book/src/developing/plugin-sdk.md</code> 中编写插件 SDK 文档</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> 在 <code>wit/</code> 目录下的文件旁编写 WIT 接口文档（由 WIT 自动生成并辅以手动编写的说明）</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> 随着内核 IPC API 的稳定，更新 OpenAPI 规范文档</p>
+</li>
+</ul>
+<p><strong>成功指标：</strong></p>
+<ul>
+<li>工作区中的每个 crate 都包含一个 <code>AGENTS.md</code></li>
+<li>架构图使用 Mermaid 格式（docs/ 目录中不包含二进制图像文件）</li>
+<li>插件 SDK 文档对于外部贡献者编写一个可用的工具插件来说已经足够。</li>
+</ul>
+<hr>
+<h3 id="第-4-阶段--v100--稳定平台"><a class="header" href="#第-4-阶段--v100--稳定平台">第 4 阶段 · v1.0.0 — “稳定平台”</a></h3>
+<p><strong>交付物：</strong></p>
+<ul>
+<li>
+<p><input disabled="" type="checkbox"> 在相应的代码发布后，将 ADR-001 至 ADR-007 标记为 <code>accepted</code>（而非 <code>proposed</code>）。</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> 在 <code>v1</code> 版本中对内核 IPC API 文档进行版本控制，并提供稳定性保证</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> # 插件注册表治理文档</p>
+<h2 id="1-概述"><a class="header" href="#1-概述">1. 概述</a></h2>
+<p>本文件定义了插件注册表（Plugin Registry）的治理结构、插件审核流程以及针对受损插件的撤销机制。其目标是确保注册表的安全性、透明度和可靠性，同时促进插件生态系统的健康发展。</p>
+<h2 id="2-注册表控制权"><a class="header" href="#2-注册表控制权">2. 注册表控制权</a></h2>
+<h3 id="21-治理委员会"><a class="header" href="#21-治理委员会">2.1 治理委员会</a></h3>
+<p>插件注册表由一个<strong>治理委员会</strong>（Governance Committee，简称“委员会”）管理。委员会由以下成员组成：</p>
+<ul>
+<li><strong>核心维护者</strong>：由项目创始人或主要贡献者任命。</li>
+<li><strong>社区代表</strong>：通过公开选举产生，任期一年。</li>
+<li><strong>安全专家</strong>：由委员会邀请，具备网络安全和插件安全方面的专业知识。</li>
+</ul>
+<h3 id="22-职责"><a class="header" href="#22-职责">2.2 职责</a></h3>
+<ul>
+<li>制定和更新注册表政策。</li>
+<li>审核和批准新插件。</li>
+<li>处理插件安全事件。</li>
+<li>管理插件撤销流程。</li>
+</ul>
+<h3 id="23-决策机制"><a class="header" href="#23-决策机制">2.3 决策机制</a></h3>
+<ul>
+<li>委员会决策需获得至少三分之二成员的同意。</li>
+<li>紧急情况下，核心维护者有权采取临时措施，但需在 48 小时内向委员会报告。</li>
+</ul>
+<h2 id="3-插件审核流程"><a class="header" href="#3-插件审核流程">3. 插件审核流程</a></h2>
+<h3 id="31-提交要求"><a class="header" href="#31-提交要求">3.1 提交要求</a></h3>
+<p>插件开发者需提交以下材料：</p>
+<ul>
+<li>插件源代码（托管在公开的代码仓库中）。</li>
+<li>插件描述和用途说明。</li>
+<li>安全审计报告（如有）。</li>
+<li>用户文档和示例。</li>
+</ul>
+<h3 id="32-审核步骤"><a class="header" href="#32-审核步骤">3.2 审核步骤</a></h3>
+<ol>
+<li>
+<p><strong>初步审查</strong>：</p>
+<ul>
+<li>检查插件是否符合注册表的基本要求（如代码规范、文档完整性）。</li>
+<li>确认插件未包含恶意代码或违反政策的内容。</li>
+</ul>
+</li>
+<li>
+<p><strong>安全审查</strong>：</p>
+<ul>
+<li>由安全专家进行代码审计，检查潜在的安全漏洞。</li>
+<li>验证插件是否依赖可信的第三方库。</li>
+</ul>
+</li>
+<li>
+<p><strong>社区反馈</strong>：</p>
+<ul>
+<li>插件将在社区论坛公开，收集用户和开发者的反馈。</li>
+<li>反馈期至少为 7 天。</li>
+</ul>
+</li>
+<li>
+<p><strong>最终批准</strong>：</p>
+<ul>
+<li>委员会根据审核结果和社区反馈做出最终决定。</li>
+<li>批准的插件将被添加到注册表中，并分配唯一的插件 ID。</li>
+</ul>
+</li>
+</ol>
+<h3 id="33-审核时间"><a class="header" href="#33-审核时间">3.3 审核时间</a></h3>
+<ul>
+<li>初步审查：1-3 个工作日。</li>
+<li>安全审查：5-10 个工作日。</li>
+<li>社区反馈：7 天。</li>
+<li>最终批准：3 个工作日。</li>
+</ul>
+<h2 id="4-受损插件撤销流程"><a class="header" href="#4-受损插件撤销流程">4. 受损插件撤销流程</a></h2>
+<h3 id="41-撤销触发条件"><a class="header" href="#41-撤销触发条件">4.1 撤销触发条件</a></h3>
+<p>以下情况将触发插件撤销流程：</p>
+<ul>
+<li>插件被发现包含恶意代码或安全漏洞。</li>
+<li>插件违反注册表政策。</li>
+<li>插件维护者主动请求撤销。</li>
+</ul>
+<h3 id="42-撤销步骤"><a class="header" href="#42-撤销步骤">4.2 撤销步骤</a></h3>
+<ol>
+<li>
+<p><strong>事件报告</strong>：</p>
+<ul>
+<li>任何用户或开发者均可通过注册表的安全报告渠道提交事件报告。</li>
+<li>报告需包含详细的证据和描述。</li>
+</ul>
+</li>
+<li>
+<p><strong>紧急响应</strong>：</p>
+<ul>
+<li>委员会在收到报告后 24 小时内启动紧急响应。</li>
+<li>核心维护者有权暂时禁用插件，以防止进一步损害。</li>
+</ul>
+</li>
+<li>
+<p><strong>调查</strong>：</p>
+<ul>
+<li>安全专家对插件进行全面调查，确认问题的严重性和影响范围。</li>
+<li>调查过程需透明，结果将公开。</li>
+</ul>
+</li>
+<li>
+<p><strong>撤销决定</strong>：</p>
+<ul>
+<li>委员会根据调查结果做出最终决定。</li>
+<li>若确认插件受损，将永久撤销其注册表条目。</li>
+</ul>
+</li>
+<li>
+<p><strong>通知</strong>：</p>
+<ul>
+<li>插件维护者和用户将通过邮件和注册表公告收到撤销通知。</li>
+<li>通知需包含撤销原因和后续步骤。</li>
+</ul>
+</li>
+</ol>
+<h3 id="43-撤销后处理"><a class="header" href="#43-撤销后处理">4.3 撤销后处理</a></h3>
+<ul>
+<li>插件代码将从注册表中移除，但源代码仓库保持不变，供社区参考。</li>
+<li>委员会将发布安全公告，提醒用户更新或替换受损插件。</li>
+<li>若插件维护者希望重新提交，需重新经过完整的审核流程。</li>
+</ul>
+<h2 id="5-透明度和问责"><a class="header" href="#5-透明度和问责">5. 透明度和问责</a></h2>
+<h3 id="51-公开记录"><a class="header" href="#51-公开记录">5.1 公开记录</a></h3>
+<ul>
+<li>所有插件审核和撤销决策的记录将公开在注册表的 GitHub 仓库中。</li>
+<li>委员会会议记录和安全事件报告将定期公开。</li>
+</ul>
+<h3 id="52-社区参与"><a class="header" href="#52-社区参与">5.2 社区参与</a></h3>
+<ul>
+<li>社区成员可通过论坛和邮件列表参与政策讨论和反馈。</li>
+<li>委员会将定期举办线上会议，回答社区问题。</li>
+</ul>
+<h3 id="53-问责机制"><a class="header" href="#53-问责机制">5.3 问责机制</a></h3>
+<ul>
+<li>若委员会成员未能履行职责，社区可通过投票启动罢免程序。</li>
+<li>安全事件的责任将公开，并追究相关人员的责任。</li>
+</ul>
+<h2 id="6-政策更新"><a class="header" href="#6-政策更新">6. 政策更新</a></h2>
+<ul>
+<li>本政策每年审查一次，必要时进行更新。</li>
+<li>政策更新需经过社区公开讨论和委员会批准。</li>
+<li>更新后的政策将提前 30 天公开，供社区反馈。</li>
+</ul>
+<h2 id="7-联系方式"><a class="header" href="#7-联系方式">7. 联系方式</a></h2>
+<ul>
+<li><strong>安全报告</strong>：security@pluginregistry.org</li>
+<li><strong>政策讨论</strong>：governance@pluginregistry.org</li>
+<li><strong>社区论坛</strong>：https://forum.pluginregistry.org</li>
+</ul>
+<hr>
+<p><strong>版本</strong>：1.0<br><strong>发布日期</strong>：2023-10-01<br><strong>最后更新</strong>：2023-10-01</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> 将插件 SDK 发布为独立文档站点（源自 <code>docs/book/src/developing/plugin-sdk.md</code>）</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> 设立 Wiki 翻译协调员角色（由社区成员担任，负责维护翻译页面并协调志愿者翻译人员）</p>
+</li>
+</ul>
+<p><strong>成功指标：</strong></p>
+<ul>
+<li>所有基础 ADR 均已接受</li>
+<li>插件 SDK 已完成，并从 README 中外部链接。</li>
+<li>Wiki 拥有至少两种语言的活跃社区维护翻译</li>
+<li>文档 CI（frontmatter 检查 + Vale）在每个 PR 上都会通过</li>
+</ul>
+<hr>
+<h2 id="附录-a术语表"><a class="header" href="#附录-a术语表">附录 A：术语表</a></h2>
+<p><strong>架构决策记录（ADR）</strong>——对重要架构决策的不可变记录，包括促使该决策的背景、所做的决策以及其后果。ADR 一经采纳便不再更改；被取代的决策将通过新的 ADR 进行记录。</p>
+<p><strong>Diátaxis</strong> — 一种系统化的技术文档结构框架，将内容分为教程（学习）、操作指南（目标导向）、参考（信息）和解释（理解）。详见 https://diataxis.fr。</p>
+<p><strong>EA 页面工件</strong> — 由 Svyatoslav Kotusev 开发的用于企业架构文档的分类框架。将工件分为五类：考虑因素、景观、大纲、设计和标准。详见 https://eaonapage.com。</p>
+<p><strong>Frontmatter</strong> — Markdown 文件顶部的 YAML 元数据，由 <code>---</code> 分隔。使文档对工具、CI 检查和 AI 助手可读且可查询。</p>
+<p><strong>Nygard 格式</strong> — 由 Michael Nygard 引入的 ADR 格式：包含三个部分（背景、决策、后果），用于捕捉核心推理过程，避免不必要的繁文缛节。</p>
+<p><strong>绞杀榕模式</strong> — 一种迁移策略，通过在旧结构周围逐步构建新结构，逐块替换旧结构，而不是一次性全部替换。在整个迁移过程中，系统始终保持功能正常。</p>
+<p><strong>Vale</strong> — 面向技术文档的散文风格检查工具。在 CI 阶段强制执行风格、一致性和可读性规则，类似于 Clippy 对 Rust 代码质量的保障。详见 https://vale.sh。</p>
+<hr>
+<h2 id="附录-b延伸阅读"><a class="header" href="#附录-b延伸阅读">附录 B：延伸阅读</a></h2>
+<ul>
+<li><strong>Diátaxis 文档框架</strong> — https://diataxis.fr — 按类型构建技术文档的权威参考。</li>
+<li><strong>页面中的 EA 工件 (v2.2)</strong> — https://eaonapage.com — 第 3 节中使用的分类框架。</li>
+<li><strong>“面向开发者的文档”</strong> —— Jared Bhatti 等 —— 一本由维护过大型文档系统的工程师撰写的技术文档实用指南。</li>
+<li><strong>Vale 文档</strong> — https://vale.sh/docs — 第 10 节中提出的文本检查器的安装指南和配置参考。</li>
+<li><strong>Michael Nygard 关于 ADR 的文章</strong> — https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions — 这篇原始文章介绍了在第 6 节中使用的 ADR 格式。</li>
+<li><strong>GitHub Wikis 文档</strong> — https://docs.github.com/en/communities/documenting-your-project-with-wikis — 关于设置和管理 GitHub Wiki 的参考文档，详见第 5 节。</li>
+</ul>
+<hr>
+<p><em>本提案基于对 ZeroClaw 文档系统在 v0.6.8 版本的直接分析。所引用的指标（169 个 i18n 文件、2.2 MB、31 种语言版本的 README）均基于直接测量。建议内容反映了开源基础设施项目技术文档中的成熟实践，并针对 ZeroClaw 的具体约束和目标进行了适配。</em></p>
+<p>欢迎提供反馈、更正和替代方案。优秀的文档是社区共同努力的成果，而最好的结构是团队能够实际维护的那一种。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-001-intentional-architecture.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-003-governance.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-001-intentional-architecture.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-003-governance.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

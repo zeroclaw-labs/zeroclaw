@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BLOCK_KIT_PREFIX"],"fn":["conversation_history_key","parse_approval_reply","parse_attachment_markers","strip_tool_call_tags","truncate_with_ellipsis"]};

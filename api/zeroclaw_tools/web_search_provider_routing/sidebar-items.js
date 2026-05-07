@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_WEB_SEARCH_PROVIDER"],"enum":["WebSearchProviderRoute"],"fn":["resolve_web_search_provider"],"struct":["WebSearchProviderResolution"]};

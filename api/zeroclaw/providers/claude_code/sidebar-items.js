@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CLAUDE_CODE_PATH_ENV"],"struct":["ClaudeCodeProvider"]};

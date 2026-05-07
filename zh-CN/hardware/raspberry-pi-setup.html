@@ -1,0 +1,515 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>树莓派 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-53bbdbb2.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-088a9fdb.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/hardware/raspberry-pi-setup.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="raspberry-pi-setup"><a class="header" href="#raspberry-pi-setup">Raspberry Pi Setup</a></h1>
+<p>This guide covers installing and running ZeroClaw on Raspberry Pi (Pi 3, Pi 4, Pi 5, Pi Zero 2 W).</p>
+<p>The README’s “runs on &lt;$10 hardware with &lt;5 MB RAM” claim is true for the <strong>runtime</strong>. Build-time is a different story — Rust’s compiler and linker need significantly more RAM than the resulting binary, so the on-device build path needs swap and a tuned profile to avoid OOM-kills during link.</p>
+<p>For most Pi users, the <strong>pre-built binary is the path of least resistance</strong>.</p>
+<h2 id="hardware-compatibility"><a class="header" href="#hardware-compatibility">Hardware Compatibility</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Model</th><th>RAM</th><th>Pre-built binary</th><th>Build from source</th></tr>
+</thead>
+<tbody>
+<tr><td>Pi 5 (16 GB)</td><td>16 GB</td><td>✅</td><td>✅ comfortable</td></tr>
+<tr><td>Pi 5 (8 GB)</td><td>8 GB</td><td>✅</td><td>✅ with swap or <code>release-fast</code> profile</td></tr>
+<tr><td>Pi 5 (4 GB)</td><td>4 GB</td><td>✅</td><td>✅ with swap + <code>release-fast</code> profile</td></tr>
+<tr><td>Pi 4 (8 GB)</td><td>8 GB</td><td>✅</td><td>✅ with <code>release-fast</code> profile</td></tr>
+<tr><td>Pi 4 (4 GB)</td><td>4 GB</td><td>✅</td><td>✅ with swap + <code>release-fast</code> profile</td></tr>
+<tr><td>Pi 4 (2 GB)</td><td>2 GB</td><td>✅</td><td>Marginal — swap required, slow</td></tr>
+<tr><td>Pi 3 (1 GB)</td><td>1 GB</td><td>✅</td><td>❌ Not recommended</td></tr>
+<tr><td>Pi Zero 2 W</td><td>512 MB</td><td>✅</td><td>❌</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Runtime memory is minimal.</strong> Even on a Pi Zero 2 W, the core agent runs in well under 5 MB RSS once it’s started. The hardware ladder above is about whether you can compile on the device, not whether ZeroClaw can run on it.</p>
+<h2 id="option-1-pre-built-binary-recommended"><a class="header" href="#option-1-pre-built-binary-recommended">Option 1: Pre-built Binary (Recommended)</a></h2>
+<p>Fastest path. No compiler, no swap, no OOM risk.</p>
+<h3 id="using-the-install-script"><a class="header" href="#using-the-install-script">Using the install script</a></h3>
+<pre><code class="language-bash">curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
+</code></pre>
+<p>The script auto-detects your architecture (<code>aarch64</code> or <code>armv7</code>) and installs the matching release binary into <code>$CARGO_HOME/bin/zeroclaw</code> (defaulting to <code>~/.cargo/bin/zeroclaw</code>). Make sure that directory is on your <code>PATH</code>.</p>
+<h3 id="manual-download"><a class="header" href="#manual-download">Manual download</a></h3>
+<p>Pick the matching tarball from the <a href="https://github.com/zeroclaw-labs/zeroclaw/releases/latest">latest release</a>:</p>
+<pre><code class="language-bash"># 64-bit (Pi 4/5 with 64-bit Raspberry Pi OS)
+curl -LO https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-aarch64-unknown-linux-gnu.tar.gz
+tar xzf zeroclaw-aarch64-unknown-linux-gnu.tar.gz
+sudo install -m 0755 zeroclaw /usr/local/bin/
+
+# 32-bit (Pi Zero 2 W, older Pi 3 with 32-bit OS)
+curl -LO https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz
+tar xzf zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz
+sudo install -m 0755 zeroclaw /usr/local/bin/
+</code></pre>
+<h3 id="check-your-architecture"><a class="header" href="#check-your-architecture">Check your architecture</a></h3>
+<pre><code class="language-bash">uname -m
+# aarch64 → 64-bit (use the aarch64 binary)
+# armv7l  → 32-bit (use the armv7 binary)
+# armv6l  → Pi 1 / Zero (not currently supported, see #4623)
+</code></pre>
+<h2 id="option-2-cross-compile-from-another-machine"><a class="header" href="#option-2-cross-compile-from-another-machine">Option 2: Cross-Compile From Another Machine</a></h2>
+<p>If you already have a beefier machine, cross-compiling is faster than building on the Pi.</p>
+<h3 id="from-macos-apple-silicon-or-intel"><a class="header" href="#from-macos-apple-silicon-or-intel">From macOS (Apple Silicon or Intel)</a></h3>
+<pre><code class="language-bash"># Install the cross-compilation target
+rustup target add aarch64-unknown-linux-gnu
+
+# Install a Linux GNU cross-toolchain — same pattern used by the Arduino Uno Q guide
+brew tap messense/macos-cross-toolchains
+brew install aarch64-unknown-linux-gnu
+
+# 构建
+CC_aarch64_unknown_linux_gnu=aarch64-unknown-linux-gnu-gcc \
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-unknown-linux-gnu-gcc \
+cargo build --release --target aarch64-unknown-linux-gnu
+
+# Copy to your Pi
+scp target/aarch64-unknown-linux-gnu/release/zeroclaw pi@raspberrypi:~/
+</code></pre>
+<blockquote>
+<p><strong>Note:</strong> earlier drafts of this guide suggested <code>aarch64-elf-gcc</code> from Homebrew. That toolchain produces bare-metal ELF binaries and links against newlib, not glibc — it will not produce a working Raspberry Pi OS binary. Use the <code>messense/macos-cross-toolchains</code> tap above (a real Linux GNU/glibc toolchain), or fall back to Option 3 (build on the Pi).</p>
+</blockquote>
+<h3 id="from-linux-x86_64"><a class="header" href="#from-linux-x86_64">From Linux x86_64</a></h3>
+<pre><code class="language-bash"># Install cross-compilation toolchain
+sudo apt-get install -y gcc-aarch64-linux-gnu
+
+# Add target
+rustup target add aarch64-unknown-linux-gnu
+
+# Configure linker (~/.cargo/config.toml)
+# [target.aarch64-unknown-linux-gnu]
+# linker = "aarch64-linux-gnu-gcc"
+
+# 构建
+cargo build --release --target aarch64-unknown-linux-gnu
+
+# Copy to Pi
+scp target/aarch64-unknown-linux-gnu/release/zeroclaw pi@raspberrypi:~/
+</code></pre>
+<h2 id="option-3-build-on-the-pi"><a class="header" href="#option-3-build-on-the-pi">Option 3: Build on the Pi</a></h2>
+<p>Possible on Pi 4/5 if you set up swap and pick the right profile. Expect 20-40 minutes on a Pi 5 (8 GB), longer on Pi 4.</p>
+<h3 id="step-1-install-rust-toolchain"><a class="header" href="#step-1-install-rust-toolchain">Step 1: Install Rust toolchain</a></h3>
+<pre><code class="language-bash">curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+</code></pre>
+<h3 id="step-2-add-swap-critical-for-pi-5-with--8-gb-or-any-pi-4"><a class="header" href="#step-2-add-swap-critical-for-pi-5-with--8-gb-or-any-pi-4">Step 2: Add swap (critical for Pi 5 with ≤ 8 GB or any Pi 4)</a></h3>
+<p>The default <code>release</code> profile peaks around 8-10 GB RSS during fat LTO linking. Without swap, that triggers the OOM-killer mid-link.</p>
+<pre><code class="language-bash"># Create a 4 GB swap file
+sudo fallocate -l 4G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+
+# Verify
+free -h
+
+# Make persistent across reboots
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+</code></pre>
+<h3 id="step-3-choose-a-build-profile"><a class="header" href="#step-3-choose-a-build-profile">Step 3: Choose a build profile</a></h3>
+<p>The default <code>release</code> profile uses <code>lto = "fat"</code> and <code>codegen-units = 1</code> — best runtime performance, worst build memory. The <code>release-fast</code> profile (<code>codegen-units = 8</code>, <code>lto = "thin"</code>) drops peak RAM by ~half, with only minor runtime impact.</p>
+<pre><code class="language-bash">git clone https://github.com/zeroclaw-labs/zeroclaw.git
+cd zeroclaw
+
+# Pi 5 (8 GB, with swap): default release works
+cargo build --release
+
+# Pi 4 (4 GB, with swap): use release-fast
+cargo build --profile release-fast
+
+# Pi 4 (2 GB) or constrained: use ci profile (debug-info-stripped, fast link)
+cargo build --profile ci
+</code></pre>
+<h3 id="step-4-install-the-binary"><a class="header" href="#step-4-install-the-binary">Step 4: Install the binary</a></h3>
+<pre><code class="language-bash"># From the build profile you used:
+sudo install -m 0755 target/release/zeroclaw /usr/local/bin/
+# or target/release-fast/zeroclaw, or target/ci/zeroclaw
+</code></pre>
+<h3 id="building-with-gpio-support"><a class="header" href="#building-with-gpio-support">Building with GPIO support</a></h3>
+<p>If you want to use Pi GPIO peripherals from skills, enable the relevant feature flag (see the <code>peripherals</code> crate). Most users don’t need this for typical agent workloads — it’s only relevant if you’re writing skills that talk to attached hardware.</p>
+<h2 id="containerized-deployment-podman-recommended-over-docker"><a class="header" href="#containerized-deployment-podman-recommended-over-docker">Containerized deployment (Podman recommended over Docker)</a></h2>
+<p><strong>Pis are memory-constrained, and that’s the operating reality this section is written against.</strong> The 2 GB Pi 4 is the low-bar test unit for this guide — if a setup doesn’t leave headroom on a 2 GB box, it’s not a setup we recommend. ZeroClaw itself runs in well under 5 MB RSS at runtime, but everything you stack alongside it (channel transports, browser-control, MCP servers, an adjacent agent or two, plus the OS) competes for the same fixed pool. Memory you don’t spend on container infrastructure is memory ZeroClaw and its tools get to use.</p>
+<p>Concrete budget on a 2 GB Pi 4 running Raspberry Pi OS Bookworm/Trixie headless:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>组件</th><th>Approx RSS</th></tr>
+</thead>
+<tbody>
+<tr><td>Kernel + base userspace + sshd</td><td>~150-250 MB</td></tr>
+<tr><td><code>dockerd</code> (idle, no containers)</td><td>~150-200 MB</td></tr>
+<tr><td>ZeroClaw runtime (gateway only)</td><td>~5 MB</td></tr>
+<tr><td>One agent container (e.g. ghcr.io/zeroclaw-labs/zeroclaw)</td><td>~30-80 MB</td></tr>
+<tr><td><strong>Available with Docker</strong></td><td>~1.3-1.5 GB</td></tr>
+<tr><td><strong>Available with Podman (no daemon)</strong></td><td>~1.5-1.7 GB</td></tr>
+</tbody>
+</table>
+</div>
+<p>The Podman delta is on the order of ~150-200 MB freed up — small in absolute terms, large as a percentage of what’s left over after the OS gets its share. On a 2 GB unit that’s the difference between comfortably running ZeroClaw + a heavy channel transport (Matrix with media, browser-automation skills) and OOM-killing under load.</p>
+<p><strong>Three reasons Podman is the better fit on Pi than Docker:</strong></p>
+<ol>
+<li><strong>Rootless by default → security headroom.</strong> Podman doesn’t need a root daemon; containers run as your user. On an exposed edge device that matters more than on a developer laptop.</li>
+<li><strong>systemd-native via Quadlets → operational simplicity.</strong> Podman ships <code>.container</code> unit files that systemd manages directly — same lifecycle, logging, and dependency model as any other unit. No separate <code>docker.service</code> to babysit, no separate logging layer.</li>
+<li><strong>No daemon RSS → memory headroom.</strong> Skipping <code>dockerd</code>’s persistent ~150-200 MB is the single biggest knob you can turn on a 2 GB Pi without sacrificing isolation.</li>
+</ol>
+<p>The trade-off: Podman’s rootless network model uses slirp4netns (or pasta on newer versions), which is slower than the bridge that Docker’s daemon sets up. For workloads that move a lot of HTTP traffic between containers on the same Pi, that’s worth measuring. For ZeroClaw’s typical “one or two long-running agent containers” pattern, the difference is negligible — and on memory-constrained hardware, the daemon-RSS savings dominate the calculation anyway.</p>
+<h3 id="quick-install-raspberry-pi-os-bookwormtrixie"><a class="header" href="#quick-install-raspberry-pi-os-bookwormtrixie">Quick install (Raspberry Pi OS Bookworm/Trixie)</a></h3>
+<pre><code class="language-bash">sudo apt-get install -y podman
+# Optional: shorter aliases — many docker-compose flows just work with podman-compose
+sudo apt-get install -y podman-compose
+</code></pre>
+<h3 id="running-zeroclaw-under-podman"><a class="header" href="#running-zeroclaw-under-podman">Running ZeroClaw under Podman</a></h3>
+<p>The published OCI image works under Podman without modification:</p>
+<pre><code class="language-bash">podman pull ghcr.io/zeroclaw-labs/zeroclaw:latest
+
+podman run --rm -d \
+  --name zeroclaw \
+  -p 42617:42617 \
+  -v ~/.zeroclaw:/root/.zeroclaw \
+  ghcr.io/zeroclaw-labs/zeroclaw:latest \
+  daemon --host 0.0.0.0 --port 42617
+</code></pre>
+<blockquote>
+<p><strong>Bind gotcha:</strong> ZeroClaw defaults to <code>127.0.0.1</code> for the gateway. Inside a container that means the gateway is unreachable from the host. Always pass <code>--host 0.0.0.0</code> (or set <code>ZEROCLAW_BIND=0.0.0.0</code>) when running in a container.</p>
+</blockquote>
+<h3 id="running-as-a-systemd-unit-via-quadlet"><a class="header" href="#running-as-a-systemd-unit-via-quadlet">Running as a systemd unit via Quadlet</a></h3>
+<p>Drop a <code>.container</code> file in <code>/etc/containers/systemd/</code> (system) or <code>~/.config/containers/systemd/</code> (rootless user):</p>
+<pre><code class="language-ini"># ~/.config/containers/systemd/zeroclaw.container
+[Unit]
+Description=ZeroClaw gateway
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/zeroclaw-labs/zeroclaw:latest
+ContainerName=zeroclaw
+PublishPort=42617:42617
+Environment=ZEROCLAW_BIND=0.0.0.0
+Exec=daemon --host 0.0.0.0 --port 42617
+Volume=zeroclaw-data:/root/.zeroclaw
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target default.target
+</code></pre>
+<pre><code class="language-bash">systemctl --user daemon-reload
+systemctl --user start zeroclaw.service
+</code></pre>
+<p>For rootless setups, also run <code>loginctl enable-linger $USER</code> so the service starts before you log in.</p>
+<h2 id="post-install-native-non-container-setup"><a class="header" href="#post-install-native-non-container-setup">Post-Install: Native (non-container) setup</a></h2>
+<h3 id="1-initialize-zeroclaw"><a class="header" href="#1-initialize-zeroclaw">1. Initialize ZeroClaw</a></h3>
+<pre><code class="language-bash">zeroclaw onboard
+</code></pre>
+<p>This walks you through provider auth, gateway config, and creates <code>~/.zeroclaw/config.toml</code>.</p>
+<h3 id="2-verify-it-works"><a class="header" href="#2-verify-it-works">2. Verify it works</a></h3>
+<pre><code class="language-bash">zeroclaw doctor
+zeroclaw agent -m "what's 2+2?"
+</code></pre>
+<h3 id="3-run-as-a-persistent-service"><a class="header" href="#3-run-as-a-persistent-service">3. Run as a persistent service</a></h3>
+<pre><code class="language-bash"># Install and start the systemd user service
+zeroclaw service install
+systemctl --user enable --now zeroclaw
+
+# So it survives logout / reboot:
+loginctl enable-linger $USER
+</code></pre>
+<h3 id="4-run-as-a-foreground-daemon"><a class="header" href="#4-run-as-a-foreground-daemon">4. Run as a foreground daemon</a></h3>
+<p>For dev / debugging:</p>
+<pre><code class="language-bash">zeroclaw daemon --host 0.0.0.0 --port 42617
+</code></pre>
+<h3 id="5-enable-channels"><a class="header" href="#5-enable-channels">5. Enable channels</a></h3>
+<p>ZeroClaw can connect to chat platforms (Matrix, Mattermost, Discord, Telegram, etc.). See <a href="../channels/overview.html">Channels → Overview</a>. Most channel transports work fine on a Pi; the heaviest is the WebRTC stack used by some voice channels, which can spike CPU during call setup.</p>
+<h2 id="gpio-and-hardware-peripherals"><a class="header" href="#gpio-and-hardware-peripherals">GPIO and Hardware Peripherals</a></h2>
+<p>If you want skills to drive GPIO pins (LEDs, buttons, sensors, etc.):</p>
+<ol>
+<li>
+<p>Add your user to the <code>gpio</code> group:</p>
+<pre><code class="language-bash">sudo usermod -aG gpio $USER
+# Log out and back in for the group change to take effect
+</code></pre>
+</li>
+<li>
+<p>Use the <code>peripherals</code> crate’s GPIO bindings from your skills. See <a href="./hardware-peripherals-design.html">Hardware → Peripherals design</a> for the abstraction model.</p>
+</li>
+</ol>
+<h2 id="故障排除"><a class="header" href="#故障排除">故障排除</a></h2>
+<h3 id="oom-killed-during-build"><a class="header" href="#oom-killed-during-build">OOM-killed during build</a></h3>
+<p>The <code>release</code> profile peaks at ~8-10 GB RSS during the final link. Either:</p>
+<ul>
+<li>Switch to <code>cargo build --profile release-fast</code> (drops peak to ~4-6 GB).</li>
+<li>Add a 4 GB swap file (Step 2 above).</li>
+<li>Cross-compile from a beefier machine (Option 2).</li>
+</ul>
+<p>If you’re using <code>release-fast</code> and still OOMing on a Pi 4 (2 GB), drop to <code>--profile ci</code> or use the pre-built binary.</p>
+<h3 id="build-extremely-slow"><a class="header" href="#build-extremely-slow">Build extremely slow</a></h3>
+<p>Expected on Pi 4. A clean release build takes 30-60 minutes; incremental builds are reasonable. Use cross-compilation (Option 2) if build time matters.</p>
+<h3 id="pre-built-binary-exec-format-error"><a class="header" href="#pre-built-binary-exec-format-error">Pre-built binary: “Exec format error”</a></h3>
+<p>Architecture mismatch. Check <code>uname -m</code> and download the matching binary. <code>aarch64</code> is 64-bit (most Pi 4/5 with 64-bit Raspberry Pi OS); <code>armv7l</code> is 32-bit.</p>
+<h3 id="gpio-permission-denied"><a class="header" href="#gpio-permission-denied">GPIO permission denied</a></h3>
+<pre><code class="language-bash">sudo usermod -aG gpio $USER
+# Log out and back in
+</code></pre>
+<h3 id="service-wont-start-after-reboot"><a class="header" href="#service-wont-start-after-reboot">Service won’t start after reboot</a></h3>
+<p>Make sure user-level systemd persists across logout:</p>
+<pre><code class="language-bash">loginctl enable-linger $USER
+</code></pre>
+<h3 id="container-cant-reach-gateway-from-host"><a class="header" href="#container-cant-reach-gateway-from-host">Container can’t reach gateway from host</a></h3>
+<p>ZeroClaw binds <code>127.0.0.1</code> by default — inside a container that means localhost-of-the-container. Pass <code>--host 0.0.0.0</code> (or <code>ZEROCLAW_BIND=0.0.0.0</code>) when running in Podman/Docker.</p>
+<h2 id="performance-tips"><a class="header" href="#performance-tips">Performance tips</a></h2>
+<ul>
+<li><strong>Use an SSD or fast SD card.</strong> Compilation is heavily I/O-bound; a USB 3.0 SSD on a Pi 4/5 cuts build time significantly.</li>
+<li><strong>Run headless.</strong> Stop the desktop environment if not needed: <code>sudo systemctl set-default multi-user.target</code>.</li>
+<li><strong>tmpfs for build artifacts</strong> (if you have RAM + swap headroom): <code>export CARGO_TARGET_DIR=/tmp/zeroclaw-target</code>.</li>
+<li><strong>Check that <code>clk_ignore_unused</code> isn’t set</strong> on the kernel cmdline if you’re using a custom image — that flag (occasionally seen on vendor BSPs) inhibits clock gating and increases idle power. Stock Raspberry Pi OS doesn’t ship with it.</li>
+</ul>
+<h2 id="相关"><a class="header" href="#相关">相关</a></h2>
+<ul>
+<li><a href="../setup/linux.html">Linux setup</a> — non-Pi-specific Linux setup, applicable here too once the binary’s installed</li>
+<li><a href="../setup/service.html">Service management</a> — systemd patterns, deeper than what’s above</li>
+<li><a href="./hardware-peripherals-design.html">Hardware → Peripherals design</a> — GPIO and the peripherals crate</li>
+<li><a href="./adding-boards-and-tools.html">Hardware → Adding boards &amp; tools</a> — extending hardware support</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../hardware/aardvark.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../sop/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../hardware/aardvark.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../sop/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,962 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Zero compromise in practice - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-c5ad0191.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-425f4b80.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/foundations/fnd-006-zero-compromise-in-practice.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="fnd-006-zero-compromise-in-practice--code-health-error-discipline-and-the-production-readiness-standard"><a class="header" href="#fnd-006-zero-compromise-in-practice--code-health-error-discipline-and-the-production-readiness-standard">FND-006: Zero Compromise in Practice — Code Health, Error Discipline, and the Production Readiness Standard</a></h1>
+<h3 id="starting-v070--type-quality--rev-1"><a class="header" href="#starting-v070--type-quality--rev-1">Starting v0.7.0 · Type: Quality · Rev. 1</a></h3>
+<blockquote>
+<p><strong>Canonical reference</strong> · Ratified by the team · Rev. 1
+Discussion thread and full revision history: <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5653">#5653</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p>A note to the team before you read this.</p>
+<p>This is the sixth document in ZeroClaw’s maturity framework. The five before it
+addressed architecture, documentation, governance, engineering infrastructure, and
+collaboration — the structural and human scaffolding that surrounds the work. Each
+one answered a different question about how we build this project together. If you
+have read them all, you may have noticed a question none of them answered: yes, but
+how do we actually write it well? The architecture RFC told you what shape to build
+in. The documentation RFC told you how to record it. The governance RFC told you how
+to coordinate. The CI/CD RFC told you how to gate it. The culture RFC told you how
+to work with the people around you. None of them told you what quality looks like at
+the sentence level — inside a function, at the moment you are making a choice.</p>
+<p>That is what this document is for.</p>
+<p>The specific topics here — error handling, API documentation, test design, technical
+debt — are Rust topics on the surface. The skills they develop are not. Technology
+changes. It changes faster with each iteration than it did the time before. The tools
+you are using today — this language, this framework, this AI assistant — will be
+superseded. Some of them within the lifetime of this project. The judgment this
+document is trying to help you build will not be superseded. It will compound quietly
+in the background of every decision you make, in every language you will ever write,
+in every system you will ever build, and in work that may have nothing to do with
+software at all. That is the investment we are making in you. Not in your ability to
+write Rust. In your ability to think about quality, failure, and craft — and to carry
+that thinking with you into every tool you ever pick up, including the AI tools you
+are using today and the ones that do not exist yet.</p>
+<p>Take your time with it.</p>
+</blockquote>
+<hr>
+<h2 id="the-maturity-framework-suite"><a class="header" href="#the-maturity-framework-suite">The Maturity Framework Suite</a></h2>
+<p>This RFC is the sixth in a set of documents that together form ZeroClaw’s maturity
+framework. They are designed to be read as a whole, though each stands on its own.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>RFC</th><th>Scope</th><th>Issue</th></tr>
+</thead>
+<tbody>
+<tr><td>Intentional Architecture — Microkernel Transition</td><td>What we are building and how it is structured</td><td>#5574</td></tr>
+<tr><td>Documentation Standards and Knowledge Architecture</td><td>How we document what we build</td><td>#5576</td></tr>
+<tr><td>Team Organization and Project Governance</td><td>How we coordinate and make decisions</td><td>#5577</td></tr>
+<tr><td>Engineering Infrastructure — CI/CD Pipeline</td><td>How we build, test, and ship reliably</td><td>#5579</td></tr>
+<tr><td>Contribution Culture — Human Collaboration, AI Partnership, and Team Growth</td><td>How we work together and grow</td><td>#5615</td></tr>
+<tr><td>Zero Compromise in Practice — Code Health, Error Discipline, and the Production Readiness Standard</td><td>How we write code that lasts</td><td>this RFC</td></tr>
+</tbody>
+</table>
+</div>
+<p>The first five RFCs answer structural and human questions. This one answers the question
+that sits inside all of them: given the structure, given the team, given the tools —
+what does it mean to write the code well?</p>
+<hr>
+<h2 id="table-of-contents"><a class="header" href="#table-of-contents">Table of Contents</a></h2>
+<ol>
+<li>A Development Philosophy: The Investment in Judgment</li>
+<li>Honest Assessment: What the Codebase Is Telling Us
+<ul>
+<li>2.1 The Evidence</li>
+<li>2.2 What the Numbers Do Not Show</li>
+<li>2.3 What Is Already Good</li>
+</ul>
+</li>
+<li>Gates and Standards: The Central Distinction</li>
+<li>The Seven Disciplines
+<ul>
+<li>4.1 Error Handling as a Design Concern</li>
+<li>4.2 Public API Surface as a Promise</li>
+<li>4.3 Tests as Design Feedback</li>
+<li>4.4 Technical Debt Triage</li>
+<li>4.5 Security at the Application Layer</li>
+<li>4.6 Observability as Debuggability</li>
+<li>4.7 Working Above the Floor</li>
+</ul>
+</li>
+<li>What This Means for AI-Assisted Development</li>
+<li>The Portability of Craft</li>
+<li>What This Means for Contributors</li>
+</ol>
+<hr>
+<h2 id="revision-history"><a class="header" href="#revision-history">Revision History</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Rev</th><th>Date</th><th>Summary</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>2026-04-12</td><td>Initial draft</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="1-a-development-philosophy-the-investment-in-judgment"><a class="header" href="#1-a-development-philosophy-the-investment-in-judgment">1. A Development Philosophy: The Investment in Judgment</a></h2>
+<p>The architecture RFC introduced a decision hierarchy that describes how every choice
+in this project should flow:</p>
+<pre><code>Vision
+  └── Architecture
+        └── Design
+              └── Implementation
+                    └── Testing
+                          └── Documentation
+                                └── Release
+</code></pre>
+<p>That hierarchy answers the question of <em>what</em> to build at each layer. This RFC lives
+inside the Implementation and Testing layers and asks a different question: <em>how well?</em></p>
+<p>The answer to “how well” is not a checklist. Checklists can be satisfied without being
+understood, and in software, understanding is what creates durable results. A contributor
+who has memorized the rules will follow them until the situation is slightly different.
+A contributor who has internalized the judgment behind the rules will apply it correctly
+to situations the rules did not anticipate — including the situations that matter most,
+which are always the ones nobody planned for.</p>
+<p>This distinction matters especially in this project’s context. ZeroClaw is operated in
+an environment of powerful tools: AI code generation, CI gates that catch a wide range
+of common errors, IDE linters, automated security scanners. These tools are genuinely
+valuable. They define a floor — a minimum below which code should not be merged. But
+what they cannot do is think. They cannot decide whether an error is operational or a
+programmer error. They cannot evaluate whether a test is asserting the right behavior.
+They cannot tell whether a public API is documented clearly enough for a future
+contributor to implement against correctly. They can only check what they were
+programmed to check.</p>
+<p>The gap between “what the tools can verify” and “quality that serves users, contributors,
+and the project over time” is filled by judgment. That judgment is what this document
+is trying to help you build — not to replace the tools, but to direct them.</p>
+<hr>
+<h2 id="2-honest-assessment-what-the-codebase-is-telling-us"><a class="header" href="#2-honest-assessment-what-the-codebase-is-telling-us">2. Honest Assessment: What the Codebase Is Telling Us</a></h2>
+<p>This section is not criticism. It is a diagnosis. The same framing that applied in the
+architecture RFC applies here: you cannot improve what you cannot name, and the
+specifics are useful precisely because they are specific.</p>
+<h3 id="21-the-evidence"><a class="header" href="#21-the-evidence">2.1 The Evidence</a></h3>
+<p>The workspace decomposition from RFC §5574 succeeded. The crates exist, the trait
+boundaries are real, and the compiler enforces the dependency direction. That is
+genuinely good work. And within those new crates, the same patterns that characterized
+the original monolith have been carried forward — because the codebase moved before
+the team had a shared model for what “quality at the implementation level” looks like.</p>
+<p>These are measured facts, not estimates:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Value</th><th>What It Indicates</th></tr>
+</thead>
+<tbody>
+<tr><td><code>zeroclaw-config/src/schema.rs</code></td><td>16,800 lines</td><td>Now the largest file in the codebase; the original <code>loop_.rs</code> was called out at 9,500 lines in the architecture RFC — this surpasses it</td></tr>
+<tr><td><code>zeroclaw-channels/src/orchestrator/mod.rs</code></td><td>11,813 lines</td><td>Second-largest file; a single module carrying concentrated responsibility</td></tr>
+<tr><td><code>zeroclaw-runtime/src/onboard/wizard.rs</code></td><td>7,988 lines</td><td>A single workflow in a single file</td></tr>
+<tr><td><code>zeroclaw-runtime/src/agent/loop_.rs</code></td><td>6,101 lines</td><td>Reduced from ~9,500 in the monolith — real, measurable progress; still large</td></tr>
+<tr><td><code>zeroclaw-channels/src/orchestrator/telegram.rs</code></td><td>5,122 lines</td><td>One channel implementation; one file</td></tr>
+<tr><td><code>.unwrap()</code> / <code>.expect()</code> calls in crates</td><td>5,630</td><td>Each one is a deferred judgment call about error handling — see §4.1</td></tr>
+<tr><td><code>.unwrap()</code> / <code>.expect()</code> calls in legacy <code>src/</code></td><td>240</td><td>The migration carried the pattern forward at scale</td></tr>
+<tr><td>Public functions in <code>zeroclaw-api</code></td><td>371</td><td>The entire foundational API surface — every other crate depends on this</td></tr>
+<tr><td>Doc comment lines in <code>zeroclaw-api</code></td><td>~27</td><td>Roughly 14:1 ratio of undocumented public API — see §4.2</td></tr>
+<tr><td><code>#[allow(unused_imports)]</code> / <code>#[allow(dead_code)]</code> in legacy <code>src/</code> modules</td><td>~30+ instances</td><td>The compiler has identified code that is no longer being used; it has been asked not to say so</td></tr>
+<tr><td><code>TODO</code> / <code>FIXME</code> / <code>todo!()</code> / <code>unimplemented!()</code> across the full codebase</td><td>20</td><td>Notably low — suggests most debt is silent rather than marked</td></tr>
+</tbody>
+</table>
+</div>
+<p>The last row deserves its own note. Twenty explicit markers of incomplete work in a
+codebase of this size is not a sign that the work is nearly finished. It is a sign that
+most of the incomplete work is not being labeled as such. Unmarked debt is harder to
+find, harder to prioritize, and harder to assign than debt that has been named. Silence
+is not the same as completeness.</p>
+<h3 id="22-what-the-numbers-do-not-show"><a class="header" href="#22-what-the-numbers-do-not-show">2.2 What the Numbers Do Not Show</a></h3>
+<p>These numbers measure what is countable. The more consequential quality questions cannot
+be counted:</p>
+<ul>
+<li>Whether the 5,630 <code>.unwrap()</code> calls are in critical paths or in test utilities</li>
+<li>Whether the tests that exist are testing behavior or testing implementation details</li>
+<li>Whether the public functions in <code>zeroclaw-api</code> can be correctly implemented by someone
+reading only the signature and type</li>
+<li>Whether a log message emitted during a production failure would contain enough context
+to diagnose the failure</li>
+<li>Whether a contributor working in the security module understands which data has crossed
+a trust boundary and which has not</li>
+</ul>
+<p>These are judgment questions. They do not have a CI gate. They have the standards this
+document is proposing to name, and the culture of review and mentorship we are building
+together.</p>
+<h3 id="23-what-is-already-good"><a class="header" href="#23-what-is-already-good">2.3 What Is Already Good</a></h3>
+<p>The diagnosis should not obscure what is genuinely well-built.</p>
+<p>The trait layer in <code>zeroclaw-api</code> is the right architecture. <code>Provider</code>, <code>Channel</code>,
+<code>Tool</code>, <code>Memory</code>, <code>Observer</code>, <code>RuntimeAdapter</code>, and <code>Peripheral</code> are clean, well-reasoned
+abstractions. They are the right seams. The problem is not the design — it is that the
+design is not yet fully expressed in documentation, test coverage, and error handling
+discipline. This RFC is about closing that gap.</p>
+<p>The security model is thoughtful. Pairing codes, autonomy levels, sandboxing layers, and
+policy enforcement show real design intent. That intent needs to be understood by every
+contributor who writes code near a trust boundary — and this RFC exists partly to give
+contributors the vocabulary to recognize where those boundaries are.</p>
+<p>The observability infrastructure is mature. OpenTelemetry, Prometheus, and DORA metrics
+are all implemented against a clean <code>Observer</code> trait. The infrastructure is in place.
+The teaching gap is in how contributors use it so that it actually helps when something
+goes wrong.</p>
+<p>The test suite is not absent. The existing test investment is real. The work this RFC
+describes is about the quality and distribution of that investment — what gets tested,
+how, and whether the tests prove what they appear to prove.</p>
+<p><code>ADR-004-tool-shared-state-ownership.md</code> is an excellent piece of architectural record.
+It proves the team can produce high-quality design documentation when the expectation
+is clear. This RFC is proposing an equivalent expectation for the code itself.</p>
+<hr>
+<h2 id="3-gates-and-standards-the-central-distinction"><a class="header" href="#3-gates-and-standards-the-central-distinction">3. Gates and Standards: The Central Distinction</a></h2>
+<p>This is the organizing idea of the entire document. Understanding it clearly matters
+more than any specific technique in §4.</p>
+<p>A <strong>gate</strong> is binary. Pass or fail. It is automated, enforced by tooling, and defines
+the minimum below which no code merges. The CI/CD RFC built the gates. They are real
+and working.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gate</th><th>What It Checks</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cargo fmt --check</code></td><td>Code is formatted consistently across the workspace</td></tr>
+<tr><td><code>cargo clippy --workspace --all-targets -D warnings</code></td><td>No Clippy-known antipatterns; workspace-wide</td></tr>
+<tr><td><code>cargo deny check</code></td><td>No unacknowledged security advisories; license and source compliance</td></tr>
+<tr><td><code>cargo nextest run --workspace</code></td><td>Tests that exist, pass</td></tr>
+</tbody>
+</table>
+</div>
+<p>A <strong>standard</strong> is aspirational. It describes what quality looks like above the floor.
+It is enforced by judgment, peer review, and the habits the team builds together.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Standard</th><th>What It Describes</th></tr>
+</thead>
+<tbody>
+<tr><td>Error handling discipline</td><td>Failures are categorized; operational errors surface with context at the right layer</td></tr>
+<tr><td>API documentation</td><td>Every public item has enough documentation to use correctly without reading the implementation</td></tr>
+<tr><td>Test quality</td><td>Tests assert behavior, not implementation; test difficulty is treated as design feedback</td></tr>
+<tr><td>Debt triage</td><td>Unaddressed debt is labeled, located, and risk-weighted; high-risk debt has an owner</td></tr>
+<tr><td>Security posture</td><td>Trust boundaries are explicit at the implementation level, not only at the policy level</td></tr>
+<tr><td>Observability discipline</td><td>Log messages answer the diagnostic question; spans bound meaningful units of work</td></tr>
+</tbody>
+</table>
+</div>
+<p>Gates and standards are not in competition. They are complementary layers. Gates without
+standards produce code that passes every check and still fails users. Standards without
+gates are unenforceable. You need both. The project currently has good gates and
+underdeveloped standards.</p>
+<blockquote>
+<p>A codebase can pass every gate and still be incomprehensible to the next contributor,
+silent where it should surface errors, impossible to test in isolation, and insecure
+at the boundary where user input meets business logic. The green checkmark answers the
+question “did this code pass the rules we wrote down?” It does not answer the question
+“is this code good?” Those are not the same question.</p>
+</blockquote>
+<p>This is not a criticism of the gates. The gates are valuable precisely because they
+define a shared, enforceable baseline that every contributor works within. The goal of
+this document is to build the shared vocabulary and judgment that defines what good looks
+like above that baseline — and to explain clearly why that judgment cannot be delegated
+to a tool.</p>
+<hr>
+<h2 id="4-the-seven-disciplines"><a class="header" href="#4-the-seven-disciplines">4. The Seven Disciplines</a></h2>
+<h3 id="41-error-handling-as-a-design-concern"><a class="header" href="#41-error-handling-as-a-design-concern">4.1 Error Handling as a Design Concern</a></h3>
+<p>Every <code>.unwrap()</code> call is a decision. Most of the 5,630 in the codebase were not made
+consciously — they were made by default, because <code>.unwrap()</code> is the path of least
+resistance when you need a value out of a <code>Result</code> or <code>Option</code> and want to move on. The
+problem with decisions made by default is that they are not decisions — they are
+deferrals. And what they defer is a real question: <em>what should happen here when this
+fails?</em></p>
+<p>The answer depends on what kind of failure you are dealing with. There are three kinds,
+and they have three different correct responses.</p>
+<p><strong>Programmer errors</strong> are violations of invariants that should be impossible in correct
+code. A function that requires a non-empty <code>Vec</code>, called with an empty one. An enum
+match that reaches an arm the type system should have made unreachable. These represent
+bugs — not operational failures, but incorrect logic. <code>panic!</code> is the correct response,
+because the goal is to find these at development time, not in front of a user at runtime.
+<code>assert!</code> and <code>debug_assert!</code> are the right tools. <code>.expect()</code> with a message explaining
+why this state is impossible is also appropriate here — it makes the reasoning explicit
+and searchable, so the next person who reads the code understands why the panic was
+intentional.</p>
+<p><strong>Operational errors</strong> are expected failure modes. Network timeouts. Files that do not
+exist. API keys that have expired. Provider responses that carry an error status. Users
+who provide malformed input. These are not bugs — they are the normal operating
+conditions of a system that interacts with the world. The correct response is
+<code>Result&lt;T, E&gt;</code>. The <code>?</code> operator propagates the failure to a caller who is in a better
+position to decide what to do about it. A <code>.unwrap()</code> on an operational error is a
+deferred panic: it will fire, eventually, under real conditions, in front of a real user,
+with no useful context and no opportunity to recover.</p>
+<p><strong>Configuration errors</strong> are malformed or missing configuration discovered at startup.
+The correct response is to fail fast — but specifically. Not a panic with a stack trace,
+not a vague “invalid config” message. A message that points at the specific field,
+explains what was expected, and tells the operator what to provide. A user who cannot
+start ZeroClaw because of a misconfiguration should leave the process with a clear
+understanding of exactly what to fix.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Failure kind</th><th>What it means</th><th>Correct response</th></tr>
+</thead>
+<tbody>
+<tr><td>Programmer error</td><td>Invariant violated; should be impossible in correct code</td><td><code>panic!</code>, <code>assert!</code>, <code>.expect("reason this is safe")</code></td></tr>
+<tr><td>Operational error</td><td>Expected failure mode; the world is not cooperating</td><td><code>Result&lt;T, E&gt;</code>, <code>?</code>, structured error type with context</td></tr>
+<tr><td>Configuration error</td><td>Invalid or missing startup configuration</td><td>Fail fast with a specific, actionable message</td></tr>
+</tbody>
+</table>
+</div>
+<p>Before every <code>.unwrap()</code> or <code>.expect()</code>, ask yourself: which kind of failure is this?
+If the answer is “programmer error — this state cannot occur in correct code,” then
+<code>.expect()</code> with a comment explaining why is the right choice, and it communicates your
+reasoning to every future reader. If the answer is anything else, use <code>?</code> or handle the
+failure explicitly.</p>
+<p>The <code>?</code> operator is worth understanding for what it <em>says</em>, not just what it does. It
+says: I acknowledge this operation can fail. I am explicitly propagating that failure to
+my caller, who is better positioned to decide what to do about it. That acknowledgment
+is architecturally meaningful — it makes the error handling contract visible at the call
+site and pushes decisions to the layer that has the most context.</p>
+<p>The goal is not zero <code>.unwrap()</code> calls. Some are correct. The goal is that every one
+represents a conscious decision, with the reasoning visible to anyone who reads the code.
+The difference between <code>.unwrap()</code> and <code>.expect("this vec is guaranteed non-empty by the caller — see §4.2 of the SOP engine invariants")</code> is not just style. It is the
+difference between deferred judgment and documented judgment.</p>
+<h3 id="42-public-api-surface-as-a-promise"><a class="header" href="#42-public-api-surface-as-a-promise">4.2 Public API Surface as a Promise</a></h3>
+<p><code>pub</code> is a contract.</p>
+<p>When you mark a function, struct, trait, or module as public, you are making a promise
+to every caller. That includes the contributor who implements against it next month with
+no memory of your original intent. It includes the AI assistant that reads your crate
+to generate an implementation. It includes the person debugging a production incident
+who needs to understand what this was supposed to do. It includes yourself, returning
+to this code after two months working on something else.</p>
+<p>A public item without documentation is a promise with no terms. The caller has no way
+to know what assumptions you made when you wrote it, what error conditions it can return
+and under what circumstances, what side effects it has, whether it is safe to call
+concurrently, or what the subtle difference is between two functions with similar names.
+They are left to infer — from the name, the type signature, and the implementation body
+— something that you could have told them in three sentences.</p>
+<p>The <code>zeroclaw-api</code> situation is specific enough to name directly. This is the one crate
+the entire architecture depends on. Every provider, channel, tool, memory backend,
+observer, runtime adapter, and peripheral implementation in the workspace is built
+against these traits and types. An undocumented interface in this foundation propagates
+confusion into every crate that implements it, every test that exercises it, and every
+AI-generated code that works with it. The 14:1 ratio of undocumented public API surface
+is not a documentation style preference — it is a gap in the contract that the
+architecture RFC said was the most important layer of the system.</p>
+<p>The AI dimension here is practical and direct: when you ask an AI assistant to implement
+a trait or call a function that has no documentation, the AI infers intent from the name
+and the type signature. Sometimes that inference is correct. More often, it produces
+code that compiles, passes the type checker, and behaves incorrectly under specific
+conditions that the AI did not know to anticipate — because nobody wrote them down.
+Documentation is not just for humans. It is the specification you provide to every tool
+that will ever work with your code, and to every person who will ever depend on it.</p>
+<p>At minimum, every public item in <code>zeroclaw-api</code> should carry:</p>
+<ul>
+<li><strong>One sentence describing what it does.</strong> Not what it is — what it does.</li>
+<li><strong>An <code># Errors</code> section</strong> (if it returns <code>Result</code>): under what conditions does this
+fail, and what error variants does the caller need to handle?</li>
+<li><strong>A <code># Panics</code> section</strong> (if it can panic): under what conditions, and why?</li>
+<li><strong>Preconditions</strong> (if any are non-obvious): what must be true before calling this?</li>
+</ul>
+<p>A three-sentence doc comment on a public trait method is worth more to the next
+implementor than a hundred lines of implementation with no explanation. The
+implementation tells them what the code does. The documentation tells them what it is
+supposed to do — which is what matters when the two diverge.</p>
+<h3 id="43-tests-as-design-feedback"><a class="header" href="#43-tests-as-design-feedback">4.3 Tests as Design Feedback</a></h3>
+<p>The goal of a test is not to produce a green checkmark. The goal is to create a precise,
+executable record of what a piece of code is <em>supposed to do</em> — a record that fails
+loudly if that behavior ever changes.</p>
+<p>This distinction matters because there are two fundamentally different kinds of tests,
+and only one of them achieves that goal.</p>
+<p>A test that reaches into a struct’s internal state, sets values directly, calls a method,
+and asserts on return values is testing the <em>implementation</em>. If the implementation
+changes — if the same behavior is achieved through a different mechanism — the test
+breaks, even though nothing the user cares about changed. This creates friction against
+refactoring without creating safety. It also tends to pass when the behavior is wrong in
+ways the test did not anticipate.</p>
+<p>A test that constructs values through public interfaces, exercises behavior through
+public methods, and asserts on observable outcomes is testing the <em>behavior</em>. If the
+implementation changes but the behavior is preserved, the test passes. If the behavior
+changes in a way that matters to users, the test fails. This is what makes confident
+refactoring possible: the tests are checking that you got the right answer, not that
+you got it a particular way.</p>
+<p>The more important principle is the diagnostic one:</p>
+<blockquote>
+<p>A test that is hard to write is usually telling you something about the design.</p>
+</blockquote>
+<p>If writing a unit test for a function requires standing up a database connection, mocking
+six dependencies, building a full configuration object, and starting an async runtime
+explicitly — that function is probably doing too much, depending on too much, or sitting
+at the wrong layer of the architecture. The difficulty is not a nuisance to work around.
+It is feedback. The test is being honest about something the code is not yet honest
+about.</p>
+<p>This connects directly to the crate structure the architecture RFC established. One of
+the purposes of crate decomposition was to create components that can be tested in
+isolation. <code>zeroclaw-tool-call-parser</code> should be testable with a <code>&amp;str</code> input and no
+runtime. <code>zeroclaw-config</code> should be testable by constructing config structs directly.
+Trait implementations in <code>zeroclaw-api</code> should be testable against fake implementations
+of the trait — not against the full production stack. When you find yourself unable to
+test a component without its entire environment, ask whether a dependency has entered
+the implementation that the architecture did not intend. The test is giving you the
+answer; the question is whether you are listening to it.</p>
+<p>A practical approach to growing test quality over time:</p>
+<ul>
+<li>When you fix a bug, write a test that would have caught it. This one habit, practiced
+consistently, moves the test suite toward the failure modes that actually matter.</li>
+<li>When you add behavior, write a test that proves the behavior exists and can be
+verified in isolation.</li>
+<li>When a test is hard to write, spend time asking <em>why</em> before reaching for a mock. The
+answer to that question is usually more valuable than the test you were about to write.</li>
+</ul>
+<h3 id="44-technical-debt-triage"><a class="header" href="#44-technical-debt-triage">4.4 Technical Debt Triage</a></h3>
+<p>The word “debt” is useful because it carries the right implication: it accrues interest.
+Debt left unexamined in a high-traffic area of the codebase compounds — new code adapts
+to its presence, new assumptions build on top of old ones, and the cost of addressing
+it grows with every layer added above it.</p>
+<p>The most common mistake teams make with technical debt is treating it as binary: either
+everything is debt and nothing can be done about it, or nothing is debt and no time
+should be spent on it. Both positions are wrong. The useful question is: <em>which debt,
+in which location, carries the most risk right now?</em></p>
+<p>Two axes determine priority.</p>
+<p><strong>Proximity to a trust boundary.</strong> Code that handles user input, enforces security
+policy, executes tools, manages authentication, or processes data from external sources
+is operating near a trust boundary. Failures here can be exploited, silently corrupt
+state, or produce incorrect behavior with security consequences. Debt near trust
+boundaries carries disproportionate risk relative to its size.</p>
+<p><strong>Blast radius.</strong> Debt in <code>zeroclaw-api</code> — the foundation everything else depends on —
+has a larger blast radius than debt in a single channel implementation. A wrong
+assumption in a foundational type propagates wherever that type is used. Debt in a leaf
+crate affects only that crate’s consumers.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th>High blast radius</th><th>Low blast radius</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Near a trust boundary</strong></td><td>Address in the current cycle</td><td>Address in the next planned cycle</td></tr>
+<tr><td><strong>Far from a trust boundary</strong></td><td>Address in a planned refactor</td><td>Address opportunistically, as adjacent work passes through</td></tr>
+</tbody>
+</table>
+</div>
+<p>This framework means that a <code>.unwrap()</code> in the security policy enforcement path is not
+the same problem as a <code>.unwrap()</code> in a CLI display formatter. Both appear in the count
+of 5,630. The count tells us the scope. The triage tells us the priority.</p>
+<p>When you are working in a file and you notice debt — an <code>.unwrap()</code> that represents an
+unhandled operational error, a function that has grown to handle four separate concerns,
+a <code>#[allow(dead_code)]</code> silencing something that nobody calls — you do not need to fix
+everything. You need to ask: is this in a high-risk location? If it is, address it in
+this PR or file a follow-up issue with the specific location, the risk, and a proposed
+owner. If it is not, you can mark it with a <code>// TODO(debt): &lt;description&gt;</code> comment that
+makes it visible without making it urgent. What you should not do is leave it completely
+unmarked — because silence is how 5,630 deferred decisions accumulate without anyone
+noticing the trend.</p>
+<p>The Strangler Fig pattern applies at this level too. The architecture RFC applied it at
+the crate level: build the new structure around the old one, migrate inward over time.
+The same pattern works inside a large file. You do not rewrite <code>schema.rs</code> in a single
+PR. You identify the functions that are closest to trust boundaries, most frequently
+changed, or hardest to test — and you extract them first, improving the structure
+incrementally, leaving the rest to follow at a pace the team can sustain.</p>
+<h3 id="45-security-at-the-application-layer"><a class="header" href="#45-security-at-the-application-layer">4.5 Security at the Application Layer</a></h3>
+<p>The CI/CD RFC established the security posture for the <em>supply chain</em>: <code>cargo deny</code>
+finds known vulnerabilities in dependencies, enforces license compliance, and ensures
+dependencies come from approved sources. That is the immune system for what enters the
+project. This section is about the security posture of the code that runs.</p>
+<p><code>cargo deny</code> cannot find a vulnerability your application logic creates. It cannot tell
+you whether user input is being validated before it reaches your business logic. It
+cannot tell you whether a tool execution is respecting the autonomy level it is supposed
+to enforce. It cannot tell you whether an error path is silently swallowing a security
+check failure. These require a contributor who understands where the trust boundaries
+are and what responsible code looks like on either side of them.</p>
+<p>Three principles that should guide any code written near a trust boundary:</p>
+<p><strong>Trust boundaries are explicit, not assumed.</strong> A trust boundary is any point where data
+arrives from outside your direct control: user input from any channel, API responses
+from providers, file contents from the filesystem, plugin outputs, tool results, hardware
+readings. At every trust boundary, validate before you process. Do not assume the shape,
+size, type, or content of data you did not produce. The ZeroClaw security model defines
+these boundaries at the policy level. The implementation should reflect them at the code
+level — not because the policy will fail, but because defense in depth means each layer
+of the system is doing its part, rather than trusting that every other layer did theirs.</p>
+<p><strong>Minimum footprint.</strong> A function that needs to read a file should not be able to write
+one. A trait implementation that handles one channel’s messages should not have access
+to another channel’s state. A tool running at autonomy level 1 should not be in a
+position to exercise capabilities that require level 3. The security model already
+defines these constraints. The discipline is in writing implementations that do not
+acquire more capability than they require for the task at hand — and in noticing when an
+implementation is reaching for something outside its intended scope.</p>
+<p><strong>Fail loudly near security boundaries.</strong> An error in a security check — a failed policy
+evaluation, a signature verification failure, an unauthorized tool call attempt, a
+pairing code mismatch — should never be silently swallowed. It should be logged,
+propagated, and handled explicitly. An error in a display helper can be recovered from
+gracefully with a log message. An error in an authorization path cannot. Know which kind
+of function you are writing, and let that determination drive how aggressively you
+surface failures from it.</p>
+<p>These are not advanced security principles. They are foundational hygiene that applies
+to any code that touches something a user can influence. The architecture RFC described
+the security model as “thoughtful.” The work this RFC is asking for is to make that
+thoughtfulness legible at the implementation level — in the functions that validate
+inputs, in the error paths that handle policy failures, in the boundaries between what
+the system was asked to do and what it actually does.</p>
+<h3 id="46-observability-as-debuggability"><a class="header" href="#46-observability-as-debuggability">4.6 Observability as Debuggability</a></h3>
+<p>The observability infrastructure is mature: OpenTelemetry tracing, Prometheus metrics,
+DORA tracking, and a clean <code>Observer</code> trait are all in place. This is production-quality
+work. The teaching gap is between having the infrastructure and using it in a way that
+actually helps when something goes wrong — ideally before you know what went wrong.</p>
+<p>Consider two log messages. Both compile. Both pass CI. Both are syntactically correct.</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>error!("request failed");
+<span class="boring">}</span></code></pre>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>error!(
+    provider = %provider_name,
+    model    = %model_id,
+    user     = %sender_id,
+    tool     = %tool_name,
+    attempt  = attempt,
+    elapsed  = ?elapsed,
+    err      = %e,
+    "provider request failed — retries exhausted"
+);
+<span class="boring">}</span></code></pre>
+<p>The first is a record. It confirms that something went wrong. The second is a
+<em>diagnostic</em>. It answers the questions that matter: what were we trying to do, in what
+context, with what parameters, and exactly what went wrong. The difference between them
+is not technical sophistication — it is whether the person writing the message was
+thinking about the person who will one day need to read it.</p>
+<p>The question to ask before writing any log message at <code>warn</code> or above:</p>
+<blockquote>
+<p>What does the person who needs to diagnose this failure at the worst moment need to know?</p>
+</blockquote>
+<p>That person might be you, six months from now, with no memory of writing this code. It
+might be another contributor who has never seen this module. It might be a user filing a
+bug report with a log excerpt they copied from their terminal. Write for them. The fields
+that almost always matter: what were we trying to do, what context was in scope at the
+time, and what specifically went wrong.</p>
+<p>The same principle governs tracing span design. A span should represent a meaningful
+unit of work, carry the context needed to understand that work, and have a name that
+makes sense when you read it in a flame graph or a trace viewer.</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// A record
+let _span = span!(Level::INFO, "process");
+
+// A diagnostic
+let _span = span!(
+    Level::INFO,
+    "agent.tool_call",
+    tool = %tool_name,
+    turn = turn_number,
+    sender = %sender_id,
+);
+<span class="boring">}</span></code></pre>
+<p>Structured logging and meaningful span design are not style preferences. They are what
+make the observability infrastructure you have actually useful — not just during
+development, but in the hands of users running ZeroClaw on hardware you will never see,
+in configurations you did not anticipate, encountering errors you did not plan for. The
+infrastructure creates the capability. The discipline in how contributors use it
+determines whether that capability translates into diagnosable systems.</p>
+<h3 id="47-working-above-the-floor"><a class="header" href="#47-working-above-the-floor">4.7 Working Above the Floor</a></h3>
+<p>The previous six disciplines each address a specific domain. This section synthesizes
+them into a single picture of what “above the floor” looks like in practice — what a
+reviewer, a future contributor, or a user actually experiences when they encounter code
+that meets the standards described in this RFC.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Dimension</th><th>At the floor — gates pass</th><th>Above the floor — standard met</th></tr>
+</thead>
+<tbody>
+<tr><td>Error handling</td><td>Code compiles; no Clippy warnings</td><td>Failures are categorized; operational errors surface with context; panics are intentional and documented</td></tr>
+<tr><td>Documentation</td><td>Doc tests pass if they exist</td><td>Every public item can be understood and used correctly without reading the implementation</td></tr>
+<tr><td>Testing</td><td>Tests that exist pass</td><td>Tests assert behavior; test difficulty is treated as design feedback; the failure modes that matter are covered</td></tr>
+<tr><td>Debt</td><td>No compiler errors or warnings (with <code>#[allow]</code> silencing the rest)</td><td>Debt is labeled, located, and risk-weighted; high-risk debt has an owner and a timeline</td></tr>
+<tr><td>Security</td><td><code>cargo deny</code> passes</td><td>Trust boundaries are explicit; security failures surface loudly; implementations respect their intended scope</td></tr>
+<tr><td>Observability</td><td>Code runs and emits something</td><td>Log messages answer the diagnostic question; spans bound meaningful units of work with useful context</td></tr>
+<tr><td>Code organization</td><td>File compiles; module structure exists</td><td>Functions do one thing; files group related concerns; large files are candidates for extraction, not the norm</td></tr>
+</tbody>
+</table>
+</div>
+<p>None of these are achievable entirely through automation. All of them are achievable by
+contributors who understand why they matter and have built the judgment to apply them
+consistently. That is what this document is working toward.</p>
+<hr>
+<h2 id="5-what-this-means-for-ai-assisted-development"><a class="header" href="#5-what-this-means-for-ai-assisted-development">5. What This Means for AI-Assisted Development</a></h2>
+<p>The culture RFC addressed how to work with AI tools as part of a collaborative team.
+This section addresses something more specific: what happens when AI-generated code
+encounters the standards described above — and what it takes to recognize and close the
+gap when it does not.</p>
+<p>AI tools are genuinely good at passing gates. They generate code that compiles,
+satisfies the type checker, passes Clippy, and often produces tests alongside the
+implementation. This is real value, and it is not the point of this section to minimize
+it. The problem is not that AI tools are unreliable. The problem is that they are
+reliable at the wrong thing: producing code that passes checks, rather than code that
+meets standards.</p>
+<p>The reason is structural. AI generates code against what it can infer. If a function
+has no documentation, the AI infers intent from the name and signature — and sometimes
+that inference is correct, and sometimes it produces subtly wrong behavior that only
+surfaces under conditions nobody tested. If an error type has no documentation of when
+it is returned, the AI handles it based on the name of the variant. If a test suite
+tests implementation rather than behavior, the AI generates implementations that match
+those tests — which may or may not match the intended behavior that the tests were
+supposed to capture. The quality ceiling of AI output is set by the quality of the
+context you provide. Better context — clearer documentation, more specific error types,
+behavior-focused tests — produces better output. Underdeveloped context produces output
+that passes the gates and defers the judgment to whoever reviews it next.</p>
+<p>This creates a specific and non-optional responsibility for contributors working with
+AI tools.</p>
+<p><strong>Review is not optional because AI wrote it.</strong> The culture RFC named this clearly, and
+it bears repeating with specifics: when reviewing AI-generated code, the gate questions
+— does it compile, do the tests pass — are the beginning of the review, not the end. The
+standard questions are: does this handle operational errors correctly, or does it
+<code>.unwrap()</code> them? Is the new public API documented? Does the test assert the behavior or
+the implementation? Is this near a trust boundary, and if so, does it validate its
+inputs? These questions are your responsibility regardless of who wrote the code or what
+tools were used to produce it.</p>
+<p><strong>AI amplifies your judgment, not your absence of it.</strong> A contributor who does not yet
+have a mental model for what good error handling looks like will accept AI-generated
+error handling at face value — <code>.unwrap()</code> and all. A contributor who has internalized
+§4.1 can look at the same output and direct the tool: “this is an operational error
+path; use <code>?</code> and propagate the failure to the caller with context.” The tool will
+produce a corrected version. The same pattern applies to every discipline in §4. The
+tool is powerful in the hands of someone who knows what to ask for. Without that
+direction, it produces code that satisfies the compiler and defers the real decisions
+to the next person in the chain.</p>
+<p><strong>This relationship compounds in both directions.</strong> A team that understands the standards
+gets progressively more value from AI tooling as the tools improve, because they can
+direct more capable tools more precisely. The gap between “what the tool produced” and
+“what the standard requires” becomes something they can close with direction rather than
+manual rewriting. A team that does not build that judgment gets a faster path to the
+same quality floor, without the ability to push past it. The investment described
+throughout this document is also, directly, an investment in the long-term effectiveness
+of every AI tool the team will ever use — because the value of those tools scales with
+the clarity of the judgment directing them.</p>
+<hr>
+<h2 id="6-the-portability-of-craft"><a class="header" href="#6-the-portability-of-craft">6. The Portability of Craft</a></h2>
+<p>Technology changes. It changes faster with each iteration than it did the time before,
+and that rate is accelerating. The specific tools in this document — Rust, <code>cargo</code>,
+<code>clippy</code>, the OpenTelemetry SDK, the AI assistants the team uses today — will be
+superseded. Some of them within the lifetime of this project. The platforms will change.
+The languages will evolve. The tooling ecosystem will look different in five years than
+it does today, and different again in ten.</p>
+<p>The mental models in this document will not change.</p>
+<p>The question “what should happen here when this fails, and who needs to know?” does not
+expire when the language changes. You will ask it in the next language you learn. You
+will ask it when designing a distributed system where the “language” is a wire protocol.
+You will ask it when building anything that other people depend on and that you cannot
+personally supervise. The specific Rust mechanism for answering it — <code>Result&lt;T, E&gt;</code>, the
+<code>?</code> operator, structured error types with context — is one answer to a question that
+exists everywhere.</p>
+<p>The question “what is the public interface I am promising, and does my documentation
+reflect that promise?” — you will ask this when designing an API, when writing a
+technical specification, when defining the scope of a team’s responsibilities, when
+communicating requirements to another team, to an AI tool, to a client, to a contractor.
+The promise-and-terms model of public interfaces extends far beyond Rust and far beyond
+software.</p>
+<p>The question “what does my test actually prove?” extends beyond software into any domain
+where you need to verify that a system behaves as intended. The instinct to ask it — to
+distinguish between evidence that your implementation exists and evidence that the right
+thing happens — is the skill. The syntax for expressing it in Rust is incidental.</p>
+<p>The question “what would the person who needs to diagnose this failure need to know?” is
+an engineering question that applies to anything you build that other people depend on.
+It is also, at a deeper level, a question about empathy — about remembering that the
+person on the other side of your work is a real person with a real problem, at a moment
+you cannot predict, with context you will not be there to provide.</p>
+<blockquote>
+<p>You are not learning Rust. You are, through the vehicle of Rust, learning to build
+things that can be trusted. That is portable. It will compound for as long as you
+practice it — across every language, every system, every team, and every domain you
+ever work in.</p>
+</blockquote>
+<p>This is the investment the project is making in you. Not in your specific technical
+skills, but in your ability to bring judgment, craft, and care to whatever you build
+next. And it is, in turn, the investment you make in every person who will one day
+depend on something you built.</p>
+<hr>
+<h2 id="7-what-this-means-for-contributors"><a class="header" href="#7-what-this-means-for-contributors">7. What This Means for Contributors</a></h2>
+<p><strong>If you are new to Rust or new to software development:</strong></p>
+<p>The seven disciplines in §4 are not requirements to master before you can contribute.
+They are a map of the territory — things you will encounter as you work, named clearly
+enough that you know what you are looking at when you see them.</p>
+<p>Start with §4.1. The error handling mental model is the single highest-leverage thing
+you can internalize early, and it is not Rust-specific. When you read existing code and
+encounter <code>.unwrap()</code>, ask yourself which of the three categories it falls into. When
+you write new code, ask the same question about your own choices. That single habit,
+practiced consistently, improves every file it touches and develops a judgment that will
+follow you everywhere.</p>
+<p>Do not wait until you feel ready to apply these standards. Apply them imperfectly, ask
+questions when you are unsure which category something falls into, and treat the
+feedback you receive in review as the teaching it is intended to be. Nobody arrived
+knowing these things. They were learned, slowly, through exactly the kind of work you
+are doing here.</p>
+<p><strong>If you are using AI tools to help you contribute:</strong></p>
+<p>The standards in this document are what a careful review will evaluate AI-generated code
+against. They are also, practically, the context that makes AI output more correct before
+it reaches review. Before asking an AI to implement something, check whether the
+interfaces it will implement against are documented. If they are not, document them
+first — or include the documentation as part of what you ask the AI to produce. The
+output will be more correct, you will have closed a real gap in the foundation, and the
+next contributor who comes along will benefit from both.</p>
+<p>When you receive review feedback on AI-generated code, treat it as feedback on the code,
+not as feedback on your choice to use AI. The standards apply equally regardless of
+authorship. The question is always: does this code meet the standard? If it does not,
+what needs to change, and why?</p>
+<p><strong>If you are reviewing pull requests:</strong></p>
+<p>The gate questions — does it compile, do the tests pass, does Clippy accept it — are
+the floor, not the ceiling. A review that only answers those questions is an incomplete
+review. Use the framework in §3 and the disciplines in §4 to structure your observations.
+Name the standard you are applying, explain why it matters, and clearly separate
+blocking concerns from non-blocking suggestions.</p>
+<p>The goal of a review is not to find fault. It is to transfer understanding. Every
+specific piece of feedback that includes an explanation — “this is an operational error
+path; here is why <code>.unwrap()</code> creates a production risk here and what to use instead” —
+is an investment in the contributor you are reviewing. That investment compounds. The
+contributor who understands the principle will apply it correctly to the next ten
+situations where it matters, without needing to be told again.</p>
+<p><strong>If you are a maintainer or more experienced contributor:</strong></p>
+<p>You are in the best position to make these standards real — not by enforcing them from
+above, but by modeling them in your own code and naming them by name in review. The most
+effective teaching in an open source project happens in PR threads and code comments,
+not in documents. This document provides the vocabulary. Using it consistently in
+everyday review is what moves it from words on a page to shared practice.</p>
+<p>When you see a <code>.unwrap()</code> on an operational error path, name it as such. When you see
+a public function without documentation, ask the question: what does a future implementor
+need to know here? When you see a test that would break on a valid refactor, explain why
+that matters. These are not corrections — they are the ongoing mentorship that the
+culture RFC identified as one of the most important things a more experienced contributor
+can offer.</p>
+<hr>
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-005-contribution-culture.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../contributing/how-to.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-005-contribution-culture.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../contributing/how-to.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

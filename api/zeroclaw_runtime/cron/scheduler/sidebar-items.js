@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["deliver_announcement","execute_job_now","register_delivery_fn","run"],"type":["DeliveryFn","EventBroadcast"]};

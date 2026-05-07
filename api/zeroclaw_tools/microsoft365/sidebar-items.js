@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["auth","graph_client","types"],"struct":["Microsoft365Tool"]};

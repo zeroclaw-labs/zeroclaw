@@ -1,0 +1,1344 @@
+<!DOCTYPE HTML>
+<html lang="ja" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>意図的なアーキテクチャ - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-83844b35.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-69ff217c.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/foundations/fnd-001-intentional-architecture.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="fnd-001-意図的なアーキテクチャ--zeroclaw-マイクロカーネル移行"><a class="header" href="#fnd-001-意図的なアーキテクチャ--zeroclaw-マイクロカーネル移行">FND-001: 意図的なアーキテクチャ — ZeroClaw マイクロカーネル移行</a></h1>
+<h3 id="v070-以降--タイプ-アーキテクチャ--rev-3"><a class="header" href="#v070-以降--タイプ-アーキテクチャ--rev-3">v0.7.0 以降 · タイプ: アーキテクチャ · Rev. 3</a></h3>
+<blockquote>
+<p><strong>正規の参照</strong> · チームによって承認済み · Rev. 3 議論スレッドおよび完全な改訂履歴: <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5574">#5574</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>これを読む前にチームへの注意。</strong></p>
+<p>この文書は、反応的に成長したコードベースから、意図を持って構築されたコードベースへと移行するために書かれました。ここで紹介されている概念があなたにとって新しいものであっても問題ありません。それは、この文書が本来の役割を果たしていることを意味します。あなたが今後携わるすべてのシニアエンジニアは、理解しきれなくなるほど巨大になったコードベースで、これらの教訓を苦労して学んできました。私たちは、パターンを早期に認識し、痛みが生じる前に軌道修正できる稀有な機会を持っています。これは良いことです。焦らず、時間をかけて取り組んでください。</p>
+</blockquote>
+<hr>
+<h2 id="目次"><a class="header" href="#目次">目次</a></h2>
+<ol>
+<li><a href="#1-a-development-philosophy-vision-first">開発哲学: ビジョンファースト</a></li>
+<li><a href="#2-the-vision--what-zeroclaw-is">ビジョン — ZeroClawとは</a></li>
+<li><a href="#3-honest-assessment-where-we-are-today">正直な評価：現在の状況</a></li>
+<li><a href="#4-the-target-architecture">ターゲットアーキテクチャ</a>
+<ul>
+<li><a href="#441-versioning-policy">4.4.1 バージョニングポリシー</a></li>
+<li><a href="#442-release-artifacts">4.4.2 リリースアーティファクト</a></li>
+</ul>
+</li>
+<li><a href="#5-standards-we-should-adopt">採用すべき標準</a></li>
+<li><a href="#6-phased-roadmap-v070--v100">フェーズ別ロードマップ: v0.7.0 → v1.0.0</a></li>
+<li><a href="#7-code-and-complexity-metrics">コードと複雑性メトリクス</a></li>
+<li><a href="#8-what-this-means-for-contributors">コントリビューターへの影響</a></li>
+</ol>
+<hr>
+<h2 id="改訂履歴"><a class="header" href="#改訂履歴">改訂履歴</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Rev</th><th>日付</th><th>目次</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>2026年4月9日</td><td>初期ドラフト</td></tr>
+<tr><td>2</td><td>2026年4月9日</td><td>§4.4.1 バージョニングポリシー（ワークスペースの継承の統一、安定性ティア、プロダクトレベルでの破壊的変更の定義）を追加しました。§4.4.2 リリースアーティファクト（フィーチャーフラグの扱い、標準的なリリースバイナリプロファイル、リリースアーティファクトのマトリクス）を追加しました。バージョニング戦略と観測性デフォルトに関するディスカションクエスチョンを追加しました。</td></tr>
+<tr><td>3</td><td>2026年4月10日</td><td>PR #5559 からの実装フィードバックに基づく用語の修正: エージェントオーケストレーション層全体で「kernel」を「runtime」に統一。「kernel」は特定の基盤（<code>--no-default-features</code> ビルド）を指すようになりました。§4.1 では明示的な2層アーキテクチャ（基盤 + ランタイム）について記述を更新。§4.2–§4.3 の依存関係ダイアグラムとコンポーネントマップを更新し、<code>zeroclaw-runtime</code> を反映。フェーズ2の名称を「The Kernel」から「The Runtime」に変更。バイナリサイズ目標は、厳格な閾値ではなく、進捗を追跡する理想的な指標として再定義。§7 では実際のフェーズ1測定値（6.6 MB の基盤ビルド）を追記し、アーキテクチャの分解が最適化を可能にするが、最適化は専用の第2フェーズで行うことを明確に記述。</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="1-開発哲学ビジョンファースト"><a class="header" href="#1-開発哲学ビジョンファースト">1. 開発哲学：ビジョンファースト</a></h2>
+<p>ソフトウェアにおけるすべての決定（何を構築するか、どのように構築するか、何を省略するか）は、意図の階層から下向きに流れるべきです。</p>
+<pre><code>Vision
+  └── Architecture
+        └── Design
+              └── Implementation
+                    └── Testing
+                          └── Documentation
+                                └── Release
+</code></pre>
+<p>これはウォーターフォールプロセスではありません。これは<strong>意思決定の階層構造</strong>です。つまり、関数を作成する際には、その関数が存在する理由を明確に追跡できる必要があります。この関数はこの設計上の決定に基づいて存在し、その決定はこのアーキテクチャ上の選択に基づいており、その選択はこのビジョンに基づいています。もしそのような経路をたどることができない場合、そのコードは存在すべきではないでしょう。</p>
+<p><strong>各レイヤーの実際の意味:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>レイヤー</th><th>この質問が答える内容</th><th>それなしで何が問題になるか</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>ビジョン</strong></td><td><em>なぜこのプロジェクトが存在するのか？誰のためにあるのか？成功とはどのような状態を指すのか？</em></td><td>あなたが作っているものは誰も必要としていないか、リリース間で矛盾しています。</td></tr>
+<tr><td><strong>アーキテクチャ</strong></td><td>そのビジョンを実現するために必要な構造的な決定とは何ですか？</td><td>「大泥棒」状態に陥ります。これは、動作はするものの、他の部分を壊さずに変更することができないコードのことです。</td></tr>
+<tr><td><strong>デザイン</strong></td><td><em>コンポーネントはどのように関連していますか？それらの間のインターフェースは何ですか？</em></td><td>密結合が生じます — コンポーネントがお互いの内部構造を過度に把握してしまう状態</td></tr>
+<tr><td><strong>実装</strong></td><td><em>この特定のコンポーネントをどのように構築しますか？</em></td><td>バグ、パフォーマンスの問題、セキュリティの脆弱性</td></tr>
+<tr><td><strong>テスト</strong></td><td>実装は設計と一致していますか？設計はアーキテクチャに適合していますか？</td><td>壊れたものを出荷し、その理由もわからない</td></tr>
+<tr><td><strong>ドキュメント</strong></td><td><em>この知識を次の人にどう伝えるか？</em></td><td>すべての貢献者は、すべてを最初から再発見する必要があります。</td></tr>
+<tr><td><strong>リリース</strong></td><td><em>どのようにしてこれを安全かつ持続可能にユーザーに提供できるでしょうか？</em></td><td>ユーザーは壊れたソフトウェアや混乱を招くソフトウェアを使用することになります。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="トップをスキップすることの問題"><a class="header" href="#トップをスキップすることの問題">トップをスキップすることの問題</a></h3>
+<p>ZeroClaw は、OpenClaw の TypeScript コードベースを基に AI ツールによってブートストラップされました。AI によるコード生成は<strong>実装</strong>レイヤーで行われます。これは、機能を実行する関数、構造体、モジュールを記述します。しかし、ビジョンの設定やアーキテクチャの決定、設計契約の定義は行いません。</p>
+<p>その結果、非常に機能的ではあるものの、アーキテクチャ的に偶然に生まれたコードベースが完成します。コードは今日の要件を満たすために必要なことを実行しますが、設計されたわけではなく、蓄積されたものです。このパターンには業界で**「ビッグボール・オブ・マッド」**という名前があります。これは、誰かが意図的に選んだからではなく、階層の上位を省略した結果として得られるものとして、ソフトウェアで最も一般的なアーキテクチャです。</p>
+<p>このRFCは、その問題を解決するチャンスです。機能するものを捨て去るのではなく、<strong>Strangler Fig Pattern</strong> という手法を用いて意図的なアーキテクチャを構築し、古い構造の周囲に新しい構造を作り、時間をかけて内側へと移行することで、最終的に古い構造を消し去ります。「大規模な書き換え」も、動作するコードの放棄もありません。着実で意図的な改善を行います。</p>
+<hr>
+<h2 id="2-ビジョン--zeroclawとは"><a class="header" href="#2-ビジョン--zeroclawとは">2. ビジョン — ZeroClawとは</a></h2>
+<p>アーキテクチャについて話す前に、私たちが構築するものを正確に定義する必要があります。これがビジョンレイヤーです。その後に続くすべてのものはこれに従属します。</p>
+<blockquote>
+<p><strong>ZeroClawは、誰でもどのハードウェアでも実行できるパーソナルAIアシスタントランタイムです。10ドルの組み込みボードからクラウドサーバーまで、設定オーバーヘッドゼロ、外部サービス不要、機能やセキュリティの妥協ゼロで動作します。</strong></p>
+</blockquote>
+<p>これを具体的なコミットメントに分解します：</p>
+<p><strong>ゼロオーバーヘッド。</strong> コアエージェントはミリ秒単位で起動し、ブラウザタブよりも少ないメモリを使用します。これはマーケティング上の主張ではなく、アーキテクチャ上の制約です。私たちが下すすべての決定は、この制約に対して検証されなければなりません。</p>
+<p><strong>外部依存関係ゼロ。</strong> ZeroClawをダウンロードし、LLMプロバイダーが設定されていれば、追加のインストールなしで動作する実用的なAIアシスタントが利用可能です。チャネル、ダッシュボード、インテグレーションは、必要に応じて追加するものであり、動作させるために必須ではありません。</p>
+<p><strong>妥協なし。</strong> Lean（軽量）は弱さを意味しません。ZeroClawには、堅牢なセキュリティモデル、本格的な観測性、そして真の拡張性が不可欠です。「小さなバイナリ」と「完全な機能」の間の緊張関係は、コンポジションによって解決されます。小さなコアを、あなたが選択したコンポーネントで拡張します。</p>
+<p><strong>すべてのスキルレベルに対応。</strong> $10のRaspberry Piを使用する学生から、本番環境のデプロイメントを行うチームまで、ZeroClawが彼ら向けに設計されていると感じてもらえるようにします。つまり、デフォルトの体験はシンプルで、上級者の体験は強力であるべきであり、これらは2つの異なる製品であってはなりません。</p>
+<p><strong>ユーザー所有。</strong> あなたのデータ、あなたのハードウェア、あなたの設定。ZeroClawはアカウントを必要とせず、外部への通信を行わず、特定のプラットフォームに縛り付けません。</p>
+<hr>
+<h2 id="3-正直な評価現在の状況"><a class="header" href="#3-正直な評価現在の状況">3. 正直な評価：現在の状況</a></h2>
+<p>このセクションは誰かの作品を批判するものではありません。これは診断であり、名前を付けないものは修正できません。</p>
+<h3 id="31-構造的な問題"><a class="header" href="#31-構造的な問題">3.1 構造的な問題</a></h3>
+<p>現在、ZeroClawのコードベース全体は1つのRustクレートに収められています。これは、</p>
+<ul>
+<li>Telegram チャンネルとコアエージェントループは、Telegram を使用しているかどうかにかかわらず、同じソースツリーからコンパイルされます。</li>
+<li>Webダッシュボード（完全なReactアプリケーション）は、<code>rust-embed</code>を使用してバイナリに埋め込まれており、CLIのみを使用するユーザーであっても、すべてのバイナリにWeb UIが含まれます。</li>
+<li>ゲートウェイのHTTPサーバーには、WhatsApp、WATI、Linq、Nextcloud Talk、GmailのWebhookハンドラーが含まれており、特定のチャネル統合がWebサーバーに組み込まれています。</li>
+<li>70以上のすべてのツールは、ユーザーが実際に呼び出すかどうかに関係なく、バイナリにコンパイルされます。</li>
+<li>コードを除外するための唯一の仕組みは、Cargo の機能フラグです。これには、ユーザーが Rust の開発環境を持っており、ソースから再コンパイルする必要があります。</li>
+</ul>
+<p><strong>ユーザーへの影響:</strong> 明らかな目標は、$10 のハードウェア向けの軽量なバイナリです。しかし、バイナリには27のメッセージングチャネル、70以上のツール、フル機能のWebサーバー、Reactアプリケーション、Jira、Notion、Google Workspace、LinkedInなどの統合が含まれており、これらの機能のほとんどは特定のユーザーが決して使用することはありません。</p>
+<p><strong>コントリビューターへの影響:</strong> ファイルが9,500行にも及ぶ場合、その内容を理解することはできません。すべての機能が1つのクレートに含まれていると、何らかの変更を加えるたびにすべてが壊れるリスクがあります。</p>
+<h3 id="32-証拠"><a class="header" href="#32-証拠">3.2 証拠</a></h3>
+<p>これらは現在のコードベースからの測定された事実であり、推定値ではありません：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ファイル</th><th>行</th><th>機能</th><th>それがすべきこと</th></tr>
+</thead>
+<tbody>
+<tr><td><code>src/agent/loop_.rs</code></td><td>約9,500</td><td>ツール呼び出しの解析、ストリーミング、履歴、コスト追跡、モデルルーティング、メモリ、資格情報のスクラビング、コンテキスト構築</td><td>エージェントのターンを1回実行する</td></tr>
+<tr><td><code>src/gateway/mod.rs</code></td><td>~2,260</td><td>Webサーバー + Reactアプリサーバー + WhatsAppウェブフック + WATIウェブフック + Linqウェブフック + Nextcloudウェブフック + Gmailウェブフック + ペアリング + レートリミティング + WebAuthn</td><td>WebダッシュボードAPIを提供する</td></tr>
+<tr><td><code>src/providers/mod.rs</code></td><td>~3,750</td><td>ファクトリ + 40以上のプロバイダー実装 + OAuthフロー + 資格情報解決 + エスクラビング</td><td>プロバイダーにルーティング</td></tr>
+<tr><td><code>src/tools/mod.rs</code></td><td><code>all_tools_with_runtime()</code> L387–L1066</td><td>すべての70以上のツールを無条件にインスタンス化します</td><td>ユーザーが設定したツールを登録する</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>9,500行のファイルはモジュールではありません。<code>.rs</code> 拡張子を持っているだけの巨大な塊です。</strong></p>
+<h3 id="33-すでに良い点"><a class="header" href="#33-すでに良い点">3.3 すでに良い点</a></h3>
+<p>この診断が、本当に良く設計されているものを隠してはなりません：</p>
+<ul>
+<li><strong>トレイトレイヤーは優れています。</strong> <code>Provider</code>、<code>Channel</code>、<code>Tool</code>、<code>Memory</code>、<code>Observer</code>、<code>RuntimeAdapter</code>、<code>Peripheral</code> はクリーンで文書化された Rust のトレイトです。これらは適切な分離点です。問題は、これらがクレートの境界に対応していないため、コンパイラがレイヤーリングを強制できないことです。</li>
+<li><strong>WASM プラグインシステムは部分的に構築されています。</strong> <code>PluginHost</code>、<code>WasmTool</code>、<code>WasmChannel</code>、<code>PluginManifest</code>、および Ed25519 署名検証はすべて <code>src/plugins/</code> に存在します。実行ブリッジはスタブですが、構造は正しいです。</li>
+<li><strong>観測性システムは成熟しています。</strong> OpenTelemetry、Prometheus、DORA メトリクスはすべて、クリーンな <code>Observer</code> トレイトに対して実装されています。これは本番環境での使用に耐えうる品質のものです。</li>
+<li><strong>セキュリティモデルは考え抜かれている。</strong> ペアリングコード、自律レベル、サンドボックス化、ポリシーの適用は、明確な設計意図を示している。</li>
+</ul>
+<p>ZeroClawを再構築するのではなく、その既存の優れたアイデアに成長できる構造を提供しています。</p>
+<hr>
+<h2 id="4-ターゲットアーキテクチャ"><a class="header" href="#4-ターゲットアーキテクチャ">4. ターゲットアーキテクチャ</a></h2>
+<h3 id="41-マイクロカーネルモデル"><a class="header" href="#41-マイクロカーネルモデル">4.1 マイクロカーネルモデル</a></h3>
+<p>マイクロカーネルアーキテクチャは、最小限で安定したコアを、それを拡張するオプションのサブシステムから分離します。オペレーティングシステムにおける古典的な例は、メモリとスケジューリングのみを処理するカーネルであり、ファイルシステム、デバイスドライバ、ネットワークスタックなどはすべて、明確に定義されたインターフェースを通じて通信する個別のプロセスとして実行されます。</p>
+<p>AIエージェントのランタイムにおいて、このマッピングは<strong>OSの类比が混同している2つの明確な内部レイヤー</strong>を示しています：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>OSマイクロカーネルの概念</th><th>ZeroClaw 同等</th></tr>
+</thead>
+<tbody>
+<tr><td>カーネル</td><td><strong>基盤レイヤー</strong> — APIのトレイト、設定、プロバイダー、メモリバックエンド、インフラ、ツール呼び出しパーサー。必要最小限のコア：<code>--no-default-features</code> でビルド可能。LLM とメッセージの送受信と、メモリの保存が可能。それ以上の機能はなし。</td></tr>
+<tr><td>初期化 / ランタイムシステム</td><td><strong>エージェントランタイムレイヤー</strong> — オーケストレーションループ、セキュリティポリシーの適用、プラグインホスト、コアツール、IPC API。<code>zeroclaw-runtime</code> クレートは、<code>agent-runtime</code> 機能で制御されます。これが ZeroClaw を単なるライブラリではなく、エージェントとして機能させるものです。</td></tr>
+<tr><td>IPC</td><td>ランタイムと外部コンポーネント間のローカルソケット / IPC API</td></tr>
+<tr><td>デバイスドライバー</td><td>チャネルプラグイン（Telegram、Discord など）</td></tr>
+<tr><td>ファイルシステムドライバ</td><td>メモリバックエンドプラグイン（SQLite、Markdown）</td></tr>
+<tr><td>ユーザープロセス</td><td>ゲートウェイバイナリ、Tauri デスクトップアプリ</td></tr>
+</tbody>
+</table>
+</div>
+<p>この区別は重要です。<strong>基盤</strong>は、任意の ZeroClaw バイナリが機能するために存在しなければならない最小限のものです。<strong>ランタイム</strong>は、それがエージェントとして機能するために存在しなければならない最小限のものです。それ以外のすべては構成されています。</p>
+<p>この2層の分割は、Phase 1のワークスペース分解（PR #5559）中に特定され、クレート名に反映されています：<code>zeroclaw-runtime</code>（クレート）は <code>agent-runtime</code>（フィーチャ）によって制御されます。このRFCの以前の改訂では、「カーネル」という用語が、現在正しく「ランタイム層」と呼ばれているものを指すために広く使われていました。今回の改訂では、この用語を全体で修正しています。</p>
+<h3 id="42-依存性ルール"><a class="header" href="#42-依存性ルール">4.2 依存性ルール</a></h3>
+<p>この設計における最も重要なアーキテクチャルール — これを破ると全体が崩壊する — はこれです：</p>
+<blockquote>
+<p><strong>依存関係は内向きです。ランタイムはプラグインについて何も知りません。プラグインはAPIを知っています。すべてを知るものは何もありません。</strong></p>
+</blockquote>
+<pre><code>    zeroclaw-api          ← defines all traits (Provider, Channel, Tool, ...)
+         ▲                  no implementations, no heavy dependencies
+         │ depends on
+  foundation crates       ← zeroclaw-config, zeroclaw-providers, zeroclaw-memory,
+         ▲                  zeroclaw-infra, zeroclaw-tool-call-parser
+         │ depends on        all depend on zeroclaw-api; no cross-dependencies
+    zeroclaw-runtime      ← implements the agent loop (agent-runtime feature)
+         ▲                  depends on zeroclaw-api + foundation crates
+         │ depends on        knows nothing about specific channels or tools
+  plugin crates           ← zeroclaw-channel-discord, zeroclaw-tools-web, ...
+         ▲                  depend on zeroclaw-api (not the runtime)
+         │ depends on
+  zeroclaw binary         ← thin wiring layer
+                             reads config, registers plugins, starts runtime
+</code></pre>
+<p><code>zeroclaw-runtime</code> が <code>TelegramChannel</code> をインポートした場合、アーキテクチャが違反されています。クレートの境界が設定されると、コンパイラがこの制約を強制します。</p>
+<h3 id="43-コンポーネントマップ"><a class="header" href="#43-コンポーネントマップ">4.3 コンポーネントマップ</a></h3>
+<pre><code>┌─────────────────────────────────────────────────────────────────────┐
+│                    zeroclaw (binary crate)                          │
+│  Reads config → registers only configured components → starts       │
+│                                                                     │
+│   ┌──────────────────────────────────────────────────────────────┐  │
+│   │              zeroclaw-runtime  (agent-runtime feature)       │  │
+│   │                                                              │  │
+│   │  Agent Loop · CLI Channel · Security Policy                  │  │
+│   │  Plugin Host · Local IPC API                                 │  │
+│   │  Core Tools: shell, file, git, memory recall/store           │  │
+│   │                                                              │  │
+│   │  ┌──────────────────────────────────────────────────────┐   │  │
+│   │  │   Foundation  (--no-default-features)                │   │  │
+│   │  │                                                      │   │  │
+│   │  │  zeroclaw-api · zeroclaw-config · zeroclaw-infra     │   │  │
+│   │  │  zeroclaw-providers · zeroclaw-memory                │   │  │
+│   │  │  zeroclaw-tool-call-parser                           │   │  │
+│   │  │                                                      │   │  │
+│   │  │  Vision target: &lt;5 MB RAM at runtime                 │   │  │
+│   │  └──────────────────────────────────────────────────────┘   │  │
+│   └──────────────────────────────────────────────────────────────┘  │
+│                              ▲                                      │
+│                   zeroclaw-api (traits only)                        │
+│                              ▲                                      │
+│   ┌──────────────┐  ┌────────┴────────┐  ┌─────────────────────┐   │
+│   │  zeroclaw-gw │  │  Channel plugins│  │   Tool plugins      │   │
+│   │  (opt-in     │  │                 │  │                     │   │
+│   │   binary)    │  │  channel-discord│  │  tools-web          │   │
+│   │              │  │  channel-slack  │  │  tools-integrations │   │
+│   │  HTTP/WS/SSE │  │  channel-tg     │  │  tools-hardware     │   │
+│   │  Web UI      │  │  channel-email  │  │  tools-mcp          │   │
+│   │  REST API    │  │  ...            │  │  ...                │   │
+│   └──────┬───────┘  └─────────────────┘  └─────────────────────┘   │
+│          │                                                          │
+│          ▼                                                          │
+│   ┌─────────────────┐                                               │
+│   │ zeroclaw-desktop│   ← Tauri app (already exists in apps/tauri)  │
+│   │ System tray app │     bundles zeroclaw-gw as a sidecar          │
+│   │ Native GUI      │                                               │
+│   └─────────────────┘                                               │
+└─────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="44-配布モデル"><a class="header" href="#44-配布モデル">4.4 配布モデル</a></h3>
+<p>このアーキテクチャにより、エンドユーザーがRustツールチェーンを必要としない、クリーンな配布ストーリーが可能になります。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ユーザーは</th><th>ダウンロードされるもの</th><th><code>zeroclaw onboard</code> の機能</th></tr>
+</thead>
+<tbody>
+<tr><td>CLIのみ</td><td><code>zeroclaw</code> ランタイムバイナリ</td><td>プロバイダーの設定が完了しました</td></tr>
+<tr><td>CLI + Discord</td><td><code>zeroclaw</code> ランタイムバイナリ</td><td><code>channel-discord.wasm</code> をダウンロードしてインストールする</td></tr>
+<tr><td>ローカル Web UI</td><td><code>zeroclaw</code> + <code>zeroclaw-gw</code></td><td>両方を設定し、ブラウザを開く</td></tr>
+<tr><td>デスクトップアプリ</td><td><code>zeroclaw-desktop</code> インストーラー</td><td>ランタイム + ゲートウェイ + UI のバンドル</td></tr>
+<tr><td>すべて</td><td><code>zeroclaw-desktop</code> または <code>zeroclaw --profile full</code></td><td>すべてのプラグインをダウンロードします</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>zeroclaw plugin install</code> コマンド（既存の <code>PluginHost</code> をバックエンドとして使用）がパッケージマネージャーとなります。<code>zeroclaw onboard</code> ウィザードはこれを統合し、非技術者ユーザーが <code>cargo</code> を直接見る必要がなくなります。</p>
+<h4 id="441-バージョニングポリシー"><a class="header" href="#441-バージョニングポリシー">4.4.1 バージョニングポリシー</a></h4>
+<p>ZeroClawが単一のクレートからマルチクレートワークスペースへ移行する際、2つの懸念事項を最初から明確に分離しておく必要があります。</p>
+<ul>
+<li><strong>製品バージョン</strong> — <code>zeroclaw --version</code> が報告するバージョン、GitHub Releases、変更履歴、パッケージマネージャー（Homebrew、apt、cargo-binstall）が追跡するバージョン。これは運用者やユーザーが参照するバージョンです。</li>
+<li><strong>コンポーネントの安定性</strong> — 特定のコンポーネントがどれほど成熟し、信頼性が高いかを示します。単一のバージョン番号だけでは、この情報を伝えることはできません。</li>
+</ul>
+<p>これらは直交しています。これらを混同すると、誤解を招くセマンティックバージョニングのノイズが生じ、バージョン番号への信頼が損なわれます。このポリシーは両方を定義しています。</p>
+<hr>
+<p><strong>クレートのバージョン管理：意図的な例外を伴う統一</strong></p>
+<p>すべてのアプリケーションクレート（カーネル、ゲートウェイ、ツールプラグインクレート、チャンネルプラグインクレート、CLI）は、Cargo ワークスペースのパッケージ継承を使用しています：</p>
+<pre><code class="language-toml"># Cargo.toml (ワークスペースのルート)
+[workspace.package]
+version = "0.8.0"
+
+# crates/zeroclaw-kernel/Cargo.toml
+[package]
+version.workspace = true
+</code></pre>
+<p>ルート <code>Cargo.toml</code> 内の単一バージョンが、公式の製品バージョンとなります。これは正しいモデルです。</p>
+<ul>
+<li>ユーザー、オペレーター、パッケージャーは1つのバージョンのみを扱います。</li>
+<li><code>release-plz</code> を使ったリリース自動化は簡単です。PR 1つ、バージョンアップ 1回、CHANGELOG エントリ 1つで完了します。</li>
+<li>これは、ZeroClawがライブラリエコシステムではなく<strong>プロダクト</strong>としてのアイデンティティを反映していることを示しています。</li>
+<li>WITインターフェースのバージョン — Rustクレートのバージョンではなく — が実際のプラグインABI契約です（§5.2参照）。</li>
+</ul>
+<p>3つのクレートクラスはワークスペースの継承から意図的に除外され、独自のスケジュールで独立したバージョンを維持しています：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>クレート</th><th>独立性の理由</th></tr>
+</thead>
+<tbody>
+<tr><td><code>zeroclaw-api</code></td><td><code>0.1.0</code> から開始され、その <code>1.0.0</code> リリースは v1.0.0 の公式マイルストーン成果物であり、プラグイン SDK 作者向けの安定した Rust トレイトの表面を示します。</td></tr>
+<tr><td><code>aardvark-sys</code>, <code>zeroclaw-robot-kit</code></td><td>独自のユーザー層とメンテナンス頻度を持つハードウェアライブラリクレート。アプリケーションコンポーネントではありません。</td></tr>
+<tr><td>WITインターフェースファイル（<code>wit/*.wit</code>）</td><td>WASI コンポーネントモデル仕様に従い、<code>@since</code> および <code>@unstable</code> アノテーションによってバージョン管理されます。これらは主要なプラグイン ABI 契約であり、Cargo の semver とは完全に独立しています。</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<p>製品バージョンにおける「破壊的変更」の意味</p>
+<p>アプリケーションのクレートが統一されたバージョンを共有しているため、チームは製品レベルでの破壊的変更の定義を、単一のクレートの内部実装における破壊的変更とは区別する必要があります。以下の境界のいずれも跨がないプラグインクレート内の破壊的変更は、製品レベルでの破壊的変更ではなく、MAJOR バージョンの増分を必要としません。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>更新</th><th>保証対象となる場合</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>重大</strong></td><td>WITインターフェースの互換性のない変更（既存のプラグインは再コンパイルが必要）；カーネルIPC APIの互換性のない変更（ゲートウェイまたは外部クライアントが破綻）；設定ファイルスキーマのマイグレーションが必要；CLIコマンドまたはフラグの削除または名前変更</td></tr>
+<tr><td><strong>マイナー</strong></td><td>ワークスペース内のどこでも利用可能な新機能、レジストリで利用可能な新しいプラグイン、安定したAPI、安定性ティアの昇格、非推奨の発表（削除ではない）</td></tr>
+<tr><td><strong>PATCH</strong></td><td>バグ修正、セキュリティパッチ、ドキュメントの修正。新機能や非推奨化はありません。</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<p><strong>安定性ティア</strong></p>
+<p>製品バージョンは「このリリースは何か？」を示します。安定性レベルは「このコンポーネントをどの程度信頼できるか？」を示します。カーネル、ゲートウェイ、プラグインクレート、WITインターフェースなど、すべてのコンポーネントには3つのレベルのいずれかが割り当てられます。レベルは、各コンポーネントの <code>AGENTS.md</code> およびプラグインレジストリのマニフェストに記載されています。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>階層</th><th>意味</th><th>含意</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>安定</strong></td><td>製品の破壊的変更ポリシーの対象となります。MAJORバージョンのアップグレードと公開された移行ガイドなしに破壊的変更は行われません。</td><td>カーネル（ターゲット: v0.8.0）、<code>zeroclaw-api</code> WITインターフェース（ターゲット: v0.9.0）、カーネルIPC API（ターゲット: v1.0.0）</td></tr>
+<tr><td><strong>ベータ</strong></td><td>機能実装済みかつテスト済みです。マイナーリリースでは破壊的変更が許可されますが、アップグレードノート付きで変更履歴に明記されます。</td><td><code>zeroclaw-gw</code> (v0.9.0 → v1.0.0)、成熟したチャンネルとツールプラグイン</td></tr>
+<tr><td><strong>実験的</strong></td><td>安定性の保証はありません。PATCH リリースで壊れる可能性があります。ドキュメントやプラグインレジストリのマニフェストでは明確に <code>experimental</code> とマークする必要があります。</td><td>新しいツール統合、新しいチャンネル実装、早期ハードウェアプラグイン</td></tr>
+</tbody>
+</table>
+</div>
+<p>安定性レベルは、チームの意図的な決定を通じて<strong>昇格され、降格されることはありません</strong>。昇格は変更ログに記録され、アーキテクチャコンポーネントの場合はADRにも記録されます。コンポーネントは、昇格が検討される前に少なくとも1つの完全なリリースサイクルの間、現在のレベルを維持する必要があります。</p>
+<hr>
+<p><strong>リリース自動化</strong></p>
+<p>リリースには <a href="https://release-plz.eplant.org/"><code>release-plz</code></a> を使用しています。これは <code>master</code> へのプッシュ時にリリース用 PR を作成し、ワークスペースのバージョンを更新し、conventional commit のタイトルから変更履歴を生成します。<code>release-plz</code> はワークスペースの継承をネイティブに理解し、クレートの公開順序を自動的に処理します。独立したバージョンを持つクレート（<code>zeroclaw-api</code>、ハードウェアライブラリクレートなど）は、同じツールのクレートごとの設定を使用して個別に管理されます。</p>
+<h4 id="442-リリースアーティファクト"><a class="header" href="#442-リリースアーティファクト">4.4.2 リリースアーティファクト</a></h4>
+<p>マイクロカーネルへの移行は、「どの機能がコンパイルされるか」という問いの根本的な性質を変更します。現在、この問いに対する答えは1つです。つまり、<code>cargo build</code> に渡した機能フラグすべてです。移行後、この問いは2つの独立した関心事項に分かれます。</p>
+<ul>
+<li><strong>カーネルバイナリに含まれるもの</strong> — コンパイル時に固定され、プラットフォームごとに決定され、GitHub Releases に公開</li>
+<li><strong>利用可能な機能</strong> — <code>zeroclaw plugin install</code> を介してインストールされたプラグインによって、実行時に決定されます</li>
+</ul>
+<p>これらはもう同じ質問ではなく、現在の <code>Cargo.toml</code> の <code>[features]</code> セクションはその観点から解釈されなければなりません。</p>
+<hr>
+<p><strong>現在のコンパイル時機能フライトの運命</strong></p>
+<p>現在の <code>Cargo.toml</code> には20以上の機能フラグがあり、アーキテクチャの成熟に伴って以下の3つのカテゴリに分類されます：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>バケット</th><th>フラグ</th><th>結果</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Retire → プラグイン</strong></td><td><code>channel-nostr</code>, <code>channel-matrix</code>, <code>channel-lark</code>, <code>channel-feishu</code>, <code>whatsapp-web</code>, <code>browser-native</code></td><td>カーネルから削除されました。それぞれがWASMプラグインクレートとしてプラグインレジストリに公開されます。コンパイル時の決定は不要です。</td></tr>
+<tr><td><strong>常時オン</strong></td><td><code>plugins-wasm</code>、<code>skill-creation</code></td><td>すべてのカーネルバイナリに条件なしでコンパイルされます。<code>plugins-wasm</code> はカーネルのコアメカニズムであり、<code>skill-creation</code> はオーバーヘッドゼロのコードパスです。どちらもフラグの背後に属しません。</td></tr>
+<tr><td><strong>Stay → プラットフォーム/インフラストラクチャのフラグ</strong></td><td><code>peripheral-rpi</code>, <code>hardware</code>, <code>sandbox-landlock</code>, <code>sandbox-bubblewrap</code>, <code>voice-wake</code>, <code>probe</code></td><td>WASM プラグインでは提供できないネイティブライブラリのリンクや OS レベルのアクセスが必要なため、コンパイル時のフラグとして維持されます。<code>peripheral-rpi</code> と <code>hardware</code> はプラットフォーム固有のリリースターゲットでのみ表示されます。</td></tr>
+</tbody>
+</table>
+</div>
+<p>v0.8.0 リリース前にチームによる明示的な判断が必要な2つのフラグがあり、これらは一方的に解決するのではなく、ここで提示しています。</p>
+<ul>
+<li><strong><code>observability-prometheus</code></strong> — 現在は <code>default</code> に設定されています。Prometheus メトリクスは、測定可能なバイナリサイズのオーバーヘッドを追加します。問題は、プロダクションランタイムがデフォルトで観測機能を有効にするべきか、それともオペレーターがオプトインするべきかです。推奨事項：標準リリースでは <code>default</code> に保持します。 severely 制約されたターゲット上のオペレーターは <code>--no-default-features</code> を指定してビルドできます。</li>
+<li><strong><code>observability-otel</code></strong> — OTLP エクスポートにはより大きな依存関係のフットプリント（opentelemetry + reqwest ブロッキングクライアント）が含まれます。推奨事項：デフォルトには含めず、オプトインのままとする。トレースエクスポートが必要な本番環境では、明示的に有効化してください。</li>
+</ul>
+<p><code>ci-all</code> メタフィーチャは、チャンネルやツールのフラグが廃止されるにつれて大幅に簡素化されます。v1.0.0 では、残りのプラットフォームおよびインフラストラクチャのフラグのみをカバーします。</p>
+<hr>
+<p><strong>公式リリースカーネルバイナリ</strong></p>
+<p>各プラットフォームターゲットに対してGitHub Releasesに公開されるバイナリは、以下のプロファイルでビルドされています：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>コンパイル済み</th><th>コンパイルされていない</th></tr>
+</thead>
+<tbody>
+<tr><td>コアエージェントループ</td><td>任意のチャネル実装</td></tr>
+<tr><td>10〜12の主要ツール（Phase 2 D2 を参照）</td><td>コア以外のツール</td></tr>
+<tr><td>SQLite + Markdown メモリバックエンド</td><td>ブラウザの自動化</td></tr>
+<tr><td>プラグインホスト（<code>plugins-wasm</code>、常時有効）</td><td><code>observability-otel</code>（オペレーターによるオプトイン）</td></tr>
+<tr><td><code>observability-prometheus</code></td><td><code>voice-wake</code> (libasound2 の依存関係)</td></tr>
+<tr><td><code>skill-creation</code>（ゼロオーバーヘッド）</td><td><code>probe</code>（ニッチなハードウェアデバッグ）</td></tr>
+<tr><td>IPC サーバー</td><td>Web アセット（<code>zeroclaw-gw</code> に移動）</td></tr>
+<tr><td>プラットフォームサンドボックス（サポートされている場合）</td><td><code>peripheral-rpi</code> (別個のハードウェアビルド)</td></tr>
+</tbody>
+</table>
+</div>
+<p>「すべてをビルドした」バイナリはもう存在しません。この概念は、<code>zeroclaw plugin install --profile full</code> に置き換えられました。これは、軽量なカーネルバイナリをインストールした後に、フルプラグインカタログをダウンロードします。</p>
+<hr>
+<p><strong>リリースアーティファクトマトリックス</strong></p>
+<p>各GitHubリリースでは、以下のアーティファクトが公開されます：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>アーティファクト</th><th>ターゲット</th><th>注釈</th></tr>
+</thead>
+<tbody>
+<tr><td><code>zeroclaw</code> カーネルバイナリ</td><td><code>x86_64-unknown-linux-musl</code>, <code>aarch64-unknown-linux-gnu</code>, <code>armv7-unknown-linux-gnueabihf</code>, <code>x86_64-apple-darwin</code>, <code>aarch64-apple-darwin</code>, <code>x86_64-pc-windows-msvc</code></td><td>Linux x86_64 用の静的な musl ビルド; ARM ターゲット用には GNU</td></tr>
+<tr><td><code>zeroclaw</code> カーネルバイナリ（ハードウェア）</td><td><code>aarch64-unknown-linux-gnu</code>, <code>armv7-unknown-linux-gnueabihf</code></td><td>同じターゲットを、Raspberry Pi デプロイメント用に <code>peripheral-rpi</code> と <code>hardware</code> フラグを指定してコンパイル</td></tr>
+<tr><td><code>zeroclaw-gw</code> ゲートウェイバイナリ</td><td>カーネルと同じプラットフォームマトリックス</td><td>カーネルと同時に公開されますが、ユーザーは別途インストールする必要があります。</td></tr>
+<tr><td>WASM プラグインファイル</td><td><code>wasm32-wasip1</code></td><td>プラグインレジストリに公開されています（GitHub Releases ではありません）。<code>zeroclaw plugin install</code> でインストール可能です。</td></tr>
+<tr><td><code>zeroclaw-desktop</code> インストーラー</td><td>macOS、Windows、Linux (AppImage/deb) 用の <code>x86_64</code> および <code>aarch64</code></td><td>カーネル + ゲートウェイ + フルプラグインセットをバンドル；Tauriワークフローによってビルド</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>wasm32-wasip1</code> プラグインのビルドは別の CI ジョブで実行され、独自のスケジュールでプラグインレジストリに公開されます。プラグインのリリースにはカーネルのリリースは必要ありません。</p>
+<hr>
+<h3 id="45-ギャウェイ分離"><a class="header" href="#45-ギャウェイ分離">4.5 ギャウェイ分離</a></h3>
+<p>現在のゲートウェイは、分離すべき2つのものを混同しています：</p>
+<pre><code>Current (wrong):
+  zeroclaw binary
+    └── gateway
+          ├── Web UI server (serves React app)
+          ├── REST/WS/SSE API
+          ├── WhatsApp webhook handler  ← this is a channel, not a web server
+          ├── WATI webhook handler      ← this is a channel, not a web server
+          ├── Linq webhook handler      ← this is a channel, not a web server
+          ├── Nextcloud webhook handler ← this is a channel, not a web server
+          └── Gmail push handler        ← this is a channel, not a web server
+
+Target (correct):
+  zeroclaw-kernel
+    └── Local IPC API (Unix socket / 127.x HTTP)
+
+  zeroclaw-gw (separate binary, optional)
+    └── Connects to kernel IPC API
+    └── Web UI server
+    └── REST/WS/SSE API
+    └── Generic webhook proxy → routes to channel plugins
+
+  channel-whatsapp.wasm
+    └── Registers its own webhook route with the gateway
+    └── Handles WhatsApp-specific message parsing
+</code></pre>
+<p><strong>これが重要な理由:</strong> ゲートウェイが別のプロセスとして動作する場合、エージェントに影響を与えることなく、クラッシュ、再起動、または存在しなくても問題ありません。カーネルは継続して実行されます。これは特にエッジハードウェアの使用ケースにおいて重要です。カーネルを実行しているラズベリーパイから、VPS 経由で Web UI を提供し、カーネルはチャネルプラグインを介してアウトバウンド接続を行います。インバウンドのファイアウォールルールは不要です。</p>
+<hr>
+<h2 id="5-採用すべき基準"><a class="header" href="#5-採用すべき基準">5. 採用すべき基準</a></h2>
+<p>標準は、多くの賢明な人々が長年にわたって合意したものです。これらを採用することで、私たちはその長年の知恵を無料で得ることができ、ソフトウェアがエコシステムと自然に統合されるようになります。以下は、ZeroClaw に直接適用される標準の一覧です。</p>
+<h3 id="51-観測性-opentelemetry"><a class="header" href="#51-観測性-opentelemetry">5.1 観測性: OpenTelemetry</a></h3>
+<p><strong>概要:</strong> OpenTelemetry (OTel) は、ソフトウェアシステムからトレース、メトリクス、ログを収集するための業界標準です。これは Cloud Native Computing Foundation によって管理され、主要なクラウドプロバイダーや監視ツールによってサポートされています。</p>
+<p><strong>ZeroClawにとっての重要性:</strong> 私たちはすでに <code>OtelObserver</code> を <code>Observer</code> トレイトに対して実装しています。Prometheus メトリクスと DORA メトリクスも用意されています。問題は、これらがまだコードベース全体で標準化されていないことです。一部のモジュールは <code>tracing::info!</code> でログを出力し、他のモジュールは <code>ObserverEvent</code> を発行しており、これらが連携していません。</p>
+<p><strong>私たちが行うべきこと:</strong></p>
+<ul>
+<li>すべてのコンポーネントに対して、OpenTelemetry を唯一の観測インターフェースとして採用する</li>
+<li>すべてのプラグインが実行時にOTelスパンを出力するようにし、ユーザーが「Discordでメッセージを受信」から「エージェントがシェルツールを呼び出す」を経て「レスポンスを送信」までの完全なトレースを確認できるようにします。</li>
+<li>カーネル ↔ ゲートウェイ ↔ プラグインの境界間でトレースIDを伝播するために、W3C Trace Context（<code>traceparent</code>/<code>tracestate</code> ヘッダー）を採用する</li>
+<li><code>ZEROCLAW_LOG_FORMAT=json</code> が設定されている場合、構造化ログの出力は JSON 形式である必要があります（すでに <code>tracing</code> クレートを使用しており、JSON サブスクライバーを追加するだけです）。</li>
+</ul>
+<p><strong>標準:</strong> OpenTelemetry仕様 · W3C Trace Context (REC) · RFC 5424 (Syslog、システムログ統合用)</p>
+<h3 id="52-プラグインインターフェース-wasi-と-wit"><a class="header" href="#52-プラグインインターフェース-wasi-と-wit">5.2 プラグインインターフェース: WASI と WIT</a></h3>
+<p><strong>概要:</strong> WASI（WebAssembly System Interface）は、WebAssembly モジュールがホストシステムとやり取りするために使用する標準 API です。WIT（WebAssembly Interface Types）は、WASM コンポーネントがエクスポートおよびインポートする内容を記述するためのインターフェース定義言語であり、WASM プラグイン用の <code>.proto</code> ファイルのようなものと考えることができます。</p>
+<p><strong>ZeroClawにとっての重要性:</strong> 現在の <code>WasmTool</code> および <code>WasmChannel</code> ブリッジには、プラグインの WASM バイナリがエクスポートすべき内容に関する正式な契約がありません。そのため、プラグイン作者は推測に頼らざるを得ません。WIT ファイルはこの契約を正確に定義し、あらゆる言語でプラグイン作者向けの自動コード生成を可能にします。</p>
+<p><strong>私たちが行うべきこと:</strong></p>
+<ul>
+<li><code>Tool</code>、<code>Channel</code>、<code>Memory</code> プラグインタイプ用の WIT インターフェースファイルを定義する（ワークスペースのルートに <code>wit/</code> ディレクトリ）</li>
+<li><code>wit-bindgen</code> を使用して、それらの WIT ファイルから Rust のホスト側のバインディングを生成します。</li>
+<li>WITインターフェースを公式プラグインSDKとして文書化する</li>
+<li>プラグイン作者は、WITインターフェースに対してRust（またはGo、C、Python）でコードを書き、<code>cargo build --target wasm32-wasi</code> を実行します。その結果は <code>~/.zeroclaw/plugins/</code> に配置されます。</li>
+</ul>
+<p><strong>標準:</strong> WASI 0.2 · W3C WebAssembly コンポーネントモデル · WIT IDL</p>
+<h3 id="53-ローカル-api-openapi-31"><a class="header" href="#53-ローカル-api-openapi-31">5.3 ローカル API: OpenAPI 3.1</a></h3>
+<p><strong>概要:</strong> OpenAPI は HTTP API を記述するための標準仕様です。バージョン 3.1 は JSON Schema Draft 2020-12 に準拠しています。</p>
+<p><strong>ZeroClawにとっての重要性:</strong> カーネルのローカルIPC API（ゲートウェイやその他のコンポーネントが接続するソケット）には、安定した文書化された契約が必要です。正式な仕様がない場合、ゲートウェイとカーネルは時間とともに静かに乖離していきます。</p>
+<p><strong>私たちが行うべきこと:</strong></p>
+<ul>
+<li>
+<p>Here is an OpenAPI 3.1 specification for a hypothetical kernel local IPC (Inter-Process Communication) API. This API allows processes to send messages, share memory, and manage IPC resources.</p>
+<pre><code class="language-yaml">openapi: 3.1.0
+info:
+  title: Kernel Local IPC API
+  description: |
+    This API provides endpoints for inter-process communication (IPC) within the kernel.
+    It supports message passing, shared memory management, and IPC resource control.
+  version: 1.0.0
+  contact:
+    name: Kernel IPC Team
+    url: https://example.com/kernel-ipc-support
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: https://api.kernel.local/v1
+    description: Local IPC API Server
+
+paths:
+  /ipc/messages:
+    post:
+      summary: Send a message
+      description: Sends a message to a specified process or queue.
+      operationId: sendMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageRequest'
+      responses:
+        '200':
+          description: Message sent successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Permission denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /ipc/messages/{messageId}:
+    get:
+      summary: Get message details
+      description: Retrieves details of a specific message by its ID.
+      operationId: getMessage
+      parameters:
+        - name: messageId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Message details retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '404':
+          description: Message not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /ipc/shared-memory:
+    post:
+      summary: Create shared memory segment
+      description: Creates a new shared memory segment for IPC.
+      operationId: createSharedMemory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SharedMemoryRequest'
+      responses:
+        '201':
+          description: Shared memory segment created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SharedMemoryResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Permission denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /ipc/shared-memory/{segmentId}:
+    get:
+      summary: Get shared memory segment details
+      description: Retrieves details of a specific shared memory segment by its ID.
+      operationId: getSharedMemory
+      parameters:
+        - name: segmentId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Shared memory segment details retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SharedMemory'
+        '404':
+          description: Shared memory segment not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    delete:
+      summary: Delete shared memory segment
+      description: Deletes a specific shared memory segment by its ID.
+      operationId: deleteSharedMemory
+      parameters:
+        - name: segmentId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Shared memory segment deleted successfully
+        '404':
+          description: Shared memory segment not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Permission denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  schemas:
+    MessageRequest:
+      type: object
+      required:
+        - target
+        - payload
+      properties:
+        target:
+          type: string
+          description: Target process ID or queue name.
+        payload:
+          type: string
+          description: Message payload.
+        priority:
+          type: integer
+          description: Message priority level.
+          default: 0
+          enum:
+            - 0
+            - 1
+            - 2
+            - 3
+        timeout:
+          type: integer
+          description: Timeout in milliseconds for sending the message.
+          default: 5000
+
+    MessageResponse:
+      type: object
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: Unique identifier for the sent message.
+        status:
+          type: string
+          description: Status of the message send operation.
+          enum:
+            - sent
+            - queued
+            - failed
+
+    Message:
+      type: object
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: Unique identifier for the message.
+        target:
+          type: string
+          description: Target process ID or queue name.
+        payload:
+          type: string
+          description: Message payload.
+        priority:
+          type: integer
+          description: Message priority level.
+        timestamp:
+          type: string
+          format: date-time
+          description: Timestamp when the message was sent.
+        status:
+          type: string
+          description: Current status of the message.
+          enum:
+            - sent
+            - delivered
+            - failed
+
+    SharedMemoryRequest:
+      type: object
+      required:
+        - size
+      properties:
+        size:
+          type: integer
+          description: Size of the shared memory segment in bytes.
+        permissions:
+          type: string
+          description: Permissions for the shared memory segment (e.g., "rw-r--r--").
+          default: "rw-r--r--"
+
+    SharedMemoryResponse:
+      type: object
+      properties:
+        segmentId:
+          type: string
+          format: uuid
+          description: Unique identifier for the shared memory segment.
+        status:
+          type: string
+          description: Status of the shared memory creation operation.
+          enum:
+            - created
+            - failed
+
+    SharedMemory:
+      type: object
+      properties:
+        segmentId:
+          type: string
+          format: uuid
+          description: Unique identifier for the shared memory segment.
+        size:
+          type: integer
+          description: Size of the shared memory segment in bytes.
+        permissions:
+          type: string
+          description: Permissions for the shared memory segment.
+        createdAt:
+          type: string
+          format: date-time
+          description: Timestamp when the shared memory segment was created.
+        status:
+          type: string
+          description: Current status of the shared memory segment.
+          enum:
+            - active
+            - deleted
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: integer
+          description: HTTP status code.
+        message:
+          type: string
+          description: Error message.
+        details:
+          type: object
+          description: Additional error details.
+</code></pre>
+<h3 id="explanation"><a class="header" href="#explanation">Explanation</a></h3>
+<ol>
+<li>
+<p><strong>Endpoints</strong>:</p>
+<ul>
+<li><code>/ipc/messages</code>: POST to send a message, GET to retrieve message details.</li>
+<li><code>/ipc/shared-memory</code>: POST to create shared memory, GET to retrieve details, DELETE to remove.</li>
+</ul>
+</li>
+<li>
+<p><strong>Schemas</strong>:</p>
+<ul>
+<li><code>MessageRequest</code> and <code>MessageResponse</code> handle message sending and responses.</li>
+<li><code>SharedMemoryRequest</code> and <code>SharedMemoryResponse</code> handle shared memory creation and responses.</li>
+<li><code>Error</code> schema standardizes error responses.</li>
+</ul>
+</li>
+<li>
+<p><strong>Security</strong>:</p>
+<ul>
+<li>This spec does not include security schemes. In a real-world scenario, you would add authentication and authorization mechanisms (e.g., OAuth2, API keys).</li>
+</ul>
+</li>
+<li>
+<p><strong>Validation</strong>:</p>
+<ul>
+<li>Ensure that the <code>target</code> in <code>MessageRequest</code> is a valid process ID or queue name.</li>
+<li>Ensure that the <code>size</code> in <code>SharedMemoryRequest</code> is a positive integer.
+This spec provides a foundational structure for implementing a kernel local IPC API. Adjustments can be made based on specific requirements and constraints of the kernel environment.</li>
+</ul>
+</li>
+</ol>
+</li>
+<li>
+<p><code>utoipa</code> または <code>aide</code> を使用して、仕様書から Rust のサーバースタブを生成します。</p>
+</li>
+<li>
+<p>仕様を <code>docs/reference/api/kernel-ipc-api.yaml</code> として公開する</p>
+</li>
+<li>
+<p>ゲートウェイの外部APIにもOpenAPI仕様が必要です。</p>
+</li>
+</ul>
+<p><strong>標準:</strong> OpenAPI 3.1 · JSON Schema Draft 2020-12</p>
+<h3 id="54-セキュリティ-owasp-asvs"><a class="header" href="#54-セキュリティ-owasp-asvs">5.4 セキュリティ: OWASP ASVS</a></h3>
+<p><strong>概要:</strong> OWASPアプリケーションセキュリティ検証基準（OWASP Application Security Verification Standard）は、リスクレベル（L1：基本、L2：標準、L3：高度）ごとに整理されたセキュリティ要件のチェックリストです。</p>
+<p><strong>ZeroClawにとっての重要性:</strong> ゲートウェイは外部サービスからのウェブフックを処理し、信頼できないユーザー入力を処理し、シークレットを管理します。ペアリングシステム、WebAuthnサポート、レート制限はすべて存在しますが、それらが完全で正しいことを検証するためのフレームワークはありません。</p>
+<p><strong>私たちが行うべきこと:</strong></p>
+<ul>
+<li>ゲートウェイとセキュリティモジュールに対して ASVS レベル 2 をターゲットにする</li>
+<li>レベル2のチェックリストを確認し、どの要件を満たしているか、部分的に満たしているか、そしてどの範囲外かを文書化してください。</li>
+<li>セキュリティ関連の課題やPRの基準としてこれを使用してください。</li>
+</ul>
+<p><strong>基準:</strong> OWASP ASVS 4.0 · OWASP Top 10</p>
+<h3 id="55-品質モデル-isoiec-25010"><a class="header" href="#55-品質モデル-isoiec-25010">5.5 品質モデル: ISO/IEC 25010</a></h3>
+<p><strong>概要:</strong> ISO/IEC 25010は、ソフトウェア製品の品質に関するモデルを定義しており、8つの主要な特性（機能適合性、パフォーマンス効率性、互換性、ユーザビリティ、信頼性、セキュリティ、保守性、移植性）を含みます。</p>
+<p><strong>ZeroClawにとっての重要性:</strong> 「これはマージに十分か？」と問われた場合、現在の回答は主観的なものです。ISO 25010 は、その議論のための用語を提供します。ビジョンのコミットメントは直接的にマッピングされます。「ゼロオーバーヘッド」→パフォーマンス効率、「任意のハードウェア」→ポータビリティ、「ゼロコンプロミス」→セキュリティ＋信頼性。</p>
+<p><strong>私たちが行うべきこと:</strong></p>
+<ul>
+<li>重要な変更については、8つの品質特性をレンズとしてPRレビューに活用してください。</li>
+<li>アーキテクチャ変更に関するPRテンプレートには、品質への影響に関する簡潔な記述を含めてください（例：「この変更は、ゲートウェイとチャネル実装間の結合を減らすことで保守性を向上させ、パフォーマンス効率には影響を与えません」）。</li>
+</ul>
+<p><strong>規格:</strong> ISO/IEC 25010:2023</p>
+<h3 id="56-すでに採用済み--これらを維持"><a class="header" href="#56-すでに採用済み--これらを維持">5.6 すでに採用済み — これらを維持</a></h3>
+<p>これらはすでに配置されており、維持される必要があります：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>標準</th><th>ステータス</th><th>どこ</th></tr>
+</thead>
+<tbody>
+<tr><td>セマンティックバージョニング 2.0.0</td><td>✅ 採用</td><td><code>Cargo.toml</code>、リリース</td></tr>
+<tr><td>Conventional Commits</td><td>✅ 採用</td><td><code>AGENTS.md</code>、コミット履歴</td></tr>
+<tr><td>RFC 3339 / ISO 8601 タイムスタンプ</td><td>✅ 採用</td><td><code>MemoryEntry</code>、すべてのタイムスタンプ</td></tr>
+<tr><td>XDG ベースディレクトリ仕様</td><td>✅ 採用</td><td><code>directories</code> クレートを使用</td></tr>
+<tr><td>変更履歴を保持する</td><td>✅ 採用</td><td><code>CHANGELOG.md</code></td></tr>
+<tr><td>Rust API ガイドライン</td><td>✅ 部分的に</td><td>Clippyの構成は多くの項目を強制します</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="6-フェーズ別ロードマップ-v070--v100"><a class="header" href="#6-フェーズ別ロードマップ-v070--v100">6. フェーズ別ロードマップ: v0.7.0 → v1.0.0</a></h2>
+<p>各フェーズは、Vision → Architecture → Design → Implementation → Testing → Documentation → Release の階層に従います。設計がレビューされ、合意されるまで、どのフェーズも実装を開始しません。</p>
+<p>全体の移行戦略は<strong>Strangler Fig Pattern</strong>を採用しています。既存のコードの周辺から新しいアーキテクチャを構築し、徐々に内部へと移行を進めていきます。最終的には古い構造が完全に置き換えられます。このアプローチでは、「システム全体を停止して書き直す」ことは行いません。アプリケーションは常にリリース可能な状態を維持されます。</p>
+<hr>
+<h3 id="フェーズ1--v070--ザシームズ"><a class="header" href="#フェーズ1--v070--ザシームズ">フェーズ1 · v0.7.0 — 「ザ・シームズ」</a></h3>
+<p><strong>テーマ:</strong> 動作を変更せずにアーキテクチャを可視化する。まず線を描く。</p>
+<p><strong>このフェーズの理由:</strong> レイヤーが実際の境界として存在するまで、階層アーキテクチャへの移行はできません。現在、トレイトは論理的な境界を定義していますが、コンパイラはそれらを強制していません。すべてが1つのクレートに含まれているため、何でもインポートできます。このフェーズでは、これらの境界を実際のものとします。</p>
+<p><strong>ビジョンの整合性:</strong> ユーザーにとって、ビジョンに関連するプロパティは変更されません。これは完全に内部の処理です。この取り組みの価値は、今後のすべての貢献が構造的に位置づけられるようになり、新しい貢献者がコードベースを全体としてではなく、部分的に理解できるようになる点にあります。</p>
+<h4 id="納品物"><a class="header" href="#納品物">納品物</a></h4>
+<p><strong>D1: <code>zeroclaw-api</code> クレートを取り出す</strong></p>
+<p>新しいクレート <code>crates/zeroclaw-api</code> を作成し、トレイト定義とそのサポート型のみを含めます。実装は含めず、依存関係も最小限にします。このクレートは2秒以内にコンパイルできる必要があります。</p>
+<p>このクレートに移動します:</p>
+<ul>
+<li><code>src/providers/traits.rs</code> → <code>Provider</code>、<code>ChatMessage</code>、<code>ChatResponse</code>、<code>ToolCall</code>、<code>StreamChunk</code>、<code>ProviderCapabilities</code></li>
+<li><code>src/channels/traits.rs</code> → <code>Channel</code>、<code>ChannelMessage</code>、<code>SendMessage</code></li>
+<li><code>src/tools/traits.rs</code> → <code>Tool</code>、<code>ToolResult</code>、<code>ToolSpec</code></li>
+<li><code>src/memory/traits.rs</code> → <code>Memory</code>、<code>MemoryEntry</code>、<code>MemoryCategory</code></li>
+<li><code>src/observability/traits.rs</code> → <code>Observer</code>、<code>ObserverEvent</code>、<code>ObserverMetric</code></li>
+<li><code>src/runtime/traits.rs</code> → <code>RuntimeAdapter</code></li>
+<li><code>src/peripherals/traits.rs</code> → <code>Peripheral</code></li>
+</ul>
+<p>ワークスペース内の他のすべてのクレートは、これらの型が必要になるたびに <code>zeroclaw-api</code> を依存関係として追加します。コンパイラは、実装クレートが API レイヤーを経由せずに他の実装クレートをインポートできないことを強制するようになりました。</p>
+<p><strong>D2: <code>zeroclaw-tool-call-parser</code> クレートを取り出す</strong></p>
+<p><code>src/agent/loop_.rs</code> のツール呼び出し解析ロジックは、純粋なテキスト変換として約 1,400 行にわたります。これは LLM から文字列を取得し、構造化されたツール呼び出しのリストを返すものです。エージェントの状態、メモリ、プロバイダー、チャネルには依存しません。JSON、XML、GLM スタイル、MiniMax、Perl スタイル、マークダウン フェンスなど、12 種類以上の異なる LLM 出力形式を処理します。</p>
+<p>このロジックは：</p>
+<ol>
+<li>自己完結型 — 独自のクレートに最適</li>
+<li>プロジェクト内で最もfuzzテストが可能なコード — プロパティベースのテストはここに属します</li>
+<li>Rustエコシステムへの真の貢献 — これを包括的に実現する他のクレートはありません</li>
+</ol>
+<p><code>crates/zeroclaw-tool-call-parser</code> を、以下の公開 API を持つように作成してください:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub fn parse(text: &amp;str, specs: &amp;[ToolSpec]) -&gt; ParseResult
+
+pub struct ParseResult {
+    pub calls: Vec&lt;ParsedToolCall&gt;,
+    pub remaining_text: Option&lt;String&gt;,
+}
+
+pub struct ParsedToolCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
+    pub tool_call_id: Option&lt;String&gt;,
+}
+<span class="boring">}</span></code></pre>
+<p>現在 <code>loop_.rs</code> にある約300個のパーサーテストが、このクレートに移動されます。<code>loop_.rs</code> は約1,400行削減されます。</p>
+<p><strong>D3: 観測可能性の標準としてOpenTelemetryを採用する</strong></p>
+<p>すでに実装済みの仕様を正式文書化します。<code>ObserverEvent</code> と <code>ObserverMetric</code> が内部イベントバスであり、<code>OtelObserver</code> が標準的な本番環境用バックエンドであることを文書化します。<code>ZEROCLAW_LOG_FORMAT=json</code> に対して JSON 構造化ログのサブスクライバーを採用します。また、今後のコンポーネント間トレーシングのために W3C Trace Context を導入します。</p>
+<p><strong>D4: WITインターフェースファイルを作成する</strong></p>
+<p>WASM プラグインの実行を実装する前に、契約を定義しましょう。ワークスペースのルートに <code>wit/</code> ディレクトリを作成し、以下のインターフェース定義を含めてください：</p>
+<ul>
+<li><code>zeroclaw:tool/tool.wit</code> — Tool プラグインのインターフェース</li>
+<li><code>zeroclaw:channel/channel.wit</code> — Channel プラグインのインターフェース</li>
+</ul>
+<p>これらが公式プラグインSDKとなります。v0.8.0での実装はこれらのファイルから生成されます。</p>
+<h4 id="v070-の成功指標"><a class="header" href="#v070-の成功指標">v0.7.0 の成功指標</a></h4>
+<ul>
+<li><code>zeroclaw-api</code> は、実装依存関係ゼロで2秒以内にコンパイルされます。</li>
+<li><code>zeroclaw-tool-call-parser</code> はテストカバレッジが 95% 以上です（ロジックは完全に独立してテスト可能です）。</li>
+<li><code>loop_.rs</code> は8,000行未満です</li>
+<li>ユーザーに見える動作の変更はありません</li>
+<li>パフォーマンスの低下なし（ベンチマークスイートがパス）</li>
+</ul>
+<hr>
+<h3 id="フェーズ-2--v080--ランタイム"><a class="header" href="#フェーズ-2--v080--ランタイム">フェーズ 2 · v0.8.0 — 「ランタイム」</a></h3>
+<p><strong>テーマ:</strong> エージェントランタイムをクリーンで独立してデプロイ可能なユニットとして形式化する。ランタイム以外のすべてをゲストとする。</p>
+<p><strong>このフェーズの理由:</strong> シームが v0.7.0 で存在するようになると、ランタイムの境界を明示的に定義できます。このフェーズでは <code>zeroclaw-runtime</code> をスタンドアロンのクレートとして抽出し、WASM プラグイン実行ブリッジを完成させ、プラグインレジストリクライアントを接続します。これにより、ランタイム外のすべてがランタイムに接続するためのメカニズムが実現します。</p>
+<p><strong>ビジョンの整合性:</strong> ここで、構成モデルがユーザーにとって現実のものとなります。CLIエージェントのみを必要とするユーザーは、1つのバイナリをダウンロードして <code>zeroclaw onboard</code> を実行するだけで完了します。Rustツールチェーンも不要で、コンパイルも不要です。<code>zeroclaw onboard</code> ウィザードには、必要に応じてプラグインコンポーネントをダウンロードする機能が追加されます。</p>
+<h4 id="納品物-1"><a class="header" href="#納品物-1">納品物</a></h4>
+<p><strong>D1: <code>zeroclaw-runtime</code> クレートを正式化する</strong></p>
+<p>エージェントのオーケストレーションループ、CLIチャンネル、セキュリティポリシー、プラグインホスト、およびIPC APIを <code>crates/zeroclaw-runtime</code> に抽出し、<code>agent-runtime</code> 機能で制御します。このクレートは <code>zeroclaw-api</code> と基盤となるクレートに依存しており、Telegram、Discord、Anthropic、または特定のツール実装に関する知識を持ちません。</p>
+<p>ランタイムはクリーンな公開APIをエクスポートします：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct Runtime { ... }
+
+pub struct Registry {
+    pub fn register_channel(&amp;mut self, ch: Arc&lt;dyn Channel&gt;);
+    pub fn register_tool(&amp;mut self, t: Box&lt;dyn Tool&gt;);
+    pub fn set_provider(&amp;mut self, p: Arc&lt;dyn Provider&gt;);
+    pub fn set_memory(&amp;mut self, m: Arc&lt;dyn Memory&gt;);
+    pub fn set_observer(&amp;mut self, o: Arc&lt;dyn Observer&gt;);
+}
+
+pub async fn run(runtime: Runtime, registry: Registry) -&gt; anyhow::Result&lt;()&gt;;
+<span class="boring">}</span></code></pre>
+<p>バイナリクレートは、設定を読み取って <code>run</code> を呼び出す薄い配線層になります。</p>
+<p><strong>D2: WASM実行ブリッジを完成させる</strong></p>
+<p><code>WasmTool::execute</code> と <code>WasmChannel</code> に Extism を組み込みます。<code>PluginHost</code> はすでに検出とインストールを処理しています。実行ブリッジが欠落している部分です。v0.7.0 で定義された WIT インターフェースを使用して、<code>wit-bindgen</code> でホスト側のバインディングを生成します。</p>
+<p>Extism を使用した <code>WasmTool::execute</code> の完全な実装は、約 30〜50 行になります。主な作業は、<code>PluginPermission</code> で既に定義されている権限モデル内で、WASM プラグインが呼び出せるホスト関数（HTTP リクエスト、メモリアクセス、ログ出力）を定義することです。</p>
+<p><strong>D3: コンポーネントレジストリクライアント</strong></p>
+<p><code>zeroclaw plugin</code> サブコマンドを追加し、シンプルなレジストリクライアントでバックエンド化します：</p>
+<pre><code>zeroclaw plugin list              # list installed plugins
+zeroclaw plugin search &lt;query&gt;    # search the component registry
+zeroclaw plugin install &lt;name&gt;    # download, verify, and install a plugin
+zeroclaw plugin remove &lt;name&gt;     # remove an installed plugin
+zeroclaw plugin update            # update all installed plugins
+</code></pre>
+<p>レジストリは、既知のURL（例：<code>https://plugins.zeroclawlabs.ai/index.json</code>）から提供されるJSONインデックスファイルです。各エントリには、名前、バージョン、ダウンロードURL、SHA-256チェックサム、およびパブリッシャーのEd25519公開鍵が含まれます。<code>PluginHost</code>の署名検証は、すでにセキュリティモデルを処理しています。</p>
+<p><strong>D4: プラグインシステムに <code>zeroclaw onboard</code> を統合する</strong></p>
+<p>オンボーディングウィザードは、ユーザーが希望するチャンネルやインテグレーションを尋ね、その後、それぞれに対して <code>PluginRegistry::install</code> を呼び出す必要があります。コンパイルは不要です。ユーザーはバイナリをダウンロードして <code>zeroclaw onboard</code> を実行するだけで、2分以内に動作する設定済みエージェントが利用可能になります。</p>
+<p><strong>D5: <code>all_tools_with_runtime</code> をコアツールのみ削減</strong></p>
+<p>カーネルには、プラグインがインストールされていない状態で有用なエージェントを作成するために必要なツールが正確に含まれています：<code>shell</code>、<code>file_read</code>、<code>file_write</code>、<code>file_edit</code>、<code>git_operations</code>、<code>glob_search</code>、<code>content_search</code>、<code>memory_recall</code>、<code>memory_store</code>、<code>memory_forget</code>、および <code>web_fetch</code>。それ以外のツールは、インストールされたプラグインによって登録されます。</p>
+<h4 id="v080-の成功指標"><a class="header" href="#v080-の成功指標">v0.8.0 の成功指標</a></h4>
+<ul>
+<li><code>zeroclaw-runtime</code> は、チャネルやツールの実装コードなしで独立してコンパイルされます。</li>
+<li><code>zeroclaw plugin install channel-discord</code> はエンドツーエンドで動作します。</li>
+<li><code>zeroclaw onboard</code> は、Rust ツールチェーンを必要とせずにプラグインをインストールします。</li>
+<li>ランタイムのバイナリサイズは<strong>追跡され、レポート</strong>され、リリースノートに記載されます。目標は、ビジョンターゲット（§7参照）に向かって下向きに進むことです。</li>
+<li>WITインターフェースを使用してRustで書かれたWASMツールプラグインが正しく実行されました。</li>
+</ul>
+<hr>
+<h3 id="フェーズ3--v090--ザゲートウェイ"><a class="header" href="#フェーズ3--v090--ザゲートウェイ">フェーズ3 · v0.9.0 — 「ザ・ゲートウェイ」</a></h3>
+<p><strong>テーマ:</strong> ウェブ表面とエージェントのコアを分離する。</p>
+<p><strong>このフェーズの理由:</strong> ゲートウェイは現在、コードベースにおいて最大の構造的結合となっています。これはコンパイルされたReactアプリケーションを組み込み、チャネル固有のWebhookロジックを処理し、ウェブページを提供する予定のない10ドルのエッジハードウェア用のバイナリを含むすべてのバイナリにコンパイルされています。</p>
+<p><strong>ビジョンの整合性:</strong> このフェーズは、「外部要件ゼロ」という約束を完全に実現します。Raspberry Pi のユーザーは、Web サーバー、React アプリ、HTTP リスナーを含まないカーネルバイナリを取得します。Web ダッシュボードを必要とするユーザーは、<code>zeroclaw-gw</code> を別途インストールします。</p>
+<h4 id="納品物-2"><a class="header" href="#納品物-2">納品物</a></h4>
+<p><strong>D1: カーネルのIPC APIを定義する</strong></p>
+<p>ゲートウェイを抽出する前に、カーネルがUnixソケットまたはループバックポートで公開するローカルAPIのOpenAPI 3.1仕様を定義してください。このAPIは、ゲートウェイ、Tauriアプリ、および将来のクライアントが接続するものです。これは、カーネルと外部世界間の安定した契約です。</p>
+<p>エンドポイントには、メッセージの送信、ストリーミング応答の受信、アクティブなセッションの一覧表示、インストール済みプラグインの一覧表示、エージェントのステータスの取得、メモリ管理、cron ジョブのトリガーが含まれます。これは設計文書です — 実装のコードを1行も書く前に、仕様書を確認し、合意する必要があります。</p>
+<p><strong>D2: カーネルのIPCサーバーを実装する</strong></p>
+<p>IPC サーバーを <code>zeroclaw-kernel</code> に、<code>--features ipc</code> の機能フラグの背後に追加します。対応しているプラットフォームでは、カーネルは <code>~/.zeroclaw/kernel.sock</code> の Unix ソケットでリッスンします。Windows では名前付きパイプを使用します。<code>zeroclaw gateway</code> コマンド（現在の Web サーバーのエントリポイント）は、このソケットに接続する <code>zeroclaw-gw</code> になります。</p>
+<p><strong>D3: <code>zeroclaw-gw</code> を別のバイナリとして抽出する</strong></p>
+<p><code>src/gateway/</code> を新しい <code>crates/zeroclaw-gw/</code> クレートに移動し、独自のバイナリを作成します。この crate は <code>zeroclaw-api</code> に依存し、IPC API を介してカーネルと接続します。<code>rust-embed</code> を介して埋め込まれていた React アプリケーションも完全にこの crate に移動され、カーネルのバイナリには Web アセットが含まれなくなります。</p>
+<p><strong>D4: チャネルのウェブフックハンドラをゲートウェイから移行する</strong></p>
+<p><code>gateway/mod.rs</code> に現在実装されている WhatsApp、WATI、Linq、Nextcloud Talk、Gmail の Webhook ハンドラは、それぞれのチャネルプラグインへ移行されます。ゲートウェイは、チャネルプラグインがロードされた際に Webhook のパスプレフィックスとハンドラ関数を登録する汎用の Webhook 登録 API を提供します。ゲートウェイは、受信した Webhook を登録されたハンドラへルーティングします。これにより、ゲートウェイは WhatsApp について直接知る必要がなくなります。</p>
+<p><strong>D5: Tauriのサイドカー関係を正式に定義する</strong></p>
+<p><code>apps/tauri/</code> を更新して、<code>zeroclaw-gw</code> を Tauri のサイドカーバイナリとしてバンドルします。Tauri アプリは「フル体験」版の配布物となり、カーネルとゲートウェイを自動的に起動し、Web UI を開きます。Tauri アプリをダウンロードしたユーザーは、ターミナルを操作することなくすべてを動作させることができます。</p>
+<h4 id="v090-の成功指標"><a class="header" href="#v090-の成功指標">v0.9.0 の成功指標</a></h4>
+<ul>
+<li>カーネルバイナリ（リリース版）には、Web アセットや HTTP サーバーのコードは含まれていません。</li>
+<li><code>zeroclaw-gw</code> が起動し、IPC を介してカーネルに接続して Web ダッシュボードを提供します</li>
+<li><code>zeroclaw-gw</code> を削除しても、カーネルやチャネルプラグインには影響しません。</li>
+<li>WhatsApp、WATI、Linq、Nextcloud Talk、Gmailのチャンネルコードがプラグインクレートに移動しました</li>
+<li>Tauri デスクトップアプリは、両方のバイナリを正しくバンドルして起動します。</li>
+</ul>
+<hr>
+<h3 id="フェーズ4--v100-プラットフォーム"><a class="header" href="#フェーズ4--v100-プラットフォーム">フェーズ4 · v1.0.0 —「プラットフォーム」</a></h3>
+<p><strong>テーマ:</strong> ZeroClawはモノリシックなアプリケーションではなく、コンポーザブルなプラットフォームへと進化します。</p>
+<p><strong>このフェーズの理由:</strong> カーネルが安定し、ゲートウェイが分離され、プラグインシステムが動作しているため、v1.0.0 はアーキテクチャがプロダクトとなるリリースです。外部開発者はプラグインを作成・公開できます。ユーザーは、自分好みの ZeroClaw を組み立てることができます。バイナリは、ビジョンが約束する軽量なプロファイルを真に実現します。</p>
+<h4 id="納品物-3"><a class="header" href="#納品物-3">納品物</a></h4>
+<p><strong>D1: 残りのすべてのチャンネルをプラグインに移行する</strong></p>
+<p>27以上のチャンネル実装それぞれが、スタンドアロンのWASMプラグインクレートになります。これらは署名付きリリースでコンポーネントレジストリに公開されます。カーネルバイナリには、CLIを除いて、チャンネル実装は含まれていません。</p>
+<p><strong>D2: 長尾ツールをプラグインに移行する</strong></p>
+<p>70以上のツールのうち約60個が、ドメインごとにグループ化されたプラグインクレートへ移行します。具体的には、<code>zeroclaw-tools-web</code>（ブラウザ、検索、スクリーンショット、PDF）、<code>zeroclaw-tools-integrations</code>（Jira、Notion、Google Workspace、MS365、LinkedIn）、<code>zeroclaw-tools-hardware</code>（ボード情報、GPIO）、<code>zeroclaw-tools-cloud</code>（クラウド運用、セキュリティ運用）です。カーネルには、v0.8.0で特定された10〜12個のコアツールのみが保持されます。</p>
+<p><strong>D3: プラグインSDKおよび開発者向けドキュメント</strong></p>
+<p>プラグイン開発ガイドを公開します。開発者は午後の間に新しいツールプラグインを作成できるはずです：</p>
+<ol>
+<li>依存関係として <code>zeroclaw-plugin-sdk</code> を追加する</li>
+<li>WITで生成されたトレイトを実装する</li>
+<li><code>cargo build --target wasm32-wasi</code></li>
+<li><code>zeroclaw plugin install ./my-plugin/</code></li>
+</ol>
+<p>SDKは、ホスト関数のバインディング、マニフェスト形式、および権限モデルを処理します。</p>
+<p><strong>D4: カーネル IPC API を v1.0 で安定化</strong></p>
+<p>カーネルのIPC APIにはバージョンプレフィックス（<code>/v1/</code>）と安定性の保証が付与されます。v1.xにおける破壊的変更はこのAPIに対して許可されません。これは、サードパーティのクライアントやゲートウェイが依存する契約です。</p>
+<p><strong>D5: バージョニングポリシーと安定性ティアの定義を <code>docs/book/src/maintainers/stability-tiers.md</code> に抽出する</strong></p>
+<p>このRFCの§4.4.1で定義されているバージョニングポリシーと安定性ティアの表は、<code>docs/book/src/maintainers/stability-tiers.md</code> に恒久的なコントリビュータ参照ドキュメントとして格納されます。このドキュメントは、コントリビュータが新しいプラグインクレートのティアを割り当てる際に日常的に参照するもので、メンテナがリリースの決定を行う際にも参照されます。RFC自体は、これらの決定がなされた理由の歴史的記録であり、抽出されたドキュメントはコントリビュータが参照する内容です。</p>
+<h4 id="v100-の成功指標"><a class="header" href="#v100-の成功指標">v1.0.0 の成功指標</a></h4>
+<ul>
+<li>ランタイムのバイナリサイズは<strong>ビジョンターゲットに対して追跡されます</strong>（§7参照）。v1.0.0のワークストリームとして、各クレートに対する専用の最適化パスが期待されています。</li>
+<li>サードパーティのデベロッパーは、公開されているドキュメントのみを使用して動作するプラグインを公開できます。</li>
+<li>27以上のチャンネル実装がレジストリでダウンロード可能なプラグインとして提供されています。</li>
+<li><code>zeroclaw onboard</code> コマンドは、Rust ツールチェーンがインストールされていない Raspberry Pi Zero 2W 上で、2分以内に完全なセットアップを完了します。</li>
+<li>すべてのプラグインカタログは、<code>zeroclaw plugin install --profile full</code> でインストール可能です。</li>
+</ul>
+<hr>
+<h2 id="7-コードと複雑性メトリクス"><a class="header" href="#7-コードと複雑性メトリクス">7. コードと複雑性メトリクス</a></h2>
+<p>これらは現在のコードベースの直接コード分析に基づく見積もりです。これらは正確な予測ではなく、規模感を把握するために提供されています。</p>
+<h3 id="ランタイムから移動するコードの行数"><a class="header" href="#ランタイムから移動するコードの行数">ランタイムから移動するコードの行数</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>何が変わるのか</th><th>概算行</th><th>宛先</th></tr>
+</thead>
+<tbody>
+<tr><td>ツール呼び出しパーサー（<code>loop_.rs</code> から）</td><td>~1,400</td><td><code>zeroclaw-tool-call-parser</code> クレート</td></tr>
+<tr><td>60以上の非コアツール実装</td><td>約30,000</td><td>プラグインクレート</td></tr>
+<tr><td>24以上の非コアチャネル実装</td><td>約7,200</td><td>プラグインクレート</td></tr>
+<tr><td>ゲートウェイ HTTP サーバー</td><td>~2,260</td><td><code>zeroclaw-gw</code> クレート</td></tr>
+<tr><td>埋め込みReactアプリ（バイナリ重み）</td><td>—</td><td><code>zeroclaw-gw</code> クレート</td></tr>
+<tr><td>ゲートウェイからチャンネルのウェブフックハンドラを処理</td><td>~500</td><td>チャンネルプラグインのクレート</td></tr>
+<tr><td><strong>ランタイムから削除された推定合計</strong></td><td><strong>約41,000行</strong></td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="ファイルレベルの複雑さの削減"><a class="header" href="#ファイルレベルの複雑さの削減">ファイルレベルの複雑さの削減</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ファイル</th><th>現在の行</th><th>移行後のターゲット</th><th>削減</th></tr>
+</thead>
+<tbody>
+<tr><td><code>src/agent/loop_.rs</code></td><td>約9,500</td><td>約5,000</td><td>~47%</td></tr>
+<tr><td><code>src/gateway/mod.rs</code></td><td>~2,260</td><td><code>zeroclaw-gw</code> に移動</td><td>100%</td></tr>
+<tr><td><code>src/tools/mod.rs</code></td><td><code>all_tools_with_runtime</code> は約680行です</td><td>約80行（コアツールのみ）</td><td>~88%</td></tr>
+<tr><td><code>src/providers/mod.rs</code></td><td>~3,750</td><td>約1,200（プロバイダーが自己登録）</td><td>約68%</td></tr>
+<tr><td><code>src/channels/mod.rs</code></td><td>~200 + 44 チャンネルのファイル</td><td>CLIチャンネルのみ</td><td>約90%</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="バイナリサイズ--測定された進捗とビジョンの目標"><a class="header" href="#バイナリサイズ--測定された進捗とビジョンの目標">バイナリサイズ — 測定された進捗とビジョンの目標</a></h3>
+<p>プロジェクトのビジョンはランタイムの観点から表現されています：<strong>10ドルのハードウェア上で＜5 MB RAM</strong>。ディスク上のバイナリサイズとランタイムのメモリフットプリント（RSS）は関連していますが同一ではありません。ページングの需要により、実行されたコードパスのみがメモリ上に残ります。これら両方が追跡されています。</p>
+<blockquote>
+<p><strong>2パスモデル:</strong> アーキテクチャの分解（フェーズ1〜3）とバイナリサイズの最適化は、それぞれ独立した作業ストリームです。依存関係を所有するクレートに分離することで、最適化が可能になります。クレートごとに効率を最大化することは、構造に関する作業そのものの成果物ではなく、期待される2回目のパスです。</p>
+</blockquote>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>設定</th><th>分解前 (v0.6.x)</th><th>フェーズ1の結果 (v0.7.0)</th><th>ビジョンターゲット</th></tr>
+</thead>
+<tbody>
+<tr><td>完全なモノリシックバイナリ</td><td>~8.8 MB</td><td>N/A（プラグインモデルに置き換え）</td><td>N/A</td></tr>
+<tr><td>Foundation のみ（<code>--no-default-features</code>）</td><td>N/A</td><td><strong>6.6 MB</strong> <em>(測定済み、ストリップ済み)</em></td><td>最適化パス後</td></tr>
+<tr><td>ランタイムバイナリ（<code>foundation</code> + <code>agent-runtime</code>）</td><td>N/A</td><td>追跡</td><td>アスピレーション: ランタイム時にRAMを5 MB以下に抑える</td></tr>
+<tr><td>ランタイム + ゲートウェイ</td><td>N/A</td><td>追跡</td><td>ディスク上で約5〜7 MB</td></tr>
+<tr><td>ランタイム + ゲートウェイ + 上位5つのチャンネル</td><td>N/A</td><td>追跡</td><td>~8〜10 MB（プラグインは別ファイル）</td></tr>
+<tr><td>Tauri デスクトップアプリ（すべてをバンドル）</td><td>N/A</td><td>追跡</td><td>~20〜25 MBのインストーラー</td></tr>
+</tbody>
+</table>
+</div>
+<p>6.6 MB の Phase 1 基盤ビルドは、8.8 MB のモノリシックビルドから実質的な進歩を示し、分解が機能していることを証明しています。ビジョンの目標に到達するには、構造の分解が完了した後、各クレートに対して依存関係の監査と最適化のパスを専用で行う必要があります。これには、各クレートの <code>Cargo.toml</code> における不要または過剰な機能を持つ依存関係のレビュー、LTO および strip プロファイルの検証、そして実際に必要な tokio/serde の機能フラグの監査が含まれます。</p>
+<p>重要な構造的な変化：バイナリサイズは「ビルド時にコンパイルされる機能」の関数から、「ユーザーが制御するランタイム時にインストールされるプラグイン」の関数へと変化します。この変化がフェーズ1〜3のアーキテクチャ上の目標です。サイズに関する数値は、その次のフェーズの最適化目標となります。</p>
+<h3 id="コンパイル時間の改善"><a class="header" href="#コンパイル時間の改善">コンパイル時間の改善</a></h3>
+<p>現在、このコードベースで <code>cargo build --release</code> を実行すると、すべてのチャンネル、すべてのツール、すべてのプロバイダー、および埋め込みされた React アプリが単一のコンパイル単位でコンパイルされます。クレートの分解とは：</p>
+<ul>
+<li>カーネルは独立してコンパイルされ、そのコンパイル結果はキャッシュされます。</li>
+<li><code>channel-discord</code> への変更はカーネルを再コンパイルしません</li>
+<li>プラグインの作業に携わる貢献者は、自分のプラグインだけを再コンパイルします。</li>
+<li>CIは、ジョブ間でクレートのコンパイルを並列化できます。</li>
+</ul>
+<p>インクリメンタルビルドの推定ウォールクロック時間の改善：カーネルに触れない変更で60〜75%の削減。</p>
+<hr>
+<h2 id="8-貢献者にとっての意味"><a class="header" href="#8-貢献者にとっての意味">8. 貢献者にとっての意味</a></h2>
+<h3 id="新しいコントリビューターの方へ"><a class="header" href="#新しいコントリビューターの方へ">新しいコントリビューターの方へ</a></h3>
+<p>大規模なコードベースに初めて貢献する人々から最もよく寄せられる不満は、「どこから始めればよいのかわからない」というものです。現在のアーキテクチャでは、「Discord のメッセージはどこに送られるのか？」という問いに答えるために、<code>channels/discord.rs</code> → <code>channels/mod.rs</code> → <code>gateway/mod.rs</code> → <code>agent/loop_.rs</code> → その他数十のファイルを追跡する必要があります。</p>
+<p>マイクロカーネルアーキテクチャでは、その答えは「<code>channel-discord</code> プラグインを介して、カーネルの <code>Channel</code> 受信者に送られる」です。新しいコントリビューターは、1つのプラグインクレートを読むだけで Discord チャンネルを完全に理解できます。また、チャンネルやツールのコードをスコープに含めることなく、<code>zeroclaw-kernel</code> を読むだけで、エージェントのループ全体を理解することができます。</p>
+<p><strong>新規コントリビューターのための目安:</strong> 変更内容を1つの文で説明する際に、1つ以上のコンポーネントに言及しない場合、適切なレベルで作業していることになります。「Discord チャンネルのスレッド返信の処理におけるバグを修正する」は1つのコンポーネントです。「エージェント ループのリファクタリング、Discord チャンネルの更新、さらにメモリ バックエンドの修正」は3つのコンポーネントに該当し、これらは3つのPRとして提出すべきです。</p>
+<h3 id="メンテナ向け"><a class="header" href="#メンテナ向け">メンテナ向け</a></h3>
+<p>すべてのバグレポートには明確な対応先があります。「エージェントがツールを誤って呼び出している」→ <code>zeroclaw-tool-call-parser</code> または <code>zeroclaw-runtime</code>。「Discord 連携が壊れている」→ <code>channel-discord</code> プラグイン。「Web ダッシュボードが読み込まれない」→ <code>zeroclaw-gw</code>。現在、これらのバグは 50,000 行以上のどこにでも存在する可能性があります。</p>
+<h3 id="リリースプロセスについて"><a class="header" href="#リリースプロセスについて">リリースプロセスについて</a></h3>
+<p>プラグインモデルにより、チャンネルやツールは独立したリリースサイクルを持つことができます。Telegram チャンネルのバグ修正に新しいカーネルのリリースは必要ありません。カーネルの安定性は、他のすべてのものが構築する基盤となります。プラグインの迅速な反復は、カーネルの安定性を脅かすリスクがありません。</p>
+<h3 id="コミュニティ向け"><a class="header" href="#コミュニティ向け">コミュニティ向け</a></h3>
+<p>公開されたWITインターフェースとプラグインSDKにより、誰でもZeroClawをフォークせずに拡張できます。特定の統合が必要な企業は、公開インターフェースに対してプラグインを作成できます。これがエコシステムを構築する方法です。</p>
+<hr>
+<h2 id="付録-a-用語集"><a class="header" href="#付録-a-用語集">付録 A: 用語集</a></h2>
+<p>この文書で使用されている用語で、なじみの薄いもの：</p>
+<p><strong>ビッグボールオブマッド</strong> — コードベースが構造的な計画なしに有機的に成長したアーキテクチャ（またはアーキテクチャの欠如）。この名称は、1997年にブライアン・フートとジョセフ・ヨダーによって発表された論文に由来しています。これは、誰かが意図的に選択するからではなく、デフォルトでそうなってしまうため、ソフトウェアにおいて最も一般的なアーキテクチャです。</p>
+<p><strong>コンウェイの法則</strong> — 「システムを設計する組織は、その設計が組織のコミュニケーション構造の鏡像となるような設計を生み出す。」（メル・コンウェイ、1968年）貢献者が互いにコミュニケーションを取らずに孤立した状態で作業する場合、コードはその状況を反映したものになります。貢献者が明確なインターフェースを介して協力して作業する場合、コードもそれを反映したものになります。</p>
+<p><strong>依存関係逆転の原則</strong> — 高レベルのモジュールは低レベルのモジュールに依存してはいけません。どちらも抽象化に依存すべきです。これが <code>zeroclaw-runtime</code> が <code>channel-discord</code>（具体的な実装）ではなく、<code>zeroclaw-api</code>（抽象化）に依存する理由です。</p>
+<p><strong>マイクロカーネル</strong> — コアシステムが最小限の機能のみを含み、他のすべての機能は、明確に定義されたインターフェースを通じてコアと通信する個別のコンポーネントによって提供されるアーキテクチャ。</p>
+<p><strong>Strangler Fig パターン</strong> — 既存のシステムの一部分を、新しいコンポーネントを古いコンポーネントの隣に構築しながら段階的に置き換える移行戦略。この名前は、既存の木を取り囲んで成長し、最終的に元の木を完全に置き換えるストランガーフィグの植物に由来しています。このパターンの特徴は、移行中もシステムが常に稼働しており、常にデプロイ可能であることです。</p>
+<p><strong>技術的負債</strong> — ソフトウェア設計においてショートカットを取ることによって蓄積されるコスト。金融上の負債と同様に、少量であれば生産的（今すぐ出荷できる）ですが、大量になると致命的になります（新機能の開発ではなく、バグ修正や回避策といった「利息」の支払いにすべての時間を費やすことになります）。</p>
+<p><strong>WIT (WebAssembly Interface Types)</strong> — WASM コンポーネントがエクスポートおよびインポートする内容を記述するためのインターフェース定義言語。これを契約と考えると、「Tool プラグインは JSON を受け取り JSON を返す <code>execute</code> という関数をエクスポートしなければならない」といった契約を、WIT は正確かつ機械可読な形で表現します。</p>
+<hr>
+<h2 id="付録b-参考文献"><a class="header" href="#付録b-参考文献">付録B: 参考文献</a></h2>
+<p>これらはチームにとって有益なリソースです。必須の読み物ではありませんが、それぞれがこの提案に直接影響を与えています。</p>
+<ul>
+<li>
+<p><strong>「ソフトウェア設計の哲学」</strong> — ジョン・オスターハウト。ソフトウェアの複雑さを管理するための最も優れた短編書籍。彼の「深いモジュール」（単純なインターフェース、強力な実装）という概念は、マイクロカーネルモデルが目指すものとまさに一致しています。</p>
+</li>
+<li>
+<p><strong>「クリーンアーキテクチャ」</strong> — ロバート・C・マーティン。この文書のセクション4.2で説明されている依存性ルールは、この本から来ています。</p>
+</li>
+<li>
+<p><strong>「Release It!」</strong> — マイケル・ナイガード。プロダクション環境で稼働し続けるソフトウェアを構築するための実践的なパターン。ここで取り上げられているゲートウェイ分離やサーキットブレーカーのパターンは、この本から引用されています。</p>
+</li>
+<li>
+<p><strong>Rust API ガイドライン</strong> — https://rust-lang.github.io/api-guidelines/ —  idiomatic な Rust ライブラリを設計するための公式ガイド。私たちのトレイトインターフェースはこれらの規約に従うべきです。</p>
+</li>
+<li>
+<p><strong>WebAssembly コンポーネントモデル</strong> — https://component-model.bytecodealliance.org/ — このRFCで提案されているプラグインシステムの技術的基盤。</p>
+</li>
+<li>
+<p><strong>OpenTelemetry仕様</strong> — https://opentelemetry.io/docs/specs/ — 私たちが採用している観測可能性の標準の完全な仕様。</p>
+</li>
+</ul>
+<hr>
+<p><em>この提案は、v0.6.8 における ZeroClaw コードベースの詳細な分析に基づいて作成されました。引用されているコードメトリクスは、ソースファイルの直接測定に基づいています。アーキテクチャの推奨事項は、ZeroClaw プロジェクトの特定の制約と目標に適用されたシステムソフトウェア設計における確立されたパターンを反映しています。</em></p>
+<p>フィードバック、修正、および反提案を歓迎します。最良のアーキテクチャとは、チームが理解し、信じるものであり、特定の個人が一方的に決定したものではありません。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/index.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-002-documentation-standards.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/index.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-002-documentation-standards.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

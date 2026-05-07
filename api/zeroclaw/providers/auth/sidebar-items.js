@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["default_profile_id","normalize_provider","select_profile_id","state_dir_from_config"],"mod":["anthropic_token","gemini_oauth","oauth_common","openai_oauth","profiles"],"struct":["AuthService"]};

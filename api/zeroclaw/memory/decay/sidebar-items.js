@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_HALF_LIFE_DAYS"],"fn":["apply_time_decay"]};

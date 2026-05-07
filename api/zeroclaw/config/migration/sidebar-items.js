@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CURRENT_SCHEMA_VERSION","V1_LEGACY_KEYS"],"fn":["migrate_file","prepare_table","sync_table"],"struct":["V1Compat"]};

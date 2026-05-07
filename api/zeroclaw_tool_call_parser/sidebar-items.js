@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["build_native_assistant_history_from_parsed_calls","canonicalize_json_for_tool_signature","detect_tool_call_parse_issue","parse_tool_calls","strip_think_tags","strip_tool_result_blocks"],"struct":["ParsedToolCall"]};

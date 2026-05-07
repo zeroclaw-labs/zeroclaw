@@ -1,0 +1,1257 @@
+<!DOCTYPE HTML>
+<html lang="ja" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>ガバナンス - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-83844b35.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-69ff217c.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/foundations/fnd-003-governance.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="fnd-003-チーム編成プロジェクトガバナンスコントリビューションパイプライン"><a class="header" href="#fnd-003-チーム編成プロジェクトガバナンスコントリビューションパイプライン">FND-003: チーム編成、プロジェクトガバナンス、コントリビューションパイプライン</a></h1>
+<h3 id="v070-以降--タイプ-ガバナンス--rev-2"><a class="header" href="#v070-以降--タイプ-ガバナンス--rev-2">v0.7.0 以降 · タイプ: ガバナンス · Rev. 2</a></h3>
+<blockquote>
+<p><strong>正規の参照</strong> · チームによって承認済み · Rev. 2 議論スレッドおよび完全な改訂履歴: <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5577">#5577</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>これを読む前にチームへの注意。</strong></p>
+<p>ソフトウェアプロジェクトが失敗するのは、コードが悪いからではありません。コードを書く人々が連携できないために失敗します。機能の重複実装、バグの置き去り、文書化されないアイデアの消失、新規コントリビューターがどこから始めればよいか分からないといった問題が生じます。このRFCは、プロジェクトを「整理されたように見せる」ためではなく、チームがより速く、より自信を持って、より少ない摩擦で進めるために必要な軽量な基盤を整えることを目的としています。ここで提案するすべての推奨事項は、小規模で成長中の学生主導のオープンソースチームに特化して選定されています。プロジェクトマネージャー、スクラムマスター、公式な委員会などは必要ありません。</p>
+</blockquote>
+<hr>
+<h2 id="改訂履歴"><a class="header" href="#改訂履歴">改訂履歴</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Rev</th><th>日付</th><th>目次</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>2026年4月9日</td><td>初期ドラフト</td></tr>
+<tr><td>2</td><td>2026年4月9日</td><td>§6.4「アーキテクチャ準拠：人間のレビューとAIの支援」を追加し、アーキテクチャレビューのAI自動化に関するディスカッション質問を記載しました。</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="目次"><a class="header" href="#目次">目次</a></h2>
+<ol>
+<li><a href="#1-the-coordination-problem">調整問題</a></li>
+<li><a href="#2-the-three-part-system">3部構成システム</a></li>
+<li><a href="#3-github-projects-the-work-pipeline">GitHub プロジェクト: ワークパイプライン</a></li>
+<li><a href="#4-github-discussions-the-ideas-parking-lot">GitHub Discussions: アイデアの駐車場</a></li>
+<li><a href="#5-team-tiers-and-contribution-authority">チームティアと貢献権限</a></li>
+<li><a href="#6-codeowners-and-branch-protection">CODEOWNERS とブランチ保護</a>
+<ul>
+<li><a href="#64-architectural-compliance-human-review-ai-support">6.4 アーキテクチャ準拠: 人間のレビュー、AI支援</a></li>
+</ul>
+</li>
+<li><a href="#7-issue-templates">イシューテンプレート</a></li>
+<li><a href="#8-the-rfc-governance-loop">RFCガバナンスループ</a></li>
+<li><a href="#9-label-taxonomy">ラベルの階層構造</a></li>
+<li><a href="#10-definition-of-done">完了の定義</a></li>
+<li><a href="#11-automation">自動化</a></li>
+<li><a href="#12-phased-rollout">フェーズドロールアウト</a></li>
+</ol>
+<hr>
+<h2 id="1-調整の問題"><a class="header" href="#1-調整の問題">1. 調整の問題</a></h2>
+<p>意図的な調整システムを持たないすべてのプロジェクトは、偶発的な調整システムを発展させます。多くのオープンソースプロジェクトにおける偶発的なシステムは以下のようになります：</p>
+<ul>
+<li>アイデアは誰かの頭の中にあるか、スクロールして画面から消えていくチャットメッセージの中にある</li>
+<li>トラッカーに優先順位、担当者、完了の明確な定義がないまま、問題が蓄積しています。</li>
+<li>コントリビューターが誰も求めていないものに対してPRを開いたり、手伝いを申し出ても無視されたりすることがあります。</li>
+<li>チームは反応的に対応しており、最も大きな声で叫んだ人が注目を集め、壊れたものが修正され、1週間先までの計画は立てられません。</li>
+<li>PRのコメントでアーキテクチャの決定が行われ、どこにも記録されない</li>
+</ul>
+<p>これは誰かの努力を批判するものではありません。デフォルトで何が起こるかを説明したものです。解決策はプロセスを増やすことではなく、チームの規模や成熟度に応じて適切なレベルで適切なプロセスを適用することです。</p>
+<p>ZeroClawには3つのものが必要です：</p>
+<ol>
+<li><strong>パイプライン</strong>は、アイデアを実装されたコードに変換するための仕組みで、各段階が可視化され、移行ごとに明確なゲートが設けられています。</li>
+<li><strong>駐車場</strong>は、まだパイプラインに投入する準備ができていないアイデアをキャプチャするための場所です。アイデアを失うことなく、アクティブな作業を混乱させることなく保管できます。</li>
+<li><strong>ガバナンスモデル</strong>は、誰が何を決定できるか、アーキテクチャの決定がどのように行われるか、そしてチームがどのように成長するかを定義します。</li>
+</ol>
+<p>これらは3つの異なる懸念事項です。これらを混同する—すべてを1つのボードにまとめる、または非公式なチャットに依存して意思決定を行う—ことが、チームが脱却しようとしている混乱の原因となります。</p>
+<hr>
+<h2 id="2-3つの構成要素"><a class="header" href="#2-3つの構成要素">2. 3つの構成要素</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>懸念</th><th>ツール</th><th>このツールの理由</th></tr>
+</thead>
+<tbody>
+<tr><td>ワークパイプライン（バックログ → リリース）</td><td><strong>GitHub プロジェクト v2</strong></td><td>カスタムフィールド、複数のビュー、カンバンとロードマップ、組み込みの自動化、マイルストーン追跡</td></tr>
+<tr><td>アイデアの駐車場</td><td><strong>GitHub Discussions</strong></td><td>コミュニティ投票で選定され、PRの提出は不要で、「いつかやるかも」のアイデアとコミットされた作業を明確に区別し、準備が整った段階でイシューに変換します。</td></tr>
+<tr><td>ガバナンスと意思決定権限</td><td><strong>RFCプロセス + チームティア + CODEOWNERS</strong></td><td>すでに <code>docs/proposals/</code> を通じて部分的に確立されていますが、正式な文書化と完了が必要です。</td></tr>
+</tbody>
+</table>
+</div>
+<p>重要な原則：<strong>プロジェクトボードには、チームが検討することをコミットした作業のみが含まれます。</strong> 評価されていないアイデアはディスカッションに保存され、評価され、承認され、スコープが設定された作業はプロジェクトに保存されます。この区別がボードを有用に保つ鍵です。</p>
+<hr>
+<h2 id="3-github-プロジェクト-ワークパイプライン"><a class="header" href="#3-github-プロジェクト-ワークパイプライン">3. GitHub プロジェクト: ワークパイプライン</a></h2>
+<h3 id="31-パイプラインのステージ"><a class="header" href="#31-パイプラインのステージ">3.1 パイプラインのステージ</a></h3>
+<p>プロジェクトボードには、7つの値を持つ単一の<strong>ステータス</strong>フィールドがあります。各値はパイプラインのステージを表します。シーケンスは線形ですが、アイテムを後戻りさせることができます：</p>
+<pre><code>💡 Idea
+    ↓  Gate: Vision alignment check
+📋 Backlog
+    ↓  Gate: Architecture fit + acceptance criteria
+🎯 Defined
+    ↓  Gate: Assignee, size, risk tier confirmed
+🚧 In Progress
+    ↓  Gate: Tests written, CI passing
+👀 In Review
+    ↓  Gate: Correct reviewer tier approved, docs updated
+✅ Done
+</code></pre>
+<p>どこからでも到達可能なターミナル状態を1つ追加します：</p>
+<pre><code>🚫 Won't Do  ← explicit decision not to pursue; never silently closed
+</code></pre>
+<h3 id="32-ザゲイトクエスチョン"><a class="header" href="#32-ザゲイトクエスチョン">3.2 ザ・ゲイト・クエスチョン</a></h3>
+<p>各遷移にはゲート質問があります。項目が次に進む前に、この質問に「yes」と答える必要があります。これによりプロジェクトボードが運用可能になります。Vision → Architecture → Design → Implementation → Testing → Documentation の階層は、各段階でチェックリストになります。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>遷移</th><th>ゲート質問</th><th>誰がチェックするか</th></tr>
+</thead>
+<tbody>
+<tr><td>アイデア → バックログ</td><td>これはビジョン statement に沿っていますか？ ターゲットアーキテクチャに適合していますか？</td><td>コアチームのトリアージ</td></tr>
+<tr><td>バックログ → 定義済み</td><td>明確な受入基準がありますか？ADRや設計ノートが必要ですか？リスクティアは割り当てられていますか？</td><td>担当者 + レビュアー</td></tr>
+<tr><td>定義済み → 進行中</td><td>担当者はいますか？サイズは設定されていますか？関連するADRやドキュメントは特定されていますか？</td><td>担当者</td></tr>
+<tr><td>進行中 → 審査中</td><td>新しい動作に対するテストは存在しますか？CIはパスしていますか？PRの説明は完全ですか？</td><td>著者（自己確認）</td></tr>
+<tr><td>レビュー → 完了</td><td>正しいレビュアーのティアが承認されましたか？ドキュメントは更新されましたか？CHANGELOGのエントリは書かれましたか？</td><td>レビュアー</td></tr>
+<tr><td>「Any」→「対応しない」</td><td>その項目のコメントで、追求しないという決定が説明されていますか？</td><td>コアチーム</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>学生チームにとって明示的なゲートが重要な理由:</strong> ゲートがないと、カードは「完了した」と誰かが感じたために移動し、完了の定義があるために移動するわけではありません。これは「完了」した作業が実際には完了していないという最も一般的な原因です。ゲートによって、完了の定義が可視化され、共有されます。</p>
+<h3 id="33-カスタムフィールド"><a class="header" href="#33-カスタムフィールド">3.3 カスタムフィールド</a></h3>
+<p>GitHub プロジェクトの設定で、次のフィールドを作成してください:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>フィールド</th><th>タイプ</th><th>値</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>ステータス</strong></td><td>単一選択</td><td>💡 アイデア · 📋 バックログ · 🎯 定義済み · 🚧 進行中 · 👀 審査中 · ✅ 完了 · 🚫 実施しない</td></tr>
+<tr><td><strong>タイプ</strong></td><td>単一選択</td><td>機能 · バグ修正 · リファクタリング · ADR · ドキュメント · セキュリティ · インフラ · RFC</td></tr>
+<tr><td><strong>優先度</strong></td><td>単一選択</td><td>🔴 重要 · 🟠 高 · 🟡 中 · 🟢 低</td></tr>
+<tr><td><strong>サイズ</strong></td><td>単一選択</td><td>XS · S · M · L · XL</td></tr>
+<tr><td><strong>リスクティア</strong></td><td>単一選択</td><td>低・中・高（<code>AGENTS.md</code> のリスク階層に対応）</td></tr>
+<tr><td><strong>コンポーネント</strong></td><td>単一選択</td><td>カーネル · ゲートウェイ · チャネル · ツール · メモリ · セキュリティ · ハードウェア · ドキュメント · インフラ</td></tr>
+<tr><td><strong>マイルストーン</strong></td><td>マイルストーン</td><td>v0.7.0 · v0.8.0 · v0.9.0 · v1.0.0 · Icebox</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>サイズ決め（Tシャツサイズ）について:</strong> ストーリーポイントにはチームがまだ持っていないキャリブレーションと履歴データが必要です。Tシャツサイズは直感的で、この段階のチームには十分です。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>サイズ</th><th>意味</th><th>概略スコープ</th></tr>
+</thead>
+<tbody>
+<tr><td>XS</td><td>2時間未満</td><td>タイプミス修正、設定調整、1行の変更</td></tr>
+<tr><td>S</td><td>半日</td><td>小さなバグ修正、軽微な機能追加、ドキュメントの更新</td></tr>
+<tr><td>M</td><td>1〜3日</td><td>意味のある機能、1つのモジュールのリファクタリング、新しいテストスイート</td></tr>
+<tr><td>L</td><td>1〜2週間</td><td>重要な機能、新しいクレートの抽出、横断的な変更</td></tr>
+<tr><td>XL</td><td>2週間以上</td><td>アーキテクチャの変更；より小さな項目に分割する必要があります</td></tr>
+</tbody>
+</table>
+</div>
+<p>XL アイテムは、通常、進行中に入る前に細分化する必要があります。細分化できない場合は、設計が十分に完了していないことを意味します。</p>
+<h3 id="34-ビュー"><a class="header" href="#34-ビュー">3.4 ビュー</a></h3>
+<p>プロジェクトに4つの名前付きビューを作成します:</p>
+<p><strong>ビュー 1: ロードマップ</strong></p>
+<ul>
+<li>タイプ: ロードマップ（タイムライン）</li>
+<li>グループ化基準: マイルストーン</li>
+<li>表示されるフィールド: タイトル、タイプ、サイズ、コンポーネント、担当者</li>
+<li>目的: 公開向け。「今後予定されていることと時期」を共有します。このリンクを README やコミュニティで共有してください。定期的に更新してください。</li>
+</ul>
+<p><strong>ビュー 2: ボード</strong></p>
+<ul>
+<li>タイプ: ボード（カンバン）</li>
+<li>列：ステータスフィールドの値</li>
+<li>フィルタリング: 現在のマイルストーンのみ</li>
+<li>表示されるフィールド: タイトル、担当者、サイズ、リスクティア</li>
+<li>目的: 日々の作業の可視化。現在、誰もが何に取り組んでいるのか？何がブロックされているのか？</li>
+</ul>
+<p><strong>ビュー 3: バックログ</strong></p>
+<ul>
+<li>タイプ: テーブル</li>
+<li>優先度（降順）、次にサイズ（昇順）でソート</li>
+<li>フィルタ条件: ステータス = バックログ OR 定義済み</li>
+<li>表示されるフィールド: タイトル、タイプ、優先度、サイズ、コンポーネント、マイルストーン、リスクティア</li>
+<li>目的: ガーミングセッション中に使用されます。次に何を作業すべきか？サイズが決まり、引き受ける準備が整っているのはどれですか？</li>
+</ul>
+<p><strong>ビュー 4: 自分の仕事</strong></p>
+<ul>
+<li>タイプ: ボード</li>
+<li>フィルタリング条件: 担当者 = @me</li>
+<li>目的: 個人ダッシュボード。各コントリビューターはノイズなしで自分のアイテムのみを確認できます。</li>
+</ul>
+<h3 id="35-ピン留めされたアイテム"><a class="header" href="#35-ピン留めされたアイテム">3.5 ピン留めされたアイテム</a></h3>
+<p>GitHubでは、リポジトリごとに最大6件のピン留めされたIssueを許可しています。これらは、重要な情報を常に目に見える形で伝えるために使用してください。</p>
+<ol>
+<li>現在議論中のアクティブなRFC</li>
+<li>最も要望の多かったコミュニティ機能（最高投票数のディスカッション）</li>
+<li>次のリリースマイルストーンを追跡する問題</li>
+<li>good-first-issue のインデックス（すべての現在の <code>good-first-issue</code> アイテムへのリンクを含むイシュー）</li>
+</ol>
+<p>ピン留めされたイシューはコミュニティへの約束です：これらは現在最も重要なものです。優先順位が変更されたら、それに応じて更新してください。</p>
+<hr>
+<h2 id="4-github-discussions-アイデアの駐車場"><a class="header" href="#4-github-discussions-アイデアの駐車場">4. GitHub Discussions: アイデアの駐車場</a></h2>
+<h3 id="41-ディスカッションを有効化しカテゴリを作成する"><a class="header" href="#41-ディスカッションを有効化しカテゴリを作成する">4.1 ディスカッションを有効化し、カテゴリを作成する</a></h3>
+<p>リポジトリで GitHub Discussions を有効にします。以下のカテゴリを作成してください：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>カテゴリ</th><th>フォーマット</th><th>目的</th></tr>
+</thead>
+<tbody>
+<tr><td>📣 <strong>お知らせ</strong></td><td>お知らせ</td><td>コアチームの投稿；コミュニティは作成できず、リアクションとコメントのみ可能</td></tr>
+<tr><td>💡 <strong>アイデア</strong></td><td>オープンエンドのディスカッション</td><td>コミュニティ機能の要望と提案：アイデアの駐車場</td></tr>
+<tr><td>🏗️ <strong>アーキテクチャ</strong></td><td>オープンエンドのディスカッション</td><td>システム設計に関する質問や提案；RFCプロセスにフィードバック</td></tr>
+<tr><td>❓ <strong>Q&amp;A</strong></td><td>質問/回答</td><td>X を行うにはどうすればよいですか？ コントリビューターとコアチームによる回答</td></tr>
+<tr><td>🐛 <strong>バグレポート（事前トリアージ）</strong></td><td>オープンエンドのディスカッション</td><td>バグレポートがイシューとして成立するために必要な追加情報</td></tr>
+<tr><td>🌐 <strong>翻訳</strong></td><td>オープンエンドのディスカッション</td><td>コミュニティが維持する翻訳とローカライズ調整</td></tr>
+<tr><td>🎉 <strong>ショーアンドテール</strong></td><td>オープンエンドのディスカッション</td><td>ZeroClaw で何を作っていますか？コミュニティのショーケース</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="42-アイデアからイシューへの昇格プロセス"><a class="header" href="#42-アイデアからイシューへの昇格プロセス">4.2 アイデアからイシューへの昇格プロセス</a></h3>
+<p><strong>アイデア</strong>カテゴリのディスカッションは、軽量なプロモーションプロセスに従います：</p>
+<pre><code>コミュニティメンバーが Discussions → Ideas にアイデアを投稿
+         ↓
+コミュニティが 👍 リアクションで投票
+         ↓
+閾値: コントリビューターまたはコアチームメンバーから 5 件の 👍
+         ↓
+コアチームメンバーが GitHub の「ディスカッションからイシューを作成」機能を使用してイシューに変換
+         ↓
+イシューがプロジェクトボードに 💡 アイデア ステータスとして登録
+         ↓
+ディスカッションは新しいイシューへのリンク付きで「回答済み」としてマーク
+</code></pre>
+<p>コントリビューターまたはコアチームからの5票の閾値は、匿名のコミュニティメンバーではないため、低信号のリクエストがバックログを埋め尽くすのを防ぎつつ、コミュニティに本当の声を届けることを可能にします。無関係なアカウントからのリアクションはコミュニティの感情データとしてカウントされますが、閾値にはカウントされません。</p>
+<p><strong>このプロセスが重要な理由:</strong> これはシグナルとノイズを分離します。すべてのアイデアが優れたアイデアというわけではなく、すべての優れたアイデアが今のところ適切なアイデアというわけではありません。Discussionsレイヤーにより、コミュニティは各リクエストがチケットになるという誤った期待を抱かせることなく、自分たちの要望を表現することができます。</p>
+<h3 id="43-投票を待たないアイデア"><a class="header" href="#43-投票を待たないアイデア">4.3 投票を待たないアイデア</a></h3>
+<p>一部のアイテムはディスカッションのプロモーションプロセスをバイパスし、バックログに直接追加されます：</p>
+<ul>
+<li>セキュリティ脆弱性（プライベートなセキュリティレポート経由、公開されない）</li>
+<li>再現手順付きのバグを確認しました（バグ報告のIssueテンプレートに直接進んでください）。</li>
+<li>RFCで承認されたアーキテクチャ項目（RFCのクローズループから直接派生）</li>
+<li>プロジェクトロードマップからのアイテム（コアチームによって直接配置）</li>
+</ul>
+<h3 id="44-アーキテクチャカテゴリ"><a class="header" href="#44-アーキテクチャカテゴリ">4.4 アーキテクチャカテゴリ</a></h3>
+<p><strong>アーキテクチャ</strong>のディスカッションカテゴリは、まだ正式なRFCとして提出する準備ができていない質問や提案のために特別に設けられています。現在の設計に問題があることに気づいた貢献者や、アイデアを探求したい貢献者は、完全なRFCを書く前にアーキテクチャのディスカッションを開くことができます。これにより、懸念を提起する際の障壁が下がります。</p>
+<p>アーキテクチャに関する議論が十分な詳細と合意形成に達した場合、コアチームのメンバーは、その内容を <code>docs/proposals/</code> に移動し、RFCのイシューをオープンすることで、それを正式なRFCに昇格させることができます。</p>
+<hr>
+<h2 id="5-チームのティアと貢献権限"><a class="header" href="#5-チームのティアと貢献権限">5. チームのティアと貢献権限</a></h2>
+<h3 id="51-3つの階層"><a class="header" href="#51-3つの階層">5.1 3つの階層</a></h3>
+<p>オープンソースプロジェクトは<strong>メリトクラシー</strong>に基づいて運営されます。つまり、影響力や権限は、年功序列や肩書き、あるいは誰を知っているかではなく、実際に示された貢献によって与えられます。これは、オープンソースが企業内のソフトウェアと異なる点の一つであり、明示的に教える価値があります。</p>
+<p>3つの階層は、プロジェクトに対する示されたコミットメントの増加を反映しています：</p>
+<hr>
+<p><strong>ティア1：コミュニティ</strong></p>
+<p>誰でも。承認は不要です。</p>
+<p><em>何ができるか:</em></p>
+<ul>
+<li>問題テンプレートを使用して問題をオープンする</li>
+<li>任意のIssueやPRにコメントする</li>
+<li>ディスカッションにリアクションし、アイデアに投票する</li>
+<li>プルリクエストを送信してください（マージ前にレビューされます）。</li>
+<li>GitHub Wiki を編集する</li>
+</ul>
+<p><em>できないこと:</em></p>
+<ul>
+<li>課題を割り当てる（割り当てをリクエストすることも可能）</li>
+<li>PRを承認する</li>
+<li>PRをマージする</li>
+<li>拘束力のある権限を持つRFCに投票する</li>
+</ul>
+<hr>
+<p><strong>ティア2: コントリビューター</strong></p>
+<p><code>master</code> ブランチに少なくとも2つのPRがマージされたコミュニティメンバー。</p>
+<p><em>なる方法:</em> 2つのPRがマージされると、Core TeamのメンバーがGitHubのContributorsチームにあなたを追加し、<code>CONTRIBUTORS.md</code>にも記載されます。</p>
+<p>コミュニティが提供するものを超えるもの：</p>
+<ul>
+<li>課題を割り当て可能</li>
+<li>PRでレビュアーとしてリクエストできます（必須ではないレビュー）。</li>
+<li>ディスカッションでのアイデアへの投票数は、昇格の閾値にカウントされます。</li>
+<li>Discussions を経由せずに RFC の議論をリクエストできます</li>
+</ul>
+<p><em>まだできないこと:</em></p>
+<ul>
+<li>高リスクパスのPRを承認する</li>
+<li>PRをマージする</li>
+<li>RFC投票のキャスト</li>
+</ul>
+<p><em>このティアが存在する理由:</em> 新規コントリビューターにとって、視覚的に分かりやすく達成可能な最初のマイルストーンを作成します。「もっとどのように関与すればよいですか？」に対する明確な答えは、2つのPRをマージすることです。これは初期の良好な貢献を促進し、チームがコントリビューターを公に認識する方法を提供します。</p>
+<hr>
+<p><strong>ティア3：コアチーム</strong></p>
+<p>長期間にわたり一貫して高品質な貢献を行い、既存のコアチームメンバーから招待されたコントリビューター。</p>
+<p><strong>コアチームメンバーになる方法:</strong> 既存のコアチームメンバーからの招待。これはディスカッションで公開されます。正式な基準はありません。過去の貢献の質、一貫性、そして整合性に基づいた判断です。</p>
+<p><em>Contributor</em> として得られるもの：</p>
+<ul>
+<li>リポジトリへの書き込みアクセス</li>
+<li>レビュー要件を満たしたPRをマージできます</li>
+<li><strong>High Risk</strong> パスの PR を承認する権限があります（CODEOWNERS の要件に従う必要があります）。</li>
+<li>RFCに対するバインディング投票を行う</li>
+<li>プロジェクトパイプラインを介してアイテムを移動できます</li>
+<li>リリースをカットできます</li>
+<li>ガバナンスの意思決定に参加する（コアチームの議論）</li>
+</ul>
+<p><em>責任:</em></p>
+<ul>
+<li>新規のイシューを3営業日以内にトリアージする</li>
+<li>専門分野のPRを5営業日以内にレビューする</li>
+<li>RFC投票に参加する</li>
+<li>プロジェクトの行動規範を遵守してください</li>
+</ul>
+<hr>
+<h3 id="52-遅延コンセンサスルール"><a class="header" href="#52-遅延コンセンサスルール">5.2 遅延コンセンサスルール</a></h3>
+<p>日常的な意思決定（ラベルの追加、古いイシューのクローズ、ドキュメントの更新など）において、コアチームメンバーは<strong>遅延コンセンサス</strong>に基づいて行動します。関連するイシューで意図を表明し、48時間以内にコアチームメンバーから反対がない場合、その決定を進めることができます。これにより、すべての事項について明示的な承認を必要とするための停滞を防ぎつつ、透明性を維持します。</p>
+<p>遅延コンセンサスは以下には適用されません：</p>
+<ul>
+<li>RFCの承認または拒否</li>
+<li>リリース</li>
+<li>CODEOWNERS またはブランチ保護ルールの変更</li>
+<li>このガバナンス文書への変更</li>
+<li>コアチームへの追加</li>
+</ul>
+<p>これらは常に明示的なコアチームの投票が必要です。</p>
+<h3 id="53-チームメンバーシップの記録"><a class="header" href="#53-チームメンバーシップの記録">5.3 チームメンバーシップの記録</a></h3>
+<p>チームのメンバーシップは2つの場所に記録されます：</p>
+<p>リポジトリのルートにある <strong><code>CONTRIBUTORS.md</code></strong> — 貢献者を階層別に整理した、すべての貢献者を記録した公開ファイル。Core Team のメンバーが貢献者を認め次第更新します。</p>
+<p>組織設定内の<strong>GitHub Teams</strong> — <code>zeroclaw-core</code> と <code>zeroclaw-contributors</code> チームは、CODEOWNERS で参照され、通知ルーティングに使用されます。</p>
+<hr>
+<h2 id="6-codeowners-とブランチ保護"><a class="header" href="#6-codeowners-とブランチ保護">6. CODEOWNERS とブランチ保護</a></h2>
+<h3 id="61-codeowners"><a class="header" href="#61-codeowners">6.1 CODEOWNERS</a></h3>
+<p><code>CODEOWNERS</code> ファイルにより、ガバナンスが自動化されます。このファイルは、PR がマージされる前にどのチームのレビューをどのパスが必要とするかを定義します。GitHub はこれを必須レビューとして適用し、要件が満たされるまで PR をマージできません。</p>
+<p><code>.github/CODEOWNERS</code> を作成します:</p>
+<pre><code># CODEOWNERS — Automatic review routing by risk tier
+# See AGENTS.md for risk tier definitions.
+# See docs/proposals/project-governance.md for team tier definitions.
+
+# ── High Risk: requires Core Team approval ──────────────────────────────────
+
+src/security/**                 @zeroclaw-labs/zeroclaw-core
+src/gateway/**                  @zeroclaw-labs/zeroclaw-core
+src/runtime/**                  @zeroclaw-labs/zeroclaw-core
+src/tools/shell.rs              @zeroclaw-labs/zeroclaw-core
+src/tools/file_write.rs         @zeroclaw-labs/zeroclaw-core
+src/tools/security_ops.rs       @zeroclaw-labs/zeroclaw-core
+
+# ── Governance and configuration: requires Core Team approval ───────────────
+
+.github/**                      @zeroclaw-labs/zeroclaw-core
+CODEOWNERS                      @zeroclaw-labs/zeroclaw-core
+Cargo.toml                      @zeroclaw-labs/zeroclaw-core
+deny.toml                       @zeroclaw-labs/zeroclaw-core
+
+# ── Architecture documents: requires Core Team review ───────────────────────
+
+docs/proposals/**               @zeroclaw-labs/zeroclaw-core
+docs/architecture/decisions/**  @zeroclaw-labs/zeroclaw-core
+AGENTS.md                       @zeroclaw-labs/zeroclaw-core
+
+# ── Default: any Contributor or Core Team member can review ─────────────────
+
+*                               @zeroclaw-labs/zeroclaw-contributors
+</code></pre>
+<p>コアチームの特定のメンバーがコンポーネントの所有権を持つ場合、チームのハンドルに加えて、各メンバーの個別のハンドルを追加してください。CODEOWNERS では、より具体的なパスルールがより一般的なルールを上書きします。</p>
+<h3 id="62-ブランチ保護ルール"><a class="header" href="#62-ブランチ保護ルール">6.2 ブランチ保護ルール</a></h3>
+<p><code>master</code> ブランチの以下の保護ルールを設定してください：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ルール</th><th>設定</th><th>理由</th></tr>
+</thead>
+<tbody>
+<tr><td>マージ前にプルリクエストを要求する</td><td>有効</td><td>master への直接プッシュは禁止です。</td></tr>
+<tr><td>承認を要求する</td><td>1は低リスク/中リスク、2は高リスク</td><td>CODEOWNERS の強制は「誰が」を処理します</td></tr>
+<tr><td>ステータスチェックの合格を必須にする</td><td><code>cargo fmt</code>、<code>cargo clippy</code>、<code>cargo test</code></td><td>マージ前にCIがグリーンである必要があります。</td></tr>
+<tr><td>ブランチを最新の状態に保つ</td><td>有効</td><td>古いコードのマージを防ぐ</td></tr>
+<tr><td>会話の解決を要求</td><td>有効</td><td>すべてのレビューコメントは解決済みである必要があります。</td></tr>
+<tr><td>上記の設定を回避しないでください</td><td>有効</td><td>管理者を含むすべてのユーザーに適用されます</td></tr>
+<tr><td>強制プッシュを許可する</td><td>無効</td><td>コミット履歴を保持する</td></tr>
+<tr><td>削除を許可する</td><td>無効</td><td>ブランチを保護する</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>管理者がバイパスできない理由:</strong> 小規模なチームのプロジェクトにおいて最も一般的な誤りの一つは、ブランチ保護を「他人のため」のものとして扱うことです。管理者がバイパスできる場合、彼らは時間的プレッシャーや緊急時、「今回は特別に」という理由でバイパスしてしまいます。するとそれがデフォルトになってしまいます。ルールが意味を持つためには、全員に適用されなければなりません。本当に緊急の場合、正しい対応はプロセスをスキップすることではなく、プロセスをより速く実行することです。</p>
+<h3 id="63-必須のステータスチェック"><a class="header" href="#63-必須のステータスチェック">6.3 必須のステータスチェック</a></h3>
+<p>PRがマージされる前に通過しなければならないCIチェック:</p>
+<pre><code>build (stable)          ← cargo build --release
+test                    ← cargo test
+fmt                     ← cargo fmt --all -- --check
+clippy                  ← cargo clippy --all-targets -- -D warnings
+</code></pre>
+<p>ワークスペースがアーキテクチャ RFC に基づいてクレートに分割されるため、各クレートごとのチェックを追加します。<code>crates/zeroclaw-api</code> への変更に対しては、そのクレートのテストスイートを独立して実行する必要があります。</p>
+<h3 id="64-アーキテクチャ準拠人間のレビューai支援"><a class="header" href="#64-アーキテクチャ準拠人間のレビューai支援">6.4 アーキテクチャ準拠：人間のレビュー、AI支援</a></h3>
+<p>このセクションは、この質問が必ず出てくる（そして実際に出てきている）ため存在します。すべてのPRで議論するのではなく、明確に文書化された回答を提供する価値があります。</p>
+<p><strong>質問:</strong> RFC で定義されたアーキテクチャや設計パターンに準拠しているかどうかを確認する自動化されたゲートを追加すべきでしょうか？</p>
+<p><strong>答え:</strong> いいえ。なぜそうなのかを理解することが重要です。</p>
+<hr>
+<p><strong>品質の強制には、根本的に異なる2つの種類があり、それぞれ異なるメカニズムが必要です。</strong></p>
+<p>最初の種類は<strong>構文準拠</strong>です：このコードは機械的なルールに違反していますか？<code>zeroclaw-kernel</code> は <code>TelegramChannel</code> をインポートしていますか？依存関係グラフのエッジが逆方向を指していますか？clippy の警告がありますか？これらは二値的な質問です。コードがルールに違反しているか、していないかのいずれかです。このルールは、コンパイラ、<code>cargo deny</code>、および <code>cargo clippy --workspace</code> によって既に強制されています。人間も AI も必要ありません。機械が権威を持ち、速く、事実上の違反については決して誤りません。</p>
+<p>2つ目の種類は「アーキテクチャの意図」です。この決定はここで行うべきでしょうか？この抽象化は適切なレイヤーにありますか？このトレードオフはビジョンと一致していますか？この結合はフェーズ3で問題になるでしょうか？このPRは、現在のdiffでは見えないメンテナンスの負担を生み出すでしょうか？これらの質問には、判断力、文脈の理解、そしてアーキテクチャが存在する「理由」の理解が必要です。単にルールが何であるかだけでなく、です。これらの質問に信頼できる答えを提供できる自動化されたツールはありません。なぜなら、答えはdiffに含まれていない情報、つまりロードマップ、チームの現在の優先順位、コントリビューターの意図、そしてこの決定の長期的なコストに依存しているからです。</p>
+<p><strong>建築的判断を自動化することの失敗モードは、どちらも悪い。</strong></p>
+<p>微妙なアーキテクチャの違反を許容するゲートは、誤った安心感を生み出します。開発者は ✅ を見て、自分の判断が正しいと誤解します。最も深刻なアーキテクチャのドリフト — 解きほぐすのに数年かかるようなもの — は構造的には正しく見えます。コンパイルは通り、リンティングもパスします。依存関係グラフも問題ありません。問題は、それが設計の精神に違反しており、その影響が後になってから、巻き戻すコストが非常に高い段階で明らかになる点にあります。</p>
+<p>ツールが文脈を誤解して有効なアーキテクチャ上の判断をフラグ付けするゲートは、開発者にゲートを完全に無視する癖をつけてしまいます。チームがノイズの多い自動チェックを無視して先に進む方法を学んでしまうと、CI 上でチェックが実行され続けていても、実質的にはチェックは機能しなくなります。プロジェクトは負の価値を生むために CI の分を費やすことになります。</p>
+<p><strong>CODEOWNERS はアーキテクチャ準拠のゲートです。レビュアーはそのツールです。</strong></p>
+<p>§6.1 の <code>CODEOWNERS</code> 設定は、すでに高リスクなパス（クレートの境界、トレイト定義、依存関係グラフ、<code>src/security/</code>、<code>.github/</code>）に変更を加える PR について、コアチームメンバーによるレビューを要求しています。このコアチームメンバーは RFC を参照枠組みとして備えており、アーキテクチャの適合性を確認する役割を果たします。彼らは、自動化では再現できない文脈に応じた判断力を提供します。</p>
+<p>これが RFC、AGENTS.md ファイル、およびドキュメント基準が存在する理由です。機械がそれらを解析してスコアを生成するためではなく、人間のレビュアーが一貫性のある文書化されたフレームワークを適用できるようにするためです。RFC は「なぜこのアーキテクチャが存在するのか」に答えます。レビュアーは「この PR がその理由に貢献しているか、それともそれを弱めているか」を判断します。</p>
+<p><strong>AIはマージゲートではなく、開発ループに属すべきです。</strong></p>
+<p>AIツール — Claude、Copilot、Cursor、そして次に来るもの — は、適切な場所で使用されれば、アーキテクチャ作業において本当に有用です。適切な場所とは、<em>マージゲート中</em> ではなく、<em>開発中</em> です。</p>
+<p>開発中、RFC とクレートの AGENTS.md を備えた AI アシスタントは、コントリビューターが新しい機能を実装する前に、その機能がどのクレートに属するかを理解するのを助け、コードがまだ設計段階にある間に潜在的な依存関係の逆転を指摘し、なぜ特定のデザインパターンが存在するのかを説明し、新しい抽象化が適切なレイヤーにあるかどうかを提案することができます。これは追加的な効果をもたらします。コントリビューターの能力を向上させます。</p>
+<p>レビュー中に、AI アシスタントは人間のレビュアーが構造化されたフィードバックをドラフト作成したり、変更を RFC と照合したり、PR に関連する RFC の議論の質問を特定したりするのに役立ちます。これは追加的な機能でもあります。レビュアーが判断を行い、AI が速度と記憶力を提供します。</p>
+<p>AIが果たせない役割は、判断を代行することです。「AIがPRの評価を支援する」と「AIがPRの自動ゲートを通す」は根本的に異なるもので、アーキテクチャの決定には前者のみが有効です。プロジェクトがアーキテクチャの適合性を、いかに洗練された自動化ゲートを通じて行おうとするとき、それはアーキテクチャが誰も気づかぬうちに、手遅れになるまで drifting していく日となります。</p>
+<p><strong>実際のポリシーを簡潔に述べると：</strong></p>
+<ul>
+<li>構造的な適合性（インポートの方向性、依存関係グラフ、リンティング、フォーマット）はCIによって強制されます。これは非交渉事項であり、自動化されています。</li>
+<li>アーキテクチャの意図の遵守は、CODEOWNERS による Core Team のレビュアーへのルーティングによって強制されます。これは非交渉事項であり、人間が行います。</li>
+<li>AIツールは、開発中の貢献者を支援し、レビュー中のレビュアーをサポートします。ただし、それら自身の権限でマージを制限することはありません。</li>
+<li>チームが将来 AI支援のレビューツールを評価したい場合、その評価はまずRFCプロセスを通じて行われます。文書化された決定がない限り、<code>.github/workflows/</code>には追加されません。</li>
+</ul>
+<p>このポリシーは、AI や自動化に対する制限ではありません。これは、異なる問題には異なるツールが必要であり、適切なツールを適切な場所で使用することが、アーキテクチャ RFC がコードベースに求めていることそのものであることを認識したものです。</p>
+<hr>
+<h2 id="7-イシューテンプレート"><a class="header" href="#7-イシューテンプレート">7. イシューテンプレート</a></h2>
+<p>Issue テンプレートは、人間が対応する前に、着信するレポートを適切なプロセスに振り分けます。適切に記述されたテンプレートは、トリアージに必要な情報を自動的に収集します。テンプレートが欠落しているか無視されると、問題の理解に3回のコメントのやり取りが必要になります。</p>
+<p><code>.github/ISSUE_TEMPLATE/</code> に以下のテンプレートを作成してください:</p>
+<h3 id="テンプレート-1-バグレポート-bug_reportyml"><a class="header" href="#テンプレート-1-バグレポート-bug_reportyml">テンプレート 1: バグレポート (<code>bug_report.yml</code>)</a></h3>
+<pre><code class="language-yaml">名前: バグレポート
+説明: 何かが期待通りに動作していません。
+ラベル: ["type:bug", ステータス: 未分類]
+本文:
+  - 型: マークダウン
+    属性:
+      値: |
+        Before submitting: search existing issues to avoid duplicates.
+        For security vulnerabilities, use the private security report
+        process described in SECURITY.md — do not open a public issue.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: The exact steps to reproduce the bug.
+      placeholder: |
+        1. Run `zeroclaw ...`
+        2. With config `...`
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: |
+        - ZeroClaw version:
+        - OS and version:
+        - Rust version (if built from source):
+        - Provider:
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Does this bug have security implications?
+      options:
+        - "No"
+        - "Yes — I have already filed a private security report"
+        - "I am not sure"
+    validations:
+      required: true
+</code></pre>
+<h3 id="テンプレート-2-機能リクエスト-feature_requestyml"><a class="header" href="#テンプレート-2-機能リクエスト-feature_requestyml">テンプレート 2: 機能リクエスト (<code>feature_request.yml</code>)</a></h3>
+<pre><code class="language-yaml">名前: 機能リクエスト
+説明: 新しい機能や改善点を提案してください
+ラベル: ["type:feature", ステータス: 未分類]
+本文:
+  - 型: マークダウン
+    属性:
+      値: |
+        Feature requests that have been discussed and upvoted in GitHub
+        Discussions → Ideas are more likely to be prioritized. Consider
+        posting there first if you want community feedback before filing.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the problem or limitation you are experiencing.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would you like to happen?
+      description: Describe the feature or change you are proposing.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What alternatives have you considered?
+      description: Other ways to solve the problem, including doing nothing.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which component does this affect?
+      options:
+        - Kernel / Agent Loop
+        - Gateway / Web UI
+        - Channels
+        - Tools
+        - Memory
+        - Security
+        - Hardware / Peripherals
+        - Documentation
+        - Infrastructure / CI
+        - Not sure
+    validations:
+      required: true
+</code></pre>
+<h3 id="テンプレート-3-rfc--アーキテクチャ提案-rfcyml"><a class="header" href="#テンプレート-3-rfc--アーキテクチャ提案-rfcyml">テンプレート 3: RFC / アーキテクチャ提案 (<code>rfc.yml</code>)</a></h3>
+<pre><code class="language-yaml">名前: RFC / アーキテクチャ提案
+説明: 重要なアーキテクチャまたは動作の変更を提案する
+ラベル: ["type:rfc", "ステータス: 議論中"]
+本文:
+  - 型: マークダウン
+    属性:
+      値: |
+        RFCs are for significant changes that affect architecture, public
+        interfaces, or project direction. Before filing an RFC issue:
+        1. Write the proposal document and add it to `docs/proposals/`
+        2. Open a PR with that document
+        3. Then open this issue to start the formal discussion period
+
+        For smaller changes, open a regular feature request or just a PR.
+  - type: input
+    id: proposal-pr
+    attributes:
+      label: Link to the proposal document PR
+      placeholder: "https://github.com/zeroclaw-labs/zeroclaw/pull/..."
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: One-paragraph summary
+      description: What is being proposed and why?
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact and tradeoffs
+      description: What does this change affect? What are the tradeoffs?
+    validations:
+      required: true
+  - type: dropdown
+    id: breaking
+    attributes:
+      label: Is this a breaking change?
+      options:
+        - "No"
+        - "Yes — existing configurations or APIs change"
+        - "Potentially — needs investigation"
+    validations:
+      required: true
+</code></pre>
+<h3 id="テンプレート4-ドキュメントの問題-docs_issueyml"><a class="header" href="#テンプレート4-ドキュメントの問題-docs_issueyml">テンプレート4: ドキュメントの問題 (<code>docs_issue.yml</code>)</a></h3>
+<pre><code class="language-yaml">名前: ドキュメントの問題
+説明: ドキュメントに不足、誤り、または混乱がある
+ラベル: ["type:docs", ステータス: 未分類]
+本文:
+  - 型: 入力
+    ID: 場所
+    属性:
+      ラベル: ドキュメントの問題はどこにありますか？
+      プレースホルダー: URL またはファイルパス（例：docs/reference/api/config-reference.md）
+    検証:
+      必須: true
+  - 型: ドロップダウン
+    ID: issue-type
+    属性:
+      ラベル: 問題の種類
+      オプション:
+        - ドキュメントが見つかりません
+        - 誤った情報
+        - 混乱したり不明瞭だったり
+        - 古くなっています（コードが変更されました）
+        - リンク切れ
+    検証:
+      必須: true
+  - 型: テキストエリア
+    ID: 説明
+    属性:
+      ラベル: 問題を説明してください。
+    検証:
+      必須: true
+  - 型: テキストエリア
+    ID: 提案
+    属性:
+      ラベル: 推奨される改善点 (オプション)
+      説明: 正しい内容が分かっている場合は、こちらに共有してください。
+</code></pre>
+<h3 id="テンプレート5-セキュリティレポートのリダイレクト"><a class="header" href="#テンプレート5-セキュリティレポートのリダイレクト">テンプレート5: セキュリティレポートのリダイレクト</a></h3>
+<p><code>.github/ISSUE_TEMPLATE/security.md</code> をリダイレクトとして作成します。GitHub はこれをテンプレートオプションとして表示しますが、実際の issue は作成されず、リダイレクトされます。</p>
+<pre><code class="language-yaml">名前: セキュリティ脆弱性
+説明: ⚠️ このテンプレートは使用しないでください。プライベートな報告については、SECURITY.md を参照してください。
+ラベル: []
+本文:
+  - 型: マークダウン
+    属性:
+      値: |
+        ## ⚠️ セキュリティ上の脆弱性は公開された問題として報告しないでください。
+
+        Security vulnerabilities disclosed publicly before a fix is available
+        put all ZeroClaw users at risk. Please follow the private disclosure
+        process described in [SECURITY.md](https://github.com/zeroclaw-labs/zeroclaw/blob/master/SECURITY.md).
+
+        If you have already filed this as a public issue by mistake, please
+        delete it and re-report privately. A Core Team member will contact
+        you to confirm receipt.
+</code></pre>
+<h3 id="テンプレート-6-初心者向けの問題-good_first_issueyml"><a class="header" href="#テンプレート-6-初心者向けの問題-good_first_issueyml">テンプレート 6: 初心者向けの問題 (<code>good_first_issue.yml</code>)</a></h3>
+<pre><code class="language-yaml">名前: Good First Issue（コアチームのみ）
+説明: 新しいコントリビューターにとっての入り口として、このイシューにタグを付けます。
+ラベル: ["good-first-issue", ステータス: 未分類]
+本文:
+  - 型: マークダウン
+    属性:
+      値: |
+        This template is for Core Team members identifying good entry
+        points for new contributors. A good first issue must have:
+        - A clear, self-contained scope (no cross-cutting changes)
+        - Size of XS or S
+        - Links to the relevant code files
+        - A named mentor the new contributor can ping for help
+  - type: textarea
+    id: description
+    attributes:
+      label: What needs to be done?
+      description: Be specific. Include file paths and function names where known.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and background
+      description: What does a new contributor need to understand to work on this?
+    validations:
+      required: true
+  - type: input
+    id: mentor
+    attributes:
+      label: Mentor / point of contact
+      placeholder: "@username"
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How will we know when this is done?
+    validations:
+      required: true
+</code></pre>
+<hr>
+<h2 id="8-rfcガバナンスループ"><a class="header" href="#8-rfcガバナンスループ">8. RFCガバナンスループ</a></h2>
+<p>RFC プロセスは、ドキュメント RFC とアーキテクチャ RFC で確立されました。このセクションでは、提案から決定、そしてアクションへの移行を含むクローズドループを定義します。</p>
+<h3 id="81-rfcの完全なライフサイクル"><a class="header" href="#81-rfcの完全なライフサイクル">8.1 RFCの完全なライフサイクル</a></h3>
+<pre><code>1. AUTHOR writes proposal → docs/proposals/&lt;slug&gt;.md
+           ↓
+2. AUTHOR opens PR with the proposal document
+           ↓
+3. AUTHOR opens RFC issue using the RFC issue template
+   linking to the PR
+           ↓
+4. DISCUSSION PERIOD — minimum 7 days
+   Anyone can comment. Core Team members engage substantively.
+   Discussions happen on the issue, not the PR.
+           ↓
+5. CORE TEAM VOTE on the issue
+   Format: comment with one of:
+     ✅ APPROVE — with brief rationale
+     ❌ REJECT — with specific objections
+     🔄 REVISE — with specific requests
+           ↓
+   ┌── Majority APPROVE ──────────────────────────────────────┐
+   │  RFC is accepted                                          │
+   │  PR is merged                                            │
+   │  Issue labeled rfc:accepted                              │
+   │  Author writes ADR(s) in docs/architecture/decisions/    │
+   │  ADR issue(s) linked back to RFC issue                   │
+   │  RFC issue closed                                        │
+   └──────────────────────────────────────────────────────────┘
+           ↓
+   ┌── Any REJECT ────────────────────────────────────────────┐
+   │  RFC is rejected                                          │
+   │  PR is closed (not merged)                               │
+   │  Issue labeled rfc:rejected                              │
+   │  Rejecting members document specific objections          │
+   │  RFC issue closed with rejection summary comment         │
+   └──────────────────────────────────────────────────────────┘
+           ↓
+   ┌── REVISE requested ──────────────────────────────────────┐
+   │  RFC is not voted on until revisions are complete        │
+   │  Issue labeled rfc:revision-requested                    │
+   │  Author revises proposal document                        │
+   │  Author re-requests review via issue comment             │
+   │  Process returns to step 4                               │
+   └──────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="82-投票の閾値"><a class="header" href="#82-投票の閾値">8.2 投票の閾値</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>変更タイプ</th><th>投票が必要です</th><th>理由</th></tr>
+</thead>
+<tbody>
+<tr><td>ドキュメント、ツール、破壊的変更のない機能</td><td>アクティブなコアチームメンバーの単純過半数</td><td>低リスク、高速イテレーション</td></tr>
+<tr><td>APIの変更、新しいサブシステム、動作の変更</td><td>コアチームの3分の2の多数決</td><td>中程度のステakes、実際のコンセンサスが必要</td></tr>
+<tr><td>アーキテクチャの変更、セキュリティモデルの変更、破壊的変更</td><td>コアチームメンバー全員の一致した合意</td><td>重大な影響があり、全員に関わる</td></tr>
+</tbody>
+</table>
+</div>
+<p>「アクティブ」なコアチームメンバーとは、過去90日以内に少なくとも1回の投票に参加したメンバーを指します。非アクティブなメンバーは多数派の閾値にはカウントされませんが、投票の通知を受け取ります。</p>
+<h3 id="83-adr接続"><a class="header" href="#83-adr接続">8.3 ADR接続</a></h3>
+<p>承認されたすべてのRFCは、対応する実装を開始する前に少なくとも1つのADRを生成する必要があります。ADRはRFCの要約ではなく、ドキュメントRFCで定義されたNygard形式による特定の決定の恒久的な記録です。RFCは長く探索的な内容になることがありますが、ADRは簡潔で決定的なものです。</p>
+<p>RFCは提案です。ADRは決定事項です。どちらも必要であり、互いに代替できるものではありません。</p>
+<h3 id="84-このリポジトリ内の既存のrfc"><a class="header" href="#84-このリポジトリ内の既存のrfc">8.4 このリポジトリ内の既存のRFC</a></h3>
+<p>以下のRFCは執筆時点で提出されており、すぐに正式なRFCの問題として変換する必要があります：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>RFC ドキュメント</th><th>作成する課題</th><th>優先度</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs/proposals/microkernel-architecture.md</code></td><td>マイクロカーネルアーキテクチャ RFC (v0.7.0+)</td><td>高い</td></tr>
+<tr><td><code>docs/proposals/documentation-standards.md</code></td><td>ドキュメントの標準化と i18n RFC</td><td>高い</td></tr>
+<tr><td><code>docs/proposals/project-governance.md</code></td><td>チーム編成とガバナンスに関するRFC</td><td>ミディアム</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="9-ラベルの階層構造"><a class="header" href="#9-ラベルの階層構造">9. ラベルの階層構造</a></h2>
+<p>ラベルは、イシューやPR（プルリクエスト）に対するメタデータの層です。一貫性があり、適切に設計されたラベルシステムにより、フィルタリング、レポート作成、自動化が可能になります。一方、一貫性のないラベルシステム（一般的に、イシューを作成した人がその場その場でラベルを追加するケース）は、ノイズを生み出します。</p>
+<p><strong>名前空間付き</strong>のラベルシステムを使用します。各ラベルには、そのカテゴリを識別するプレフィックスがあります：</p>
+<h3 id="type--これはどのような種類の作業ですか"><a class="header" href="#type--これはどのような種類の作業ですか"><code>type:</code> — これはどのような種類の作業ですか？</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ラベル</th><th>色</th><th>使用</th></tr>
+</thead>
+<tbody>
+<tr><td><code>type:feature</code></td><td><code>#0075ca</code> 青</td><td>新しい機能または強化</td></tr>
+<tr><td><code>type:bug</code></td><td><code>#d73a4a</code> 赤</td><td>何かが正しく動作していません。</td></tr>
+<tr><td><code>type:refactor</code></td><td><code>#e4e669</code> 黄色</td><td>動作を変更せずにコードを再構築する</td></tr>
+<tr><td><code>type:docs</code></td><td><code>#0075ca</code> 青</td><td>ドキュメントの変更のみ</td></tr>
+<tr><td><code>type:security</code></td><td><code>#e11d48</code> 濃い赤</td><td>セキュリティ関連の変更</td></tr>
+<tr><td><code>type:インフラストラクチャ</code></td><td><code>#6366f1</code> 紫</td><td>CI、ツール、ビルドシステム</td></tr>
+<tr><td><code>type:adr</code></td><td><code>#a855f7</code> 薄い紫</td><td>アーキテクチャ・デシジョン・レコード</td></tr>
+<tr><td><code>type:rfc</code></td><td><code>#f59e0b</code> アンバー</td><td>リクエスト・フォー・コメント / 提案</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="priority--これの緊急性はどのくらいですか"><a class="header" href="#priority--これの緊急性はどのくらいですか"><code>priority:</code> — これの緊急性はどのくらいですか？</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ラベル</th><th>色</th><th>使用</th></tr>
+</thead>
+<tbody>
+<tr><td><code>priority:critical</code></td><td><code>#b91c1c</code> 濃い赤</td><td>リリースのブロックまたはデータ損失の発生</td></tr>
+<tr><td><code>priority:high</code></td><td><code>#f97316</code> オレンジ</td><td>重要、次のマイルストーンに含まれるべき</td></tr>
+<tr><td><code>priority:medium</code></td><td><code>#eab308</code> 黄色</td><td>通常優先度</td></tr>
+<tr><td><code>priority:low</code></td><td><code>#22c55e</code> 緑</td><td>あると嬉しい、優先度低</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="size--この作業項目の規模はどのくらいですか"><a class="header" href="#size--この作業項目の規模はどのくらいですか"><code>size:</code> — この作業項目の規模はどのくらいですか？</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ラベル</th><th>色</th><th>使用</th></tr>
+</thead>
+<tbody>
+<tr><td><code>size:xs</code></td><td><code>#dcfce7</code> 薄い緑</td><td>2時間未満</td></tr>
+<tr><td><code>size:s</code></td><td><code>#bbf7d0</code> 緑</td><td>半日</td></tr>
+<tr><td><code>size:m</code></td><td><code>#86efac</code> 中緑</td><td>1〜3日</td></tr>
+<tr><td><code>size:l</code></td><td><code>#4ade80</code> 濃い緑</td><td>1〜2週間</td></tr>
+<tr><td><code>size:xl</code></td><td><code>#16a34a</code> 深い緑</td><td>2週間以上かかる場合は、細分化する必要があります。</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="component--システムのどの部分ですか"><a class="header" href="#component--システムのどの部分ですか"><code>component:</code> — システムのどの部分ですか？</a></h3>
+<p><code>component:kernel</code> · <code>component:gateway</code> · <code>component:channels</code> · <code>component:tools</code> · <code>component:memory</code> · <code>component:security</code> · <code>component:hardware</code> · <code>component:docs</code> · <code>component:infra</code></p>
+<p>すべてのコンポーネントラベルに <code>#f1f5f9</code>（ライトグレー）を使用して、視覚的に他のカテゴリと区別してください。</p>
+<h3 id="risk--リスクのティアは何ですかagentsmd-と同じ"><a class="header" href="#risk--リスクのティアは何ですかagentsmd-と同じ"><code>risk:</code> — リスクのティアは何ですか？（<code>AGENTS.md</code> と同じ）</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ラベル</th><th>色</th><th>使用</th></tr>
+</thead>
+<tbody>
+<tr><td><code>リスク:低</code></td><td><code>#dcfce7</code></td><td>ドキュメント、テスト、マイナーな変更</td></tr>
+<tr><td><code>リスク:中</code></td><td><code>#fef9c3</code></td><td><code>src/**</code> の変更</td></tr>
+<tr><td><code>リスク:高</code></td><td><code>#fee2e2</code></td><td>セキュリティ、ゲートウェイ、ランタイム、CI</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="status--これはプロセスのどの段階にありますか"><a class="header" href="#status--これはプロセスのどの段階にありますか"><code>status:</code> — これはプロセスのどの段階にありますか？</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ラベル</th><th>色</th><th>使用</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ステータス:triageが必要</code></td><td><code>#f8fafc</code> 白</td><td>新規作成、未レビュー</td></tr>
+<tr><td><code>status:blocked</code></td><td><code>#dc2626</code> 赤</td><td>外部のものを待機中</td></tr>
+<tr><td><code>status:help-wanted</code></td><td><code>#059669</code> グリーン</td><td>コントリビューターを探しています</td></tr>
+<tr><td><code>status:good-first-issue</code></td><td><code>#059669</code> グリーン</td><td>新規コントリビューター向け</td></tr>
+<tr><td><code>status:discussion</code></td><td><code>#a78bfa</code> 紫</td><td>作業開始前にチームでの議論が必要です</td></tr>
+<tr><td><code>status:wont-fix</code></td><td><code>#9ca3af</code> グレー</td><td>明示的に追求しないことを決定</td></tr>
+<tr><td><code>status:duplicate</code></td><td><code>#9ca3af</code> グレー</td><td>他のイシューの重複</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="rfc--rfc固有のステータス"><a class="header" href="#rfc--rfc固有のステータス"><code>rfc:</code> — RFC固有のステータス</a></h3>
+<p><code>rfc:accepted</code> · <code>rfc:rejected</code> · <code>rfc:revision-requested</code></p>
+<hr>
+<h2 id="10-完了の定義"><a class="header" href="#10-完了の定義">10. 完了の定義</a></h2>
+<p>「完了」には特定の意味があります。これを定義しないと、人によって解釈が異なり、その違いが最も不適切なタイミング、つまりレビュー時、リリース時、またはユーザーがバグを報告した際に表面化します。</p>
+<p>あるアイテムが<strong>完了</strong>しているのは、以下のすべての条件が満たされている場合です：</p>
+<h3 id="コードの変更について"><a class="header" href="#コードの変更について">コードの変更について:</a></h3>
+<ul>
+<li><input disabled="" type="checkbox"> PRは、必要なレビュアーの階層（CODEOWNERSおよびリスクレベルに基づく）によってレビューされ、承認されました。</li>
+<li><input disabled="" type="checkbox"> すべてのCIチェックがパスしました: <code>cargo fmt</code>、<code>cargo clippy</code>、<code>cargo test</code></li>
+<li><input disabled="" type="checkbox"> 新しいまたは変更された動作に対するテストが存在します（少なくともユニットテスト；ユーザー向け機能にはインテグレーションテスト）。</li>
+<li><input disabled="" type="checkbox"> PR 前にパスしていたテストカバレッジは失われていません</li>
+<li><input disabled="" type="checkbox"> PRの説明では、変更内容と変更理由を明確に説明します（単に「バグを修正した」だけでなく、どのバグを、何が問題で、何が変更されたのかを具体的に記載してください）。</li>
+<li><input disabled="" type="checkbox"> 変更がユーザーに見える動作に影響を与える場合、関連する参照ドキュメントは同じPRで更新されます。</li>
+<li><input disabled="" type="checkbox"> 変更が重要な場合、CHANGELOG.md の適切なマイルストーンセクションにエントリが追加されます。</li>
+<li><input disabled="" type="checkbox"> 変更がADRを必要とする場合、ADRは実装PRと同時、またはそれ以前に作成され、リンクされ、マージされます。</li>
+</ul>
+<h3 id="ドキュメントの変更について"><a class="header" href="#ドキュメントの変更について">ドキュメントの変更について:</a></h3>
+<ul>
+<li><input disabled="" type="checkbox"> YAMLのフロントマターが存在し、有効です。</li>
+<li><input disabled="" type="checkbox"> すべての内部リンクが正しく解決されます</li>
+<li><input disabled="" type="checkbox"> ドキュメントが現在の動作を説明している場合、それは現在の <code>master</code> ブランチに対して正確です。</li>
+<li><input disabled="" type="checkbox"> ADR の場合、Nygard フォーマットに従い、<code>status</code> フィールドが含まれます。</li>
+</ul>
+<h3 id="リリース用"><a class="header" href="#リリース用">リリース用：</a></h3>
+<ul>
+<li><input disabled="" type="checkbox"> マイルストーンのすべてのアイテムが <code>Done</code> ステータスになっているか、または理由を説明するコメント付きで次のマイルストーンに明示的に移動されています。</li>
+<li><input disabled="" type="checkbox"> リリースの CHANGELOG.md のエントリは完成です。</li>
+<li><input disabled="" type="checkbox"> このマイルストーンで承認されたRFCによって生成されたすべてのADRは、作成され、承認されています。</li>
+<li><input disabled="" type="checkbox"> このリリースは少なくとも1つのプラットフォーム（Linux x86_64以上）でテストされています。</li>
+<li><input disabled="" type="checkbox"> リリースタグはセマンティックバージョニングに従います。</li>
+</ul>
+<h3 id="完了完了ルール"><a class="header" href="#完了完了ルール">「完了完了」ルール</a></h3>
+<p>ソフトウェアチームには、「完了」だが「完全に完了」ではない作業という概念があります。「完了」とはコードが書かれた状態を指し、「完全に完了」とはテスト、ドキュメント化、レビュー、マージ、リリースが完了した状態を指します。上記の「完了の定義」は「完全に完了」を説明しています。完全な定義を満たすまで、何も「完了」として扱うべきではありません。</p>
+<hr>
+<h2 id="11-自動化"><a class="header" href="#11-自動化">11. 自動化</a></h2>
+<p>GitHub Projects v2 と GitHub Actions を組み合わせることで、手動の調整オーバーヘッドを大幅に削減する強力な自動化が可能になります。以下に、価値対労力比を考慮して実装すべき内容を記載します。</p>
+<h3 id="111-プロジェクトボードの自動化ビルトインアクション不要"><a class="header" href="#111-プロジェクトボードの自動化ビルトインアクション不要">11.1 プロジェクトボードの自動化（ビルトイン、アクション不要）</a></h3>
+<p>プロジェクトの組み込み自動化設定でこれらを設定してください：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>トリガー</th><th>対応</th></tr>
+</thead>
+<tbody>
+<tr><td>Issue opened</td><td>プロジェクトに追加; ステータスを 💡 アイデア に設定</td></tr>
+<tr><td><code>type:bug</code> ラベル付きのイシュー</td><td>優先度を設定 = 🟠 高（優先度が設定されていない場合）</td></tr>
+<tr><td>PRがissueを参照して作成されました</td><td>リンクされた課題のステータスを 👀 審査中 に設定</td></tr>
+<tr><td>PRがマージされました</td><td>リンクされたイシューのステータスを✅完了に設定し、リンクされたイシューを閉じます。</td></tr>
+<tr><td>計画外のためクローズしました</td><td>ステータスを 🚫 実施しない に設定</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="112-github-actions-ワークフロー"><a class="header" href="#112-github-actions-ワークフロー">11.2 GitHub Actions ワークフロー</a></h3>
+<p><strong>変更されたファイルによる自動ラベル付け (<code>.github/workflows/label-by-path.yml</code>):</strong></p>
+<p>変更されたファイルに基づいて、PR にコンポーネントとリスクのラベルを自動的に付与します。<code>src/security/</code> に変更がある PR には <code>component:security</code> と <code>risk:high</code> が付与され、<code>docs/</code> に変更がある PR には <code>type:docs</code> と <code>risk:low</code> が付与されます。これにより、PR 作成者が自分の PR にラベルを付けることを忘れる必要がなくなり、レビュアーには即座に文脈が提供されます。</p>
+<p><strong>CODEOWNERS のレビューを自動でリクエスト（CODEOWNERS に組み込まれているため、アクションは不要）：</strong></p>
+<p>GitHub は、CODEOWNERS ファイルが存在し、ブランチ保護で必要とされている場合に自動的に CODEOWNERS を適用します。アクションは不要です。</p>
+<p><strong>古いIssueの管理 (<code>.github/workflows/stale.yml</code>):</strong></p>
+<p>45日間活動がないIssueには <code>status:stale</code> ラベルが付けられ、そのIssueがまだ関連性があるかどうかを確認するコメントが投稿されます。<code>status:stale</code> ラベルが適用されてから15日間活動がないIssueはクローズされます。これにより、何ヶ月も前の関連性の低いIssueがバックログに蓄積するのを防ぎます。<code>status:blocked</code>、<code>priority:critical</code>、<code>type:rfc</code> は stale プロセスから除外されます。</p>
+<p><strong>PRサイズラベル付け (<code>.github/workflows/pr-size.yml</code>):</strong></p>
+<p>変更された行数に基づいて、PR に <code>size:xs</code> から <code>size:xl</code> までのラベルを自動的に付与します。これにより、差分を開かずにレビュアーやメンテナーが範囲をすぐに把握できます。これらの閾値を初期値として使用してください：XS &lt; 10行、S &lt; 50行、M &lt; 250行、L &lt; 1000行、XL ≥ 1000行。</p>
+<p><strong>PRマージ時のマイルストーンチェック (<code>.github/workflows/milestone-check.yml</code>):</strong></p>
+<p>マイルストーンが設定された関連するイシューがない状態でPRがマージされると、警告（ブロックはしない）を表示します。これは厳格な制限ではなく、マイルドな通知です。目的は、リリースに追跡されないまま作業が行われるのを防ぐことです。</p>
+<h3 id="113-まだ自動化すべきではないこと"><a class="header" href="#113-まだ自動化すべきではないこと">11.3 まだ自動化すべきではないこと</a></h3>
+<ul>
+<li><strong>自動リリースドラフト:</strong> GitHub の release-drafter は便利ですが、設定のオーバーヘッドが増加します。チームが安定したリリースリズムを確立した後に導入してください。</li>
+<li><strong>自動依存関係の更新（Dependabot の PR）:</strong> Dependabot のセキュリティ更新を有効化します（無料、ノイズが少ない）。ただし、CI の安定性が確保されるまで、自動的なバージョンの更新は延期してください。バージョンを更新すると、CI の基盤が安定する前にノイズが発生します。</li>
+<li><strong>スプリントプランニングの自動化:</strong> スプリントプランニングを自動化しないでください。このチーム規模では、キャパシティ、優先順位、チームのコンテキストに関する人間の判断が不可欠であり、自動化では代替できません。</li>
+</ul>
+<hr>
+<h2 id="12-フェーズドロールアウト"><a class="header" href="#12-フェーズドロールアウト">12. フェーズドロールアウト</a></h2>
+<p>ガバナンスとツールは段階的に導入する必要があります。チームが各要素の存在意義を理解する前にすべてを導入すると、オーバーヘッドが生じます。</p>
+<hr>
+<h3 id="フェーズ1--今週--基礎"><a class="header" href="#フェーズ1--今週--基礎">フェーズ1 · 今週 — 「基礎」</a></h3>
+<p>最小限のガバナンス設定。チームの調整をすぐに開始します。</p>
+<ul>
+<li><input disabled="" type="checkbox"> ステータス、タイプ、優先度、マイルストーンフィールドを含むGitHubプロジェクトを作成します。</li>
+<li><input disabled="" type="checkbox"> 4つのプロジェクトビュー（ロードマップ、ボード、バックログ、マイワーク）を作成します</li>
+<li><input disabled="" type="checkbox"> セクション4.1で定義された7つのカテゴリを使用してGitHub Discussionsを有効にします</li>
+<li><input disabled="" type="checkbox"> 既存の提案（セクション 8.4）に対して、3つのRFC課題を作成する</li>
+<li><input disabled="" type="checkbox"> 6つのイシューテンプレート（セクション7）を追加する</li>
+<li><input disabled="" type="checkbox"> <code>CODEOWNERS</code> ファイルを作成する（セクション 6.1）</li>
+<li><input disabled="" type="checkbox"> <code>master</code> ブランチの保護ルールを有効にする（セクション 6.2）</li>
+<li><input disabled="" type="checkbox"> 残りのラベル階層（セクション 9）をリポジトリに追加する</li>
+<li><input disabled="" type="checkbox"> 3つのRFCの課題と次のリリースのマイルストーン課題を固定する</li>
+</ul>
+<p><strong>成功のシグナル:</strong> 新しい課題がプロジェクトに自動的に表示されます。チームはアクティブな作業を確認する場所やアイデアを投稿する場所を把握しています。</p>
+<hr>
+<h3 id="フェーズ2--v070-マイルストーン--パイプライン"><a class="header" href="#フェーズ2--v070-マイルストーン--パイプライン">フェーズ2 · v0.7.0 マイルストーン — 「パイプライン」</a></h3>
+<p>承認されたRFCから完全なワークフローを確立し、バックログを埋める。</p>
+<ul>
+<li><input disabled="" type="checkbox"> プロジェクトにサイズ、リスクティア、およびコンポーネントのフィールドを追加</li>
+<li><input disabled="" type="checkbox"> バックログにマイクロカーネルアーキテクチャのRFCからの成果物を追加する</li>
+<li><input disabled="" type="checkbox"> バックログに、ドキュメント基準のRFCからの成果物を追加する</li>
+<li><input disabled="" type="checkbox"> 既存の3つの提案に対する最初の公式RFC投票を実施する</li>
+<li><input disabled="" type="checkbox"> RFCが承認された場合、ADR-001からADR-007まで（RFCに関するドキュメントに従って）のADRを作成します。</li>
+<li><input disabled="" type="checkbox"> 現在のチームメンバーを各ティアに分類した <code>CONTRIBUTORS.md</code> ファイルを追加する</li>
+<li><input disabled="" type="checkbox"> パスによる自動ラベル付けのActionsワークフローを実装する</li>
+<li><input disabled="" type="checkbox"> 古いIssueの管理ワークフローを実装する</li>
+<li><input disabled="" type="checkbox"> <code>zeroclaw-core</code> と <code>zeroclaw-contributors</code> の GitHub Teams を作成する</li>
+</ul>
+<p><strong>成功のシグナル:</strong> チームはボードを日常的に使用しています。アイテムは可視化されたゲートチェックを通じてステージを移動します。マイクロカーネルアーキテクチャに関するRFCには、記録された投票結果があります。</p>
+<hr>
+<h3 id="フェーズ3--v080-マイルストーン--コミュニティの拡大"><a class="header" href="#フェーズ3--v080-マイルストーン--コミュニティの拡大">フェーズ3 · v0.8.0 マイルストーン — 「コミュニティの拡大」</a></h3>
+<p>プラグインシステムが実用的になるにつれて、外部からの貢献者が増えることになります。貢献のためのインフラストラクチャは準備できていなければなりません。</p>
+<ul>
+<li><input disabled="" type="checkbox"> PRのサイズラベリングワークフローを実装する</li>
+<li><input disabled="" type="checkbox"> プラグインSDKの作業において、最初のバッチの <code>good-first-issue</code> アイテム（最低5件）を作成してください。</li>
+<li><input disabled="" type="checkbox"> 「Good First Issue Index」を現在の good-first-issues へのリンク付きでピン留めされたイシューとして追加する</li>
+<li><input disabled="" type="checkbox"> アイデアの促進閾値を設定し、最初のDiscussionアイデアをイシューに促進します</li>
+<li><input disabled="" type="checkbox"> コアチームの拡大プロセスを文書化する — 新しいコアチームメンバーを招待するための基準</li>
+</ul>
+<p><strong>成功のシグナル:</strong> 少なくとも1人の外部コントリビューター（現在のチームに属さない人）が、good-first-issueを通じてPRを提出する。Discussions Ideasカテゴリには活発なコミュニティ参加がある。</p>
+<hr>
+<h3 id="フェーズ4--v100--持続可能なガバナンス"><a class="header" href="#フェーズ4--v100--持続可能なガバナンス">フェーズ4 · v1.0.0 — 「持続可能なガバナンス」</a></h3>
+<p>v1.0.0 までに、ガバナンスモデルは自己維持可能であるべきです。チームはそれについて考える必要はなく、自動的に機能するはずです。</p>
+<ul>
+<li>
+<p><input disabled="" type="checkbox"> 機能した点と機能しなかった点を踏まえ、ガバナンス文書を見直して更新してください。</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> リリース頻度（リリースの頻度、誰がリリースを行うか）を決定する</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> プラグインレジストリのガバナンス文書（アーキテクチャRFCに基づく）を公開する</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> マイルストーンベースの計画が緩すぎると感じる場合は、タイムボックス化されたサイクル（2週間または4週間）の導入を検討してください。</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox"> <strong>コアチームメンバーの離脱または非アクティブ化のプロセス</strong></p>
+<p>コアチームメンバーが離脱するか、非アクティブになる場合、以下の手順に従ってください。</p>
+<h3 id="1-離脱または非アクティブ化の理由の明確化"><a class="header" href="#1-離脱または非アクティブ化の理由の明確化">1. 離脱または非アクティブ化の理由の明確化</a></h3>
+<p>まず、離脱または非アクティブ化の理由を明確にします。これにより、チーム全体が状況を理解し、適切な対応を取ることができます。</p>
+<h3 id="2-チームへの通知"><a class="header" href="#2-チームへの通知">2. チームへの通知</a></h3>
+<p>離脱または非アクティブ化の意思をチームに正式に通知します。以下の方法で通知を行うことが推奨されます：</p>
+<ul>
+<li><strong>メール</strong>: チームの共有メールアドレスまたは個別にメールを送信します。</li>
+<li><strong>チャットツール</strong>: SlackやDiscordなどのチャットツールでメッセージを投稿します。</li>
+<li><strong>会議</strong>: 必要に応じて、オンライン会議を開催し、直接説明します。</li>
+</ul>
+<h3 id="3-責任の引き継ぎ"><a class="header" href="#3-責任の引き継ぎ">3. 責任の引き継ぎ</a></h3>
+<p>現在の役割や責任を引き継ぐための手順を確立します。これには以下が含まれます：</p>
+<ul>
+<li><strong>タスクの整理</strong>: 現在担当しているタスクやプロジェクトの進捗状況を整理します。</li>
+<li><strong>ドキュメントの更新</strong>: プロジェクトのドキュメントやリポジトリを更新し、新しいメンバーが引き継ぎやすいようにします。</li>
+<li><strong>引き継ぎ会議</strong>: 引き継ぎを受けるメンバーと会議を開き、詳細な説明を行います。</li>
+</ul>
+<h3 id="4-アクセス権限の調整"><a class="header" href="#4-アクセス権限の調整">4. アクセス権限の調整</a></h3>
+<p>必要に応じて、プロジェクトやリポジトリへのアクセス権限を調整します。これには以下が含まれます：</p>
+<ul>
+<li><strong>リポジトリのアクセス権限</strong>: GitHubやGitLabなどのリポジトリからアクセス権限を削除します。</li>
+<li><strong>ツールへのアクセス</strong>: Slack、Jira、Confluenceなどのツールからのアクセス権限を調整します。</li>
+</ul>
+<h3 id="5-感謝と挨拶"><a class="header" href="#5-感謝と挨拶">5. 感謝と挨拶</a></h3>
+<p>チームに対して感謝の意を表し、適切な挨拶を行います。これにより、良好な関係を維持し、将来の協力の可能性を残すことができます。</p>
+<h3 id="6-記録の更新"><a class="header" href="#6-記録の更新">6. 記録の更新</a></h3>
+<p>プロジェクトのドキュメントやリポジトリに、メンバーの離脱または非アクティブ化に関する情報を記録します。これには以下が含まれます：</p>
+<ul>
+<li><strong>メンバーリストの更新</strong>: チームのメンバーリストから名前を削除します。</li>
+<li><strong>履歴の記録</strong>: 離脱または非アクティブ化の日時と理由を記録します。</li>
+</ul>
+<h3 id="7-後継者の選定必要に応じて"><a class="header" href="#7-後継者の選定必要に応じて">7. 後継者の選定（必要に応じて）</a></h3>
+<p>必要に応じて、新しいメンバーを選定し、トレーニングやオンボーディングを行います。これにより、プロジェクトの継続性を確保します。</p>
+<h3 id="8-最終確認"><a class="header" href="#8-最終確認">8. 最終確認</a></h3>
+<p>すべての手順が完了したことを確認し、チーム全体に報告します。これにより、プロジェクトの円滑な進行を確保します。</p>
+<p>このプロセスに従うことで、コアチームメンバーの離脱または非アクティブ化をスムーズに行うことができます。</p>
+</li>
+</ul>
+<p><strong>成功のシグナル:</strong> 直近6ヶ月の開発履歴において、パイプラインの一貫した使用が確認されています。問題は3日以内に分類され、PRは5日以内にレビューされています。CHANGELOGはマージのたびに更新されています。</p>
+<hr>
+<h2 id="付録-a-用語集"><a class="header" href="#付録-a-用語集">付録 A: 用語集</a></h2>
+<p><strong>バックログの整備</strong> — チームの定期的な活動（通常は週次または隔週）で、チームがバックログを見直し、項目の優先順位を再設定し、古い項目を閉じ、上位の項目が「定義済み」で取り掛かる準備ができていることを確認します。</p>
+<p><strong>ブランチ保護</strong> — 保護されたブランチへの直接プッシュを防止し、マージ前にレビューやCIチェックなどの要件を強制するGitHubの機能。</p>
+<p><strong>CODEOWNERS</strong> — GitHubのファイルで、PRで所有するファイルが変更されたときに、指定された個人またはチームに自動的にレビューをリクエストします。</p>
+<p><strong>完了の定義</strong> — 作業項目が「完了」したことを正確に示す共有チェックリスト。共有の完了定義がない場合、「完了」は人によって異なる意味を持ちます。</p>
+<p><strong>遅延コンセンサス</strong> — 定義された期間内に誰かが反対しない限り、提案されたアクションが進行する意思決定アプローチ。日常的な決定に対して明示的な承認を必要としないことで、オーバーヘッドを削減します。</p>
+<p><strong>実力主義</strong> — 権力や影響力が、年功や肩書きではなく、実証された貢献によって得られるガバナンスモデル。オープンソースプロジェクトで標準的に採用されています。</p>
+<p><strong>マイルストーン</strong> — GitHubの機能で、リリース対象ごとにイシューとPRをグループ化します。マイルストーンはソフトウェアのバージョンを表します。</p>
+<p><strong>Tシャツサイズ</strong> — 抽象的なサイズ（XS、S、M、L、XL）を使用して見積もりを行う手法。過去の較正データがなくても使いやすく、初期段階のチームに適しています。</p>
+<p><strong>トライアージ</strong> — 新しいイシューを確認し、有効性を検証し、ラベルと優先度を割り当て、マイルストーンに関連付け、バックログに含めるべきかクローズすべきかを判断するプロセス。</p>
+<hr>
+<h2 id="付録b-参考文献"><a class="header" href="#付録b-参考文献">付録B: 参考文献</a></h2>
+<ul>
+<li><strong>GitHub Projects のドキュメント</strong> — https://docs.github.com/en/issues/planning-and-tracking-with-projects — GitHub Projects v2 の機能に関する完全なリファレンス。</li>
+<li><strong>GitHub Discussions のドキュメント</strong> — https://docs.github.com/en/discussions — GitHub Discussions のセットアップガイドとガバナンスオプション。</li>
+<li><strong>CODEOWNERS 構文リファレンス</strong> — https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners — CODEOWNERS ファイルの完全な構文。</li>
+<li><strong>「オープンソース・ソフトウェアの生産」</strong> — カール・フォゲル — オープンソース・プロジェクトの運営に関する決定版の書籍。https://producingoss.com でオンラインで無料公開されています。ガバナンス、コントリビューター管理、コミュニケーションに関する章は直接的に適用可能です。</li>
+<li><strong>「オープンソースガバナンスモデルへの入門」</strong> — Apache Software Foundation のガバナンス文書は、成熟したオープンソースプロジェクトが権限と意思決定をどのように形式化するかを示す良いモデルです: https://www.apache.org/foundation/governance/</li>
+<li><strong>Vale プロセslint</strong> — https://vale.sh — ドキュメント RFC で参照されています。<code>good-first-issue</code> ドキュメント改善ワークフローと統合されています。</li>
+</ul>
+<hr>
+<p><em>この提案は、ZeroClaw v0.6.8 およびその直前に策定された2つのアーキテクチャおよびドキュメントに関するRFCの文脈で開発されました。ここで提案されるガバナンスモデルは、コミュニティ成長の初期段階にある学生主導のプロジェクト向けに、意図的に軽量な設計となっています。このモデルは、チームの拡大に伴ってプロセスを追加していくことでスケーラブルに設計されており、一度にすべてを導入するものではありません。</em></p>
+<p>最も優れたガバナンスモデルは、チームが実際に従う最もシンプルなものです。ここから始め、学んだ内容に基づいて調整してください。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-002-documentation-standards.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-004-engineering-infrastructure.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-002-documentation-standards.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-004-engineering-infrastructure.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

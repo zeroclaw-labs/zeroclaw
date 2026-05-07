@@ -1,0 +1,191 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `crates/zeroclaw-infra/src/stall_watchdog.rs`."><title>stall_watchdog.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-b7b9f40b.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="zeroclaw_infra" data-themes="" data-resource-suffix="" data-rustdoc-version="1.95.0 (59807616e 2026-04-14)" data-channel="1.95.0" data-search-js="search-63369b7b.js" data-stringdex-js="stringdex-b897f86f.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">zeroclaw_infra/</div>stall_watchdog.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! Generic transport stall watchdog for WebSocket-based channels.
+<a href=#2 id=2 data-nosnippet>2</a>//!
+<a href=#3 id=3 data-nosnippet>3</a>//! [`StallWatchdog`] detects when a channel transport goes idle beyond a
+<a href=#4 id=4 data-nosnippet>4</a>//! configurable threshold.  Channels call [`StallWatchdog::touch`] on every
+<a href=#5 id=5 data-nosnippet>5</a>//! received event; the watchdog fires a caller-supplied callback when the
+<a href=#6 id=6 data-nosnippet>6</a>//! elapsed silence exceeds `timeout_secs`.
+<a href=#7 id=7 data-nosnippet>7</a>//!
+<a href=#8 id=8 data-nosnippet>8</a>//! The timestamp is stored in an [`AtomicU64`] so `touch()` is lock-free and
+<a href=#9 id=9 data-nosnippet>9</a>//! safe to call from any async context.
+<a href=#10 id=10 data-nosnippet>10</a>
+<a href=#11 id=11 data-nosnippet>11</a></span><span class="kw">use </span>std::sync::Arc;
+<a href=#12 id=12 data-nosnippet>12</a><span class="kw">use </span>std::sync::atomic::{AtomicU64, Ordering};
+<a href=#13 id=13 data-nosnippet>13</a><span class="kw">use </span>tokio::sync::Mutex;
+<a href=#14 id=14 data-nosnippet>14</a><span class="kw">use </span>tokio::task::JoinHandle;
+<a href=#15 id=15 data-nosnippet>15</a>
+<a href=#16 id=16 data-nosnippet>16</a><span class="doccomment">/// Returns the current Unix timestamp in seconds.
+<a href=#17 id=17 data-nosnippet>17</a></span><span class="kw">fn </span>now_secs() -&gt; u64 {
+<a href=#18 id=18 data-nosnippet>18</a>    std::time::SystemTime::now()
+<a href=#19 id=19 data-nosnippet>19</a>        .duration_since(std::time::UNIX_EPOCH)
+<a href=#20 id=20 data-nosnippet>20</a>        .unwrap_or_default()
+<a href=#21 id=21 data-nosnippet>21</a>        .as_secs()
+<a href=#22 id=22 data-nosnippet>22</a>}
+<a href=#23 id=23 data-nosnippet>23</a>
+<a href=#24 id=24 data-nosnippet>24</a><span class="doccomment">/// A reusable watchdog that detects stalled (idle) WebSocket transports.
+<a href=#25 id=25 data-nosnippet>25</a>///
+<a href=#26 id=26 data-nosnippet>26</a>/// Create one per channel, call [`touch`](Self::touch) on every received
+<a href=#27 id=27 data-nosnippet>27</a>/// message or event, and [`start`](Self::start) with a callback that triggers
+<a href=#28 id=28 data-nosnippet>28</a>/// reconnection.
+<a href=#29 id=29 data-nosnippet>29</a></span><span class="kw">pub struct </span>StallWatchdog {
+<a href=#30 id=30 data-nosnippet>30</a>    <span class="doccomment">/// Unix timestamp (seconds) of the last received event.
+<a href=#31 id=31 data-nosnippet>31</a>    </span>last_event: Arc&lt;AtomicU64&gt;,
+<a href=#32 id=32 data-nosnippet>32</a>    <span class="doccomment">/// Stall threshold in seconds.
+<a href=#33 id=33 data-nosnippet>33</a>    </span>timeout_secs: u64,
+<a href=#34 id=34 data-nosnippet>34</a>    <span class="doccomment">/// Handle to the background polling task (if running).
+<a href=#35 id=35 data-nosnippet>35</a>    </span>task: Mutex&lt;<span class="prelude-ty">Option</span>&lt;JoinHandle&lt;()&gt;&gt;&gt;,
+<a href=#36 id=36 data-nosnippet>36</a>}
+<a href=#37 id=37 data-nosnippet>37</a>
+<a href=#38 id=38 data-nosnippet>38</a><span class="kw">impl </span>StallWatchdog {
+<a href=#39 id=39 data-nosnippet>39</a>    <span class="doccomment">/// Create a new watchdog with the given stall threshold.
+<a href=#40 id=40 data-nosnippet>40</a>    ///
+<a href=#41 id=41 data-nosnippet>41</a>    /// The watchdog is **not** started — call [`start`](Self::start) to begin
+<a href=#42 id=42 data-nosnippet>42</a>    /// monitoring.
+<a href=#43 id=43 data-nosnippet>43</a>    </span><span class="kw">pub fn </span>new(timeout_secs: u64) -&gt; <span class="self">Self </span>{
+<a href=#44 id=44 data-nosnippet>44</a>        <span class="self">Self </span>{
+<a href=#45 id=45 data-nosnippet>45</a>            last_event: Arc::new(AtomicU64::new(now_secs())),
+<a href=#46 id=46 data-nosnippet>46</a>            timeout_secs,
+<a href=#47 id=47 data-nosnippet>47</a>            task: Mutex::new(<span class="prelude-val">None</span>),
+<a href=#48 id=48 data-nosnippet>48</a>        }
+<a href=#49 id=49 data-nosnippet>49</a>    }
+<a href=#50 id=50 data-nosnippet>50</a>
+<a href=#51 id=51 data-nosnippet>51</a>    <span class="doccomment">/// Record that an event was received **right now**.
+<a href=#52 id=52 data-nosnippet>52</a>    ///
+<a href=#53 id=53 data-nosnippet>53</a>    /// This is lock-free (atomic store) and can be called from any async
+<a href=#54 id=54 data-nosnippet>54</a>    /// context without contention.
+<a href=#55 id=55 data-nosnippet>55</a>    </span><span class="kw">pub fn </span>touch(<span class="kw-2">&amp;</span><span class="self">self</span>) {
+<a href=#56 id=56 data-nosnippet>56</a>        <span class="self">self</span>.last_event.store(now_secs(), Ordering::Relaxed);
+<a href=#57 id=57 data-nosnippet>57</a>    }
+<a href=#58 id=58 data-nosnippet>58</a>
+<a href=#59 id=59 data-nosnippet>59</a>    <span class="doccomment">/// Returns `true` if the time since the last event exceeds the configured
+<a href=#60 id=60 data-nosnippet>60</a>    /// timeout.
+<a href=#61 id=61 data-nosnippet>61</a>    </span><span class="kw">pub fn </span>is_stalled(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool {
+<a href=#62 id=62 data-nosnippet>62</a>        <span class="kw">let </span>last = <span class="self">self</span>.last_event.load(Ordering::Relaxed);
+<a href=#63 id=63 data-nosnippet>63</a>        now_secs().saturating_sub(last) &gt; <span class="self">self</span>.timeout_secs
+<a href=#64 id=64 data-nosnippet>64</a>    }
+<a href=#65 id=65 data-nosnippet>65</a>
+<a href=#66 id=66 data-nosnippet>66</a>    <span class="doccomment">/// Start the background polling task.
+<a href=#67 id=67 data-nosnippet>67</a>    ///
+<a href=#68 id=68 data-nosnippet>68</a>    /// The task wakes every `timeout_secs / 2` seconds and checks whether the
+<a href=#69 id=69 data-nosnippet>69</a>    /// transport has stalled.  When a stall is detected `on_stall` is invoked
+<a href=#70 id=70 data-nosnippet>70</a>    /// (typically to log a warning and break out of the listen loop).
+<a href=#71 id=71 data-nosnippet>71</a>    ///
+<a href=#72 id=72 data-nosnippet>72</a>    /// Calling `start` while a task is already running replaces the previous
+<a href=#73 id=73 data-nosnippet>73</a>    /// task (the old one is aborted).
+<a href=#74 id=74 data-nosnippet>74</a>    </span><span class="kw">pub async fn </span>start(<span class="kw-2">&amp;</span><span class="self">self</span>, on_stall: <span class="kw">impl </span>Fn() + Send + <span class="lifetime">'static</span>) {
+<a href=#75 id=75 data-nosnippet>75</a>        <span class="comment">// Reset timestamp so the freshly-started watchdog doesn't immediately
+<a href=#76 id=76 data-nosnippet>76</a>        // fire.
+<a href=#77 id=77 data-nosnippet>77</a>        </span><span class="self">self</span>.touch();
+<a href=#78 id=78 data-nosnippet>78</a>
+<a href=#79 id=79 data-nosnippet>79</a>        <span class="kw">let </span>last_event = Arc::clone(<span class="kw-2">&amp;</span><span class="self">self</span>.last_event);
+<a href=#80 id=80 data-nosnippet>80</a>        <span class="kw">let </span>timeout = <span class="self">self</span>.timeout_secs;
+<a href=#81 id=81 data-nosnippet>81</a>        <span class="kw">let </span>poll_interval = std::time::Duration::from_secs((timeout / <span class="number">2</span>).max(<span class="number">1</span>));
+<a href=#82 id=82 data-nosnippet>82</a>
+<a href=#83 id=83 data-nosnippet>83</a>        <span class="kw">let </span>handle = tokio::spawn(<span class="kw">async move </span>{
+<a href=#84 id=84 data-nosnippet>84</a>            <span class="kw">let </span><span class="kw-2">mut </span>interval = tokio::time::interval(poll_interval);
+<a href=#85 id=85 data-nosnippet>85</a>            <span class="comment">// The first tick completes immediately — skip it so we wait a full
+<a href=#86 id=86 data-nosnippet>86</a>            // interval before the first check.
+<a href=#87 id=87 data-nosnippet>87</a>            </span>interval.tick().<span class="kw">await</span>;
+<a href=#88 id=88 data-nosnippet>88</a>
+<a href=#89 id=89 data-nosnippet>89</a>            <span class="kw">loop </span>{
+<a href=#90 id=90 data-nosnippet>90</a>                interval.tick().<span class="kw">await</span>;
+<a href=#91 id=91 data-nosnippet>91</a>                <span class="kw">let </span>last = last_event.load(Ordering::Relaxed);
+<a href=#92 id=92 data-nosnippet>92</a>                <span class="kw">if </span>now_secs().saturating_sub(last) &gt; timeout {
+<a href=#93 id=93 data-nosnippet>93</a>                    on_stall();
+<a href=#94 id=94 data-nosnippet>94</a>                    <span class="kw">break</span>;
+<a href=#95 id=95 data-nosnippet>95</a>                }
+<a href=#96 id=96 data-nosnippet>96</a>            }
+<a href=#97 id=97 data-nosnippet>97</a>        });
+<a href=#98 id=98 data-nosnippet>98</a>
+<a href=#99 id=99 data-nosnippet>99</a>        <span class="kw">let </span><span class="kw-2">mut </span>task = <span class="self">self</span>.task.lock().<span class="kw">await</span>;
+<a href=#100 id=100 data-nosnippet>100</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(old) = task.take() {
+<a href=#101 id=101 data-nosnippet>101</a>            old.abort();
+<a href=#102 id=102 data-nosnippet>102</a>        }
+<a href=#103 id=103 data-nosnippet>103</a>        <span class="kw-2">*</span>task = <span class="prelude-val">Some</span>(handle);
+<a href=#104 id=104 data-nosnippet>104</a>    }
+<a href=#105 id=105 data-nosnippet>105</a>
+<a href=#106 id=106 data-nosnippet>106</a>    <span class="doccomment">/// Stop the background polling task (if running).
+<a href=#107 id=107 data-nosnippet>107</a>    </span><span class="kw">pub async fn </span>stop(<span class="kw-2">&amp;</span><span class="self">self</span>) {
+<a href=#108 id=108 data-nosnippet>108</a>        <span class="kw">let </span><span class="kw-2">mut </span>task = <span class="self">self</span>.task.lock().<span class="kw">await</span>;
+<a href=#109 id=109 data-nosnippet>109</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(handle) = task.take() {
+<a href=#110 id=110 data-nosnippet>110</a>            handle.abort();
+<a href=#111 id=111 data-nosnippet>111</a>        }
+<a href=#112 id=112 data-nosnippet>112</a>    }
+<a href=#113 id=113 data-nosnippet>113</a>}
+<a href=#114 id=114 data-nosnippet>114</a>
+<a href=#115 id=115 data-nosnippet>115</a><span class="kw">impl </span>Drop <span class="kw">for </span>StallWatchdog {
+<a href=#116 id=116 data-nosnippet>116</a>    <span class="kw">fn </span>drop(<span class="kw-2">&amp;mut </span><span class="self">self</span>) {
+<a href=#117 id=117 data-nosnippet>117</a>        <span class="comment">// Best-effort cleanup — abort the task synchronously if it exists.
+<a href=#118 id=118 data-nosnippet>118</a>        </span><span class="kw">if let </span><span class="prelude-val">Ok</span>(<span class="kw-2">mut </span>guard) = <span class="self">self</span>.task.try_lock()
+<a href=#119 id=119 data-nosnippet>119</a>            &amp;&amp; <span class="kw">let </span><span class="prelude-val">Some</span>(handle) = guard.take()
+<a href=#120 id=120 data-nosnippet>120</a>        {
+<a href=#121 id=121 data-nosnippet>121</a>            handle.abort();
+<a href=#122 id=122 data-nosnippet>122</a>        }
+<a href=#123 id=123 data-nosnippet>123</a>    }
+<a href=#124 id=124 data-nosnippet>124</a>}
+<a href=#125 id=125 data-nosnippet>125</a>
+<a href=#126 id=126 data-nosnippet>126</a><span class="attr">#[cfg(test)]
+<a href=#127 id=127 data-nosnippet>127</a></span><span class="kw">mod </span>tests {
+<a href=#128 id=128 data-nosnippet>128</a>    <span class="kw">use </span>super::<span class="kw-2">*</span>;
+<a href=#129 id=129 data-nosnippet>129</a>    <span class="kw">use </span>std::sync::atomic::AtomicBool;
+<a href=#130 id=130 data-nosnippet>130</a>
+<a href=#131 id=131 data-nosnippet>131</a>    <span class="attr">#[tokio::test]
+<a href=#132 id=132 data-nosnippet>132</a>    </span><span class="kw">async fn </span>touch_prevents_stall() {
+<a href=#133 id=133 data-nosnippet>133</a>        <span class="kw">let </span>wd = StallWatchdog::new(<span class="number">2</span>);
+<a href=#134 id=134 data-nosnippet>134</a>        wd.touch();
+<a href=#135 id=135 data-nosnippet>135</a>        <span class="macro">assert!</span>(!wd.is_stalled());
+<a href=#136 id=136 data-nosnippet>136</a>    }
+<a href=#137 id=137 data-nosnippet>137</a>
+<a href=#138 id=138 data-nosnippet>138</a>    <span class="attr">#[tokio::test]
+<a href=#139 id=139 data-nosnippet>139</a>    </span><span class="kw">async fn </span>is_stalled_after_timeout() {
+<a href=#140 id=140 data-nosnippet>140</a>        <span class="kw">let </span>wd = StallWatchdog::new(<span class="number">0</span>); <span class="comment">// 0-second timeout → always stalled
+<a href=#141 id=141 data-nosnippet>141</a>        // Force last_event into the past
+<a href=#142 id=142 data-nosnippet>142</a>        </span>wd.last_event.store(<span class="number">0</span>, Ordering::Relaxed);
+<a href=#143 id=143 data-nosnippet>143</a>        <span class="macro">assert!</span>(wd.is_stalled());
+<a href=#144 id=144 data-nosnippet>144</a>    }
+<a href=#145 id=145 data-nosnippet>145</a>
+<a href=#146 id=146 data-nosnippet>146</a>    <span class="attr">#[tokio::test]
+<a href=#147 id=147 data-nosnippet>147</a>    </span><span class="kw">async fn </span>callback_fires_on_stall() {
+<a href=#148 id=148 data-nosnippet>148</a>        <span class="kw">let </span>fired = Arc::new(AtomicBool::new(<span class="bool-val">false</span>));
+<a href=#149 id=149 data-nosnippet>149</a>        <span class="kw">let </span>fired_clone = Arc::clone(<span class="kw-2">&amp;</span>fired);
+<a href=#150 id=150 data-nosnippet>150</a>
+<a href=#151 id=151 data-nosnippet>151</a>        <span class="kw">let </span>wd = StallWatchdog::new(<span class="number">1</span>);
+<a href=#152 id=152 data-nosnippet>152</a>
+<a href=#153 id=153 data-nosnippet>153</a>        wd.start(<span class="kw">move </span>|| {
+<a href=#154 id=154 data-nosnippet>154</a>            fired_clone.store(<span class="bool-val">true</span>, Ordering::Relaxed);
+<a href=#155 id=155 data-nosnippet>155</a>        })
+<a href=#156 id=156 data-nosnippet>156</a>        .<span class="kw">await</span>;
+<a href=#157 id=157 data-nosnippet>157</a>
+<a href=#158 id=158 data-nosnippet>158</a>        <span class="comment">// Force last_event far into the past *after* start() so the next poll
+<a href=#159 id=159 data-nosnippet>159</a>        // detects a stall (start() calls touch() which would overwrite an
+<a href=#160 id=160 data-nosnippet>160</a>        // earlier store).
+<a href=#161 id=161 data-nosnippet>161</a>        </span>wd.last_event.store(<span class="number">0</span>, Ordering::Relaxed);
+<a href=#162 id=162 data-nosnippet>162</a>
+<a href=#163 id=163 data-nosnippet>163</a>        <span class="comment">// Wait long enough for the poll interval (1 / 2 = clamped to 1s) + margin.
+<a href=#164 id=164 data-nosnippet>164</a>        </span>tokio::time::sleep(std::time::Duration::from_secs(<span class="number">2</span>)).<span class="kw">await</span>;
+<a href=#165 id=165 data-nosnippet>165</a>        <span class="macro">assert!</span>(fired.load(Ordering::Relaxed));
+<a href=#166 id=166 data-nosnippet>166</a>    }
+<a href=#167 id=167 data-nosnippet>167</a>
+<a href=#168 id=168 data-nosnippet>168</a>    <span class="attr">#[tokio::test]
+<a href=#169 id=169 data-nosnippet>169</a>    </span><span class="kw">async fn </span>stop_prevents_callback() {
+<a href=#170 id=170 data-nosnippet>170</a>        <span class="kw">let </span>fired = Arc::new(AtomicBool::new(<span class="bool-val">false</span>));
+<a href=#171 id=171 data-nosnippet>171</a>        <span class="kw">let </span>fired_clone = Arc::clone(<span class="kw-2">&amp;</span>fired);
+<a href=#172 id=172 data-nosnippet>172</a>
+<a href=#173 id=173 data-nosnippet>173</a>        <span class="kw">let </span>wd = StallWatchdog::new(<span class="number">1</span>);
+<a href=#174 id=174 data-nosnippet>174</a>
+<a href=#175 id=175 data-nosnippet>175</a>        wd.start(<span class="kw">move </span>|| {
+<a href=#176 id=176 data-nosnippet>176</a>            fired_clone.store(<span class="bool-val">true</span>, Ordering::Relaxed);
+<a href=#177 id=177 data-nosnippet>177</a>        })
+<a href=#178 id=178 data-nosnippet>178</a>        .<span class="kw">await</span>;
+<a href=#179 id=179 data-nosnippet>179</a>
+<a href=#180 id=180 data-nosnippet>180</a>        wd.last_event.store(<span class="number">0</span>, Ordering::Relaxed);
+<a href=#181 id=181 data-nosnippet>181</a>
+<a href=#182 id=182 data-nosnippet>182</a>        <span class="comment">// Stop immediately before the poll task can fire.
+<a href=#183 id=183 data-nosnippet>183</a>        </span>wd.stop().<span class="kw">await</span>;
+<a href=#184 id=184 data-nosnippet>184</a>
+<a href=#185 id=185 data-nosnippet>185</a>        tokio::time::sleep(std::time::Duration::from_secs(<span class="number">2</span>)).<span class="kw">await</span>;
+<a href=#186 id=186 data-nosnippet>186</a>        <span class="macro">assert!</span>(!fired.load(Ordering::Relaxed));
+<a href=#187 id=187 data-nosnippet>187</a>    }
+<a href=#188 id=188 data-nosnippet>188</a>}
+</code></pre></div></section></main></body></html>

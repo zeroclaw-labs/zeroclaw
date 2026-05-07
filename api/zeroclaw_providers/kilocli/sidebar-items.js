@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["KILO_CLI_PATH_ENV"],"struct":["KiloCliProvider"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["handle_catalog","handle_catalog_models","handle_onboard_status","handle_section_picker","handle_section_select","handle_sections"],"struct":["CatalogProvider","CatalogResponse","ModelsQuery","ModelsResponse","OnboardStatusResponse","PickerItem","PickerResponse","SectionInfo","SectionItemPath","SectionPath","SectionsResponse","SelectItemResponse"]};

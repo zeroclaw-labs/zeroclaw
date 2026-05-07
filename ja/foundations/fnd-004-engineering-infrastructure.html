@@ -1,0 +1,687 @@
+<!DOCTYPE HTML>
+<html lang="ja" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>エンジニアリングインフラ - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-83844b35.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-69ff217c.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/foundations/fnd-004-engineering-infrastructure.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="fnd-004-エンジニアリングインフラストラクチャ--cicdパイプラインとリリース自動化"><a class="header" href="#fnd-004-エンジニアリングインフラストラクチャ--cicdパイプラインとリリース自動化">FND-004: エンジニアリングインフラストラクチャ — CI/CDパイプラインとリリース自動化</a></h1>
+<h3 id="v070--v100-のサポート--タイプ-アーキテクチャ--rev-1"><a class="header" href="#v070--v100-のサポート--タイプ-アーキテクチャ--rev-1">v0.7.0 → v1.0.0 のサポート · タイプ: アーキテクチャ · Rev. 1</a></h3>
+<blockquote>
+<p><strong>正規の参照</strong> · チームによって承認済み · Rev. 1 議論スレッドおよび完全な改訂履歴: <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5579">#5579</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>これを読む前にチームへの注意。</strong></p>
+<p>この文書は、コードを取り巻くインフラストラクチャ、つまりコードをビルドし、テストし、監査し、リリースするための自動化について説明しています。このインフラストラクチャは正常に動作しているときは目に見えませんが、問題が生じた際には大きな負担となります。多くのチームは、問題が生じて初めてこれに気づきますが、その頃には誰も完全に理解できないほど複雑になっています。このRFCは、そのような事態を未然に防ぐ試みです。CI/CDについて深く考えたことがない方には、ここから始めるのが良いでしょう。すでに経験がある方には、既知のパターンが認識できるはずです。いずれにせよ、目標は同じです。チームに自信を与えつつ、邪魔をしないパイプラインを実現することです。</p>
+</blockquote>
+<hr>
+<h2 id="目次"><a class="header" href="#目次">目次</a></h2>
+<ol>
+<li><a href="#1-context-pipelines-are-architecture">コンテキスト: パイプラインはアーキテクチャ</a></li>
+<li><a href="#2-honest-assessment-where-we-are-today">正直な評価：現在の状況</a></li>
+<li><a href="#3-the-target-pipeline-design">ターゲットパイプラインの設計</a></li>
+<li><a href="#4-security-scanning-as-a-lifecycle">セキュリティスキャンをライフサイクルとして</a></li>
+<li><a href="#5-release-automation-aligned-to-the-distribution-model">配布モデルに合わせたリリース自動化</a></li>
+<li><a href="#6-standards-we-should-adopt">採用すべき標準</a></li>
+<li><a href="#7-phased-roadmap">フェーズ別ロードマップ</a></li>
+<li><a href="#8-what-this-means-for-contributors">コントリビューターへの影響</a></li>
+</ol>
+<hr>
+<h2 id="改訂履歴"><a class="header" href="#改訂履歴">改訂履歴</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Rev</th><th>日付</th><th>目次</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>2026年4月9日</td><td>初期ドラフト</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="1-コンテキスト-パイプラインはアーキテクチャである"><a class="header" href="#1-コンテキスト-パイプラインはアーキテクチャである">1. コンテキスト: パイプラインはアーキテクチャである</a></h2>
+<p>アーキテクチャ RFC (#5574) は以下の原則を確立しました。<em>依存関係は内側へ流れ、構造はコンパイラによって強制されます。</em> この原則は、コードを取り巻くパイプラインにも適用されます。パイプラインは単なる自動化ではなく、何を信頼し、何を検証し、いつ検証し、どのように出荷するかというアーキテクチャ上の意思決定の集合体です。</p>
+<p>これらの決定には結果が伴います。モノリシック向けに設計されたパイプラインはマイクロカーネルに積極的に抵抗します。トリアージプロセスがないセキュリティゲートは、すべてをブロックするか、回避されるかのどちらかになります。1つのバイナリを中心に構築されたリリースワークフローは、5つのアーティファクトタイプを持つ配布モデルでは維持できません。これらは設定の問題ではありません。設計の問題であり、コードアーキテクチャと同じ意図的な扱いが必要です。</p>
+<p>現在のパイプラインは反応的に成長し、<code>loop_.rs</code> が 9,500 行にまで膨張したのと同じ経緯をたどりました。現在の状態を意図的に選択したわけではありません。それは蓄積された結果です。PR #5559 — マイクロカーネル移行における最初の主要なステップ — は、パイプラインの前提条件がもはや成立していない箇所をいくつか明らかにしました。これは有用なシグナルです。つまり、今まさに停止し、評価し、意図的に設計し直す絶好のタイミングなのです。</p>
+<p>このRFCは、アーキテクチャRFCがコードベースに対して行うことと同様に、パイプラインに対して行います：存在するものを明確にし、構造的な問題を特定し、プロジェクトの方向性と整合性のある次のステップを提案します。</p>
+<hr>
+<h2 id="2-正直な評価現在の状況"><a class="header" href="#2-正直な評価現在の状況">2. 正直な評価：現在の状況</a></h2>
+<p>このセクションは批判ではありません。これは診断です。現在のパイプラインは、当時妥当だった判断を反映しています。目標は、それを明確に理解し、改善することです。</p>
+<h3 id="21-同じ作業を行う2つのワークフロー"><a class="header" href="#21-同じ作業を行う2つのワークフロー">2.1 同じ作業を行う2つのワークフロー</a></h3>
+<p>現在、リポジトリには <code>master</code> に対するプルリクエストで実行される2つの別々のワークフローがあります。</p>
+<ul>
+<li><code>checks-on-pr.yml</code> — 「Quality Gate」としてブランド化</li>
+<li><code>ci-run.yml</code> — 「CI」としてブランド化</li>
+</ul>
+<p>両方のリポジトリで、すべてのPRに対してLint、ビルド、テスト、セキュリティジョブを独立して実行します。つまり、各PRで2つのパイプラインが並列に実行されます。単一のコンパイルユニットを持つモノリシックなリポジトリでは、これはコストがかかりますが管理可能な範囲でした。しかし、マルチクレートワークスペースでは、すでに大きなCI予算がさらに倍増し、追加のシグナルは得られません。</p>
+<p>重複には、計算時間の消費以外にも、より微妙なコストがあります。あるワークフローでチェックが失敗し、別のワークフローでは失敗しない場合、コントリビューターはどちらの結果を信頼すべきか分かりません。新しいチェックを追加する必要がある場合、それを2か所に追加しなければなりません。動作を変更する必要がある場合、それを2か所で変更しなければなりません。真の情報が2つあることは、コードにおける真の情報が2つあるのと同じ問題です。</p>
+<h3 id="22-シングルバイナリの前提は至る所に組み込まれている"><a class="header" href="#22-シングルバイナリの前提は至る所に組み込まれている">2.2 シングルバイナリの前提は至る所に組み込まれている</a></h3>
+<p>リリース自動化 — <code>release-stable-manual.yml</code>, <code>release-beta-on-push.yml</code>, <code>publish-crates.yml</code>, <code>pub-aur.yml</code>, <code>pub-homebrew-core.yml</code>, <code>pub-scoop.yml</code>, <code>discord-release.yml</code>, <code>tweet-release.yml</code> — は、リリースが1つのバイナリであることを前提として設計されています。ビルドして署名し、パッケージマネージャーにプッシュし、アナウンスを行います。</p>
+<p>アーキテクチャ RFC では、5つの異なるアーティファクトタイプを持つ配布モデルを定義しています。これらは、カーネルバイナリ（複数のプラットフォームターゲット）、ハードウェアバリアントカーネルバイナリ、ゲートウェイバイナリ、WASM プラグインファイル、および Tauri デスクトップインストーラーです。現在のリリースワークフローは、この構造を考慮していません。アーキテクチャの移行がフェーズ3とフェーズ4に達すると、これらのワークフローはすべて変更する必要があります — ただし、今このモデルを念頭に置いて再設計されない限り。</p>
+<h3 id="23-ライフサイクルなしのセキュリティスキャン"><a class="header" href="#23-ライフサイクルなしのセキュリティスキャン">2.3 ライフサイクルなしのセキュリティスキャン</a></h3>
+<p>セキュリティジョブは <code>cargo audit</code> をハードゲートとして実行します。依存関係ツリーにアドバイザリが存在する場合、ゲートが失敗し、PR はマージできません。意図は正しいですが、実装には構造的な問題があります。</p>
+<p><code>cargo audit</code> は依存関係ツリー内のすべてのアドバイザリを報告します：アクティブな脆弱性、メンテナンスされていないクレート、および情報通知。しかし、以下を区別しません：</p>
+<ul>
+<li>プロジェクトが積極的に呼び出しているクレートにおける重大な脆弱性</li>
+<li>オプション機能の3段階下にある間接依存関係における脆弱性</li>
+<li>プロジェクトが依存しているクレートが、制御できないサードパーティのライブラリを通じて間接的に「メンテナンスされていない」ことを示す通知</li>
+<li>このPRがオープンされる前に存在していた既存のアドバイザリ</li>
+</ul>
+<p>これらすべてが同じハードフェイルを生成する場合、ゲートはノイズになります。ノイズに対する現実的な対応は、ゲートを下げる、失敗を無視する、またはチェックを抑制することです。これら3つの対応はいずれも、プロジェクトのセキュリティを高めるのではなく、むしろ低下させます。維持できないセキュリティゲートは、維持されません。</p>
+<p>PR #5559 で RUSTSEC-2026 のアドバイザリが12件同時に浮上しました。「このPRによって新たに導入されたアドバイザリ」と「masterブランチに既に存在していたアドバイザリ」を区別するツールがないため、PRの著者やレビュアーはこのPRがセキュリティ姿勢を悪化させたかどうかを判断できません。</p>
+<h3 id="24-厳格なデルタリンティングスクリプト"><a class="header" href="#24-厳格なデルタリンティングスクリプト">2.4 厳格なデルタリンティングスクリプト</a></h3>
+<p><code>ci-run.yml</code> には、<code>scripts/ci/rust_strict_delta_gate.sh</code> を実行するジョブが含まれています。これは、PR のベース SHA に対して clippy の出力を比較するカスタムスクリプトです。このコンセプトは理にかなっています：コードベースに警告が存在するかどうかだけでなく、この PR が新しい警告を導入したかどうかを知りたいのです。この実装は、単一のクレートに対する小さく焦点を絞った PR に対してうまく機能します。</p>
+<p>10個の新しいクレートにまたがって260,000行のコードを移動し、数百のファイルに影響を与えるPRは、このスクリプトが設計された範囲を超えた領域に踏み込みます。変更されたファイルの範囲が大きすぎるため、増分的な比較では意味のあるシグナルを生成できません。スクリプトはワークスペースの構造、具体的には <code>crates/zeroclaw-channels/</code> 内のファイルへの変更はそのクレートの文脈で評価されるべきであり、ルートディレクトリではないことを理解する必要があります。</p>
+<h3 id="25-ワークスペース対応のキャッシュやスコープなし"><a class="header" href="#25-ワークスペース対応のキャッシュやスコープなし">2.5 ワークスペース対応のキャッシュやスコープなし</a></h3>
+<p>現在のRustキャッシュの設定（<code>Swatinem/rust-cache</code>）は単一のクレートには十分ですが、マルチクレートワークスペースでは、どのクレートが変更されたか、およびどのコンパイル済みアーティファクトを再利用できるかを理解することがキャッシュの有効性に依存します。明示的なワークスペーススコーピングがない場合、任意のクレートへの変更が他のクレートが依存するキャッシュを無効化し、すべてのPRで完全な再コンパイルを引き起こす可能性があります。</p>
+<p>さらに重要なのは、特定の変更によって影響を受けるクレートに対してのみ CI を実行する仕組みがないことです。<code>zeroclaw-tool-call-parser</code> の typo を修正する PR において、ゲートウェイの再ビルドや再テストは不要です。ワークスペースがアーキテクチャ RFC で想定されている 30 以上のクレート規模へと成長するにつれて、すべての PR に対してフルパイプラインを実行するコストは、コントリビューションにとって意味のある障壁となります。</p>
+<h3 id="26-アクションの固定は良い--しかし文書化されていない"><a class="header" href="#26-アクションの固定は良い--しかし文書化されていない">2.6 アクションの固定は良い — しかし文書化されていない</a></h3>
+<p>既存のワークフローでは、アクションを完全なコミット SHA にピン留めしており、これは正しいセキュリティプラクティスであり、認識される価値があります。しかし、なぜそうする必要があるのかを説明する文書化されたポリシー、それらの SHA を更新すべき時期をレビューするプロセス、それらを最新に保つための自動化は存在しません。ポリシーのない良い行動は脆いものです。ワークフローステップを追加する次の貢献者は、SHA ピン留めの重要性を知らないまま、変更可能なタグを使用する可能性があります。</p>
+<hr>
+<h2 id="3-ターゲットパイプラインの設計"><a class="header" href="#3-ターゲットパイプラインの設計">3. ターゲットパイプラインの設計</a></h2>
+<h3 id="31-1つのパイプライン1つの真実のソース"><a class="header" href="#31-1つのパイプライン1つの真実のソース">3.1 1つのパイプライン、1つの真実のソース</a></h3>
+<p>2つの並列ワークフローは、1つの構造化されたパイプラインに統合すべきです。「Quality Gate」と「CI」の区別はコントリビューターにとって意味がありません。どちらもPRが通過しなければならないチェックです。統合により、チェック結果を確認する場所、動作変更時に更新する場所、各チェックの目的と理由を文書化する場所が1つになります。</p>
+<p>統合パイプラインは、高速で低コストのチェックが先に実行され、それによって遅く高コストのチェックを制御する段階的な構造に従います。</p>
+<pre><code>Stage 1: Format + Lint (2–5 min)
+  └── cargo fmt --check
+  └── cargo clippy --workspace --all-targets -- -D warnings
+  └── Docs quality gate
+
+Stage 2: Build + Check (parallel, 5–15 min)
+  └── Build matrix (Linux x86_64, macOS ARM, Windows)
+  └── cargo check --features ci-all
+  └── cargo check --no-default-features (kernel profile)
+  └── cargo check --target i686 (32-bit)
+
+Stage 3: Test (10–30 min, gated on Stage 1)
+  └── cargo nextest run --workspace
+
+Stage 4: Security (parallel with Stage 3)
+  └── cargo deny check (licenses, sources, advisories)
+  └── Advisory triage gate (see §4)
+
+Stage 5: Required Gate
+  └── Composite status — branch protection requires only this job
+</code></pre>
+<p>ステージ 2、3、および 4 は、ステージ 1 が成功した後に並列で実行されます。これにより、フォーマットエラーが発生した場合に迅速に失敗し、破棄されるビルドに対して計算リソースを無駄に消費しません。Required Gate ジョブはすべての結果を集約するため、ブランチ保護では 1 つのジョブ名のみを追跡すればよく、これは既存のワークフローで既に採用されているパターンです。</p>
+<h3 id="32-ワークスペース対応のclippy"><a class="header" href="#32-ワークスペース対応のclippy">3.2 ワークスペース対応のClippy</a></h3>
+<p>現在の clippy の呼び出しは、ルートクレートのデフォルトの機能セットに対して実行されます。マルチクレートワークスペースに対して正しい呼び出しは以下の通りです：</p>
+<pre><code class="language-bash">cargo clippy --workspace --all-targets -- -D warnings
+</code></pre>
+<p><code>--workspace</code> フラグは、ルートだけでなくワークスペース内のすべてのクレートがリンティングされるようにします。<code>--all-targets</code> フラグは、テスト、ベンチマーク、および例を含みます。フィーチャゲート付きチェックに対して <code>--features ci-all</code> と組み合わせることで、包括的な状況把握が可能になります。</p>
+<p>厳密なデルタ lint の概念 — この PR が警告を新たに導入したかどうかをチェックするもので、警告がそもそも存在するかどうかをチェックするものではない — は維持する価値があります。実装は、diff 出力を比較するシェルスクリプトから、影響を受けた各クレートを独立して評価する適切なワークスペース対応の呼び出しに移行すべきです。よりシンプルで信頼性の高いアプローチとして、常にクリーンな状態を維持するために <code>--workspace -D warnings</code> の実行を要求し、デルタの概念を暗黙的にします。ベースラインが常にクリーンであれば、警告を新たに導入するすべての PR は失敗します。これにより、カスタム比較スクリプトの必要性がなくなります。</p>
+<h3 id="33-変更されたクレートの検出"><a class="header" href="#33-変更されたクレートの検出">3.3 変更されたクレートの検出</a></h3>
+<p>30以上のクレートに成長したワークスペースでは、変更内容に関わらずすべてのプルリクエストでフルテストスイートを実行するのは非効率です。パイプラインは、プルリクエストによって影響を受けたクレートを検出し、テストの実行範囲をそれに合わせて絞り込む必要があります。</p>
+<p>仕組みは単純です。PR で変更されたファイルをワークスペースのメンバーリストと比較し、変更されたファイルを含むクレートを特定し、変更されたクレートに依存するすべてのクレート（下流への影響）を含むセットに拡張し、そのセットに対してのみテストを実行します。</p>
+<pre><code>PR changes: crates/zeroclaw-tool-call-parser/src/lib.rs
+
+Affected crates:
+  zeroclaw-tool-call-parser     ← directly changed
+  zeroclaw-misc                 ← depends on it
+  zeroclawlabs (root)           ← depends on it
+
+Not affected:
+  zeroclaw-channels             ← no dependency path
+  zeroclaw-memory               ← no dependency path
+  zeroclaw-providers            ← no dependency path
+</code></pre>
+<p>これは、依存関係グラフを抽出するために <code>cargo metadata</code> を使用し、それを走査する短いスクリプトによって実装されています。完全なテストスイートは <code>master</code> へのプッシュやリリースブランチで引き続き実行されます。PR では、影響を受けるクレートのサブセットが実行されます。</p>
+<h3 id="34-キャッシュ戦略"><a class="header" href="#34-キャッシュ戦略">3.4 キャッシュ戦略</a></h3>
+<p><code>Swatinem/rust-cache</code> は、<code>workspaces</code> 設定を通じてワークスペース対応のキャッシュをサポートしています。キャッシュキーにはワークスペースのメンバーリストを含める必要があり、新しいクレートが追加された際に、関連しないクレートのキャッシュを無効化することなく適切に無効化されるようにします。</p>
+<pre><code class="language-yaml">- 使用: Swatinem/rust-cache@&lt;sha&gt;
+  with:
+    ワークスペース: |
+      . -&gt; target
+    cache-on-failure: true
+    save-if: ${{ github.ref == 'refs/heads/master' }}
+</code></pre>
+<p><code>save-if</code> 条件は、キャッシュがすべての PR に対してではなく、<code>master</code> へのプッシュ時のみ書き込まれることを意味します。PR はキャッシュから読み込みますが、競合するバージョンは書き込みません。これにより、複数の PR が同時に開かれている場合でも、キャッシュの競合を回避できます。</p>
+<hr>
+<h2 id="4-ライフサイクルとしてのセキュリティスキャン"><a class="header" href="#4-ライフサイクルとしてのセキュリティスキャン">4. ライフサイクルとしてのセキュリティスキャン</a></h2>
+<h3 id="41-二値ゲートの問題"><a class="header" href="#41-二値ゲートの問題">4.1 二値ゲートの問題</a></h3>
+<p>コンテキストなしで任意のアドバイザリに対してブロックするセキュリティゲートは、チームにセキュリティ上の失敗をノイズとして扱うよう訓練してしまいます。これは意図した効果の反対です。目指すべきゲートは以下の通りです：</p>
+<ul>
+<li><strong>高シグナル</strong> — 失敗は、このPRが実際に影響を与えたものを意味します</li>
+<li><strong>アクション可能</strong> — 貢献者は何をすべきか、そしてなぜそれを行うべきかを理解している</li>
+<li><strong>持続可能</strong> — ゲートは絶え間ない手動介入なしで維持できます</li>
+</ul>
+<p><code>cargo audit</code> だけではこれを実現できません。<code>cargo deny</code> がそれを行います。</p>
+<h3 id="42-cargo-deny-を主要なセキュリティツールとして"><a class="header" href="#42-cargo-deny-を主要なセキュリティツールとして">4.2 cargo-deny を主要なセキュリティツールとして</a></h3>
+<p><code>cargo deny</code> は、プロジェクトレベルの依存関係ポリシーに対してより強力な後継ツールであり、以下を強制します：</p>
+<ul>
+<li><strong>アドバイザリ</strong> — RUSTSEC データベース。特定のアドバイザリを拒否、警告、または文書化された正当な理由に基づいて明示的に無視する機能。</li>
+<li><strong>ライセンス</strong> — すべての依存関係が許容可能なライセンスを使用していることを保証します（ワークスペースが拡大し、新しいコントリビューターが依存関係を追加する際に重要）。</li>
+<li><strong>Sources</strong> — 依存関係が承認されたレジストリ（crates.io、パス、特定のホストを持つ git）からのみ取得されることを保証します</li>
+<li><strong>重複</strong> — 依存関係ツリー内に同じクレートの複数のバージョンが含まれている場合に警告します</li>
+</ul>
+<p>主要な機能は <code>deny.toml</code> の <code>[advisories]</code> セクションであり、これにより明示的な無視が可能になります：</p>
+<pre><code class="language-toml">[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+vulnerability = "deny"
+unmaintained = "warn"
+unsound = "deny"
+notice = "warn"
+
+ignore = [
+    # RUSTSEC-2024-0388: `derivative` のメンテナンス終了 — matrix-sdk を経由して間接的に依存
+    # matrix-sdk を通じて間接的に依存関係に組み込まれていますが、直接の使用は行われておらず、
+    # 実際の攻撃も確認されていません。#XXXX で追跡中。
+    { id = "RUSTSEC-2024-0388", reason = "matrix-sdk を経由した間接依存; 直接使用なし" },
+]
+</code></pre>
+<p>このアプローチにより、セキュリティスキャンは単なる合格・不合格の判定から、文書化され監査可能なポリシーへと変化します。無視されたすべてのアドバイザリには書面による正当化理由と追跡用Issueが存在します。レビューアーは、どのアドバイザリが抑制されているか、そしてその理由を明確に把握できます。抑制されたアドバイザリがエスカレートした場合（新たな脆弱性が発見された、修正版が利用可能になった場合など）、追跡用Issueがリマインダーとして機能します。</p>
+<h3 id="43-アドバイザリトライアージプロセス"><a class="header" href="#43-アドバイザリトライアージプロセス">4.3 アドバイザリトライアージプロセス</a></h3>
+<p>依存関係ツリーに新しいアドバイザリ（PR または daily advisory database の更新から）が表示された場合、処理は以下の通りです：</p>
+<ol>
+<li><strong>アドバイスを分類する</strong>: 影響を受けるクレートは直接依存関係にありますか、それとも間接依存関係にありますか？ZeroClaw は脆弱なコードパスを呼び出しますか？修正済みのバージョンが利用可能ですか？</li>
+<li><strong>応答の決定</strong>:
+<ul>
+<li><em>修正可能な直接依存関係の脆弱性</em> → 依存関係を更新し、無視は不要</li>
+<li><em>修正可能な依存関係の脆弱性</em> → 依存関係を固定するか、直接の依存関係が更新されるまで待つか、追跡用Issueを作成する</li>
+<li><em>メンテナンス終了の通知、アクティブなエクスプロイトなし</em> → <code>deny.toml</code> の無視リストに正当化と追跡用イシューを追加</li>
+<li><em>修正のない重大な脆弱性</em> → ワークアラウンドを評価；PRをブロックする可能性があります</li>
+</ul>
+</li>
+<li><strong>決定事項</strong>を <code>deny.toml</code> に記録し、アドバイザリ ID、簡潔な理由、および追跡イシューへのリンクを含めます。</li>
+</ol>
+<p>このプロセスにより、#5559 のような既存のアドバイザリを12件表示するPRが、文脈なしでゲートに失敗することがなくなります。アドバイザリは分類され、既存のものは文書化され、ゲートはPRによって導入された新しい未分類のアドバイザリのみを報告します。</p>
+<h3 id="44-日次アドバイザリスキャン"><a class="header" href="#44-日次アドバイザリスキャン">4.4 日次アドバイザリスキャン</a></h3>
+<p>セキュリティアドバイザリは継続的に公開されています。マージ時にセキュリティゲートを通過したPRでも、翌週に公開された脆弱性を含んでいる可能性があります。パイプラインには、<code>master</code> ブランチに対して毎日定期的に実行され、アドバイザリデータベースを確認して、新しい未分類のアドバイザリが見つかった場合にGitHub Issueをオープンする処理を含める必要があります。</p>
+<pre><code class="language-yaml">on:
+  スケジュール:
+    - cron: '0 9 * * *'  # 毎日 09:00 UTC
+</code></pre>
+<p>これにより、アドバイザリ（advisory）のトリアージサイクルとPRのマージサイクルが分離されます。コントリビューターは、PR作成後に出現したアドバイザリによってブロックされなくなります。セキュリティチーム（またはローテーション担当）は、デイリースキャンの出力を通常の保守タスクとして処理します。</p>
+<hr>
+<h2 id="5-ディストリビューションモデルに合わせたリリース自動化"><a class="header" href="#5-ディストリビューションモデルに合わせたリリース自動化">5. ディストリビューションモデルに合わせたリリース自動化</a></h2>
+<h3 id="51-現在のミスマッチ"><a class="header" href="#51-現在のミスマッチ">5.1 現在のミスマッチ</a></h3>
+<p>アーキテクチャ RFC §4.4.2 では、以下のリリース成果物が定義されています：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>アーティファクト</th><th>ビルドターゲット</th><th>公開先</th></tr>
+</thead>
+<tbody>
+<tr><td>カーネルバイナリ（標準）</td><td>x86_64-linux-musl、aarch64-linux-gnu、armv7-linux-gnueabihf、x86_64-darwin、aarch64-darwin、x86_64-windows</td><td>GitHub リリース</td></tr>
+<tr><td>カーネルバイナリ（ハードウェア）</td><td>aarch64-linux-gnu, armv7-linux-gnueabihf</td><td>GitHub リリース</td></tr>
+<tr><td>ゲートウェイバイナリ</td><td>同じプラットフォームのマトリックス</td><td>GitHub リリース</td></tr>
+<tr><td>WASM プラグインファイル</td><td>wasm32-wasip1</td><td>プラグインレジストリ</td></tr>
+<tr><td>デスクトップインストーラー</td><td>x86_64 + aarch64、macOS/Windows/Linux</td><td>GitHub Releases、プラットフォームストア</td></tr>
+</tbody>
+</table>
+</div>
+<p>現在のリリースワークフローは、標準バイナリという1つのアーティファクトのみを認識しています。他のアーティファクトはまだ自動化の対象外です。これは現時点では適切です——プラグインシステムはまだ完成していません。ただし、新しいアーティファクトタイプが追加されるたびにワークフローを書き直す必要がないよう、リリースワークフローはこのモデルを念頭に置いて設計されるべきです。</p>
+<h3 id="52-リリースパイプラインの構造"><a class="header" href="#52-リリースパイプラインの構造">5.2 リリースパイプラインの構造</a></h3>
+<p>ターゲットリリースパイプラインは、モノリシックなワークフローではなく、ジョブの有向グラフです。</p>
+<pre><code>version-bump (release-plz PR merged)
+    │
+    ├── build-kernel-standard (matrix: 6 targets)
+    ├── build-kernel-hardware (matrix: 2 ARM targets + hardware flags)
+    ├── build-gateway (matrix: 6 targets)
+    ├── build-plugins-wasm (matrix: all plugin crates → wasm32-wasip1)
+    └── build-desktop (matrix: macOS, Windows, Linux AppImage/deb)
+            │
+            ├── publish-github-release (attaches all kernel + gateway binaries)
+            ├── publish-plugin-registry (uploads WASM files)
+            ├── publish-aur (kernel binary for Arch Linux)
+            ├── publish-homebrew (kernel binary for macOS)
+            ├── publish-scoop (kernel binary for Windows)
+            └── announce (Discord, social)
+</code></pre>
+<p>各ビルドジョブは独立しており、ホットフィックスリリースごとに個別にトリガーできます。公開ジョブは、関連するすべてのビルドジョブが成功した後に依存関係が満たされます。アナウンスジョブは最後に実行されます。</p>
+<p>この構造により、プラグイン専用のリリース（<code>channel-discord.wasm</code> の新バージョン）では、<code>build-plugins-wasm</code> と <code>publish-plugin-registry</code> のジョブのみを実行し、カーネルのフルビルドをトリガーすることなく実行できます。カーネルのパッチリリースでは、<code>build-kernel-*</code> と下流の公開ジョブを実行し、プラグインレジストリには影響を与えません。</p>
+<h3 id="53-リリース管理のためのワークスペース対応バージョン管理"><a class="header" href="#53-リリース管理のためのワークスペース対応バージョン管理">5.3 リリース管理のためのワークスペース対応バージョン管理</a></h3>
+<p>アーキテクチャ RFC §4.4.1 では、リリース自動化ツールとして <code>release-plz</code> を指定しています。<code>release-plz</code> はこのパイプラインモデルに直接統合されます：</p>
+<ul>
+<li><code>master</code> へのプッシュ時に、<code>release-plz</code> はワークスペースのバージョンを更新し、従来のコミット履歴から変更履歴を更新し、最後のリリース以降に変更されたすべてのクレートをリストアップする「リリースPR」を開きます。</li>
+<li>Release PRがマージされると、リリースパイプラインが自動的にトリガーされます。</li>
+<li><code>version.workspace = true</code> を持つクレートは一緒にバージョンアップされます。独立してバージョン管理されているクレート（<code>zeroclaw-api</code>、ハードウェアライブラリクレートなど）は、バージョン管理ポリシーに従って個別に処理されます。</li>
+</ul>
+<p>リリースPRはレビューのチェックポイントとして機能します。チームは、何も公開される前に、どのバージョンが公開されるか、そして変更履歴に何が記載されているかを正確に把握できます。これにより、手動でのバージョン番号の更新や <code>version-sync.yml</code> ワークフローの必要性がなくなります。</p>
+<h3 id="54-アクション固定ポリシー"><a class="header" href="#54-アクション固定ポリシー">5.4 アクション固定ポリシー</a></h3>
+<p>現在のワークフローでは、アクションを完全なコミットSHAに固定しています。これは正しく、貢献者の入れ替わりにも耐えられるように、明示的なポリシーとして正式に定めるべきです。</p>
+<p><strong>ポリシー:</strong> ワークフローファイル内のすべての <code>uses:</code> 参照は、バージョンコメント付きの完全なコミット SHA に固定する必要があります。変更可能なタグ（<code>@v4</code>、<code>@main</code>、<code>@latest</code>）は許可されません。例外はありません。</p>
+<pre><code class="language-yaml"># 正しい
+- 使用: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+# 許可されていません
+- 使用: actions/checkout@v4
+- 使用: actions/checkout@main
+</code></pre>
+<p><strong>理由:</strong> ミュータブルなタグは、サードパーティがアクションの動作が変更されないことを約束するものです。しかし、この約束は GitHub Actions エコシステム全体で何度も破られてきました。SHA ピンを使用すると、アクション作者が後から何を変更しても、ワークフローはレビューされた内容と完全に一致して実行されます。これは、書き込み権限やシークレットにアクセスするアクションにとって特に重要です。</p>
+<p>更新プロセス: GitHub Actions用に設定された <code>dependabot</code> または <code>renovate</code> を使用して、新しいSHAバージョンが利用可能になった際にPRを作成します。チームはこれらのPRを確認し、マージします。これにより、手動での監視を行うことなく、アクションを最新に保つことができます。</p>
+<hr>
+<h2 id="6-採用すべき標準"><a class="header" href="#6-採用すべき標準">6. 採用すべき標準</a></h2>
+<h3 id="61-slsa-サプライチェーンセキュリティフレームワーク"><a class="header" href="#61-slsa-サプライチェーンセキュリティフレームワーク">6.1 SLSA: サプライチェーンセキュリティフレームワーク</a></h3>
+<p>SLSA（Supply-chain Levels for Software Artifacts、発音は「salsa」）は、Googleによって開発され、業界全体で採用されているソフトウェアサプライチェーンのセキュリティを強化するためのフレームワークです。これは、基本的なレベルから完全な分離まで、ビルドの整合性に関する4つのレベルを定義しています。</p>
+<p>ZeroClawの現在の規模とチーム規模を考慮すると、<strong>SLSA Level 2</strong> が適切な目標となります：</p>
+<ul>
+<li>ビルドはホストされたCIプラットフォーム（すでにGitHub Actions）で実行されます。</li>
+<li>ビルドスクリプトはバージョン管理されています（すでに適用済み）。</li>
+<li>ビルドの起源情報は生成され、リリースアーティファクトに付与されます（追加するステップ）。</li>
+</ul>
+<p>SLSA Level 2 のプロベナンスとは、各リリースアーティファクトに、暗号学的に署名されたアテステーションが添付されていることを意味します。このアテステーションには、どのソースコミットから生成されたか、どのワークフローでビルドされたか、そしてそのワークフローが期待されるプラットフォーム上で実行されたかという情報が記録されます。ユーザーやパッケージマネージャーはこのアテステーションを検証できます。これにより、「このバイナリはこのソースから来た」という主張と、「このバイナリが実際にこのソースから来たことを証明できる」という事実との間のギャップを埋めます。</p>
+<p>GitHub Actions は、<code>actions/attest-build-provenance</code> アクションを通じて SLSA Level 2 の生成元情報の生成をネイティブにサポートしています。これを追加するコストは、ビルドジョブごとに1ステップです。</p>
+<h3 id="62-従来のコミット-すでに暗黙的に示されている--形式化"><a class="header" href="#62-従来のコミット-すでに暗黙的に示されている--形式化">6.2 従来のコミット (すでに暗黙的に示されている — 形式化)</a></h3>
+<p>アーキテクチャ RFC のバージョニングポリシーと release-plz の統合は、どちらも変更履歴の生成に conventional commit フォーマットに依存しています。ガバナンス RFC ではすでに PR タイトルの規約を参照しています。この RFC はその接続を正式に定義します：コミットメッセージおよび PR タイトルにおける conventional commit フォーマットは、変更履歴の自動生成を駆動する入力であるため、推奨事項ではなく必須事項です。</p>
+<p>ZeroClawの更新履歴で重要なカテゴリ：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>プレフィックス</th><th>変更履歴セクション</th><th>バージョンの影響</th></tr>
+</thead>
+<tbody>
+<tr><td><code>feat:</code></td><td>新機能</td><td>マイナー</td></tr>
+<tr><td><code>fix:</code></td><td>バグ修正</td><td>PATCH</td></tr>
+<tr><td><code>feat!:</code> または <code>fix!:</code></td><td>破壊的変更</td><td>メジャー</td></tr>
+<tr><td><code>chore:</code></td><td>メンテナンス</td><td>リリースエントリがありません</td></tr>
+<tr><td><code>docs:</code></td><td>ドキュメント</td><td>リリースエントリがありません</td></tr>
+<tr><td><code>perf:</code></td><td>パフォーマンス</td><td>PATCH</td></tr>
+<tr><td><code>security:</code></td><td>セキュリティ修正</td><td>PATCH（少なくとも）</td></tr>
+</tbody>
+</table>
+</div>
+<p>CI は、他のチェックが実行される前に、PR のタイトルが conventional commit フォーマットに一致していることを検証する PR タイトル lint ジョブによってこれを強制します。</p>
+<h3 id="63-再利用可能なワークフロー"><a class="header" href="#63-再利用可能なワークフロー">6.3 再利用可能なワークフロー</a></h3>
+<p>クレートやアーティファクトの種類の数が増えるにつれて、ワークフローの重複が保守上の問題となります。GitHub Actions は再利用可能なワークフローをサポートしています。これは、関数のように他のワークフローから呼び出すことができるワークフローです。ビルドマトリックス、セキュリティスキャン、テストランナーはそれぞれ再利用可能なワークフローとして抽出すべきです。</p>
+<pre><code>.github/
+  workflows/
+    ci.yml               ← PR checks (calls reusable workflows)
+    release.yml          ← Release pipeline (calls reusable workflows)
+    daily-audit.yml      ← Scheduled security scan
+  _workflows/            ← Reusable workflow definitions
+    build-rust.yml       ← Parameterised build job
+    test-workspace.yml   ← Parameterised test job
+    security-scan.yml    ← cargo-deny invocation + triage
+    publish-release.yml  ← Parameterised publish job
+</code></pre>
+<p>再利用可能なワークフローは、パラメータを使用して呼び出されます：</p>
+<pre><code class="language-yaml">ジョブ:
+  カーネルのビルド:
+    使用: ./.github/_workflows/build-rust.yml
+    with:
+      ターゲット: x86_64-unknown-linux-musl
+      機能: ""
+      プロファイル: dist
+</code></pre>
+<p>これは、CI ワークフローとリリース ワークフローが同じビルド定義を共有していることを意味します。ビルド プロセスに対する修正は、すべての場所で同時に適用されます。</p>
+<hr>
+<h2 id="7-フェーズ別ロードマップ"><a class="header" href="#7-フェーズ別ロードマップ">7. フェーズ別ロードマップ</a></h2>
+<p>パイプラインの移行は、コード移行と同じくStrangler Figのアプローチに従います：並行して構築し、着実に移行し、既存のゲートを壊さないようにします。</p>
+<hr>
+<h3 id="フェーズ1--v070--合理化"><a class="header" href="#フェーズ1--v070--合理化">フェーズ1 · v0.7.0 — 「合理化」</a></h3>
+<p><strong>テーマ:</strong> 1つのパイプライン、クリーンなシグナル、重複なし。</p>
+<p><strong>このフェーズの理由:</strong> アーキテクチャの移行はすでに進行中であり、パイプラインがそれに逆らうことで、実装作業が不必要に複雑になるのを避ける必要があります。</p>
+<h4 id="納品物"><a class="header" href="#納品物">納品物</a></h4>
+<p><strong>D1: <code>checks-on-pr.yml</code> と <code>ci-run.yml</code> を単一のワークフローに統合する</strong></p>
+<p>2つのPRワークフローを1つに統合します。統合されたワークフローは§3.1で定義されたステージ構造を維持します。<code>Quality Gate</code>と<code>CI</code>の命名上の区別はなくなります。ワークフローは1つ、結果は1セット、確認する場所も1箇所です。</p>
+<p>複合ゲートジョブ（<code>CI Required Gate</code>）は保持されます。ブランチ保護は引き続き、その単一のジョブのみを必要とします。これにより、パイプラインの内部構造が変更されても、ブランチ保護ルールの更新は不要になります。</p>
+<p><strong>D2: <code>cargo audit</code> を <code>cargo deny</code> に置き換える</strong></p>
+<p><code>deny.toml</code> をリポジトリのルートに追加します。<code>[advisories]</code>、<code>[licenses]</code>、<code>[sources]</code> のセクションを設定します。<code>master</code> ブランチ上のすべての現在の RUSTSEC アドバイザリを処理します：更新可能なものは更新し、更新できないものは正当性と追跡用イシューを記載して文書化します。このフェーズが完了する前に、<code>master</code> ブランチ上のセキュリティゲートは正常に通過している必要があります。</p>
+<p><strong>D3: ワークスペース対応のclippy呼び出しを修正</strong></p>
+<p>統合されたワークフローで <code>cargo clippy --all-targets -- -D warnings</code> を <code>cargo clippy --workspace --all-targets -- -D warnings</code> に変更します。<code>rust_strict_delta_gate.sh</code> スクリプトを削除します。<code>--workspace -D warnings</code> によって常にクリーンな状態が強制されるため、デルタの概念は暗黙的になります。</p>
+<p><strong>D4: アクションの固定ポリシーを正式に定義する</strong></p>
+<p><code>SECURITY.md</code> に注釈を追加し、ワークフローファイル内のすべての <code>uses:</code> 参照が SHA で固定されていることを検証する CI チェックを追加します。GitHub Actions の更新用に <code>dependabot</code> の設定を追加します。</p>
+<p><strong>D5: 毎日のアドバイザリスキャンワークフローを追加</strong></p>
+<p><code>master</code> ブランチに対して <code>cargo deny check advisories</code> を実行するスケジュールされたワークフローとして <code>daily-audit.yml</code> を追加します。失敗した場合は、<code>gh issue create</code> を使用してアドバイザリの詳細を含む GitHub Issue を開きます。</p>
+<h4 id="フェーズ1の成功指標"><a class="header" href="#フェーズ1の成功指標">フェーズ1の成功指標</a></h4>
+<ul>
+<li>単一のPRワークフローファイル、重複なし</li>
+<li><code>master</code> ブランチでセキュリティゲートがクリーンに通過し、既存のすべてのアドバイザリに対する文書化されたトリアージが完了しています。</li>
+<li><code>cargo clippy --workspace</code> を実行し、クリーンにパスしました。</li>
+<li>どのワークフローファイルにも、ミュータブルなアクションタグの参照が含まれていません。</li>
+<li>デイリーアドバイザリスキャンが稼働中</li>
+</ul>
+<hr>
+<h3 id="フェーズ-2--v080--ワークスペース対応"><a class="header" href="#フェーズ-2--v080--ワークスペース対応">フェーズ 2 · v0.8.0 — 「ワークスペース対応」</a></h3>
+<p><strong>テーマ:</strong> パイプラインはワークスペースを理解します。焦点を絞った変更に対する高速フィードバック。</p>
+<p><strong>このフェーズの理由:</strong> v0.8.0 までにワークスペースはさらに拡大します。すべての PR に対してフルパイプラインを実行するのは、ますますコストがかかります。<code>zeroclaw-tool-call-parser</code> のコントリビューターは、ゲートウェイの再構築に 30 分も待つべきではありません。</p>
+<h4 id="納品物-1"><a class="header" href="#納品物-1">納品物</a></h4>
+<p><strong>D1: 変更されたクレートの検出</strong></p>
+<p>PRで変更されたファイルの影響を受けるクレートのセットを返すために、<code>cargo metadata</code> を使用して依存関係グラフを構築する <code>scripts/ci/affected_crates.sh</code> スクリプトを追加します。CIワークフローはこの出力を使用して、テスト実行のスコープを絞り込みます。</p>
+<p><strong>D2: クレートごとのテストスコーピング</strong></p>
+<p><code>cargo nextest</code> に、影響を受けたクレートの出力に基づいて <code>--package</code> フラグを追加します。<code>master</code> へのプッシュとナイトリービルドでは、ワークスペース全体のテストが引き続き実行されます。PR では、影響を受けたサブセットのテストが実行されます。</p>
+<p><strong>D3: ワークスペース対応のキャッシュ設定</strong></p>
+<p><code>Swatinem/rust-cache</code> の設定を更新し、明示的なワークスペーススコーピングと <code>save-if: ${{ github.ref == 'refs/heads/master' }}</code> を追加して、並列 PR によるキャッシュのフラッシュを防止します。</p>
+<p><strong>D4: 再利用可能なワークフロー定義を抽出する</strong></p>
+<p>ビルド、テスト、セキュリティのジョブを <code>.github/_workflows/</code> 配下の再利用可能なワークフローファイルに抽出します。<code>ci.yml</code> と新しい <code>release.yml</code> のスケルトンを更新して、それらを呼び出すようにします。</p>
+<h4 id="フェーズ2の成功指標"><a class="header" href="#フェーズ2の成功指標">フェーズ2の成功指標</a></h4>
+<ul>
+<li><code>zeroclaw-tool-call-parser</code> のみを変更する PR は、ワークスペース全体のテストではなく、そのクレートとその依存関係のテストを実行します。</li>
+<li>インクリメンタルビルドにおけるCIのキャッシュヒット率が80%を超えている</li>
+<li>ビルド、テスト、セキュリティジョブ用の再利用可能なワークフローが用意されています</li>
+</ul>
+<hr>
+<h3 id="フェーズ3--v090--リリースパイプライン"><a class="header" href="#フェーズ3--v090--リリースパイプライン">フェーズ3 · v0.9.0 — 「リリースパイプライン」</a></h3>
+<p><strong>テーマ:</strong> ディストリビューションモデルに適合するリリース自動化</p>
+<p><strong>このフェーズの理由:</strong> アーキテクチャ RFC のフェーズ 3 では、<code>zeroclaw-gw</code> を別のバイナリとして抽出します。ここで最初のマルチアーティファクトリリースが行われます。リリースパイプラインは、必要になる前に準備しておく必要があります。</p>
+<h4 id="納品物-2"><a class="header" href="#納品物-2">納品物</a></h4>
+<p><strong>D1: <code>release-plz</code> を導入し、<code>version-sync.yml</code> を削除する</strong></p>
+<p>ワークスペースに対して <code>release-plz</code> を設定します。ワークスペース内のアプリケーションクレートは <code>version.workspace = true</code> を使用します。<code>zeroclaw-api</code> およびハードウェアライブラリのクレートは、独立したリリース設定で構成されます。<code>version-sync.yml</code> ワークフローは廃止されます。</p>
+<p><strong>D2: <code>release.yml</code> に構造化されたリリースパイプラインを構築する</strong></p>
+<p>§5.2 のディレクトリリリースグラフを実装する：<code>build-kernel-standard</code>、<code>build-kernel-hardware</code>、<code>build-gateway</code>、および下流の公開ジョブ。プラグインのビルドジョブはスタブされており、フェーズ 4 まで何もしない成功として扱われる。</p>
+<p><strong>D3: SLSA Level 2 のプロベナンスを追加</strong></p>
+<p>各ビルドジョブに <code>actions/attest-build-provenance</code> を追加します。プロベナンスの証明は GitHub Release のアセットに付与されます。<code>SECURITY.md</code> に検証手順を記載してください。</p>
+<p><strong>D4: 冗長なリリースワークフローを廃止する</strong></p>
+<p><code>release-stable-manual.yml</code>、<code>release-beta-on-push.yml</code>、<code>pub-aur.yml</code>、<code>pub-homebrew-core.yml</code>、<code>pub-scoop.yml</code>、<code>discord-release.yml</code>、<code>tweet-release.yml</code> を構造化された <code>release.yml</code> パイプラインに統合します。これらのワークフローは独立して成長してきましたが、構造化されたパイプラインはこれらを単一の監査可能なフローに置き換えます。</p>
+<h4 id="フェーズ3の成功指標"><a class="header" href="#フェーズ3の成功指標">フェーズ3の成功指標</a></h4>
+<ul>
+<li><code>release-plz</code> は <code>master</code> ブランチでリリースPRの作成と管理を行います。</li>
+<li>カーネルとゲートウェイのバイナリは、単一の <code>release.yml</code> ワークフローからビルドされ、公開されます。</li>
+<li>すべてのリリースアセットにSLSA Level 2の進出情報を付与</li>
+<li>冗長なリリースワークフローは廃止されました</li>
+</ul>
+<hr>
+<h3 id="フェーズ4--v100-プラットフォームパイプライン"><a class="header" href="#フェーズ4--v100-プラットフォームパイプライン">フェーズ4 · v1.0.0 —「プラットフォームパイプライン」</a></h3>
+<p><strong>テーマ:</strong> パイプラインはバイナリだけでなくプラットフォームも出荷する。</p>
+<p><strong>このフェーズの理由:</strong> v1.0.0 では WASM プラグインが公開可能になります。パイプラインは、プラグインの公開、レジストリへのアップロード、そして Tauri デスクトップインストーラーを主要なリリースアーティファクトとして処理する必要があります。</p>
+<h4 id="納品物-3"><a class="header" href="#納品物-3">納品物</a></h4>
+<p><strong>D1: WASM プラグインのビルドジョブを有効にする</strong></p>
+<p>リリースパイプラインに <code>build-plugins-wasm</code> を実装します。各プラグインクレートは、専用のジョブで <code>wasm32-wasip1</code> 向けにビルドされます。プラグインマニフェストは生成され、署名されます。<code>publish-plugin-registry</code> ジョブは、署名付きの WASM ファイルをプラグインレジストリにアップロードします。</p>
+<p><strong>D2: デスクトップインストーラーのビルドと公開</strong></p>
+<p>macOS、Windows、Linux 用の Tauri ビルドジョブを完了します。インストーラーにはカーネルとゲートウェイのバイナリが含まれます。macOS と Windows のコード署名資格情報は、必要なリポジトリシークレットとして文書化されており、セットアップガイドも用意されています。</p>
+<p><strong>D3: CI/CDの標準を <code>docs/book/src/maintainers/ci-and-actions.md</code> に公開する</strong></p>
+<p>このRFCで定義されているアクションのピン留めポリシー、アドバイザリートリアージプロセス、コンベンショナルコミットの要件、およびリリースパイプラインの構造は、恒久的な参照資料として <code>docs/book/src/maintainers/ci-and-actions.md</code> に抽出されています。このRFCは意思決定の歴史的記録であり、コントリビューターが日常的に参照するのは抽出された文書です。</p>
+<p><strong>D4: パイプラインへのコントリビューターオンボーディング</strong></p>
+<p>コントリビューションに関するドキュメントに「ローカルでのCI実行」セクションを追加し、コントリビューターがプッシュする前に自分のマシンでCIチェックを再現する方法を示してください：</p>
+<pre><code class="language-bash"># CIで実行される内容 — プッシュ前にこれらを実行してください
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo nextest run --workspace
+cargo deny check
+</code></pre>
+<h4 id="フェーズ4の成功指標"><a class="header" href="#フェーズ4の成功指標">フェーズ4の成功指標</a></h4>
+<ul>
+<li>WASM プラグインファイルは、リリースパイプラインの一部としてレジストリに公開されます。</li>
+<li>Tauri デスクトップインストーラーは、リリース時に自動的にビルドされ、公開されます。</li>
+<li><code>docs/book/src/maintainers/ci-and-actions.md</code> は存在し、アクションのピン留め、アドバイザリ_triage_、および conventional commits についてカバーしています。</li>
+<li>コントリビューターは、4つのコマンドでローカル環境ですべてのCIチェックを再現できます。</li>
+</ul>
+<hr>
+<h2 id="8-貢献者にとっての意味"><a class="header" href="#8-貢献者にとっての意味">8. 貢献者にとっての意味</a></h2>
+<h3 id="prを提出するコントリビューター向け"><a class="header" href="#prを提出するコントリビューター向け">PRを提出するコントリビューター向け</a></h3>
+<p>統合パイプラインは、結果を確認するための一元化された場所を提供します。ステージ1（フォーマットとリンティング）は高速に失敗します — フォーマットエラーがある場合、ビルドを待たずに2分以内にエラーに気づくことができます。ステージ1が成功した場合、ビルドとテストのステージが並列で実行され、ほとんどの変更に対して30分以内に完全な結果が得られます。</p>
+<p>PRのタイトルに対する conventional commit の要件は CI によって強制されます。タイトルがフォーマットに一致しない場合、lint ジョブは明確なメッセージで即座に失敗します。これは官僚主義ではなく、変更履歴を自動的に生成するための入力であり、これによりリリースがより迅速に行われ、手動での作業が少なくなります。</p>
+<h3 id="依存関係を追加するコントリビューター向け"><a class="header" href="#依存関係を追加するコントリビューター向け">依存関係を追加するコントリビューター向け</a></h3>
+<p>新しい依存関係はすべて <code>cargo deny</code> を通過します。依存関係に既知の脆弱性がある場合、受け入れられないライセンスがある場合、または信頼できないソースから来ている場合、セキュリティゲートは失敗し、その理由を通知します。これは設計上の意図です。正しい対応は、チェックを抑制するのではなく、依存関係を調査することです。</p>
+<p>依存関係に修正不可能なアドバイザリ（更新が利用できないトランジティブ依存関係）が含まれている場合、§4.3 のトライアージプロセスがその文書化の方法となります。トラッキングイシューを作成し、正当性を記載した上で <code>deny.toml</code> に無視エントリを追加し、次に進みます。セキュリティ姿勢は、アドバイザリが解消されることを期待するのではなく、文書化を通じて維持されます。</p>
+<h3 id="ワークフローファイルを追加するコントリビューター向け"><a class="header" href="#ワークフローファイルを追加するコントリビューター向け">ワークフローファイルを追加するコントリビューター向け</a></h3>
+<p>新しいワークフローファイルは、例外なく以下の3つのルールに従います：</p>
+<ol>
+<li>すべての <code>uses:</code> リファレンスは、バージョンコメント付きで SHA ピンされています。</li>
+<li>既存のジョブからロジックを再利用する新しいジョブは、再利用可能なワークフローとして抽出されます。</li>
+<li>新しいリリース関連のジョブが、新しいワークフローファイルとしてではなく、<code>release.yml</code> に追加されました。</li>
+</ol>
+<p>迷ったときは、追加する前に確認してください。ワークフローファイルは高リスクな変更です。これらはCIインフラ上で elevated permissions で実行され、サプライチェーンのセキュリティに影響を与える可能性があります。そのため、<code>src/security/</code> と同じレビュー基準が求められます。</p>
+<h3 id="メンテナ向け"><a class="header" href="#メンテナ向け">メンテナ向け</a></h3>
+<p>毎日のアドバイザリスキャンにより、セキュリティは危機的な状況ではなく、通常の保守タスクとなります。新しいアドバイザリが検出されると、トリアージプロセスは明確に定義されており、その結果は <code>deny.toml</code> と追跡用イシューに文書化されます。レビュアーは、git の履歴内でアドバイザリに関する意思決定の完全な履歴を検証できます。</p>
+<p><code>release-plz</code> からのリリースPRは、リリースレビューのチェックポイントです。何も公開される前に、チームはバージョン、変更履歴、および変更されたクレートのリストを確認します。リリースは偶然に起こるものではありません。</p>
+<hr>
+<h2 id="付録-a-用語集"><a class="header" href="#付録-a-用語集">付録 A: 用語集</a></h2>
+<p><strong>SLSA (Supply-chain Levels for Software Artifacts)</strong> — ソフトウェアアーティファクトのサプライチェーンにおけるセキュリティフレームワークで、基本的なプロベナンスから完全なhermeticビルドまで、ビルドの整合性のレベルを定義します。Googleによって開発され、OpenSSFによって採用されています。レベル2は、ほとんどのオープンソースプロジェクトにとって実用的な目標です：ホストされたビルドプラットフォーム、バージョン管理されたビルドスクリプト、アーティファクトに添付された署名付きプロベナンス。</p>
+<p><strong>プロベナンス</strong> — ビルド成果物の出所を示す暗号学的に署名された記録：どのソースコミット、どのワークフロー、どのプラットフォームから生成されたかを示します。これにより、ユーザーやパッケージマネージャーは、バイナリが主張されたソースから主張されたプロセスによって生成されたことを検証できます。</p>
+<p><strong><code>cargo deny</code></strong> — 依存関係のポリシーを3つの次元で強制するCargoプラグイン：セキュリティアドバイザリ（RustSecデータベースから）、ソフトウェアライセンス（定義された許可リストに対して）、ソースレジストリ（依存関係が承認された場所からのみ来ることを保証）。<code>cargo audit</code> よりも柔軟に構成可能で、大規模なポリシー管理により適しています。</p>
+<p><strong><code>release-plz</code></strong> — Rustエコシステム向けのリリース自動化ツール。デフォルトブランチへのプッシュ時に「リリースPR」を作成し、バージョンのアップと従来のコミット履歴に基づく変更ログの生成を行います。ワークスペースに対応しており、どのクレートが変更され、どのクレートに新しいバージョンが必要かを理解します。</p>
+<p><strong>再利用可能なワークフロー</strong> — 他のワークフローからジョブとして呼び出せる GitHub Actions ワークフローで、パラメータを受け取ることができます。ビルド、テスト、セキュリティのロジックを一度定義し、PR パイプラインとリリースパイプラインの両方から呼び出すことができます。</p>
+<p><strong>Conventional Commits</strong> — <code>feat:</code>、<code>fix:</code>、<code>chore:</code> などのコミットメッセージの規約で、自動的な変更履歴の生成とバージョンの決定を可能にします。<code>release-plz</code> などのツールが、リリースがパッチ、マイナー、またはメジャーのバージョンアップかどうかを判断するために使用する入力です。</p>
+<p><strong>Strangler Fig（パイプラインの文脈において）</strong> — ワークフローに適用される同じ移行戦略：既存のパイプライン構造と並行して新しいパイプライン構造を構築し、ジョブを一つずつ移行し、新しい構造が完成して検証された後に古いファイルを廃止する。</p>
+<hr>
+<h2 id="付録b-参考文献"><a class="header" href="#付録b-参考文献">付録B: 参考文献</a></h2>
+<ul>
+<li>
+<p><strong>SLSA フレームワーク</strong> — https://slsa.dev — サプライチェーンセキュリティレベルに関する完全な仕様と実装ガイド。</p>
+</li>
+<li>
+<p><strong><code>cargo deny</code> ドキュメント</strong> — https://embarkstudios.github.io/cargo-deny/ — <code>deny.toml</code> ポリシーファイルの設定リファレンス。すべてのアドバイザリ、ライセンス、およびソースオプションが含まれています。</p>
+</li>
+<li>
+<p><strong><code>release-plz</code> ドキュメント</strong> — https://release-plz.eplant.org — ワークスペースの設定、変更ログ形式のカスタマイズ、GitHub Actions の統合ガイド。</p>
+</li>
+<li>
+<p><strong>GitHub Actions のセキュリティ強化</strong> — https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions — Actions ワークフローにおける SHA ピンニング、トークンの権限、サプライチェーンリスクに関する公式ガイドライン。</p>
+</li>
+<li>
+<p><strong>Conventional Commits 仕様</strong> — https://www.conventionalcommits.org — コミットメッセージの形式とセマンティックバージョニングとの関係に関する完全な仕様。</p>
+</li>
+<li>
+<p><strong>OpenSSF Scorecard</strong> — https://securityscorecards.dev — 依存関係の固定、ブランチ保護、コードレビュー要件など、セキュリティプラクティスに基づいてオープンソースプロジェクトを評価する自動化されたツール。ベンチマーク評価や継続的な健全性指標として有用です。</p>
+</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-003-governance.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-005-contribution-culture.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-003-governance.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-005-contribution-culture.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

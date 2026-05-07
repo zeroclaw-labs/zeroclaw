@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ReportFormat"],"fn":["milestone_report_template","render_template","risk_register_template","sprint_review_template","weekly_status_template"],"struct":["ReportTemplate","TemplateSection"]};

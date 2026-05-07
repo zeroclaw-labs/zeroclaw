@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["TurnEvent"],"fn":["process_message","run"],"mod":["agent","classifier","context_analyzer","context_compressor","cost","dispatcher","eval","history","history_pruner","loop_","loop_detector","memory_loader","personality","personality_templates","prompt","system_prompt","thinking","tool_execution","tool_receipts"],"struct":["Agent","AgentBuilder"]};

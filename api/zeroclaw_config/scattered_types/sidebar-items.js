@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ThinkingLevel","VoiceProvider"],"struct":["AutoClassifyConfig","BrowserDelegateConfig","ClawdTalkConfig","ContextCompressionConfig","EmailConfig","EvalConfig","GmailPushConfig","HistoryPrunerConfig","ThinkingConfig","TrustConfig","VoiceCallConfig"]};

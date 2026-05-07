@@ -1,0 +1,405 @@
+<!DOCTYPE HTML>
+<html lang="es" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Generación de registro de cambios - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-8cdc8f66.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-a1a0ea85.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/maintainers/changelog-generation.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="generación-de-registro-de-cambios"><a class="header" href="#generación-de-registro-de-cambios">Generación de Registro de Cambios</a></h1>
+<p>El procedimiento oficial para ensamblar <code>CHANGELOG-next.md</code> entre versiones estables. Esta página es cargada por la habilidad <code>changelog-generation</code> y leída por los mantenedores que ejecutan una versión manualmente — ambos consumen el mismo protocolo.</p>
+<p>The release workflows (<code>release-stable-manual.yml</code>) automatically use <code>CHANGELOG-next.md</code> as the GitHub Release body if it’s at the repo root when a release fires. After the stable release ships, <code>CHANGELOG-next.md</code> is intentionally left on <code>master</code>; the next release cycle overwrites it with a fresh file. No manual cleanup is needed.</p>
+<h2 id="1-establecer-el-rango-de-confirmaciones"><a class="header" href="#1-establecer-el-rango-de-confirmaciones">1. Establecer el rango de confirmaciones</a></h2>
+<h3 id="predeterminado-última-etiqueta-estable--head"><a class="header" href="#predeterminado-última-etiqueta-estable--head">Predeterminado: última etiqueta estable → HEAD</a></h3>
+<pre><code class="language-bash">PREV_TAG=$(git tag --sort=-creatordate | grep -vE '\-beta\.' | head -1)
+echo "Rango: ${PREV_TAG}..HEAD"
+</code></pre>
+<h3 id="rango-especificado-por-el-usuario"><a class="header" href="#rango-especificado-por-el-usuario">Rango especificado por el usuario</a></h3>
+<p>Aceptar cualquiera de los siguientes y normalizar a <code>&lt;from&gt;..&lt;to&gt;</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Entrada</th><th>Interpretación</th></tr>
+</thead>
+<tbody>
+<tr><td><code>v0.7.2</code></td><td><code>v0.7.2..HEAD</code></td></tr>
+<tr><td><code>v0.7.1..v0.7.2</code></td><td>Exactly as given</td></tr>
+<tr><td><code>v0.7.1 v0.7.2</code></td><td><code>v0.7.1..v0.7.2</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Verifica que ambas referencias existan antes de continuar:</p>
+<pre><code class="language-bash">git rev-parse --verify &lt;ref&gt; 2&gt;/dev/null || echo "ERROR: referencia no encontrada"
+</code></pre>
+<h2 id="2-recopilar-y-categorizar-los-commits"><a class="header" href="#2-recopilar-y-categorizar-los-commits">2. Recopilar y categorizar los commits</a></h2>
+<h3 id="recopilar"><a class="header" href="#recopilar">Recopilar</a></h3>
+<pre><code class="language-bash">git log &lt;from&gt;..&lt;to&gt; --pretty=format:"%H %h %s" --no-merges
+</code></pre>
+<p>Guardar los SHAs completos para el paso de resolución del colaborador:</p>
+<pre><code class="language-bash">git log &lt;from&gt;..&lt;to&gt; --pretty=format:"%H" --no-merges &gt; /tmp/zc-commits.txt
+</code></pre>
+<h3 id="categorizar"><a class="header" href="#categorizar">Categorizar</a></h3>
+<p>Asigna cada commit a una sección según su prefijo de commit convencional. Los commits sin un prefijo reconocido deben seguir siendo leídos y categorizados por su contenido; nunca los omitas silenciosamente.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Prefijo</th><th>Sección</th></tr>
+</thead>
+<tbody>
+<tr><td><code>feat:</code>, <code>feat(*)</code></td><td>¿Qué hay de nuevo?</td></tr>
+<tr><td><code>fix:</code>, <code>fix(*)</code></td><td>Corrección de errores</td></tr>
+<tr><td><code>refactor:</code>, <code>perf:</code></td><td>Novedades (agrupado como “Mejoras”)</td></tr>
+<tr><td><code>security:</code>, <code>fix(*security*)</code></td><td>¿Qué hay de nuevo → Seguridad</td></tr>
+<tr><td><code>docs:</code>, <code>docs(*)</code></td><td>Novedades → Documentación (omitir correcciones de errores tipográficos triviales)</td></tr>
+<tr><td><code>chore:</code>, <code>ci:</code>, <code>build:</code></td><td>Omitir a menos que sea visible para el usuario (nueva ruta de instalación, plataforma eliminada, etc.)</td></tr>
+<tr><td><code>breaking:</code> o sufijo <code>!</code></td><td>Cambios importantes — siempre mostrar</td></tr>
+<tr><td>Sin prefijo</td><td>Leer el cuerpo; categorizar por contenido; anotar en la revisión</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="orden-de-las-secciones-en-el-archivo-de-salida"><a class="header" href="#orden-de-las-secciones-en-el-archivo-de-salida">Orden de las secciones en el archivo de salida</a></h3>
+<ol>
+<li>Preámbulo</li>
+<li>Destacados</li>
+<li>¿Qué hay de nuevo?</li>
+<li>Corrección de errores</li>
+<li>Cambios importantes (omitir si está vacío)</li>
+<li>Colaboradores</li>
+</ol>
+<h2 id="3-resolución-del-colaborador"><a class="header" href="#3-resolución-del-colaborador">3. Resolución del colaborador</a></h2>
+<p>No utilices <code>git log --pretty=format:"%an"</code> por sí solo, ya que omite a todos los listados en los trailers <code>Co-Authored-By</code>. Utiliza el campo <code>authors</code> de GraphQL de GitHub, que resuelve tanto a los autores directos como a los coautores.</p>
+<h3 id="consulta"><a class="header" href="#consulta">Consulta</a></h3>
+<p>Pagina en lotes de 100 commits. Usa <code>pageInfo.endCursor</code> mientras <code>hasNextPage</code> sea <code>true</code>.</p>
+<pre><code class="language-graphql">{
+  repository(owner: "zeroclaw-labs", name: "zeroclaw") {
+    ref(qualifiedName: "refs/heads/master") {
+      target {
+        ... on Commit {
+          history(first: 100) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              oid
+              authors(first: 10) {
+                nodes {
+                  user { login }
+                  email
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+</code></pre>
+<p>Ejecutar mediante <code>gh</code>:</p>
+<pre><code class="language-bash">gh api graphql -f query='&lt;query&gt;'
+</code></pre>
+<h3 id="filtrar-lista--excluir-todo-lo-siguiente"><a class="header" href="#filtrar-lista--excluir-todo-lo-siguiente">Filtrar lista — excluir todo lo siguiente</a></h3>
+<p><strong>Por patrón de inicio de sesión:</strong></p>
+<ul>
+<li>Cualquier inicio de sesión que termine en <code>[bot]</code></li>
+<li><code>web-flow</code></li>
+<li><code>dependabot</code></li>
+<li><code>github-actions</code></li>
+<li><code>blacksmith</code></li>
+</ul>
+<p><strong>Por patrón de correo electrónico:</strong></p>
+<ul>
+<li><code>*@noreply.github.com</code></li>
+<li><code>*@noreply.anthropic.com</code></li>
+<li><code>*noreply*</code></li>
+</ul>
+<p><strong>Nombres de modelos de IA que aparecen como nombres de autor (no como inicios de sesión):</strong></p>
+<ul>
+<li><code>Claude</code>, <code>Copilot</code>, <code>ChatGPT</code>, <code>Codex</code>, <code>Gemini</code>, <code>GitHub Copilot</code></li>
+<li>Cualquier nombre que coincida con <code>^(gpt|claude|gemini|copilot)-</code></li>
+</ul>
+<h3 id="salida"><a class="header" href="#salida">Salida</a></h3>
+<p>Cruza cada <code>oid</code> de la respuesta de GraphQL con <code>/tmp/zc-commits.txt</code> para incluir solo los commits dentro del rango de la versión. Recopila los nombres de usuario únicos, ordénalos sin distinguir entre mayúsculas y minúsculas y añade el prefijo <code>@</code> a cada uno.</p>
+<h2 id="4-formato-de-changelog-nextmd"><a class="header" href="#4-formato-de-changelog-nextmd">4. Formato de CHANGELOG-next.md</a></h2>
+<h3 id="preámbulo"><a class="header" href="#preámbulo">Preámbulo</a></h3>
+<p>Esta nueva versión trae mejoras significativas en rendimiento y seguridad, diseñadas para ofrecer una experiencia más fluida y confiable. Con un enfoque en la usabilidad, se han simplificado las funciones clave para que todos los usuarios puedan aprovecharlas fácilmente. ¡Descubre cómo estas actualizaciones pueden beneficiarte hoy mismo!</p>
+<h3 id="destacados"><a class="header" href="#destacados">Destacados</a></h3>
+<p>Cuatro a seis viñetas. Comienza con el impacto visible para el usuario, no con detalles de implementación. Cada viñeta debe responder: <em>“¿Qué puedo hacer ahora que antes no podía?”</em> o <em>“¿Qué acaba de mejorar?”</em></p>
+<h3 id="qué-hay-de-nuevo"><a class="header" href="#qué-hay-de-nuevo">¿Qué hay de nuevo?</a></h3>
+<p>Agrupar entradas por área. Utilizar solo los grupos que tengan contenido.</p>
+<p>Grupos sugeridos (agrega u omite libremente):</p>
+<ul>
+<li>Arquitectura y espacio de trabajo</li>
+<li>Agente y Entorno de Ejecución</li>
+<li>Proveedores</li>
+<li>Canales</li>
+<li>Herramientas</li>
+<li>Configuración</li>
+<li>Panel de control web</li>
+<li>Habilidades</li>
+<li>Seguridad</li>
+<li>Hardware</li>
+<li>Instalación y distribución</li>
+<li>Dependencias y avisos de seguridad</li>
+</ul>
+<p>Escribe cada entrada como una oración para un lector humano, no como un mensaje de commit sin procesar. Referencia los números de PR con <code>(#NNNN)</code> cuando estén disponibles.</p>
+<h3 id="corrección-de-errores"><a class="header" href="#corrección-de-errores">Corrección de errores</a></h3>
+<p>Una tabla resumen. Columnas: <code>Área</code> | <code>Solución</code>. Fusiona múltiples soluciones para la misma función en una sola fila cuando esto sea más claro que tener filas separadas.</p>
+<h3 id="cambios-importantes"><a class="header" href="#cambios-importantes">Cambios importantes</a></h3>
+<p>Señala cada cambio incompatible con una ruta de migración. Busca:</p>
+<ul>
+<li>Cambios en el esquema de configuración (campos renombrados o eliminados)</li>
+<li>Subcomandos o indicadores de CLI obsoletos o renombrados</li>
+<li>Cambios en los límites del crate o en la superficie de la API pública</li>
+<li>Cambios de comportamiento detrás de las claves de configuración existentes</li>
+</ul>
+<p>Si no hay cambios incompatibles, omite esta sección por completo.</p>
+<h3 id="colaboradores"><a class="header" href="#colaboradores">Colaboradores</a></h3>
+<p><code>@login</code> maneja desde el paso 3, ordenados de forma insensible a mayúsculas y minúsculas, uno por línea.</p>
+<h3 id="pie-de-página"><a class="header" href="#pie-de-página">Pie de página</a></h3>
+<pre><code>*Full diff: `git log &lt;prev-tag&gt;..&lt;next-tag&gt; --oneline`*
+</code></pre>
+<h2 id="5-integración-del-flujo-de-trabajo-de-salida-y-liberación"><a class="header" href="#5-integración-del-flujo-de-trabajo-de-salida-y-liberación">5. Integración del flujo de trabajo de salida y liberación</a></h2>
+<h3 id="escribir-ubicación"><a class="header" href="#escribir-ubicación">Escribir ubicación</a></h3>
+<p>Escribe en <code>CHANGELOG-next.md</code> en la raíz del repositorio, que es la ruta que buscan los flujos de trabajo de lanzamiento. Una copia también se guarda en <code>tmp/CHANGELOG-next.md</code> para su revisión durante la sesión antes de confirmar.</p>
+<h3 id="confirmar"><a class="header" href="#confirmar">Confirmar</a></h3>
+<pre><code class="language-bash">git add CHANGELOG-next.md
+git commit -m "chore(release): agregar CHANGELOG-next.md para vX.Y.Z"
+</code></pre>
+<p>Reemplaza <code>vX.Y.Z</code> con la versión de la próxima liberación. Pide confirmación al usuario antes de hacer el commit.</p>
+<h3 id="enviar"><a class="header" href="#enviar">Enviar</a></h3>
+<p>Empuja al sucursal del PR de la versión abierta en <code>zeroclaw-labs/zeroclaw</code>:</p>
+<pre><code class="language-bash">git push upstream &lt;branch&gt;
+</code></pre>
+<p>No empujes directamente a <code>master</code>.</p>
+<h3 id="consumo-de-flujo-de-trabajo"><a class="header" href="#consumo-de-flujo-de-trabajo">Consumo de flujo de trabajo</a></h3>
+<p><code>release-stable-manual.yml</code> verifica la existencia de <code>CHANGELOG-next.md</code> al inicio del trabajo de lanzamiento. Si se encuentra, su contenido se convierte en el cuerpo de la versión de GitHub. Si no se encuentra, el flujo de trabajo utiliza como alternativa las notas generadas automáticamente que solo incluyen <code>feat:</code>.</p>
+<p>After a successful stable release, <code>CHANGELOG-next.md</code> is intentionally left on <code>master</code>. The next release cycle will overwrite it. No manual cleanup is required.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../maintainers/release-runbook.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../maintainers/release-runbook.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

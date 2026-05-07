@@ -1,0 +1,491 @@
+<!DOCTYPE HTML>
+<html lang="es" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Cultura de contribución - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-8cdc8f66.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-a1a0ea85.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/foundations/fnd-005-contribution-culture.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="fnd-005-cultura-de-contribución--colaboración-humana-alianza-con-ia-y-crecimiento-del-equipo"><a class="header" href="#fnd-005-cultura-de-contribución--colaboración-humana-alianza-con-ia-y-crecimiento-del-equipo">FND-005: Cultura de Contribución — Colaboración Humana, Alianza con IA y Crecimiento del Equipo</a></h1>
+<h3 id="a-partir-de-la-versión-070--tipo-cultura--rev-1"><a class="header" href="#a-partir-de-la-versión-070--tipo-cultura--rev-1">A partir de la versión 0.7.0 · Tipo: Cultura · Rev. 1</a></h3>
+<blockquote>
+<p><strong>Referencia canónica</strong> · Ratificado por el equipo · Rev. 1 Hilo de discusión e historial completo de revisiones: <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5615">#5615</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>Una nota para el equipo antes de que lean esto.</strong></p>
+<p>Este es el quinto documento del marco de madurez de ZeroClaw. Los otros cuatro abordan la arquitectura, la documentación, la gobernanza y la infraestructura de ingeniería: las capas estructurales que hacen que un proyecto funcione. Este se centra en algo que esos cuatro dan por sentado pero nunca enseñan explícitamente: cómo trabajar juntos.</p>
+<p>Las herramientas y los procesos de los otros RFCs solo funcionan tan bien como el equipo que los utiliza. Un pipeline de CI perfecto no ayuda a un equipo que no puede dar retroalimentación honesta. Una arquitectura limpia no sobrevive en un equipo que no puede disentir de manera productiva. Un modelo de gobernanza no fomenta la responsabilidad en personas que nunca han aprendido lo que significa la responsabilidad.</p>
+<p>Este documento trata sobre la construcción de ese equipo: no solo de individuos técnicamente capacitados, sino de personas que saben cómo dar y recibir retroalimentación, cómo pedir ayuda, cómo utilizar herramientas poderosas de manera responsable y cómo crecer juntos con el tiempo. Estas son habilidades que se pueden aprender. Nadie llega con ellas completamente formadas. Este documento las nombra de manera clara para que puedas comenzar a practicarlas deliberadamente, aquí, en el contexto de un trabajo real que importa.</p>
+<p>Nada en este documento es una crítica de quién eres o de dónde partiste. Es un mapa de hacia dónde estamos tratando de ir juntos.</p>
+</blockquote>
+<hr>
+<h2 id="el-conjunto-de-marcos-de-madurez"><a class="header" href="#el-conjunto-de-marcos-de-madurez">El Conjunto de Marcos de Madurez</a></h2>
+<p>Este RFC es el quinto de un conjunto de cinco documentos que juntos forman el marco de madurez de ZeroClaw. Están diseñados para ser leídos como un todo, aunque cada uno puede entenderse por sí mismo.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>RFC</th><th>Ámbito</th><th>Problema</th></tr>
+</thead>
+<tbody>
+<tr><td>Arquitectura Intencional — Transición al Microkernel</td><td>Lo que estamos construyendo y cómo está estructurado</td><td>#5574</td></tr>
+<tr><td>Estándares de Documentación y Arquitectura del Conocimiento</td><td>Cómo documentamos lo que construimos</td><td>#5576</td></tr>
+<tr><td>Organización del equipo y gobernanza del proyecto</td><td>Cómo coordinamos y tomamos decisiones</td><td>#5577</td></tr>
+<tr><td>Infraestructura de Ingeniería — Pipeline de CI/CD</td><td>Cómo construimos, probamos y enviamos de manera confiable</td><td>#5579</td></tr>
+<tr><td><strong>Cultura de Contribución — Colaboración Humana y Alianza con IA</strong></td><td><strong>Cómo trabajamos juntos y crecemos</strong></td><td><strong>FND-005</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>Los cuatro primeros RFCs responden a preguntas estructurales. Este responde a una pregunta humana: dada la estructura, ¿cómo se comportan las personas dentro de ella entre sí y con sus herramientas? Esta pregunta no tiene un compilador, un linter ni un filtro de CI. Solo tiene los hábitos que construimos, los ejemplos que establecemos y la intencionalidad que le aportamos.</p>
+<hr>
+<h2 id="tabla-de-contenidos"><a class="header" href="#tabla-de-contenidos">Tabla de contenidos</a></h2>
+<ol>
+<li><a href="#1-why-this-document-exists">¿Por qué existe este documento?</a></li>
+<li><a href="#2-the-work-before-the-work">El trabajo antes del trabajo</a></li>
+<li><a href="#3-working-with-people">Trabajar con personas</a>
+<ul>
+<li><a href="#giving-feedback">Enviar comentarios</a></li>
+<li><a href="#receiving-feedback">Recibir comentarios</a></li>
+<li><a href="#solicitar-ayuda">Solicitar ayuda</a></li>
+<li><a href="#disentenderse-de-manera-productiva">Disentenderse de manera productiva</a></li>
+<li><a href="#propiedad">Propiedad</a></li>
+<li><a href="#supporting-someone-who-is-struggling">Apoyar a alguien que está luchando</a></li>
+</ul>
+</li>
+<li><a href="#4-working-with-ai">Trabajando con IA</a>
+<ul>
+<li><a href="#el-modelo-mental-de-delegación">El modelo mental de delegación</a></li>
+<li><a href="#ai-works-at-the-implementation-layer">La IA funciona en la capa de implementación</a></li>
+<li><a href="#amplification-is-not-magic">La amplificación no es magia</a></li>
+<li><a href="#la-disciplina-de-revisión">La disciplina de revisión</a></li>
+<li><a href="#what-this-means-for-your-career">Lo que esto significa para tu carrera</a></li>
+</ul>
+</li>
+<li><a href="#5-la-taxonomía-de-comentarios">La taxonomía de comentarios</a></li>
+<li><a href="#6-a-note-to-reviewers-and-mentors">Una nota para los revisores y mentores</a></li>
+</ol>
+<hr>
+<h2 id="1-por-qué-existe-este-documento"><a class="header" href="#1-por-qué-existe-este-documento">1. Por qué existe este documento</a></h2>
+<p>La mayoría de las guías de contribución te indican cómo abrir un PR. Te dicen qué etiquetas usar, cómo ejecutar el conjunto de pruebas y qué incluir en el mensaje del commit. Esas cosas son importantes, y tenemos documentos que las cubren.</p>
+<p>Este documento aborda un tema diferente: las habilidades que determinan si un grupo de personas talentosas se convierte en un equipo funcional o en una colección de individuos que simplemente comparten un repositorio.</p>
+<p>Estas son habilidades que se pueden aprender. No son rasgos de personalidad que uno tiene o no tiene. No son cosas que vienen automáticamente con la capacidad técnica. Se practican —lentamente, con retroalimentación, a lo largo del tiempo— de la misma manera que se aprende cualquier otra habilidad. La mayoría de la educación en ingeniería de software se centra casi exclusivamente en la capa técnica y deja la capa humana al azar. El resultado es que muchas personas con capacidad técnica terminan en equipos que no funcionan bien juntas, sin una comprensión clara de qué falta o cómo solucionarlo.</p>
+<p>El objetivo de este documento es nombrar esas habilidades de manera clara para que puedas comenzar a practicarlas deliberadamente, aquí, en el contexto de un trabajo real que importa.</p>
+<hr>
+<h2 id="2-el-trabajo-antes-del-trabajo"><a class="header" href="#2-el-trabajo-antes-del-trabajo">2. El trabajo antes del trabajo</a></h2>
+<p>Antes de escribir una línea de código, abrir una PR o solicitar a una IA que genere algo, hay un conjunto de preguntas que deberías poder responder. Este proyecto utiliza una jerarquía de decisiones para describirlas:</p>
+<pre><code>Vision
+  └── Architecture
+        └── Design
+              └── Implementation
+                    └── Testing
+                          └── Documentation
+                                └── Release
+</code></pre>
+<p>La jerarquía se describe en detalle en la RFC de arquitectura (#5574). Lo que importa aquí es el principio detrás de ella: <strong>toda decisión que tomes debe poder rastrearse hasta la cima.</strong></p>
+<p>En la práctica, esto significa preguntarte a ti mismo antes de comenzar a construir:</p>
+<ul>
+<li><strong>¿Qué problema estoy resolviendo?</strong> No “qué tarea estoy cerrando”, sino ¿qué problema real resuelve esto para alguien?</li>
+<li><strong>¿Esto se ajusta a la arquitectura?</strong> Si no puedes describir dónde pertenece esto en la estructura del sistema, aún no comprendes el sistema lo suficientemente bien como para modificarlo.</li>
+<li><strong>¿Cómo se ve el trabajo completado?</strong> Antes de escribir el código, escribe los criterios de aceptación. “Funciona” no es un criterio de aceptación. “Un usuario puede instalar un plugin sin una cadena de herramientas de Rust y este se ejecuta correctamente” sí lo es.</li>
+<li><strong>¿Quién necesita saber sobre esto?</strong> Los cambios que afectan el trabajo de otras personas o que toman decisiones que todo el equipo debe considerar, necesitan visibilidad antes de la implementación, no después.</li>
+</ul>
+<p>Esto no es burocracia. Es la diferencia entre construir algo y construir lo correcto. También se aplica directamente a la forma en que trabajas con herramientas de IA, lo cual cubrimos en la Sección 4.</p>
+<p>La versión honesta de lo que sucede cuando omites este paso es que construyes algo que funciona, abres una solicitud de extracción (PR) y luego descubres durante la revisión que resuelve el problema incorrecto, o que resuelve el problema correcto de una manera que entra en conflicto con una decisión ya tomada en otro lugar. Esto desperdicia tu tiempo, el tiempo del revisor y retrasa a las personas que dependen de este trabajo. El trabajo previo no es un añadido innecesario; es la forma en que proteges tu propio esfuerzo.</p>
+<hr>
+<h2 id="3-trabajar-con-personas"><a class="header" href="#3-trabajar-con-personas">3. Trabajar con personas</a></h2>
+<h3 id="dar-retroalimentación"><a class="header" href="#dar-retroalimentación">Dar retroalimentación</a></h3>
+<p>La retroalimentación es una de las acciones de mayor impacto que puedes ofrecer a otro ingeniero. Un comentario de revisión bien redactado puede enseñar algo que tomaría años aprender por tu cuenta. Por otro lado, uno mal redactado puede desanimar a alguien a volver a contribuir.</p>
+<p><strong>Sé específico.</strong> Los comentarios vagos generan ansiedad sin dirección.</p>
+<blockquote>
+<p>❌ “Esto es difícil de leer.”</p>
+<p>✅ “Esta función está manejando tres preocupaciones separadas: validación de entrada, lógica de negocio y formato de la respuesta. Considera dividirlas para que cada función haga una sola cosa. Esto facilita probar cada parte y entender de un vistazo qué hace cada una.”</p>
+</blockquote>
+<p>La segunda versión es más larga, pero enseña algo. El lector ahora sabe cuál es el problema, por qué es importante y qué hacer al respecto.</p>
+<p><strong>Explica el principio, no solo el veredicto.</strong> Si le pides a alguien que cambie algo, diles por qué. “Cambia X por Y” produce una solución. “Cambia X por Y porque Z” produce comprensión que se aplica a las próximas diez situaciones donde se aplica el mismo principio.</p>
+<p><strong>Separa el trabajo de la persona.</strong> “Este enfoque tiene un problema” y “cometiste un error” no son lo mismo. El primero se refiere al código. El segundo se refiere a la persona. Mantén tus comentarios enfocados en el trabajo.</p>
+<p><strong>Di qué está bien.</strong> No se trata de ser amable, sino de ser útil. Cuando le dices a alguien qué hizo bien y explicas por qué lo hizo bien, le enseñas qué patrones debe repetir. Los elogios genéricos (“¡gran trabajo!”) no enseñan nada. Los elogios específicos (“extraer esto en su propio crate fue la decisión correcta porque ahora podemos probar esta lógica de forma aislada sin tener que levantar todo el bucle del agente”) enseñan el principio y refuerzan la decisión.</p>
+<p><strong>Utiliza la taxonomía de retroalimentación.</strong> El modelo de cuatro categorías de la Sección 5 asigna un peso claro a cada comentario. Los revisores que mezclan problemas bloqueantes con sugerencias menores sin distinguir entre ellos obligan al autor a adivinar qué aspectos realmente necesitan cambios. No hagas que las personas tengan que adivinar.</p>
+<hr>
+<h3 id="recibir-comentarios"><a class="header" href="#recibir-comentarios">Recibir comentarios</a></h3>
+<p>Esto es más difícil que dar retroalimentación para la mayoría de las personas, y vale la pena ser honesto sobre el porqué.</p>
+<p>Cuando has pasado horas trabajando en algo — resolviendo un problema, tomando decisiones, escribiendo el código — y alguien te dice que tiene problemas, la respuesta humana natural es sentir que la crítica va dirigida hacia ti. No es así. Se trata del trabajo. Aprender a mantener estas dos cosas separadas es una habilidad, y requiere práctica.</p>
+<p>Algunas cosas que ayudan:</p>
+<p><strong>Lee los comentarios antes de responder.</strong> No solo la línea del resumen, sino todo el comentario, incluida la explicación. Muchas respuestas a los comentarios se escriben en reacción al veredicto antes de que la persona haya absorbido el razonamiento. Lee el porqué antes de decidir cómo te sientes respecto al qué.</p>
+<p><strong>Distingue entre “No estoy de acuerdo” y “No lo entiendo.”</strong> Estas situaciones requieren respuestas diferentes. Si no entiendes la retroalimentación, haz una pregunta aclaratoria. Si la entiendes y no estás de acuerdo, dilo con evidencia. Ambos son resultados positivos. Lo que no es útil es guardar silencio cuando tienes preguntas, o decir “está bien” cuando realmente no estás de acuerdo.</p>
+<p><strong>No tienes que estar de acuerdo con cada comentario para aprender de ellos.</strong> A veces los comentarios son incorrectos. En otras ocasiones, reflejan un conjunto diferente de compensaciones que las que tú estabas optimizando. Tienes derecho a discrepar; consulta la sección “Discrepar de manera productiva” más abajo. Pero incluso los comentarios que finalmente rechaces valen la pena entenderlos completamente antes de decidir rechazarlos.</p>
+<p><strong>Cierra el ciclo.</strong> Cuando alguien se tome el tiempo de revisar tu trabajo, indícale cuándo has atendido sus comentarios. No es necesario agradecerles de manera efusiva; con un simple “solucionado en el último commit” es suficiente. Esto les indica que su tiempo fue valioso y mantiene el PR en movimiento.</p>
+<p><strong>La retroalimentación sobre tu código no es un reflejo de tu valor.</strong> Esto parece obvio. No lo es cuando estás en medio de ello. Todo ingeniero experimentado ha tenido su código revisado por personas con más experiencia, y ese proceso es incómodo cada vez. La incomodidad es la sensación de aprender. No desaparece; simplemente te vuelves mejor para soportarla.</p>
+<hr>
+<h3 id="solicitando-ayuda"><a class="header" href="#solicitando-ayuda">Solicitando ayuda</a></h3>
+<p>En la escuela, pedir ayuda puede sentirse como admitir que vas atrasado o que no perteneces. En un equipo, pedir ayuda es una de las cosas más profesionales que puedes hacer.</p>
+<p><strong>El costo de quedarse atascado y no preguntar casi siempre es mayor que el costo de preguntar.</strong> Tres horas dedicadas a resolver un problema que podría resolverse con una conversación de cinco minutos son tres horas de tu tiempo y del tiempo de tu equipo que se pierden. Saber cuándo preguntar es una habilidad, no una debilidad.</p>
+<p>Una buena solicitud de ayuda tiene tres partes:</p>
+<ol>
+<li><strong>Lo que estás intentando hacer.</strong> No solo “está roto”, ¿cuál es el objetivo?</li>
+<li><strong>Lo que ya has intentado.</strong> Esto demuestra que has interactuado con el problema y le da a la persona que te ayuda un punto de partida que no es cero.</li>
+<li><strong>En lo que estás atascado específicamente.</strong> “No sé qué está mal” es un problema diferente a “Sé qué está mal pero no sé cómo solucionarlo” y “Lo solucioné pero no sé por qué mi solución funciona.”</li>
+</ol>
+<p>Una solicitud de ayuda que contenga estos tres componentes se resuelve más rápido y te enseña más, porque la persona que te ayuda puede calibrarse exactamente a dónde estás.</p>
+<p><strong>Pregunta públicamente cuando puedas.</strong> Una pregunta formulada en un canal compartido o en una PR beneficia a todos quienes tengan la misma duda más adelante. Una pregunta privada solo beneficia a ti. Hay momentos en los que lo privado es lo adecuado — como comentarios sensibles o circunstancias personales —, pero las preguntas técnicas sobre la base de código casi siempre es mejor hacerlas en público.</p>
+<p><strong>No saber algo no es vergonzoso.</strong> Nadie lo sabe todo. Los ingenieros que parecen saberlo todo han hecho muchas preguntas a lo largo del tiempo, y las respuestas se han acumulado. La única forma de llegar ahí es empezar a preguntar.</p>
+<hr>
+<h3 id="discordar-de-manera-productiva"><a class="header" href="#discordar-de-manera-productiva">Discordar de manera productiva</a></h3>
+<p>Los desacuerdos sobre la arquitectura son saludables. Significan que la gente se preocupa por cómo se construye el sistema y está prestando atención a las decisiones que se están tomando. Un equipo donde nadie discrepa no es un equipo donde todos están de acuerdo, es un equipo donde la gente ha dejado de participar.</p>
+<p>La diferencia entre un desacuerdo productivo y uno improductivo suele estar en el enfoque.</p>
+<p><strong>Aborda primero la preocupación, no el veredicto.</strong></p>
+<blockquote>
+<p>❌ “Este enfoque es incorrecto.”</p>
+<p>✅ “Tengo una preocupación sobre este enfoque, específicamente, si conectamos el gateway directamente en el runtime aquí, rompemos la regla de dependencia en RFC §4.2. ¿Podemos hablar sobre si hay una manera de lograr el mismo resultado sin ese acoplamiento?”</p>
+</blockquote>
+<p>La segunda versión abre una conversación. La primera la cierra.</p>
+<p><strong>Presenta evidencia.</strong> Un desacuerdo arquitectural respaldado por un hecho medible, una sección específica de un RFC o un escenario de fallo concreto es una contribución. Un desacuerdo arquitectural respaldado por “solo siento que” es una opinión. Ambos merecen ser expresados, pero solo uno avanza rápidamente la conversación.</p>
+<p><strong>Sé genuinamente abierto a equivocarte.</strong> Si entras en un desacuerdo habiendo decidido ya que tienes razón, no estás teniendo una conversación, estás haciendo lobby. La gente puede notar la diferencia, y eso hace que sea menos probable que se comprometan seriamente con tus preocupaciones. El objetivo es lograr el mejor resultado para el proyecto, no tener la razón.</p>
+<p><strong>Cuando el equipo tome una decisión, avanza con el equipo.</strong> Puedes dejar constancia de tu disenso en el registro — en el issue, en los comentarios del RFC, en el hilo del PR — y luego construyes lo que se decidió. Esto no es capitulación. Es así como funcionan los equipos. Un equipo que sigue debatiendo decisiones ya resueltas no logra entregar productos.</p>
+<p><strong>Algunas decisiones son reversibles y otras no.</strong> Conoce el tipo de decisión que estás debatiendo. Una decisión sobre el nombre es reversible. Una decisión sobre el protocolo de cable que estará en los binarios de producción durante dos años no lo es. Pondera tu energía en consecuencia.</p>
+<hr>
+<h3 id="propiedad"><a class="header" href="#propiedad">Propiedad</a></h3>
+<p>La propiedad es una de esas palabras que se usa mucho sin una definición clara. Esto es lo que significa en la práctica en este proyecto:</p>
+<p><strong>La propiedad implica que ves el problema antes de que te lo pidan.</strong> Significa revisar un PR que afecta tu área y notar un efecto secundario que el autor no vio. Significa detectar un problema pendiente sin asignar y tomarlo. Significa no esperar a que te lo digan.</p>
+<p><strong>La propiedad significa que tu palabra tiene valor.</strong> Si presentas un seguimiento del problema con tu nombre, ese problema es tu compromiso. No es “alguien debería hacer esto”, tú lo harás. Si las circunstancias cambian y no puedes, dilo pronto y encuentra una forma de traspasar la responsabilidad. Un registro lleno de problemas presentados y olvidados con nombres adjuntos es un registro de confianza roto.</p>
+<p><strong>La propiedad no es “yo hice mi parte.”</strong> Es “me importa si todo el sistema funciona.” Puedes ser responsable de un crate sin ser indiferente a si el sistema en el que se encuentra está saludable. Puedes ser responsable de una funcionalidad sin ser indiferente a si los usuarios realmente pueden usarla. La propiedad estrecha — “yo hice mi parte, el resto es problema de otro” — produce sistemas que técnicamente tienen responsables para cada pieza y funcionalmente no tienen a nadie responsable de nada.</p>
+<p><strong>La propiedad incluye el seguimiento.</strong> Enviar código no es el final de la propiedad. Es el comienzo de la responsabilidad de asegurarse de que funcione, de corregir lo que se rompe y de enseñar a la siguiente persona que trabaje en esa área lo que aprendiste.</p>
+<hr>
+<h3 id="apoyar-a-alguien-que-está-luchando"><a class="header" href="#apoyar-a-alguien-que-está-luchando">Apoyar a alguien que está luchando</a></h3>
+<p>En algún momento de este proyecto, tendrás más experiencia que otra persona en un hilo. Quizás lleves más tiempo aquí. Tal vez conozcas la parte del código en la que están trabajando. O quizás ya hayas visto este modo de fallo en particular.</p>
+<p>Lo que hagas con esa posición es importante.</p>
+<p><strong>No solo lo arregles por ellos.</strong> Darle a alguien una solución funcional sin explicar qué estaba mal o por qué tu solución funciona produce un PR fusionado y cero aprendizaje. La próxima vez que se enfrenten a un problema similar, estarán en la misma situación. Tómate esos cinco minutos adicionales para explicar lo que viste y por qué el arreglo funciona.</p>
+<p><strong>Revisión con intención de enseñar.</strong> Una mala solicitud de extracción (PR) no es solo un problema que cerrar, sino una oportunidad de enseñanza. Una revisión despectiva (“esto no sigue la arquitectura”) es menos útil que una revisión que indique qué se pasó por alto, explique el principio que viola y señale dónde el colaborador puede aprender más. El esfuerzo adicional es una inversión en un colaborador que escribirá mejores PRs a partir de ese momento.</p>
+<p><strong>Si alguien está bloqueado y no está pidiendo ayuda, di algo.</strong> A veces las personas no piden ayuda porque no quieren parecer que están teniendo dificultades. Otras veces no están seguras de a quién dirigirse. En ocasiones llevan tanto tiempo luchando que han dejado de notar lo estancadas que están. Un tranquilo “parece que esto lleva abierto un tiempo, ¿hay algo en lo que pueda ayudarte a desbloquear?” cuesta casi nada y puede significar mucho para alguien que está dando vueltas.</p>
+<p><strong>Haz que sea seguro no saber cosas.</strong> Si las personas en tu equipo sienten que son juzgadas por no saber algo, fingirán que sí lo saben. Esto produce peores decisiones, no mejores. El equipo que hace que sea seguro decir “No lo sé, déjame averiguarlo” toma mejores decisiones que el equipo donde todos fingen confianza.</p>
+<hr>
+<h2 id="4-trabajar-con-ia"><a class="header" href="#4-trabajar-con-ia">4. Trabajar con IA</a></h2>
+<p>Esta sección trata sobre un tema que la mayoría de las guías de contribución no cubren: cómo trabajar con herramientas de codificación de IA de manera que te haga mejor, no solo más rápido.</p>
+<h3 id="el-modelo-mental-de-delegación"><a class="header" href="#el-modelo-mental-de-delegación">El modelo mental de delegación</a></h3>
+<p>Esta es la forma más útil de replantear la interacción con la IA para trabajar de manera efectiva:</p>
+<p><strong>Trabajar con una IA es la misma habilidad que delegar a una persona.</strong></p>
+<p>Cuando delegas trabajo a un colega o a un ingeniero junior, proporcionas contexto. Explicas el objetivo, las restricciones, cómo se ve algo bien hecho y cuáles son los límites. No te limitas a decir “desarrolla esta funcionalidad”. Dices: esto es lo que el usuario intenta hacer, así es como se integra en el sistema, así es cómo sabremos que está terminado y esto es lo que no debes hacer.</p>
+<p>Luego — de manera crítica — revisas lo que se devuelve. No aceptas la solicitud de extracción (PR) de un ingeniero junior sin leerla. Verificas si hace lo que se solicitó, si se ajusta a la arquitectura, si tiene cobertura de pruebas y si el manejo de errores es correcto. Proporcionas comentarios. Puede que haya iteraciones.</p>
+<p>Las herramientas de IA funcionan exactamente de la misma manera. La calidad de lo que obtienes está determinada casi por completo por la calidad de lo que introduces. Un prompt vago produce una salida vaga. Un prompt con contexto claro, restricciones específicas y criterios de aceptación concretos produce una salida que realmente es útil como punto de partida.</p>
+<p>Los ingenieros que tienen dificultades con las herramientas de IA suelen ser aquellos que aún están aprendiendo a dar instrucciones claras a cualquier cosa, ya sea humana o de IA. Los ingenieros que prosperan con ellas son aquellos que ya saben lo que quieren antes de pedirlo.</p>
+<p>Este modelo mental también implica que la salida es tu responsabilidad. No puedes enviar un PR y decir “la IA lo escribió”. Tú lo revisaste. Tú abriste el PR. Es tu trabajo.</p>
+<hr>
+<h3 id="la-ia-funciona-en-la-capa-de-implementación"><a class="header" href="#la-ia-funciona-en-la-capa-de-implementación">La IA funciona en la capa de implementación</a></h3>
+<p>Esta es la limitación técnica más importante que debes comprender.</p>
+<p>La generación de código con IA funciona en la <strong>capa de implementación</strong> de la jerarquía de decisiones:</p>
+<pre><code>Vision          ← AI cannot set this. You must.
+Architecture    ← AI cannot make these decisions. You must.
+Design          ← AI will sometimes guess. You must verify.
+Implementation  ← AI can help here.
+Testing         ← AI can help, but you define what to test.
+Documentation   ← AI can draft. You must review for accuracy.
+Release         ← Human judgment required.
+</code></pre>
+<p>Una herramienta de IA generará una función que haga lo que has descrito. No te indicará si esa función pertenece a este crate o a otro diferente. No señalará que el enfoque contradice una decisión arquitectónica tomada hace tres meses. No preguntará si has considerado las implicaciones de seguridad. No notará que estás resolviendo el problema incorrecto.</p>
+<p>ZeroClaw en sí mismo es un ejemplo útil. La base de código inicial fue generada con asistencia de IA. El resultado, según lo describe el RFC de arquitectura, es “impresionantemente funcional pero arquitectónicamente accidental”. El código hace lo que necesita hacer hoy, pero no fue diseñado; se acumuló. Esto no es un fallo de las herramientas de IA. Es un resultado predecible de utilizar herramientas de capa de implementación sin realizar primero el trabajo de visión, arquitectura y diseño que da dirección a la implementación.</p>
+<p>La solución no es usar menos IA. Es hacer tú mismo el trabajo de la parte superior de la jerarquía, siempre, antes de pedirle a la IA que construya algo.</p>
+<hr>
+<h3 id="la-amplificación-no-es-magia"><a class="header" href="#la-amplificación-no-es-magia">La amplificación no es magia</a></h3>
+<p>Las herramientas de IA amplifican tus capacidades existentes. Esa es la descripción honesta de lo que hacen.</p>
+<p>Si tienes una visión clara, una arquitectura definida, criterios de calidad que puedas articular y la capacidad de evaluar críticamente los resultados, la IA es un verdadero multiplicador de fuerza. Avanzas más rápido. Exploras más opciones. Escribes más pruebas. Redactas más documentación.</p>
+<p>Si no cuentas con esas cosas, la IA genera mucho código que parece convincente pero no es coherente. Genera pruebas que pasan sin probar nada significativo. Genera documentación que describe el código, pero no la intención. Genera arquitectura que es localmente consistente y globalmente incoherente.</p>
+<p>La amplificación es neutral. Amplifica las entradas buenas y las malas con igual entusiasmo.</p>
+<p>Esto significa que la habilidad más valiosa en un flujo de trabajo asistido por IA no es la ingeniería de prompts. Es la capacidad de evaluar la salida. Esto requiere saber cómo se ve algo bueno antes de solicitar cualquier cosa. Lo que te lleva de vuelta, una y otra vez, a la cima de la jerarquía de decisiones.</p>
+<p>Una autoverificación útil antes de usar una herramienta de IA para implementar algo:</p>
+<ul>
+<li>¿Puedo describir el problema en una oración sin mencionar detalles de implementación?</li>
+<li>¿Puedo nombrar la sección del RFC o la decisión de diseño que esta implementación sirve?</li>
+<li>¿Puedo describir cómo se ve una implementación correcta antes de ver una?</li>
+<li>¿Puedo explicar por qué una implementación generada es correcta o no después de verla?</li>
+</ul>
+<p>Si la respuesta a alguna de estas preguntas es no, aún no estás listo para implementar. Todavía estás en la fase de diseño.</p>
+<hr>
+<h3 id="la-disciplina-de-revisión"><a class="header" href="#la-disciplina-de-revisión">La disciplina de revisión</a></h3>
+<p>El código generado por IA requiere la misma disciplina de revisión que el código escrito por humanos. En algunos aspectos, requiere más, porque el área de problemas que estás verificando es más amplia.</p>
+<p>Cuando revises la salida generada por IA —ya sea la tuya o la de otra persona—, verifica lo siguiente:</p>
+<p><strong>Ajuste arquitectónico.</strong> ¿Respeta las reglas de dependencia? ¿Se encuentra en el crate adecuado? ¿Introduce un acoplamiento que el diseño evita explícitamente?</p>
+<p><strong>Corrección en los límites.</strong> Los modelos de IA son muy buenos en el caso común y frecuentemente fallan en el caso límite. Verifica qué sucede cuando las entradas están vacías, son nulas, están malformadas o tienen el tamaño máximo esperado. Verifica qué sucede cuando una dependencia no está disponible.</p>
+<p><strong>Implicaciones de seguridad.</strong> Las herramientas de IA no tienen una mentalidad de seguridad por defecto. Generarán código que acepta entradas del usuario sin validación, que registra valores sensibles, que utiliza primitivas criptográficas obsoletas y que abre rutas de archivos sin verificarlas. Debes aplicar explícitamente una perspectiva de seguridad.</p>
+<p><strong>Calidad de las pruebas.</strong> Las pruebas generadas por IA a menudo prueban la implementación en lugar del comportamiento. Una prueba que afirma que una función devuelve un valor de estructura interna específico no es una prueba de comportamiento, sino una instantánea de la implementación que fallará cada vez que cambie la implementación. Pregúntate: ¿esta prueba verifica que el sistema hace lo que el usuario o el llamador necesita, o verifica que el código hace lo que actualmente hace?</p>
+<p><strong>Completitud.</strong> Las herramientas de IA optimizan para una completitud que parece plausible. Generarán código que maneja exhaustivamente el caso de éxito y de manera superficial el caso de error. Verifica que los errores se propaguen, manejen o muestren de una manera que sea realmente útil para quien llama.</p>
+<hr>
+<h3 id="lo-que-esto-significa-para-tu-carrera"><a class="header" href="#lo-que-esto-significa-para-tu-carrera">Lo que esto significa para tu carrera</a></h3>
+<p>Las habilidades que se describen aquí — dar instrucciones de manera clara, evaluar críticamente los resultados, comprender cómo encaja un componente en un sistema más amplio, y saber qué se considera un buen resultado antes de comenzar a construir — no son habilidades específicas de la IA. Son las habilidades que hacen que alguien sea un ingeniero eficaz, un líder técnico eficaz y, eventualmente, un gerente de ingeniería eficaz.</p>
+<p>Los ingenieros que serán más valiosos en un mundo saturado de código generado por IA no son aquellos que pueden escribir más código más rápido. Son aquellos que pueden determinar si el código es correcto. Eso requiere pensamiento sistémico, juicio arquitectónico y la capacidad de evaluar el trabajo en función de un estándar que has internalizado.</p>
+<p>Todo lo que practicas aquí — comprender la RFC antes de implementarla, preguntar “por qué” antes de construir, revisar la salida de la IA con la misma atención que le darías a la revisión de código de un ingeniero junior — es práctica para ese tipo de juicio. Se acumula. Cada PR en el que te involucras seriamente con la arquitectura es un dato que facilita la próxima decisión arquitectónica.</p>
+<p>Los colaboradores de este proyecto tienen una ventaja inusual: están desarrollando estos hábitos en un sistema real, con restricciones arquitectónicas reales, con personas que revisarán su trabajo y explicarán por qué. Esa combinación es poco común. Vale la pena tomárselo en serio.</p>
+<hr>
+<h2 id="5-la-taxonomía-de-retroalimentación"><a class="header" href="#5-la-taxonomía-de-retroalimentación">5. La taxonomía de retroalimentación</a></h2>
+<p>Cada comentario de revisión en este proyecto tiene uno de cuatro pesos. Usarlos de manera consistente significa que los revisores se comunican claramente y los autores saben exactamente qué requiere acción.</p>
+<hr>
+<h3 id="-reconocimiento"><a class="header" href="#-reconocimiento">✅ Reconocimiento</a></h3>
+<p>Algo que el autor hizo bien, nombrado específicamente y explicado para que el patrón se repita.</p>
+<p>Esto no es cortesía. Los elogios genéricos (“¡buen trabajo!”) no enseñan nada. Los elogios específicos con una explicación enseñan el principio detrás de lo que se hizo bien, lo cual se aplica a cada decisión futura en la misma categoría.</p>
+<p><strong>Las felicitaciones no requieren acción.</strong> Su propósito es reforzar.</p>
+<blockquote>
+<p><em>Ejemplo: “Extraer el analizador de llamadas de herramientas a su propio crate fue la decisión correcta: este código no tiene dependencias del estado del agente y ahora es testeable de forma independiente. Las 91 pruebas que añadiste son exactamente el tipo de cobertura que sería imposible de lograr cuando esta lógica estaba dentro de <code>loop_.rs</code>.”</em></p>
+</blockquote>
+<hr>
+<h3 id="-bloqueando"><a class="header" href="#-bloqueando">🔴 Bloqueando</a></h3>
+<p>Algo que debe resolverse antes de que se fusione la PR. Los elementos bloqueantes se dividen en dos categorías:</p>
+<ul>
+<li><strong>Violaciones arquitectónicas</strong>: código que cruza un límite de dependencia que el diseño prohíbe explícitamente, o que contradice una decisión registrada en un RFC o ADR.</li>
+<li><strong>Regresiones de calidad</strong>: falta de cobertura de pruebas para el nuevo comportamiento, problemas de seguridad, incompatibilidad con el contrato existente o código que introduce un defecto.</li>
+</ul>
+<p>Un comentario de bloqueo explica cuál es el problema, por qué es importante y, donde sea posible, cómo se ve una ruta de resolución. Un comentario de bloqueo no es un juicio sobre el autor. Es responsabilidad del revisor hacia la base de código y los usuarios que dependen de ella.</p>
+<p><strong>Los autores no deben interpretar un comentario bloqueante como un rechazo.</strong> Es un problema específico y resoluble. Abórdalo y sigue adelante.</p>
+<hr>
+<h3 id="-condicional"><a class="header" href="#-condicional">🟡 Condicional</a></h3>
+<p>Algo aceptable para posponer, pero solo con un problema rastreado comprometido y un asignado. Un elemento condicional es el revisor diciendo: <em>Confío en que esto se abordará, pero necesito ese compromiso registrado antes de fusionar.</em></p>
+<p>La distinción entre bloqueo y condicional a menudo se refiere al tiempo y al riesgo. Una función que falta y que se entregará en el próximo PR es condicional. Una función que falta y que crea una brecha de seguridad es de bloqueo.</p>
+<p><strong>Una postergación condicional sin un responsable no es una postergación, es un deseo.</strong> Los problemas rastreados sin un propietario tienden a permanecer abiertos indefinidamente. Cuando un revisor marca algo como condicional, está solicitando un compromiso con un nombre, no una intención futura teórica.</p>
+<hr>
+<h3 id="-decisión-del-equipo"><a class="header" href="#-decisión-del-equipo">🔵 Decisión del equipo</a></h3>
+<p>Una pregunta que el PR plantea y que ningún revisor o autor debería responder de manera unilateral. Las decisiones del equipo implican compromisos que afectan la dirección del proyecto, su arquitectura o sus usuarios, y corresponden al grupo.</p>
+<p>El uso de esta etiqueta es la forma en que los revisores evitan retrasar a los contribuyentes individuales con preguntas que realmente se refieren a la dirección compartida. Pone de manifiesto la decisión, enmarca los compromisos y pide al equipo que emita su opinión, sin hacer que el autor sienta que su PR está bloqueado por algo que no está bajo su control.</p>
+<p><strong>Las decisiones del equipo deben responderse en el hilo del PR, de manera documentada, por las personas que deben asumir la responsabilidad del resultado.</strong> Una decisión tomada en una conversación paralela que no se refleje en el hilo del PR no existe para quienes lean el historial más adelante.</p>
+<hr>
+<h2 id="6-una-nota-para-los-revisores-y-mentores"><a class="header" href="#6-una-nota-para-los-revisores-y-mentores">6. Una nota para los revisores y mentores</a></h2>
+<p>Si te encuentras en una posición de revisar el trabajo de otra persona, ya sea como propietario del código, un contribuyente con más experiencia o simplemente alguien que lleva más tiempo aquí, esta sección es para ti.</p>
+<p><strong>Estás modelando cómo se ve la colaboración.</strong> Cada revisión que escribes enseña al autor cómo revisar. Cada pregunta que haces en un hilo de PR enseña a los contribuyentes más nuevos qué preguntas merecen la pena hacer. No puedes eximirte de esto: la única opción es hacerlo de manera intencional o accidental.</p>
+<p><strong>La exhaustividad es un acto de respeto.</strong> Una revisión exhaustiva que explica su razonamiento es más respetuosa con el esfuerzo del autor que una aprobación rápida. El autor dedicó tiempo a su trabajo. Merece entender por qué está o no listo para fusionarse, y qué puede llevarse de la interacción.</p>
+<p><strong>El objetivo de cada interacción de revisión es dejar al autor mejor preparado de lo que estaba antes.</strong> No solo para producir un PR fusionado. No para demostrar tu propio conocimiento. No para imponer reglas. Para dejar al autor con algo que pueda usar — un principio, un patrón, una comprensión de un compromiso — que se aplique más allá del PR inmediato.</p>
+<p><strong>Nombra el patrón, no solo la instancia.</strong> Cuando solicites un cambio, explica el principio que lo sustenta. “Renombra esta variable por algo que describa lo que contiene” es menos útil que “los nombres de las variables deben describir su propósito desde la perspectiva del llamador, no desde la implementación: ¿qué le importa realmente al llamador de esta función que represente este valor?”. La segunda versión se aplica a cada variable en cada función que el autor escribirá en el futuro.</p>
+<p><strong>Sé honesto sobre cuál es tu preferencia y cuál es un requisito.</strong> “Lo escribiría de manera diferente” no es lo mismo que “esto debe cambiar”. Si estás expresando una preferencia, dilo. Si estás citando un requisito estricto — arquitectura, seguridad, compatibilidad — cita la razón específica. Los autores que no pueden distinguir entre la preferencia del revisor y la necesidad arquitectónica o bien cambiarán todo o no cambiarán nada. Ninguna de las dos opciones les beneficia.</p>
+<p><strong>El equipo que estás ayudando a construir es el equipo en el que trabajarás.</strong> La inversión que haces en una revisión cuidadosa y educativa hoy se traduce en un colaborador que escribe mejor código, abre mejores PRs y revisa el trabajo de otros con más reflexión. Esto mejora el proyecto. También facilita tu propio trabajo, porque las personas a tu alrededor están creciendo.</p>
+<p>Esto no es una habilidad blanda. Es trabajo de ingeniería.</p>
+<hr>
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-004-engineering-infrastructure.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-006-zero-compromise-in-practice.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-004-engineering-infrastructure.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-006-zero-compromise-in-practice.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_MAX_HISTORY_MESSAGES"],"fn":["emergency_history_trim","estimate_history_tokens","fast_trim_tool_results","floor_char_boundary","load_interactive_session_history","save_interactive_session_history","trim_history","truncate_tool_message","truncate_tool_result"],"struct":["InteractiveSessionState"]};

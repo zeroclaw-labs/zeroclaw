@@ -1,0 +1,1471 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>CLI - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-c5ad0191.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-425f4b80.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/reference/cli.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="command-line-help-for-zeroclaw"><a class="header" href="#command-line-help-for-zeroclaw">Command-Line Help for <code>zeroclaw</code></a></h1>
+<p>This document contains the help content for the <code>zeroclaw</code> command-line program.</p>
+<p><strong>Command Overview:</strong></p>
+<ul>
+<li><a href="#zeroclaw"><code>zeroclaw</code>↴</a></li>
+<li><a href="#zeroclaw-onboard"><code>zeroclaw onboard</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-workspace"><code>zeroclaw onboard workspace</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-providers"><code>zeroclaw onboard providers</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-channels"><code>zeroclaw onboard channels</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-memory"><code>zeroclaw onboard memory</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-hardware"><code>zeroclaw onboard hardware</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-tunnel"><code>zeroclaw onboard tunnel</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-personality"><code>zeroclaw onboard personality</code>↴</a></li>
+<li><a href="#zeroclaw-agent"><code>zeroclaw agent</code>↴</a></li>
+<li><a href="#zeroclaw-gateway"><code>zeroclaw gateway</code>↴</a></li>
+<li><a href="#zeroclaw-gateway-start"><code>zeroclaw gateway start</code>↴</a></li>
+<li><a href="#zeroclaw-gateway-restart"><code>zeroclaw gateway restart</code>↴</a></li>
+<li><a href="#zeroclaw-gateway-get-paircode"><code>zeroclaw gateway get-paircode</code>↴</a></li>
+<li><a href="#zeroclaw-acp"><code>zeroclaw acp</code>↴</a></li>
+<li><a href="#zeroclaw-daemon"><code>zeroclaw daemon</code>↴</a></li>
+<li><a href="#zeroclaw-service"><code>zeroclaw service</code>↴</a></li>
+<li><a href="#zeroclaw-service-install"><code>zeroclaw service install</code>↴</a></li>
+<li><a href="#zeroclaw-service-start"><code>zeroclaw service start</code>↴</a></li>
+<li><a href="#zeroclaw-service-stop"><code>zeroclaw service stop</code>↴</a></li>
+<li><a href="#zeroclaw-service-restart"><code>zeroclaw service restart</code>↴</a></li>
+<li><a href="#zeroclaw-service-status"><code>zeroclaw service status</code>↴</a></li>
+<li><a href="#zeroclaw-service-uninstall"><code>zeroclaw service uninstall</code>↴</a></li>
+<li><a href="#zeroclaw-service-logs"><code>zeroclaw service logs</code>↴</a></li>
+<li><a href="#zeroclaw-doctor"><code>zeroclaw doctor</code>↴</a></li>
+<li><a href="#zeroclaw-doctor-models"><code>zeroclaw doctor models</code>↴</a></li>
+<li><a href="#zeroclaw-doctor-traces"><code>zeroclaw doctor traces</code>↴</a></li>
+<li><a href="#zeroclaw-status"><code>zeroclaw status</code>↴</a></li>
+<li><a href="#zeroclaw-estop"><code>zeroclaw estop</code>↴</a></li>
+<li><a href="#zeroclaw-estop-status"><code>zeroclaw estop status</code>↴</a></li>
+<li><a href="#zeroclaw-estop-resume"><code>zeroclaw estop resume</code>↴</a></li>
+<li><a href="#zeroclaw-cron"><code>zeroclaw cron</code>↴</a></li>
+<li><a href="#zeroclaw-cron-list"><code>zeroclaw cron list</code>↴</a></li>
+<li><a href="#zeroclaw-cron-add"><code>zeroclaw cron add</code>↴</a></li>
+<li><a href="#zeroclaw-cron-add-at"><code>zeroclaw cron add-at</code>↴</a></li>
+<li><a href="#zeroclaw-cron-add-every"><code>zeroclaw cron add-every</code>↴</a></li>
+<li><a href="#zeroclaw-cron-once"><code>zeroclaw cron once</code>↴</a></li>
+<li><a href="#zeroclaw-cron-remove"><code>zeroclaw cron remove</code>↴</a></li>
+<li><a href="#zeroclaw-cron-update"><code>zeroclaw cron update</code>↴</a></li>
+<li><a href="#zeroclaw-cron-pause"><code>zeroclaw cron pause</code>↴</a></li>
+<li><a href="#zeroclaw-cron-resume"><code>zeroclaw cron resume</code>↴</a></li>
+<li><a href="#zeroclaw-models"><code>zeroclaw models</code>↴</a></li>
+<li><a href="#zeroclaw-models-refresh"><code>zeroclaw models refresh</code>↴</a></li>
+<li><a href="#zeroclaw-models-list"><code>zeroclaw models list</code>↴</a></li>
+<li><a href="#zeroclaw-models-set"><code>zeroclaw models set</code>↴</a></li>
+<li><a href="#zeroclaw-models-status"><code>zeroclaw models status</code>↴</a></li>
+<li><a href="#zeroclaw-providers"><code>zeroclaw providers</code>↴</a></li>
+<li><a href="#zeroclaw-channel"><code>zeroclaw channel</code>↴</a></li>
+<li><a href="#zeroclaw-channel-list"><code>zeroclaw channel list</code>↴</a></li>
+<li><a href="#zeroclaw-channel-start"><code>zeroclaw channel start</code>↴</a></li>
+<li><a href="#zeroclaw-channel-doctor"><code>zeroclaw channel doctor</code>↴</a></li>
+<li><a href="#zeroclaw-channel-add"><code>zeroclaw channel add</code>↴</a></li>
+<li><a href="#zeroclaw-channel-remove"><code>zeroclaw channel remove</code>↴</a></li>
+<li><a href="#zeroclaw-channel-bind-telegram"><code>zeroclaw channel bind-telegram</code>↴</a></li>
+<li><a href="#zeroclaw-channel-send"><code>zeroclaw channel send</code>↴</a></li>
+<li><a href="#zeroclaw-integrations"><code>zeroclaw integrations</code>↴</a></li>
+<li><a href="#zeroclaw-integrations-info"><code>zeroclaw integrations info</code>↴</a></li>
+<li><a href="#zeroclaw-skills"><code>zeroclaw skills</code>↴</a></li>
+<li><a href="#zeroclaw-skills-list"><code>zeroclaw skills list</code>↴</a></li>
+<li><a href="#zeroclaw-skills-audit"><code>zeroclaw skills audit</code>↴</a></li>
+<li><a href="#zeroclaw-skills-install"><code>zeroclaw skills install</code>↴</a></li>
+<li><a href="#zeroclaw-skills-remove"><code>zeroclaw skills remove</code>↴</a></li>
+<li><a href="#zeroclaw-skills-test"><code>zeroclaw skills test</code>↴</a></li>
+<li><a href="#zeroclaw-sop"><code>zeroclaw sop</code>↴</a></li>
+<li><a href="#zeroclaw-sop-list"><code>zeroclaw sop list</code>↴</a></li>
+<li><a href="#zeroclaw-sop-validate"><code>zeroclaw sop validate</code>↴</a></li>
+<li><a href="#zeroclaw-sop-show"><code>zeroclaw sop show</code>↴</a></li>
+<li><a href="#zeroclaw-migrate"><code>zeroclaw migrate</code>↴</a></li>
+<li><a href="#zeroclaw-migrate-openclaw"><code>zeroclaw migrate openclaw</code>↴</a></li>
+<li><a href="#zeroclaw-auth"><code>zeroclaw auth</code>↴</a></li>
+<li><a href="#zeroclaw-auth-login"><code>zeroclaw auth login</code>↴</a></li>
+<li><a href="#zeroclaw-auth-paste-redirect"><code>zeroclaw auth paste-redirect</code>↴</a></li>
+<li><a href="#zeroclaw-auth-paste-token"><code>zeroclaw auth paste-token</code>↴</a></li>
+<li><a href="#zeroclaw-auth-setup-token"><code>zeroclaw auth setup-token</code>↴</a></li>
+<li><a href="#zeroclaw-auth-refresh"><code>zeroclaw auth refresh</code>↴</a></li>
+<li><a href="#zeroclaw-auth-logout"><code>zeroclaw auth logout</code>↴</a></li>
+<li><a href="#zeroclaw-auth-use"><code>zeroclaw auth use</code>↴</a></li>
+<li><a href="#zeroclaw-auth-list"><code>zeroclaw auth list</code>↴</a></li>
+<li><a href="#zeroclaw-auth-status"><code>zeroclaw auth status</code>↴</a></li>
+<li><a href="#zeroclaw-hardware"><code>zeroclaw hardware</code>↴</a></li>
+<li><a href="#zeroclaw-hardware-discover"><code>zeroclaw hardware discover</code>↴</a></li>
+<li><a href="#zeroclaw-hardware-introspect"><code>zeroclaw hardware introspect</code>↴</a></li>
+<li><a href="#zeroclaw-hardware-info"><code>zeroclaw hardware info</code>↴</a></li>
+<li><a href="#zeroclaw-peripheral"><code>zeroclaw peripheral</code>↴</a></li>
+<li><a href="#zeroclaw-peripheral-list"><code>zeroclaw peripheral list</code>↴</a></li>
+<li><a href="#zeroclaw-peripheral-add"><code>zeroclaw peripheral add</code>↴</a></li>
+<li><a href="#zeroclaw-peripheral-flash"><code>zeroclaw peripheral flash</code>↴</a></li>
+<li><a href="#zeroclaw-peripheral-setup-uno-q"><code>zeroclaw peripheral setup-uno-q</code>↴</a></li>
+<li><a href="#zeroclaw-peripheral-flash-nucleo"><code>zeroclaw peripheral flash-nucleo</code>↴</a></li>
+<li><a href="#zeroclaw-memory"><code>zeroclaw memory</code>↴</a></li>
+<li><a href="#zeroclaw-memory-list"><code>zeroclaw memory list</code>↴</a></li>
+<li><a href="#zeroclaw-memory-get"><code>zeroclaw memory get</code>↴</a></li>
+<li><a href="#zeroclaw-memory-stats"><code>zeroclaw memory stats</code>↴</a></li>
+<li><a href="#zeroclaw-memory-clear"><code>zeroclaw memory clear</code>↴</a></li>
+<li><a href="#zeroclaw-memory-reindex"><code>zeroclaw memory reindex</code>↴</a></li>
+<li><a href="#zeroclaw-config"><code>zeroclaw config</code>↴</a></li>
+<li><a href="#zeroclaw-config-schema"><code>zeroclaw config schema</code>↴</a></li>
+<li><a href="#zeroclaw-config-list"><code>zeroclaw config list</code>↴</a></li>
+<li><a href="#zeroclaw-config-get"><code>zeroclaw config get</code>↴</a></li>
+<li><a href="#zeroclaw-config-set"><code>zeroclaw config set</code>↴</a></li>
+<li><a href="#zeroclaw-config-init"><code>zeroclaw config init</code>↴</a></li>
+<li><a href="#zeroclaw-config-migrate"><code>zeroclaw config migrate</code>↴</a></li>
+<li><a href="#zeroclaw-config-patch"><code>zeroclaw config patch</code>↴</a></li>
+<li><a href="#zeroclaw-config-docs"><code>zeroclaw config docs</code>↴</a></li>
+<li><a href="#zeroclaw-update"><code>zeroclaw update</code>↴</a></li>
+<li><a href="#zeroclaw-self-test"><code>zeroclaw self-test</code>↴</a></li>
+<li><a href="#zeroclaw-completions"><code>zeroclaw completions</code>↴</a></li>
+<li><a href="#zeroclaw-desktop"><code>zeroclaw desktop</code>↴</a></li>
+</ul>
+<h2 id="zeroclaw"><a class="header" href="#zeroclaw"><code>zeroclaw</code></a></h2>
+<p>The fastest, smallest AI assistant.</p>
+<p><strong>Usage:</strong> <code>zeroclaw [OPTIONS] &lt;COMMAND&gt;</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>onboard</code> — Initialize your workspace and configuration</li>
+<li><code>agent</code> — Start the AI agent loop</li>
+<li><code>gateway</code> — Start/manage the gateway server (webhooks, websockets)</li>
+<li><code>acp</code> — Start ACP (Agent Control Protocol) server over stdio</li>
+<li><code>daemon</code> — Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)</li>
+<li><code>service</code> — Manage OS service lifecycle (launchd/systemd user service)</li>
+<li><code>doctor</code> — Run diagnostics for daemon/scheduler/channel freshness</li>
+<li><code>status</code> — Show system status (full details)</li>
+<li><code>estop</code> — Engage, inspect, and resume emergency-stop states</li>
+<li><code>cron</code> — Configure and manage scheduled tasks</li>
+<li><code>models</code> — Manage provider model catalogs</li>
+<li><code>providers</code> — List supported AI providers</li>
+<li><code>channel</code> — Manage channels (telegram, discord, slack)</li>
+<li><code>integrations</code> — Browse 50+ integrations</li>
+<li><code>skills</code> — Manage skills (user-defined capabilities)</li>
+<li><code>sop</code> — Manage standard operating procedures (SOPs)</li>
+<li><code>migrate</code> — Migrate data from other agent runtimes</li>
+<li><code>auth</code> — Manage provider subscription authentication profiles</li>
+<li><code>hardware</code> — Discover and introspect USB hardware</li>
+<li><code>peripheral</code> — Manage hardware peripherals (STM32, RPi GPIO, etc.)</li>
+<li><code>memory</code> — Manage agent memory (list, get, stats, clear)</li>
+<li><code>config</code> — Manage configuration</li>
+<li><code>update</code> — Check for and apply updates</li>
+<li><code>self-test</code> — Run diagnostic self-tests</li>
+<li><code>completions</code> — Generate shell completion script to stdout</li>
+<li><code>desktop</code> — Launch or install the companion desktop app</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--config-dir &lt;CONFIG_DIR&gt;</code></li>
+</ul>
+<h2 id="zeroclaw-onboard"><a class="header" href="#zeroclaw-onboard"><code>zeroclaw onboard</code></a></h2>
+<p>Initialize your workspace and configuration</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard [OPTIONS] [COMMAND]</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>workspace</code> — Workspace isolation settings</li>
+<li><code>providers</code> — Provider selection, credentials, and live model picker</li>
+<li><code>channels</code> — Messaging channels (Telegram, Discord, Slack, Matrix, …)</li>
+<li><code>memory</code> — Memory backend (sqlite, lucid, markdown, none) + auto-save</li>
+<li><code>hardware</code> — Physical hardware transport (native GPIO, serial, probe)</li>
+<li><code>tunnel</code> — Public tunnel provider (cloudflare, ngrok, tailscale, …)</li>
+<li><code>personality</code> — Edit the markdown files that shape your agent (SOUL, IDENTITY, USER, …)</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--quick</code> — Skip interactive prompts; read from –api-key/–provider/–model/–memory</li>
+<li><code>--cli</code> — Force the dialoguer CLI backend instead of the default ratatui TUI</li>
+<li><code>--force</code> — Don’t ask “keep stored secret?” — always re-prompt</li>
+<li><code>--reinit</code> — Back up existing config and start from defaults</li>
+<li><code>--api-key &lt;API_KEY&gt;</code> — API key for provider configuration</li>
+<li><code>--provider &lt;PROVIDER&gt;</code> — Provider name (sets providers.fallback)</li>
+<li><code>--model &lt;MODEL&gt;</code> — Model ID override</li>
+<li><code>--memory &lt;MEMORY&gt;</code> — Memory backend (sqlite, lucid, markdown, none)</li>
+</ul>
+<h2 id="zeroclaw-onboard-workspace"><a class="header" href="#zeroclaw-onboard-workspace"><code>zeroclaw onboard workspace</code></a></h2>
+<p>Workspace isolation settings</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard workspace</code></p>
+<h2 id="zeroclaw-onboard-providers"><a class="header" href="#zeroclaw-onboard-providers"><code>zeroclaw onboard providers</code></a></h2>
+<p>Provider selection, credentials, and live model picker</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard providers</code></p>
+<h2 id="zeroclaw-onboard-channels"><a class="header" href="#zeroclaw-onboard-channels"><code>zeroclaw onboard channels</code></a></h2>
+<p>Messaging channels (Telegram, Discord, Slack, Matrix, …)</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard channels</code></p>
+<h2 id="zeroclaw-onboard-memory"><a class="header" href="#zeroclaw-onboard-memory"><code>zeroclaw onboard memory</code></a></h2>
+<p>Memory backend (sqlite, lucid, markdown, none) + auto-save</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard memory</code></p>
+<h2 id="zeroclaw-onboard-hardware"><a class="header" href="#zeroclaw-onboard-hardware"><code>zeroclaw onboard hardware</code></a></h2>
+<p>Physical hardware transport (native GPIO, serial, probe)</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard hardware</code></p>
+<h2 id="zeroclaw-onboard-tunnel"><a class="header" href="#zeroclaw-onboard-tunnel"><code>zeroclaw onboard tunnel</code></a></h2>
+<p>Public tunnel provider (cloudflare, ngrok, tailscale, …)</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard tunnel</code></p>
+<h2 id="zeroclaw-onboard-personality"><a class="header" href="#zeroclaw-onboard-personality"><code>zeroclaw onboard personality</code></a></h2>
+<p>Edit the markdown files that shape your agent (SOUL, IDENTITY, USER, …)</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard personality</code></p>
+<h2 id="zeroclaw-agent"><a class="header" href="#zeroclaw-agent"><code>zeroclaw agent</code></a></h2>
+<p>Start the AI agent loop.</p>
+<p>Launches an interactive chat session with the configured AI provider. Use –message for single-shot queries without entering interactive mode.</p>
+<p>Examples:
+zeroclaw agent                              # interactive session
+zeroclaw agent -m “Summarize today’s logs”  # single message
+zeroclaw agent -p anthropic –model claude-sonnet-4-20250514
+zeroclaw agent –peripheral nucleo-f401re:/dev/ttyACM0</p>
+<p><strong>Usage:</strong> <code>zeroclaw agent [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>-m</code>, <code>--message &lt;MESSAGE&gt;</code> — Single message mode (don’t enter interactive mode)</li>
+<li><code>--session-state-file &lt;SESSION_STATE_FILE&gt;</code> — Load and save interactive session state in this JSON file</li>
+<li><code>-p</code>, <code>--provider &lt;PROVIDER&gt;</code> — Provider to use (openrouter, anthropic, openai, openai-codex)</li>
+<li><code>--model &lt;MODEL&gt;</code> — Model to use</li>
+<li><code>-t</code>, <code>--temperature &lt;TEMPERATURE&gt;</code> — Temperature (0.0 - 2.0, defaults to config default_temperature)</li>
+<li><code>--peripheral &lt;PERIPHERAL&gt;</code> — Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)</li>
+</ul>
+<h2 id="zeroclaw-gateway"><a class="header" href="#zeroclaw-gateway"><code>zeroclaw gateway</code></a></h2>
+<p>Manage the gateway server (webhooks, websockets).</p>
+<p>Start, restart, or inspect the HTTP/WebSocket gateway that accepts incoming webhook events and WebSocket connections.</p>
+<p>Examples:
+zeroclaw gateway start              # start gateway
+zeroclaw gateway restart            # restart gateway
+zeroclaw gateway get-paircode       # show pairing code</p>
+<p><strong>Usage:</strong> <code>zeroclaw gateway [COMMAND]</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>start</code> — Start the gateway server (default if no subcommand specified)</li>
+<li><code>restart</code> — Restart the gateway server</li>
+<li><code>get-paircode</code> — Show or generate the pairing code without restarting</li>
+</ul>
+<h2 id="zeroclaw-gateway-start"><a class="header" href="#zeroclaw-gateway-start"><code>zeroclaw gateway start</code></a></h2>
+<p>Start the gateway server (webhooks, websockets).</p>
+<p>Runs the HTTP/WebSocket gateway that accepts incoming webhook events and WebSocket connections. Bind address defaults to the values in your config file (gateway.host / gateway.port).</p>
+<p>Examples:
+zeroclaw gateway start              # use config defaults
+zeroclaw gateway start -p 8080      # listen on port 8080
+zeroclaw gateway start –host 0.0.0.0   # requires [gateway].allow_public_bind=true or a tunnel
+zeroclaw gateway start -p 0         # random available port</p>
+<p><strong>Usage:</strong> <code>zeroclaw gateway start [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>-p</code>, <code>--port &lt;PORT&gt;</code> — Port to listen on (use 0 for random available port); defaults to config gateway.port</li>
+<li><code>--host &lt;HOST&gt;</code> — Host to bind to; defaults to config gateway.host Note: Binding to 0.0.0.0 requires <code>gateway.allow_public_bind = true</code> in config</li>
+</ul>
+<h2 id="zeroclaw-gateway-restart"><a class="header" href="#zeroclaw-gateway-restart"><code>zeroclaw gateway restart</code></a></h2>
+<p>Restart the gateway server.</p>
+<p>Stops the running gateway if present, then starts a new instance with the current configuration.</p>
+<p>Examples:
+zeroclaw gateway restart            # restart with config defaults
+zeroclaw gateway restart -p 8080    # restart on port 8080</p>
+<p><strong>Usage:</strong> <code>zeroclaw gateway restart [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>-p</code>, <code>--port &lt;PORT&gt;</code> — Port to listen on (use 0 for random available port); defaults to config gateway.port</li>
+<li><code>--host &lt;HOST&gt;</code> — Host to bind to; defaults to config gateway.host Note: Binding to 0.0.0.0 requires <code>gateway.allow_public_bind = true</code> in config</li>
+</ul>
+<h2 id="zeroclaw-gateway-get-paircode"><a class="header" href="#zeroclaw-gateway-get-paircode"><code>zeroclaw gateway get-paircode</code></a></h2>
+<p>Show or generate the gateway pairing code.</p>
+<p>Displays the pairing code for connecting new clients without restarting the gateway. Requires the gateway to be running.</p>
+<p>With –new, generates a fresh pairing code even if the gateway was previously paired (useful for adding additional clients).</p>
+<p>Examples:
+zeroclaw gateway get-paircode       # show current pairing code
+zeroclaw gateway get-paircode –new # generate a new pairing code</p>
+<p><strong>Usage:</strong> <code>zeroclaw gateway get-paircode [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--new</code> — Generate a new pairing code (even if already paired)</li>
+</ul>
+<h2 id="zeroclaw-acp"><a class="header" href="#zeroclaw-acp"><code>zeroclaw acp</code></a></h2>
+<p>Start the ACP server (JSON-RPC 2.0 over stdio).</p>
+<p>Launches a JSON-RPC 2.0 server on stdin/stdout for IDE and tool integration. Supports session management and streaming agent responses as notifications.</p>
+<p>Methods: initialize, session/new, session/prompt, session/stop.</p>
+<p>Examples:
+zeroclaw acp                        # start ACP server
+zeroclaw acp –max-sessions 5       # limit concurrent sessions</p>
+<p><strong>Usage:</strong> <code>zeroclaw acp [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--max-sessions &lt;MAX_SESSIONS&gt;</code> — Maximum concurrent sessions (default: 10)</li>
+<li><code>--session-timeout &lt;SESSION_TIMEOUT&gt;</code> — Session inactivity timeout in seconds (default: 3600)</li>
+</ul>
+<h2 id="zeroclaw-daemon"><a class="header" href="#zeroclaw-daemon"><code>zeroclaw daemon</code></a></h2>
+<p>Start the long-running autonomous daemon.</p>
+<p>Launches the full ZeroClaw runtime: gateway server, all configured channels (Telegram, Discord, Slack, etc.), heartbeat monitor, and the cron scheduler. This is the recommended way to run ZeroClaw in production or as an always-on assistant.</p>
+<p>Use ‘zeroclaw service install’ to register the daemon as an OS service (systemd/launchd) for auto-start on boot.</p>
+<p>Examples:
+zeroclaw daemon                   # use config defaults
+zeroclaw daemon -p 9090           # gateway on port 9090
+zeroclaw daemon –host 127.0.0.1  # localhost only</p>
+<p><strong>Usage:</strong> <code>zeroclaw daemon [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>-p</code>, <code>--port &lt;PORT&gt;</code> — Port to listen on (use 0 for random available port); defaults to config gateway.port</li>
+<li><code>--host &lt;HOST&gt;</code> — Host to bind to; defaults to config gateway.host</li>
+</ul>
+<h2 id="zeroclaw-service"><a class="header" href="#zeroclaw-service"><code>zeroclaw service</code></a></h2>
+<p>Manage OS service lifecycle (launchd/systemd user service)</p>
+<p><strong>Usage:</strong> <code>zeroclaw service [OPTIONS] &lt;COMMAND&gt;</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>install</code> — Install daemon service unit for auto-start and restart</li>
+<li><code>start</code> — Start daemon service</li>
+<li><code>stop</code> — Stop daemon service</li>
+<li><code>restart</code> — Restart daemon service to apply latest config</li>
+<li><code>status</code> — Check daemon service status</li>
+<li><code>uninstall</code> — Uninstall daemon service unit</li>
+<li><code>logs</code> — Tail daemon service logs</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li>
+<p><code>--service-init &lt;SERVICE_INIT&gt;</code> — Init system to use: auto (detect), systemd, or openrc</p>
+<p>Default value: <code>auto</code></p>
+<p>Possible values: <code>auto</code>, <code>systemd</code>, <code>openrc</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-service-install"><a class="header" href="#zeroclaw-service-install"><code>zeroclaw service install</code></a></h2>
+<p>Install daemon service unit for auto-start and restart</p>
+<p><strong>Usage:</strong> <code>zeroclaw service install</code></p>
+<h2 id="zeroclaw-service-start"><a class="header" href="#zeroclaw-service-start"><code>zeroclaw service start</code></a></h2>
+<p>Start daemon service</p>
+<p><strong>Usage:</strong> <code>zeroclaw service start</code></p>
+<h2 id="zeroclaw-service-stop"><a class="header" href="#zeroclaw-service-stop"><code>zeroclaw service stop</code></a></h2>
+<p>Stop daemon service</p>
+<p><strong>Usage:</strong> <code>zeroclaw service stop</code></p>
+<h2 id="zeroclaw-service-restart"><a class="header" href="#zeroclaw-service-restart"><code>zeroclaw service restart</code></a></h2>
+<p>Restart daemon service to apply latest config</p>
+<p><strong>Usage:</strong> <code>zeroclaw service restart</code></p>
+<h2 id="zeroclaw-service-status"><a class="header" href="#zeroclaw-service-status"><code>zeroclaw service status</code></a></h2>
+<p>Check daemon service status</p>
+<p><strong>Usage:</strong> <code>zeroclaw service status</code></p>
+<h2 id="zeroclaw-service-uninstall"><a class="header" href="#zeroclaw-service-uninstall"><code>zeroclaw service uninstall</code></a></h2>
+<p>Uninstall daemon service unit</p>
+<p><strong>Usage:</strong> <code>zeroclaw service uninstall</code></p>
+<h2 id="zeroclaw-service-logs"><a class="header" href="#zeroclaw-service-logs"><code>zeroclaw service logs</code></a></h2>
+<p>Tail daemon service logs</p>
+<p><strong>Usage:</strong> <code>zeroclaw service logs [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li>
+<p><code>-n</code>, <code>--lines &lt;LINES&gt;</code> — Number of lines to show (default: 50)</p>
+<p>Default value: <code>50</code></p>
+</li>
+<li>
+<p><code>-f</code>, <code>--follow</code> — Follow log output (like tail -f)</p>
+</li>
+</ul>
+<h2 id="zeroclaw-doctor"><a class="header" href="#zeroclaw-doctor"><code>zeroclaw doctor</code></a></h2>
+<p>Run diagnostics for daemon/scheduler/channel freshness</p>
+<p><strong>Usage:</strong> <code>zeroclaw doctor [COMMAND]</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>models</code> — Probe model catalogs across providers and report availability</li>
+<li><code>traces</code> — Query runtime trace events (tool diagnostics and model replies)</li>
+</ul>
+<h2 id="zeroclaw-doctor-models"><a class="header" href="#zeroclaw-doctor-models"><code>zeroclaw doctor models</code></a></h2>
+<p>Probe model catalogs across providers and report availability</p>
+<p><strong>Usage:</strong> <code>zeroclaw doctor models [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--provider &lt;PROVIDER&gt;</code> — Probe a specific provider only (default: all known providers)</li>
+<li><code>--use-cache</code> — Prefer cached catalogs when available (skip forced live refresh)</li>
+</ul>
+<h2 id="zeroclaw-doctor-traces"><a class="header" href="#zeroclaw-doctor-traces"><code>zeroclaw doctor traces</code></a></h2>
+<p>Query runtime trace events (tool diagnostics and model replies)</p>
+<p><strong>Usage:</strong> <code>zeroclaw doctor traces [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li>
+<p><code>--id &lt;ID&gt;</code> — Show a specific trace event by id</p>
+</li>
+<li>
+<p><code>--event &lt;EVENT&gt;</code> — Filter list output by event type</p>
+</li>
+<li>
+<p><code>--contains &lt;CONTAINS&gt;</code> — Case-insensitive text match across message/payload</p>
+</li>
+<li>
+<p><code>--limit &lt;LIMIT&gt;</code> — Maximum number of events to display</p>
+<p>Default value: <code>20</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-status"><a class="header" href="#zeroclaw-status"><code>zeroclaw status</code></a></h2>
+<p>Show system status (full details)</p>
+<p><strong>Usage:</strong> <code>zeroclaw status [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--format &lt;FORMAT&gt;</code> — Output format: “exit-code” exits 0 if healthy, 1 otherwise (for Docker HEALTHCHECK)</li>
+</ul>
+<h2 id="zeroclaw-estop"><a class="header" href="#zeroclaw-estop"><code>zeroclaw estop</code></a></h2>
+<p>Engage, inspect, and resume emergency-stop states.</p>
+<p>Examples: - <code>zeroclaw estop</code> - <code>zeroclaw estop --level network-kill</code> - <code>zeroclaw estop --level domain-block --domain "*.chase.com"</code> - <code>zeroclaw estop --level tool-freeze --tool shell --tool browser</code> - <code>zeroclaw estop status</code> - <code>zeroclaw estop resume --network</code> - <code>zeroclaw estop resume --domain "*.chase.com"</code> - <code>zeroclaw estop resume --tool shell</code></p>
+<p><strong>Usage:</strong> <code>zeroclaw estop [OPTIONS] [COMMAND]</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>status</code> — Print current estop status</li>
+<li><code>resume</code> — Resume from an engaged estop level</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li>
+<p><code>--level &lt;LEVEL&gt;</code> — Level used when engaging estop from <code>zeroclaw estop</code></p>
+<p>Possible values: <code>kill-all</code>, <code>network-kill</code>, <code>domain-block</code>, <code>tool-freeze</code></p>
+</li>
+<li>
+<p><code>--domain &lt;DOMAINS&gt;</code> — Domain pattern(s) for <code>domain-block</code> (repeatable)</p>
+</li>
+<li>
+<p><code>--tool &lt;TOOLS&gt;</code> — Tool name(s) for <code>tool-freeze</code> (repeatable)</p>
+</li>
+</ul>
+<h2 id="zeroclaw-estop-status"><a class="header" href="#zeroclaw-estop-status"><code>zeroclaw estop status</code></a></h2>
+<p>Print current estop status</p>
+<p><strong>Usage:</strong> <code>zeroclaw estop status</code></p>
+<h2 id="zeroclaw-estop-resume"><a class="header" href="#zeroclaw-estop-resume"><code>zeroclaw estop resume</code></a></h2>
+<p>Resume from an engaged estop level</p>
+<p><strong>Usage:</strong> <code>zeroclaw estop resume [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--network</code> — Resume only network kill</li>
+<li><code>--domain &lt;DOMAINS&gt;</code> — Resume one or more blocked domain patterns</li>
+<li><code>--tool &lt;TOOLS&gt;</code> — Resume one or more frozen tools</li>
+<li><code>--otp &lt;OTP&gt;</code> — OTP code. If omitted and OTP is required, a prompt is shown</li>
+</ul>
+<h2 id="zeroclaw-cron"><a class="header" href="#zeroclaw-cron"><code>zeroclaw cron</code></a></h2>
+<p>Configure and manage scheduled tasks.</p>
+<p>Schedule recurring, one-shot, or interval-based tasks using cron expressions, RFC 3339 timestamps, durations, or fixed intervals.</p>
+<p>Cron expressions use the standard 5-field format: ‘min hour day month weekday’. Timezones default to UTC; override with –tz and an IANA timezone name.</p>
+<p>Examples:
+zeroclaw cron list
+zeroclaw cron add ‘0 9 * * 1-5’ ‘Good morning’ –tz America/New_York –agent
+zeroclaw cron add ‘*/30 * * * <em>’ ‘Check system health’ –agent
+zeroclaw cron add ‘</em>/5 * * * *’ ‘echo ok’
+zeroclaw cron add-at 2025-01-15T14:00:00Z ‘Send reminder’ –agent
+zeroclaw cron add-every 60000 ‘Ping heartbeat’
+zeroclaw cron once 30m ‘Run backup in 30 minutes’ –agent
+zeroclaw cron pause TASK_ID
+zeroclaw cron update TASK_ID –expression ‘0 8 * * *’ –tz Europe/London</p>
+<p><strong>Usage:</strong> <code>zeroclaw cron &lt;COMMAND&gt;</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>list</code> — List all scheduled tasks</li>
+<li><code>add</code> — Add a new scheduled task</li>
+<li><code>add-at</code> — Add a one-shot scheduled task at an RFC3339 timestamp</li>
+<li><code>add-every</code> — Add a fixed-interval scheduled task</li>
+<li><code>once</code> — Add a one-shot delayed task (e.g. “30m”, “2h”, “1d”)</li>
+<li><code>remove</code> — Remove a scheduled task</li>
+<li><code>update</code> — Update a scheduled task</li>
+<li><code>pause</code> — Pause a scheduled task</li>
+<li><code>resume</code> — Resume a paused task</li>
+</ul>
+<h2 id="zeroclaw-cron-list"><a class="header" href="#zeroclaw-cron-list"><code>zeroclaw cron list</code></a></h2>
+<p>List all scheduled tasks</p>
+<p><strong>Usage:</strong> <code>zeroclaw cron list</code></p>
+<h2 id="zeroclaw-cron-add"><a class="header" href="#zeroclaw-cron-add"><code>zeroclaw cron add</code></a></h2>
+<p>Add a new recurring scheduled task.</p>
+<p>Uses standard 5-field cron syntax: ‘min hour day month weekday’. Times are evaluated in UTC by default; use –tz with an IANA timezone name to override.</p>
+<p>Examples:
+zeroclaw cron add ‘0 9 * * 1-5’ ‘Good morning’ –tz America/New_York –agent
+zeroclaw cron add ‘*/30 * * * <em>’ ‘Check system health’ –agent
+zeroclaw cron add ‘</em>/5 * * * *’ ‘echo ok’</p>
+<p><strong>Usage:</strong> <code>zeroclaw cron add [OPTIONS] &lt;EXPRESSION&gt; &lt;COMMAND&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;EXPRESSION&gt;</code> — Cron expression</li>
+<li><code>&lt;COMMAND&gt;</code> — Command (shell) or prompt (agent) to run</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--tz &lt;TZ&gt;</code> — Optional IANA timezone (e.g. America/Los_Angeles)</li>
+<li><code>--agent</code> — Treat the argument as an agent prompt instead of a shell command</li>
+<li><code>--allowed-tool &lt;ALLOWED_TOOLS&gt;</code> — Restrict agent cron jobs to the specified tool names (repeatable, agent-only)</li>
+</ul>
+<h2 id="zeroclaw-cron-add-at"><a class="header" href="#zeroclaw-cron-add-at"><code>zeroclaw cron add-at</code></a></h2>
+<p>Add a one-shot task that fires at a specific UTC timestamp.</p>
+<p>The timestamp must be in RFC 3339 format (e.g. 2025-01-15T14:00:00Z).</p>
+<p>Examples:
+zeroclaw cron add-at 2025-01-15T14:00:00Z ‘Send reminder’
+zeroclaw cron add-at 2025-12-31T23:59:00Z ‘Happy New Year!’</p>
+<p><strong>Usage:</strong> <code>zeroclaw cron add-at [OPTIONS] &lt;AT&gt; &lt;COMMAND&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;AT&gt;</code> — One-shot timestamp in RFC3339 format</li>
+<li><code>&lt;COMMAND&gt;</code> — Command (shell) or prompt (agent) to run</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--agent</code> — Treat the argument as an agent prompt instead of a shell command</li>
+<li><code>--allowed-tool &lt;ALLOWED_TOOLS&gt;</code> — Restrict agent cron jobs to the specified tool names (repeatable, agent-only)</li>
+</ul>
+<h2 id="zeroclaw-cron-add-every"><a class="header" href="#zeroclaw-cron-add-every"><code>zeroclaw cron add-every</code></a></h2>
+<p>Add a task that repeats at a fixed interval.</p>
+<p>Interval is specified in milliseconds. For example, 60000 = 1 minute.</p>
+<p>Examples:
+zeroclaw cron add-every 60000 ‘Ping heartbeat’     # every minute
+zeroclaw cron add-every 3600000 ‘Hourly report’    # every hour</p>
+<p><strong>Usage:</strong> <code>zeroclaw cron add-every [OPTIONS] &lt;EVERY_MS&gt; &lt;COMMAND&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;EVERY_MS&gt;</code> — Interval in milliseconds</li>
+<li><code>&lt;COMMAND&gt;</code> — Command (shell) or prompt (agent) to run</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--agent</code> — Treat the argument as an agent prompt instead of a shell command</li>
+<li><code>--allowed-tool &lt;ALLOWED_TOOLS&gt;</code> — Restrict agent cron jobs to the specified tool names (repeatable, agent-only)</li>
+</ul>
+<h2 id="zeroclaw-cron-once"><a class="header" href="#zeroclaw-cron-once"><code>zeroclaw cron once</code></a></h2>
+<p>Add a one-shot task that fires after a delay from now.</p>
+<p>Accepts human-readable durations: s (seconds), m (minutes), h (hours), d (days).</p>
+<p>Examples:
+zeroclaw cron once 30m ‘Run backup in 30 minutes’
+zeroclaw cron once 2h ‘Follow up on deployment’
+zeroclaw cron once 1d ‘Daily check’</p>
+<p><strong>Usage:</strong> <code>zeroclaw cron once [OPTIONS] &lt;DELAY&gt; &lt;COMMAND&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;DELAY&gt;</code> — Delay duration</li>
+<li><code>&lt;COMMAND&gt;</code> — Command (shell) or prompt (agent) to run</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--agent</code> — Treat the argument as an agent prompt instead of a shell command</li>
+<li><code>--allowed-tool &lt;ALLOWED_TOOLS&gt;</code> — Restrict agent cron jobs to the specified tool names (repeatable, agent-only)</li>
+</ul>
+<h2 id="zeroclaw-cron-remove"><a class="header" href="#zeroclaw-cron-remove"><code>zeroclaw cron remove</code></a></h2>
+<p>Remove a scheduled task</p>
+<p><strong>Usage:</strong> <code>zeroclaw cron remove &lt;ID&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;ID&gt;</code> — Task ID</li>
+</ul>
+<h2 id="zeroclaw-cron-update"><a class="header" href="#zeroclaw-cron-update"><code>zeroclaw cron update</code></a></h2>
+<p>Update one or more fields of an existing scheduled task.</p>
+<p>Only the fields you specify are changed; others remain unchanged.</p>
+<p>Examples:
+zeroclaw cron update TASK_ID –expression ‘0 8 * * *’
+zeroclaw cron update TASK_ID –tz Europe/London –name ‘Morning check’
+zeroclaw cron update TASK_ID –command ‘Updated message’</p>
+<p><strong>Usage:</strong> <code>zeroclaw cron update [OPTIONS] &lt;ID&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;ID&gt;</code> — Task ID</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--expression &lt;EXPRESSION&gt;</code> — New cron expression</li>
+<li><code>--tz &lt;TZ&gt;</code> — New IANA timezone</li>
+<li><code>--command &lt;COMMAND&gt;</code> — New command to run</li>
+<li><code>--name &lt;NAME&gt;</code> — New job name</li>
+<li><code>--allowed-tool &lt;ALLOWED_TOOLS&gt;</code> — Replace the agent job allowlist with the specified tool names (repeatable)</li>
+</ul>
+<h2 id="zeroclaw-cron-pause"><a class="header" href="#zeroclaw-cron-pause"><code>zeroclaw cron pause</code></a></h2>
+<p>Pause a scheduled task</p>
+<p><strong>Usage:</strong> <code>zeroclaw cron pause &lt;ID&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;ID&gt;</code> — Task ID</li>
+</ul>
+<h2 id="zeroclaw-cron-resume"><a class="header" href="#zeroclaw-cron-resume"><code>zeroclaw cron resume</code></a></h2>
+<p>Resume a paused task</p>
+<p><strong>Usage:</strong> <code>zeroclaw cron resume &lt;ID&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;ID&gt;</code> — Task ID</li>
+</ul>
+<h2 id="zeroclaw-models"><a class="header" href="#zeroclaw-models"><code>zeroclaw models</code></a></h2>
+<p>Manage provider model catalogs</p>
+<p><strong>Usage:</strong> <code>zeroclaw models &lt;COMMAND&gt;</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>refresh</code> — Refresh and cache provider models</li>
+<li><code>list</code> — List cached models for a provider</li>
+<li><code>set</code> — Set the default model in config</li>
+<li><code>status</code> — Show current model configuration and cache status</li>
+</ul>
+<h2 id="zeroclaw-models-refresh"><a class="header" href="#zeroclaw-models-refresh"><code>zeroclaw models refresh</code></a></h2>
+<p>Refresh and cache provider models</p>
+<p><strong>Usage:</strong> <code>zeroclaw models refresh [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--provider &lt;PROVIDER&gt;</code> — Provider name (defaults to configured default provider)</li>
+<li><code>--all</code> — Refresh all providers that support live model discovery</li>
+<li><code>--force</code> — Force live refresh and ignore fresh cache</li>
+</ul>
+<h2 id="zeroclaw-models-list"><a class="header" href="#zeroclaw-models-list"><code>zeroclaw models list</code></a></h2>
+<p>List cached models for a provider</p>
+<p><strong>Usage:</strong> <code>zeroclaw models list [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--provider &lt;PROVIDER&gt;</code> — Provider name (defaults to configured default provider)</li>
+</ul>
+<h2 id="zeroclaw-models-set"><a class="header" href="#zeroclaw-models-set"><code>zeroclaw models set</code></a></h2>
+<p>Set the default model in config</p>
+<p><strong>Usage:</strong> <code>zeroclaw models set &lt;MODEL&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;MODEL&gt;</code> — Model name to set as default</li>
+</ul>
+<h2 id="zeroclaw-models-status"><a class="header" href="#zeroclaw-models-status"><code>zeroclaw models status</code></a></h2>
+<p>Show current model configuration and cache status</p>
+<p><strong>Usage:</strong> <code>zeroclaw models status</code></p>
+<h2 id="zeroclaw-providers"><a class="header" href="#zeroclaw-providers"><code>zeroclaw providers</code></a></h2>
+<p>List supported AI providers</p>
+<p><strong>Usage:</strong> <code>zeroclaw providers</code></p>
+<h2 id="zeroclaw-channel"><a class="header" href="#zeroclaw-channel"><code>zeroclaw channel</code></a></h2>
+<p>Manage communication channels.</p>
+<p>Add, remove, list, send, and health-check channels that connect ZeroClaw to messaging platforms. Supported channel types: telegram, discord, slack, whatsapp, matrix, imessage, email.</p>
+<p>Examples:
+zeroclaw channel list
+zeroclaw channel doctor
+zeroclaw channel add telegram ‘{“bot_token”:“…”,“name”:“my-bot”}’
+zeroclaw channel remove my-bot
+zeroclaw channel bind-telegram zeroclaw_user
+zeroclaw channel send ‘Alert!’ –channel-id telegram –recipient 123456789</p>
+<p><strong>Usage:</strong> <code>zeroclaw channel &lt;COMMAND&gt;</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>list</code> — List all configured channels</li>
+<li><code>start</code> — Start all configured channels (handled in main.rs for async)</li>
+<li><code>doctor</code> — Run health checks for configured channels (handled in main.rs for async)</li>
+<li><code>add</code> — Add a new channel configuration</li>
+<li><code>remove</code> — Remove a channel configuration</li>
+<li><code>bind-telegram</code> — Bind a Telegram identity (username or numeric user ID) into allowlist</li>
+<li><code>send</code> — Send a message to a configured channel</li>
+</ul>
+<h2 id="zeroclaw-channel-list"><a class="header" href="#zeroclaw-channel-list"><code>zeroclaw channel list</code></a></h2>
+<p>List all configured channels</p>
+<p><strong>Usage:</strong> <code>zeroclaw channel list</code></p>
+<h2 id="zeroclaw-channel-start"><a class="header" href="#zeroclaw-channel-start"><code>zeroclaw channel start</code></a></h2>
+<p>Start all configured channels (handled in main.rs for async)</p>
+<p><strong>Usage:</strong> <code>zeroclaw channel start</code></p>
+<h2 id="zeroclaw-channel-doctor"><a class="header" href="#zeroclaw-channel-doctor"><code>zeroclaw channel doctor</code></a></h2>
+<p>Run health checks for configured channels (handled in main.rs for async)</p>
+<p><strong>Usage:</strong> <code>zeroclaw channel doctor</code></p>
+<h2 id="zeroclaw-channel-add"><a class="header" href="#zeroclaw-channel-add"><code>zeroclaw channel add</code></a></h2>
+<p>Add a new channel configuration.</p>
+<p>Provide the channel type and a JSON object with the required configuration keys for that channel type.</p>
+<p>Supported types: telegram, discord, slack, whatsapp, matrix, imessage, email.</p>
+<p>Examples:
+zeroclaw channel add telegram ‘{“bot_token”:“…”,“name”:“my-bot”}’
+zeroclaw channel add discord ‘{“bot_token”:“…”,“name”:“my-discord”}’</p>
+<p><strong>Usage:</strong> <code>zeroclaw channel add &lt;CHANNEL_TYPE&gt; &lt;CONFIG&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;CHANNEL_TYPE&gt;</code> — Channel type (telegram, discord, slack, whatsapp, matrix, imessage, email)</li>
+<li><code>&lt;CONFIG&gt;</code> — Optional configuration as JSON</li>
+</ul>
+<h2 id="zeroclaw-channel-remove"><a class="header" href="#zeroclaw-channel-remove"><code>zeroclaw channel remove</code></a></h2>
+<p>Remove a channel configuration</p>
+<p><strong>Usage:</strong> <code>zeroclaw channel remove &lt;NAME&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;NAME&gt;</code> — Channel name to remove</li>
+</ul>
+<h2 id="zeroclaw-channel-bind-telegram"><a class="header" href="#zeroclaw-channel-bind-telegram"><code>zeroclaw channel bind-telegram</code></a></h2>
+<p>Bind a Telegram identity into the allowlist.</p>
+<p>Adds a Telegram username (without the ‘@’ prefix) or numeric user ID to the channel allowlist so the agent will respond to messages from that identity.</p>
+<p>Examples:
+zeroclaw channel bind-telegram zeroclaw_user
+zeroclaw channel bind-telegram 123456789</p>
+<p><strong>Usage:</strong> <code>zeroclaw channel bind-telegram &lt;IDENTITY&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;IDENTITY&gt;</code> — Telegram identity to allow (username without ‘@’ or numeric user ID)</li>
+</ul>
+<h2 id="zeroclaw-channel-send"><a class="header" href="#zeroclaw-channel-send"><code>zeroclaw channel send</code></a></h2>
+<p>Send a one-off message to a configured channel.</p>
+<p>Sends a text message through the specified channel without starting the full agent loop. Useful for scripted notifications, hardware sensor alerts, and automation pipelines.</p>
+<p>The –channel-id selects the channel by its config section name (e.g. ‘telegram’, ‘discord’, ‘slack’). The –recipient is the platform-specific destination (e.g. a Telegram chat ID).</p>
+<p>Examples:
+zeroclaw channel send ‘Someone is near your device.’ –channel-id telegram –recipient 123456789
+zeroclaw channel send ‘Build succeeded!’ –channel-id discord –recipient 987654321</p>
+<p><strong>Usage:</strong> <code>zeroclaw channel send --channel-id &lt;CHANNEL_ID&gt; --recipient &lt;RECIPIENT&gt; &lt;MESSAGE&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;MESSAGE&gt;</code> — Message text to send</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--channel-id &lt;CHANNEL_ID&gt;</code> — Channel config name (e.g. telegram, discord, slack)</li>
+<li><code>--recipient &lt;RECIPIENT&gt;</code> — Recipient identifier (platform-specific, e.g. Telegram chat ID)</li>
+</ul>
+<h2 id="zeroclaw-integrations"><a class="header" href="#zeroclaw-integrations"><code>zeroclaw integrations</code></a></h2>
+<p>Browse 50+ integrations</p>
+<p><strong>Usage:</strong> <code>zeroclaw integrations &lt;COMMAND&gt;</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>info</code> — Show details about a specific integration</li>
+</ul>
+<h2 id="zeroclaw-integrations-info"><a class="header" href="#zeroclaw-integrations-info"><code>zeroclaw integrations info</code></a></h2>
+<p>Show details about a specific integration</p>
+<p><strong>Usage:</strong> <code>zeroclaw integrations info &lt;NAME&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;NAME&gt;</code> — Integration name</li>
+</ul>
+<h2 id="zeroclaw-skills"><a class="header" href="#zeroclaw-skills"><code>zeroclaw skills</code></a></h2>
+<p>Manage skills (user-defined capabilities)</p>
+<p><strong>Usage:</strong> <code>zeroclaw skills &lt;COMMAND&gt;</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>list</code> — List all installed skills</li>
+<li><code>audit</code> — Audit a skill source directory or installed skill name</li>
+<li><code>install</code> — Install a new skill from a URL or local path</li>
+<li><code>remove</code> — Remove an installed skill</li>
+<li><code>test</code> — Run TEST.sh validation for a skill (or all skills)</li>
+</ul>
+<h2 id="zeroclaw-skills-list"><a class="header" href="#zeroclaw-skills-list"><code>zeroclaw skills list</code></a></h2>
+<p>List all installed skills</p>
+<p><strong>Usage:</strong> <code>zeroclaw skills list</code></p>
+<h2 id="zeroclaw-skills-audit"><a class="header" href="#zeroclaw-skills-audit"><code>zeroclaw skills audit</code></a></h2>
+<p>Audit a skill source directory or installed skill name</p>
+<p><strong>Usage:</strong> <code>zeroclaw skills audit &lt;SOURCE&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;SOURCE&gt;</code> — Skill path or installed skill name</li>
+</ul>
+<h2 id="zeroclaw-skills-install"><a class="header" href="#zeroclaw-skills-install"><code>zeroclaw skills install</code></a></h2>
+<p>Install a new skill from a URL or local path</p>
+<p><strong>Usage:</strong> <code>zeroclaw skills install &lt;SOURCE&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;SOURCE&gt;</code> — Source URL or local path</li>
+</ul>
+<h2 id="zeroclaw-skills-remove"><a class="header" href="#zeroclaw-skills-remove"><code>zeroclaw skills remove</code></a></h2>
+<p>Remove an installed skill</p>
+<p><strong>Usage:</strong> <code>zeroclaw skills remove &lt;NAME&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;NAME&gt;</code> — Skill name to remove</li>
+</ul>
+<h2 id="zeroclaw-skills-test"><a class="header" href="#zeroclaw-skills-test"><code>zeroclaw skills test</code></a></h2>
+<p>Run TEST.sh validation for a skill (or all skills)</p>
+<p><strong>Usage:</strong> <code>zeroclaw skills test [OPTIONS] [NAME]</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;NAME&gt;</code> — Skill name to test; omit for all skills</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--verbose</code> — Show verbose output</li>
+</ul>
+<h2 id="zeroclaw-sop"><a class="header" href="#zeroclaw-sop"><code>zeroclaw sop</code></a></h2>
+<p>Manage standard operating procedures (SOPs)</p>
+<p><strong>Usage:</strong> <code>zeroclaw sop &lt;COMMAND&gt;</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>list</code> — List loaded SOPs</li>
+<li><code>validate</code> — Validate SOP definitions</li>
+<li><code>show</code> — Show details of an SOP</li>
+</ul>
+<h2 id="zeroclaw-sop-list"><a class="header" href="#zeroclaw-sop-list"><code>zeroclaw sop list</code></a></h2>
+<p>List loaded SOPs</p>
+<p><strong>Usage:</strong> <code>zeroclaw sop list</code></p>
+<h2 id="zeroclaw-sop-validate"><a class="header" href="#zeroclaw-sop-validate"><code>zeroclaw sop validate</code></a></h2>
+<p>Validate SOP definitions</p>
+<p><strong>Usage:</strong> <code>zeroclaw sop validate [NAME]</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;NAME&gt;</code> — SOP name to validate (all if omitted)</li>
+</ul>
+<h2 id="zeroclaw-sop-show"><a class="header" href="#zeroclaw-sop-show"><code>zeroclaw sop show</code></a></h2>
+<p>Show details of an SOP</p>
+<p><strong>Usage:</strong> <code>zeroclaw sop show &lt;NAME&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;NAME&gt;</code> — Name of the SOP to show</li>
+</ul>
+<h2 id="zeroclaw-migrate"><a class="header" href="#zeroclaw-migrate"><code>zeroclaw migrate</code></a></h2>
+<p>Migrate data from other agent runtimes</p>
+<p><strong>Usage:</strong> <code>zeroclaw migrate &lt;COMMAND&gt;</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>openclaw</code> — Import memory from an <code>OpenClaw</code> workspace into this <code>ZeroClaw</code> workspace</li>
+</ul>
+<h2 id="zeroclaw-migrate-openclaw"><a class="header" href="#zeroclaw-migrate-openclaw"><code>zeroclaw migrate openclaw</code></a></h2>
+<p>Import memory from an <code>OpenClaw</code> workspace into this <code>ZeroClaw</code> workspace</p>
+<p><strong>Usage:</strong> <code>zeroclaw migrate openclaw [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--source &lt;SOURCE&gt;</code> — Optional path to <code>OpenClaw</code> workspace (defaults to ~/.openclaw/workspace)</li>
+<li><code>--dry-run</code> — Validate and preview migration without writing any data</li>
+</ul>
+<h2 id="zeroclaw-auth"><a class="header" href="#zeroclaw-auth"><code>zeroclaw auth</code></a></h2>
+<p>Manage provider subscription authentication profiles</p>
+<p><strong>Usage:</strong> <code>zeroclaw auth &lt;COMMAND&gt;</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>login</code> — Login with OAuth (OpenAI Codex or Gemini)</li>
+<li><code>paste-redirect</code> — Complete OAuth by pasting redirect URL or auth code</li>
+<li><code>paste-token</code> — Paste setup token / auth token (for Anthropic subscription auth)</li>
+<li><code>setup-token</code> — Alias for <code>paste-token</code> (interactive by default)</li>
+<li><code>refresh</code> — Refresh OpenAI Codex access token using refresh token</li>
+<li><code>logout</code> — Remove auth profile</li>
+<li><code>use</code> — Set active profile for a provider</li>
+<li><code>list</code> — List auth profiles</li>
+<li><code>status</code> — Show auth status with active profile and token expiry info</li>
+</ul>
+<h2 id="zeroclaw-auth-login"><a class="header" href="#zeroclaw-auth-login"><code>zeroclaw auth login</code></a></h2>
+<p>Login with OAuth (OpenAI Codex or Gemini)</p>
+<p><strong>Usage:</strong> <code>zeroclaw auth login [OPTIONS] --provider &lt;PROVIDER&gt;</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li>
+<p><code>--provider &lt;PROVIDER&gt;</code> — Provider (<code>openai-codex</code> or <code>gemini</code>)</p>
+</li>
+<li>
+<p><code>--profile &lt;PROFILE&gt;</code> — Profile name (default: default)</p>
+<p>Default value: <code>default</code></p>
+</li>
+<li>
+<p><code>--device-code</code> — Use OAuth device-code flow</p>
+</li>
+<li>
+<p><code>--import &lt;PATH&gt;</code> — Import an existing auth.json file instead of starting a new login flow. Currently supports only <code>openai-codex</code>; Codex defaults to <code>~/.codex/auth.json</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-auth-paste-redirect"><a class="header" href="#zeroclaw-auth-paste-redirect"><code>zeroclaw auth paste-redirect</code></a></h2>
+<p>Complete OAuth by pasting redirect URL or auth code</p>
+<p><strong>Usage:</strong> <code>zeroclaw auth paste-redirect [OPTIONS] --provider &lt;PROVIDER&gt;</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li>
+<p><code>--provider &lt;PROVIDER&gt;</code> — Provider (<code>openai-codex</code>)</p>
+</li>
+<li>
+<p><code>--profile &lt;PROFILE&gt;</code> — Profile name (default: default)</p>
+<p>Default value: <code>default</code></p>
+</li>
+<li>
+<p><code>--input &lt;INPUT&gt;</code> — Full redirect URL or raw OAuth code</p>
+</li>
+</ul>
+<h2 id="zeroclaw-auth-paste-token"><a class="header" href="#zeroclaw-auth-paste-token"><code>zeroclaw auth paste-token</code></a></h2>
+<p>Paste setup token / auth token (for Anthropic subscription auth)</p>
+<p><strong>Usage:</strong> <code>zeroclaw auth paste-token [OPTIONS] --provider &lt;PROVIDER&gt;</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li>
+<p><code>--provider &lt;PROVIDER&gt;</code> — Provider (<code>anthropic</code>)</p>
+</li>
+<li>
+<p><code>--profile &lt;PROFILE&gt;</code> — Profile name (default: default)</p>
+<p>Default value: <code>default</code></p>
+</li>
+<li>
+<p><code>--token &lt;TOKEN&gt;</code> — Token value (if omitted, read interactively)</p>
+</li>
+<li>
+<p><code>--auth-kind &lt;AUTH_KIND&gt;</code> — Auth kind override (<code>authorization</code> or <code>api-key</code>)</p>
+</li>
+</ul>
+<h2 id="zeroclaw-auth-setup-token"><a class="header" href="#zeroclaw-auth-setup-token"><code>zeroclaw auth setup-token</code></a></h2>
+<p>Alias for <code>paste-token</code> (interactive by default)</p>
+<p><strong>Usage:</strong> <code>zeroclaw auth setup-token [OPTIONS] --provider &lt;PROVIDER&gt;</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li>
+<p><code>--provider &lt;PROVIDER&gt;</code> — Provider (<code>anthropic</code>)</p>
+</li>
+<li>
+<p><code>--profile &lt;PROFILE&gt;</code> — Profile name (default: default)</p>
+<p>Default value: <code>default</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-auth-refresh"><a class="header" href="#zeroclaw-auth-refresh"><code>zeroclaw auth refresh</code></a></h2>
+<p>Refresh OpenAI Codex access token using refresh token</p>
+<p><strong>Usage:</strong> <code>zeroclaw auth refresh [OPTIONS] --provider &lt;PROVIDER&gt;</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--provider &lt;PROVIDER&gt;</code> — Provider (<code>openai-codex</code>)</li>
+<li><code>--profile &lt;PROFILE&gt;</code> — Profile name or profile id</li>
+</ul>
+<h2 id="zeroclaw-auth-logout"><a class="header" href="#zeroclaw-auth-logout"><code>zeroclaw auth logout</code></a></h2>
+<p>Remove auth profile</p>
+<p><strong>Usage:</strong> <code>zeroclaw auth logout [OPTIONS] --provider &lt;PROVIDER&gt;</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li>
+<p><code>--provider &lt;PROVIDER&gt;</code> — Provider</p>
+</li>
+<li>
+<p><code>--profile &lt;PROFILE&gt;</code> — Profile name (default: default)</p>
+<p>Default value: <code>default</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-auth-use"><a class="header" href="#zeroclaw-auth-use"><code>zeroclaw auth use</code></a></h2>
+<p>Set active profile for a provider</p>
+<p><strong>Usage:</strong> <code>zeroclaw auth use --provider &lt;PROVIDER&gt; --profile &lt;PROFILE&gt;</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--provider &lt;PROVIDER&gt;</code> — Provider</li>
+<li><code>--profile &lt;PROFILE&gt;</code> — Profile name or full profile id</li>
+</ul>
+<h2 id="zeroclaw-auth-list"><a class="header" href="#zeroclaw-auth-list"><code>zeroclaw auth list</code></a></h2>
+<p>List auth profiles</p>
+<p><strong>Usage:</strong> <code>zeroclaw auth list</code></p>
+<h2 id="zeroclaw-auth-status"><a class="header" href="#zeroclaw-auth-status"><code>zeroclaw auth status</code></a></h2>
+<p>Show auth status with active profile and token expiry info</p>
+<p><strong>Usage:</strong> <code>zeroclaw auth status</code></p>
+<h2 id="zeroclaw-hardware"><a class="header" href="#zeroclaw-hardware"><code>zeroclaw hardware</code></a></h2>
+<p>Discover and introspect USB hardware.</p>
+<p>Enumerate connected USB devices, identify known development boards (STM32 Nucleo, Arduino, ESP32), and retrieve chip information via probe-rs / ST-Link.</p>
+<p>Examples:
+zeroclaw hardware discover
+zeroclaw hardware introspect /dev/ttyACM0
+zeroclaw hardware info –chip STM32F401RETx</p>
+<p><strong>Usage:</strong> <code>zeroclaw hardware &lt;COMMAND&gt;</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>discover</code> — Enumerate USB devices (VID/PID) and show known boards</li>
+<li><code>introspect</code> — Introspect a device by path (e.g. /dev/ttyACM0)</li>
+<li><code>info</code> — Get chip info via USB (probe-rs over ST-Link). No firmware needed on target</li>
+</ul>
+<h2 id="zeroclaw-hardware-discover"><a class="header" href="#zeroclaw-hardware-discover"><code>zeroclaw hardware discover</code></a></h2>
+<p>Enumerate USB devices and show known boards.</p>
+<p>Scans connected USB devices by VID/PID and matches them against known development boards (STM32 Nucleo, Arduino, ESP32).</p>
+<p>Examples:
+zeroclaw hardware discover</p>
+<p><strong>Usage:</strong> <code>zeroclaw hardware discover</code></p>
+<h2 id="zeroclaw-hardware-introspect"><a class="header" href="#zeroclaw-hardware-introspect"><code>zeroclaw hardware introspect</code></a></h2>
+<p>Introspect a device by its serial or device path.</p>
+<p>Opens the specified device path and queries for board information, firmware version, and supported capabilities.</p>
+<p>Examples:
+zeroclaw hardware introspect /dev/ttyACM0
+zeroclaw hardware introspect COM3</p>
+<p><strong>Usage:</strong> <code>zeroclaw hardware introspect &lt;PATH&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;PATH&gt;</code> — Serial or device path</li>
+</ul>
+<h2 id="zeroclaw-hardware-info"><a class="header" href="#zeroclaw-hardware-info"><code>zeroclaw hardware info</code></a></h2>
+<p>Get chip info via USB using probe-rs over ST-Link.</p>
+<p>Queries the target MCU directly through the debug probe without requiring any firmware on the target board.</p>
+<p>Examples:
+zeroclaw hardware info
+zeroclaw hardware info –chip STM32F401RETx</p>
+<p><strong>Usage:</strong> <code>zeroclaw hardware info [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li>
+<p><code>--chip &lt;CHIP&gt;</code> — Chip name (e.g. STM32F401RETx). Default: STM32F401RETx for Nucleo-F401RE</p>
+<p>Default value: <code>STM32F401RETx</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-peripheral"><a class="header" href="#zeroclaw-peripheral"><code>zeroclaw peripheral</code></a></h2>
+<p>Manage hardware peripherals.</p>
+<p>Add, list, flash, and configure hardware boards that expose tools to the agent (GPIO, sensors, actuators). Supported boards: nucleo-f401re, rpi-gpio, esp32, arduino-uno.</p>
+<p>Examples:
+zeroclaw peripheral list
+zeroclaw peripheral add nucleo-f401re /dev/ttyACM0
+zeroclaw peripheral add rpi-gpio native
+zeroclaw peripheral flash –port /dev/cu.usbmodem12345
+zeroclaw peripheral flash-nucleo</p>
+<p><strong>Usage:</strong> <code>zeroclaw peripheral &lt;COMMAND&gt;</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>list</code> — List configured peripherals</li>
+<li><code>add</code> — Add a peripheral (board path, e.g. nucleo-f401re /dev/ttyACM0)</li>
+<li><code>flash</code> — Flash ZeroClaw firmware to Arduino (creates .ino, installs arduino-cli if needed, uploads)</li>
+<li><code>setup-uno-q</code> — Setup Arduino Uno Q Bridge app (deploy GPIO bridge for agent control)</li>
+<li><code>flash-nucleo</code> — Flash ZeroClaw firmware to Nucleo-F401RE (builds + probe-rs run)</li>
+</ul>
+<h2 id="zeroclaw-peripheral-list"><a class="header" href="#zeroclaw-peripheral-list"><code>zeroclaw peripheral list</code></a></h2>
+<p>List configured peripherals</p>
+<p><strong>Usage:</strong> <code>zeroclaw peripheral list</code></p>
+<h2 id="zeroclaw-peripheral-add"><a class="header" href="#zeroclaw-peripheral-add"><code>zeroclaw peripheral add</code></a></h2>
+<p>Add a peripheral by board type and transport path.</p>
+<p>Registers a hardware board so the agent can use its tools (GPIO, sensors, actuators). Use ‘native’ as path for local GPIO on single-board computers like Raspberry Pi.</p>
+<p>Supported boards: nucleo-f401re, rpi-gpio, esp32, arduino-uno.</p>
+<p>Examples:
+zeroclaw peripheral add nucleo-f401re /dev/ttyACM0
+zeroclaw peripheral add rpi-gpio native
+zeroclaw peripheral add esp32 /dev/ttyUSB0</p>
+<p><strong>Usage:</strong> <code>zeroclaw peripheral add &lt;BOARD&gt; &lt;PATH&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;BOARD&gt;</code> — Board type (nucleo-f401re, rpi-gpio, esp32)</li>
+<li><code>&lt;PATH&gt;</code> — Path for serial transport (/dev/ttyACM0) or “native” for local GPIO</li>
+</ul>
+<h2 id="zeroclaw-peripheral-flash"><a class="header" href="#zeroclaw-peripheral-flash"><code>zeroclaw peripheral flash</code></a></h2>
+<p>Flash ZeroClaw firmware to an Arduino board.</p>
+<p>Generates the .ino sketch, installs arduino-cli if it is not already available, compiles, and uploads the firmware.</p>
+<p>Examples:
+zeroclaw peripheral flash
+zeroclaw peripheral flash –port /dev/cu.usbmodem12345
+zeroclaw peripheral flash -p COM3</p>
+<p><strong>Usage:</strong> <code>zeroclaw peripheral flash [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>-p</code>, <code>--port &lt;PORT&gt;</code> — Serial port (e.g. /dev/cu.usbmodem12345). If omitted, uses first arduino-uno from config</li>
+</ul>
+<h2 id="zeroclaw-peripheral-setup-uno-q"><a class="header" href="#zeroclaw-peripheral-setup-uno-q"><code>zeroclaw peripheral setup-uno-q</code></a></h2>
+<p>Setup Arduino Uno Q Bridge app (deploy GPIO bridge for agent control)</p>
+<p><strong>Usage:</strong> <code>zeroclaw peripheral setup-uno-q [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--host &lt;HOST&gt;</code> — Uno Q IP (e.g. 192.168.0.48). If omitted, assumes running ON the Uno Q</li>
+</ul>
+<h2 id="zeroclaw-peripheral-flash-nucleo"><a class="header" href="#zeroclaw-peripheral-flash-nucleo"><code>zeroclaw peripheral flash-nucleo</code></a></h2>
+<p>Flash ZeroClaw firmware to Nucleo-F401RE (builds + probe-rs run)</p>
+<p><strong>Usage:</strong> <code>zeroclaw peripheral flash-nucleo</code></p>
+<h2 id="zeroclaw-memory"><a class="header" href="#zeroclaw-memory"><code>zeroclaw memory</code></a></h2>
+<p>Manage agent memory entries.</p>
+<p>List, inspect, and clear memory entries stored by the agent. Supports filtering by category and session, pagination, and batch clearing with confirmation.</p>
+<p>Examples:
+zeroclaw memory stats
+zeroclaw memory list
+zeroclaw memory list –category core –limit 10
+zeroclaw memory get KEY
+zeroclaw memory clear –category conversation –yes</p>
+<p><strong>Usage:</strong> <code>zeroclaw memory &lt;COMMAND&gt;</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>list</code> — List memory entries with optional filters</li>
+<li><code>get</code> — Get a specific memory entry by key</li>
+<li><code>stats</code> — Show memory backend statistics and health</li>
+<li><code>clear</code> — Clear memories by category, by key, or clear all</li>
+<li><code>reindex</code> — Rebuild backend indexes: FTS tables + any missing embedding vectors</li>
+</ul>
+<h2 id="zeroclaw-memory-list"><a class="header" href="#zeroclaw-memory-list"><code>zeroclaw memory list</code></a></h2>
+<p>List memory entries with optional filters</p>
+<p><strong>Usage:</strong> <code>zeroclaw memory list [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li>
+<p><code>--category &lt;CATEGORY&gt;</code></p>
+</li>
+<li>
+<p><code>--session &lt;SESSION&gt;</code></p>
+</li>
+<li>
+<p><code>--limit &lt;LIMIT&gt;</code></p>
+<p>Default value: <code>50</code></p>
+</li>
+<li>
+<p><code>--offset &lt;OFFSET&gt;</code></p>
+<p>Default value: <code>0</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-memory-get"><a class="header" href="#zeroclaw-memory-get"><code>zeroclaw memory get</code></a></h2>
+<p>Get a specific memory entry by key</p>
+<p><strong>Usage:</strong> <code>zeroclaw memory get &lt;KEY&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;KEY&gt;</code></li>
+</ul>
+<h2 id="zeroclaw-memory-stats"><a class="header" href="#zeroclaw-memory-stats"><code>zeroclaw memory stats</code></a></h2>
+<p>Show memory backend statistics and health</p>
+<p><strong>Usage:</strong> <code>zeroclaw memory stats</code></p>
+<h2 id="zeroclaw-memory-clear"><a class="header" href="#zeroclaw-memory-clear"><code>zeroclaw memory clear</code></a></h2>
+<p>Clear memories by category, by key, or clear all</p>
+<p><strong>Usage:</strong> <code>zeroclaw memory clear [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--key &lt;KEY&gt;</code> — Delete a single entry by key (supports prefix match)</li>
+<li><code>--category &lt;CATEGORY&gt;</code></li>
+<li><code>--yes</code> — Skip confirmation prompt</li>
+</ul>
+<h2 id="zeroclaw-memory-reindex"><a class="header" href="#zeroclaw-memory-reindex"><code>zeroclaw memory reindex</code></a></h2>
+<p>Rebuild backend indexes: FTS tables + any missing embedding vectors.</p>
+<p>Run after <code>zeroclaw migrate openclaw</code> or other bulk writes that land rows with <code>embedding = NULL</code>. Safe to re-run; only touches entries whose vector is missing. No-op for backends without a vector index.</p>
+<p><strong>Usage:</strong> <code>zeroclaw memory reindex</code></p>
+<h2 id="zeroclaw-config"><a class="header" href="#zeroclaw-config"><code>zeroclaw config</code></a></h2>
+<p>Manage ZeroClaw configuration.</p>
+<p>View, set, or initialize config properties by dotted path. Use ‘schema’ to dump the full JSON Schema for the config file.</p>
+<p>Properties are addressed by dotted path (e.g. channels.matrix.mention-only).
+Secret fields (API keys, tokens) automatically use masked input.
+Enum fields offer interactive selection when value is omitted.</p>
+<p>Examples:
+zeroclaw config list                                  # list all properties
+zeroclaw config list –secrets                        # list only secrets
+zeroclaw config list –filter channels.matrix         # filter by prefix
+zeroclaw config get channels.matrix.mention-only      # get a value
+zeroclaw config set channels.matrix.mention-only true # set a value
+zeroclaw config set channels.matrix.access-token      # secret: masked input
+zeroclaw config set channels.matrix.stream-mode       # enum: interactive select
+zeroclaw config init channels.matrix                  # init section with defaults
+zeroclaw config schema                                # print JSON Schema to stdout
+zeroclaw config schema &gt; schema.json</p>
+<p>Property path tab completion is included automatically in <code>zeroclaw completions &lt;shell&gt;</code>.</p>
+<p><strong>Usage:</strong> <code>zeroclaw config &lt;COMMAND&gt;</code></p>
+<p><strong>Subcommands:</strong></p>
+<ul>
+<li><code>schema</code> — Dump the full configuration JSON Schema to stdout. With <code>--path</code>, returns the schema fragment for that property only — same payload <code>OPTIONS /api/config/prop?path=...</code> returns over HTTP</li>
+<li><code>list</code> — List all config properties with current values</li>
+<li><code>get</code> — Get a config property value</li>
+<li><code>set</code> — Set a config property (secret fields auto-prompt for masked input)</li>
+<li><code>init</code> — Initialize unconfigured sections with defaults (enabled=false)</li>
+<li><code>migrate</code> — Migrate config.toml to the current schema version on disk (preserves comments)</li>
+<li><code>patch</code> — Apply a JSON Patch (RFC 6902) document atomically. Mirrors <code>PATCH /api/config</code></li>
+<li><code>docs</code> — Print the API explorer URL (plus a hint if the daemon isn’t running)</li>
+</ul>
+<h2 id="zeroclaw-config-schema"><a class="header" href="#zeroclaw-config-schema"><code>zeroclaw config schema</code></a></h2>
+<p>Dump the full configuration JSON Schema to stdout. With <code>--path</code>, returns the schema fragment for that property only — same payload <code>OPTIONS /api/config/prop?path=...</code> returns over HTTP</p>
+<p><strong>Usage:</strong> <code>zeroclaw config schema [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--path &lt;PATH&gt;</code> — Property path to scope the schema dump (e.g. <code>providers.fallback</code>). Without it, dumps the whole-config schema</li>
+</ul>
+<h2 id="zeroclaw-config-list"><a class="header" href="#zeroclaw-config-list"><code>zeroclaw config list</code></a></h2>
+<p>List all config properties with current values</p>
+<p><strong>Usage:</strong> <code>zeroclaw config list [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>-f</code>, <code>--filter &lt;FILTER&gt;</code> — Filter by path prefix (e.g. “channels.telegram”)</li>
+<li><code>--secrets</code> — Show only secret (encrypted) fields</li>
+</ul>
+<h2 id="zeroclaw-config-get"><a class="header" href="#zeroclaw-config-get"><code>zeroclaw config get</code></a></h2>
+<p>Get a config property value</p>
+<p><strong>Usage:</strong> <code>zeroclaw config get [OPTIONS] &lt;PATH&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;PATH&gt;</code> — Property path (e.g. channels.telegram.mention-only)</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--json</code> — Emit a structured JSON envelope ({path, value} or {path, populated}) instead of plain text</li>
+</ul>
+<h2 id="zeroclaw-config-set"><a class="header" href="#zeroclaw-config-set"><code>zeroclaw config set</code></a></h2>
+<p>Set a config property (secret fields auto-prompt for masked input)</p>
+<p><strong>Usage:</strong> <code>zeroclaw config set [OPTIONS] &lt;PATH&gt; [VALUE]</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;PATH&gt;</code> — Property path</li>
+<li><code>&lt;VALUE&gt;</code> — New value (omit for secret fields to get masked input)</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--no-interactive</code> — Skip interactive prompts — require value on command line, accept raw strings for enums</li>
+<li><code>--comment &lt;COMMENT&gt;</code> — Optional comment to write alongside the value in TOML (preserves through future edits)</li>
+<li><code>--json</code> — Emit a structured JSON envelope on success</li>
+</ul>
+<h2 id="zeroclaw-config-init"><a class="header" href="#zeroclaw-config-init"><code>zeroclaw config init</code></a></h2>
+<p>Initialize unconfigured sections with defaults (enabled=false)</p>
+<p><strong>Usage:</strong> <code>zeroclaw config init [OPTIONS] [SECTION]</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;SECTION&gt;</code> — Section prefix (e.g. channels.matrix). Omit to init all</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--json</code> — Emit a structured JSON envelope ({initialized: […]}) instead of plain text</li>
+</ul>
+<h2 id="zeroclaw-config-migrate"><a class="header" href="#zeroclaw-config-migrate"><code>zeroclaw config migrate</code></a></h2>
+<p>Migrate config.toml to the current schema version on disk (preserves comments)</p>
+<p><strong>Usage:</strong> <code>zeroclaw config migrate [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--json</code> — Emit a structured JSON envelope ({migrated, backup_path?, schema_version}) instead of plain text</li>
+</ul>
+<h2 id="zeroclaw-config-patch"><a class="header" href="#zeroclaw-config-patch"><code>zeroclaw config patch</code></a></h2>
+<p>Apply a JSON Patch (RFC 6902) document atomically. Mirrors <code>PATCH /api/config</code>.</p>
+<p>Reads operations from the given file, or from stdin when path is <code>-</code> or omitted. Supported ops: <code>add</code>, <code>replace</code>, <code>remove</code>, <code>test</code>. <code>move</code> and <code>copy</code> are rejected.</p>
+<p><strong>Usage:</strong> <code>zeroclaw config patch [OPTIONS] [INPUT]</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li><code>&lt;INPUT&gt;</code> — Path to a JSON Patch document, or <code>-</code> for stdin (default)</li>
+</ul>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--json</code> — Print results as JSON (one object per applied op) instead of human-readable text</li>
+</ul>
+<h2 id="zeroclaw-config-docs"><a class="header" href="#zeroclaw-config-docs"><code>zeroclaw config docs</code></a></h2>
+<p>Print the API explorer URL (plus a hint if the daemon isn’t running)</p>
+<p><strong>Usage:</strong> <code>zeroclaw config docs</code></p>
+<h2 id="zeroclaw-update"><a class="header" href="#zeroclaw-update"><code>zeroclaw update</code></a></h2>
+<p>Check for and apply ZeroClaw updates.</p>
+<p>By default, downloads and installs the latest release with a 6-phase pipeline: preflight, download, backup, validate, swap, and smoke test. Automatic rollback on failure.</p>
+<p>Use –check to only check for updates without installing.
+Use –force to skip the confirmation prompt.
+Use –version to target a specific release instead of latest.</p>
+<p>Examples:
+zeroclaw update                      # download and install latest
+zeroclaw update –check              # check only, don’t install
+zeroclaw update –force              # install without confirmation
+zeroclaw update –version 0.6.0      # install specific version</p>
+<p><strong>Usage:</strong> <code>zeroclaw update [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--check</code> — Only check for updates, don’t install</li>
+<li><code>--force</code> — Skip confirmation prompt</li>
+<li><code>--version &lt;VERSION&gt;</code> — Target version (default: latest)</li>
+</ul>
+<h2 id="zeroclaw-self-test"><a class="header" href="#zeroclaw-self-test"><code>zeroclaw self-test</code></a></h2>
+<p>Run diagnostic self-tests to verify the ZeroClaw installation.</p>
+<p>By default, runs the full test suite including network checks (gateway health, memory round-trip). Use –quick to skip network checks for faster offline validation.</p>
+<p>Examples:
+zeroclaw self-test             # full suite
+zeroclaw self-test –quick     # quick checks only (no network)</p>
+<p><strong>Usage:</strong> <code>zeroclaw self-test [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--quick</code> — Run quick checks only (no network)</li>
+</ul>
+<h2 id="zeroclaw-completions"><a class="header" href="#zeroclaw-completions"><code>zeroclaw completions</code></a></h2>
+<p>Generate shell completion scripts for <code>zeroclaw</code>.</p>
+<p>The script is printed to stdout so it can be sourced directly:</p>
+<p>Examples (Unix shells):
+source &lt;(zeroclaw completions bash)
+zeroclaw completions zsh &gt; ~/.zfunc/_zeroclaw
+zeroclaw completions fish &gt; ~/.config/fish/completions/zeroclaw.fish</p>
+<p>Examples (Windows PowerShell):
+zeroclaw completions powershell | Out-String | Invoke-Expression
+zeroclaw completions powershell &gt; $PROFILE.CurrentUserAllHosts</p>
+<p><strong>Usage:</strong> <code>zeroclaw completions &lt;SHELL&gt;</code></p>
+<p><strong>Arguments:</strong></p>
+<ul>
+<li>
+<p><code>&lt;SHELL&gt;</code> — Target shell</p>
+<p>Possible values: <code>bash</code>, <code>fish</code>, <code>zsh</code>, <code>powershell</code>, <code>elvish</code></p>
+</li>
+</ul>
+<h2 id="zeroclaw-desktop"><a class="header" href="#zeroclaw-desktop"><code>zeroclaw desktop</code></a></h2>
+<p>Launch the ZeroClaw companion desktop app.</p>
+<p>The companion app is a lightweight menu bar / system tray application that connects to the same gateway as the CLI. It provides quick access to the dashboard, status monitoring, and device pairing.</p>
+<p>Use –install to download the pre-built companion app for your platform.</p>
+<p>Examples:
+zeroclaw desktop              # launch the companion app
+zeroclaw desktop –install    # download and install it</p>
+<p><strong>Usage:</strong> <code>zeroclaw desktop [OPTIONS]</code></p>
+<p><strong>Options:</strong></p>
+<ul>
+<li><code>--install</code> — Download and install the companion app</li>
+</ul>
+<hr />
+<p><small><i>
+This document was generated automatically by
+<a href="https://crates.io/crates/clap-markdown"><code>clap-markdown</code></a>.
+</i></small></p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../architecture/crates.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference/config.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../architecture/crates.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference/config.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

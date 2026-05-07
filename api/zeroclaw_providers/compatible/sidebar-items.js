@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["AuthStyle"],"struct":["OpenAiCompatibleProvider"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DispatchResult"],"fn":["check_sop_cron_triggers","dispatch_peripheral_signal","dispatch_sop_event","process_headless_results"],"struct":["SopCronCache"]};

@@ -1,0 +1,2 @@
+window.ALL_CRATES = ["aardvark_sys","fill_translations","fluent","mdbook","web","xtask","zeroclaw","zeroclaw_acp_bridge","zeroclaw_api","zeroclaw_channels","zeroclaw_config","zeroclaw_gateway","zeroclaw_hardware","zeroclaw_infra","zeroclaw_macros","zeroclaw_memory","zeroclaw_plugins","zeroclaw_providers","zeroclaw_robot_kit","zeroclaw_runtime","zeroclaw_tool_call_parser","zeroclaw_tools","zeroclaw_tui"];
+//{"start":21,"fragment_lengths":[14,20,9,9,6,8,11,22,15,20,18,19,20,17,18,18,19,21,21,19,28,17,15]}

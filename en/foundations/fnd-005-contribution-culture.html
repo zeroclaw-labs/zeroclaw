@@ -1,0 +1,747 @@
+<!DOCTYPE HTML>
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Contribution culture - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-0c90d4b5.svg">
+        <link rel="shortcut icon" href="../favicon-53763955.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-9dfbd86b.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-a6e9ac27.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-c5ad0191.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-425f4b80.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('ayu')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw/edit/master/docs/book/src/foundations/fnd-005-contribution-culture.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="fnd-005-contribution-culture--human-collaboration-ai-partnership-and-team-growth"><a class="header" href="#fnd-005-contribution-culture--human-collaboration-ai-partnership-and-team-growth">FND-005: Contribution Culture — Human Collaboration, AI Partnership, and Team Growth</a></h1>
+<h3 id="starting-v070--type-culture--rev-1"><a class="header" href="#starting-v070--type-culture--rev-1">Starting v0.7.0 · Type: Culture · Rev. 1</a></h3>
+<blockquote>
+<p><strong>Canonical reference</strong> · Ratified by the team · Rev. 1
+Discussion thread and full revision history: <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5615">#5615</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>A note to the team before you read this.</strong></p>
+<p>This is the fifth document in ZeroClaw’s maturity framework. The other four address
+architecture, documentation, governance, and engineering infrastructure — the structural
+layers that make a project work. This one addresses something those four take for granted
+but never explicitly teach: how to work together.</p>
+<p>The tools and processes in the other RFCs only function as well as the team using them.
+A perfect CI pipeline does not help a team that cannot give honest feedback. A clean
+architecture does not survive a team that cannot disagree productively. A governance
+model does not build ownership in people who have never been taught what ownership means.</p>
+<p>This document is about building that team — not just technically capable individuals,
+but people who know how to give and receive feedback, how to ask for help, how to use
+powerful tools responsibly, and how to grow together over time. These are learnable
+skills. Nobody arrives with them fully formed. This document names them clearly enough
+that you can start practicing them deliberately, here, in the context of real work that
+matters.</p>
+<p>Nothing in this document is criticism of who you are or where you started. It is a map
+for where we are trying to go together.</p>
+</blockquote>
+<hr>
+<h2 id="the-maturity-framework-suite"><a class="header" href="#the-maturity-framework-suite">The Maturity Framework Suite</a></h2>
+<p>This RFC is the fifth in a set of five documents that together form ZeroClaw’s maturity
+framework. They are designed to be read as a whole, though each stands on its own.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>RFC</th><th>Scope</th><th>Issue</th></tr>
+</thead>
+<tbody>
+<tr><td>Intentional Architecture — Microkernel Transition</td><td>What we are building and how it is structured</td><td>#5574</td></tr>
+<tr><td>Documentation Standards and Knowledge Architecture</td><td>How we document what we build</td><td>#5576</td></tr>
+<tr><td>Team Organization and Project Governance</td><td>How we coordinate and make decisions</td><td>#5577</td></tr>
+<tr><td>Engineering Infrastructure — CI/CD Pipeline</td><td>How we build, test, and ship reliably</td><td>#5579</td></tr>
+<tr><td><strong>Contribution Culture — Human Collaboration and AI Partnership</strong></td><td><strong>How we work together and grow</strong></td><td><strong>FND-005</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>The first four RFCs answer structural questions. This one answers a human question: given
+the structure, how do the people inside it behave toward each other and toward their tools?
+That question does not have a compiler, a linter, or a CI gate. It has only the habits we
+build, the examples we set, and the intentionality we bring to it.</p>
+<hr>
+<h2 id="table-of-contents"><a class="header" href="#table-of-contents">Table of Contents</a></h2>
+<ol>
+<li><a href="#1-why-this-document-exists">Why this document exists</a></li>
+<li><a href="#2-the-work-before-the-work">The work before the work</a></li>
+<li><a href="#3-working-with-people">Working with people</a>
+<ul>
+<li><a href="#giving-feedback">Giving feedback</a></li>
+<li><a href="#receiving-feedback">Receiving feedback</a></li>
+<li><a href="#asking-for-help">Asking for help</a></li>
+<li><a href="#disagreeing-productively">Disagreeing productively</a></li>
+<li><a href="#ownership">Ownership</a></li>
+<li><a href="#supporting-someone-who-is-struggling">Supporting someone who is struggling</a></li>
+</ul>
+</li>
+<li><a href="#4-working-with-ai">Working with AI</a>
+<ul>
+<li><a href="#the-delegation-mental-model">The delegation mental model</a></li>
+<li><a href="#ai-works-at-the-implementation-layer">AI works at the implementation layer</a></li>
+<li><a href="#amplification-is-not-magic">Amplification is not magic</a></li>
+<li><a href="#the-review-discipline">The review discipline</a></li>
+<li><a href="#what-this-means-for-your-career">What this means for your career</a></li>
+</ul>
+</li>
+<li><a href="#5-the-feedback-taxonomy">The feedback taxonomy</a></li>
+<li><a href="#6-a-note-to-reviewers-and-mentors">A note to reviewers and mentors</a></li>
+</ol>
+<hr>
+<h2 id="1-why-this-document-exists"><a class="header" href="#1-why-this-document-exists">1. Why this document exists</a></h2>
+<p>Most contributing guides tell you how to open a PR. They tell you what labels to use,
+how to run the test suite, and what goes in the commit message. Those things matter, and
+we have documents that cover them.</p>
+<p>This document covers something different: the skills that determine whether a group of
+talented people becomes a functional team or a collection of individuals who happen to
+share a repository.</p>
+<p>These are learnable skills. They are not personality traits you either have or do not
+have. They are not things that come automatically with technical ability. They are
+practiced — slowly, with feedback, over time — the same way any other skill is learned.
+Most software engineering education focuses almost entirely on the technical layer and
+leaves the human layer to chance. The result is that a lot of technically capable people
+end up in teams that do not work well together, without any clear understanding of what
+is missing or how to fix it.</p>
+<p>The goal of this document is to name those skills clearly enough that you can start
+practicing them deliberately, here, in the context of real work that matters.</p>
+<hr>
+<h2 id="2-the-work-before-the-work"><a class="header" href="#2-the-work-before-the-work">2. The work before the work</a></h2>
+<p>Before you write a line of code, open a PR, or ask an AI to generate anything, there is
+a set of questions you should be able to answer. This project uses a decision hierarchy
+to describe them:</p>
+<pre><code>Vision
+  └── Architecture
+        └── Design
+              └── Implementation
+                    └── Testing
+                          └── Documentation
+                                └── Release
+</code></pre>
+<p>The hierarchy is described in full in the architecture RFC (#5574). What matters here is
+the principle behind it: <strong>every decision you make should be traceable back up to the top.</strong></p>
+<p>In practice, this means asking yourself before you start building:</p>
+<ul>
+<li><strong>What problem am I solving?</strong> Not “what ticket am I closing” — what actual problem
+does this solve for someone?</li>
+<li><strong>Does this fit the architecture?</strong> If you cannot describe where this belongs in the
+system structure, you do not yet understand the system well enough to change it.</li>
+<li><strong>What does done look like?</strong> Before you write the code, write the acceptance criteria.
+“It works” is not an acceptance criterion. “A user can install a plugin without a Rust
+toolchain and it runs correctly” is.</li>
+<li><strong>Who needs to know about this?</strong> Changes that touch other people’s work, or that make
+decisions the whole team should make, need visibility before implementation — not after.</li>
+</ul>
+<p>This is not bureaucracy. It is the difference between building something and building the
+right thing. It also applies directly to how you work with AI tools, which we cover in
+Section 4.</p>
+<p>The honest version of what happens when you skip this step: you build something that
+works, open a PR, and then learn in the review that it solves the wrong problem, or
+solves the right problem in a way that conflicts with a decision that was already made
+somewhere else. That wastes your time, the reviewer’s time, and delays the people who
+depend on the work. The pre-work is not extra — it is how you protect your own effort.</p>
+<hr>
+<h2 id="3-working-with-people"><a class="header" href="#3-working-with-people">3. Working with people</a></h2>
+<h3 id="giving-feedback"><a class="header" href="#giving-feedback">Giving feedback</a></h3>
+<p>Feedback is one of the highest-leverage things you can do for another engineer. A
+well-written review comment can teach something that takes years to learn on your own.
+A poorly written one can discourage someone from contributing again.</p>
+<p><strong>Be specific.</strong> Vague feedback creates anxiety without direction.</p>
+<blockquote>
+<p>❌ “This is hard to read.”</p>
+<p>✅ “This function is handling three separate concerns — input validation, business logic,
+and formatting the response. Consider splitting them so each function does one thing.
+That makes it easier to test each piece and easier to understand at a glance what each
+one does.”</p>
+</blockquote>
+<p>The second version is longer, but it teaches something. The reader now knows what the
+problem is, why it matters, and what to do about it.</p>
+<p><strong>Explain the principle, not just the verdict.</strong> If you ask someone to change something,
+tell them why. “Change X to Y” produces a fix. “Change X to Y because Z” produces
+understanding that applies to the next ten situations where the same principle applies.</p>
+<p><strong>Separate the work from the person.</strong> “This approach has a problem” and “you made a
+mistake” are not the same statement. The first is about the code. The second is about
+the person. Keep your feedback pointed at the work.</p>
+<p><strong>Name what is good.</strong> This is not about being nice — it is about being useful. When you
+tell someone what they got right and explain why it is right, you teach them what
+patterns to repeat. Generic praise (“great work!”) teaches nothing. Specific praise
+(“extracting this into its own crate was the right call because it means we can now test
+this logic in isolation without standing up the whole agent loop”) teaches the principle
+and reinforces the decision.</p>
+<p><strong>Use the feedback taxonomy.</strong> The four-bucket model in Section 5 gives every comment a
+clear weight. Reviewers who mix blocking issues with minor suggestions without
+distinguishing between them force the author to guess which things actually need to
+change. Do not make people guess.</p>
+<hr>
+<h3 id="receiving-feedback"><a class="header" href="#receiving-feedback">Receiving feedback</a></h3>
+<p>This is harder than giving feedback for most people, and it is worth being honest about
+why.</p>
+<p>When you have spent hours on something — working through a problem, making decisions,
+writing the code — and someone tells you it has issues, the natural human response is
+to feel like the criticism is about you. It is not. It is about the work. Learning to
+hold those two things as separate is a skill, and it takes practice.</p>
+<p>A few things that help:</p>
+<p><strong>Read the feedback before you respond to it.</strong> Not just the summary line — the whole
+comment, including the explanation. Many feedback responses are written in reaction to
+the verdict before the person has absorbed the reasoning. Read the why before you decide
+how you feel about the what.</p>
+<p><strong>Distinguish between “I disagree” and “I do not understand.”</strong> These require different
+responses. If you do not understand the feedback, ask a clarifying question. If you
+understand it and disagree, say so with evidence. Both are good outcomes. What is not
+useful is staying silent when you have questions, or saying “ok fine” when you actually
+disagree.</p>
+<p><strong>You do not have to agree with every piece of feedback to learn from it.</strong> Sometimes
+feedback is wrong. Sometimes it reflects a different set of tradeoffs than the ones you
+were optimising for. You are allowed to push back — see Disagreeing productively below.
+But even feedback you ultimately reject is worth understanding fully before you decide
+to reject it.</p>
+<p><strong>Close the loop.</strong> When someone takes time to review your work, tell them when you have
+addressed their feedback. You do not have to thank them effusively — a simple “addressed
+in the latest commit” is enough. It tells them their time was worthwhile and keeps the
+PR moving.</p>
+<p><strong>Feedback on your code is not feedback on your worth.</strong> This sounds obvious. It is not
+obvious when you are in the middle of it. Every experienced engineer has code reviewed by
+people who are more experienced, and that process is uncomfortable every time. The
+discomfort is the sensation of learning. It does not go away; you just get better at
+sitting with it.</p>
+<hr>
+<h3 id="asking-for-help"><a class="header" href="#asking-for-help">Asking for help</a></h3>
+<p>In school, asking for help can feel like admitting you are behind, or that you do not
+belong. In a team, asking for help is one of the most professional things you can do.</p>
+<p><strong>The cost of being stuck and not asking is almost always higher than the cost of
+asking.</strong> Three hours of spinning on a problem that a five-minute conversation would
+resolve is three hours of your time and your team’s time that is gone. Knowing when to
+ask is a skill, not a weakness.</p>
+<p>A good help request has three parts:</p>
+<ol>
+<li><strong>What you are trying to do.</strong> Not just “it’s broken” — what is the goal?</li>
+<li><strong>What you have already tried.</strong> This shows you have engaged with the problem and
+gives the person helping you a starting point that is not zero.</li>
+<li><strong>Where you are stuck specifically.</strong> “I don’t know what’s wrong” is a different
+problem than “I know what’s wrong but I don’t know how to fix it” and “I fixed it
+but I don’t know why my fix works.”</li>
+</ol>
+<p>A help request that has these three components gets answered faster and teaches you more,
+because the person helping you can calibrate to exactly where you are.</p>
+<p><strong>Ask publicly when you can.</strong> A question asked in a shared channel or on a PR benefits
+everyone who has the same question later. A question asked privately benefits only you.
+There are times when private is right — sensitive feedback, personal circumstances — but
+technical questions about the codebase are almost always better asked in the open.</p>
+<p><strong>Not knowing something is not shameful.</strong> Nobody knows everything. The engineers who
+appear to know everything have asked a lot of questions over a long time, and the answers
+accumulated. The only way to get there is to start asking.</p>
+<hr>
+<h3 id="disagreeing-productively"><a class="header" href="#disagreeing-productively">Disagreeing productively</a></h3>
+<p>Architecture disagreements are healthy. They mean people care about how the system is
+built and are paying attention to the decisions being made. A team where nobody disagrees
+is not a team where everyone agrees — it is a team where people have stopped engaging.</p>
+<p>The difference between a productive disagreement and an unproductive one is usually in
+the framing.</p>
+<p><strong>Lead with the concern, not the verdict.</strong></p>
+<blockquote>
+<p>❌ “This approach is wrong.”</p>
+<p>✅ “I have a concern about this approach — specifically, if we wire the gateway directly
+into the runtime here, we break the dependency rule in RFC §4.2. Can we talk through
+whether there is a way to achieve the same result without that coupling?”</p>
+</blockquote>
+<p>The second version opens a conversation. The first closes one.</p>
+<p><strong>Bring evidence.</strong> An architecture disagreement backed by a measured fact, a specific
+RFC section, or a concrete failure scenario is a contribution. An architecture
+disagreement backed by “I just feel like” is an opinion. Both are worth expressing, but
+only one moves the conversation forward quickly.</p>
+<p><strong>Be genuinely open to being wrong.</strong> If you go into a disagreement having already
+decided you are right, you are not having a conversation — you are lobbying. People can
+tell the difference, and it makes them less likely to engage seriously with your concerns.
+The goal is the best outcome for the project, not being right.</p>
+<p><strong>When the team decides, move with the team.</strong> You can note your dissent on the record —
+in the issue, in the RFC comments, in the PR thread — and then you build what was
+decided. This is not capitulation. It is how teams function. A team that keeps
+relitigating settled decisions does not ship.</p>
+<p><strong>Some decisions are reversible and some are not.</strong> Know which kind you are arguing about.
+A naming decision is reversible. A wire protocol decision that will be in production
+binaries for two years is not. Weight your energy accordingly.</p>
+<hr>
+<h3 id="ownership"><a class="header" href="#ownership">Ownership</a></h3>
+<p>Ownership is one of those words that gets used a lot without a clear definition. Here
+is what it means in practice on this project:</p>
+<p><strong>Ownership means you see the problem before you are asked to.</strong> It means reading a PR
+that touches your area and noticing a side effect the author did not notice. It means
+seeing a follow-up issue sitting without an assignee and picking it up. It means not
+waiting to be told.</p>
+<p><strong>Ownership means your word means something.</strong> If you file a follow-up issue with your
+name on it, that issue is your commitment. Not “someone should do this” — you will do
+this. If circumstances change and you cannot, you say so early and you find a handoff.
+A tracker full of filed-and-forgotten issues with names attached is a broken trust
+register.</p>
+<p><strong>Ownership is not “I did my part.”</strong> It is “I care whether the whole thing works.” You
+can own a crate without being indifferent to whether the system that crate lives in is
+healthy. You can own a feature without being indifferent to whether users can actually
+use it. Narrow ownership — “I did my bit, the rest is someone else’s problem” — produces
+systems that technically have owners for every piece and functionally have no one
+responsible for anything.</p>
+<p><strong>Ownership includes the follow-through.</strong> Shipping code is not the end of ownership.
+It is the beginning of the responsibility to make sure it works, to fix what breaks,
+and to teach the next person who works in that area what you learned.</p>
+<hr>
+<h3 id="supporting-someone-who-is-struggling"><a class="header" href="#supporting-someone-who-is-struggling">Supporting someone who is struggling</a></h3>
+<p>At some point in this project you will be more experienced than someone else in a thread.
+Maybe you have been here longer. Maybe you happen to know the part of the codebase they
+are working in. Maybe you have seen this particular failure mode before.</p>
+<p>What you do with that position matters.</p>
+<p><strong>Do not just fix it for them.</strong> Giving someone a working solution without explaining
+what was wrong or why your solution works produces a merged PR and zero learning. The
+next time they hit a similar problem, they will be in the same place. Take the extra
+five minutes to explain what you saw and why the fix works.</p>
+<p><strong>Review with intent to teach.</strong> A bad PR is not just a problem to close — it is a
+teaching opportunity. A dismissive review (“this doesn’t follow the architecture”) is
+less useful than a review that names what was missed, explains the principle it violates,
+and points to where the contributor can learn more. The extra effort is an investment in
+a contributor who writes better PRs from that point forward.</p>
+<p><strong>If someone is blocked and not asking for help, say something.</strong> Sometimes people do
+not ask because they do not want to look like they are struggling. Sometimes they are not
+sure who to ask. Sometimes they have been struggling long enough that they have stopped
+noticing how stuck they are. A quiet “looks like this one has been open for a while —
+is there anything I can help unblock?” costs almost nothing and can mean everything to
+someone who is spinning.</p>
+<p><strong>Make it safe to not know things.</strong> If people in your team feel judged for not knowing
+something, they will pretend to know things. That produces worse decisions, not better
+ones. The team that makes it safe to say “I don’t know, let me find out” makes better
+decisions than the team where everyone performs confidence.</p>
+<hr>
+<h2 id="4-working-with-ai"><a class="header" href="#4-working-with-ai">4. Working with AI</a></h2>
+<p>This section is about something that most contributing guides do not cover: how to work
+with AI coding tools in a way that makes you better, not just faster.</p>
+<h3 id="the-delegation-mental-model"><a class="header" href="#the-delegation-mental-model">The delegation mental model</a></h3>
+<p>Here is the most useful reframe for working with AI effectively:</p>
+<p><strong>Working with an AI is the same skill as delegating to a person.</strong></p>
+<p>When you delegate work to a colleague or a junior engineer, you provide context. You
+explain the goal, the constraints, what good looks like, and what the boundaries are.
+You do not just say “build me a feature.” You say: here is what the user is trying to
+do, here is how it fits into the system, here is how we will know it is done, and here
+are the things you should not do.</p>
+<p>Then — critically — you review what comes back. You do not accept a junior engineer’s
+PR without reading it. You check whether it does what was asked, whether it fits the
+architecture, whether it has test coverage, whether the error handling is correct. You
+give feedback. You may iterate.</p>
+<p>AI tools work exactly the same way. The quality of what you get back is determined
+almost entirely by the quality of what you put in. A vague prompt produces vague output.
+A prompt with clear context, specific constraints, and concrete acceptance criteria
+produces output that is actually useful as a starting point.</p>
+<p>The engineers who struggle with AI tools are usually the ones who are still learning
+to give clear direction to anything — human or AI. The engineers who thrive with them
+are the ones who already know what they want before they ask for it.</p>
+<p>This mental model also means that the output is your responsibility. You cannot submit
+a PR and say “the AI wrote it.” You reviewed it. You opened the PR. It is your work.</p>
+<hr>
+<h3 id="ai-works-at-the-implementation-layer"><a class="header" href="#ai-works-at-the-implementation-layer">AI works at the implementation layer</a></h3>
+<p>This is the most important technical limitation to understand.</p>
+<p>AI code generation works at the <strong>implementation layer</strong> of the decision hierarchy:</p>
+<pre><code>Vision          ← AI cannot set this. You must.
+Architecture    ← AI cannot make these decisions. You must.
+Design          ← AI will sometimes guess. You must verify.
+Implementation  ← AI can help here.
+Testing         ← AI can help, but you define what to test.
+Documentation   ← AI can draft. You must review for accuracy.
+Release         ← Human judgment required.
+</code></pre>
+<p>An AI tool will generate a function that does what you described. It will not tell you
+whether that function belongs in this crate or a different one. It will not flag that
+the approach contradicts an architectural decision made three months ago. It will not
+ask whether you have thought through the security implications. It will not notice that
+you are solving the wrong problem.</p>
+<p>ZeroClaw itself is a useful example. The initial codebase was bootstrapped with AI
+assistance. The result, as the architecture RFC describes it, is “impressively functional
+but architecturally accidental.” The code does what it needs to do today — but it was
+not designed, it accumulated. That is not a failure of AI tools. It is a predictable
+outcome of using implementation-layer tooling without first doing the vision,
+architecture, and design work that gives implementation its direction.</p>
+<p>The solution is not to use AI less. It is to do the top-of-hierarchy work yourself,
+always, before you ask the AI to build anything.</p>
+<hr>
+<h3 id="amplification-is-not-magic"><a class="header" href="#amplification-is-not-magic">Amplification is not magic</a></h3>
+<p>AI tools amplify your existing capabilities. That is the honest description of what
+they do.</p>
+<p>If you have a clear vision, a defined architecture, quality criteria you can articulate,
+and the ability to evaluate output critically — AI is a genuine force multiplier. You
+move faster. You explore more options. You write more tests. You draft more documentation.</p>
+<p>If you do not have those things — AI generates a lot of code that looks convincing and
+does not hold together. It generates tests that pass without testing anything meaningful.
+It generates documentation that describes the code but not the intent. It generates
+architecture that is locally consistent and globally incoherent.</p>
+<p>The amplification is neutral. It amplifies good inputs and bad inputs with equal
+enthusiasm.</p>
+<p>This means the most valuable skill in an AI-assisted workflow is not prompt engineering.
+It is the ability to evaluate the output. That requires knowing what good looks like
+before you ask for anything. Which brings you back, every time, to the top of the
+decision hierarchy.</p>
+<p>A useful self-check before using an AI tool to implement something:</p>
+<ul>
+<li>Can I describe the problem in one sentence without mentioning implementation details?</li>
+<li>Can I name the RFC section or design decision that this implementation serves?</li>
+<li>Can I describe what a correct implementation looks like before I see one?</li>
+<li>Can I explain why a generated implementation is or is not correct after I see one?</li>
+</ul>
+<p>If the answer to any of these is no, you are not ready to implement yet. You are still
+in the design phase.</p>
+<hr>
+<h3 id="the-review-discipline"><a class="header" href="#the-review-discipline">The review discipline</a></h3>
+<p>AI-generated code requires the same review discipline as human-written code. In some
+ways it requires more, because the surface area of issues you are checking for is wider.</p>
+<p>When you review AI-generated output — your own or someone else’s — check for:</p>
+<p><strong>Architectural fit.</strong> Does this respect the dependency rules? Does it live in the right
+crate? Does it introduce a coupling that the design explicitly avoids?</p>
+<p><strong>Correctness at the boundary.</strong> AI models are very good at the common case and
+frequently wrong at the edge case. Check what happens when inputs are empty, null,
+malformed, or at the maximum expected size. Check what happens when a dependency is
+unavailable.</p>
+<p><strong>Security implications.</strong> AI tools do not have a security mindset by default. They
+will generate code that accepts user input without validation, that logs sensitive
+values, that uses deprecated cryptographic primitives, that opens file paths without
+checking them. You have to bring the security lens explicitly.</p>
+<p><strong>Test quality.</strong> AI-generated tests frequently test the implementation rather than the
+behaviour. A test that asserts a function returns a specific internal struct value is
+not a behaviour test — it is a snapshot of the implementation that will break whenever
+the implementation changes. Ask: does this test verify that the system does what the
+user or caller needs, or does it verify that the code does what it currently does?</p>
+<p><strong>Completeness.</strong> AI tools optimise for plausible-looking completeness. They will
+generate code that handles the happy path thoroughly and the error path superficially.
+Check that errors are propagated, handled, or surfaced in a way that is actually useful
+to the caller.</p>
+<hr>
+<h3 id="what-this-means-for-your-career"><a class="header" href="#what-this-means-for-your-career">What this means for your career</a></h3>
+<p>The skills being described here — giving direction clearly, evaluating output critically,
+understanding where a component fits in a larger system, knowing what good looks like
+before you build — are not AI-specific skills. They are the skills that make someone
+an effective engineer, an effective tech lead, and eventually an effective engineering
+manager.</p>
+<p>The engineers who will be most valuable in a world saturated with AI-generated code are
+not the ones who can write the most code fastest. They are the ones who can tell whether
+the code is right. That requires system thinking, architectural judgment, and the
+ability to evaluate work against a standard you have internalised.</p>
+<p>Everything you practice here — understanding the RFC before you implement, asking “why”
+before you build, reviewing AI output with the same eye you would bring to a junior
+engineer’s PR — is practice for that kind of judgment. It compounds. Every PR where you
+engage seriously with the architecture is a data point that makes the next architectural
+decision easier.</p>
+<p>The contributors on this project have an unusual advantage: you are building these habits
+on a real system, with real architectural constraints, with people who will review your
+work and explain why. That combination is rare. It is worth taking seriously.</p>
+<hr>
+<h2 id="5-the-feedback-taxonomy"><a class="header" href="#5-the-feedback-taxonomy">5. The feedback taxonomy</a></h2>
+<p>Every review comment on this project carries one of four weights. Using them consistently
+means reviewers communicate clearly and authors know exactly what requires action.</p>
+<hr>
+<h3 id="-commendation"><a class="header" href="#-commendation">✅ Commendation</a></h3>
+<p>Something the author got right, named specifically and explained so the pattern gets
+repeated.</p>
+<p>This is not politeness. Generic praise (“nice work!”) teaches nothing. Specific praise
+with an explanation teaches the principle behind what was done well, which applies to
+every future decision in the same category.</p>
+<p><strong>Commendations require no action.</strong> Their purpose is to reinforce.</p>
+<blockquote>
+<p><em>Example: “Extracting the tool call parser into its own crate was the right call — this
+code has zero dependencies on agent state and is now independently testable. The 91
+tests you added are exactly the kind of coverage that would be impossible to achieve
+when this logic lived inside <code>loop_.rs</code>.”</em></p>
+</blockquote>
+<hr>
+<h3 id="-blocking"><a class="header" href="#-blocking">🔴 Blocking</a></h3>
+<p>Something that must be resolved before the PR merges. Blocking items fall into two
+categories:</p>
+<ul>
+<li><strong>Architectural violations</strong>: code that crosses a dependency boundary the design
+explicitly prohibits, or that contradicts a decision recorded in an RFC or ADR.</li>
+<li><strong>Quality regressions</strong>: missing test coverage for new behaviour, security issues,
+broken contract compatibility, or code that introduces a defect.</li>
+</ul>
+<p>A blocking comment explains what the issue is, why it matters, and — where possible —
+what a resolution path looks like. A blocking comment is not a judgment of the author.
+It is the reviewer’s responsibility to the codebase and the users who depend on it.</p>
+<p><strong>Authors should not interpret a blocking comment as rejection.</strong> It is a specific,
+resolvable problem. Address it and move forward.</p>
+<hr>
+<h3 id="-conditional"><a class="header" href="#-conditional">🟡 Conditional</a></h3>
+<p>Something acceptable to defer, but only with a committed tracked issue and an assignee.
+A conditional item is the reviewer saying: <em>I trust that this will be addressed, but I
+need that commitment on record before we merge.</em></p>
+<p>The distinction between blocking and conditional is often about timing and risk. A
+missing feature that will be delivered in the next PR is conditional. A missing feature
+that creates a security gap is blocking.</p>
+<p><strong>A conditional deferral without an assignee is not a deferral — it is a wish.</strong> Tracked
+issues with no owner tend to stay open indefinitely. When a reviewer marks something
+conditional, they are asking for a named commitment, not a theoretical future intention.</p>
+<hr>
+<h3 id="-team-decision"><a class="header" href="#-team-decision">🔵 Team Decision</a></h3>
+<p>A question the PR surfaces that no single reviewer or author should answer unilaterally.
+Team decisions involve tradeoffs that affect the project’s direction, its architecture,
+or its users — and they belong to the group.</p>
+<p>Using this label is how reviewers avoid holding up individual contributors with questions
+that are really about shared direction. It surfaces the decision, frames the tradeoffs,
+and asks the team to weigh in — without making the author feel like their PR is blocked
+on something that is not in their control.</p>
+<p><strong>Team decisions should be answered in the PR thread, on the record, by the people who
+need to own the outcome.</strong> A decision answered in a side conversation that does not
+appear in the PR thread does not exist for anyone who reads the history later.</p>
+<hr>
+<h2 id="6-a-note-to-reviewers-and-mentors"><a class="header" href="#6-a-note-to-reviewers-and-mentors">6. A note to reviewers and mentors</a></h2>
+<p>If you are in a position of reviewing someone else’s work — whether as a code owner, a
+more experienced contributor, or simply someone who has been here longer — this section
+is for you.</p>
+<p><strong>You are modelling what collaboration looks like.</strong> Every review you write teaches the
+author how to review. Every question you ask in a PR thread teaches newer contributors
+what questions are worth asking. You cannot opt out of this — the only choice is whether
+to do it intentionally or accidentally.</p>
+<p><strong>Thoroughness is respect.</strong> A thorough review that explains its reasoning is more
+respectful of the author’s effort than a quick approval. The author put time into the
+work. They deserve to understand why it is or is not ready to merge, and what they can
+take forward from the interaction.</p>
+<p><strong>The goal of every review interaction is to leave the author better equipped than they
+were before.</strong> Not just to produce a merged PR. Not to demonstrate your own knowledge.
+Not to enforce rules. To leave the author with something they can use — a principle,
+a pattern, an understanding of a tradeoff — that applies beyond the immediate PR.</p>
+<p><strong>Name the pattern, not just the instance.</strong> When you ask for a change, explain the
+principle behind it. “Rename this variable to something that describes what it contains”
+is less useful than “variable names should describe their purpose from the caller’s
+perspective, not the implementation’s — what does the caller of this function actually
+care that this value represents?” The second version applies to every variable in every
+function the author will ever write.</p>
+<p><strong>Be honest about what is your preference and what is a requirement.</strong> “I would write
+this differently” is not the same as “this must change.” If you are expressing a
+preference, say so. If you are citing a hard requirement — architecture, security,
+compatibility — cite the specific reason. Authors who cannot tell the difference between
+reviewer preference and architectural necessity will either change everything or change
+nothing. Neither serves them well.</p>
+<p><strong>The team you are helping build is the team you will work in.</strong> The investment you make
+in a careful, educational review today compounds into a contributor who writes better
+code, opens better PRs, and reviews others more thoughtfully. That makes the project
+better. It also makes your own work easier, because the people around you are growing.</p>
+<p>This is not a soft skill. It is engineering work.</p>
+<hr>
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-004-engineering-infrastructure.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-006-zero-compromise-in-practice.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-004-engineering-infrastructure.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-006-zero-compromise-in-practice.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/lang-switcher-82c8c4bf.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-94f7f342.js"></script>
+
+
+
+    </div>
+    </body>
+</html>
