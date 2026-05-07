@@ -1,125 +1,124 @@
 # Fallback & Routing
 
-Two meta-providers let you stack concrete providers into reliability pipelines and task-aware routing.
+ZeroClaw's earlier schema versions exposed two meta-providers — `reliable` (fallback chains) and `router` (task-hint routing). Both are gone in the current typed-family schema. Routing now happens at the **agent layer**, not the model-provider layer.
 
-## Fallback chains — `reliable`
+## Why the change
 
-A `reliable` provider wraps a list of other providers. On timeout, network error, or authentication failure on the first, it transparently falls through to the next.
+The old meta-providers tried to shoulder two different jobs at once:
+
+- **Per-call backend selection** ("use the cheap model unless this prompt looks like reasoning").
+- **Provider reliability** ("if Claude times out, fall back to OpenAI").
+
+Both conflated request-time intent with infrastructure plumbing. The current model splits them cleanly:
+
+- Per-call backend selection becomes per-agent dispatch — set up multiple agents with different `model_provider` references and route channel traffic accordingly.
+- Provider reliability is OpenRouter's job, not ours. Use OpenRouter as a normal provider and let it handle vendor fan-out.
+
+## Per-agent dispatch — the V3 way
+
+Define each routing target as its own agent, then point channels at the agent that should handle their traffic.
 
 ```toml
-[providers.models.primary]
-kind = "reliable"
-fallback_providers = ["claude", "haiku", "local"]
-# fallback_providers references other [providers.models.*] by name
-
-[providers.models.claude]
-kind = "anthropic"
-model = "claude-sonnet-4-6"
+[providers.models.anthropic.sonnet]
+model   = "claude-sonnet-4-6"
 api_key = "sk-ant-..."
 
-[providers.models.haiku]
-kind = "anthropic"
-model = "claude-haiku-4-5-20251001"
+[providers.models.anthropic.haiku]
+model   = "claude-haiku-4-5-20251001"
 api_key = "sk-ant-..."
 
-[providers.models.local]
-kind = "ollama"
-base_url = "http://localhost:11434"
-model = "qwen3.6:35b-a3b"
+[providers.models.deepseek.reasoner]
+model   = "deepseek-reasoner"
+api_key = "sk-..."
+
+[providers.models.gemini.vision]
+model   = "gemini-2.5-pro"
+api_key = "..."
+
+[agents.fast]
+enabled        = true
+model_provider = "anthropic.haiku"
+risk_profile   = "default"
+runtime_profile = "default"
+channels        = ["telegram.default"]
+
+[agents.deep]
+enabled        = true
+model_provider = "anthropic.sonnet"
+risk_profile   = "default"
+runtime_profile = "default"
+channels        = ["slack.engineering"]
+
+[agents.reasoner]
+enabled        = true
+model_provider = "deepseek.reasoner"
+risk_profile   = "default"
+runtime_profile = "default"
+channels        = ["slack.research"]
+
+[agents.eyes]
+enabled        = true
+model_provider = "gemini.vision"
+risk_profile   = "default"
+runtime_profile = "default"
+channels        = ["discord.media"]
 ```
 
-Then:
+Each channel binds to one agent. Channels can move between agents by editing `channels = [...]` on the agent that should pick them up; `Config::validate()` makes sure references resolve.
+
+For ad-hoc multi-step routing inside a single conversation, use the `delegate` tool: an agent can hand off to another configured agent (also typed via `agent_<alias>` references).
+
+## Reliability — use OpenRouter
+
+OpenRouter is treated as a single first-class provider. Your runtime sees one endpoint; OpenRouter handles vendor fallback, model selection, and uptime behind that endpoint.
 
 ```toml
-default_model = "primary"
+[providers.models.openrouter.default]
+model   = "anthropic/claude-sonnet-4-20250514"
+api_key = "sk-or-..."
+
+[agents.default]
+enabled        = true
+model_provider = "openrouter.default"
+risk_profile   = "default"
+runtime_profile = "default"
 ```
 
-Behaviour:
+If OpenRouter is unavailable, that's an outage — there is no in-process fallback. Operators who need cross-vendor reliability run multiple ZeroClaw instances behind a load balancer or use OpenRouter's enterprise SLA.
 
-- Tries `claude` first; on transient error retries twice with exponential backoff (2 s, 4 s).
-- After two retries exhausted, falls through to `haiku` and restarts the retry cycle.
-- If `haiku` also exhausts, falls through to `local`.
-- Only returns an error once every provider in the chain has failed.
+## Why no in-process fallback?
 
-**Best practice — order by reliability:** put the most reliable provider first, not the best. A Claude fallback behind a flaky local Ollama won't save you during an API outage. `[fastest/best_quality, fallback_quality, always_on_local]` is a common pattern.
+A few practical reasons the V2 `reliable` chain didn't earn its keep:
 
-## Routing — `router`
+- **Failure modes are vendor-specific.** "Provider returned 500" means different things for different vendors; a single retry-and-fall-through policy hid bugs more often than it caught them.
+- **State across providers is hard.** A fallback chain that swaps providers mid-conversation has to reconcile message-format differences, tool-call IDs, and reasoning-token shapes. Doing it correctly is a lot of code; doing it incorrectly silently corrupts conversation state.
+- **OpenRouter does it better.** Vendor fan-out is OpenRouter's whole product. We don't need to reimplement it.
+- **Per-agent dispatch is more honest.** When two channels should use different models, naming two agents is clearer than encoding the routing rule inside a meta-provider.
 
-A `router` provider picks a backend per request based on hints supplied by the caller.
+## What does NOT exist in V3
 
-```toml
-[providers.models.brain]
-kind = "router"
-default = "haiku"                       # used if no hint matches
-routes = [
-    { hint = "reasoning", provider = "deepseek-r1" },
-    { hint = "cheap",     provider = "haiku" },
-    { hint = "vision",    provider = "gemini" },
-]
-```
+- `kind = "reliable"` — no fallback meta-provider.
+- `kind = "router"` — no task-hint router meta-provider.
+- `fallback_providers = [...]` field — eradicated from the schema and runtime.
+- `default_provider` / `default_model` global keys — eradicated.
+- `provider_family_excludes()` runtime filter — gone (typed-family schema makes per-family fields self-describing).
 
-Channels, tools, and SOPs can emit hints via request metadata. For example, an SOP step might request `hint:reasoning` for a planning phase and `hint:cheap` for a summarisation phase. Everything else goes to `default`.
-
-## Combining them
-
-`reliable` and `router` compose. Routes can point at `reliable` providers, and `reliable` can wrap a `router`.
-
-```toml
-[providers.models.production]
-kind = "reliable"
-fallback_providers = ["brain", "local"]  # if routing fails, fall to local Ollama
-
-[providers.models.brain]
-kind = "router"
-default = "haiku"
-routes = [
-    { hint = "reasoning", provider = "sonnet" },
-    { hint = "cheap",     provider = "haiku" },
-]
-```
-
-## Cost, performance, and reliability
-
-Three common patterns users pick:
-
-### Cost-optimised
-```toml
-fallback_providers = ["haiku", "gpt-4o-mini", "local"]
-```
-Cheapest hosted first, local as the final safety net.
-
-### Quality-optimised
-```toml
-fallback_providers = ["opus", "sonnet", "haiku"]
-```
-Best model first; fall to cheaper Claude models on failure.
-
-### Hybrid routing
-```toml
-routes = [
-    { hint = "code",       provider = "claude-code" },
-    { hint = "reasoning",  provider = "deepseek-r1" },
-    { hint = "multimodal", provider = "gemini" },
-]
-default = "haiku"
-```
-Match the tool to the job.
+The migration drops these keys at load time and emits a warning so operators upgrading from older configs see what's been removed.
 
 ## Observability
 
-Fallback events and routing decisions are logged via the infra crate:
+Per-agent dispatch decisions are visible in tracing logs:
 
 ```
-INFO provider=claude attempt=1 → timeout
-INFO provider=claude attempt=2 → timeout
-WARN provider=claude exhausted, falling back → provider=haiku
-INFO router hint=reasoning → provider=deepseek-r1
+INFO channel=telegram.default routed to agent=fast
+INFO agent=fast model_provider=anthropic.haiku turn_id=...
+INFO model_provider=anthropic.haiku stream complete tokens={input=512, output=128}
 ```
 
 For production deployments, wire the log output to Loki / Grafana. See [Operations → Logs & observability](../ops/observability.md).
 
 ## See also
 
-- [Overview](./overview.md)
-- [Configuration](./configuration.md)
-- [Provider catalog](./catalog.md)
+- [Overview](./overview.md) — provider model and per-agent dispatch
+- [Configuration](./configuration.md) — full `[providers.*]` schema
+- [Provider catalog](./catalog.md) — every canonical slot

@@ -115,7 +115,7 @@ nano ~/.zeroclaw/config.toml
 
 ### 3.2 Minimal config
 
-At minimum, set `api_key` / `default_provider` / `default_model`, plus `[channels.telegram]` with your `bot_token`. Leave `[peripherals]` disabled until Phase 4 below. See the [Config reference](../reference/config.md) for all fields.
+At minimum, configure one `[providers.models.<type>.<alias>]` entry with `api_key` / `model`, one `[agents.<alias>]` that references it via `model_provider = "<type>.<alias>"`, and one `[channels.telegram.<alias>]` with your `bot_token`. Bind the channel to the agent via `channels = ["telegram.<alias>"]` on the agent. Leave `[peripherals]` disabled until Phase 4 below. See the [Config reference](../reference/config.md) for all fields.
 
 ---
 
@@ -187,4 +187,4 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 - **Telegram not responding** — Check bot_token, allowed_users, and that the Uno Q has internet (WiFi).
 - **Out of memory** — Keep features minimal (`--features hardware` for Uno Q); consider `compact_context = true`.
 - **GPIO commands ignored** — Ensure Bridge app is running (`zeroclaw peripheral setup-uno-q` deploys and starts it). Config must have `board = "arduino-uno-q"` and `transport = "bridge"`.
-- **LLM provider (GLM/Zhipu)** — Use `default_provider = "glm"` or `"zhipu"` with `GLM_API_KEY` in env or config. ZeroClaw uses the correct v4 endpoint.
+- **LLM provider (GLM/Zhipu)** — Configure `[providers.models.glm.<alias>]` with `GLM_API_KEY` in env or config (the legacy `zhipu` synonym is collapsed onto `glm`). ZeroClaw uses the correct v4 endpoint.

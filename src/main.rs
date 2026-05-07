@@ -1459,10 +1459,13 @@ async fn main() -> Result<()> {
                     let entry = config
                         .providers
                         .models
-                        .entry(p.clone())
-                        .or_default()
-                        .entry("default".to_string())
-                        .or_default();
+                        .ensure(p, "default")
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Unknown model_provider family: {p}. \
+                             Run `zeroclaw onboard model_providers` to see configured options."
+                            )
+                        })?;
                     if let Some(m) = &model {
                         entry.model = Some(m.clone());
                     }
