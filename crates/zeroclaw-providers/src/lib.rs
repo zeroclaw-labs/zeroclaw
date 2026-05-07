@@ -2448,7 +2448,9 @@ pub fn list_providers() -> Vec<ProviderInfo> {
         ProviderInfo {
             name: "atomic-chat",
             display_name: "Atomic Chat",
+            description: "Atomic Chat / Jan local runtime",
             aliases: &["atomic_chat", "atomic"],
+            activation: ProviderActivation::FallbackKey,
             local: true,
         },
         // ── Fast inference ────────────────────────────────────
@@ -2614,12 +2616,6 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             aliases: &[],
             activation: ProviderActivation::FallbackKey,
             local: false,
-        },
-        ProviderInfo {
-            name: "atomic-chat",
-            display_name: "Atomic Chat",
-            aliases: &["atomic_chat", "atomic"],
-            local: true,
         },
     ]
 }
