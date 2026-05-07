@@ -1444,7 +1444,6 @@ fn create_provider_with_url_and_options(
                     .without_native_tools(),
             ))
         }
-
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => {
             let mut p = OpenAiCompatibleProvider::new(
