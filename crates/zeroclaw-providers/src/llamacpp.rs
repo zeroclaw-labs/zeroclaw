@@ -280,8 +280,7 @@ impl LlamaCppProvider {
             .send()
             .await?;
         if !response.status().is_success() {
-            let error = response.text().await?;
-            anyhow::bail!("llama.cpp responses API error: {error}");
+            return Err(super::api_error("llama.cpp", response).await);
         }
         let body = response.text().await?;
         parse_response_body(&body)
@@ -367,8 +366,9 @@ impl LlamaCppProvider {
                     .text()
                     .await
                     .unwrap_or_else(|_| format!("HTTP {status}"));
+                let sanitized = super::sanitize_api_error(&error);
                 let _ = tx
-                    .send(Err(StreamError::Provider(format!("{status}: {error}"))))
+                    .send(Err(StreamError::Provider(format!("{status}: {sanitized}"))))
                     .await;
                 return;
             }
@@ -674,7 +674,7 @@ fn build_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<serde_json::Va
 fn parse_response_body(body: &str) -> anyhow::Result<ProviderChatResponse> {
     debug!("llama.cpp response body: {body}");
     let resp = serde_json::from_str::<ResponsesResponse>(body).map_err(|e| {
-        let snippet: String = body.chars().take(200).collect();
+        let snippet = super::sanitize_api_error(body);
         anyhow::anyhow!("llama.cpp responses API returned unexpected payload: {e}; body={snippet}")
     })?;
 
@@ -1033,6 +1033,38 @@ mod url_tests {
         assert_eq!(
             provider("http://localhost:8080/openai/v1").responses_url(),
             "http://localhost:8080/openai/v1/responses"
+        );
+    }
+}
+
+#[cfg(test)]
+mod error_sanitization_tests {
+    use super::parse_response_body;
+
+    #[test]
+    fn parse_error_redacts_api_key_shaped_values() {
+        // Non-JSON body containing an OpenAI-style key — the key must not
+        // appear verbatim in the user-visible error.
+        let body = "upstream error: invalid api key sk-abc123def456ghi789 rejected";
+        let err = parse_response_body(body).unwrap_err().to_string();
+        assert!(
+            !err.contains("sk-abc123"),
+            "raw key must not appear in error: {err}"
+        );
+        assert!(
+            err.contains("[REDACTED]"),
+            "key should be replaced with [REDACTED]: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_error_includes_sanitized_snippet() {
+        // Non-secret bodies should still surface a truncated snippet.
+        let body = "upstream returned plain text instead of JSON";
+        let err = parse_response_body(body).unwrap_err().to_string();
+        assert!(
+            err.contains("plain text"),
+            "sanitized snippet should appear in error: {err}"
         );
     }
 }
