@@ -83,7 +83,7 @@ default = [
     "channel-bluesky", "channel-twitter", "channel-reddit", "channel-notion",
     "channel-linq", "channel-wati", "channel-nextcloud", "channel-mochat",
     "channel-wecom", "channel-clawdtalk", "channel-webhook",
-    "channel-whatsapp-cloud", "channel-voice-call",
+    "channel-whatsapp-cloud", "channel-voice-call", "channel-rocketchat",
 ]
 # Channels with optional deps
 channel-email = ["dep:lettre", "dep:mail-parser", "dep:async-imap"]
@@ -104,6 +104,7 @@ channel-qq = []
 channel-bluesky = []
 channel-twitter = []
 channel-reddit = []
+channel-rocketchat = []
 channel-notion = []
 channel-linq = []
 channel-wati = []

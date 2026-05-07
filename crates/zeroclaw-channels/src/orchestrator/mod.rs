@@ -47,6 +47,7 @@ pub use crate::nostr::NostrChannel;
 pub use crate::notion::NotionChannel;
 pub use crate::qq::QQChannel;
 pub use crate::reddit::RedditChannel;
+pub use crate::rocketchat::RocketChatChannel;
 pub use crate::signal::SignalChannel;
 pub use crate::slack::SlackChannel;
 pub use crate::transcription;
@@ -4476,6 +4477,21 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 lq.allowed_senders.clone(),
             )))
         }
+        "rocketchat" => {
+            let rc = config
+                .channels
+                .rocketchat
+                .as_ref()
+                .context("Rocket.Chat channel is not configured")?;
+            Ok(Arc::new(RocketChatChannel::new(
+                rc.server_url.clone(),
+                rc.auth_token.clone(),
+                rc.user_id.clone(),
+                rc.allowed_users.clone(),
+                rc.room_ids.clone(),
+                rc.poll_interval_secs,
+            )))
+        }
         #[cfg(feature = "channel-email")]
         "email" => {
             let em = config
@@ -5270,6 +5286,22 @@ fn collect_configured_channels(
                 rd.refresh_token.clone(),
                 rd.username.clone(),
                 rd.subreddit.clone(),
+            )),
+        });
+    }
+
+    if let Some(ref rc) = config.channels.rocketchat
+        && rc.enabled
+    {
+        channels.push(ConfiguredChannel {
+            display_name: "RocketChat",
+            channel: Arc::new(RocketChatChannel::new(
+                rc.server_url.clone(),
+                rc.auth_token.clone(),
+                rc.user_id.clone(),
+                rc.allowed_users.clone(),
+                rc.room_ids.clone(),
+                rc.poll_interval_secs,
             )),
         });
     }

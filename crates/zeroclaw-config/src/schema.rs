@@ -6858,6 +6858,9 @@ pub struct ChannelsConfig {
     #[display_name = "Reddit"]
     #[description = "Reddit OAuth2 bot"]
     pub reddit: Option<RedditConfig>,
+    /// Rocket.Chat channel configuration (REST polling).
+    #[nested]
+    pub rocketchat: Option<RocketChatConfig>,
     /// Bluesky channel configuration (AT Protocol).
     #[nested]
     #[display_name = "Bluesky"]
@@ -7044,6 +7047,10 @@ impl ChannelsConfig {
                 self.reddit.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.rocketchat.as_ref())),
+                self.rocketchat.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.bluesky.as_ref())),
                 self.bluesky.is_some(),
             ),
@@ -7110,6 +7117,7 @@ impl Default for ChannelsConfig {
             nostr: None,
             clawdtalk: None,
             reddit: None,
+            rocketchat: None,
             bluesky: None,
             voice_call: None,
             #[cfg(feature = "voice-wake")]
@@ -9029,6 +9037,56 @@ impl ChannelConfig for RedditConfig {
     }
     fn desc() -> &'static str {
         "Reddit bot (OAuth2)"
+    }
+}
+
+fn default_rocketchat_poll_interval_secs() -> u64 {
+    10
+}
+
+/// Rocket.Chat channel configuration (REST polling).
+///
+/// Mints a Personal Access Token in Rocket.Chat (My Account → Personal
+/// Access Tokens → Add) and copies both the token and the bot's `_id`
+/// into `auth_token` and `user_id` respectively. The agent polls each
+/// listed `room_ids` for new messages every `poll_interval_secs`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.rocketchat"]
+pub struct RocketChatConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Rocket.Chat server base URL, e.g. `"https://chat.example.com"`.
+    /// Trailing slash is optional and stripped at load time.
+    pub server_url: String,
+    /// Personal Access Token sent as `X-Auth-Token`.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub auth_token: String,
+    /// Bot account's Rocket.Chat `_id`, sent as `X-User-Id`. Shown next to
+    /// the token in the PAT creation dialog.
+    pub user_id: String,
+    /// Allowed Rocket.Chat usernames (no leading `@`). Empty list = deny all.
+    /// `"*"` allows everyone.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Room IDs (DM, channel, or private group) to poll for new messages.
+    /// Find them via the RC web UI URL (`/channel/<name>` then look up `_id`
+    /// via the admin REST API, or open the channel in admin mode).
+    #[serde(default)]
+    pub room_ids: Vec<String>,
+    /// Polling cadence (seconds). Default: 10.
+    #[serde(default = "default_rocketchat_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+}
+
+impl ChannelConfig for RocketChatConfig {
+    fn name() -> &'static str {
+        "RocketChat"
+    }
+    fn desc() -> &'static str {
+        "Rocket.Chat (REST polling)"
     }
 }
 
@@ -12544,6 +12602,7 @@ auto_save = true
                 nostr: None,
                 clawdtalk: None,
                 reddit: None,
+                rocketchat: None,
                 bluesky: None,
                 voice_call: None,
                 voice_duplex: None,
@@ -13718,6 +13777,7 @@ allowed_users = ["@u:matrix.org"]
             nostr: None,
             clawdtalk: None,
             reddit: None,
+            rocketchat: None,
             bluesky: None,
             voice_call: None,
             voice_duplex: None,
@@ -14100,6 +14160,7 @@ bot_token = "xoxb-tok"
             nostr: None,
             clawdtalk: None,
             reddit: None,
+            rocketchat: None,
             bluesky: None,
             voice_call: None,
             voice_duplex: None,

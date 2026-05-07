@@ -148,6 +148,27 @@ databases = ["..."]                # DB IDs the agent can write to
 
 Treats a Notion database as a message surface. Useful for asynchronous workflows where the "channel" is a task inbox.
 
+## Rocket.Chat
+
+```toml
+[channels.rocketchat]
+enabled = true
+server_url = "https://chat.example.com"   # any RC-compatible server (rocket.chat-cloud or self-hosted)
+auth_token = "xxxxxxxxxxxxxxxxxxxxxxxx"   # SECRET — Personal Access Token, copy from RC web UI
+user_id = "abc123"                         # Bot account `_id`, shown next to the token in the PAT dialog
+allowed_users = ["alice"]                  # `*` allows anyone; usernames are matched case-insensitively
+room_ids = ["GENERAL", "RID_DM_alice"]    # rooms to poll — DM, channel, or private group ids
+poll_interval_secs = 10                    # default 10s; lower bound 2s
+```
+
+- **Auth model:** Personal Access Token. Mint via **My Account → Personal Access Tokens → Add**. Both the `auth_token` and the `user_id` shown in the dialog are required (RC sends them as `X-Auth-Token` and `X-User-Id` headers). No OAuth flow.
+- **Inbound (polling):** for each `room_ids` entry, the agent polls `GET {server}/api/v1/chat.syncMessages?roomId={rid}&lastUpdate={iso8601}` every `poll_interval_secs`. The cursor is the most recent `_updatedAt` already dispatched. Filters drop the bot's own messages, anything outside `allowed_users`, system/bot-flagged posts, and message edits (agent ingestion is append-only).
+- **Outbound:** `POST {server}/api/v1/chat.postMessage` with `roomId` + `text`. Bodies over ~4000 characters are split at sentence/word boundaries with a `(i/N) ` continuation marker; Rocket.Chat doesn't enforce a per-message ceiling, but very long messages render awkwardly in the UI.
+- **Recipient format:** the room id directly (DMs, channels, and private groups all use the same `chat.postMessage` endpoint). The agent's runtime sets this automatically when responding to inbound messages.
+- **Compatibility:** any Rocket.Chat-API-compatible server. Self-hosted instances with private TLS roots need their CA trusted at the OS level.
+- **Rate budget:** default 10s × N rooms = 6N requests/min. Stay under your server's REST rate limit (default in RC is generous; admins can tune).
+- **Out of scope (v1):** DDP/WebSocket realtime, outgoing-webhook receive, attachments, reactions, threads, edit propagation, mention-only gating, `request_approval()`. Polling is the simplest operator story; a follow-up can layer DDP for sub-second latency.
+
 ---
 
 ## When to prefer a dedicated guide
