@@ -6,6 +6,7 @@
 /docs/book/po-extract/
 /docs/book/src/reference/cli.md
 /docs/book/src/reference/config.md
+/docs/book/theme/lang-switcher.js
 .secrets
 firmware/*/target
 web/dist/*
@@ -80,3 +81,9 @@ rust_out
 
 # Auto-generated Tauri schemas
 apps/tauri/gen/schemas/
+
+# Generated TypeScript client (rebuild via cargo web gen-api)
+web/src/lib/api-generated.ts
+
+# Generated OpenAPI spec (transient handoff for openapi-typescript)
+target/openapi.json
