@@ -47,6 +47,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_urlencoded = "0.7"
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 
 # Error handling

@@ -6773,6 +6773,11 @@ pub struct ChannelsConfig {
     #[display_name = "Linq"]
     #[description = "Linq Partner API for iMessage/RCS/SMS"]
     pub linq: Option<LinqConfig>,
+    /// Vonage (Nexmo) SMS channel configuration.
+    #[nested]
+    #[display_name = "Vonage SMS"]
+    #[description = "Vonage / Nexmo programmable SMS"]
+    pub vonage: Option<VonageConfig>,
     /// WATI WhatsApp Business API channel configuration.
     #[nested]
     #[display_name = "WATI"]
@@ -6987,6 +6992,10 @@ impl ChannelsConfig {
                 self.linq.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.vonage.as_ref())),
+                self.vonage.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.wati.as_ref())),
                 self.wati.is_some(),
             ),
@@ -7092,6 +7101,7 @@ impl Default for ChannelsConfig {
             signal: None,
             whatsapp: None,
             linq: None,
+            vonage: None,
             wati: None,
             nextcloud_talk: None,
             email: None,
@@ -7790,6 +7800,56 @@ impl ChannelConfig for LinqConfig {
     }
     fn desc() -> &'static str {
         "iMessage/RCS/SMS via Linq API"
+    }
+}
+
+/// Vonage (Nexmo) SMS channel configuration.
+///
+/// Inbound SMS arrives via the gateway at the hardcoded path
+/// `/vonage/sms`. The operator must point Vonage's "Inbound SMS
+/// Webhook" at `https://{public-gateway-url}/vonage/sms` (POST,
+/// `application/x-www-form-urlencoded`) and configure a "Signature
+/// secret" + "HMAC SHA-256" in the Vonage dashboard settings — that's
+/// what the gateway uses to authenticate inbound payloads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.vonage"]
+pub struct VonageConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Vonage API key — public identifier shown in the dashboard.
+    pub api_key: String,
+    /// Vonage API secret. Sent in the outbound SMS POST body alongside
+    /// `api_key` (Vonage's legacy SMS API takes credentials in the form
+    /// body, not headers).
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_secret: String,
+    /// Sender — E.164 phone number (e.g. `"+15555550100"`), short code,
+    /// or alphanumeric sender ID (where allowed by destination country).
+    pub from_number_or_sender_id: String,
+    /// Allowed sender numbers in E.164 format (e.g. `"+15555550199"`).
+    /// Empty list = deny all. `"*"` allows everyone (use with care; this
+    /// is a public PSTN endpoint).
+    #[serde(default)]
+    pub allowed_numbers: Vec<String>,
+    /// Inbound webhook signature secret. **Distinct from `api_secret`**
+    /// — set separately in the Vonage dashboard's API settings as the
+    /// "Signature secret" with algorithm "HMAC SHA-256". The gateway
+    /// recomputes the `sig` parameter on every inbound webhook and
+    /// rejects mismatches with 401 before they reach the agent loop.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub signature_secret: String,
+}
+
+impl ChannelConfig for VonageConfig {
+    fn name() -> &'static str {
+        "Vonage"
+    }
+    fn desc() -> &'static str {
+        "Vonage / Nexmo programmable SMS"
     }
 }
 
@@ -12526,6 +12586,7 @@ auto_save = true
                 signal: None,
                 whatsapp: None,
                 linq: None,
+                vonage: None,
                 wati: None,
                 nextcloud_talk: None,
                 email: None,
@@ -13700,6 +13761,7 @@ allowed_users = ["@u:matrix.org"]
             signal: None,
             whatsapp: None,
             linq: None,
+            vonage: None,
             wati: None,
             nextcloud_talk: None,
             email: None,
@@ -14082,6 +14144,7 @@ bot_token = "xoxb-tok"
                 approval_timeout_secs: 300,
             }),
             linq: None,
+            vonage: None,
             wati: None,
             nextcloud_talk: None,
             email: None,

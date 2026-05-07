@@ -148,6 +148,28 @@ databases = ["..."]                # DB IDs the agent can write to
 
 Treats a Notion database as a message surface. Useful for asynchronous workflows where the "channel" is a task inbox.
 
+## Vonage SMS
+
+```toml
+[channels.vonage]
+enabled = true
+api_key = "ABCDEF12"                              # public — Vonage Dashboard → Account → API settings
+api_secret = "xxxxxxxxxxxxxxxx"                   # SECRET — paired with api_key for outbound POSTs
+from_number_or_sender_id = "+15555550100"         # E.164, short code, or alphanumeric sender ID
+allowed_numbers = ["+15555550199"]                # `*` allows anyone (use with care; this is the public PSTN)
+signature_secret = "yyyyyyyyyyyyyyyy"             # SECRET — separate from api_secret, configured in dashboard
+```
+
+- **Auth model:** Vonage uses **two distinct credentials**, both copied from the dashboard:
+  - `api_secret` — the legacy SMS API password. Sent in the outbound POST body alongside `api_key` (Vonage's `/sms/json` endpoint takes credentials in the form body, not headers).
+  - `signature_secret` — the inbound webhook HMAC key, configured separately under **API settings → Signed messages** with algorithm **HMAC SHA-256**. Mixing this up with `api_secret` is a common operator footgun (analogous to Telnyx's api_key vs. public_key) — they're two unrelated values.
+- **Inbound endpoint:** ZeroClaw's gateway hosts `POST /vonage/sms` on its public URL. In the Vonage dashboard, set the **Inbound SMS Webhook** to `https://{your-public-gateway-url}/vonage/sms` with HTTP method **POST** and `application/x-www-form-urlencoded`.
+- **Signature verification:** the gateway recomputes Vonage's `sig` parameter on every inbound webhook — HMAC-SHA256 over alphabetically-sorted form params + `signature_secret`, hex-encoded. Mismatches return 401 and the message is dropped before reaching the agent loop.
+- **Outbound:** `POST https://rest.nexmo.com/sms/json` with form fields `api_key`, `api_secret`, `from`, `to`, `text`. Bodies over 1600 chars are split into ≤1600-char chunks at sentence/word boundaries with a `(i/N) ` continuation marker. Vonage's per-message status (in the JSON response) is also checked — `status != "0"` surfaces as an error.
+- **Public exposure:** the gateway needs to be reachable from Vonage's public IP range. Use one of the `[tunnel]` providers — Cloudflare Tunnel, Tailscale Funnel, ngrok, Pinggy, or a custom command. The tunnel must terminate TLS on a stable hostname so the signature stays valid across reconnects (Vonage signs the URL it was configured with).
+- **Trial accounts:** Vonage trial accounts can only message verified destinations. This is a Vonage constraint, not a ZeroClaw bug.
+- **Cost:** every outbound SMS segment is billable to your Vonage account. The default `enabled = false` is intentional — opt in only after you've confirmed the configuration is right.
+
 ---
 
 ## When to prefer a dedicated guide

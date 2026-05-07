@@ -64,6 +64,8 @@ pub mod twitter;
 pub mod voice_call;
 #[cfg(feature = "voice-wake")]
 pub mod voice_wake;
+#[cfg(feature = "channel-vonage")]
+pub mod vonage;
 #[cfg(feature = "channel-wati")]
 pub mod wati;
 #[cfg(feature = "channel-webhook")]
