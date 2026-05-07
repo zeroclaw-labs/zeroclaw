@@ -479,10 +479,20 @@ impl Agent {
             Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
-            session_cwd.unwrap_or(&config.workspace_dir),
-        ));
+        let security = Arc::new({
+            let mut policy = SecurityPolicy::from_config(
+                &config.autonomy,
+                session_cwd.unwrap_or(&config.workspace_dir),
+            );
+            // When a per-session cwd overrides the sandbox root, ensure the
+            // ZeroClaw workspace (where skills, identity, and config data live)
+            // remains readable. Without this, file_read and search tools are
+            // locked out of the workspace the moment the session cwd differs.
+            if session_cwd.is_some() {
+                policy.allowed_roots.push(config.workspace_dir.clone());
+            }
+            policy
+        });
 
         let fallback_provider_ag = config.providers.fallback_provider();
         let memory: Arc<dyn Memory> =
