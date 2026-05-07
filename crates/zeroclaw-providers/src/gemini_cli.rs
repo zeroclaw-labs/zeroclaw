@@ -123,16 +123,13 @@ impl GeminiCliProvider {
     /// Returns the trimmed stdout output as the assistant response.
     async fn invoke_cli(&self, message: &str, model: &str) -> anyhow::Result<String> {
         let mut cmd = Command::new(&self.binary_path);
-        cmd.arg("--print");
+        cmd.arg("--prompt").arg(message);
 
         if Self::should_forward_model(model) {
             cmd.arg("--model").arg(model);
         }
 
-        // Read prompt from stdin to avoid exposing sensitive content in process args.
-        cmd.arg("-");
         cmd.kill_on_drop(true);
-        cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -143,15 +140,6 @@ impl GeminiCliProvider {
                 self.binary_path.display()
             )
         })?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(message.as_bytes()).await.map_err(|err| {
-                anyhow::anyhow!("Failed to write prompt to Gemini CLI stdin: {err}")
-            })?;
-            stdin.shutdown().await.map_err(|err| {
-                anyhow::anyhow!("Failed to finalize Gemini CLI stdin stream: {err}")
-            })?;
-        }
 
         let output = timeout(GEMINI_CLI_REQUEST_TIMEOUT, child.wait_with_output())
             .await
