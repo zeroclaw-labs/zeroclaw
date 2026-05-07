@@ -220,18 +220,29 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     }
 }
 
-/// Produce a short human-readable summary of tool arguments.
+/// Produce a short human-readable summary of tool arguments. Argument keys
+/// whose names suggest a credential get their value replaced with
+/// `[redacted]` before truncation, so summaries that cross security
+/// boundaries (e.g. the gateway WebSocket `approval_request` frame) cannot
+/// leak secret-bearing fields. Operators MUST treat the summary as
+/// best-effort: a tool that names its credential field something other than
+/// the patterns below still surfaces. The tool author's typed config and
+/// `#[secret]` annotations are the long-term truth source.
 pub fn summarize_args(args: &serde_json::Value) -> String {
     match args {
         serde_json::Value::Object(map) => {
             let parts: Vec<String> = map
                 .iter()
                 .map(|(k, v)| {
-                    let val = match v {
-                        serde_json::Value::String(s) => truncate_for_summary(s, 80),
-                        other => {
-                            let s = other.to_string();
-                            truncate_for_summary(&s, 80)
+                    let val = if looks_like_secret_key(k) {
+                        "[redacted]".to_string()
+                    } else {
+                        match v {
+                            serde_json::Value::String(s) => truncate_for_summary(s, 80),
+                            other => {
+                                let s = other.to_string();
+                                truncate_for_summary(&s, 80)
+                            }
                         }
                     };
                     format!("{k}: {val}")
@@ -244,6 +255,31 @@ pub fn summarize_args(args: &serde_json::Value) -> String {
             truncate_for_summary(&s, 120)
         }
     }
+}
+
+/// Heuristic for argument keys that should have their value redacted in
+/// human-readable summaries. Matches anywhere in the (lowercased) key:
+/// covers `api_key`, `api-key`, `apiKey`, `oauth_token`, `secret`,
+/// `password`, `auth_token`, `bearer`, `client_secret`, `private_key`, etc.
+fn looks_like_secret_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    [
+        "secret",
+        "password",
+        "passwd",
+        "token",
+        "api_key",
+        "api-key",
+        "apikey",
+        "auth",
+        "bearer",
+        "private_key",
+        "private-key",
+        "privatekey",
+        "credential",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn truncate_for_summary(input: &str, max_chars: usize) -> String {
@@ -670,5 +706,63 @@ mod tests {
         assert_eq!(parsed, ChannelApprovalResponse::AlwaysApprove);
         let parsed: ChannelApprovalResponse = serde_json::from_str("\"deny\"").unwrap();
         assert_eq!(parsed, ChannelApprovalResponse::Deny);
+    }
+
+    // ── summarize_args secret-key redaction ────────────────────
+
+    #[test]
+    fn summarize_args_redacts_known_secret_key_names() {
+        let args = serde_json::json!({
+            "endpoint": "https://api.example.com",
+            "api_key": "sk-very-secret-key-value",
+            "oauth_token": "oauth-secret",
+            "client_secret": "client-secret",
+            "password": "hunter2",
+            "private_key": "-----BEGIN PRIVATE KEY-----abc",
+            "bearer_token": "bearer-thing",
+        });
+        let summary = summarize_args(&args);
+        for needle in [
+            "sk-very-secret-key-value",
+            "oauth-secret",
+            "client-secret",
+            "hunter2",
+            "-----BEGIN PRIVATE KEY-----",
+            "bearer-thing",
+        ] {
+            assert!(
+                !summary.contains(needle),
+                "summary leaked secret value {needle:?}: {summary}"
+            );
+        }
+        assert!(summary.contains("endpoint:"));
+        assert!(summary.contains("api.example.com"));
+    }
+
+    #[test]
+    fn summarize_args_keeps_non_secret_values() {
+        let args = serde_json::json!({
+            "path": "/tmp/file.txt",
+            "limit": 42,
+        });
+        let summary = summarize_args(&args);
+        assert!(summary.contains("/tmp/file.txt"));
+        assert!(summary.contains("42"));
+    }
+
+    #[test]
+    fn summarize_args_redaction_is_case_insensitive_and_substring_aware() {
+        let args = serde_json::json!({
+            "X-API-Key": "hdrsecret",
+            "DBPassword": "dbpw",
+            "AuthHeader": "auth-thing",
+        });
+        let summary = summarize_args(&args);
+        for leaked in ["hdrsecret", "dbpw", "auth-thing"] {
+            assert!(
+                !summary.contains(leaked),
+                "redaction missed {leaked:?}: {summary}"
+            );
+        }
     }
 }
