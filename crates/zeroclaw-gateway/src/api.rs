@@ -69,7 +69,7 @@ pub struct CronRunsQuery {
 #[derive(Deserialize)]
 pub struct CronAddBody {
     /// Configured agent alias the cron job will run as. Required —
-    /// V3 has no default agent.
+    /// there is no default agent.
     pub agent: String,
     pub name: Option<String>,
     pub schedule: String,

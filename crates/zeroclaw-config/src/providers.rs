@@ -662,9 +662,9 @@ impl ProvidersConfig {
         self.models.iter_entries().next().map(|(ty, _, _)| ty)
     }
 
-    /// Return the V3 dotted `<type>.<alias>` identifier of the first
-    /// configured model model_provider entry, if any. Use this when callers need
-    /// the alias reference (matches `agents.<x>.model_provider` values).
+    /// Return the dotted `<type>.<alias>` identifier of the first configured
+    /// model model_provider entry, if any. Use this when callers need the
+    /// alias reference (matches `agents.<x>.model_provider` values).
     pub fn first_provider_alias(&self) -> Option<String> {
         self.models
             .iter_entries()

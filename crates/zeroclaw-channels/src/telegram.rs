@@ -526,7 +526,7 @@ impl TelegramChannel {
 
     /// Configure text-to-speech for outgoing voice replies.
     ///
-    /// Builds a [`super::tts::TtsManager`] from the V3
+    /// Builds a [`super::tts::TtsManager`] from the
     /// `[providers.tts.<type>.<alias>]` map. Disabled when `[tts].enabled = false`
     /// or when the manager fails to construct (logged at warn).
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {

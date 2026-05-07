@@ -2645,8 +2645,9 @@ pub struct DelegateAgentConfig {
     pub transcription_provider: crate::providers::TranscriptionProviderRef,
 
     // ── Agent loop / runtime tunables (folded from `[agent]` ──────
-    // V3 makes these per-agent. Defaults preserve V2 behavior so an
-    // unconfigured agent runs identically to the old global `[agent]`.
+    // These are per-agent. Defaults preserve the legacy single-agent
+    // behavior so an unconfigured agent runs identically to a config
+    // that previously lived under a global `[agent]` table.
     /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
     #[serde(default = "default_agent_compact_context")]
     pub compact_context: bool,
@@ -2792,11 +2793,11 @@ impl Config {
     /// agent doesn't exist, the reference is unparseable, or the
     /// `<type>.<alias>` pair doesn't resolve in `providers.models`.
     ///
-    /// This is the V3-correct lookup the orchestrator uses to build
-    /// per-agent model_provider runtime options instead of falling back to
-    /// `first_model_provider()`, which silently collapses multiple aliases under
-    /// the same model_provider family to whichever entry happens to be first
-    /// (#6266 review). The matching split logic lives in
+    /// This is the lookup the orchestrator uses to build per-agent
+    /// model_provider runtime options instead of falling back to
+    /// `first_model_provider()`, which silently collapses multiple aliases
+    /// under the same model_provider family to whichever entry happens to be
+    /// first. The matching split logic lives in
     /// `crates/zeroclaw-runtime/src/tools/delegate.rs::resolve_brain` for
     /// delegate sub-agents; this helper exposes the same contract for the
     /// channel-server startup path.
@@ -3014,12 +3015,12 @@ where
 }
 
 /// Deserialize an `Option<String>` that maps an empty literal `""` to
-/// `None`. Used by `JiraConfig::email` so a V2 config that round-tripped
-/// `email = ""` to disk (V2's `email: String` had no
-/// `skip_serializing_if`) doesn't migrate into V3 as `Some("")` and
-/// silently break Basic auth — Removed the email-required validation
-/// when adding Server/DC Bearer-token support (#6116), so this is the
-/// last line of defense (#6266 review).
+/// `None`. Used by `JiraConfig::email` so a config that round-tripped
+/// `email = ""` to disk (the legacy `email: String` had no
+/// `skip_serializing_if`) doesn't deserialize as `Some("")` and silently
+/// break Basic auth — the email-required validation was removed when
+/// Server/DC Bearer-token support landed, so this is the last line of
+/// defense.
 fn deserialize_optional_email_skip_empty<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error>
@@ -3378,7 +3379,7 @@ fn default_tts_max_text_length() -> usize {
 
 /// Text-to-Speech subsystem configuration (`[tts]`).
 ///
-/// V3 promotes per-instance TTS configs to `[providers.tts.<type>.<alias>]`
+/// Per-instance TTS configs live under `[providers.tts.<type>.<alias>]`
 /// (parallel to `providers.models`). What remains here are the global
 /// runtime knobs that apply to every model_provider invocation.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -7430,7 +7431,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 
 /// Persistent storage configuration (`[storage]` section).
 ///
-/// V3 promotes storage to a two-tier alias-keyed map: `[storage.<backend>.<alias>]`,
+/// Storage is a two-tier alias-keyed map: `[storage.<backend>.<alias>]`,
 /// parallel to `[providers.models.<type>.<alias>]`. Each backend has its own typed
 /// config struct. `MemoryConfig.backend` carries a dotted reference (`"sqlite.default"`,
 /// `"postgres.work"`) that resolves to one of these entries via
@@ -7477,9 +7478,8 @@ pub struct SqliteStorageConfig {
 
 /// PostgreSQL storage backend (`[storage.postgres.<alias>]`).
 ///
-/// Holds connection parameters AND pgvector settings — V3 collapses the V2
-/// `[storage.model_provider.config]` (connection) and `[memory.postgres]`
-/// (vector params) into one alias-keyed entry.
+/// Holds connection parameters AND pgvector settings on one alias-keyed
+/// entry; previously these lived in two separate sections.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "storage-postgres"]
@@ -7720,10 +7720,9 @@ pub struct MemoryConfig {
     #[nested]
     pub policy: MemoryPolicyConfig,
     // Backend-specific config fields (sqlite_open_timeout_secs, qdrant.*,
-    // postgres.*) lived here in V2. V3 moves them onto
-    // `[storage.<backend>.<alias>]`. The `backend` field now carries a dotted
-    // alias reference and the runtime looks up the typed config via
-    // `Config::resolve_active_storage`.
+    // postgres.*) live on `[storage.<backend>.<alias>]`. The `backend` field
+    // carries a dotted alias reference and the runtime looks up the typed
+    // config via `Config::resolve_active_storage`.
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -8012,12 +8011,11 @@ impl Default for WebhookAuditConfig {
 
 // ── Autonomy / Security ──────────────────────────────────────────
 //
-// V2's global `[autonomy]` table is gone. All policy fields live on
-// per-agent `[risk_profiles.<alias>]` entries (see `RiskProfileConfig`
-// below); the migration synthesizes `risk_profiles.default` from V2's
-// `[autonomy] + [security.sandbox] + [security.resources]` blocks.
-// `Config::active_risk_profile(agent_alias)` resolves the active profile
-// for any callsite (agent-driven or non-agent contexts).
+// All policy fields live on per-agent `[risk_profiles.<alias>]` entries
+// (see `RiskProfileConfig` below). `Config::active_risk_profile(agent_alias)`
+// resolves the active profile for any callsite (agent-driven or non-agent
+// contexts). Configs from older schema versions are folded into
+// `risk_profiles.default` by the migration in `schema/v2.rs`.
 
 fn default_shell_timeout_secs() -> u64 {
     60
@@ -8056,9 +8054,9 @@ impl RiskProfileConfig {
     }
 
     /// Synthesize a [`SandboxConfig`] from this profile's flattened sandbox
-    /// fields. V3 stores sandbox config flat on the profile; legacy
-    /// callsites that still want a `SandboxConfig` instance (sandbox detection
-    /// in `zeroclaw-runtime::security::detect`) can call this helper.
+    /// fields. Sandbox config is stored flat on the profile; callsites that
+    /// still want a `SandboxConfig` instance (sandbox detection in
+    /// `zeroclaw-runtime::security::detect`) can call this helper.
     #[must_use]
     pub fn sandbox_config(&self) -> SandboxConfig {
         let backend = self
@@ -8126,13 +8124,13 @@ fn is_valid_env_var_name(name: &str) -> bool {
 
 /// Named risk/autonomy profile (`[risk_profiles.<alias>]`).
 ///
-/// V3 unified policy surface. Replaces V2's global `[autonomy]` table:
-/// agents reference a profile by alias, the runtime resolves through it
-/// for shell command allowlists, approval gates, sandbox/resource limits,
-/// and delegation guardrails. The conventional `risk_profiles["default"]`
-/// is the resolution target for non-agent contexts (orchestrator init,
-/// cron worker startup); the `Default` impl below mirrors V2's
-/// safety-first defaults so a fresh install behaves the same.
+/// Unified policy surface. Agents reference a profile by alias and the
+/// runtime resolves through it for shell command allowlists, approval gates,
+/// sandbox/resource limits, and delegation guardrails. The conventional
+/// `risk_profiles["default"]` is the resolution target for non-agent
+/// contexts (orchestrator init, cron worker startup); the `Default` impl
+/// below mirrors the legacy safety-first defaults so a fresh install
+/// behaves the same as a config from before the per-profile split.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "risk-profile"]
@@ -8298,11 +8296,11 @@ pub struct SkillBundleConfig {
 /// Isolates agent memory operations within a named namespace, preventing
 /// cross-contamination between agents sharing the same backend.
 ///
-/// V3 model: namespaces are tags within the active memory backend — they
-/// do not pick a different backend. SQL backends column-tag rows with
-/// the namespace value; qdrant uses per-namespace collections; markdown
-/// uses per-namespace directories. The per-backend isolation primitive
-/// is the runtime backend's responsibility.
+/// Namespaces are tags within the active memory backend — they do not pick
+/// a different backend. SQL backends column-tag rows with the namespace
+/// value; qdrant uses per-namespace collections; markdown uses per-namespace
+/// directories. The per-backend isolation primitive is the runtime backend's
+/// responsibility.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory-namespace"]
@@ -8310,7 +8308,7 @@ pub struct SkillBundleConfig {
 pub struct MemoryNamespaceConfig {
     /// Namespace key used to scope memory operations.
     pub namespace: String,
-    /// Optional backend override (DEPRECATED — V3 namespaces share the
+    /// Optional backend override (DEPRECATED — namespaces share the
     /// global backend; this field will be removed once runtime backend
     /// routing migrates to per-agent storage selection).
     pub backend: Option<String>,
@@ -8535,8 +8533,8 @@ impl Default for ReliabilityConfig {
 
 /// Scheduler configuration for periodic task execution (`[scheduler]` section).
 ///
-/// V3 owns the cron-runtime knobs (previously on `[cron]`): per-job declarations
-/// moved to `Config.cron: HashMap<String, CronJobDecl>` (alias-keyed), while the
+/// Owns the cron-runtime knobs: per-job declarations live on
+/// `Config.cron: HashMap<String, CronJobDecl>` (alias-keyed), while the
 /// scheduler loop's runtime behavior (`enabled`, polling cap, catch-up) lives here.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -8697,7 +8695,7 @@ pub struct ClassificationRule {
 #[allow(clippy::struct_excessive_bools)]
 pub struct HeartbeatConfig {
     /// Enable periodic heartbeat pings. Default: `false`. When enabled,
-    /// `agent` must name a configured agent — V3 has no default agent
+    /// `agent` must name a configured agent — there is no default agent
     /// for heartbeat to fall through to.
     #[serde(default)]
     pub enabled: bool,
@@ -10691,8 +10689,7 @@ impl ChannelConfig for FeishuConfig {
 
 /// Security configuration for audit logging, OTP, e-stop, IAM/SSO, and WebAuthn.
 ///
-/// V2's `[security.sandbox]` and `[security.resources]` subsections are
-/// gone. Sandbox backend and resource limits live on per-agent risk profiles
+/// Sandbox backend and resource limits live on per-agent risk profiles
 /// (see `RiskProfileConfig::sandbox_*` and `RiskProfileConfig::max_*`); the
 /// runtime resolves them via `Config::active_risk_profile(agent_alias)`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
@@ -11695,10 +11692,11 @@ pub struct JiraConfig {
     pub base_url: String,
     /// Jira account email used for Basic auth (Cloud).
     /// Omit for Server/DC deployments using Bearer token auth.
-    /// An empty string (`email = ""`) deserializes as `None`; V2 configs
-    /// with the empty default would otherwise silently regress to Basic
-    /// auth with empty username under V3, which dropped the email-required
-    /// validation (#6266 review).
+    /// An empty string (`email = ""`) deserializes as `None`. Configs
+    /// that round-tripped the empty default to disk would otherwise
+    /// silently regress to Basic auth with empty username, since the
+    /// email-required validation was dropped when Server/DC Bearer-token
+    /// support landed.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -12807,7 +12805,7 @@ impl Config {
         }
 
         // Validate every configured risk profile. Each profile stands on
-        // its own — V3 has no "active" or "default" risk profile concept;
+        // its own — there is no "active" or "default" risk profile concept;
         // an agent's `risk_profile` field names exactly which one applies.
         let mut profile_aliases: Vec<&String> = self.risk_profiles.keys().collect();
         profile_aliases.sort();
@@ -13625,7 +13623,7 @@ impl Config {
                 }
             }
 
-            // risk_profile is mandatory for enabled agents — V3 has no
+            // risk_profile is mandatory for enabled agents — there is no
             // global fallback, so an enabled agent with no profile can't
             // gate its actions. Run this check last so the more specific
             // dangling/format errors above surface first.
@@ -14260,9 +14258,9 @@ mod tests {
     #[test]
     async fn heartbeat_config_default() {
         let h = HeartbeatConfig::default();
-        // V3 defaults heartbeat to disabled. Enabling requires the user
-        // to also bind it to a configured agent — there is no default
-        // agent for heartbeat to fall through to.
+        // Heartbeat defaults to disabled. Enabling requires the user to
+        // also bind it to a configured agent — there is no default agent
+        // for heartbeat to fall through to.
         assert!(!h.enabled);
         assert!(h.agent.is_empty());
         assert_eq!(h.interval_minutes, 30);
@@ -14700,9 +14698,9 @@ default_temperature = 0.7
         );
         assert_eq!(parsed.observability.backend, "none");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
-        // Migration synthesizes risk_profiles.default from the V2-shape
+        // Migration synthesizes risk_profiles.default from the legacy
         // [autonomy] block; assert against the named entry rather than a
-        // global "active" profile (V3 has no such concept).
+        // global "active" profile (no such concept exists).
         assert_eq!(
             parsed
                 .risk_profiles
@@ -14712,7 +14710,7 @@ default_temperature = 0.7
             AutonomyLevel::Supervised
         );
         assert_eq!(parsed.runtime.kind, "native");
-        // V3 defaults heartbeat to disabled.
+        // Heartbeat defaults to disabled.
         assert!(!parsed.heartbeat.enabled);
         assert!(parsed.channels.cli);
         assert!(parsed.memory.hygiene_enabled);
@@ -17373,7 +17371,7 @@ default_model = "persisted-profile"
         // exists unchanged; this test was dropped during the
         // upstream/master merge resolution alongside the env_override
         // tests that were intentionally deleted with `apply_env_overrides()`.
-        // It's V3-compatible — restoring (#6266 review).
+        // Restoring it here.
         for action in ["list_projects", "myself"] {
             let mut config = Config::default();
             config.jira.enabled = true;
@@ -17394,12 +17392,13 @@ default_model = "persisted-profile"
 
     #[test]
     async fn jira_email_empty_string_deserializes_as_none() {
-        // V2 configs round-tripped `email = ""` to disk because V2's
-        // `email: String` lacked `skip_serializing_if`. After migration,
-        // V3 would otherwise deserialize `email = ""` as `Some("")`, and
-        // JiraTool would attempt Basic auth with empty username (the
-        // dropped email-required validation no longer catches this).
-        // Defense-in-depth: empty strings deserialize as None (#6266 review).
+        // Legacy configs round-tripped `email = ""` to disk because the
+        // pre-rename `email: String` lacked `skip_serializing_if`. The
+        // current `Option<String>` would otherwise deserialize `""` as
+        // `Some("")`, and JiraTool would attempt Basic auth with empty
+        // username (the dropped email-required validation no longer
+        // catches this). Defense-in-depth: empty strings deserialize as
+        // None.
         let toml_input = r#"
 enabled = true
 base_url = "https://jira.example.test"
@@ -19511,7 +19510,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     #[test]
     async fn typed_custom_slot_round_trips_uri_through_save_and_load() {
-        // V2 colon-URL keys (`custom:https://...`) are gone — `custom`
+        // Legacy colon-URL keys (`custom:https://...`) are gone — `custom`
         // is a typed slot whose `uri` field carries the operator URL.
         // This pins: secret routing, save/encrypt, and round-trip reload
         // for the typed `custom` slot.
@@ -19613,7 +19612,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     #[test]
     async fn map_key_sections_discovers_per_family_provider_slots() {
-        // V3 typed-family split: `providers.models` is a struct of typed
+        // Typed-family split: `providers.models` is a struct of typed
         // family maps, not a single open HashMap. Each family slot
         // (`providers.models.<family>`) is its own Map-kind section; the
         // dashboard's "+ Add alias" affordance hangs off the family path.
@@ -19666,7 +19665,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     #[test]
     async fn create_map_key_inserts_default_alias_under_typed_family() {
-        // V3 dashboard "+ Add alias" target is the typed family slot,
+        // Dashboard "+ Add alias" target is the typed family slot,
         // not a free-form provider key under `providers.models`.
         let mut config = Config::default();
         assert!(
@@ -19710,7 +19709,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut config = Config::default();
         assert!(config.channels.matrix.is_empty());
 
-        // V3 channels are HashMaps — init_defaults cannot insert a default key
+        // Channels are HashMaps — init_defaults cannot insert a default key
         // (there is no meaningful default alias). Callers use create_map_key.
         config
             .create_map_key("channels.matrix", "default")

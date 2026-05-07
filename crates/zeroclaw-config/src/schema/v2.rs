@@ -35,10 +35,10 @@ use std::collections::HashMap;
 
 /// V1/V2 supported a "colon-URL" provider string form (e.g.
 /// `"anthropic-custom:https://api.z.ai/api/anthropic"`) where the URL was
-/// embedded inline. V3 uses typed `base_url` fields on the per-provider
-/// config entry. This helper splits the colon-URL form into `(type, url)`
+/// embedded inline. V3 uses a typed `uri` field on the per-provider
+/// alias entry. This helper splits the colon-URL form into `(type, url)`
 /// so the migration can use `type` as the V3 provider key and store the
-/// URL in `base_url` on the alias entry. Returns `(type_key, Some(url))`
+/// URL in `uri` on the alias entry. Returns `(type_key, Some(url))`
 /// for colon-URL forms; otherwise `(raw.to_string(), None)`.
 fn split_colon_url_provider(raw: &str) -> (String, Option<String>) {
     if let Some(colon_idx) = raw.find(':') {

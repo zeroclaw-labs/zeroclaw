@@ -1012,9 +1012,8 @@ channel_ids = ["aaaa"]
 // provider key, then synthesized `model_provider = "<type>:<url>.<alias>"`.
 // V3's `split_once('.')` resolution then tokenized at the first URL dot
 // (e.g. inside `api.z.ai`), making the reference unresolvable. The fix
-// splits the URL into `base_url` on the alias entry and uses only the
-// prefix as the V3 type key, keeping `<type>.<alias>` parseable (#6266
-// review).
+// splits the URL into `uri` on the alias entry and uses only the
+// prefix as the V3 type key, keeping `<type>.<alias>` parseable.
 // ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -1043,7 +1042,7 @@ api_key = "sk-zai-test"
 }
 
 #[test]
-fn custom_colon_url_default_provider_splits_into_base_url() {
+fn custom_colon_url_default_provider_splits_into_uri() {
     let raw = r#"
 default_provider = "custom:http://localhost:8080/v1"
 default_model = "local-model"

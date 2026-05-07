@@ -514,12 +514,12 @@ pub async fn run_gateway(
     // that need an agent context (`/webhook?agent=`, `/ws/chat?agent=`,
     // ACP `session/new`, agent-scoped tools/memory) take it from the
     // request. The shared SecurityPolicy / risk_profile / tools_registry
-    // built here are V2 vestiges driving the legacy single-agent
+    // built here are vestiges driving the legacy single-agent
     // `/api/tools` listing and the `run_gateway_chat_with_tools` test
     // mock; per-request agent dispatch is tracked as a follow-up. Pick
     // the migration-synthesized "default" agent when present, else the
     // first enabled agent — purely to seed AppState for those legacy
-    // surfaces; new V3 endpoints don't read from this state.
+    // surfaces; per-agent endpoints don't read from this state.
     let agent_alias = config
         .agents
         .keys()
@@ -1535,7 +1535,7 @@ async fn run_gateway_chat_with_tools(
     #[cfg(not(test))]
     {
         let config = state.config.lock().clone();
-        // V2 vestige: webhook chat / SSE / pairing endpoints don't yet
+        // Legacy: webhook chat / SSE / pairing endpoints don't yet
         // accept an explicit agent in the request payload. Pick the
         // migration-synthesized "default" agent (or first enabled) until
         // the per-request agent dispatch refactor lands.

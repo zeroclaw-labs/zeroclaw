@@ -412,7 +412,7 @@ pub fn all_tools_with_runtime(
     ];
 
     // Register discord_search if any configured Discord alias has
-    // archive enabled. V3 supports multiple Discord aliases (one per
+    // archive enabled. Multiple Discord aliases are supported (one per
     // bot/server set); the search tool reads from a shared archive DB
     // so it's enabled when at least one alias archives.
     if root_config.channels.discord.values().any(|d| d.archive) {

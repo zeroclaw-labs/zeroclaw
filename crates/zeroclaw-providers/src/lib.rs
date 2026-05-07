@@ -2978,7 +2978,7 @@ mod tests {
     fn provider_runtime_options_from_config_propagates_native_tools() {
         // End-to-end path: setting `native_tools` on the first configured
         // model_provider entry must reach `ModelProviderRuntimeOptions` so the
-        // Groq factory branch sees it. V3 has no global fallback; the
+        // Groq factory branch sees it. There is no global fallback; the
         // orchestrator resolves per-agent and falls back to
         // `first_model_provider()`.
         use zeroclaw_config::schema::{GroqModelProviderConfig, ModelProviderConfig};
@@ -3105,7 +3105,7 @@ mod tests {
     // Migration of legacy colon-URL configs is exercised by the integration
     // tests in `crates/zeroclaw-config/tests/migration.rs`
     // (`anthropic_custom_colon_url_default_provider_folds_under_anthropic`,
-    // `custom_colon_url_default_provider_splits_into_base_url`,
+    // `custom_colon_url_default_provider_splits_into_uri`,
     // `agent_inline_brain_colon_url_provider_splits_into_uri`).
 
     #[test]
@@ -3177,9 +3177,9 @@ mod tests {
 
     #[test]
     fn factory_all_canonical_model_providers_create_successfully() {
-        // Canonical V3 family names only — legacy synonyms are collapsed by
-        // `normalize_model_provider_type` in `schema/v2.rs` and never reach the
-        // runtime. `azure` is excluded (typed-config required, see
+        // Canonical family names only — legacy synonyms are collapsed by
+        // `normalize_model_provider_type` in `schema/v2.rs` and never reach
+        // the runtime. `azure` is excluded (typed-config required, see
         // `listed_model_providers_are_constructible` skip list); `custom` is
         // excluded (URI required, covered by `factory_custom_*` tests).
         let canonical = [

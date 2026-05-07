@@ -852,10 +852,9 @@ fn resolved_default_provider(config: &Config) -> String {
 
 /// Resolve the default model for channel startup: the first configured
 /// `[providers.models.<type>.<alias>]` entry's `model` field. Hard-fails
-/// with an actionable error when nothing is configured (#6099,
-/// #6215). V3 has no global fallback provider — every callsite either
-/// resolves through an agent's `model_provider` or comes through
-/// `first_provider()`.
+/// with an actionable error when nothing is configured. There is no
+/// global fallback provider — every callsite either resolves through an
+/// agent's `model_provider` or comes through `first_provider()`.
 fn resolved_default_model(config: &Config) -> anyhow::Result<String> {
     if let Some(m) = config
         .providers
@@ -5373,10 +5372,10 @@ pub async fn start_channels(
     config: Config,
     canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
 ) -> Result<()> {
-    // V3 model: each channel is owned by exactly one Agent (via
-    // agent_for_channel). Per-channel runtime contexts (one SecurityPolicy
-    // / tools_registry / ChannelRuntimeContext per owning agent) are the
-    // correct shape and tracked as follow-up. For now the orchestrator
+    // Each channel is owned by exactly one Agent (via agent_for_channel).
+    // Per-channel runtime contexts (one SecurityPolicy / tools_registry /
+    // ChannelRuntimeContext per owning agent) are the correct shape and
+    // tracked as follow-up. For now the orchestrator
     // builds ONE shared runtime context off the migration-synthesized
     // "default" agent (or the first enabled agent if no "default"
     // exists); a multi-agent config still loads, but every channel runs
@@ -11486,7 +11485,7 @@ This is an example JSON object for profile settings."#;
                 excluded_tools: vec![],
             },
         );
-        // In V3, a channel is only collected when an enabled agent references it.
+        // A channel is only collected when an enabled agent references it.
         config.agents.insert(
             "mattermost-default".to_string(),
             zeroclaw_config::schema::DelegateAgentConfig {

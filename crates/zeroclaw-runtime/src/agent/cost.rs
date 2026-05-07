@@ -101,9 +101,9 @@ pub fn record_tool_loop_cost_usage(
 
     // Promote first sighting of (model_provider, model) without pricing to a WARN
     // so operators notice the silent zero-cost record before they need to
-    // grep DEBUG logs (#6356). Subsequent sightings stay at DEBUG so the
-    // warn stream doesn't get spammy. V3 form: missing pricing means either
-    // the model_provider has no pricing map at all, or the map exists but
+    // grep DEBUG logs. Subsequent sightings stay at DEBUG so the warn
+    // stream doesn't get spammy. Missing pricing means either the
+    // model_provider has no pricing map at all, or the map exists but
     // produced zero rates for this model.
     if pricing.is_none() || (input_rate == 0.0 && output_rate == 0.0) {
         warn_once_missing_pricing(model_provider_name, model);

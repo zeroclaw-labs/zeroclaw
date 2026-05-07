@@ -238,25 +238,25 @@ impl DelegateTool {
         self
     }
 
-    /// Attach V3 risk profiles for depth/timeout resolution.
+    /// Attach risk profiles for depth/timeout resolution.
     pub fn with_risk_profiles(mut self, m: HashMap<String, RiskProfileConfig>) -> Self {
         self.risk_profiles = Arc::new(m);
         self
     }
 
-    /// Attach V3 runtime profiles for agentic/tools/iteration resolution.
+    /// Attach runtime profiles for agentic/tools/iteration resolution.
     pub fn with_runtime_profiles(mut self, m: HashMap<String, RuntimeProfileConfig>) -> Self {
         self.runtime_profiles = Arc::new(m);
         self
     }
 
-    /// Attach V3 skill bundles for skills-directory resolution.
+    /// Attach skill bundles for skills-directory resolution.
     pub fn with_skill_bundles(mut self, m: HashMap<String, SkillBundleConfig>) -> Self {
         self.skill_bundles = Arc::new(m);
         self
     }
 
-    /// Attach V3 memory namespaces for isolation resolution.
+    /// Attach memory namespaces for isolation resolution.
     pub fn with_memory_namespaces(mut self, m: HashMap<String, MemoryNamespaceConfig>) -> Self {
         self.memory_namespaces = Arc::new(m);
         self
@@ -584,7 +584,7 @@ impl DelegateTool {
             }
         };
 
-        // Resolve V3 profile references
+        // Resolve profile references
         let max_depth = self.resolve_max_depth(&agent_config.risk_profile);
         let (provider_type, credential, model, temperature) =
             self.resolve_brain(&agent_config.model_provider);

@@ -2218,7 +2218,7 @@ mod tests {
         config.memory.backend = "none".to_string();
         config.memory.auto_save = false;
 
-        // V3 requires an explicit agent. Wire up a minimal agent that
+        // An explicit agent is required. Wire up a minimal agent that
         // points at the synthesized model_provider entry, then construct
         // Agent::from_config against it.
         config.risk_profiles.insert(

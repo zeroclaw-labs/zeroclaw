@@ -572,7 +572,7 @@ fn memory_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
 /// Generic schema-walk picker for sections like `channels` whose subsections
 /// are `#[nested] HashMap<String, T>` fields. Discovery: use `map_key_sections()`
 /// to enumerate all statically-known sub-sections under `<section>.` — this
-/// works for V3 HashMap-based channels without needing init_defaults to insert
+/// works for HashMap-based channels without needing init_defaults to insert
 /// entries (HashMap fields start empty and init_defaults leaves them empty).
 fn schema_walk_picker(cfg: &zeroclaw_config::schema::Config, section: &str) -> Vec<PickerItem> {
     let prefix_with_dot = format!("{section}.");
@@ -600,7 +600,7 @@ fn schema_walk_picker(cfg: &zeroclaw_config::schema::Config, section: &str) -> V
 
     all.into_iter()
         .map(|name| {
-            // V3: channel configs no longer carry an `enabled` field; a channel is
+            // Channel configs no longer carry an `enabled` field; a channel is
             // active when an enabled agent references it. Badge = "configured" when
             // at least one alias exists, absent otherwise.
             let badge = if configured.contains(&name) {
@@ -984,7 +984,7 @@ mod tests {
 
     #[test]
     fn providers_picker_marks_configured_after_create_map_key() {
-        // V3 typed-family layout: each canonical family is a map-keyed
+        // Typed-family layout: each canonical family is a map-keyed
         // sub-section at `providers.models.<family>` whose entries are
         // operator-named aliases. Adding an alias on any family flips the
         // picker badge to "configured" for that family.

@@ -1174,11 +1174,11 @@ pub struct MigrateResponse {
     pub schema_version: u32,
 }
 
-/// POST /api/config/migrate — apply V1→V2 migration to the on-disk
-/// config file in place. Mirrors `zeroclaw config migrate`. Backs up the
-/// previous content alongside the original (`config.toml.bak`) before
-/// writing the migrated form. Returns `{migrated: false}` when the config
-/// is already at the current schema version.
+/// POST /api/config/migrate — apply the schema migration chain to the
+/// on-disk config file in place. Mirrors `zeroclaw config migrate`. Backs
+/// up the previous content alongside the original (`config.toml.bak`)
+/// before writing the migrated form. Returns `{migrated: false}` when the
+/// config is already at the current schema version.
 pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();

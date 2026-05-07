@@ -67,8 +67,8 @@ pub struct WsQuery {
     pub session_id: Option<String>,
     /// Optional human-readable name for the session.
     pub name: Option<String>,
-    /// Configured agent alias to run as. Required: V3 has no default
-    /// agent — every WebSocket session is bound to an explicit agent.
+    /// Configured agent alias to run as. Required — every WebSocket
+    /// session is bound to an explicit agent (no default agent exists).
     #[serde(default, alias = "agentAlias", alias = "agent")]
     pub agent_alias: Option<String>,
     /// Project root / working directory for this session.
@@ -154,7 +154,7 @@ pub async fn handle_ws_chat(
     };
 
     // Reject the upgrade up-front when the client didn't pick an agent.
-    // V3 has no default — every WS session is bound to an explicit agent.
+    // No default — every WS session is bound to an explicit agent.
     let Some(agent_alias) = params.agent_alias.filter(|s| !s.trim().is_empty()) else {
         return (
             axum::http::StatusCode::BAD_REQUEST,

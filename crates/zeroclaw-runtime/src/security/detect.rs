@@ -7,7 +7,7 @@ use zeroclaw_config::schema::{SandboxBackend, SandboxConfig};
 
 /// Create a sandbox based on auto-detection or explicit config.
 ///
-/// V3: takes a [`SandboxConfig`] (synthesized from the active risk profile via
+/// Takes a [`SandboxConfig`] (synthesized from the active risk profile via
 /// `RiskProfileConfig::sandbox_config()`). `runtime_kind` is the
 /// `runtime.kind` string from the top-level config. When the caller has set
 /// `runtime.kind = "native"`, Docker must never be selected as the sandbox

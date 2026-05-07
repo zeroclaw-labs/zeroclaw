@@ -335,9 +335,10 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
-            // V2 `opencode-go` was folded into the `opencode` family under
-            // alias `go`; activation depends on alias presence, not just
-            // family presence, so this entry stays on a custom status_fn.
+            // Legacy `opencode-go` was folded into the `opencode` family
+            // under alias `go` by the V2->V3 migration; activation depends
+            // on alias presence, not just family presence, so this entry
+            // stays on a custom status_fn.
             name: "OpenCode Go",
             description: "Subsidized Code-focused AI models",
             category: IntegrationCategory::AiModel,

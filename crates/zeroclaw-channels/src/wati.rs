@@ -58,7 +58,7 @@ impl WatiChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
-                // V3 routes per-agent `transcription_provider` through the
+                // Per-agent `transcription_provider` routes through the
                 // orchestrator's resolved-runtime path. For the
                 // `try_transcribe_audio` direct path (gateway WS handler /
                 // channel-side ingest), bind to the sole registered provider

@@ -556,9 +556,9 @@ impl AcpServer {
             .to_string_lossy()
             .into_owned();
 
-        // V3 has no default agent — every ACP session is bound to an
-        // explicit agent. Accept `agentAlias` (camelCase) or `agent_alias`
-        // / `agent` from the JSON-RPC params object.
+        // No default agent — every ACP session is bound to an explicit
+        // agent. Accept `agentAlias` (camelCase) or `agent_alias` / `agent`
+        // from the JSON-RPC params object.
         let agent_alias = params
             .get("agentAlias")
             .or_else(|| params.get("agent_alias"))
