@@ -103,7 +103,16 @@ fn has_serde_skip(field: &syn::Field) -> bool {
 /// in `crates/zeroclaw-config/src/schema.rs`.
 #[proc_macro_derive(
     Configurable,
-    attributes(secret, nested, prefix, serde, derived_from_secret)
+    attributes(
+        secret,
+        nested,
+        prefix,
+        serde,
+        derived_from_secret,
+        display_name,
+        description,
+        integration
+    )
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -111,6 +120,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
     let prefix = extract_prefix(&input);
     let category = derive_category(&prefix);
+    let integration_descriptor_method = build_integration_descriptor_method(&input.attrs);
 
     let fields = match &input.data {
         Data::Struct(data) => match &data.fields {
@@ -163,6 +173,14 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let mut create_map_key_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut create_map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+
+    // ── Nested-Option enumeration ──
+    // One entry per `#[nested] Option<T>` field, surfacing the schema's
+    // own field name plus an `is_some()` snapshot. Consumers (e.g. the
+    // integrations registry) iterate this list so adding a new
+    // `pub foo: Option<FooConfig>` to a Configurable struct surfaces
+    // automatically — no hand-maintained mirror list anywhere.
+    let mut nested_option_entry_pushes: Vec<proc_macro2::TokenStream> = Vec::new();
 
     for field in fields {
         let field_ident = field.ident.as_ref().expect("Named field must have ident");
@@ -430,6 +448,20 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
                 continue;
             } else if is_option {
+                let field_name_str = field_ident.to_string();
+                let display_name_lit = extract_string_attr(&field.attrs, "display_name")
+                    .unwrap_or_else(|| snake_to_title(&field_name_str));
+                let description_lit =
+                    extract_string_attr(&field.attrs, "description").unwrap_or_default();
+                nested_option_entry_pushes.push(quote! {
+                    out.push(crate::config::NestedOptionEntry {
+                        field: #field_name_str,
+                        present: self.#field_ident.is_some(),
+                        display_name: #display_name_lit,
+                        description: #description_lit,
+                    });
+                });
+
                 nested_collect.push(quote! {
                     if let Some(inner) = &self.#field_ident {
                         fields.extend(inner.secret_fields());
@@ -804,6 +836,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 #prefix_lit
             }
 
+            #integration_descriptor_method
+
             /// Returns metadata about all `#[secret]` fields on this struct and nested children.
             pub fn secret_fields(&self) -> Vec<crate::config::SecretFieldInfo> {
                 let mut fields = vec![#(#secret_field_entries),*];
@@ -901,6 +935,20 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 out
             }
 
+            /// Snapshot of every `#[nested] Option<T>` field on this struct
+            /// as `(field_name, is_some)` tuples, in declaration order.
+            ///
+            /// `field_name` is the raw Rust ident (snake_case) — consumers
+            /// can map to display names via their own table. The schema
+            /// is the single source of truth: adding a new
+            /// `pub foo: Option<FooConfig>` field with `#[nested]` surfaces
+            /// here without touching any caller.
+            pub fn nested_option_entries(&self) -> Vec<crate::config::NestedOptionEntry> {
+                let mut out: Vec<crate::config::NestedOptionEntry> = Vec::new();
+                #(#nested_option_entry_pushes)*
+                out
+            }
+
             /// Insert a default-valued entry under a map-keyed section, or
             /// append to a list-shaped one, with `map_key` as the new entry's
             /// natural identifier (HashMap key for Map sections; identifier
@@ -972,6 +1020,120 @@ fn has_attr(field: &syn::Field, name: &str) -> bool {
 
 fn snake_to_kebab(s: &str) -> String {
     s.replace('_', "-")
+}
+
+/// Title-case a snake_case identifier for use as a default display name
+/// when a field has no `#[display_name = "..."]` override (e.g.
+/// `discord_history` becomes `"Discord History"`). Pure ASCII fallback —
+/// brand-cased / acronym names need an explicit attribute.
+fn snake_to_title(s: &str) -> String {
+    s.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Read the `&str` value of a `#[name = "value"]` field-level attribute,
+/// or `None` when the attribute is absent. Used by the new
+/// `#[display_name = ...]` and `#[description = ...]` annotations on
+/// `Option<XConfig>` fields.
+fn extract_string_attr(attrs: &[syn::Attribute], name: &str) -> Option<String> {
+    for attr in attrs {
+        if !attr.path().is_ident(name) {
+            continue;
+        }
+        let Meta::NameValue(nv) = &attr.meta else {
+            continue;
+        };
+        let syn::Expr::Lit(expr_lit) = &nv.value else {
+            continue;
+        };
+        let Lit::Str(lit_str) = &expr_lit.lit else {
+            continue;
+        };
+        return Some(lit_str.value());
+    }
+    None
+}
+
+/// Build the `pub fn integration_descriptor(&self) -> IntegrationDescriptor`
+/// method body when the struct carries
+/// `#[integration(category = "...", display_name = "...", description = "...", status_field = "...")]`.
+/// Returns an empty `TokenStream` when the attribute is absent so structs
+/// without it don't get the method.
+fn build_integration_descriptor_method(attrs: &[syn::Attribute]) -> proc_macro2::TokenStream {
+    let mut category: Option<String> = None;
+    let mut display_name: Option<String> = None;
+    let mut description: Option<String> = None;
+    let mut status_field: Option<String> = None;
+    let mut found = false;
+
+    for attr in attrs {
+        if !attr.path().is_ident("integration") {
+            continue;
+        }
+        found = true;
+        let parsed = attr.parse_args_with(
+            syn::punctuated::Punctuated::<syn::MetaNameValue, syn::Token![,]>::parse_terminated,
+        );
+        let nested = match parsed {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        for meta in nested {
+            let key = match meta.path.get_ident() {
+                Some(i) => i.to_string(),
+                None => continue,
+            };
+            let value = match &meta.value {
+                syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
+                    Lit::Str(s) => s.value(),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            match key.as_str() {
+                "category" => category = Some(value),
+                "display_name" => display_name = Some(value),
+                "description" => description = Some(value),
+                "status_field" => status_field = Some(value),
+                _ => {}
+            }
+        }
+    }
+
+    if !found {
+        return proc_macro2::TokenStream::new();
+    }
+
+    let category_lit = category.unwrap_or_default();
+    let display_name_lit = display_name.unwrap_or_default();
+    let description_lit = description.unwrap_or_default();
+    let status_field_ident = match status_field {
+        Some(name) => syn::Ident::new(&name, proc_macro2::Span::call_site()),
+        None => syn::Ident::new("enabled", proc_macro2::Span::call_site()),
+    };
+
+    quote! {
+        /// Auto-generated by `#[integration(...)]`. Returns the integration
+        /// descriptor for this nested toggleable config so callers (e.g. the
+        /// integrations registry) consume schema-side metadata instead of
+        /// carrying a hand-list.
+        pub fn integration_descriptor(&self) -> crate::config::IntegrationDescriptor {
+            crate::config::IntegrationDescriptor {
+                display_name: #display_name_lit,
+                description: #description_lit,
+                category: #category_lit,
+                active: self.#status_field_ident,
+            }
+        }
+    }
 }
 
 /// Flatten a field's `///` doc comment into a single space-separated line.
