@@ -59,7 +59,7 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
-use zeroclaw_providers::{self, Provider};
+use zeroclaw_providers::{self, ModelProvider};
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
@@ -364,7 +364,7 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Mutex<Config>>,
-    pub provider: Arc<dyn Provider>,
+    pub model_provider: Arc<dyn ModelProvider>,
     pub model: String,
     pub temperature: f64,
     pub mem: Arc<dyn Memory>,
@@ -447,7 +447,9 @@ pub async fn run_gateway(
     canvas_store: Option<CanvasStore>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
-    if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
+    if is_public_bind(host)
+        && config.tunnel.model_provider == "none"
+        && !config.gateway.allow_public_bind
     {
         tracing::warn!(
             "⚠️  Binding to {host} — gateway will be exposed to all network interfaces.\n\
@@ -473,24 +475,19 @@ pub async fn run_gateway(
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    let fallback = config.providers.first_provider();
-    let provider_name = config
-        .providers
-        .first_provider_type()
-        .unwrap_or("openrouter");
-    let provider: Arc<dyn Provider> =
-        Arc::from(zeroclaw_providers::create_resilient_provider_with_options(
-            provider_name,
+    let fallback = config.providers.first_model_provider();
+    let model_provider: Arc<dyn ModelProvider> = Arc::from(
+        zeroclaw_providers::create_resilient_model_provider_with_options(
+            config
+                .providers
+                .first_model_provider_type()
+                .unwrap_or("openrouter"),
             fallback.and_then(|e| e.api_key.as_deref()),
-            fallback.and_then(|e| e.base_url.as_deref()),
+            fallback.and_then(|e| e.uri.as_deref()),
             &config.reliability,
             &zeroclaw_providers::provider_runtime_options_from_config(&config),
-        )?);
-    // Model resolution (#6099, #6215): take the first configured
-    // `[providers.models.<type>.<alias>]` entry's `model` field, or hard-fail
-    // with an actionable error. V3 has no global fallback provider — every
-    // gateway request that needs agent context resolves through its
-    // `?agent=` parameter.
+        )?,
+    );
     let model = match fallback
         .and_then(|e| e.model.as_deref())
         .map(str::trim)
@@ -517,12 +514,12 @@ pub async fn run_gateway(
     // that need an agent context (`/webhook?agent=`, `/ws/chat?agent=`,
     // ACP `session/new`, agent-scoped tools/memory) take it from the
     // request. The shared SecurityPolicy / risk_profile / tools_registry
-    // built here are V2 vestiges driving the legacy single-agent
+    // built here are vestiges driving the legacy single-agent
     // `/api/tools` listing and the `run_gateway_chat_with_tools` test
     // mock; per-request agent dispatch is tracked as a follow-up. Pick
     // the migration-synthesized "default" agent when present, else the
     // first enabled agent — purely to seed AppState for those legacy
-    // surfaces; new V3 endpoints don't read from this state.
+    // surfaces; per-agent endpoints don't read from this state.
     let agent_alias = config
         .agents
         .keys()
@@ -587,7 +584,7 @@ pub async fn run_gateway(
         &config.agents,
         config
             .providers
-            .first_provider()
+            .first_model_provider()
             .and_then(|e| e.api_key.as_deref()),
         &config,
         Some(canvas_store.clone()),
@@ -790,7 +787,7 @@ pub async fn run_gateway(
             .agents
             .values()
             .filter(|a| a.enabled)
-            .flat_map(|a| a.channels.iter().cloned())
+            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
             .collect();
         config
             .channels
@@ -992,7 +989,7 @@ pub async fn run_gateway(
 
     let state = AppState {
         config: config_state,
-        provider,
+        model_provider,
         model,
         temperature,
         mem,
@@ -1524,13 +1521,13 @@ async fn run_gateway_chat_with_tools(
     session_id: Option<&str>,
 ) -> anyhow::Result<String> {
     // Tests exercise webhook infrastructure (idempotency, auth, autosave)
-    // through handle_webhook, so dispatch to the mock provider directly
+    // through handle_webhook, so dispatch to the mock model_provider directly
     // instead of bootstrapping the full agent runtime.
     #[cfg(test)]
     {
         let _ = session_id;
         return state
-            .provider
+            .model_provider
             .chat_with_system(None, message, &state.model, Some(state.temperature))
             .await;
     }
@@ -1538,7 +1535,7 @@ async fn run_gateway_chat_with_tools(
     #[cfg(not(test))]
     {
         let config = state.config.lock().clone();
-        // V2 vestige: webhook chat / SSE / pairing endpoints don't yet
+        // Legacy: webhook chat / SSE / pairing endpoints don't yet
         // accept an explicit agent in the request payload. Pick the
         // migration-synthesized "default" agent (or first enabled) until
         // the per-request agent dispatch refactor lands.
@@ -1685,7 +1682,7 @@ async fn handle_webhook(
         .config
         .lock()
         .providers
-        .first_provider_type()
+        .first_model_provider_type()
         .unwrap_or("unknown")
         .to_string();
     let model_label = state.model.clone();
@@ -1693,13 +1690,13 @@ async fn handle_webhook(
 
     state.observer.record_event(
         &zeroclaw_runtime::observability::ObserverEvent::AgentStart {
-            provider: provider_label.clone(),
+            model_provider: provider_label.clone(),
             model: model_label.clone(),
         },
     );
     state.observer.record_event(
         &zeroclaw_runtime::observability::ObserverEvent::LlmRequest {
-            provider: provider_label.clone(),
+            model_provider: provider_label.clone(),
             model: model_label.clone(),
             messages_count: 1,
         },
@@ -1710,7 +1707,7 @@ async fn handle_webhook(
             let duration = started_at.elapsed();
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
-                    provider: provider_label.clone(),
+                    model_provider: provider_label.clone(),
                     model: model_label.clone(),
                     duration,
                     success: true,
@@ -1724,7 +1721,7 @@ async fn handle_webhook(
             );
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
+                    model_provider: provider_label,
                     model: model_label,
                     duration,
                     tokens_used: None,
@@ -1741,7 +1738,7 @@ async fn handle_webhook(
 
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
-                    provider: provider_label.clone(),
+                    model_provider: provider_label.clone(),
                     model: model_label.clone(),
                     duration,
                     success: false,
@@ -1761,7 +1758,7 @@ async fn handle_webhook(
                 });
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
+                    model_provider: provider_label,
                     model: model_label,
                     duration,
                     tokens_used: None,
@@ -1769,7 +1766,7 @@ async fn handle_webhook(
                 },
             );
 
-            tracing::error!("Webhook provider error: {}", sanitized);
+            tracing::error!("Webhook model_provider error: {}", sanitized);
             let err = serde_json::json!({"error": "LLM request failed"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
@@ -2580,7 +2577,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_api::channel::ChannelMessage;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
-    use zeroclaw_providers::Provider;
+    use zeroclaw_providers::ModelProvider;
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
     fn generate_test_secret() -> String {
@@ -2650,7 +2647,7 @@ mod tests {
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
-            provider: Arc::new(MockProvider::default()),
+            model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),
@@ -2724,7 +2721,7 @@ mod tests {
         let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(wrapped);
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
-            provider: Arc::new(MockProvider::default()),
+            model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),
@@ -3094,12 +3091,12 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct MockProvider {
+    struct MockModelProvider {
         calls: AtomicUsize,
     }
 
     #[async_trait]
-    impl Provider for MockProvider {
+    impl ModelProvider for MockModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -3177,13 +3174,13 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_idempotency_skips_duplicate_provider_calls() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
-            provider,
+            model_provider,
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
@@ -3257,15 +3254,15 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_autosave_stores_distinct_keys_per_request() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
 
         let tracking_impl = Arc::new(TrackingMemory::default());
         let memory: Arc<dyn Memory> = tracking_impl.clone();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
-            provider,
+            model_provider,
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
@@ -3352,14 +3349,14 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_secret_hash_rejects_missing_header() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
-            provider,
+            model_provider,
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
@@ -3417,15 +3414,15 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_secret_hash_rejects_invalid_header() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let valid_secret = generate_test_secret();
         let wrong_secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
-            provider,
+            model_provider,
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
@@ -3489,14 +3486,14 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_secret_hash_accepts_valid_header() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
-            provider,
+            model_provider,
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
@@ -3567,12 +3564,12 @@ mod tests {
 
     #[tokio::test]
     async fn nextcloud_talk_webhook_returns_not_found_when_not_configured() {
-        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
-            provider,
+            model_provider,
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
@@ -3626,8 +3623,8 @@ mod tests {
 
     #[tokio::test]
     async fn nextcloud_talk_webhook_rejects_invalid_signature() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let channel = Arc::new(NextcloudTalkChannel::new(
@@ -3645,7 +3642,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
-            provider,
+            model_provider,
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,

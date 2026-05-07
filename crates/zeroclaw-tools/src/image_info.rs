@@ -11,9 +11,9 @@ const MAX_IMAGE_BYTES: u64 = 5_242_880;
 
 /// Tool to read image metadata and optionally return base64-encoded data.
 ///
-/// Since providers are currently text-only, this tool extracts what it can
+/// Since model_providers are currently text-only, this tool extracts what it can
 /// (file size, format, dimensions from header bytes) and provides base64
-/// data for future multimodal provider support.
+/// data for future multimodal model_provider support.
 pub struct ImageInfoTool {
     security: Arc<SecurityPolicy>,
 }

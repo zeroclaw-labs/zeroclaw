@@ -2180,7 +2180,7 @@ impl SlackChannel {
     }
 
     /// Download an audio file attachment and transcribe it using the configured
-    /// transcription provider. Returns `None` if transcription is not configured
+    /// transcription model_provider. Returns `None` if transcription is not configured
     /// or if the download/transcription fails.
     async fn try_transcribe_audio_file(&self, file: &serde_json::Value) -> Option<String> {
         let manager = self.transcription_manager.as_deref()?;
@@ -2485,8 +2485,8 @@ impl SlackChannel {
     }
 
     /// Parse a Socket Mode `interactive` envelope containing a `block_actions`
-    /// payload from the `/config` Block Kit UI.  Translates provider/model
-    /// dropdown selections into synthetic `/models <provider>` or `/model <id>`
+    /// payload from the `/config` Block Kit UI.  Translates model_provider/model
+    /// dropdown selections into synthetic `/models <model_provider>` or `/model <id>`
     /// commands so the existing runtime command handler can apply them.
     fn parse_block_action_as_command(
         envelope: &serde_json::Value,

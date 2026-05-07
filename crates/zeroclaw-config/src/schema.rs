@@ -22,14 +22,14 @@ use tokio::io::AsyncWriteExt;
 use zeroclaw_macros::Configurable;
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
-    "provider.anthropic",
-    "provider.compatible",
-    "provider.copilot",
-    "provider.gemini",
-    "provider.glm",
-    "provider.ollama",
-    "provider.openai",
-    "provider.openrouter",
+    "model_provider.anthropic",
+    "model_provider.compatible",
+    "model_provider.copilot",
+    "model_provider.gemini",
+    "model_provider.glm",
+    "model_provider.ollama",
+    "model_provider.openai",
+    "model_provider.openrouter",
     "channel.dingtalk",
     "channel.discord",
     "channel.feishu",
@@ -55,7 +55,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
 ];
 
 const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
-    "provider.*",
+    "model_provider.*",
     "channel.*",
     "tool.*",
     "memory.*",
@@ -85,7 +85,7 @@ pub struct Config {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
 
-    /// Provider configuration (`[providers]`).
+    /// ModelProvider configuration (`[model_providers]`).
     #[serde(default)]
     #[nested]
     pub providers: crate::providers::ProvidersConfig,
@@ -194,7 +194,7 @@ pub struct Config {
     #[nested]
     pub memory: MemoryConfig,
 
-    /// Persistent storage provider configuration (`[storage]`).
+    /// Persistent storage model_provider configuration (`[storage]`).
     #[serde(default)]
     #[nested]
     pub storage: StorageConfig,
@@ -509,7 +509,7 @@ pub struct Config {
 pub struct OnboardStateConfig {
     /// Section keys the user has completed at least once via onboard.
     /// Values are the lowercased Section variant names
-    /// (`"workspace"`, `"providers"`, …).
+    /// (`"workspace"`, `"model_providers"`, …).
     #[serde(default)]
     pub completed_sections: Vec<String>,
 }
@@ -530,7 +530,7 @@ pub struct WorkspaceConfig {
     /// Give each profile its own `brain.db` so conversation history, notes, and memories from one engagement don't leak into another. Turn off only if you want all profiles sharing a single memory store.
     #[serde(default = "default_true")]
     pub isolate_memory: bool,
-    /// Scope provider API keys, channel tokens, and other secrets to the active profile — so a key added while on `client-a` isn't visible from `client-b`. Turn off only if you want all profiles sharing one secret namespace.
+    /// Scope model_provider API keys, channel tokens, and other secrets to the active profile — so a key added while on `client-a` isn't visible from `client-b`. Turn off only if you want all profiles sharing one secret namespace.
     #[serde(default = "default_true")]
     pub isolate_secrets: bool,
     /// Give each profile its own tool-call and channel-message audit trail, so you can hand off logs for a single engagement without exposing other work.
@@ -561,33 +561,70 @@ impl Default for WorkspaceConfig {
 
 /// Used by `#[serde(skip_serializing_if)]` on plain `bool` fields to omit
 /// them from TOML output when they carry their struct-level default (`false`).
-/// Keeps fresh provider entries clean — a default-constructed
-/// `ModelProviderConfig` for one provider family shouldn't write flag fields
+/// Keeps fresh model_provider entries clean — a default-constructed
+/// `ModelProviderConfig` for one model_provider family shouldn't write flag fields
 /// that only apply to a different family.
 fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// Named provider profile definition.
+/// One trait per family-endpoint enum. Returns the URI template for the chosen
+/// variant — a literal URL for fixed endpoints (`https://api.openai.com/v1`),
+/// or a substitution template for computed endpoints (Azure's
+/// `https://{resource}.openai.azure.com/...`). Substitution happens family-side
+/// in the runtime constructor; for non-templated families the return value is
+/// the final URL.
+///
+/// Resolution order at runtime is uniform across every model model_provider family:
+/// operator's `cfg.uri` first; family endpoint enum's `uri()` second; loud
+/// failure when neither is set.
+pub trait ModelEndpoint {
+    fn uri(&self) -> &'static str;
+}
+
+/// Implemented by every `*ModelProviderConfig`. Multi-region families
+/// override to return `Some(self.endpoint.uri())`; single-endpoint families
+/// inherit the `None` default. Drives `ModelProviders::resolved_endpoint_uri`,
+/// which is itself driven by the `for_each_model_provider_slot!` macro — so
+/// adding a new family without an impl is a compile error.
+pub trait FamilyEndpoint {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// Authentication mode for model model_provider families that support more than one
+/// (e.g. Qwen, Minimax can use API key OR OAuth). Families that only support a
+/// single auth flow simply omit this field from their config struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// Standard API key authentication via the `api_key` field.
+    #[default]
+    ApiKey,
+    /// OAuth flow — credential resolution defers to the family runtime impl
+    /// (typically reading a vendor-specific token cache or env var).
+    OAuth,
+}
+
+/// Named model_provider profile definition.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models"]
 pub struct ModelProviderConfig {
-    /// Secret API token for this provider — grab it from the provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.
+    /// Secret API token for this model_provider — grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    /// Override the provider type label. Rarely needed — only useful when you run two profiles against the same provider type (e.g. two different OpenAI-compatible gateways) and want to tell them apart in logs.
+    /// Override the model_provider type label. Rarely needed — only useful when you run two profiles against the same model_provider type (e.g. two different OpenAI-compatible gateways) and want to tell them apart in logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// HTTPS endpoint the client hits. Override when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a regional endpoint, or a proxy; leave unset to use the provider's public endpoint.
+    /// Endpoint URI the client hits. Override the family's default endpoint when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a custom proxy, or any non-standard URL. Leave unset to use the family's default URI from its `ModelEndpoint` impl. Set this to the FULL endpoint URL — there is no separate path-suffix field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
-    /// Path suffix appended to the base URL. Almost no one needs this — only touch it for custom reverse-proxy routing where your gateway mounts the API under a non-standard prefix.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_path: Option<String>,
-    /// Model identifier to send with each request — the ID string from the provider's catalog (e.g. `gpt-4o`, `claude-sonnet-4-5`, `llama-3.3-70b`). Must match a model the provider actually serves on this account.
+    pub uri: Option<String>,
+    /// Model identifier to send with each request — the ID string from the model_provider's catalog (e.g. `gpt-4o`, `claude-sonnet-4-5`, `llama-3.3-70b`). Must match a model the model_provider actually serves on this account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Sampling temperature passed to the model. Lower values (0.0–0.3) give
@@ -595,37 +632,28 @@ pub struct ModelProviderConfig {
     /// Higher values (0.7–1.2) give more varied output — fits open-ended chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
-    /// HTTP request timeout in seconds. Bump this for slow local providers (Ollama on CPU, big local models) or high-latency networks; leave unset otherwise.
+    /// HTTP request timeout in seconds. Bump this for slow local model_providers (Ollama on CPU, big local models) or high-latency networks; leave unset otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     /// Extra HTTP headers sent with every request. Niche — used for auth bridges, corporate proxies, or custom gateways that demand a tracing header. Most users never touch this; edit `config.toml` directly if you need it.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub extra_headers: HashMap<String, String>,
-    /// Wire protocol flavor: `"responses"` for OpenAI's Codex/Responses API, `"chat_completions"` for everything else (OpenAI chat, Anthropic, OpenRouter, Groq, local gateways). Auto-selected per provider — only override if you're forcing an unusual combination.
+    /// Wire protocol flavor: `"responses"` for OpenAI's Codex/Responses API, `"chat_completions"` for everything else (OpenAI chat, Anthropic, OpenRouter, Groq, local gateways). Auto-selected per model_provider — only override if you're forcing an unusual combination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_api: Option<String>,
-    /// When true, the client pulls credentials from `OPENAI_API_KEY` or `~/.codex/auth.json` instead of the `api_key` field above. Turn on only for the OpenAI Codex provider; leave off for standard API-key providers.
+    /// When true, the client pulls credentials from `OPENAI_API_KEY` or `~/.codex/auth.json` instead of the `api_key` field above. Turn on only for the OpenAI Codex model_provider; leave off for standard API-key model_providers.
     #[serde(default, skip_serializing_if = "is_false")]
     pub requires_openai_auth: bool,
-    /// Azure OpenAI resource name (the `<resource>` part of `<resource>.openai.azure.com`). Azure-only; ignore for OpenAI, Anthropic, and everything else.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub azure_openai_resource: Option<String>,
-    /// Azure OpenAI deployment name — the deployment you created in Azure AI Studio that wraps a specific model. Azure-only; ignore for other providers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub azure_openai_deployment: Option<String>,
-    /// Azure OpenAI API version string (e.g. `2024-10-21`). Azure-only; must match a version your resource supports. Ignore for other providers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub azure_openai_api_version: Option<String>,
     /// Hard cap on response length in tokens. Most models enforce sensible built-in limits already — leave unset unless you specifically need to clip long outputs for cost or latency reasons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    /// Provider-specific quirk: fold the system prompt into the first user message instead of sending a separate system role. Only needed for models that reject (or mishandle) a standalone system role — e.g. certain older Mistral variants.
+    /// ModelProvider-specific quirk: fold the system prompt into the first user message instead of sending a separate system role. Only needed for models that reject (or mishandle) a standalone system role — e.g. certain older Mistral variants.
     #[serde(default, skip_serializing_if = "is_false")]
     pub merge_system_into_user: bool,
     /// Extra JSON parameters to include in API requests.
     /// Merged at the top level of the request body, allowing provider-specific
     /// features (routing, transforms, etc.) without code changes.
-    /// Example: `provider_extra = { provider = { only = ["Anthropic"] } }`
+    /// Example: `provider_extra = { model_provider = { only = ["Anthropic"] } }`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_extra: Option<serde_json::Value>,
     /// Per-model pricing for cost tracking, USD per 1M tokens.
@@ -652,6 +680,1873 @@ pub struct ModelProviderConfig {
     pub native_tools: Option<bool>,
 }
 
+// ── Per-family model model_provider configs ────────────────────────────
+//
+// Each family carries its own typed config (composing `ModelProviderConfig`
+// via `#[serde(flatten)]`) plus a per-family `*Endpoint` enum that names the
+// known endpoints and resolves them via the `ModelEndpoint` trait. Families
+// that support multiple auth flows additionally carry an `auth_mode` field.
+//
+// Pattern reference for adding a new family:
+// - Single-endpoint family with no extras: see `AnthropicModelProviderConfig`
+// - Family with extras: see `OpenAIModelProviderConfig`
+// - Family with computed-endpoint template: see `AzureModelProviderConfig`
+// - Multi-region family with a required `endpoint` field: see `MoonshotModelProviderConfig`
+//
+// The `ModelProviders` container in `crates/zeroclaw-config/src/model_providers.rs`
+// holds a typed slot per family; the runtime impls in zeroclaw-providers
+// consume the typed configs directly.
+
+// ── OpenAI ──
+
+/// OpenAI canonical endpoint. Single variant — OpenAI publishes one base URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAIEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for OpenAIEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.openai.com/v1",
+        }
+    }
+}
+
+/// OpenAI model model_provider config. The OpenAI-family extras (`wire_api`,
+/// `requires_openai_auth`) live on the shared `ModelProviderConfig` base
+/// because they're consumed by validation and runtime helpers that operate
+/// on the base struct without family awareness; this wrapper is a thin
+/// typed slot, no extra fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.openai"]
+pub struct OpenAIModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Azure OpenAI ──
+
+/// Azure OpenAI endpoint template. Single variant; the URL is computed at
+/// runtime by substituting `{resource}` and `{deployment}` from the typed
+/// config fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AzureEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for AzureEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            // Azure's URI is a template — substitution happens in the
+            // AzureModelProvider runtime constructor against the typed
+            // config's resource / deployment fields.
+            Self::Default => "https://{resource}.openai.azure.com/openai/deployments/{deployment}",
+        }
+    }
+}
+
+/// Azure OpenAI model model_provider config. Carries the Azure-specific connection
+/// fields (`resource`, `deployment`, `api_version`) — the URI template
+/// substitutes `{resource}` and `{deployment}` at runtime. Operators can
+/// still override the entire endpoint via `base.uri`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.azure"]
+pub struct AzureModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Azure resource name (the `<resource>` part of `<resource>.openai.azure.com`).
+    /// Accepts the legacy `azure_openai_resource` key on deserialize for
+    /// disk-key compatibility.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "azure_openai_resource"
+    )]
+    pub resource: Option<String>,
+    /// Azure deployment name — the deployment created in Azure AI Studio that
+    /// wraps a specific model.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "azure_openai_deployment"
+    )]
+    pub deployment: Option<String>,
+    /// Azure API version string (e.g. `2024-10-21`). Must match a version the
+    /// resource supports.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "azure_openai_api_version"
+    )]
+    pub api_version: Option<String>,
+}
+
+// ── Anthropic ──
+
+/// Anthropic canonical endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for AnthropicEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.anthropic.com",
+        }
+    }
+}
+
+/// Anthropic model model_provider config. No family-specific extras yet — typed
+/// slot reserved for future Anthropic-only knobs (cache_control, beta
+/// headers) so they land cleanly without another schema rework.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.anthropic"]
+pub struct AnthropicModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Moonshot (multi-region exemplar) ──
+
+/// Moonshot endpoint variants. Operators pick the region that matches their
+/// account; the runtime resolves the URI from the chosen variant unless
+/// overridden by `base.uri`. Code variant is intl-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MoonshotEndpoint {
+    /// Mainland China endpoint.
+    Cn,
+    /// International endpoint.
+    #[default]
+    Intl,
+    /// Code-specialist endpoint (intl).
+    Code,
+}
+
+impl ModelEndpoint for MoonshotEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Cn => "https://api.moonshot.cn/v1",
+            Self::Intl => "https://api.moonshot.ai/v1",
+            Self::Code => "https://api.moonshot.cn/coder/v1",
+        }
+    }
+}
+
+/// Moonshot model model_provider config. The `endpoint` field is required (no
+/// implicit default) — operators must pick a region explicitly. Migration
+/// fills it in from collapsed `moonshot-cn` / `moonshot-intl` outer keys.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.moonshot"]
+pub struct MoonshotModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Required: pick `cn`, `intl`, or `code`. Defaults to `intl` when omitted
+    /// to ease transition; operators on the China endpoint should set
+    /// `endpoint = "cn"` explicitly.
+    #[serde(default)]
+    pub endpoint: MoonshotEndpoint,
+}
+
+impl FamilyEndpoint for MoonshotModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
+// ── Qwen (multi-region + auth_mode exemplar) ──
+
+/// Qwen endpoint variants. Operators pick the region matching their account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QwenEndpoint {
+    /// Mainland China (DashScope).
+    Cn,
+    /// International (alicloud international).
+    #[default]
+    Intl,
+    /// United States (DashScope US).
+    Us,
+    /// Code-specialist endpoint.
+    Code,
+}
+
+impl ModelEndpoint for QwenEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Cn => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            Self::Intl => "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            Self::Us => "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
+            Self::Code => {
+                "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
+            }
+        }
+    }
+}
+
+/// Qwen model model_provider config. Multi-region (`endpoint` required) and
+/// supports both API key and OAuth flows (`auth_mode` chooses which).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.qwen"]
+pub struct QwenModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    #[serde(default)]
+    pub endpoint: QwenEndpoint,
+    /// Auth flow. Defaults to `api_key`; set to `oauth` to use the vendor's
+    /// OAuth-cache integration instead of the `api_key` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<AuthMode>,
+}
+
+impl FamilyEndpoint for QwenModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
+// ── OpenRouter ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenRouterEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for OpenRouterEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://openrouter.ai/api/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.openrouter"]
+pub struct OpenRouterModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Ollama (local-default endpoint) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OllamaEndpoint {
+    #[default]
+    LocalDefault,
+}
+
+impl ModelEndpoint for OllamaEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => "http://localhost:11434",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.ollama"]
+pub struct OllamaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Together ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TogetherEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for TogetherEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.together.xyz/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.together"]
+pub struct TogetherModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Fireworks ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FireworksEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for FireworksEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.fireworks.ai/inference/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.fireworks"]
+pub struct FireworksModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Groq ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GroqEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for GroqEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.groq.com/openai/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.groq"]
+pub struct GroqModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Mistral ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MistralEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for MistralEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.mistral.ai/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.mistral"]
+pub struct MistralModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── DeepSeek ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DeepseekEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for DeepseekEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.deepseek.com/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.deepseek"]
+pub struct DeepseekModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Cohere ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CohereEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for CohereEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.cohere.ai/compatibility/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.cohere"]
+pub struct CohereModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Perplexity ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PerplexityEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for PerplexityEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.perplexity.ai",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.perplexity"]
+pub struct PerplexityModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── xAI (Grok) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum XaiEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for XaiEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.x.ai/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.xai"]
+pub struct XaiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Cerebras ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CerebrasEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for CerebrasEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.cerebras.ai/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.cerebras"]
+pub struct CerebrasModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── SambaNova ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SambanovaEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for SambanovaEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.sambanova.ai/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.sambanova"]
+pub struct SambanovaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Hyperbolic ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum HyperbolicEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for HyperbolicEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.hyperbolic.xyz/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.hyperbolic"]
+pub struct HyperbolicModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── DeepInfra ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DeepinfraEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for DeepinfraEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.deepinfra.com/v1/openai",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.deepinfra"]
+pub struct DeepinfraModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Hugging Face ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum HuggingfaceEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for HuggingfaceEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://router.huggingface.co/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.huggingface"]
+pub struct HuggingfaceModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── AI21 ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Ai21Endpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for Ai21Endpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.ai21.com/studio/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.ai21"]
+pub struct Ai21ModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Reka ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RekaEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for RekaEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.reka.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.reka"]
+pub struct RekaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── BaseTen ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum BasetenEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for BasetenEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://inference.baseten.co/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.baseten"]
+pub struct BasetenModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── NScale ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NscaleEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for NscaleEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://inference.api.nscale.com/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.nscale"]
+pub struct NscaleModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── AnyScale ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AnyscaleEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for AnyscaleEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.endpoints.anyscale.com/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.anyscale"]
+pub struct AnyscaleModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Nebius ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NebiusEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for NebiusEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.studio.nebius.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.nebius"]
+pub struct NebiusModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Friendli ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FriendliEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for FriendliEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.friendli.ai/serverless/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.friendli"]
+pub struct FriendliModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Stepfun ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum StepfunEndpoint {
+    /// Mainland China endpoint.
+    Cn,
+    /// International endpoint.
+    #[default]
+    Intl,
+}
+impl ModelEndpoint for StepfunEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Cn => "https://api.stepfun.com/v1",
+            Self::Intl => "https://api.stepfun.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.stepfun"]
+pub struct StepfunModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    #[serde(default)]
+    pub endpoint: StepfunEndpoint,
+}
+
+impl FamilyEndpoint for StepfunModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
+// ── AIHubMix ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AihubmixEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for AihubmixEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://aihubmix.com/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.aihubmix"]
+pub struct AihubmixModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── SiliconFlow ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SiliconflowEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for SiliconflowEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.siliconflow.cn/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.siliconflow"]
+pub struct SiliconflowModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Astrai ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AstraiEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for AstraiEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://as-trai.com/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.astrai"]
+pub struct AstraiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Avian ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AvianEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for AvianEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.avian.io/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.avian"]
+pub struct AvianModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── DeepMyst ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DeepmystEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for DeepmystEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.deepmyst.com/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.deepmyst"]
+pub struct DeepmystModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Venice ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum VeniceEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for VeniceEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.venice.ai",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.venice"]
+pub struct VeniceModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Novita ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NovitaEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for NovitaEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.novita.ai/openai",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.novita"]
+pub struct NovitaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── NVIDIA ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NvidiaEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for NvidiaEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://integrate.api.nvidia.com/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.nvidia"]
+pub struct NvidiaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Telnyx ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TelnyxEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for TelnyxEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.telnyx.com/v2",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.telnyx"]
+pub struct TelnyxModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Vercel AI Gateway ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum VercelEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for VercelEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://ai-gateway.vercel.sh/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.vercel"]
+pub struct VercelModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Cloudflare AI Gateway ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CloudflareEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for CloudflareEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://gateway.ai.cloudflare.com/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.cloudflare"]
+pub struct CloudflareModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── OVH ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OvhEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for OvhEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.ovh"]
+pub struct OvhModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── GitHub Copilot ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CopilotEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for CopilotEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.githubcopilot.com",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.copilot"]
+pub struct CopilotModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── GLM (multi-region) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GlmEndpoint {
+    Cn,
+    #[default]
+    Global,
+}
+impl ModelEndpoint for GlmEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Cn => "https://open.bigmodel.cn/api/paas/v4",
+            Self::Global => "https://api.z.ai/api/paas/v4",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.glm"]
+pub struct GlmModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    #[serde(default)]
+    pub endpoint: GlmEndpoint,
+}
+
+impl FamilyEndpoint for GlmModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
+// ── Minimax (multi-region + auth_mode) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MinimaxEndpoint {
+    Cn,
+    #[default]
+    Intl,
+}
+impl ModelEndpoint for MinimaxEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Cn => "https://api.minimaxi.com/v1",
+            Self::Intl => "https://api.minimax.io/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.minimax"]
+pub struct MinimaxModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    #[serde(default)]
+    pub endpoint: MinimaxEndpoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<AuthMode>,
+}
+
+impl FamilyEndpoint for MinimaxModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
+// ── Z.AI (multi-region) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ZaiEndpoint {
+    Cn,
+    #[default]
+    Global,
+}
+impl ModelEndpoint for ZaiEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Cn => "https://open.bigmodel.cn/api/coding/paas/v4",
+            Self::Global => "https://api.z.ai/api/coding/paas/v4",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.zai"]
+pub struct ZaiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    #[serde(default)]
+    pub endpoint: ZaiEndpoint,
+}
+
+impl FamilyEndpoint for ZaiModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
+// ── Doubao (Volcengine; single canonical endpoint) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DoubaoEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for DoubaoEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://ark.cn-beijing.volces.com/api/v3",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.doubao"]
+pub struct DoubaoModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Yi (Lingyiwanwu; single endpoint) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum YiEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for YiEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.lingyiwanwu.com/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.yi"]
+pub struct YiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Hunyuan (Tencent; single endpoint) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum HunyuanEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for HunyuanEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.hunyuan.cloud.tencent.com/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.hunyuan"]
+pub struct HunyuanModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Qianfan (Baidu) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QianfanEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for QianfanEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://qianfan.baidubce.com/v2",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.qianfan"]
+pub struct QianfanModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Baichuan ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum BaichuanEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for BaichuanEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.baichuan-ai.com/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.baichuan"]
+pub struct BaichuanModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Gemini (OAuth-capable) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GeminiEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for GeminiEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://generativelanguage.googleapis.com/v1beta",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.gemini"]
+pub struct GeminiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Auth flow. Defaults to `api_key`; `oauth` uses GeminiModelProvider's
+    /// OAuth-cache integration instead of the `api_key` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<AuthMode>,
+}
+
+// ── Gemini CLI (subprocess wrapper) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GeminiCliEndpoint {
+    #[default]
+    LocalSubprocess,
+}
+impl ModelEndpoint for GeminiCliEndpoint {
+    fn uri(&self) -> &'static str {
+        // Subprocess — no remote endpoint. Sentinel for trait conformity.
+        "subprocess://gemini-cli"
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.gemini_cli"]
+pub struct GeminiCliModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── LMStudio (local default) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LmstudioEndpoint {
+    #[default]
+    LocalDefault,
+}
+impl ModelEndpoint for LmstudioEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => "http://localhost:1234/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.lmstudio"]
+pub struct LmstudioModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── llama.cpp (local default) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LlamacppEndpoint {
+    #[default]
+    LocalDefault,
+}
+impl ModelEndpoint for LlamacppEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => "http://localhost:8080/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.llamacpp"]
+pub struct LlamacppModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── SGLang (local default) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SglangEndpoint {
+    #[default]
+    LocalDefault,
+}
+impl ModelEndpoint for SglangEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => "http://localhost:30000/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.sglang"]
+pub struct SglangModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── vLLM (local default) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum VllmEndpoint {
+    #[default]
+    LocalDefault,
+}
+impl ModelEndpoint for VllmEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => "http://localhost:8000/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.vllm"]
+pub struct VllmModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Osaurus (local default) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OsaurusEndpoint {
+    #[default]
+    LocalDefault,
+}
+impl ModelEndpoint for OsaurusEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => "http://localhost:1337/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.osaurus"]
+pub struct OsaurusModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── LiteLLM (operator-self-hosted gateway) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LitellmEndpoint {
+    #[default]
+    LocalDefault,
+}
+impl ModelEndpoint for LitellmEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => "http://localhost:4000/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.litellm"]
+pub struct LitellmModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Lepton ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LeptonEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for LeptonEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://llama3-1-405b.lepton.run/api/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.lepton"]
+pub struct LeptonModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Synthetic ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SyntheticEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for SyntheticEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.synthetic.new/openai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.synthetic"]
+pub struct SyntheticModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── OpenCode (Zen) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpencodeEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for OpencodeEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://opencode.ai/zen/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.opencode"]
+pub struct OpencodeModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── KiloCli (subprocess wrapper) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum KiloCliEndpoint {
+    #[default]
+    LocalSubprocess,
+}
+impl ModelEndpoint for KiloCliEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalSubprocess => "subprocess://kilocli",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.kilocli"]
+pub struct KiloCliModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Custom (user-supplied URL, no canonical default) ──
+
+/// Custom catch-all for operator-defined endpoints. The endpoint variant has
+/// no canonical URL — operators must always set `base.uri`. The trait return
+/// is a sentinel string; the runtime constructor must verify `base.uri` is
+/// set for `custom` entries and fail with a clear error if not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CustomEndpoint {
+    #[default]
+    OperatorSupplied,
+}
+impl ModelEndpoint for CustomEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::OperatorSupplied => "operator-supplied:set-cfg-uri",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.custom"]
+pub struct CustomModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+// ── Bedrock (computed-endpoint exemplar, AWS region template) ──
+
+/// AWS Bedrock endpoint template. Single variant; the URL is computed at
+/// runtime by substituting `{region}` from the typed config field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum BedrockEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for BedrockEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            // Bedrock URI is a template — substitution happens in the
+            // BedrockModelProvider runtime constructor against cfg.region.
+            Self::Default => "https://bedrock-runtime.{region}.amazonaws.com",
+        }
+    }
+}
+
+/// AWS Bedrock model model_provider config. Carries the AWS region (the URI
+/// template substitutes `{region}` from this field). Bedrock auth is
+/// SigV4 — credentials come from the standard AWS credential chain
+/// (env vars, instance metadata, profile), not from `api_key`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.bedrock"]
+pub struct BedrockModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// AWS region for the Bedrock endpoint (e.g. `us-east-1`, `eu-west-1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+}
+
+// ── FamilyEndpoint default impls (single-endpoint families) ─────
+//
+// Multi-endpoint families (Moonshot, Qwen, Glm, Minimax, Zai, Stepfun) define
+// their own `impl FamilyEndpoint` next to the struct. Every other family
+// gets the `None` default via this list. The list is exhaustive: a new
+// family with no impl here AND no manual impl elsewhere will fail to
+// compile against `ModelProviders::resolved_endpoint_uri`, which expands
+// `endpoint_uri()` per slot through `for_each_model_provider_slot!`.
+
+macro_rules! impl_default_family_endpoint {
+    ($($t:ty),+ $(,)?) => {
+        $( impl FamilyEndpoint for $t {} )+
+    };
+}
+
+impl_default_family_endpoint! {
+    OpenAIModelProviderConfig,
+    AzureModelProviderConfig,
+    AnthropicModelProviderConfig,
+    OpenRouterModelProviderConfig,
+    OllamaModelProviderConfig,
+    TogetherModelProviderConfig,
+    FireworksModelProviderConfig,
+    GroqModelProviderConfig,
+    MistralModelProviderConfig,
+    DeepseekModelProviderConfig,
+    CohereModelProviderConfig,
+    PerplexityModelProviderConfig,
+    XaiModelProviderConfig,
+    CerebrasModelProviderConfig,
+    SambanovaModelProviderConfig,
+    HyperbolicModelProviderConfig,
+    DeepinfraModelProviderConfig,
+    HuggingfaceModelProviderConfig,
+    Ai21ModelProviderConfig,
+    RekaModelProviderConfig,
+    BasetenModelProviderConfig,
+    NscaleModelProviderConfig,
+    AnyscaleModelProviderConfig,
+    NebiusModelProviderConfig,
+    FriendliModelProviderConfig,
+    AihubmixModelProviderConfig,
+    SiliconflowModelProviderConfig,
+    AstraiModelProviderConfig,
+    AvianModelProviderConfig,
+    DeepmystModelProviderConfig,
+    VeniceModelProviderConfig,
+    NovitaModelProviderConfig,
+    NvidiaModelProviderConfig,
+    TelnyxModelProviderConfig,
+    VercelModelProviderConfig,
+    CloudflareModelProviderConfig,
+    OvhModelProviderConfig,
+    CopilotModelProviderConfig,
+    DoubaoModelProviderConfig,
+    YiModelProviderConfig,
+    HunyuanModelProviderConfig,
+    QianfanModelProviderConfig,
+    BaichuanModelProviderConfig,
+    GeminiModelProviderConfig,
+    GeminiCliModelProviderConfig,
+    LmstudioModelProviderConfig,
+    LlamacppModelProviderConfig,
+    SglangModelProviderConfig,
+    VllmModelProviderConfig,
+    OsaurusModelProviderConfig,
+    LitellmModelProviderConfig,
+    LeptonModelProviderConfig,
+    SyntheticModelProviderConfig,
+    OpencodeModelProviderConfig,
+    KiloCliModelProviderConfig,
+    CustomModelProviderConfig,
+    BedrockModelProviderConfig,
+}
+
 // ── Delegate Tool Configuration ─────────────────────────────────
 
 /// Global delegate tool configuration for default timeout values.
@@ -659,7 +2554,7 @@ pub struct ModelProviderConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "delegate"]
 pub struct DelegateToolConfig {
-    /// Default timeout in seconds for non-agentic sub-agent provider calls.
+    /// Default timeout in seconds for non-agentic sub-agent model_provider calls.
     /// Can be overridden per-agent in `[agents.<name>]` config.
     /// Default: 120 seconds.
     #[serde(default = "default_delegate_timeout_secs")]
@@ -693,13 +2588,16 @@ pub struct DelegateAgentConfig {
     /// Optional system prompt. Prefer placing prose in `agents/<alias>/AGENTS.md`.
     #[serde(default)]
     pub system_prompt: Option<String>,
-    /// Channel aliases this agent handles (e.g. `["telegram.default", "discord.work"]`).
+    /// Channel aliases this agent handles (e.g. `["telegram.<alias>", "discord.<alias>"]`).
+    /// Each entry is a `ChannelRef` resolving through `[channels.<type>.<alias>]`;
+    /// `Config::validate()` fails loud on dangling references.
     #[serde(default)]
-    pub channels: Vec<String>,
-    /// Dotted model-provider alias (e.g. `"anthropic.default"`).
-    /// Resolves through `providers.models.<type>.<alias>` at runtime.
+    pub channels: Vec<crate::providers::ChannelRef>,
+    /// Dotted model-provider alias (e.g. `"anthropic.<alias>"`).
+    /// Resolves through `providers.models.<type>.<alias>` at runtime;
+    /// `Config::validate()` fails loud on dangling references.
     #[serde(default)]
-    pub model_provider: String,
+    pub model_provider: crate::providers::ModelProviderRef,
     /// Risk profile alias (e.g. `"default"`). Resolves delegation guardrails at runtime.
     #[serde(default)]
     pub risk_profile: String,
@@ -731,14 +2629,25 @@ pub struct DelegateAgentConfig {
     #[serde(default)]
     pub cron_jobs: Vec<String>,
     /// TTS provider as a dotted alias reference (`<type>.<alias>`,
-    /// e.g. `"openai.default"`). Resolves through `providers.tts.<type>.<alias>`.
-    /// Empty = inherit `[tts].default_provider` (or no TTS if both empty).
+    /// e.g. `"openai.<alias>"`). Resolves through `providers.tts.<type>.<alias>`.
+    /// Empty = no TTS for this agent (there is no global default-provider concept;
+    /// every agent that wants TTS sets its own `tts_provider`).
     #[serde(default)]
-    pub tts_provider: String,
+    pub tts_provider: crate::providers::TtsProviderRef,
+    /// Transcription / STT provider as a dotted alias reference
+    /// (`<type>.<alias>`, e.g. `"groq.<alias>"`). Resolves through
+    /// `providers.transcription.<type>.<alias>`. Empty = agent has no
+    /// transcription preference; channels that ingest voice still need a
+    /// resolved provider (there is no global default), so an inbound voice
+    /// flow into an agent with empty `transcription_provider` errors loudly
+    /// at the channel boundary.
+    #[serde(default)]
+    pub transcription_provider: crate::providers::TranscriptionProviderRef,
 
-    // ── Agent loop / runtime tunables (folded from V2 `[agent]` ──────
-    // V3 makes these per-agent. Defaults preserve V2 behavior so an
-    // unconfigured agent runs identically to the old global `[agent]`.
+    // ── Agent loop / runtime tunables (folded from `[agent]` ──────
+    // These are per-agent. Defaults preserve the legacy single-agent
+    // behavior so an unconfigured agent runs identically to a config
+    // that previously lived under a global `[agent]` table.
     /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
     #[serde(default = "default_agent_compact_context")]
     pub compact_context: bool,
@@ -828,7 +2737,7 @@ impl Default for DelegateAgentConfig {
             enabled: true,
             system_prompt: None,
             channels: Vec::new(),
-            model_provider: String::new(),
+            model_provider: crate::providers::ModelProviderRef::default(),
             risk_profile: String::new(),
             runtime_profile: String::new(),
             skill_bundles: Vec::new(),
@@ -836,7 +2745,8 @@ impl Default for DelegateAgentConfig {
             mcp_bundles: Vec::new(),
             memory_namespace: String::new(),
             cron_jobs: Vec::new(),
-            tts_provider: String::new(),
+            tts_provider: crate::providers::TtsProviderRef::default(),
+            transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             compact_context: default_agent_compact_context(),
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
@@ -864,7 +2774,7 @@ impl Config {
     ///
     /// Each agent's `risk_profile` field names a `[risk_profiles.<alias>]`
     /// entry that gates its actions. There is no "global" risk profile in
-    /// V3: every callsite must come through an agent. When the agent has
+    /// every callsite must come through an agent. When the agent has
     /// no profile set or names a missing entry, returns `None` and the
     /// caller decides how to handle it (validation rejects this shape at
     /// load time; the runtime treating `None` as a config error).
@@ -883,11 +2793,11 @@ impl Config {
     /// agent doesn't exist, the reference is unparseable, or the
     /// `<type>.<alias>` pair doesn't resolve in `providers.models`.
     ///
-    /// This is the V3-correct lookup the orchestrator uses to build
-    /// per-agent provider runtime options instead of falling back to
-    /// `first_provider()`, which silently collapses multiple aliases under
-    /// the same provider family to whichever entry happens to be first
-    /// (#6266 review). The matching split logic lives in
+    /// This is the lookup the orchestrator uses to build per-agent
+    /// model_provider runtime options instead of falling back to
+    /// `first_model_provider()`, which silently collapses multiple aliases
+    /// under the same model_provider family to whichever entry happens to be
+    /// first. The matching split logic lives in
     /// `crates/zeroclaw-runtime/src/tools/delegate.rs::resolve_brain` for
     /// delegate sub-agents; this helper exposes the same contract for the
     /// channel-server startup path.
@@ -895,7 +2805,7 @@ impl Config {
     pub fn model_provider_for_agent(&self, agent_alias: &str) -> Option<&ModelProviderConfig> {
         let agent = self.agents.get(agent_alias)?;
         let (type_key, alias_key) = agent.model_provider.split_once('.')?;
-        self.providers.models.get(type_key)?.get(alias_key)
+        self.providers.models.find(type_key, alias_key)
     }
 
     /// Reverse-lookup the agent alias that owns a configured channel
@@ -933,6 +2843,31 @@ impl Config {
     #[must_use]
     pub fn agent(&self, agent_alias: &str) -> Option<&DelegateAgentConfig> {
         self.agents.get(agent_alias)
+    }
+
+    /// Resolve the runtime-active agent alias the orchestrator binds
+    /// channels to. Mirrors the same selection logic as
+    /// `start_channels()` in zeroclaw-channels: prefer the migration-
+    /// synthesized `"default"` agent, fall back to the first enabled
+    /// agent. Returns `None` only when no agent is configured at all.
+    ///
+    /// Used by per-agent infrastructure (TtsManager, TranscriptionManager)
+    /// to pick which agent's `tts_provider` / `transcription_provider`
+    /// drives the manager's resolved alias. Until the per-channel
+    /// dispatch refactor lands, the orchestrator runs in single-agent
+    /// mode, so all manager instances share the same resolved agent.
+    #[must_use]
+    pub fn resolved_runtime_agent_alias(&self) -> Option<&str> {
+        self.agents
+            .keys()
+            .find(|k| k.as_str() == "default")
+            .or_else(|| {
+                self.agents
+                    .iter()
+                    .find(|(_, a)| a.enabled)
+                    .map(|(alias, _)| alias)
+            })
+            .map(String::as_str)
     }
 
     /// Resolve the active storage backend for the memory subsystem.
@@ -1080,12 +3015,12 @@ where
 }
 
 /// Deserialize an `Option<String>` that maps an empty literal `""` to
-/// `None`. Used by `JiraConfig::email` so a V2 config that round-tripped
-/// `email = ""` to disk (V2's `email: String` had no
-/// `skip_serializing_if`) doesn't migrate into V3 as `Some("")` and
-/// silently break Basic auth — V3 dropped the email-required validation
-/// when adding Server/DC Bearer-token support (#6116), so this is the
-/// last line of defense (#6266 review).
+/// `None`. Used by `JiraConfig::email` so a config that round-tripped
+/// `email = ""` to disk (the legacy `email: String` had no
+/// `skip_serializing_if`) doesn't deserialize as `Some("")` and silently
+/// break Basic auth — the email-required validation was removed when
+/// Server/DC Bearer-token support landed, so this is the last line of
+/// defense.
 fn deserialize_optional_email_skip_empty<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error>
@@ -1183,10 +3118,6 @@ fn default_transcription_max_duration_secs() -> u64 {
     120
 }
 
-fn default_transcription_provider() -> String {
-    "groq".into()
-}
-
 fn default_openai_stt_model() -> String {
     "whisper-1".into()
 }
@@ -1210,23 +3141,20 @@ pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
-    /// Default STT provider: "groq", "openai", "deepgram", "assemblyai", "google".
-    #[serde(default = "default_transcription_provider")]
-    pub default_provider: String,
-    /// API key used for transcription requests (Groq provider).
+    /// API key used for transcription requests (Groq transcription provider).
     ///
     /// If unset, runtime falls back to `GROQ_API_KEY` for backward compatibility.
     #[serde(default)]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
-    /// Whisper API endpoint URL (Groq provider).
+    /// Whisper API endpoint URL (Groq transcription provider).
     #[serde(default = "default_transcription_api_url")]
     pub api_url: String,
-    /// Whisper model name (Groq provider).
+    /// Whisper model name (Groq transcription provider).
     #[serde(default = "default_transcription_model")]
     pub model: String,
-    /// Optional language hint (ISO-639-1, e.g. "en", "ru") for Groq provider.
+    /// Optional language hint (ISO-639-1, e.g. "en", "ru") for Groq transcription provider.
     #[serde(default)]
     pub language: Option<String>,
     /// Optional initial prompt to bias transcription toward expected vocabulary
@@ -1237,23 +3165,23 @@ pub struct TranscriptionConfig {
     /// Maximum voice duration in seconds (messages longer than this are skipped).
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
-    /// OpenAI Whisper STT provider configuration.
+    /// OpenAI Whisper STT model_provider configuration.
     #[serde(default)]
     #[nested]
     pub openai: Option<OpenAiSttConfig>,
-    /// Deepgram STT provider configuration.
+    /// Deepgram STT model_provider configuration.
     #[serde(default)]
     #[nested]
     pub deepgram: Option<DeepgramSttConfig>,
-    /// AssemblyAI STT provider configuration.
+    /// AssemblyAI STT model_provider configuration.
     #[serde(default)]
     #[nested]
     pub assemblyai: Option<AssemblyAiSttConfig>,
-    /// Google Cloud Speech-to-Text provider configuration.
+    /// Google Cloud Speech-to-Text model_provider configuration.
     #[serde(default)]
     #[nested]
     pub google: Option<GoogleSttConfig>,
-    /// Local/self-hosted Whisper-compatible STT provider.
+    /// Local/self-hosted Whisper-compatible STT model_provider.
     #[serde(default)]
     #[nested]
     pub local_whisper: Option<LocalWhisperConfig>,
@@ -1267,7 +3195,6 @@ impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            default_provider: default_transcription_provider(),
             api_key: None,
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
@@ -1452,9 +3379,9 @@ fn default_tts_max_text_length() -> usize {
 
 /// Text-to-Speech subsystem configuration (`[tts]`).
 ///
-/// V3 promotes per-instance TTS configs to `[providers.tts.<type>.<alias>]`
+/// Per-instance TTS configs live under `[providers.tts.<type>.<alias>]`
 /// (parallel to `providers.models`). What remains here are the global
-/// runtime knobs that apply to every provider invocation.
+/// runtime knobs that apply to every model_provider invocation.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tts"]
@@ -1462,12 +3389,7 @@ pub struct TtsConfig {
     /// Enable TTS synthesis.
     #[serde(default)]
     pub enabled: bool,
-    /// Default TTS provider as a dotted alias reference (`<type>.<alias>`,
-    /// e.g. `"openai.default"`). Resolves through `providers.tts.<type>.<alias>`.
-    /// When empty, agents must specify `tts_provider` explicitly.
-    #[serde(default)]
-    pub default_provider: String,
-    /// Default voice ID passed to the selected provider.
+    /// Default voice ID passed to the selected tts provider.
     #[serde(default = "default_tts_voice")]
     pub default_voice: String,
     /// Default audio output format (`"mp3"`, `"opus"`, `"wav"`).
@@ -1482,7 +3404,6 @@ impl Default for TtsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            default_provider: String::new(),
             default_voice: default_tts_voice(),
             default_format: default_tts_format(),
             max_text_length: default_tts_max_text_length(),
@@ -1490,7 +3411,7 @@ impl Default for TtsConfig {
     }
 }
 
-/// Per-instance TTS provider configuration (`[providers.tts.<type>.<alias>]`).
+/// Per-instance TTS model_provider configuration (`[providers.tts.<type>.<alias>]`).
 ///
 /// Mirrors `ModelProviderConfig` in shape — one struct holds the union of
 /// fields across backends. Only the fields relevant to the selected backend
@@ -1521,8 +3442,356 @@ pub struct TtsProviderConfig {
     pub language_code: Option<String>,
     /// Path to backend binary (edge-tts subprocess; piper local server).
     pub binary_path: Option<String>,
-    /// Base URL for HTTP-based backends (piper local server).
-    pub api_url: Option<String>,
+    /// Endpoint URI for HTTP-based backends (piper local server). Renamed
+    /// from `api_url` for parity with `ModelProviderConfig.uri`.
+    #[serde(alias = "api_url")]
+    pub uri: Option<String>,
+}
+
+// ── TTS endpoint trait + per-family typed configs ──────────────────────────
+//
+// Mirrors the model provider typed-family pattern. Each TTS family carries
+// its own typed config (composing TtsProviderConfig as the shared base via
+// `#[serde(flatten)]`) and a single-variant `*TtsEndpoint` enum impl'ing
+// `TtsEndpoint`. Edge and Piper skip the base — they're subprocess / local
+// runtimes with no shared `api_key` / `voice` defaults.
+
+/// One trait per family-endpoint enum. Returns the URI for the chosen
+/// variant. Mirrors `ModelEndpoint` for parity across model and TTS.
+pub trait TtsEndpoint {
+    fn uri(&self) -> &'static str;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAITtsEndpoint {
+    #[default]
+    Default,
+}
+impl TtsEndpoint for OpenAITtsEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.openai.com/v1/audio/speech",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.tts.openai"]
+pub struct OpenAITtsProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TtsProviderConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ElevenLabsTtsEndpoint {
+    #[default]
+    Default,
+}
+impl TtsEndpoint for ElevenLabsTtsEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.elevenlabs.io/v1/text-to-speech",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.tts.elevenlabs"]
+pub struct ElevenLabsTtsProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TtsProviderConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GoogleTtsEndpoint {
+    #[default]
+    Default,
+}
+impl TtsEndpoint for GoogleTtsEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://texttospeech.googleapis.com/v1/text:synthesize",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.tts.google"]
+pub struct GoogleTtsProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TtsProviderConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeTtsEndpoint {
+    /// Subprocess — no remote endpoint. Sentinel for trait conformity.
+    #[default]
+    LocalSubprocess,
+}
+impl TtsEndpoint for EdgeTtsEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalSubprocess => "subprocess://edge-tts",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.tts.edge"]
+pub struct EdgeTtsProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TtsProviderConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PiperTtsEndpoint {
+    #[default]
+    LocalDefault,
+}
+impl TtsEndpoint for PiperTtsEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => "http://127.0.0.1:5000/v1/audio/speech",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.tts.piper"]
+pub struct PiperTtsProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TtsProviderConfig,
+}
+
+// ── Transcription providers (typed-family split, mirrors models/tts) ────
+//
+// Six family slots: `groq`, `openai`, `deepgram`, `assemblyai`, `google`,
+// `local_whisper`. Each is a `HashMap<String, *TranscriptionProviderConfig>`
+// keyed by operator-chosen alias. The shared `TranscriptionProviderConfig`
+// base carries `api_key` + `language` since every cloud STT family takes
+// both; `local_whisper` skips the base because it's a self-hosted endpoint
+// with its own auth token, not a vendor API key.
+
+/// Shared base for cloud transcription providers. Each cloud family
+/// composes this via `#[serde(flatten)] base: TranscriptionProviderConfig`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription"]
+pub struct TranscriptionProviderConfig {
+    /// API key for the transcription provider.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: Option<String>,
+    /// Optional language hint passed to the provider (ISO-639-1 like `"en"` /
+    /// `"ru"`, or BCP-47 like `"en-US"` for Google). Most providers auto-detect
+    /// when this is unset.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Whisper-style initial prompt to bias the model toward expected
+    /// vocabulary (proper nouns, technical terms). Provider-specific support;
+    /// silently ignored where not applicable.
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
+}
+
+/// Trait that every transcription endpoint enum implements. Mirrors
+/// `ModelEndpoint` / `TtsEndpoint` for parity.
+pub trait TranscriptionEndpoint {
+    fn uri(&self) -> &'static str;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GroqTranscriptionEndpoint {
+    #[default]
+    Default,
+}
+impl TranscriptionEndpoint for GroqTranscriptionEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.groq.com/openai/v1/audio/transcriptions",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription.groq"]
+pub struct GroqTranscriptionProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TranscriptionProviderConfig,
+    /// Whisper model name (default: `"whisper-large-v3-turbo"`).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiTranscriptionEndpoint {
+    #[default]
+    Default,
+}
+impl TranscriptionEndpoint for OpenAiTranscriptionEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.openai.com/v1/audio/transcriptions",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription.openai"]
+pub struct OpenAiTranscriptionProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TranscriptionProviderConfig,
+    /// Whisper model name (default: `"whisper-1"`).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DeepgramTranscriptionEndpoint {
+    #[default]
+    Default,
+}
+impl TranscriptionEndpoint for DeepgramTranscriptionEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.deepgram.com/v1/listen",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription.deepgram"]
+pub struct DeepgramTranscriptionProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TranscriptionProviderConfig,
+    /// Deepgram model name (default: `"nova-2"`).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AssemblyAiTranscriptionEndpoint {
+    #[default]
+    Default,
+}
+impl TranscriptionEndpoint for AssemblyAiTranscriptionEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.assemblyai.com/v2/transcript",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription.assemblyai"]
+pub struct AssemblyAiTranscriptionProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TranscriptionProviderConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GoogleTranscriptionEndpoint {
+    #[default]
+    Default,
+}
+impl TranscriptionEndpoint for GoogleTranscriptionEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://speech.googleapis.com/v1/speech:recognize",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription.google"]
+pub struct GoogleTranscriptionProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: TranscriptionProviderConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LocalWhisperTranscriptionEndpoint {
+    /// Self-hosted endpoint — no remote URL. Sentinel for trait conformity.
+    /// The actual URL lives on `LocalWhisperTranscriptionProviderConfig.uri`.
+    #[default]
+    SelfHosted,
+}
+impl TranscriptionEndpoint for LocalWhisperTranscriptionEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::SelfHosted => "self-hosted",
+        }
+    }
+}
+
+/// Local / self-hosted Whisper-compatible transcription endpoint. Skips the
+/// shared `TranscriptionProviderConfig` base because it uses a bearer-token
+/// scheme and a per-instance URL rather than a vendor API key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription.local_whisper"]
+pub struct LocalWhisperTranscriptionProviderConfig {
+    /// Endpoint URL, e.g. `"http://10.10.0.1:8001/v1/transcribe"`.
+    pub uri: String,
+    /// Bearer token for endpoint authentication. Omit for unauthenticated
+    /// local endpoints.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub bearer_token: Option<String>,
+    /// Optional language hint (passed through to the local endpoint).
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Maximum audio file size in bytes accepted by this endpoint.
+    /// Defaults to 25 MB to match the cloud cap; raise as needed.
+    #[serde(default = "default_local_whisper_max_audio_bytes")]
+    pub max_audio_bytes: usize,
+    /// Request timeout in seconds.
+    #[serde(default = "default_local_whisper_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 /// Determines when a `ToolFilterGroup` is active.
@@ -1575,7 +3844,7 @@ pub struct ToolFilterGroup {
     pub filter_builtins: bool,
 }
 
-/// OpenAI Whisper STT provider configuration (`[transcription.openai]`).
+/// OpenAI Whisper STT model_provider configuration (`[transcription.openai]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.openai"]
@@ -1590,7 +3859,7 @@ pub struct OpenAiSttConfig {
     pub model: String,
 }
 
-/// Deepgram STT provider configuration (`[transcription.deepgram]`).
+/// Deepgram STT model_provider configuration (`[transcription.deepgram]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.deepgram"]
@@ -1605,7 +3874,7 @@ pub struct DeepgramSttConfig {
     pub model: String,
 }
 
-/// AssemblyAI STT provider configuration (`[transcription.assemblyai]`).
+/// AssemblyAI STT model_provider configuration (`[transcription.assemblyai]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.assemblyai"]
@@ -1617,7 +3886,7 @@ pub struct AssemblyAiSttConfig {
     pub api_key: Option<String>,
 }
 
-/// Google Cloud Speech-to-Text provider configuration (`[transcription.google]`).
+/// Google Cloud Speech-to-Text model_provider configuration (`[transcription.google]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.google"]
@@ -1965,13 +4234,13 @@ pub struct MultimodalConfig {
     /// Allow fetching remote image URLs (http/https). Disabled by default.
     #[serde(default)]
     pub allow_remote_fetch: bool,
-    /// Provider name to use for vision/image messages (e.g. `"ollama"`).
+    /// ModelProvider name to use for vision/image messages (e.g. `"ollama"`).
     /// When set, messages containing `[IMAGE:]` markers are routed to this
-    /// provider instead of the default text provider.
+    /// model_provider instead of the default text model_provider.
     #[serde(default)]
-    pub vision_provider: Option<String>,
-    /// Model to use when routing to the vision provider (e.g. `"llava:7b"`).
-    /// Only used when `vision_provider` is set.
+    pub vision_model_provider: Option<String>,
+    /// Model to use when routing to the vision model_provider (e.g. `"llava:7b"`).
+    /// Only used when `vision_model_provider` is set.
     #[serde(default)]
     pub vision_model: Option<String>,
 }
@@ -1999,7 +4268,7 @@ impl Default for MultimodalConfig {
             max_images: default_multimodal_max_images(),
             max_image_size_mb: default_multimodal_max_image_size_mb(),
             allow_remote_fetch: false,
-            vision_provider: None,
+            vision_model_provider: None,
             vision_model: None,
         }
     }
@@ -2021,7 +4290,7 @@ pub struct MediaPipelineConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Transcribe audio attachments using the configured transcription provider.
+    /// Transcribe audio attachments using the configured transcription model_provider.
     #[serde(default = "default_true")]
     pub transcribe_audio: bool,
 
@@ -3087,20 +5356,20 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), or "searxng" (self-hosted)
+    /// Search model_provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), or "searxng" (self-hosted)
     #[serde(default = "default_web_search_provider")]
-    pub provider: String,
-    /// Brave Search API key (required if provider is "brave")
+    pub model_provider: String,
+    /// Brave Search API key (required if model_provider is "brave")
     #[serde(default)]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub brave_api_key: Option<String>,
-    /// Tavily Search API key (required if provider is "tavily")
+    /// Tavily Search API key (required if model_provider is "tavily")
     #[serde(default)]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub tavily_api_key: Option<String>,
-    /// SearXNG instance URL (required if provider is `"searxng"`), e.g. `"https://searx.example.com"`.
+    /// SearXNG instance URL (required if model_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
     /// Maximum results per search (1-10)
@@ -3127,7 +5396,7 @@ impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            provider: default_web_search_provider(),
+            model_provider: default_web_search_provider(),
             brave_api_key: None,
             tavily_api_key: None,
             searxng_instance_url: None,
@@ -3677,11 +5946,11 @@ pub struct LinkedInImageConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Provider priority order. Tried in sequence; first success wins.
+    /// ModelProvider priority order. Tried in sequence; first success wins.
     #[serde(default = "default_image_providers")]
     pub providers: Vec<String>,
 
-    /// Generate a branded SVG text card when all AI providers fail.
+    /// Generate a branded SVG text card when all AI model_providers fail.
     #[serde(default = "default_true")]
     pub fallback_card: bool,
 
@@ -3693,22 +5962,22 @@ pub struct LinkedInImageConfig {
     #[serde(default = "default_image_temp_dir")]
     pub temp_dir: String,
 
-    /// Stability AI provider settings.
+    /// Stability AI model_provider settings.
     #[serde(default)]
     #[nested]
     pub stability: ImageProviderStabilityConfig,
 
-    /// Google Imagen (Vertex AI) provider settings.
+    /// Google Imagen (Vertex AI) model_provider settings.
     #[serde(default)]
     #[nested]
     pub imagen: ImageProviderImagenConfig,
 
-    /// OpenAI DALL-E provider settings.
+    /// OpenAI DALL-E model_provider settings.
     #[serde(default)]
     #[nested]
     pub dalle: ImageProviderDalleConfig,
 
-    /// Flux (fal.ai) provider settings.
+    /// Flux (fal.ai) model_provider settings.
     #[serde(default)]
     #[nested]
     pub flux: ImageProviderFluxConfig,
@@ -5162,7 +7431,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 
 /// Persistent storage configuration (`[storage]` section).
 ///
-/// V3 promotes storage to a two-tier alias-keyed map: `[storage.<backend>.<alias>]`,
+/// Storage is a two-tier alias-keyed map: `[storage.<backend>.<alias>]`,
 /// parallel to `[providers.models.<type>.<alias>]`. Each backend has its own typed
 /// config struct. `MemoryConfig.backend` carries a dotted reference (`"sqlite.default"`,
 /// `"postgres.work"`) that resolves to one of these entries via
@@ -5209,9 +7478,8 @@ pub struct SqliteStorageConfig {
 
 /// PostgreSQL storage backend (`[storage.postgres.<alias>]`).
 ///
-/// Holds connection parameters AND pgvector settings — V3 collapses the V2
-/// `[storage.provider.config]` (connection) and `[memory.postgres]`
-/// (vector params) into one alias-keyed entry.
+/// Holds connection parameters AND pgvector settings on one alias-keyed
+/// entry; previously these lived in two separate sections.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "storage-postgres"]
@@ -5362,10 +7630,10 @@ pub struct MemoryConfig {
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
-    /// Embedding model identifier — must match a model your chosen embedding provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings; you'll need to re-index.
+    /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings; you'll need to re-index.
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
-    /// Vector width produced by the embedding model — must match the model's native dimension or vectors won't store correctly. Look up the number on the provider's model page.
+    /// Vector width produced by the embedding model — must match the model's native dimension or vectors won't store correctly. Look up the number on the model_provider's model page.
     #[serde(default = "default_embedding_dims")]
     pub embedding_dimensions: usize,
     /// How heavily vector (semantic) similarity counts when `search_mode = hybrid`. Raise toward 1.0 to favor meaning-based matches; lower it to lean on keyword overlap instead.
@@ -5374,7 +7642,7 @@ pub struct MemoryConfig {
     /// How heavily BM25 (keyword) overlap counts when `search_mode = hybrid`. Raise toward 1.0 for exact-term matching; lower it when paraphrases should still score well.
     #[serde(default = "default_keyword_weight")]
     pub keyword_weight: f64,
-    /// How memories are retrieved: `bm25` = keyword-only (no embeddings, cheapest); `embedding` = vector similarity only (needs an embedding provider); `hybrid` = blended keyword + vector score using the weights above (most robust).
+    /// How memories are retrieved: `bm25` = keyword-only (no embeddings, cheapest); `embedding` = vector similarity only (needs an embedding model_provider); `hybrid` = blended keyword + vector score using the weights above (most robust).
     #[serde(default)]
     pub search_mode: SearchMode,
     /// Minimum hybrid score (0.0–1.0) for a memory to be included in context.
@@ -5452,10 +7720,9 @@ pub struct MemoryConfig {
     #[nested]
     pub policy: MemoryPolicyConfig,
     // Backend-specific config fields (sqlite_open_timeout_secs, qdrant.*,
-    // postgres.*) lived here in V2. V3 moves them onto
-    // `[storage.<backend>.<alias>]`. The `backend` field now carries a dotted
-    // alias reference and the runtime looks up the typed config via
-    // `Config::resolve_active_storage`.
+    // postgres.*) live on `[storage.<backend>.<alias>]`. The `backend` field
+    // carries a dotted alias reference and the runtime looks up the typed
+    // config via `Config::resolve_active_storage`.
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -5744,12 +8011,11 @@ impl Default for WebhookAuditConfig {
 
 // ── Autonomy / Security ──────────────────────────────────────────
 //
-// V3: V2's global `[autonomy]` table is gone. All policy fields live on
-// per-agent `[risk_profiles.<alias>]` entries (see `RiskProfileConfig`
-// below); the migration synthesizes `risk_profiles.default` from V2's
-// `[autonomy] + [security.sandbox] + [security.resources]` blocks.
-// `Config::active_risk_profile(agent_alias)` resolves the active profile
-// for any callsite (agent-driven or non-agent contexts).
+// All policy fields live on per-agent `[risk_profiles.<alias>]` entries
+// (see `RiskProfileConfig` below). `Config::active_risk_profile(agent_alias)`
+// resolves the active profile for any callsite (agent-driven or non-agent
+// contexts). Configs from older schema versions are folded into
+// `risk_profiles.default` by the migration in `schema/v2.rs`.
 
 fn default_shell_timeout_secs() -> u64 {
     60
@@ -5788,9 +8054,9 @@ impl RiskProfileConfig {
     }
 
     /// Synthesize a [`SandboxConfig`] from this profile's flattened sandbox
-    /// fields. V3 stores sandbox config flat on the profile; legacy
-    /// callsites that still want a `SandboxConfig` instance (sandbox detection
-    /// in `zeroclaw-runtime::security::detect`) can call this helper.
+    /// fields. Sandbox config is stored flat on the profile; callsites that
+    /// still want a `SandboxConfig` instance (sandbox detection in
+    /// `zeroclaw-runtime::security::detect`) can call this helper.
     #[must_use]
     pub fn sandbox_config(&self) -> SandboxConfig {
         let backend = self
@@ -5858,13 +8124,13 @@ fn is_valid_env_var_name(name: &str) -> bool {
 
 /// Named risk/autonomy profile (`[risk_profiles.<alias>]`).
 ///
-/// V3 unified policy surface. Replaces V2's global `[autonomy]` table:
-/// agents reference a profile by alias, the runtime resolves through it
-/// for shell command allowlists, approval gates, sandbox/resource limits,
-/// and delegation guardrails. The conventional `risk_profiles["default"]`
-/// is the resolution target for non-agent contexts (orchestrator init,
-/// cron worker startup); the `Default` impl below mirrors V2's
-/// safety-first defaults so a fresh install behaves the same.
+/// Unified policy surface. Agents reference a profile by alias and the
+/// runtime resolves through it for shell command allowlists, approval gates,
+/// sandbox/resource limits, and delegation guardrails. The conventional
+/// `risk_profiles["default"]` is the resolution target for non-agent
+/// contexts (orchestrator init, cron worker startup); the `Default` impl
+/// below mirrors the legacy safety-first defaults so a fresh install
+/// behaves the same as a config from before the per-profile split.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "risk-profile"]
@@ -5956,15 +8222,15 @@ impl Default for RiskProfileConfig {
 
 /// Named runtime/LLM execution profile (`[runtime_profiles.<alias>]`).
 ///
-/// Defines a reusable set of LLM provider and execution parameters. Agents
+/// Defines a reusable set of LLM model_provider and execution parameters. Agents
 /// or channels that reference this profile inherit its settings as overrides.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "runtime-profile"]
 #[serde(default)]
 pub struct RuntimeProfileConfig {
-    /// Model provider name (e.g. `"openrouter"`, `"ollama"`).
-    pub provider: Option<String>,
+    /// Model model_provider name (e.g. `"openrouter"`, `"ollama"`).
+    pub model_provider: Option<String>,
     /// Model identifier.
     pub model: Option<String>,
     /// API key override for this profile.
@@ -5975,7 +8241,7 @@ pub struct RuntimeProfileConfig {
     pub temperature: Option<f64>,
     /// Maximum tokens to generate.
     pub max_tokens: Option<u32>,
-    /// Provider call timeout in seconds for non-agentic calls.
+    /// ModelProvider call timeout in seconds for non-agentic calls.
     pub timeout_secs: Option<u64>,
     /// Enable agentic (multi-turn tool-call loop) mode.
     pub agentic: bool,
@@ -6030,11 +8296,11 @@ pub struct SkillBundleConfig {
 /// Isolates agent memory operations within a named namespace, preventing
 /// cross-contamination between agents sharing the same backend.
 ///
-/// V3 model: namespaces are tags within the active memory backend — they
-/// do not pick a different backend. SQL backends column-tag rows with
-/// the namespace value; qdrant uses per-namespace collections; markdown
-/// uses per-namespace directories. The per-backend isolation primitive
-/// is the runtime backend's responsibility.
+/// Namespaces are tags within the active memory backend — they do not pick
+/// a different backend. SQL backends column-tag rows with the namespace
+/// value; qdrant uses per-namespace collections; markdown uses per-namespace
+/// directories. The per-backend isolation primitive is the runtime backend's
+/// responsibility.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory-namespace"]
@@ -6042,7 +8308,7 @@ pub struct SkillBundleConfig {
 pub struct MemoryNamespaceConfig {
     /// Namespace key used to scope memory operations.
     pub namespace: String,
-    /// Optional backend override (DEPRECATED — V3 namespaces share the
+    /// Optional backend override (DEPRECATED — namespaces share the
     /// global backend; this field will be removed once runtime backend
     /// routing migrates to per-agent storage selection).
     pub backend: Option<String>,
@@ -6102,13 +8368,13 @@ pub struct RuntimeConfig {
     #[nested]
     pub docker: DockerRuntimeConfig,
 
-    /// Global reasoning override for providers that expose explicit controls.
-    /// - `None`: provider default behavior
+    /// Global reasoning override for model_providers that expose explicit controls.
+    /// - `None`: model_provider default behavior
     /// - `Some(true)`: request reasoning/thinking when supported
     /// - `Some(false)`: disable reasoning/thinking when supported
     #[serde(default)]
     pub reasoning_enabled: Option<bool>,
-    /// Optional reasoning effort for providers that expose a level control.
+    /// Optional reasoning effort for model_providers that expose a level control.
     #[serde(default, deserialize_with = "deserialize_reasoning_effort_opt")]
     pub reasoning_effort: Option<String>,
 }
@@ -6196,15 +8462,15 @@ impl Default for RuntimeConfig {
 
 /// Reliability and supervision configuration (`[reliability]` section).
 ///
-/// Controls provider retries, API key rotation, and channel restart backoff.
+/// Controls model_provider retries, API key rotation, and channel restart backoff.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "reliability"]
 pub struct ReliabilityConfig {
-    /// Retries per provider before bailing.
+    /// Retries per model_provider before bailing.
     #[serde(default = "default_provider_retries")]
     pub provider_retries: u32,
-    /// Base backoff (ms) for provider retry delay.
+    /// Base backoff (ms) for model_provider retry delay.
     #[serde(default = "default_provider_backoff_ms")]
     pub provider_backoff_ms: u64,
     /// Additional API keys for round-robin rotation on rate-limit (429) errors.
@@ -6267,8 +8533,8 @@ impl Default for ReliabilityConfig {
 
 /// Scheduler configuration for periodic task execution (`[scheduler]` section).
 ///
-/// V3 owns the cron-runtime knobs (previously on `[cron]`): per-job declarations
-/// moved to `Config.cron: HashMap<String, CronJobDecl>` (alias-keyed), while the
+/// Owns the cron-runtime knobs: per-job declarations live on
+/// `Config.cron: HashMap<String, CronJobDecl>` (alias-keyed), while the
 /// scheduler loop's runtime behavior (`enabled`, polling cap, catch-up) lives here.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -6321,17 +8587,17 @@ impl Default for SchedulerConfig {
 
 // ── Model routing ────────────────────────────────────────────────
 
-/// Route a task hint to a specific provider + model.
+/// Route a task hint to a specific model_provider + model.
 ///
 /// ```toml
 /// [[model_routes]]
 /// hint = "reasoning"
-/// provider = "openrouter"
+/// model_provider = "openrouter"
 /// model = "anthropic/claude-opus-4-20250514"
 ///
 /// [[model_routes]]
 /// hint = "fast"
-/// provider = "groq"
+/// model_provider = "groq"
 /// model = "llama-3.3-70b-versatile"
 /// ```
 ///
@@ -6341,23 +8607,23 @@ impl Default for SchedulerConfig {
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     pub hint: String,
-    /// Provider to route to (must match a known provider name)
-    pub provider: String,
-    /// Model to use with that provider
+    /// Model provider to route to (must match a known model-provider name)
+    pub model_provider: String,
+    /// Model to use with that model provider
     pub model: String,
-    /// Optional API key override for this route's provider
+    /// Optional API key override for this route's model provider
     #[serde(default)]
     pub api_key: Option<String>,
 }
 
 // ── Embedding routing ───────────────────────────────────────────
 
-/// Route an embedding hint to a specific provider + model.
+/// Route an embedding hint to a specific model_provider + model.
 ///
 /// ```toml
 /// [[embedding_routes]]
 /// hint = "semantic"
-/// provider = "openai"
+/// model_provider = "openai"
 /// model = "text-embedding-3-small"
 /// dimensions = 1536
 ///
@@ -6369,14 +8635,14 @@ pub struct ModelRouteConfig {
 pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
     pub hint: String,
-    /// Embedding provider (`none`, `openai`, or `custom:<url>`)
-    pub provider: String,
-    /// Embedding model to use with that provider
+    /// Embedding-capable model provider (`none`, `openai`, or `custom:<url>`)
+    pub model_provider: String,
+    /// Embedding model to use with that model provider
     pub model: String,
     /// Optional embedding dimension override for this route
     #[serde(default)]
     pub dimensions: Option<usize>,
-    /// Optional API key override for this route's provider
+    /// Optional API key override for this route's model_provider
     #[serde(default)]
     pub api_key: Option<String>,
 }
@@ -6429,7 +8695,7 @@ pub struct ClassificationRule {
 #[allow(clippy::struct_excessive_bools)]
 pub struct HeartbeatConfig {
     /// Enable periodic heartbeat pings. Default: `false`. When enabled,
-    /// `agent` must name a configured agent — V3 has no default agent
+    /// `agent` must name a configured agent — there is no default agent
     /// for heartbeat to fall through to.
     #[serde(default)]
     pub enabled: bool,
@@ -6685,40 +8951,40 @@ fn default_max_run_history() -> u32 {
 
 /// Tunnel configuration for exposing the gateway publicly (`[tunnel]` section).
 ///
-/// Supported providers: `"none"` (default), `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, `"pinggy"`, `"custom"`.
+/// Supported model_providers: `"none"` (default), `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, `"pinggy"`, `"custom"`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel"]
 pub struct TunnelConfig {
     /// How the gateway gets exposed to the public internet so webhooks (Telegram, Slack, etc.) can reach it. `none` = keep it local, no tunnel; `cloudflare` = Cloudflare Tunnel via cloudflared (needs a Zero Trust account and token); `tailscale` = Tailscale Funnel/Serve (tailnet-only or public, no account beyond tailscale); `ngrok` = ngrok agent with auth token; `openvpn` = bring-your-own OpenVPN egress; `pinggy` = Pinggy SSH tunnels (quick one-shot URLs); `custom` = run an arbitrary command you define under `[tunnel.custom]`.
-    pub provider: String,
+    pub model_provider: String,
 
-    /// Cloudflare Tunnel configuration (used when `provider = "cloudflare"`).
+    /// Cloudflare Tunnel configuration (used when `model_provider = "cloudflare"`).
     #[serde(default)]
     #[nested]
     pub cloudflare: Option<CloudflareTunnelConfig>,
 
-    /// Tailscale Funnel/Serve configuration (used when `provider = "tailscale"`).
+    /// Tailscale Funnel/Serve configuration (used when `model_provider = "tailscale"`).
     #[serde(default)]
     #[nested]
     pub tailscale: Option<TailscaleTunnelConfig>,
 
-    /// ngrok tunnel configuration (used when `provider = "ngrok"`).
+    /// ngrok tunnel configuration (used when `model_provider = "ngrok"`).
     #[serde(default)]
     #[nested]
     pub ngrok: Option<NgrokTunnelConfig>,
 
-    /// OpenVPN tunnel configuration (used when `provider = "openvpn"`).
+    /// OpenVPN tunnel configuration (used when `model_provider = "openvpn"`).
     #[serde(default)]
     #[nested]
     pub openvpn: Option<OpenVpnTunnelConfig>,
 
-    /// Custom tunnel command configuration (used when `provider = "custom"`).
+    /// Custom tunnel command configuration (used when `model_provider = "custom"`).
     #[serde(default)]
     #[nested]
     pub custom: Option<CustomTunnelConfig>,
 
-    /// Pinggy tunnel configuration (used when `provider = "pinggy"`).
+    /// Pinggy tunnel configuration (used when `model_provider = "pinggy"`).
     #[serde(default)]
     #[nested]
     pub pinggy: Option<PinggyTunnelConfig>,
@@ -6727,7 +8993,7 @@ pub struct TunnelConfig {
 impl Default for TunnelConfig {
     fn default() -> Self {
         Self {
-            provider: "none".into(),
+            model_provider: "none".into(),
             cloudflare: None,
             tailscale: None,
             ngrok: None,
@@ -6777,8 +9043,8 @@ pub struct NgrokTunnelConfig {
 
 /// OpenVPN tunnel configuration (`[tunnel.openvpn]`).
 ///
-/// Required when `tunnel.provider = "openvpn"`. Omitting this section entirely
-/// preserves previous behavior. Setting `tunnel.provider = "none"` (or removing
+/// Required when `tunnel.model_provider = "openvpn"`. Omitting this section entirely
+/// preserves previous behavior. Setting `tunnel.model_provider = "none"` (or removing
 /// the `[tunnel.openvpn]` block) cleanly reverts to no-tunnel mode.
 ///
 /// Defaults: `connect_timeout_secs = 30`.
@@ -6870,7 +9136,7 @@ impl<T: ChannelConfig> crate::traits::ConfigHandle for ConfigWrapper<T> {
 
 /// Top-level channel configurations (`[channels]` section).
 ///
-/// V3: each channel type is a keyed table of named instances (aliases).
+/// each channel type is a keyed table of named instances (aliases).
 /// `[channels.telegram.default]` is the conventional single-instance key.
 /// Access via `config.channels.telegram.get("default")`.
 #[allow(clippy::struct_excessive_bools)]
@@ -8423,8 +10689,7 @@ impl ChannelConfig for FeishuConfig {
 
 /// Security configuration for audit logging, OTP, e-stop, IAM/SSO, and WebAuthn.
 ///
-/// V3: V2's `[security.sandbox]` and `[security.resources]` subsections are
-/// gone. Sandbox backend and resource limits live on per-agent risk profiles
+/// Sandbox backend and resource limits live on per-agent risk profiles
 /// (see `RiskProfileConfig::sandbox_*` and `RiskProfileConfig::max_*`); the
 /// runtime resolves them via `Config::active_risk_profile(agent_alias)`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
@@ -9427,10 +11692,11 @@ pub struct JiraConfig {
     pub base_url: String,
     /// Jira account email used for Basic auth (Cloud).
     /// Omit for Server/DC deployments using Bearer token auth.
-    /// An empty string (`email = ""`) deserializes as `None`; V2 configs
-    /// with the empty default would otherwise silently regress to Basic
-    /// auth with empty username under V3, which dropped the email-required
-    /// validation (#6266 review).
+    /// An empty string (`email = ""`) deserializes as `None`. Configs
+    /// that round-tripped the empty default to disk would otherwise
+    /// silently regress to Basic auth with empty username, since the
+    /// email-required validation was dropped when Server/DC Bearer-token
+    /// support landed.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -9483,10 +11749,10 @@ pub struct CloudOpsConfig {
     /// Enable cloud operations tools. Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// Default cloud provider for analysis context. Default: "aws".
+    /// Default cloud model_provider for analysis context. Default: "aws".
     #[serde(default = "default_cloud_ops_cloud")]
     pub default_cloud: String,
-    /// Supported cloud providers. Default: [`aws`, `azure`, `gcp`].
+    /// Supported cloud model_providers. Default: [`aws`, `azure`, `gcp`].
     #[serde(default = "default_cloud_ops_supported_clouds")]
     pub supported_clouds: Vec<String>,
     /// Supported IaC tools for review. Default: \[`terraform`\].
@@ -10456,9 +12722,9 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         // Tunnel — OpenVPN
-        if self.tunnel.provider.trim() == "openvpn" {
+        if self.tunnel.model_provider.trim() == "openvpn" {
             let openvpn = self.tunnel.openvpn.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("tunnel.provider='openvpn' requires [tunnel.openvpn]")
+                anyhow::anyhow!("tunnel.model_provider='openvpn' requires [tunnel.openvpn]")
             })?;
 
             if openvpn.config_file.trim().is_empty() {
@@ -10539,7 +12805,7 @@ impl Config {
         }
 
         // Validate every configured risk profile. Each profile stands on
-        // its own — V3 has no "active" or "default" risk profile concept;
+        // its own — there is no "active" or "default" risk profile concept;
         // an agent's `risk_profile` field names exactly which one applies.
         let mut profile_aliases: Vec<&String> = self.risk_profiles.keys().collect();
         profile_aliases.sort();
@@ -10653,11 +12919,11 @@ impl Config {
                     "model_routes[{i}].hint must not be empty"
                 );
             }
-            if route.provider.trim().is_empty() {
+            if route.model_provider.trim().is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
-                    format!("model_routes[{i}].provider"),
-                    "model_routes[{i}].provider must not be empty"
+                    format!("model_routes[{i}].model_provider"),
+                    "model_routes[{i}].model_provider must not be empty"
                 );
             }
             if route.model.trim().is_empty() {
@@ -10678,11 +12944,11 @@ impl Config {
                     "embedding_routes[{i}].hint must not be empty"
                 );
             }
-            if route.provider.trim().is_empty() {
+            if route.model_provider.trim().is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
-                    format!("embedding_routes[{i}].provider"),
-                    "embedding_routes[{i}].provider must not be empty"
+                    format!("embedding_routes[{i}].model_provider"),
+                    "embedding_routes[{i}].model_provider must not be empty"
                 );
             }
             if route.model.trim().is_empty() {
@@ -10694,89 +12960,83 @@ impl Config {
             }
         }
 
-        for (type_key, alias_map) in &self.providers.models {
-            if type_key.trim().is_empty() {
-                anyhow::bail!("model_providers contains an empty provider type name");
+        for (type_key, alias_key, profile) in self.providers.models.iter_entries() {
+            let profile_name = format!("{type_key}.{alias_key}");
+
+            let has_name = profile
+                .name
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            let has_uri = profile
+                .uri
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+
+            // Entries created by migration from top-level fields use the model_provider
+            // name as the map key and may not have explicit `name` or `uri`
+            // (the model_provider factory resolves the family's default endpoint via
+            // `ModelEndpoint`). An entry with no identifying information at
+            // all is almost always an in-progress onboarding state — the user
+            // picked the model_provider but hasn't filled anything in yet. Warn but
+            // don't bail; the runtime falls back to family-default endpoint at
+            // use time, and a chat against the unconfigured model_provider fails
+            // with a clear error then.
+            let has_api_key = profile
+                .api_key
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+            let has_model = profile
+                .model
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+            if !has_name && !has_uri && !has_api_key && !has_model {
+                tracing::warn!(
+                    model_provider = %profile_name,
+                    "providers.models.{profile_name} is empty (no name / uri / api_key / model). \
+                     Skipping at runtime; finish onboarding via the dashboard or `zeroclaw onboard` \
+                     to make this model_provider usable.",
+                );
+                continue;
             }
-            for (alias_key, profile) in alias_map {
-                let profile_name = format!("{type_key}.{alias_key}");
 
-                let has_name = profile
-                    .name
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|value| !value.is_empty());
-                let has_base_url = profile
-                    .base_url
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|value| !value.is_empty());
-
-                // Entries created by migration from top-level fields use the provider
-                // name as the map key and may not have explicit `name` or `base_url`
-                // (the provider factory resolves known names). An entry with no
-                // identifying information at all is almost always an in-progress
-                // onboarding state — the user picked the provider but hasn't filled
-                // anything in yet. Warn but don't bail; the runtime falls back to
-                // provider-trait defaults at use time, and a chat against the
-                // unconfigured provider fails with a clear error then.
-                let has_api_key = profile
-                    .api_key
-                    .as_deref()
-                    .is_some_and(|v| !v.trim().is_empty());
-                let has_model = profile
-                    .model
-                    .as_deref()
-                    .is_some_and(|v| !v.trim().is_empty());
-                if !has_name && !has_base_url && !has_api_key && !has_model {
-                    tracing::warn!(
-                        provider = %profile_name,
-                        "providers.models.{profile_name} is empty (no name / base_url / api_key / model). \
-                         Skipping at runtime; finish onboarding via the dashboard or `zeroclaw onboard` \
-                         to make this provider usable.",
-                    );
-                    continue;
+            if let Some(uri) = profile.uri.as_deref().map(str::trim)
+                && !uri.is_empty()
+            {
+                let parsed = reqwest::Url::parse(uri).with_context(|| {
+                    format!("model_providers.{profile_name}.uri is not a valid URL")
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("model_providers.{profile_name}.uri must use http/https");
                 }
+            }
 
-                if let Some(base_url) = profile.base_url.as_deref().map(str::trim)
-                    && !base_url.is_empty()
-                {
-                    let parsed = reqwest::Url::parse(base_url).with_context(|| {
-                        format!("model_providers.{profile_name}.base_url is not a valid URL")
-                    })?;
-                    if !matches!(parsed.scheme(), "http" | "https") {
-                        anyhow::bail!(
-                            "model_providers.{profile_name}.base_url must use http/https"
-                        );
-                    }
-                }
+            if let Some(wire_api) = profile.wire_api.as_deref().map(str::trim)
+                && !wire_api.is_empty()
+                && normalize_wire_api(wire_api).is_none()
+            {
+                anyhow::bail!(
+                    "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions"
+                );
+            }
 
-                if let Some(wire_api) = profile.wire_api.as_deref().map(str::trim)
-                    && !wire_api.is_empty()
-                    && normalize_wire_api(wire_api).is_none()
-                {
+            if let Some(temp) = profile.temperature {
+                validate_temperature(temp).map_err(|e| {
+                    anyhow::anyhow!("providers.models.{profile_name}.temperature: {e}")
+                })?;
+            }
+
+            for (key, value) in &profile.pricing {
+                if value.is_nan() {
                     anyhow::bail!(
-                        "model_providers.{profile_name}.wire_api must be one of: responses, chat_completions"
+                        "providers.models.{profile_name}.pricing.{key}: value must not be NaN"
                     );
                 }
-
-                if let Some(temp) = profile.temperature {
-                    validate_temperature(temp).map_err(|e| {
-                        anyhow::anyhow!("providers.models.{profile_name}.temperature: {e}")
-                    })?;
-                }
-
-                for (key, value) in &profile.pricing {
-                    if value.is_nan() {
-                        anyhow::bail!(
-                            "providers.models.{profile_name}.pricing.{key}: value must not be NaN"
-                        );
-                    }
-                    if *value < 0.0 {
-                        anyhow::bail!(
-                            "providers.models.{profile_name}.pricing.{key}: value must be >= 0.0 (got {value})"
-                        );
-                    }
+                if *value < 0.0 {
+                    anyhow::bail!(
+                        "providers.models.{profile_name}.pricing.{key}: value must be >= 0.0 (got {value})"
+                    );
                 }
             }
         }
@@ -10794,22 +13054,24 @@ impl Config {
         if let Some(entry) = self
             .providers
             .models
-            .get("ollama")
-            .and_then(|m| m.values().next())
+            .ollama
+            .values()
+            .next()
+            .map(|cfg| &cfg.base)
             .filter(|e| {
                 e.model
                     .as_deref()
                     .is_some_and(|m| m.trim().ends_with(":cloud"))
             })
         {
-            if is_local_ollama_endpoint(entry.base_url.as_deref()) {
+            if is_local_ollama_endpoint(entry.uri.as_deref()) {
                 anyhow::bail!(
-                    "default_model uses ':cloud' with provider 'ollama', but api_url is local or unset. Set api_url to a remote Ollama endpoint (for example https://ollama.com)."
+                    "default_model uses ':cloud' with model_provider 'ollama', but uri is local or unset. Set uri to a remote Ollama endpoint (for example https://ollama.com)."
                 );
             }
             if !has_ollama_cloud_credential(entry.api_key.as_deref()) {
                 anyhow::bail!(
-                    "default_model uses ':cloud' with provider 'ollama', but no API key is configured. Set api_key or OLLAMA_API_KEY."
+                    "default_model uses ':cloud' with model_provider 'ollama', but no API key is configured. Set api_key or OLLAMA_API_KEY."
                 );
             }
         }
@@ -11175,19 +13437,6 @@ impl Config {
             anyhow::bail!("security.nevis: {msg}");
         }
 
-        // Transcription
-        {
-            let dp = self.transcription.default_provider.trim();
-            match dp {
-                "groq" | "openai" | "deepgram" | "assemblyai" | "google" | "local_whisper" => {}
-                other => {
-                    anyhow::bail!(
-                        "transcription.default_provider must be one of: groq, openai, deepgram, assemblyai, google, local_whisper (got '{other}')"
-                    );
-                }
-            }
-        }
-
         // Delegate tool global defaults
         if self.delegate.timeout_secs == 0 {
             validation_bail!(
@@ -11219,8 +13468,8 @@ impl Config {
             if mp.is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
-                    format!("agents.{alias}.model-provider"),
-                    "agents.{alias}.model_provider must reference a configured model provider (e.g. \"anthropic.default\")",
+                    format!("agents.{alias}.model_provider"),
+                    "agents.{alias}.model_provider must reference a configured model model_provider (e.g. \"anthropic.default\")",
                 );
             }
             match mp.split_once('.') {
@@ -11231,14 +13480,14 @@ impl Config {
                     if !exists {
                         validation_bail!(
                             DanglingReference,
-                            format!("agents.{alias}.model-provider"),
+                            format!("agents.{alias}.model_provider"),
                             "agents.{alias}.model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
                 }
                 _ => validation_bail!(
                     InvalidFormat,
-                    format!("agents.{alias}.model-provider"),
+                    format!("agents.{alias}.model_provider"),
                     "agents.{alias}.model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
                 ),
             }
@@ -11266,6 +13515,46 @@ impl Config {
                         InvalidFormat,
                         format!("agents.{alias}.channels[{i}]"),
                         "agents.{alias}.channels[{i}] must be dotted form `<type>.<alias>` (got {trimmed:?})",
+                    ),
+                }
+            }
+
+            // Per-agent provider refs that resolve into the typed provider
+            // sections. Empty = no preference for that category (no TTS / no
+            // STT for this agent), which is valid. Non-empty values must
+            // match a configured `[providers.<category>.<type>.<alias>]`
+            // entry, fail loud with the dangling ref otherwise.
+            // there is no global default-X-provider concept — every consumer
+            // either picks a configured alias or opts out entirely.
+            let typed_provider_refs: &[(&str, &str, &str)] = &[
+                ("providers.tts", "tts_provider", agent.tts_provider.trim()),
+                (
+                    "providers.transcription",
+                    "transcription_provider",
+                    agent.transcription_provider.trim(),
+                ),
+            ];
+            for (section_prefix, field, value) in typed_provider_refs {
+                if value.is_empty() {
+                    continue;
+                }
+                match value.split_once('.') {
+                    Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                        let exists = self
+                            .get_map_keys(&format!("{section_prefix}.{ty}"))
+                            .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                        if !exists {
+                            validation_bail!(
+                                DanglingReference,
+                                format!("agents.{alias}.{field}"),
+                                "agents.{alias}.{field} = {value:?} but {section_prefix}.{ty}.{inner} is not configured",
+                            );
+                        }
+                    }
+                    _ => validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.{field}"),
+                        "agents.{alias}.{field} must be dotted form `<type>.<alias>` (got {value:?})",
                     ),
                 }
             }
@@ -11334,7 +13623,7 @@ impl Config {
                 }
             }
 
-            // risk_profile is mandatory for enabled agents — V3 has no
+            // risk_profile is mandatory for enabled agents — there is no
             // global fallback, so an enabled agent with no profile can't
             // gate its actions. Run this check last so the more specific
             // dangling/format errors above surface first.
@@ -11635,6 +13924,75 @@ impl_enum_prop_kind!(
     OtpMethod,
     SandboxBackend,
     AutonomyLevel,
+    AuthMode,
+    OpenAIEndpoint,
+    AzureEndpoint,
+    AnthropicEndpoint,
+    MoonshotEndpoint,
+    QwenEndpoint,
+    BedrockEndpoint,
+    OpenRouterEndpoint,
+    OllamaEndpoint,
+    TogetherEndpoint,
+    FireworksEndpoint,
+    GroqEndpoint,
+    MistralEndpoint,
+    DeepseekEndpoint,
+    CohereEndpoint,
+    PerplexityEndpoint,
+    XaiEndpoint,
+    CerebrasEndpoint,
+    SambanovaEndpoint,
+    HyperbolicEndpoint,
+    DeepinfraEndpoint,
+    HuggingfaceEndpoint,
+    Ai21Endpoint,
+    RekaEndpoint,
+    BasetenEndpoint,
+    NscaleEndpoint,
+    AnyscaleEndpoint,
+    NebiusEndpoint,
+    FriendliEndpoint,
+    StepfunEndpoint,
+    AihubmixEndpoint,
+    SiliconflowEndpoint,
+    AstraiEndpoint,
+    AvianEndpoint,
+    DeepmystEndpoint,
+    VeniceEndpoint,
+    NovitaEndpoint,
+    NvidiaEndpoint,
+    TelnyxEndpoint,
+    VercelEndpoint,
+    CloudflareEndpoint,
+    OvhEndpoint,
+    CopilotEndpoint,
+    OpenAITtsEndpoint,
+    ElevenLabsTtsEndpoint,
+    GoogleTtsEndpoint,
+    EdgeTtsEndpoint,
+    PiperTtsEndpoint,
+    GlmEndpoint,
+    MinimaxEndpoint,
+    ZaiEndpoint,
+    DoubaoEndpoint,
+    YiEndpoint,
+    HunyuanEndpoint,
+    QianfanEndpoint,
+    BaichuanEndpoint,
+    GeminiEndpoint,
+    GeminiCliEndpoint,
+    LmstudioEndpoint,
+    LlamacppEndpoint,
+    SglangEndpoint,
+    VllmEndpoint,
+    OsaurusEndpoint,
+    LitellmEndpoint,
+    LeptonEndpoint,
+    SyntheticEndpoint,
+    OpencodeEndpoint,
+    KiloCliEndpoint,
+    CustomEndpoint,
 );
 
 impl HasPropKind for serde_json::Value {
@@ -11749,9 +14107,9 @@ mod tests {
     #[test]
     async fn config_default_has_sane_values() {
         let c = Config::default();
-        // No provider configured by default — set during onboarding.
+        // No model_provider configured by default — set during onboarding.
         assert!(c.providers.models.is_empty());
-        assert!(c.providers.first_provider().is_none());
+        assert!(c.providers.first_model_provider().is_none());
         assert!(!c.skills.open_skills_enabled);
         assert!(!c.skills.allow_scripts);
         assert_eq!(
@@ -11825,7 +14183,7 @@ mod tests {
         assert!(!properties.contains_key("workspace_dir"));
         assert!(!properties.contains_key("config_path"));
         // These fields are now #[serde(skip)] cache fields, not in schema.
-        assert!(!properties.contains_key("default_provider"));
+        assert!(!properties.contains_key("default_model_provider"));
         assert!(!properties.contains_key("api_key"));
         assert!(!properties.contains_key("default_model"));
 
@@ -11900,9 +14258,9 @@ mod tests {
     #[test]
     async fn heartbeat_config_default() {
         let h = HeartbeatConfig::default();
-        // V3 defaults heartbeat to disabled. Enabling requires the user
-        // to also bind it to a configured agent — there is no default
-        // agent for heartbeat to fall through to.
+        // Heartbeat defaults to disabled. Enabling requires the user to
+        // also bind it to a configured agent — there is no default agent
+        // for heartbeat to fall through to.
         assert!(!h.enabled);
         assert!(h.agent.is_empty());
         assert_eq!(h.interval_minutes, 30);
@@ -12109,19 +14467,19 @@ auto_save = true
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::ProvidersConfig {
                 models: {
-                    let mut m = HashMap::new();
-                    m.entry("openrouter".to_string())
-                        .or_insert_with(HashMap::new)
-                        .insert(
-                            "default".to_string(),
-                            ModelProviderConfig {
+                    let mut m = crate::providers::ModelProviders::default();
+                    m.openrouter.insert(
+                        "default".to_string(),
+                        OpenRouterModelProviderConfig {
+                            base: ModelProviderConfig {
                                 api_key: Some("sk-test-key".into()),
                                 model: Some("gpt-4o".into()),
                                 temperature: Some(0.5),
                                 timeout_secs: Some(120),
                                 ..Default::default()
                             },
-                        );
+                        },
+                    );
                     m
                 },
                 ..Default::default()
@@ -12296,7 +14654,7 @@ auto_save = true
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
         };
-        // Provider fields are now resolved directly — no cache needed.
+        // ModelProvider fields are now resolved directly — no cache needed.
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed = parse_test_config(&toml_str);
@@ -12334,15 +14692,15 @@ default_temperature = 0.7
         assert!(
             parsed
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.api_key.as_deref())
                 .is_none()
         );
         assert_eq!(parsed.observability.backend, "none");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
-        // Migration synthesizes risk_profiles.default from the V2-shape
+        // Migration synthesizes risk_profiles.default from the legacy
         // [autonomy] block; assert against the named entry rather than a
-        // global "active" profile (V3 has no such concept).
+        // global "active" profile (no such concept exists).
         assert_eq!(
             parsed
                 .risk_profiles
@@ -12352,18 +14710,18 @@ default_temperature = 0.7
             AutonomyLevel::Supervised
         );
         assert_eq!(parsed.runtime.kind, "native");
-        // V3 defaults heartbeat to disabled.
+        // Heartbeat defaults to disabled.
         assert!(!parsed.heartbeat.enabled);
         assert!(parsed.channels.cli);
         assert!(parsed.memory.hygiene_enabled);
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
         assert_eq!(parsed.memory.conversation_retention_days, 30);
-        // Temperature migrated onto the primary provider entry
+        // Temperature migrated onto the primary model_provider entry
         assert!(
             (parsed
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
                 - 0.7)
@@ -12373,14 +14731,14 @@ default_temperature = 0.7
         assert_eq!(
             parsed
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.timeout_secs)
                 .unwrap_or(120),
             DEFAULT_DELEGATE_TIMEOUT_SECS
         );
     }
 
-    /// V2 `[autonomy]` migrates onto `[risk_profiles.default]` via the V2→V3
+    /// `[autonomy]` migrates onto `[risk_profiles.default]` via the V2→V3
     /// migration. The fields must round-trip without being silently dropped.
     #[test]
     async fn v2_autonomy_section_migrates_onto_risk_profiles_default() {
@@ -12500,7 +14858,7 @@ auto_approve = ["weather", "file_read"]
     #[test]
     async fn provider_timeout_secs_parses_from_toml() {
         // V1 top-level `provider_timeout_secs` is folded into the
-        // synthesized provider entry's `timeout_secs` by V1→V2 migration.
+        // synthesized model_provider entry's `timeout_secs`.
         let raw = r#"
 default_temperature = 0.7
 provider_timeout_secs = 300
@@ -12509,7 +14867,7 @@ provider_timeout_secs = 300
         assert_eq!(
             parsed
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.timeout_secs)
                 .unwrap_or(120),
             300
@@ -12586,7 +14944,7 @@ provider_timeout_secs = 300
     #[test]
     async fn extra_headers_parses_from_toml() {
         // V1 top-level `[extra_headers]` is folded into the synthesized
-        // default provider entry's `extra_headers` map by V1→V2 migration.
+        // default model_provider entry's `extra_headers` map.
         let raw = r#"
 default_temperature = 0.7
 
@@ -12597,8 +14955,8 @@ X-Title = "zeroclaw"
         let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
         let headers = &parsed
             .providers
-            .first_provider()
-            .expect("synthesized default provider")
+            .first_model_provider()
+            .expect("synthesized default model_provider")
             .extra_headers;
         assert_eq!(headers.len(), 2);
         assert_eq!(headers.get("User-Agent").unwrap(), "MyApp/1.0");
@@ -12614,7 +14972,7 @@ default_temperature = 0.7
         assert!(
             parsed
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .map(|e| e.extra_headers.is_empty())
                 .unwrap_or(true)
         );
@@ -12778,20 +15136,18 @@ default_temperature = 0.7
 
         let config_path = dir.join("config.toml");
         let mut providers = crate::providers::ProvidersConfig::default();
-        providers
-            .models
-            .entry("openrouter".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     api_key: Some("sk-roundtrip".into()),
                     model: Some("test-model".into()),
                     temperature: Some(0.9),
                     timeout_secs: Some(120),
                     ..Default::default()
                 },
-            );
+            },
+        );
         let config = Config {
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
@@ -12872,13 +15228,17 @@ default_temperature = 0.7
             escalation: EscalationConfig::default(),
         };
 
-        // Provider fields are now resolved directly — no cache needed.
+        // ModelProvider fields are now resolved directly — no cache needed.
         config.save().await.unwrap();
         assert!(config_path.exists());
 
         let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
         let loaded = crate::migration::migrate_to_current(&contents).unwrap();
-        let entry = &loaded.providers.models["openrouter"]["default"];
+        let entry = &loaded
+            .providers
+            .models
+            .find("openrouter", "default")
+            .expect("entry exists");
         assert!(
             entry
                 .api_key
@@ -12911,19 +15271,16 @@ default_temperature = 0.7
             config_path: dir.join("config.toml"),
             ..Default::default()
         };
-        config
-            .providers
-            .models
-            .entry("anthropic".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.anthropic.insert(
+            "default".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
                     api_key: Some("root-credential".into()),
                     ..Default::default()
                 },
-            );
-        // Provider fields are now resolved directly — no cache needed.
+            },
+        );
+        // ModelProvider fields are now resolved directly — no cache needed.
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
@@ -12951,19 +15308,16 @@ default_temperature = 0.7
             },
         );
 
-        config
-            .providers
-            .models
-            .entry("openrouter".into())
-            .or_default()
-            .insert(
-                "worker".into(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "worker".into(),
+            crate::schema::OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     api_key: Some("agent-credential".into()),
                     model: Some("model-test".into()),
                     ..Default::default()
                 },
-            );
+            },
+        );
         config.agents.insert(
             "worker".into(),
             DelegateAgentConfig {
@@ -12983,8 +15337,7 @@ default_temperature = 0.7
         let root_encrypted = stored
             .providers
             .models
-            .get("anthropic")
-            .and_then(|m| m.get("default"))
+            .find("anthropic", "default")
             .and_then(|e| e.api_key.as_deref())
             .unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(root_encrypted));
@@ -13025,8 +15378,7 @@ default_temperature = 0.7
         let worker_provider = stored
             .providers
             .models
-            .get("openrouter")
-            .and_then(|m| m.get("worker"))
+            .find("openrouter", "worker")
             .unwrap();
         let worker_encrypted = worker_provider.api_key.as_deref().unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(worker_encrypted));
@@ -13089,26 +15441,22 @@ default_temperature = 0.7
             config_path: config_path.clone(),
             ..Default::default()
         };
-        config
-            .providers
-            .models
-            .entry("test".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     model: Some("model-a".into()),
                     ..Default::default()
                 },
-            );
+            },
+        );
         config.save().await.unwrap();
         assert!(config_path.exists());
 
         config
             .providers
             .models
-            .get_mut("test")
-            .and_then(|m| m.get_mut("default"))
+            .ensure("openrouter", "default")
             .unwrap()
             .model = Some("model-b".into());
         config.save().await.unwrap();
@@ -14185,129 +16533,109 @@ default_temperature = 0.7
     }
 
     #[test]
-    async fn toml_supports_model_provider_and_model_alias_fields() {
-        // V1 aliases: `model_provider` → `default_provider`,
-        // `model` → `default_model`. Both folded into the synthesized
-        // `[providers.models.<type>.default]` entry by V1→V2 migration.
+    async fn v1_known_provider_migrates_with_globals_folded_onto_typed_slot() {
+        // Top-level `model_provider` + `model` + `default_temperature` flow
+        // onto the migrated typed-slot entry. Vendor-canonical names like
+        // `openai` map straight to their typed slot; `wire_api` and
+        // `requires_openai_auth` survive the move.
+        //
+        // (Unknown V1 names like `sub2api` are intentionally silent-dropped
+        // by the V2→V3 migration — see the `Unknown/passthrough` arm of
+        // `normalize_provider_type` in schema/v2.rs.)
         let raw = r#"
 default_temperature = 0.7
-model_provider = "sub2api"
+model_provider = "openai"
 model = "gpt-5.3-codex"
 
-[model_providers.sub2api]
-name = "sub2api"
-base_url = "https://api.tonsof.blue/v1"
+[model_providers.openai]
+api_key = "sk-test"
+uri = "https://api.openai.com/v1"
 wire_api = "responses"
 requires_openai_auth = true
 "#;
 
         let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
         assert!(
-            parsed.providers.models.contains_key("sub2api"),
-            "expected sub2api in providers.models"
-        );
-        assert_eq!(
             parsed
                 .providers
-                .first_provider()
-                .and_then(|e| e.model.as_deref()),
-            Some("gpt-5.3-codex")
+                .models
+                .contains_model_provider_type("openai"),
+            "vendor-canonical V1 provider should land in its typed slot",
         );
         let profile = parsed
             .providers
             .models
-            .get("sub2api")
-            .and_then(|m| m.get("default"))
-            .expect("profile should exist");
+            .find("openai", "default")
+            .expect("openai.default entry");
+        assert_eq!(profile.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(profile.uri.as_deref(), Some("https://api.openai.com/v1"));
+        assert_eq!(profile.model.as_deref(), Some("gpt-5.3-codex"));
         assert_eq!(profile.wire_api.as_deref(), Some("responses"));
         assert!(profile.requires_openai_auth);
     }
 
     #[test]
-    async fn model_provider_profile_maps_to_custom_endpoint() {
+    async fn typed_custom_slot_routes_uri_through_find() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("sub2api".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
-                    name: Some("sub2api".to_string()),
-                    base_url: Some("https://api.tonsof.blue/v1".to_string()),
-                    wire_api: None,
-                    requires_openai_auth: false,
-                    azure_openai_resource: None,
-                    azure_openai_deployment: None,
-                    azure_openai_api_version: None,
-                    api_path: None,
-                    max_tokens: None,
+        config.providers.models.custom.insert(
+            "default".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("https://api.tonsof.blue/v1".to_string()),
                     ..Default::default()
                 },
-            );
+            },
+        );
 
         assert_eq!(
             config
                 .providers
                 .models
-                .get("sub2api")
-                .and_then(|m| m.get("default"))
-                .and_then(|e| e.base_url.as_deref()),
+                .find("custom", "default")
+                .and_then(|e| e.uri.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
-        assert!(config.providers.first_provider().is_some());
+        assert!(config.providers.first_model_provider().is_some());
     }
 
     #[test]
-    async fn model_provider_profile_responses_uses_openai_codex_and_openai_key() {
+    async fn openai_codex_alias_carries_responses_wire_api_and_requires_openai_auth() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("sub2api".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
-                    name: Some("sub2api".to_string()),
-                    base_url: Some("https://api.tonsof.blue".to_string()),
+        config.providers.models.openai.insert(
+            "codex".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("https://api.tonsof.blue".to_string()),
                     wire_api: Some("responses".to_string()),
                     requires_openai_auth: true,
-                    azure_openai_resource: None,
-                    azure_openai_deployment: None,
-                    azure_openai_api_version: None,
-                    api_path: None,
-                    max_tokens: None,
                     ..Default::default()
                 },
-            );
+            },
+        );
 
         let entry = config
             .providers
             .models
-            .get("sub2api")
-            .and_then(|m| m.get("default"))
-            .expect("sub2api.default entry");
-        assert_eq!(entry.base_url.as_deref(), Some("https://api.tonsof.blue"));
+            .find("openai", "codex")
+            .expect("openai.codex entry");
+        assert_eq!(entry.uri.as_deref(), Some("https://api.tonsof.blue"));
         assert_eq!(entry.wire_api.as_deref(), Some("responses"));
         assert!(entry.requires_openai_auth);
     }
 
-    /// Round-trip test for the config CLI: a TOML file with the user's value
-    /// Round-trip test for the config CLI: a TOML file with a provider model
-    /// must deserialize, apply env overrides, and serialize back correctly.
+    /// Round-trip test for the config CLI: a TOML file with a typed-family
+    /// model entry must deserialize, find via the typed accessor, and
+    /// re-serialize without losing any field.
     #[test]
     async fn provider_models_round_trips_through_load_apply_serialize() {
         let _env_guard = env_override_lock().await;
         let toml_in = r#"
 schema_version = 3
 
-[providers.models.primary.default]
-name = "alias-name"
-base_url = "https://example.invalid/v1"
+[providers.models.openrouter.default]
+uri = "https://example.invalid/v1"
 model = "primary-model"
 "#;
 
@@ -14317,8 +16645,7 @@ model = "primary-model"
             config
                 .providers
                 .models
-                .get("primary")
-                .and_then(|m| m.get("default"))
+                .find("openrouter", "default")
                 .and_then(|e| e.model.as_deref()),
             Some("primary-model"),
         );
@@ -14332,7 +16659,7 @@ model = "primary-model"
     }
 
     /// `resolve_default_model` returns the first available `models.*` entry's
-    /// model. Returning `None` is reserved for "no provider has any model
+    /// model. Returning `None` is reserved for "no model_provider has any model
     /// configured", which callers must surface as a configuration error
     /// rather than silently substituting a vendor default.
     #[test]
@@ -14346,43 +16673,36 @@ model = "primary-model"
         config
             .providers
             .models
-            .entry("secondary".to_string())
-            .or_default()
-            .insert("default".to_string(), ModelProviderConfig::default());
+            .anthropic
+            .insert("default".into(), AnthropicModelProviderConfig::default());
         assert_eq!(config.providers.resolve_default_model(), None);
 
         // Add an entry with a model -> first-available wins.
-        config
-            .providers
-            .models
-            .entry("tertiary".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.together.insert(
+            "default".to_string(),
+            TogetherModelProviderConfig {
+                base: ModelProviderConfig {
                     model: Some("tertiary-model".to_string()),
                     ..Default::default()
                 },
-            );
+            },
+        );
         assert_eq!(
             config.providers.resolve_default_model().as_deref(),
             Some("tertiary-model"),
         );
 
-        // Add a provider with a model — resolve_default_model finds it.
-        config
-            .providers
-            .models
-            .entry("primary".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        // Add a model_provider with a model — resolve_default_model finds it.
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     model: Some("primary-model".to_string()),
                     ..Default::default()
                 },
-            );
-        // resolve_default_model returns the first non-empty model across all providers.
+            },
+        );
+        // resolve_default_model returns the first non-empty model across all model_providers.
         assert!(config.providers.resolve_default_model().is_some());
     }
 
@@ -14405,19 +16725,16 @@ model = "primary-model"
             config_path: PathBuf::from("config.toml"),
             ..Default::default()
         };
-        config
-            .providers
-            .models
-            .entry("anthropic".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.anthropic.insert(
+            "default".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
                     temperature: Some(0.5),
                     ..Default::default()
                 },
-            );
-        // Provider fields are now resolved directly — no cache needed.
+            },
+        );
+        // ModelProvider fields are now resolved directly — no cache needed.
         config.save().await.unwrap();
 
         assert!(resolved_config_path.exists());
@@ -14429,8 +16746,7 @@ model = "primary-model"
             (parsed
                 .providers
                 .models
-                .get("anthropic")
-                .and_then(|m| m.get("default"))
+                .find("anthropic", "default")
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
                 - 0.5)
@@ -14454,24 +16770,21 @@ model = "primary-model"
     async fn validate_ollama_cloud_model_requires_remote_api_url() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("ollama".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
                     model: Some("glm-5:cloud".to_string()),
-                    base_url: None,
+                    uri: None,
                     api_key: Some("ollama-key".to_string()),
                     ..Default::default()
                 },
-            );
+            },
+        );
 
         let error = config.validate().expect_err("expected validation to fail");
         assert!(error.to_string().contains(
-            "default_model uses ':cloud' with provider 'ollama', but api_url is local or unset"
+            "default_model uses ':cloud' with model_provider 'ollama', but uri is local or unset"
         ));
     }
 
@@ -14479,20 +16792,17 @@ model = "primary-model"
     async fn validate_ollama_cloud_model_accepts_remote_endpoint_and_env_key() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("ollama".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
                     model: Some("glm-5:cloud".to_string()),
-                    base_url: Some("https://ollama.com/api".to_string()),
+                    uri: Some("https://ollama.com/api".to_string()),
                     api_key: None,
                     ..Default::default()
                 },
-            );
+            },
+        );
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("OLLAMA_API_KEY", "ollama-env-key") };
@@ -14507,26 +16817,19 @@ model = "primary-model"
     async fn validate_rejects_unknown_model_provider_wire_api() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("sub2api".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     name: Some("sub2api".to_string()),
-                    base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                    uri: Some("https://api.tonsof.blue/v1".to_string()),
                     wire_api: Some("ws".to_string()),
                     requires_openai_auth: false,
-                    azure_openai_resource: None,
-                    azure_openai_deployment: None,
-                    azure_openai_api_version: None,
-                    api_path: None,
                     max_tokens: None,
                     ..Default::default()
                 },
-            );
+            },
+        );
 
         let error = config.validate().expect_err("expected validation failure");
         assert!(
@@ -14743,7 +17046,7 @@ default_model = "legacy-model"
         assert_eq!(
             config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.model.as_deref()),
             Some("legacy-model")
         );
@@ -14857,7 +17160,7 @@ default_model = "legacy-model"
         assert_eq!(
             config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.model.as_deref()),
             Some("persisted-profile")
         );
@@ -14985,7 +17288,7 @@ default_model = "persisted-profile"
         assert_eq!(
             config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.model.as_deref()),
             Some("persisted-profile")
         );
@@ -15008,19 +17311,16 @@ default_model = "persisted-profile"
     #[test]
     async fn validate_rejects_out_of_range_temperature() {
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("test".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     name: Some("test-provider".into()),
                     temperature: Some(99.0),
                     ..Default::default()
                 },
-            );
+            },
+        );
         let err = config.validate().unwrap_err();
         assert!(
             err.to_string().contains("temperature"),
@@ -15031,19 +17331,16 @@ default_model = "persisted-profile"
     #[test]
     async fn validate_rejects_negative_temperature() {
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("test".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     name: Some("test-provider".into()),
                     temperature: Some(-0.5),
                     ..Default::default()
                 },
-            );
+            },
+        );
         let err = config.validate().unwrap_err();
         assert!(
             err.to_string().contains("temperature"),
@@ -15054,19 +17351,16 @@ default_model = "persisted-profile"
     #[test]
     async fn validate_accepts_valid_temperature() {
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("test".into())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     name: Some("test-provider".into()),
                     temperature: Some(0.7),
                     ..Default::default()
                 },
-            );
+            },
+        );
         assert!(config.validate().is_ok());
     }
 
@@ -15074,10 +17368,10 @@ default_model = "persisted-profile"
     async fn validate_rejects_unpublished_jira_actions() {
         // Restored from upstream's #6116 (Jira API v2 server mode). The
         // validation logic at `Config::validate -> jira.allowed_actions`
-        // exists in V3 unchanged; this test was dropped during the
+        // exists unchanged; this test was dropped during the
         // upstream/master merge resolution alongside the env_override
         // tests that were intentionally deleted with `apply_env_overrides()`.
-        // It's V3-compatible — restoring (#6266 review).
+        // Restoring it here.
         for action in ["list_projects", "myself"] {
             let mut config = Config::default();
             config.jira.enabled = true;
@@ -15098,12 +17392,13 @@ default_model = "persisted-profile"
 
     #[test]
     async fn jira_email_empty_string_deserializes_as_none() {
-        // V2 configs round-tripped `email = ""` to disk because V2's
-        // `email: String` lacked `skip_serializing_if`. After migration,
-        // V3 would otherwise deserialize `email = ""` as `Some("")`, and
-        // JiraTool would attempt Basic auth with empty username (the
-        // dropped email-required validation no longer catches this).
-        // Defense-in-depth: empty strings deserialize as None (#6266 review).
+        // Legacy configs round-tripped `email = ""` to disk because the
+        // pre-rename `email: String` lacked `skip_serializing_if`. The
+        // current `Option<String>` would otherwise deserialize `""` as
+        // `Some("")`, and JiraTool would attempt Basic auth with empty
+        // username (the dropped email-required validation no longer
+        // catches this). Defense-in-depth: empty strings deserialize as
+        // None.
         let toml_input = r#"
 enabled = true
 base_url = "https://jira.example.test"
@@ -15281,7 +17576,7 @@ api_token = "tok"
     #[test]
     async fn runtime_proxy_client_cache_reuses_default_profile_key() {
         let service_key = format!(
-            "provider.cache_test.{}",
+            "model_provider.cache_test.{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock should be after unix epoch")
@@ -15302,7 +17597,7 @@ api_token = "tok"
     #[test]
     async fn set_runtime_proxy_config_clears_runtime_proxy_client_cache() {
         let service_key = format!(
-            "provider.cache_timeout_test.{}",
+            "model_provider.cache_timeout_test.{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock should be after unix epoch")
@@ -15676,7 +17971,7 @@ group_policy = "disabled"
             "test setup requires world-readable config"
         );
 
-        if let Some(entry) = config.providers.first_provider_mut() {
+        if let Some(entry) = config.providers.first_model_provider_mut() {
             entry.temperature = Some(0.6);
         }
         config.save().await.unwrap();
@@ -15740,7 +18035,7 @@ group_policy = "disabled"
     #[test]
     async fn config_without_transcription_uses_defaults() {
         let toml_str = r#"
-            default_provider = "openrouter"
+            default_model_provider = "openrouter"
             default_model = "test-model"
             default_temperature = 0.7
         "#;
@@ -15753,7 +18048,7 @@ group_policy = "disabled"
     async fn security_defaults_are_backward_compatible() {
         let parsed = parse_test_config(
             r#"
-default_provider = "openrouter"
+default_model_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4.6"
 default_temperature = 0.7
 "#,
@@ -15769,7 +18064,7 @@ default_temperature = 0.7
     async fn security_toml_parses_otp_and_estop_sections() {
         let parsed = parse_test_config(
             r#"
-default_provider = "openrouter"
+default_model_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4.6"
 default_temperature = 0.7
 
@@ -15805,29 +18100,12 @@ require_otp_to_resume = true
         assert!(err.to_string().contains("gated_domains"));
     }
 
-    #[test]
-    async fn validate_accepts_local_whisper_as_transcription_default_provider() {
-        let mut config = Config::default();
-        config.transcription.default_provider = "local_whisper".to_string();
-
-        config.validate().expect(
-            "local_whisper must be accepted by the transcription.default_provider allowlist",
-        );
-    }
-
-    #[test]
-    async fn validate_rejects_unknown_transcription_default_provider() {
-        let mut config = Config::default();
-        config.transcription.default_provider = "unknown_stt".to_string();
-
-        let err = config
-            .validate()
-            .expect_err("expected validation to reject unknown transcription provider");
-        assert!(
-            err.to_string().contains("transcription.default_provider"),
-            "got: {err}"
-        );
-    }
+    // The two `validate_*_transcription_default_provider` tests were removed
+    // alongside the deleted `TranscriptionConfig.default_transcription_provider`
+    // field in #6273. there is no global default-provider concept; the equivalent
+    // dangling-reference enforcement now lives on the per-agent
+    // `agent.transcription_provider` field (see
+    // `Config::validate()` checks for `tts_provider` / `transcription_provider`).
 
     #[tokio::test]
     async fn channel_secret_telegram_bot_token_roundtrip() {
@@ -16616,7 +18894,7 @@ schema_version = 3
 workspace_dir = "/zeroclaw-data/workspace"
 config_path = "/zeroclaw-data/.zeroclaw/config.toml"
 api_key = ""
-default_provider = "openrouter"
+default_model_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4-20250514"
 default_temperature = 0.7
 
@@ -16792,17 +19070,12 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn config_tree_traversal_discovers_nested_secrets() {
         let mut config = Config::default();
-        // Set api_key on first provider entry (or create one)
+        // Set api_key on first model_provider entry (or create one)
         config
             .providers
             .models
-            .entry("anthropic".into())
-            .or_default()
-            .entry("default".to_string())
-            .or_insert_with(|| ModelProviderConfig {
-                api_key: Some("test-key".into()),
-                ..Default::default()
-            })
+            .ensure("anthropic", "default")
+            .expect("anthropic typed slot")
             .api_key = Some("test-key".into());
         config.channels.matrix.insert(
             "default".to_string(),
@@ -17236,35 +19509,38 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
-    async fn hashmap_property_paths_preserve_url_like_keys() {
+    async fn typed_custom_slot_round_trips_uri_through_save_and_load() {
+        // Legacy colon-URL keys (`custom:https://...`) are gone — `custom`
+        // is a typed slot whose `uri` field carries the operator URL.
+        // This pins: secret routing, save/encrypt, and round-trip reload
+        // for the typed `custom` slot.
         let dir = TempDir::new().unwrap();
         let mut config = Config {
             config_path: dir.path().join("config.toml"),
             workspace_dir: dir.path().join("workspace"),
             ..Default::default()
         };
-        let provider_type = "custom:https://api.example.invalid/v1";
         let alias = "default";
         config
             .providers
             .models
-            .entry(provider_type.to_string())
-            .or_default()
-            .insert(alias.to_string(), ModelProviderConfig::default());
+            .ensure("custom", alias)
+            .expect("custom typed slot");
 
-        let api_key_path = format!("providers.models.{provider_type}.{alias}.api-key");
-        let base_url_path = format!("providers.models.{provider_type}.{alias}.base-url");
-        let model_path = format!("providers.models.{provider_type}.{alias}.model");
-        let temperature_path = format!("providers.models.{provider_type}.{alias}.temperature");
+        let prefix = format!("providers.models.custom.{alias}");
+        let api_key_path = format!("{prefix}.api-key");
+        let uri_path = format!("{prefix}.uri");
+        let model_path = format!("{prefix}.model");
+        let temperature_path = format!("{prefix}.temperature");
 
         assert!(
             Config::prop_is_secret(&api_key_path),
-            "url-like provider keys must still route secret metadata"
+            "typed custom-slot api-key must route through the secret marker",
         );
 
         config.set_prop(&api_key_path, "sk-test-custom").unwrap();
         config
-            .set_prop(&base_url_path, "https://api.example.invalid/v1")
+            .set_prop(&uri_path, "https://api.example.invalid/v1")
             .unwrap();
         config.set_prop(&model_path, "local-large").unwrap();
         config.set_prop(&temperature_path, "0.2").unwrap();
@@ -17272,12 +19548,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let provider = config
             .providers
             .models
-            .get(provider_type)
-            .and_then(|m| m.get(alias))
-            .expect("custom provider key should be preserved exactly");
+            .find("custom", alias)
+            .expect("custom typed slot entry must be present");
         assert_eq!(provider.api_key.as_deref(), Some("sk-test-custom"));
         assert_eq!(
-            provider.base_url.as_deref(),
+            provider.uri.as_deref(),
             Some("https://api.example.invalid/v1")
         );
         assert_eq!(provider.model.as_deref(), Some("local-large"));
@@ -17285,7 +19560,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
         assert_eq!(config.get_prop(&api_key_path).unwrap(), "**** (encrypted)");
         assert_eq!(
-            config.get_prop(&base_url_path).unwrap(),
+            config.get_prop(&uri_path).unwrap(),
             "https://api.example.invalid/v1"
         );
 
@@ -17294,12 +19569,12 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             .await
             .unwrap();
         assert!(
-            raw_toml.contains(provider_type),
-            "saved TOML should preserve the exact URL-like provider key"
+            raw_toml.contains("[providers.models.custom.default]"),
+            "saved TOML should write under the typed custom slot",
         );
         assert!(
             !raw_toml.contains("sk-test-custom"),
-            "saved TOML must not contain the plaintext custom provider API key"
+            "saved TOML must not contain the plaintext custom provider API key",
         );
 
         let mut loaded: Config = crate::migration::migrate_to_current(&raw_toml).unwrap();
@@ -17307,15 +19582,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         loaded.workspace_dir = config.workspace_dir.clone();
         let store = crate::secrets::SecretStore::new(dir.path(), loaded.secrets.encrypt);
         loaded.decrypt_secrets(&store).unwrap();
-        let loaded_provider: &ModelProviderConfig = loaded
+        let loaded_provider = loaded
             .providers
             .models
-            .get(provider_type)
-            .and_then(|m| m.get(alias))
-            .expect("saved custom provider key should reload exactly");
+            .find("custom", alias)
+            .expect("typed custom slot entry must round-trip through save/load");
         assert_eq!(loaded_provider.api_key.as_deref(), Some("sk-test-custom"));
         assert_eq!(
-            loaded_provider.base_url.as_deref(),
+            loaded_provider.uri.as_deref(),
             Some("https://api.example.invalid/v1")
         );
         assert_eq!(loaded_provider.model.as_deref(), Some("local-large"));
@@ -17337,18 +19611,18 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
-    async fn map_key_sections_discovers_providers_models() {
-        // The Configurable derive walks #[nested] HashMap<String, T> fields
-        // and exposes them via map_key_sections(). Without this enumeration,
-        // the dashboard has no way to know `providers.models.<name>` is an
-        // addable shape — it only sees fields that already exist.
+    async fn map_key_sections_discovers_per_family_provider_slots() {
+        // Typed-family split: `providers.models` is a struct of typed
+        // family maps, not a single open HashMap. Each family slot
+        // (`providers.models.<family>`) is its own Map-kind section; the
+        // dashboard's "+ Add alias" affordance hangs off the family path.
         let sections = Config::map_key_sections();
-        let providers_models = sections
+        let anthropic = sections
             .iter()
-            .find(|s| s.path == "providers.models")
-            .expect("providers.models must be discoverable as a map-keyed section");
-        assert_eq!(providers_models.kind, crate::traits::MapKeyKind::Map);
-        assert_eq!(providers_models.value_type, "ModelProviderConfig");
+            .find(|s| s.path == "providers.models.anthropic")
+            .expect("providers.models.anthropic must be discoverable as a map-keyed section");
+        assert_eq!(anthropic.kind, crate::traits::MapKeyKind::Map);
+        assert_eq!(anthropic.value_type, "AnthropicModelProviderConfig");
 
         // agents is also #[nested] HashMap on root Config.
         assert!(
@@ -17390,20 +19664,33 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
-    async fn create_map_key_inserts_default_provider() {
-        // Round-trip: `+ Add anthropic provider` from the dashboard.
+    async fn create_map_key_inserts_default_alias_under_typed_family() {
+        // Dashboard "+ Add alias" target is the typed family slot,
+        // not a free-form provider key under `providers.models`.
         let mut config = Config::default();
-        assert!(!config.providers.models.contains_key("anthropic"));
+        assert!(
+            !config
+                .providers
+                .models
+                .contains_model_provider_type("anthropic")
+        );
 
         let created = config
-            .create_map_key("providers.models", "anthropic")
-            .expect("providers.models should accept new map keys");
+            .create_map_key("providers.models.anthropic", "default")
+            .expect("typed family slot should accept a new alias");
         assert!(created, "first add should report created=true");
-        assert!(config.providers.models.contains_key("anthropic"));
+        assert!(
+            config
+                .providers
+                .models
+                .find("anthropic", "default")
+                .is_some(),
+            "the new alias must show up under the typed family slot",
+        );
 
         // Idempotent: second add returns false, doesn't error.
         let again = config
-            .create_map_key("providers.models", "anthropic")
+            .create_map_key("providers.models.anthropic", "default")
             .expect("second add still resolves the section");
         assert!(!again, "duplicate add should report created=false");
     }
@@ -17422,7 +19709,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut config = Config::default();
         assert!(config.channels.matrix.is_empty());
 
-        // V3 channels are HashMaps — init_defaults cannot insert a default key
+        // Channels are HashMaps — init_defaults cannot insert a default key
         // (there is no meaningful default alias). Callers use create_map_key.
         config
             .create_map_key("channels.matrix", "default")
@@ -17600,21 +19887,22 @@ allowed_users = []
         let store = crate::secrets::SecretStore::new(dir.path(), true);
 
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("openrouter".into())
-            .or_default()
-            .insert(
-                "test".into(),
-                ModelProviderConfig {
+        config.providers.models.openrouter.insert(
+            "test".into(),
+            crate::schema::OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
                     api_key: Some("secret-key".into()),
                     ..Default::default()
                 },
-            );
+            },
+        );
 
         config.encrypt_secrets(&store).unwrap();
-        let encrypted_key = config.providers.models["openrouter"]["test"]
+        let encrypted_key = config
+            .providers
+            .models
+            .find("openrouter", "test")
+            .expect("entry exists")
             .api_key
             .as_ref()
             .unwrap();
@@ -17622,7 +19910,11 @@ allowed_users = []
 
         config.decrypt_secrets(&store).unwrap();
         assert_eq!(
-            config.providers.models["openrouter"]["test"]
+            config
+                .providers
+                .models
+                .find("openrouter", "test")
+                .expect("entry exists")
                 .api_key
                 .as_deref(),
             Some("secret-key")

@@ -1,4 +1,4 @@
-use super::Provider;
+use super::ModelProvider;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
@@ -9,20 +9,20 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-// ── Provider Fallback Notification ──────────────────────────────────────
-// When ReliableProvider uses a fallback (different provider or model than
+// ── ModelProvider Fallback Notification ──────────────────────────────────────
+// When ReliableModelProvider uses a fallback (different model_provider or model than
 // requested), it records the details here so channel code can notify the user.
 // Uses tokio::task_local to avoid cross-request leakage between concurrent
 // users (the old global static had a race window).
 
-/// Info about a provider fallback that occurred during a request.
+/// Info about a model_provider fallback that occurred during a request.
 #[derive(Debug, Clone)]
 pub struct ProviderFallbackInfo {
-    /// Provider that was originally requested.
+    /// ModelProvider that was originally requested.
     pub requested_provider: String,
     /// Model that was originally requested.
     pub requested_model: String,
-    /// Provider that actually served the request.
+    /// ModelProvider that actually served the request.
     pub actual_provider: String,
     /// Model that actually served the request.
     pub actual_model: String,
@@ -32,7 +32,7 @@ tokio::task_local! {
     static PROVIDER_FALLBACK: RefCell<Option<ProviderFallbackInfo>>;
 }
 
-/// Take (consume) the last provider fallback info, if any.
+/// Take (consume) the last model_provider fallback info, if any.
 /// Must be called within a `scope_provider_fallback` scope.
 pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
     PROVIDER_FALLBACK
@@ -42,14 +42,14 @@ pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
 }
 
 /// Run the given future within a provider-fallback scope.
-/// Both `record_provider_fallback` (inside ReliableProvider) and
+/// Both `record_provider_fallback` (inside ReliableModelProvider) and
 /// `take_last_provider_fallback` (post-loop channel code) must execute
 /// within this scope for the data to be visible.
 pub async fn scope_provider_fallback<F: std::future::Future>(future: F) -> F::Output {
     PROVIDER_FALLBACK.scope(RefCell::new(None), future).await
 }
 
-/// Record a provider fallback event.
+/// Record a model_provider fallback event.
 fn record_provider_fallback(
     requested_provider: &str,
     requested_model: &str,
@@ -69,7 +69,7 @@ fn record_provider_fallback(
 // ── Error Classification ─────────────────────────────────────────────────
 // Errors are split into retryable (transient server/network failures) and
 // non-retryable (permanent client errors). This distinction drives whether
-// the retry loop continues, falls back to the next provider, or aborts
+// the retry loop continues, falls back to the next model_provider, or aborts
 // immediately — avoiding wasted latency on errors that cannot self-heal.
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
@@ -80,7 +80,7 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
         return false;
     }
 
-    // Tool schema validation errors are NOT non-retryable — the provider's
+    // Tool schema validation errors are NOT non-retryable — the model_provider's
     // built-in fallback in compatible.rs can recover by switching to
     // prompt-guided tool instructions.
     if is_tool_schema_error(err) {
@@ -95,7 +95,7 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
         let code = status.as_u16();
         return status.is_client_error() && code != 429 && code != 408;
     }
-    // Fallback: parse status codes from stringified errors (some providers
+    // Fallback: parse status codes from stringified errors (some model_providers
     // embed codes in error messages rather than returning typed HTTP errors).
     let msg = err.to_string();
     for word in msg.split(|c: char| !c.is_ascii_digit()) {
@@ -139,7 +139,7 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
 }
 
 /// Check if an error indicates an authentication/authorization failure.
-/// Used by channels to evict cached providers whose OAuth tokens may have
+/// Used by channels to evict cached model_providers whose OAuth tokens may have
 /// expired so the next request triggers a fresh credential resolution (#5219).
 pub fn is_auth_error(err: &anyhow::Error) -> bool {
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
@@ -168,7 +168,7 @@ pub fn is_auth_error(err: &anyhow::Error) -> bool {
 
 /// Check if an error is a tool schema validation failure (e.g. Groq returning
 /// "tool call validation failed: attempted to call tool '...' which was not in request").
-/// These errors should NOT be classified as non-retryable because the provider's
+/// These errors should NOT be classified as non-retryable because the model_provider's
 /// built-in fallback logic (`compatible.rs::is_native_tool_schema_unsupported`)
 /// can recover by switching to prompt-guided tool instructions.
 pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
@@ -217,7 +217,7 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
 /// Examples:
 /// - plan does not include requested model
 /// - insufficient balance / package not active
-/// - known provider business codes (e.g. Z.AI: 1311, 1113)
+/// - known model_provider business codes (e.g. Z.AI: 1311, 1113)
 fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
     if !is_rate_limited(err) {
         return false;
@@ -246,7 +246,7 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
         return true;
     }
 
-    // Known provider business codes observed for 429 where retry is futile.
+    // Known model_provider business codes observed for 429 where retry is futile.
     for token in lower.split(|c: char| !c.is_ascii_digit()) {
         if let Ok(code) = token.parse::<u16>()
             && matches!(code, 1113 | 1311)
@@ -350,26 +350,26 @@ fn push_failure(
     error_detail: &str,
 ) {
     failures.push(format!(
-        "provider={provider_name} model={model} attempt {attempt}/{max_attempts}: {reason}; error={error_detail}"
+        "model_provider={provider_name} model={model} attempt {attempt}/{max_attempts}: {reason}; error={error_detail}"
     ));
 }
 
-// ── Resilient Provider Wrapper ────────────────────────────────────────────
-// Two-level strategy: provider chain → retry loop.
-//   Outer loop: iterate registered providers in priority order. The production
+// ── Resilient ModelProvider Wrapper ────────────────────────────────────────────
+// Two-level strategy: model_provider chain → retry loop.
+//   Outer loop: iterate registered model_providers in priority order. The production
 //               caller always wires a single primary; tests construct multi-
 //               element chains directly to exercise failover semantics.
-//   Inner loop: retry the same (provider, model) pair with exponential backoff,
+//   Inner loop: retry the same (model_provider, model) pair with exponential backoff,
 //               rotating API keys on rate-limit errors.
 // Loop invariant: `failures` accumulates every failed attempt so the final
 // error message gives operators a complete diagnostic trail.
 
-/// Provider wrapper with retry + auth-key rotation. The provider Vec exists
+/// ModelProvider wrapper with retry + auth-key rotation. The model_provider Vec exists
 /// for tests to exercise multi-provider failover; production wiring always
 /// passes a single primary. Per-model failover chains are also test-only —
 /// the schema no longer surfaces them.
-pub struct ReliableProvider {
-    providers: Vec<(String, Box<dyn Provider>)>,
+pub struct ReliableModelProvider {
+    model_providers: Vec<(String, Box<dyn ModelProvider>)>,
     max_retries: u32,
     base_backoff_ms: u64,
     /// Extra API keys for rotation (index tracks round-robin position).
@@ -379,14 +379,14 @@ pub struct ReliableProvider {
     model_fallbacks: HashMap<String, Vec<String>>,
 }
 
-impl ReliableProvider {
+impl ReliableModelProvider {
     pub fn new(
-        providers: Vec<(String, Box<dyn Provider>)>,
+        model_providers: Vec<(String, Box<dyn ModelProvider>)>,
         max_retries: u32,
         base_backoff_ms: u64,
     ) -> Self {
         Self {
-            providers,
+            model_providers,
             max_retries,
             base_backoff_ms: base_backoff_ms.max(50),
             api_keys: Vec::new(),
@@ -439,12 +439,15 @@ impl ReliableProvider {
 }
 
 #[async_trait]
-impl Provider for ReliableProvider {
+impl ModelProvider for ReliableModelProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
-        for (name, provider) in &self.providers {
-            tracing::info!(provider = name, "Warming up provider connection pool");
-            if provider.warmup().await.is_err() {
-                tracing::warn!(provider = name, "Warmup failed (non-fatal)");
+        for (name, model_provider) in &self.model_providers {
+            tracing::info!(
+                model_provider = name,
+                "Warming up model_provider connection pool"
+            );
+            if model_provider.warmup().await.is_err() {
+                tracing::warn!(model_provider = name, "Warmup failed (non-fatal)");
             }
         }
         Ok(())
@@ -460,34 +463,34 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        // Outer: model fallback chain. Middle: provider priority. Inner: retries.
-        // Each iteration: attempt one (provider, model) call. On success, return
-        // immediately. On non-retryable error, break to next provider. On
+        // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
+        // Each iteration: attempt one (model_provider, model) call. On success, return
+        // immediately. On non-retryable error, break to next model_provider. On
         // retryable error, sleep with exponential backoff and retry.
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+            for (provider_name, model_provider) in &self.model_providers {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
-                    match provider
+                    match model_provider
                         .chat_with_system(system_prompt, message, current_model, temperature)
                         .await
                     {
                         Ok(resp) => {
                             if attempt > 0
                                 || *current_model != model
-                                || self.providers.first().map(|(n, _)| n.as_str())
+                                || self.model_providers.first().map(|(n, _)| n.as_str())
                                     != Some(provider_name)
                             {
                                 tracing::info!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
-                                    "Provider recovered (failover/retry)"
+                                    "ModelProvider recovered (failover/retry)"
                                 );
                                 let primary = self
-                                    .providers
+                                    .model_providers
                                     .first()
                                     .map(|(n, _)| n.as_str())
                                     .unwrap_or("");
@@ -543,10 +546,10 @@ impl Provider for ReliableProvider {
                                 && let Some(new_key) = self.rotate_key()
                             {
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     error = %error_detail,
                                     "Rate limited; key rotation selected key ending ...{} \
-                                     but cannot apply (Provider trait has no set_api_key). \
+                                     but cannot apply (ModelProvider trait has no set_api_key). \
                                      Retrying with original key.",
                                     &new_key[new_key.len().saturating_sub(4)..]
                                 );
@@ -554,7 +557,7 @@ impl Provider for ReliableProvider {
 
                             if non_retryable {
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     model = *current_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
@@ -565,13 +568,13 @@ impl Provider for ReliableProvider {
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     model = *current_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
                                     reason = failure_reason,
                                     error = %error_detail,
-                                    "Provider call failed, retrying"
+                                    "ModelProvider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
@@ -581,9 +584,9 @@ impl Provider for ReliableProvider {
                 }
 
                 tracing::warn!(
-                    provider = provider_name,
+                    model_provider = provider_name,
                     model = *current_model,
-                    "Exhausted retries, trying next provider/model"
+                    "Exhausted retries, trying next model_provider/model"
                 );
             }
 
@@ -591,13 +594,13 @@ impl Provider for ReliableProvider {
                 tracing::warn!(
                     original_model = model,
                     fallback_model = *current_model,
-                    "Model fallback exhausted all providers, trying next fallback model"
+                    "Model fallback exhausted all model_providers, trying next fallback model"
                 );
             }
         }
 
         anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
+            "All model_providers/models failed. Attempts:\n{}",
             failures.join("\n")
         )
     }
@@ -614,11 +617,11 @@ impl Provider for ReliableProvider {
         let mut context_truncated = false;
 
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+            for (provider_name, model_provider) in &self.model_providers {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
-                    match provider
+                    match model_provider
                         .chat_with_history(&effective_messages, current_model, temperature)
                         .await
                     {
@@ -626,19 +629,19 @@ impl Provider for ReliableProvider {
                             if attempt > 0
                                 || *current_model != model
                                 || context_truncated
-                                || self.providers.first().map(|(n, _)| n.as_str())
+                                || self.model_providers.first().map(|(n, _)| n.as_str())
                                     != Some(provider_name)
                             {
                                 tracing::info!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
                                     context_truncated,
-                                    "Provider recovered (failover/retry)"
+                                    "ModelProvider recovered (failover/retry)"
                                 );
                                 let primary = self
-                                    .providers
+                                    .model_providers
                                     .first()
                                     .map(|(n, _)| n.as_str())
                                     .unwrap_or("");
@@ -658,7 +661,7 @@ impl Provider for ReliableProvider {
                                 if dropped > 0 {
                                     context_truncated = true;
                                     tracing::warn!(
-                                        provider = provider_name,
+                                        model_provider = provider_name,
                                         model = *current_model,
                                         dropped,
                                         remaining = effective_messages.len(),
@@ -708,10 +711,10 @@ impl Provider for ReliableProvider {
                                 && let Some(new_key) = self.rotate_key()
                             {
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     error = %error_detail,
                                     "Rate limited; key rotation selected key ending ...{} \
-                                     but cannot apply (Provider trait has no set_api_key). \
+                                     but cannot apply (ModelProvider trait has no set_api_key). \
                                      Retrying with original key.",
                                     &new_key[new_key.len().saturating_sub(4)..]
                                 );
@@ -719,7 +722,7 @@ impl Provider for ReliableProvider {
 
                             if non_retryable {
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     model = *current_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
@@ -730,13 +733,13 @@ impl Provider for ReliableProvider {
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     model = *current_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
                                     reason = failure_reason,
                                     error = %error_detail,
-                                    "Provider call failed, retrying"
+                                    "ModelProvider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
@@ -746,30 +749,30 @@ impl Provider for ReliableProvider {
                 }
 
                 tracing::warn!(
-                    provider = provider_name,
+                    model_provider = provider_name,
                     model = *current_model,
-                    "Exhausted retries, trying next provider/model"
+                    "Exhausted retries, trying next model_provider/model"
                 );
             }
         }
 
         anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
+            "All model_providers/models failed. Attempts:\n{}",
             failures.join("\n")
         )
     }
 
     fn supports_native_tools(&self) -> bool {
-        self.providers
+        self.model_providers
             .first()
             .map(|(_, p)| p.supports_native_tools())
             .unwrap_or(false)
     }
 
     fn supports_vision(&self) -> bool {
-        self.providers
+        self.model_providers
             .iter()
-            .any(|(_, provider)| provider.supports_vision())
+            .any(|(_, model_provider)| model_provider.supports_vision())
     }
 
     async fn chat_with_tools(
@@ -785,11 +788,11 @@ impl Provider for ReliableProvider {
         let mut context_truncated = false;
 
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+            for (provider_name, model_provider) in &self.model_providers {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
-                    match provider
+                    match model_provider
                         .chat_with_tools(&effective_messages, tools, current_model, temperature)
                         .await
                     {
@@ -797,19 +800,19 @@ impl Provider for ReliableProvider {
                             if attempt > 0
                                 || *current_model != model
                                 || context_truncated
-                                || self.providers.first().map(|(n, _)| n.as_str())
+                                || self.model_providers.first().map(|(n, _)| n.as_str())
                                     != Some(provider_name)
                             {
                                 tracing::info!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
                                     context_truncated,
-                                    "Provider recovered (failover/retry)"
+                                    "ModelProvider recovered (failover/retry)"
                                 );
                                 let primary = self
-                                    .providers
+                                    .model_providers
                                     .first()
                                     .map(|(n, _)| n.as_str())
                                     .unwrap_or("");
@@ -829,7 +832,7 @@ impl Provider for ReliableProvider {
                                 if dropped > 0 {
                                     context_truncated = true;
                                     tracing::warn!(
-                                        provider = provider_name,
+                                        model_provider = provider_name,
                                         model = *current_model,
                                         dropped,
                                         remaining = effective_messages.len(),
@@ -879,10 +882,10 @@ impl Provider for ReliableProvider {
                                 && let Some(new_key) = self.rotate_key()
                             {
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     error = %error_detail,
                                     "Rate limited; key rotation selected key ending ...{} \
-                                     but cannot apply (Provider trait has no set_api_key). \
+                                     but cannot apply (ModelProvider trait has no set_api_key). \
                                      Retrying with original key.",
                                     &new_key[new_key.len().saturating_sub(4)..]
                                 );
@@ -890,7 +893,7 @@ impl Provider for ReliableProvider {
 
                             if non_retryable {
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     model = *current_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
@@ -901,13 +904,13 @@ impl Provider for ReliableProvider {
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     model = *current_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
                                     reason = failure_reason,
                                     error = %error_detail,
-                                    "Provider call failed, retrying"
+                                    "ModelProvider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
@@ -917,15 +920,15 @@ impl Provider for ReliableProvider {
                 }
 
                 tracing::warn!(
-                    provider = provider_name,
+                    model_provider = provider_name,
                     model = *current_model,
-                    "Exhausted retries, trying next provider/model"
+                    "Exhausted retries, trying next model_provider/model"
                 );
             }
         }
 
         anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
+            "All model_providers/models failed. Attempts:\n{}",
             failures.join("\n")
         )
     }
@@ -942,7 +945,7 @@ impl Provider for ReliableProvider {
         let mut context_truncated = false;
 
         for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+            for (provider_name, model_provider) in &self.model_providers {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -950,24 +953,24 @@ impl Provider for ReliableProvider {
                         messages: &effective_messages,
                         tools: request.tools,
                     };
-                    match provider.chat(req, current_model, temperature).await {
+                    match model_provider.chat(req, current_model, temperature).await {
                         Ok(resp) => {
                             if attempt > 0
                                 || *current_model != model
                                 || context_truncated
-                                || self.providers.first().map(|(n, _)| n.as_str())
+                                || self.model_providers.first().map(|(n, _)| n.as_str())
                                     != Some(provider_name)
                             {
                                 tracing::info!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
                                     context_truncated,
-                                    "Provider recovered (failover/retry)"
+                                    "ModelProvider recovered (failover/retry)"
                                 );
                                 let primary = self
-                                    .providers
+                                    .model_providers
                                     .first()
                                     .map(|(n, _)| n.as_str())
                                     .unwrap_or("");
@@ -987,7 +990,7 @@ impl Provider for ReliableProvider {
                                 if dropped > 0 {
                                     context_truncated = true;
                                     tracing::warn!(
-                                        provider = provider_name,
+                                        model_provider = provider_name,
                                         model = *current_model,
                                         dropped,
                                         remaining = effective_messages.len(),
@@ -1037,10 +1040,10 @@ impl Provider for ReliableProvider {
                                 && let Some(new_key) = self.rotate_key()
                             {
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     error = %error_detail,
                                     "Rate limited; key rotation selected key ending ...{} \
-                                     but cannot apply (Provider trait has no set_api_key). \
+                                     but cannot apply (ModelProvider trait has no set_api_key). \
                                      Retrying with original key.",
                                     &new_key[new_key.len().saturating_sub(4)..]
                                 );
@@ -1048,7 +1051,7 @@ impl Provider for ReliableProvider {
 
                             if non_retryable {
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     model = *current_model,
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
@@ -1059,13 +1062,13 @@ impl Provider for ReliableProvider {
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
-                                    provider = provider_name,
+                                    model_provider = provider_name,
                                     model = *current_model,
                                     attempt = attempt + 1,
                                     backoff_ms = wait,
                                     reason = failure_reason,
                                     error = %error_detail,
-                                    "Provider call failed, retrying"
+                                    "ModelProvider call failed, retrying"
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
@@ -1075,9 +1078,9 @@ impl Provider for ReliableProvider {
                 }
 
                 tracing::warn!(
-                    provider = provider_name,
+                    model_provider = provider_name,
                     model = *current_model,
-                    "Exhausted retries, trying next provider/model"
+                    "Exhausted retries, trying next model_provider/model"
                 );
             }
 
@@ -1085,23 +1088,25 @@ impl Provider for ReliableProvider {
                 tracing::warn!(
                     original_model = model,
                     fallback_model = *current_model,
-                    "Model fallback exhausted all providers, trying next fallback model"
+                    "Model fallback exhausted all model_providers, trying next fallback model"
                 );
             }
         }
 
         anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
+            "All model_providers/models failed. Attempts:\n{}",
             failures.join("\n")
         )
     }
 
     fn supports_streaming(&self) -> bool {
-        self.providers.iter().any(|(_, p)| p.supports_streaming())
+        self.model_providers
+            .iter()
+            .any(|(_, p)| p.supports_streaming())
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
-        self.providers
+        self.model_providers
             .iter()
             .any(|(_, p)| p.supports_streaming_tool_events())
     }
@@ -1115,12 +1120,12 @@ impl Provider for ReliableProvider {
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
 
-        for (provider_name, provider) in &self.providers {
-            if !provider.supports_streaming() || !options.enabled {
+        for (provider_name, model_provider) in &self.model_providers {
+            if !model_provider.supports_streaming() || !options.enabled {
                 continue;
             }
 
-            if needs_tool_events && !provider.supports_streaming_tool_events() {
+            if needs_tool_events && !model_provider.supports_streaming_tool_events() {
                 continue;
             }
 
@@ -1137,7 +1142,7 @@ impl Provider for ReliableProvider {
                 messages: request.messages,
                 tools: request.tools,
             };
-            let stream = provider.stream_chat(req, &current_model, temperature, options);
+            let stream = model_provider.stream_chat(req, &current_model, temperature, options);
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
             tokio::spawn(async move {
@@ -1145,7 +1150,7 @@ impl Provider for ReliableProvider {
                 while let Some(event) = stream.next().await {
                     if let Err(ref e) = event {
                         tracing::warn!(
-                            provider = provider_clone,
+                            model_provider = provider_clone,
                             model = current_model,
                             "Streaming error: {e}"
                         );
@@ -1163,11 +1168,11 @@ impl Provider for ReliableProvider {
         }
 
         let message = if needs_tool_events {
-            "No provider supports streaming tool events".to_string()
+            "No model_provider supports streaming tool events".to_string()
         } else {
-            "No provider supports streaming".to_string()
+            "No model_provider supports streaming".to_string()
         };
-        stream::once(async move { Err(super::traits::StreamError::Provider(message)) }).boxed()
+        stream::once(async move { Err(super::traits::StreamError::ModelProvider(message)) }).boxed()
     }
 
     fn stream_chat_with_system(
@@ -1178,14 +1183,14 @@ impl Provider for ReliableProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        // Try each provider/model combination for streaming
-        // For streaming, we use the first provider that supports it and has streaming enabled
-        for (provider_name, provider) in &self.providers {
-            if !provider.supports_streaming() || !options.enabled {
+        // Try each model_provider/model combination for streaming
+        // For streaming, we use the first model_provider that supports it and has streaming enabled
+        for (provider_name, model_provider) in &self.model_providers {
+            if !model_provider.supports_streaming() || !options.enabled {
                 continue;
             }
 
-            // Clone provider data for the stream
+            // Clone model_provider data for the stream
             let provider_clone = provider_name.clone();
 
             // Try the first model in the chain for streaming
@@ -1196,7 +1201,7 @@ impl Provider for ReliableProvider {
 
             // For streaming, we attempt once and propagate errors
             // The caller can retry the entire request if needed
-            let stream = provider.stream_chat_with_system(
+            let stream = model_provider.stream_chat_with_system(
                 system_prompt,
                 message,
                 &current_model,
@@ -1212,7 +1217,7 @@ impl Provider for ReliableProvider {
                 while let Some(chunk) = stream.next().await {
                     if let Err(ref e) = chunk {
                         tracing::warn!(
-                            provider = provider_clone,
+                            model_provider = provider_clone,
                             model = current_model,
                             "Streaming error: {e}"
                         );
@@ -1232,8 +1237,8 @@ impl Provider for ReliableProvider {
 
         // No streaming support available
         stream::once(async move {
-            Err(super::traits::StreamError::Provider(
-                "No provider supports streaming".to_string(),
+            Err(super::traits::StreamError::ModelProvider(
+                "No model_provider supports streaming".to_string(),
             ))
         })
         .boxed()
@@ -1246,11 +1251,11 @@ impl Provider for ReliableProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        // Try each provider/model combination for streaming with history.
+        // Try each model_provider/model combination for streaming with history.
         // Mirrors stream_chat_with_system but delegates to the underlying
-        // provider's stream_chat_with_history, preserving the full conversation.
-        for (provider_name, provider) in &self.providers {
-            if !provider.supports_streaming() || !options.enabled {
+        // model_provider's stream_chat_with_history, preserving the full conversation.
+        for (provider_name, model_provider) in &self.model_providers {
+            if !model_provider.supports_streaming() || !options.enabled {
                 continue;
             }
 
@@ -1261,8 +1266,12 @@ impl Provider for ReliableProvider {
                 None => model.to_string(),
             };
 
-            let stream =
-                provider.stream_chat_with_history(messages, &current_model, temperature, options);
+            let stream = model_provider.stream_chat_with_history(
+                messages,
+                &current_model,
+                temperature,
+                options,
+            );
 
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
@@ -1271,7 +1280,7 @@ impl Provider for ReliableProvider {
                 while let Some(chunk) = stream.next().await {
                     if let Err(ref e) = chunk {
                         tracing::warn!(
-                            provider = provider_clone,
+                            model_provider = provider_clone,
                             model = current_model,
                             "Streaming error: {e}"
                         );
@@ -1290,8 +1299,8 @@ impl Provider for ReliableProvider {
 
         // No streaming support available
         stream::once(async move {
-            Err(super::traits::StreamError::Provider(
-                "No provider supports streaming".to_string(),
+            Err(super::traits::StreamError::ModelProvider(
+                "No model_provider supports streaming".to_string(),
             ))
         })
         .boxed()
@@ -1305,7 +1314,7 @@ mod tests {
     use std::sync::Arc;
     use zeroclaw_api::tool::ToolSpec;
 
-    struct MockProvider {
+    struct MockModelProvider {
         calls: Arc<AtomicUsize>,
         fail_until_attempt: usize,
         response: &'static str,
@@ -1313,7 +1322,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for MockProvider {
+    impl ModelProvider for MockModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -1351,7 +1360,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for ModelAwareMock {
+    impl ModelProvider for ModelAwareMock {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -1373,10 +1382,10 @@ mod tests {
     #[tokio::test]
     async fn succeeds_without_retry() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "primary".into(),
-                Box::new(MockProvider {
+                Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
                     fail_until_attempt: 0,
                     response: "ok",
@@ -1387,7 +1396,7 @@ mod tests {
             1,
         );
 
-        let result = provider
+        let result = model_provider
             .simple_chat("hello", "test", Some(0.0))
             .await
             .unwrap();
@@ -1398,10 +1407,10 @@ mod tests {
     #[tokio::test]
     async fn retries_then_recovers() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "primary".into(),
-                Box::new(MockProvider {
+                Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
                     fail_until_attempt: 1,
                     response: "recovered",
@@ -1412,7 +1421,7 @@ mod tests {
             1,
         );
 
-        let result = provider
+        let result = model_provider
             .simple_chat("hello", "test", Some(0.0))
             .await
             .unwrap();
@@ -1425,11 +1434,11 @@ mod tests {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
 
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![
                 (
                     "primary".into(),
-                    Box::new(MockProvider {
+                    Box::new(MockModelProvider {
                         calls: Arc::clone(&primary_calls),
                         fail_until_attempt: usize::MAX,
                         response: "never",
@@ -1438,7 +1447,7 @@ mod tests {
                 ),
                 (
                     "fallback".into(),
-                    Box::new(MockProvider {
+                    Box::new(MockModelProvider {
                         calls: Arc::clone(&fallback_calls),
                         fail_until_attempt: 0,
                         response: "from fallback",
@@ -1450,7 +1459,7 @@ mod tests {
             1,
         );
 
-        let result = provider
+        let result = model_provider
             .simple_chat("hello", "test", Some(0.0))
             .await
             .unwrap();
@@ -1461,11 +1470,11 @@ mod tests {
 
     #[tokio::test]
     async fn returns_aggregated_error_when_all_providers_fail() {
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![
                 (
                     "p1".into(),
-                    Box::new(MockProvider {
+                    Box::new(MockModelProvider {
                         calls: Arc::new(AtomicUsize::new(0)),
                         fail_until_attempt: usize::MAX,
                         response: "never",
@@ -1474,7 +1483,7 @@ mod tests {
                 ),
                 (
                     "p2".into(),
-                    Box::new(MockProvider {
+                    Box::new(MockModelProvider {
                         calls: Arc::new(AtomicUsize::new(0)),
                         fail_until_attempt: usize::MAX,
                         response: "never",
@@ -1486,14 +1495,14 @@ mod tests {
             1,
         );
 
-        let err = provider
+        let err = model_provider
             .simple_chat("hello", "test", Some(0.0))
             .await
-            .expect_err("all providers should fail");
+            .expect_err("all model_providers should fail");
         let msg = err.to_string();
-        assert!(msg.contains("All providers/models failed"));
-        assert!(msg.contains("provider=p1 model=test"));
-        assert!(msg.contains("provider=p2 model=test"));
+        assert!(msg.contains("All model_providers/models failed"));
+        assert!(msg.contains("model_provider=p1 model=test"));
+        assert!(msg.contains("model_provider=p2 model=test"));
         assert!(msg.contains("error=p1 error"));
         assert!(msg.contains("error=p2 error"));
         assert!(msg.contains("retryable"));
@@ -1554,10 +1563,10 @@ mod tests {
             vec!["gpt-5.2-codex".to_string()],
         );
 
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "openai-codex".into(),
-                Box::new(MockProvider {
+                Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
                     fail_until_attempt: usize::MAX,
                     response: "never",
@@ -1569,7 +1578,7 @@ mod tests {
         )
         .with_model_fallbacks(model_fallbacks);
 
-        let err = provider
+        let err = model_provider
             .simple_chat("hello", "gpt-5.3-codex", Some(0.0))
             .await
             .expect_err("context window overflow should fail fast");
@@ -1583,10 +1592,10 @@ mod tests {
     #[tokio::test]
     async fn aggregated_error_marks_non_retryable_model_mismatch_with_details() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "custom".into(),
-                Box::new(MockProvider {
+                Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
                     fail_until_attempt: usize::MAX,
                     response: "never",
@@ -1597,10 +1606,10 @@ mod tests {
             1,
         );
 
-        let err = provider
+        let err = model_provider
             .simple_chat("hello", "glm-4.7", Some(0.0))
             .await
-            .expect_err("provider should fail");
+            .expect_err("model_provider should fail");
         let msg = err.to_string();
 
         assert!(msg.contains("non_retryable"));
@@ -1614,11 +1623,11 @@ mod tests {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
 
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![
                 (
                     "primary".into(),
-                    Box::new(MockProvider {
+                    Box::new(MockModelProvider {
                         calls: Arc::clone(&primary_calls),
                         fail_until_attempt: usize::MAX,
                         response: "never",
@@ -1627,7 +1636,7 @@ mod tests {
                 ),
                 (
                     "fallback".into(),
-                    Box::new(MockProvider {
+                    Box::new(MockModelProvider {
                         calls: Arc::clone(&fallback_calls),
                         fail_until_attempt: 0,
                         response: "from fallback",
@@ -1639,7 +1648,7 @@ mod tests {
             1,
         );
 
-        let result = provider
+        let result = model_provider
             .simple_chat("hello", "test", Some(0.0))
             .await
             .unwrap();
@@ -1652,10 +1661,10 @@ mod tests {
     #[tokio::test]
     async fn chat_with_history_retries_then_recovers() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "primary".into(),
-                Box::new(MockProvider {
+                Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
                     fail_until_attempt: 1,
                     response: "history ok",
@@ -1667,7 +1676,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
-        let result = provider
+        let result = model_provider
             .chat_with_history(&messages, "test", Some(0.0))
             .await
             .unwrap();
@@ -1680,11 +1689,11 @@ mod tests {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
 
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![
                 (
                     "primary".into(),
-                    Box::new(MockProvider {
+                    Box::new(MockModelProvider {
                         calls: Arc::clone(&primary_calls),
                         fail_until_attempt: usize::MAX,
                         response: "never",
@@ -1693,7 +1702,7 @@ mod tests {
                 ),
                 (
                     "fallback".into(),
-                    Box::new(MockProvider {
+                    Box::new(MockModelProvider {
                         calls: Arc::clone(&fallback_calls),
                         fail_until_attempt: 0,
                         response: "fallback ok",
@@ -1706,7 +1715,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("hello")];
-        let result = provider
+        let result = model_provider
             .chat_with_history(&messages, "test", Some(0.0))
             .await
             .unwrap();
@@ -1730,17 +1739,17 @@ mod tests {
         let mut fallbacks = HashMap::new();
         fallbacks.insert("claude-opus".to_string(), vec!["claude-sonnet".to_string()]);
 
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "anthropic".into(),
-                Box::new(mock.clone()) as Box<dyn Provider>,
+                Box::new(mock.clone()) as Box<dyn ModelProvider>,
             )],
             0, // no retries — force immediate model failover
             1,
         )
         .with_model_fallbacks(fallbacks);
 
-        let result = provider
+        let result = model_provider
             .simple_chat("hello", "claude-opus", Some(0.0))
             .await
             .unwrap();
@@ -1768,18 +1777,24 @@ mod tests {
             vec!["model-b".to_string(), "model-c".to_string()],
         );
 
-        let provider = ReliableProvider::new(
-            vec![("p1".into(), Box::new(mock.clone()) as Box<dyn Provider>)],
+        let model_provider = ReliableModelProvider::new(
+            vec![(
+                "p1".into(),
+                Box::new(mock.clone()) as Box<dyn ModelProvider>,
+            )],
             0,
             1,
         )
         .with_model_fallbacks(fallbacks);
 
-        let err = provider
+        let err = model_provider
             .simple_chat("hello", "model-a", Some(0.0))
             .await
             .expect_err("all models should fail");
-        assert!(err.to_string().contains("All providers/models failed"));
+        assert!(
+            err.to_string()
+                .contains("All model_providers/models failed")
+        );
 
         let seen = mock.models_seen.lock();
         assert_eq!(seen.len(), 3);
@@ -1788,10 +1803,10 @@ mod tests {
     #[tokio::test]
     async fn no_model_fallbacks_behaves_like_before() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "primary".into(),
-                Box::new(MockProvider {
+                Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
                     fail_until_attempt: 0,
                     response: "ok",
@@ -1802,7 +1817,7 @@ mod tests {
             1,
         );
         // No model_fallbacks set — should work exactly as before
-        let result = provider
+        let result = model_provider
             .simple_chat("hello", "test", Some(0.0))
             .await
             .unwrap();
@@ -1814,10 +1829,10 @@ mod tests {
 
     #[tokio::test]
     async fn auth_rotation_cycles_keys() {
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "p".into(),
-                Box::new(MockProvider {
+                Box::new(MockModelProvider {
                     calls: Arc::new(AtomicUsize::new(0)),
                     fail_until_attempt: 0,
                     response: "ok",
@@ -1830,14 +1845,16 @@ mod tests {
         .with_api_keys(vec!["key-a".into(), "key-b".into(), "key-c".into()]);
 
         // Rotate 5 times, verify round-robin
-        let keys: Vec<&str> = (0..5).map(|_| provider.rotate_key().unwrap()).collect();
+        let keys: Vec<&str> = (0..5)
+            .map(|_| model_provider.rotate_key().unwrap())
+            .collect();
         assert_eq!(keys, vec!["key-a", "key-b", "key-c", "key-a", "key-b"]);
     }
 
     #[tokio::test]
     async fn auth_rotation_returns_none_when_empty() {
-        let provider = ReliableProvider::new(vec![], 0, 1);
-        assert!(provider.rotate_key().is_none());
+        let model_provider = ReliableModelProvider::new(vec![], 0, 1);
+        assert!(model_provider.rotate_key().is_none());
     }
 
     // ── New tests: Retry-After parsing ──
@@ -1907,23 +1924,23 @@ mod tests {
 
     #[test]
     fn compute_backoff_uses_retry_after() {
-        let provider = ReliableProvider::new(vec![], 0, 500);
+        let model_provider = ReliableModelProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("429 Retry-After: 3");
-        assert_eq!(provider.compute_backoff(500, &err), 3_000);
+        assert_eq!(model_provider.compute_backoff(500, &err), 3_000);
     }
 
     #[test]
     fn compute_backoff_caps_at_30s() {
-        let provider = ReliableProvider::new(vec![], 0, 500);
+        let model_provider = ReliableModelProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("429 Retry-After: 120");
-        assert_eq!(provider.compute_backoff(500, &err), 30_000);
+        assert_eq!(model_provider.compute_backoff(500, &err), 30_000);
     }
 
     #[test]
     fn compute_backoff_falls_back_to_base() {
-        let provider = ReliableProvider::new(vec![], 0, 500);
+        let model_provider = ReliableModelProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("500 Server Error");
-        assert_eq!(provider.compute_backoff(500, &err), 500);
+        assert_eq!(model_provider.compute_backoff(500, &err), 500);
     }
 
     // ── §2.1 API auth error (401/403) tests ──────────────────
@@ -2037,10 +2054,10 @@ mod tests {
     #[tokio::test]
     async fn non_retryable_skips_retries_for_401() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "primary".into(),
-                Box::new(MockProvider {
+                Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
                     fail_until_attempt: usize::MAX,
                     response: "never",
@@ -2051,7 +2068,7 @@ mod tests {
             1,
         );
 
-        let result = provider.simple_chat("hello", "test", Some(0.0)).await;
+        let result = model_provider.simple_chat("hello", "test", Some(0.0)).await;
         assert!(result.is_err(), "401 should fail without retries");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -2063,10 +2080,10 @@ mod tests {
     #[tokio::test]
     async fn non_retryable_rate_limit_skips_retries_for_plan_errors() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "primary".into(),
-                Box::new(MockProvider {
+                Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
                     fail_until_attempt: usize::MAX,
                     response: "never",
@@ -2077,7 +2094,7 @@ mod tests {
             1,
         );
 
-        let result = provider.simple_chat("hello", "test", Some(0.0)).await;
+        let result = model_provider.simple_chat("hello", "test", Some(0.0)).await;
         assert!(
             result.is_err(),
             "plan-restricted 429 should fail quickly without retrying"
@@ -2089,9 +2106,9 @@ mod tests {
         );
     }
 
-    // Arc<ModelAwareMock> Provider impl provided by blanket impl in zeroclaw-types.
+    // Arc<ModelAwareMock> ModelProvider impl provided by blanket impl in zeroclaw-types.
 
-    /// Mock provider that implements `chat()` with native tool support.
+    /// Mock model_provider that implements `chat()` with native tool support.
     struct NativeToolMock {
         calls: Arc<AtomicUsize>,
         fail_until_attempt: usize,
@@ -2101,7 +2118,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for NativeToolMock {
+    impl ModelProvider for NativeToolMock {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2144,7 +2161,7 @@ mod tests {
             arguments: r#"{"command":"date"}"#.to_string(),
             extra_content: None,
         };
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "primary".into(),
                 Box::new(NativeToolMock {
@@ -2153,7 +2170,7 @@ mod tests {
                     response_text: "ok",
                     tool_calls: vec![tool_call.clone()],
                     error: "boom",
-                }) as Box<dyn Provider>,
+                }) as Box<dyn ModelProvider>,
             )],
             2,
             1,
@@ -2164,7 +2181,7 @@ mod tests {
             messages: &messages,
             tools: None,
         };
-        let result = provider
+        let result = model_provider
             .chat(request, "test-model", Some(0.0))
             .await
             .unwrap();
@@ -2184,7 +2201,7 @@ mod tests {
             arguments: r#"{"command":"date"}"#.to_string(),
             extra_content: None,
         };
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "primary".into(),
                 Box::new(NativeToolMock {
@@ -2193,7 +2210,7 @@ mod tests {
                     response_text: "recovered",
                     tool_calls: vec![tool_call],
                     error: "temporary failure",
-                }) as Box<dyn Provider>,
+                }) as Box<dyn ModelProvider>,
             )],
             3,
             1,
@@ -2204,7 +2221,7 @@ mod tests {
             messages: &messages,
             tools: None,
         };
-        let result = provider
+        let result = model_provider
             .chat(request, "test-model", Some(0.0))
             .await
             .unwrap();
@@ -2219,7 +2236,7 @@ mod tests {
     #[tokio::test]
     async fn chat_preserves_native_tools_support() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "primary".into(),
                 Box::new(NativeToolMock {
@@ -2228,25 +2245,25 @@ mod tests {
                     response_text: "ok",
                     tool_calls: vec![],
                     error: "boom",
-                }) as Box<dyn Provider>,
+                }) as Box<dyn ModelProvider>,
             )],
             2,
             1,
         );
 
         assert!(
-            provider.supports_native_tools(),
-            "ReliableProvider must propagate supports_native_tools from inner provider"
+            model_provider.supports_native_tools(),
+            "ReliableModelProvider must propagate supports_native_tools from inner model_provider"
         );
     }
 
     // ── Gap 2-4: Parity tests for chat() ────────────────────────
 
-    /// Gap 2: `chat()` returns an aggregated error when all providers fail,
+    /// Gap 2: `chat()` returns an aggregated error when all model_providers fail,
     /// matching behavior of `returns_aggregated_error_when_all_providers_fail`.
     #[tokio::test]
     async fn chat_returns_aggregated_error_when_all_providers_fail() {
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![
                 (
                     "p1".into(),
@@ -2256,7 +2273,7 @@ mod tests {
                         response_text: "never",
                         tool_calls: vec![],
                         error: "p1 chat error",
-                    }) as Box<dyn Provider>,
+                    }) as Box<dyn ModelProvider>,
                 ),
                 (
                     "p2".into(),
@@ -2266,7 +2283,7 @@ mod tests {
                         response_text: "never",
                         tool_calls: vec![],
                         error: "p2 chat error",
-                    }) as Box<dyn Provider>,
+                    }) as Box<dyn ModelProvider>,
                 ),
             ],
             0,
@@ -2278,14 +2295,14 @@ mod tests {
             messages: &messages,
             tools: None,
         };
-        let err = provider
+        let err = model_provider
             .chat(request, "test", Some(0.0))
             .await
-            .expect_err("all providers should fail");
+            .expect_err("all model_providers should fail");
         let msg = err.to_string();
-        assert!(msg.contains("All providers/models failed"));
-        assert!(msg.contains("provider=p1 model=test"));
-        assert!(msg.contains("provider=p2 model=test"));
+        assert!(msg.contains("All model_providers/models failed"));
+        assert!(msg.contains("model_provider=p1 model=test"));
+        assert!(msg.contains("model_provider=p2 model=test"));
         assert!(msg.contains("error=p1 chat error"));
         assert!(msg.contains("error=p2 chat error"));
         assert!(msg.contains("retryable"));
@@ -2301,7 +2318,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for NativeModelAwareMock {
+    impl ModelProvider for NativeModelAwareMock {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2336,7 +2353,7 @@ mod tests {
         }
     }
 
-    // Arc<NativeModelAwareMock> Provider impl provided by blanket impl in zeroclaw-types.
+    // Arc<NativeModelAwareMock> ModelProvider impl provided by blanket impl in zeroclaw-types.
 
     /// Gap 3: `chat()` tries fallback models on failure,
     /// matching behavior of `model_failover_tries_fallback_model`.
@@ -2353,10 +2370,10 @@ mod tests {
         let mut fallbacks = HashMap::new();
         fallbacks.insert("claude-opus".to_string(), vec!["claude-sonnet".to_string()]);
 
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "anthropic".into(),
-                Box::new(mock.clone()) as Box<dyn Provider>,
+                Box::new(mock.clone()) as Box<dyn ModelProvider>,
             )],
             0, // no retries — force immediate model failover
             1,
@@ -2368,7 +2385,7 @@ mod tests {
             messages: &messages,
             tools: None,
         };
-        let result = provider
+        let result = model_provider
             .chat(request, "claude-opus", Some(0.0))
             .await
             .unwrap();
@@ -2387,7 +2404,7 @@ mod tests {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
 
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![
                 (
                     "primary".into(),
@@ -2397,7 +2414,7 @@ mod tests {
                         response_text: "never",
                         tool_calls: vec![],
                         error: "401 Unauthorized",
-                    }) as Box<dyn Provider>,
+                    }) as Box<dyn ModelProvider>,
                 ),
                 (
                     "fallback".into(),
@@ -2407,7 +2424,7 @@ mod tests {
                         response_text: "from fallback",
                         tool_calls: vec![],
                         error: "fallback err",
-                    }) as Box<dyn Provider>,
+                    }) as Box<dyn ModelProvider>,
                 ),
             ],
             3,
@@ -2419,7 +2436,10 @@ mod tests {
             messages: &messages,
             tools: None,
         };
-        let result = provider.chat(request, "test", Some(0.0)).await.unwrap();
+        let result = model_provider
+            .chat(request, "test", Some(0.0))
+            .await
+            .unwrap();
         assert_eq!(result.text.as_deref(), Some("from fallback"));
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
@@ -2497,7 +2517,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for ContextOverflowMock {
+    impl ModelProvider for ContextOverflowMock {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2534,8 +2554,8 @@ mod tests {
             message_counts: parking_lot::Mutex::new(Vec::new()),
         };
 
-        let provider = ReliableProvider::new(
-            vec![("local".into(), Box::new(mock) as Box<dyn Provider>)],
+        let model_provider = ReliableModelProvider::new(
+            vec![("local".into(), Box::new(mock) as Box<dyn ModelProvider>)],
             3,
             1,
         );
@@ -2549,7 +2569,7 @@ mod tests {
             ChatMessage::user("current question"),
         ];
 
-        let result = provider
+        let result = model_provider
             .chat_with_history(&messages, "local-model", Some(0.0))
             .await
             .unwrap();
@@ -2567,8 +2587,8 @@ mod tests {
             message_counts: parking_lot::Mutex::new(Vec::new()),
         };
 
-        let provider = ReliableProvider::new(
-            vec![("local".into(), Box::new(mock) as Box<dyn Provider>)],
+        let model_provider = ReliableModelProvider::new(
+            vec![("local".into(), Box::new(mock) as Box<dyn ModelProvider>)],
             3,
             1,
         );
@@ -2579,7 +2599,7 @@ mod tests {
             ChatMessage::user("hello"),
         ];
 
-        let result = provider
+        let result = model_provider
             .chat_with_history(&messages, "local-model", Some(0.0))
             .await;
         assert!(result.is_err());
@@ -2662,7 +2682,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for StreamingToolEventMock {
+    impl ModelProvider for StreamingToolEventMock {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2702,21 +2722,21 @@ mod tests {
         }
     }
 
-    // Arc<StreamingToolEventMock> Provider impl provided by blanket impl in zeroclaw-types.
+    // Arc<StreamingToolEventMock> ModelProvider impl provided by blanket impl in zeroclaw-types.
 
     #[tokio::test]
     async fn stream_chat_prefers_provider_with_tool_event_support() {
         let primary = Arc::new(StreamingToolEventMock::new(false));
         let fallback = Arc::new(StreamingToolEventMock::new(true));
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![
                 (
                     "primary".into(),
-                    Box::new(Arc::clone(&primary)) as Box<dyn Provider>,
+                    Box::new(Arc::clone(&primary)) as Box<dyn ModelProvider>,
                 ),
                 (
                     "fallback".into(),
-                    Box::new(Arc::clone(&fallback)) as Box<dyn Provider>,
+                    Box::new(Arc::clone(&fallback)) as Box<dyn ModelProvider>,
                 ),
             ],
             0,
@@ -2734,7 +2754,7 @@ mod tests {
                 }
             }),
         }];
-        let mut stream = provider.stream_chat(
+        let mut stream = model_provider.stream_chat(
             ChatRequest {
                 messages: &messages,
                 tools: Some(&tools),
@@ -2760,10 +2780,10 @@ mod tests {
     #[tokio::test]
     async fn stream_chat_errors_when_no_provider_supports_tool_events() {
         let primary = Arc::new(StreamingToolEventMock::new(false));
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "primary".into(),
-                Box::new(Arc::clone(&primary)) as Box<dyn Provider>,
+                Box::new(Arc::clone(&primary)) as Box<dyn ModelProvider>,
             )],
             0,
             1,
@@ -2775,7 +2795,7 @@ mod tests {
             description: "run shell".to_string(),
             parameters: serde_json::json!({"type": "object"}),
         }];
-        let mut stream = provider.stream_chat(
+        let mut stream = model_provider.stream_chat(
             ChatRequest {
                 messages: &messages,
                 tools: Some(&tools),
@@ -2789,7 +2809,7 @@ mod tests {
         let err = first.expect_err("stream should fail without tool-event support");
         assert!(
             err.to_string()
-                .contains("No provider supports streaming tool events"),
+                .contains("No model_provider supports streaming tool events"),
             "unexpected stream error: {err}"
         );
         assert!(stream.next().await.is_none());
@@ -2798,14 +2818,14 @@ mod tests {
 
     // ── stream_chat_with_history failover tests ──────────────────────
 
-    /// Mock provider that supports streaming via stream_chat_with_history.
+    /// Mock model_provider that supports streaming via stream_chat_with_history.
     struct StreamingHistoryMock {
         stream_calls: Arc<AtomicUsize>,
         supports: bool,
     }
 
     #[async_trait]
-    impl Provider for StreamingHistoryMock {
+    impl ModelProvider for StreamingHistoryMock {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2841,13 +2861,13 @@ mod tests {
     #[tokio::test]
     async fn stream_chat_with_history_delegates_to_streaming_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "primary".into(),
                 Box::new(StreamingHistoryMock {
                     stream_calls: Arc::clone(&calls),
                     supports: true,
-                }) as Box<dyn Provider>,
+                }) as Box<dyn ModelProvider>,
             )],
             0,
             1,
@@ -2859,7 +2879,7 @@ mod tests {
             ChatMessage::assistant("resp1"),
             ChatMessage::user("msg2"),
         ];
-        let mut stream = provider.stream_chat_with_history(
+        let mut stream = model_provider.stream_chat_with_history(
             &messages,
             "model",
             Some(0.0),
@@ -2867,7 +2887,10 @@ mod tests {
         );
 
         let first = stream.next().await.unwrap().unwrap();
-        assert_eq!(first.delta, "4", "should pass all 4 messages to provider");
+        assert_eq!(
+            first.delta, "4",
+            "should pass all 4 messages to model_provider"
+        );
         let second = stream.next().await.unwrap().unwrap();
         assert!(second.is_final);
         assert!(stream.next().await.is_none());
@@ -2879,21 +2902,21 @@ mod tests {
         let non_streaming_calls = Arc::new(AtomicUsize::new(0));
         let streaming_calls = Arc::new(AtomicUsize::new(0));
 
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![
                 (
                     "non-streaming".into(),
                     Box::new(StreamingHistoryMock {
                         stream_calls: Arc::clone(&non_streaming_calls),
                         supports: false,
-                    }) as Box<dyn Provider>,
+                    }) as Box<dyn ModelProvider>,
                 ),
                 (
                     "streaming".into(),
                     Box::new(StreamingHistoryMock {
                         stream_calls: Arc::clone(&streaming_calls),
                         supports: true,
-                    }) as Box<dyn Provider>,
+                    }) as Box<dyn ModelProvider>,
                 ),
             ],
             0,
@@ -2901,7 +2924,7 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("hello")];
-        let mut stream = provider.stream_chat_with_history(
+        let mut stream = model_provider.stream_chat_with_history(
             &messages,
             "model",
             Some(0.0),
@@ -2913,31 +2936,31 @@ mod tests {
         assert_eq!(
             non_streaming_calls.load(Ordering::SeqCst),
             0,
-            "non-streaming provider should be skipped"
+            "non-streaming model_provider should be skipped"
         );
         assert_eq!(
             streaming_calls.load(Ordering::SeqCst),
             1,
-            "streaming provider should be used"
+            "streaming model_provider should be used"
         );
     }
 
     #[tokio::test]
     async fn stream_chat_with_history_errors_when_no_provider_supports_streaming() {
-        let provider = ReliableProvider::new(
+        let model_provider = ReliableModelProvider::new(
             vec![(
                 "non-streaming".into(),
                 Box::new(StreamingHistoryMock {
                     stream_calls: Arc::new(AtomicUsize::new(0)),
                     supports: false,
-                }) as Box<dyn Provider>,
+                }) as Box<dyn ModelProvider>,
             )],
             0,
             1,
         );
 
         let messages = vec![ChatMessage::user("hello")];
-        let mut stream = provider.stream_chat_with_history(
+        let mut stream = model_provider.stream_chat_with_history(
             &messages,
             "model",
             Some(0.0),
@@ -2945,9 +2968,10 @@ mod tests {
         );
 
         let first = stream.next().await.unwrap();
-        let err = first.expect_err("should fail when no provider supports streaming");
+        let err = first.expect_err("should fail when no model_provider supports streaming");
         assert!(
-            err.to_string().contains("No provider supports streaming"),
+            err.to_string()
+                .contains("No model_provider supports streaming"),
             "unexpected error: {err}"
         );
         assert!(stream.next().await.is_none());
@@ -2956,11 +2980,11 @@ mod tests {
     #[tokio::test]
     async fn fallback_records_provider_fallback_info() {
         scope_provider_fallback(async {
-            let provider = ReliableProvider::new(
+            let model_provider = ReliableModelProvider::new(
                 vec![
                     (
                         "broken".into(),
-                        Box::new(MockProvider {
+                        Box::new(MockModelProvider {
                             calls: Arc::new(AtomicUsize::new(0)),
                             fail_until_attempt: 99, // always fail
                             response: "unused",
@@ -2969,7 +2993,7 @@ mod tests {
                     ),
                     (
                         "working".into(),
-                        Box::new(MockProvider {
+                        Box::new(MockModelProvider {
                             calls: Arc::new(AtomicUsize::new(0)),
                             fail_until_attempt: 0,
                             response: "hello from working",
@@ -2981,7 +3005,7 @@ mod tests {
                 1,
             );
 
-            let resp = provider
+            let resp = model_provider
                 .simple_chat("hi", "test-model", Some(0.0))
                 .await
                 .unwrap();

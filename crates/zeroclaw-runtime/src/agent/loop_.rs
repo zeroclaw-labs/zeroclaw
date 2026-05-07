@@ -47,12 +47,12 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::channel::Channel;
-use zeroclaw_api::provider::StreamEvent;
+use zeroclaw_api::model_provider::StreamEvent;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory, decay};
 use zeroclaw_providers::multimodal;
 use zeroclaw_providers::{
-    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
+    self, ChatMessage, ChatRequest, ModelProvider, ProviderCapabilityError, ToolCall,
 };
 
 // Cost tracking moved to `super::cost`.
@@ -82,7 +82,7 @@ pub use super::history::{
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
 /// Callback type for checking if model has been switched during tool execution.
-/// Returns Some((provider, model)) if a switch was requested, None otherwise.
+/// Returns Some((model_provider, model)) if a switch was requested, None otherwise.
 pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
 
 /// Global model switch request state - used for runtime model switching via model_switch tool.
@@ -437,7 +437,7 @@ pub use super::tool_execution::{
 };
 
 /// Build assistant history entry in JSON format for native tool-call APIs.
-/// `convert_messages` in the OpenRouter provider parses this JSON to reconstruct
+/// `convert_messages` in the OpenRouter model_provider parses this JSON to reconstruct
 /// the proper `NativeMessage` with structured `tool_calls`.
 fn build_native_assistant_history(
     text: &str,
@@ -517,7 +517,7 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
 
 #[derive(Debug)]
 pub struct ModelSwitchRequested {
-    pub provider: String,
+    pub model_provider: String,
     pub model: String,
 }
 
@@ -526,7 +526,7 @@ impl std::fmt::Display for ModelSwitchRequested {
         write!(
             f,
             "model switch requested to {} {}",
-            self.provider, self.model
+            self.model_provider, self.model
         )
     }
 }
@@ -536,7 +536,7 @@ impl std::error::Error for ModelSwitchRequested {}
 pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)> {
     err.chain()
         .filter_map(|source| source.downcast_ref::<ModelSwitchRequested>())
-        .map(|e| (e.provider.clone(), e.model.clone()))
+        .map(|e| (e.model_provider.clone(), e.model.clone()))
         .next()
 }
 
@@ -547,7 +547,7 @@ struct StreamedChatOutcome {
     ///
     /// Captured separately from `response_text` so it can be threaded into
     /// `ChatResponse.reasoning_content` and ultimately persisted on the
-    /// `AssistantToolCalls` history entry. Required for providers like
+    /// `AssistantToolCalls` history entry. Required for model_providers like
     /// DeepSeek V4 that reject follow-up requests when the assistant's
     /// prior `reasoning_content` is missing from replayed tool-call turns
     /// (see issue #6059).
@@ -557,7 +557,7 @@ struct StreamedChatOutcome {
 }
 
 async fn consume_provider_streaming_response(
-    provider: &dyn Provider,
+    model_provider: &dyn ModelProvider,
     messages: &[ChatMessage],
     request_tools: Option<&[crate::tools::ToolSpec]>,
     model: &str,
@@ -565,7 +565,7 @@ async fn consume_provider_streaming_response(
     cancellation_token: Option<&CancellationToken>,
     on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
 ) -> Result<StreamedChatOutcome> {
-    let mut provider_stream = provider.stream_chat(
+    let mut provider_stream = model_provider.stream_chat(
         ChatRequest {
             messages,
             tools: request_tools,
@@ -593,7 +593,8 @@ async fn consume_provider_streaming_response(
             break;
         };
 
-        let event = event_result.map_err(|err| anyhow::anyhow!("provider stream error: {err}"))?;
+        let event =
+            event_result.map_err(|err| anyhow::anyhow!("model_provider stream error: {err}"))?;
         match event {
             StreamEvent::Final => break,
             StreamEvent::ToolCall(tool_call) => {
@@ -609,7 +610,7 @@ async fn consume_provider_streaming_response(
                 // Reasoning/thinking deltas arrive on the same `TextDelta`
                 // event as plain text but populate `chunk.reasoning` instead
                 // of `chunk.delta`. They must be captured into the outcome
-                // even when `chunk.delta` is empty — otherwise providers
+                // even when `chunk.delta` is empty — otherwise model_providers
                 // that require reasoning to round-trip on subsequent turns
                 // (DeepSeek V4 thinking mode; see #6059) reject the next
                 // request with a 400. Reasoning is never forwarded as a
@@ -668,7 +669,7 @@ async fn consume_provider_streaming_response(
 /// When `silent` is true, suppresses stdout (for channel use).
 #[allow(clippy::too_many_arguments)]
 pub async fn agent_turn(
-    provider: &dyn Provider,
+    model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
@@ -688,7 +689,7 @@ pub async fn agent_turn(
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
     run_tool_call_loop(
-        provider,
+        model_provider,
         history,
         tools_registry,
         observer,
@@ -830,7 +831,7 @@ fn maybe_inject_channel_delivery_defaults(
 /// execute tools, and loop until the LLM produces a final text response.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tool_call_loop(
-    provider: &dyn Provider,
+    model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
@@ -944,25 +945,25 @@ pub async fn run_tool_call_loop(
 
         // Remove orphaned tool-role messages whose assistant (tool_calls)
         // counterpart was dropped by proactive trimming, context compression,
-        // or session history reloading.  Without this, providers like MiniMax
+        // or session history reloading.  Without this, model_providers like MiniMax
         // reject the request with "tool result's tool id not found" (bug #5743).
         crate::agent::history_pruner::remove_orphaned_tool_messages(history);
 
         // Check if model switch was requested via model_switch tool
         if let Some(ref callback) = model_switch_callback
             && let Ok(guard) = callback.lock()
-            && let Some((new_provider, new_model)) = guard.as_ref()
-            && (new_provider != provider_name || new_model != model)
+            && let Some((new_model_provider, new_model)) = guard.as_ref()
+            && (new_model_provider != provider_name || new_model != model)
         {
             tracing::info!(
                 "Model switch detected: {} {} -> {} {}",
                 provider_name,
                 model,
-                new_provider,
+                new_model_provider,
                 new_model
             );
             return Err(ModelSwitchRequested {
-                provider: new_provider.clone(),
+                model_provider: new_model_provider.clone(),
                 model: new_model.clone(),
             }
             .into());
@@ -981,26 +982,28 @@ pub async fn run_tool_call_loop(
                 }
             }
         }
-        let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
+        let use_native_tools = model_provider.supports_native_tools() && !tool_specs.is_empty();
 
         let image_marker_count = multimodal::count_image_markers(history);
 
-        // ── Vision provider routing ──────────────────────────
-        // When the default provider lacks vision support but a dedicated
-        // vision_provider is configured, create it on demand and use it
+        // ── Vision model_provider routing ──────────────────────────
+        // When the default model_provider lacks vision support but a dedicated
+        // vision_model_provider is configured, create it on demand and use it
         // for this iteration.  Otherwise, preserve the original error.
-        let vision_provider_box: Option<Box<dyn Provider>> = if image_marker_count > 0
-            && !provider.supports_vision()
+        let vision_model_provider_box: Option<Box<dyn ModelProvider>> = if image_marker_count > 0
+            && !model_provider.supports_vision()
         {
-            if let Some(ref vp) = multimodal_config.vision_provider {
-                let vp_instance = zeroclaw_providers::create_provider(vp, None)
-                    .map_err(|e| anyhow::anyhow!("failed to create vision provider '{vp}': {e}"))?;
+            if let Some(ref vp) = multimodal_config.vision_model_provider {
+                let vp_instance =
+                    zeroclaw_providers::create_model_provider(vp, None).map_err(|e| {
+                        anyhow::anyhow!("failed to create vision model_provider '{vp}': {e}")
+                    })?;
                 if !vp_instance.supports_vision() {
                     return Err(ProviderCapabilityError {
-                        provider: vp.clone(),
+                        model_provider: vp.clone(),
                         capability: "vision".to_string(),
                         message: format!(
-                            "configured vision_provider '{vp}' does not support vision input"
+                            "configured vision_model_provider '{vp}' does not support vision input"
                         ),
                     }
                     .into());
@@ -1008,10 +1011,10 @@ pub async fn run_tool_call_loop(
                 Some(vp_instance)
             } else {
                 return Err(ProviderCapabilityError {
-                        provider: provider_name.to_string(),
+                        model_provider: provider_name.to_string(),
                         capability: "vision".to_string(),
                         message: format!(
-                            "received {image_marker_count} image marker(s), but this provider does not support vision input"
+                            "received {image_marker_count} image marker(s), but this model_provider does not support vision input"
                         ),
                     }
                     .into());
@@ -1020,17 +1023,20 @@ pub async fn run_tool_call_loop(
             None
         };
 
-        let (active_provider, active_provider_name, active_model): (&dyn Provider, &str, &str) =
-            if let Some(ref vp_box) = vision_provider_box {
-                let vp_name = multimodal_config
-                    .vision_provider
-                    .as_deref()
-                    .unwrap_or(provider_name);
-                let vm = multimodal_config.vision_model.as_deref().unwrap_or(model);
-                (vp_box.as_ref(), vp_name, vm)
-            } else {
-                (provider, provider_name, model)
-            };
+        let (active_model_provider, active_model_provider_name, active_model): (
+            &dyn ModelProvider,
+            &str,
+            &str,
+        ) = if let Some(ref vp_box) = vision_model_provider_box {
+            let vp_name = multimodal_config
+                .vision_model_provider
+                .as_deref()
+                .unwrap_or(provider_name);
+            let vm = multimodal_config.vision_model.as_deref().unwrap_or(model);
+            (vp_box.as_ref(), vp_name, vm)
+        } else {
+            (model_provider, provider_name, model)
+        };
 
         let prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
@@ -1046,14 +1052,14 @@ pub async fn run_tool_call_loop(
         }
 
         observer.record_event(&ObserverEvent::LlmRequest {
-            provider: active_provider_name.to_string(),
+            model_provider: active_model_provider_name.to_string(),
             model: active_model.to_string(),
             messages_count: history.len(),
         });
         runtime_trace::record_event(
             "llm_request",
             Some(channel_name),
-            Some(active_provider_name),
+            Some(active_model_provider_name),
             Some(active_model),
             Some(&turn_id),
             None,
@@ -1086,7 +1092,7 @@ pub async fn run_tool_call_loop(
             ));
         }
 
-        // Unified path via Provider::chat so provider-specific native tool logic
+        // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         let request_tools = if use_native_tools {
             Some(tool_specs.as_slice())
@@ -1094,11 +1100,11 @@ pub async fn run_tool_call_loop(
             None
         };
         let should_consume_provider_stream = on_delta.is_some()
-            && provider.supports_streaming()
-            && (request_tools.is_none() || provider.supports_streaming_tool_events());
+            && model_provider.supports_streaming()
+            && (request_tools.is_none() || model_provider.supports_streaming_tool_events());
         tracing::debug!(
             has_on_delta = on_delta.is_some(),
-            supports_streaming = provider.supports_streaming(),
+            supports_streaming = model_provider.supports_streaming(),
             should_consume_provider_stream,
             "Streaming decision for iteration {}",
             iteration + 1,
@@ -1107,7 +1113,7 @@ pub async fn run_tool_call_loop(
 
         let chat_result = if should_consume_provider_stream {
             match consume_provider_streaming_response(
-                active_provider,
+                active_model_provider,
                 &prepared_messages.messages,
                 request_tools,
                 active_model,
@@ -1133,26 +1139,26 @@ pub async fn run_tool_call_loop(
                 }
                 Err(stream_err) => {
                     tracing::warn!(
-                        provider = active_provider_name,
+                        model_provider = active_model_provider_name,
                         model = active_model,
                         iteration = iteration + 1,
-                        "provider streaming failed, falling back to non-streaming chat: {stream_err}"
+                        "model_provider streaming failed, falling back to non-streaming chat: {stream_err}"
                     );
                     runtime_trace::record_event(
                         "llm_stream_fallback",
                         Some(channel_name),
-                        Some(active_provider_name),
+                        Some(active_model_provider_name),
                         Some(active_model),
                         Some(&turn_id),
                         Some(false),
-                        Some("provider stream failed; fallback to non-streaming chat"),
+                        Some("model_provider stream failed; fallback to non-streaming chat"),
                         serde_json::json!({
                             "iteration": iteration + 1,
                             "error": scrub_credentials(&stream_err.to_string()),
                         }),
                     );
                     {
-                        let chat_future = active_provider.chat(
+                        let chat_future = active_model_provider.chat(
                             ChatRequest {
                                 messages: &prepared_messages.messages,
                                 tools: request_tools,
@@ -1174,7 +1180,7 @@ pub async fn run_tool_call_loop(
         } else {
             // Non-streaming path: wrap with optional per-step timeout from
             // pacing config to catch hung model responses.
-            let chat_future = active_provider.chat(
+            let chat_future = active_model_provider.chat(
                 ChatRequest {
                     messages: &prepared_messages.messages,
                     tools: request_tools,
@@ -1237,7 +1243,7 @@ pub async fn run_tool_call_loop(
                     .unwrap_or((None, None));
 
                 observer.record_event(&ObserverEvent::LlmResponse {
-                    provider: provider_name.to_string(),
+                    model_provider: provider_name.to_string(),
                     model: model.to_string(),
                     duration: llm_started_at.elapsed(),
                     success: true,
@@ -1255,7 +1261,7 @@ pub async fn run_tool_call_loop(
                 let response_text = resp.text_or_empty().to_string();
                 // First try native structured tool calls (OpenAI-format).
                 // Fall back to text-based parsing (XML tags, markdown blocks,
-                // GLM format) only if the provider returned no native calls —
+                // GLM format) only if the model_provider returned no native calls —
                 // this ensures we support both native and prompt-guided models.
                 let mut calls: Vec<ParsedToolCall> = resp
                     .tool_calls
@@ -1352,7 +1358,7 @@ pub async fn run_tool_call_loop(
             Err(e) => {
                 let safe_error = zeroclaw_providers::sanitize_api_error(&e.to_string());
                 observer.record_event(&ObserverEvent::LlmResponse {
-                    provider: provider_name.to_string(),
+                    model_provider: provider_name.to_string(),
                     model: model.to_string(),
                     duration: llm_started_at.elapsed(),
                     success: false,
@@ -1476,7 +1482,7 @@ pub async fn run_tool_call_loop(
         // Accumulate text from this iteration (tool calls present, loop continues).
         accumulated_display_text.push_str(&display_text);
 
-        // Native tool-call providers can return assistant text separately from
+        // Native tool-call model_providers can return assistant text separately from
         // the structured call payload; relay it to draft-capable channels.
         if !display_text.is_empty() {
             if !native_tool_calls.is_empty()
@@ -2014,7 +2020,7 @@ pub async fn run_tool_call_loop(
         messages: history,
         tools: None, // No tools — force a text response
     };
-    match provider
+    match model_provider
         .chat(summary_request, model, Some(temperature))
         .await
     {
@@ -2066,7 +2072,7 @@ pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
 
 // ── CLI Entrypoint ───────────────────────────────────────────────────────
 // Wires up all subsystems (observer, runtime, security, memory, tools,
-// provider, hardware RAG, peripherals) and enters either single-shot or
+// model_provider, hardware RAG, peripherals) and enters either single-shot or
 // interactive REPL mode. The interactive loop manages history compaction
 // and hard trimming to keep the context window bounded.
 
@@ -2103,7 +2109,7 @@ pub async fn run(
         Arc::from(platform::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
 
-    let primary_provider = config.providers.first_provider();
+    let primary_model_provider = config.providers.first_model_provider();
 
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
@@ -2111,7 +2117,7 @@ pub async fn run(
         &config.providers.embedding_routes,
         config.resolve_active_storage(),
         &config.workspace_dir,
-        primary_provider.and_then(|e| e.api_key.as_deref()),
+        primary_model_provider.and_then(|e| e.api_key.as_deref()),
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
@@ -2153,7 +2159,7 @@ pub async fn run(
         &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
-        primary_provider.and_then(|e| e.api_key.as_deref()),
+        primary_model_provider.and_then(|e| e.api_key.as_deref()),
         &config,
         None,
     );
@@ -2255,36 +2261,37 @@ pub async fn run(
         }
     }
 
-    // ── Resolve provider ─────────────────────────────────────────
+    // ── Resolve model_provider ─────────────────────────────────────────
     let mut provider_name = provider_override
         .as_deref()
-        .or(config.providers.first_provider_type())
+        .or(config.providers.first_model_provider_type())
         .unwrap_or("openrouter")
         .to_string();
 
     let mut model_name = model_override
         .as_deref()
-        .or(primary_provider.and_then(|e| e.model.as_deref()))
+        .or(primary_model_provider.and_then(|e| e.model.as_deref()))
         .unwrap_or("anthropic/claude-sonnet-4")
         .to_string();
 
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_from_config(&config);
 
-    let mut provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
-        &provider_name,
-        primary_provider.and_then(|e| e.api_key.as_deref()),
-        primary_provider.and_then(|e| e.base_url.as_deref()),
-        &config.reliability,
-        &config.providers.model_routes,
-        &model_name,
-        &provider_runtime_options,
-    )?;
+    let mut model_provider: Box<dyn ModelProvider> =
+        zeroclaw_providers::create_routed_model_provider_with_options(
+            &provider_name,
+            primary_model_provider.and_then(|e| e.api_key.as_deref()),
+            primary_model_provider.and_then(|e| e.uri.as_deref()),
+            &config.reliability,
+            &config.providers.model_routes,
+            &model_name,
+            &provider_runtime_options,
+        )?;
 
     let model_switch_callback = get_model_switch_state();
 
     observer.record_event(&ObserverEvent::AgentStart {
-        provider: provider_name.to_string(),
+        model_provider: provider_name.to_string(),
         model: model_name.to_string(),
     });
 
@@ -2446,7 +2453,7 @@ pub async fn run(
     } else {
         None
     };
-    let native_tools = provider.supports_native_tools();
+    let native_tools = model_provider.supports_native_tools();
     let mut system_prompt = crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
         &config.workspace_dir,
         &model_name,
@@ -2461,7 +2468,7 @@ pub async fn run(
         agent.max_system_prompt_chars,
     );
 
-    // Append structured tool-use instructions with schemas (only for non-native providers)
+    // Append structured tool-use instructions with schemas (only for non-native model_providers)
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
@@ -2495,11 +2502,9 @@ pub async fn run(
                 let pricing: crate::agent::cost::ModelProviderPricing = config
                     .providers
                     .models
-                    .iter()
-                    .flat_map(|(type_k, alias_map)| {
-                        alias_map.iter().map(move |(alias_k, profile)| {
-                            (format!("{type_k}.{alias_k}"), profile.pricing.clone())
-                        })
+                    .iter_entries()
+                    .map(|(type_k, alias_k, profile)| {
+                        (format!("{type_k}.{alias_k}"), profile.pricing.clone())
                     })
                     .filter(|(_, p)| !p.is_empty())
                     .collect();
@@ -2599,7 +2604,7 @@ pub async fn run(
                 .scope(
                     cost_tracking_context.clone(),
                     run_tool_call_loop(
-                        provider.as_ref(),
+                        model_provider.as_ref(),
                         &mut history,
                         &tools_registry,
                         observer.as_ref(),
@@ -2635,32 +2640,33 @@ pub async fn run(
                     break;
                 }
                 Err(e) => {
-                    if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
+                    if let Some((new_model_provider, new_model)) = is_model_switch_requested(&e) {
                         tracing::info!(
                             "Model switch requested, switching from {} {} to {} {}",
                             provider_name,
                             model_name,
-                            new_provider,
+                            new_model_provider,
                             new_model
                         );
 
-                        provider = zeroclaw_providers::create_routed_provider_with_options(
-                            &new_provider,
-                            primary_provider.and_then(|e| e.api_key.as_deref()),
-                            primary_provider.and_then(|e| e.base_url.as_deref()),
-                            &config.reliability,
-                            &config.providers.model_routes,
-                            &new_model,
-                            &provider_runtime_options,
-                        )?;
+                        model_provider =
+                            zeroclaw_providers::create_routed_model_provider_with_options(
+                                &new_model_provider,
+                                primary_model_provider.and_then(|e| e.api_key.as_deref()),
+                                primary_model_provider.and_then(|e| e.uri.as_deref()),
+                                &config.reliability,
+                                &config.providers.model_routes,
+                                &new_model,
+                                &provider_runtime_options,
+                            )?;
 
-                        provider_name = new_provider;
+                        provider_name = new_model_provider;
                         model_name = new_model;
 
                         clear_model_switch_request();
 
                         observer.record_event(&ObserverEvent::AgentStart {
-                            provider: provider_name.to_string(),
+                            model_provider: provider_name.to_string(),
                             model: model_name.to_string(),
                         });
 
@@ -2911,7 +2917,7 @@ pub async fn run(
                     .scope(
                         cost_tracking_context.clone(),
                         run_tool_call_loop(
-                            provider.as_ref(),
+                            model_provider.as_ref(),
                             &mut history,
                             &tools_registry,
                             observer.as_ref(),
@@ -2948,32 +2954,34 @@ pub async fn run(
                             eprintln!("\n\x1b[2m(cancelled)\x1b[0m");
                             break String::new();
                         }
-                        if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
+                        if let Some((new_model_provider, new_model)) = is_model_switch_requested(&e)
+                        {
                             tracing::info!(
                                 "Model switch requested, switching from {} {} to {} {}",
                                 provider_name,
                                 model_name,
-                                new_provider,
+                                new_model_provider,
                                 new_model
                             );
 
-                            provider = zeroclaw_providers::create_routed_provider_with_options(
-                                &new_provider,
-                                primary_provider.and_then(|e| e.api_key.as_deref()),
-                                primary_provider.and_then(|e| e.base_url.as_deref()),
-                                &config.reliability,
-                                &config.providers.model_routes,
-                                &new_model,
-                                &provider_runtime_options,
-                            )?;
+                            model_provider =
+                                zeroclaw_providers::create_routed_model_provider_with_options(
+                                    &new_model_provider,
+                                    primary_model_provider.and_then(|e| e.api_key.as_deref()),
+                                    primary_model_provider.and_then(|e| e.uri.as_deref()),
+                                    &config.reliability,
+                                    &config.providers.model_routes,
+                                    &new_model,
+                                    &provider_runtime_options,
+                                )?;
 
-                            provider_name = new_provider;
+                            provider_name = new_model_provider;
                             model_name = new_model;
 
                             clear_model_switch_request();
 
                             observer.record_event(&ObserverEvent::AgentStart {
-                                provider: provider_name.to_string(),
+                                model_provider: provider_name.to_string(),
                                 model: model_name.to_string(),
                             });
 
@@ -2994,7 +3002,7 @@ pub async fn run(
                             match compressor
                                 .compress_on_error(
                                     &mut history,
-                                    provider.as_ref(),
+                                    model_provider.as_ref(),
                                     &model_name,
                                     &error_msg,
                                 )
@@ -3050,7 +3058,7 @@ pub async fn run(
                 )
                 .with_memory(mem.clone());
                 match compressor
-                    .compress_if_needed(&mut history, provider.as_ref(), &model_name)
+                    .compress_if_needed(&mut history, model_provider.as_ref(), &model_name)
                     .await
                 {
                     Ok(result) if result.compressed => {
@@ -3091,7 +3099,7 @@ pub async fn run(
 
     let duration = start.elapsed();
     observer.record_event(&ObserverEvent::AgentEnd {
-        provider: provider_name.to_string(),
+        model_provider: provider_name.to_string(),
         model: model_name.to_string(),
         duration,
         tokens_used: None,
@@ -3127,14 +3135,14 @@ pub async fn process_message(
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
-    let primary_provider = config.providers.first_provider();
+    let primary_model_provider = config.providers.first_model_provider();
     let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
         &config.providers.embedding_routes,
         config.resolve_active_storage(),
         &config.workspace_dir,
-        primary_provider.and_then(|e| e.api_key.as_deref()),
+        primary_model_provider.and_then(|e| e.api_key.as_deref()),
     )?);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
@@ -3166,7 +3174,7 @@ pub async fn process_message(
         &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
-        primary_provider.and_then(|e| e.api_key.as_deref()),
+        primary_model_provider.and_then(|e| e.api_key.as_deref()),
         &config,
         None,
     );
@@ -3245,9 +3253,9 @@ pub async fn process_message(
 
     let provider_name = config
         .providers
-        .first_provider_type()
+        .first_model_provider_type()
         .unwrap_or("openrouter");
-    let model_name = match primary_provider
+    let model_name = match primary_model_provider
         .and_then(|e| e.model.as_deref())
         .map(str::trim)
         .filter(|m| !m.is_empty())
@@ -3256,9 +3264,9 @@ pub async fn process_message(
         None => match config.providers.resolve_default_model() {
             Some(m) => {
                 tracing::warn!(
-                    provider = provider_name,
+                    model_provider = provider_name,
                     model = %m,
-                    "fallback provider has no `model` set; using first configured \
+                    "fallback model_provider has no `model` set; using first configured \
                      providers.models entry as default. Set [providers.models.{provider_name}] \
                      model = \"...\" to silence this warning.",
                 );
@@ -3275,15 +3283,16 @@ pub async fn process_message(
     };
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_from_config(&config);
-    let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
-        provider_name,
-        primary_provider.and_then(|e| e.api_key.as_deref()),
-        primary_provider.and_then(|e| e.base_url.as_deref()),
-        &config.reliability,
-        &config.providers.model_routes,
-        &model_name,
-        &provider_runtime_options,
-    )?;
+    let model_provider: Box<dyn ModelProvider> =
+        zeroclaw_providers::create_routed_model_provider_with_options(
+            provider_name,
+            primary_model_provider.and_then(|e| e.api_key.as_deref()),
+            primary_model_provider.and_then(|e| e.uri.as_deref()),
+            &config.reliability,
+            &config.providers.model_routes,
+            &model_name,
+            &provider_runtime_options,
+        )?;
 
     let hardware_rag: Option<crate::rag::HardwareRag> = config
         .peripherals
@@ -3389,7 +3398,7 @@ pub async fn process_message(
     } else {
         None
     };
-    let native_tools = provider.supports_native_tools();
+    let native_tools = model_provider.supports_native_tools();
     let mut system_prompt = crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
         &config.workspace_dir,
         &model_name,
@@ -3426,7 +3435,7 @@ pub async fn process_message(
     let effective_temperature = crate::agent::thinking::clamp_temperature(
         config
             .providers
-            .first_provider()
+            .first_model_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             + thinking_params.temperature_adjustment,
@@ -3475,7 +3484,7 @@ pub async fn process_message(
     }
 
     agent_turn(
-        provider.as_ref(),
+        model_provider.as_ref(),
         &mut history,
         &tools_registry,
         observer.as_ref(),
@@ -3964,17 +3973,19 @@ mod tests {
     }
     use crate::observability::NoopObserver;
     use tempfile::TempDir;
-    use zeroclaw_api::provider::{ProviderCapabilities, StreamChunk, StreamEvent, StreamOptions};
+    use zeroclaw_api::model_provider::{
+        ProviderCapabilities, StreamChunk, StreamEvent, StreamOptions,
+    };
     use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
     use zeroclaw_providers::ChatResponse;
-    use zeroclaw_providers::router::{Route, RouterProvider};
+    use zeroclaw_providers::router::{Route, RouterModelProvider};
 
-    struct NonVisionProvider {
+    struct NonVisionModelProvider {
         calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
-    impl Provider for NonVisionProvider {
+    impl ModelProvider for NonVisionModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -3987,12 +3998,12 @@ mod tests {
         }
     }
 
-    struct VisionProvider {
+    struct VisionModelProvider {
         calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
-    impl Provider for VisionProvider {
+    impl ModelProvider for VisionModelProvider {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 native_tool_calling: false,
@@ -4038,12 +4049,12 @@ mod tests {
         }
     }
 
-    struct ScriptedProvider {
+    struct ScriptedModelProvider {
         responses: Arc<Mutex<VecDeque<ChatResponse>>>,
         capabilities: ProviderCapabilities,
     }
 
-    impl ScriptedProvider {
+    impl ScriptedModelProvider {
         fn from_text_responses(responses: Vec<&str>) -> Self {
             let scripted = responses
                 .into_iter()
@@ -4067,7 +4078,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for ScriptedProvider {
+    impl ModelProvider for ScriptedModelProvider {
         fn capabilities(&self) -> ProviderCapabilities {
             self.capabilities.clone()
         }
@@ -4079,7 +4090,7 @@ mod tests {
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            anyhow::bail!("chat_with_system should not be used in scripted provider tests");
+            anyhow::bail!("chat_with_system should not be used in scripted model_provider tests");
         }
 
         async fn chat(
@@ -4094,17 +4105,17 @@ mod tests {
                 .expect("responses lock should be valid");
             responses
                 .pop_front()
-                .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted responses"))
+                .ok_or_else(|| anyhow::anyhow!("scripted model_provider exhausted responses"))
         }
     }
 
-    struct StreamingScriptedProvider {
+    struct StreamingScriptedModelProvider {
         responses: Arc<Mutex<VecDeque<String>>>,
         stream_calls: Arc<AtomicUsize>,
         chat_calls: Arc<AtomicUsize>,
     }
 
-    impl StreamingScriptedProvider {
+    impl StreamingScriptedModelProvider {
         fn from_text_responses(responses: Vec<&str>) -> Self {
             Self {
                 responses: Arc::new(Mutex::new(
@@ -4117,7 +4128,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for StreamingScriptedProvider {
+    impl ModelProvider for StreamingScriptedModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -4126,7 +4137,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!(
-                "chat_with_system should not be used in streaming scripted provider tests"
+                "chat_with_system should not be used in streaming scripted model_provider tests"
             );
         }
 
@@ -4184,14 +4195,14 @@ mod tests {
         },
     }
 
-    struct StreamingNativeToolEventProvider {
+    struct StreamingNativeToolEventModelProvider {
         turns: Arc<Mutex<VecDeque<NativeStreamTurn>>>,
         stream_calls: Arc<AtomicUsize>,
         stream_tool_requests: Arc<AtomicUsize>,
         chat_calls: Arc<AtomicUsize>,
     }
 
-    impl StreamingNativeToolEventProvider {
+    impl StreamingNativeToolEventModelProvider {
         fn with_turns(turns: Vec<NativeStreamTurn>) -> Self {
             Self {
                 turns: Arc::new(Mutex::new(turns.into())),
@@ -4203,7 +4214,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for StreamingNativeToolEventProvider {
+    impl ModelProvider for StreamingNativeToolEventModelProvider {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 native_tool_calling: true,
@@ -4220,7 +4231,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!(
-                "chat_with_system should not be used in streaming native tool event provider tests"
+                "chat_with_system should not be used in streaming native tool event model_provider tests"
             );
         }
 
@@ -4288,14 +4299,14 @@ mod tests {
         }
     }
 
-    struct RouteAwareStreamingProvider {
+    struct RouteAwareStreamingModelProvider {
         response: String,
         stream_calls: Arc<AtomicUsize>,
         chat_calls: Arc<AtomicUsize>,
         last_model: Arc<Mutex<String>>,
     }
 
-    impl RouteAwareStreamingProvider {
+    impl RouteAwareStreamingModelProvider {
         fn new(response: &str) -> Self {
             Self {
                 response: response.to_string(),
@@ -4307,7 +4318,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for RouteAwareStreamingProvider {
+    impl ModelProvider for RouteAwareStreamingModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -4608,7 +4619,7 @@ mod tests {
     #[tokio::test]
     async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = NonVisionProvider {
+        let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
         };
 
@@ -4619,7 +4630,7 @@ mod tests {
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -4648,7 +4659,7 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect_err("provider without vision support should fail");
+        .expect_err("model_provider without vision support should fail");
 
         assert!(err.to_string().contains("provider_capability_error"));
         assert!(err.to_string().contains("capability=vision"));
@@ -4658,7 +4669,7 @@ mod tests {
     #[tokio::test]
     async fn run_tool_call_loop_rejects_oversized_image_payload() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = VisionProvider {
+        let model_provider = VisionModelProvider {
             calls: Arc::clone(&calls),
         };
 
@@ -4677,7 +4688,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -4718,7 +4729,7 @@ mod tests {
     #[tokio::test]
     async fn run_tool_call_loop_accepts_valid_multimodal_request_flow() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = VisionProvider {
+        let model_provider = VisionModelProvider {
             calls: Arc::clone(&calls),
         };
 
@@ -4729,7 +4740,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -4764,12 +4775,12 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    /// When `vision_provider` is not set and the default provider lacks vision
+    /// When `vision_model_provider` is not set and the default model_provider lacks vision
     /// support, the original `ProviderCapabilityError` should be returned.
     #[tokio::test]
     async fn run_tool_call_loop_no_vision_provider_config_preserves_error() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = NonVisionProvider {
+        let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
         };
 
@@ -4780,7 +4791,7 @@ mod tests {
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -4809,19 +4820,19 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect_err("should fail without vision_provider config");
+        .expect_err("should fail without vision_model_provider config");
 
         assert!(err.to_string().contains("capability=vision"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
-    /// When `vision_provider` is set but the provider factory cannot resolve
+    /// When `vision_model_provider` is set but the model_provider factory cannot resolve
     /// the name, a descriptive error should be returned (not the generic
     /// capability error).
     #[tokio::test]
     async fn run_tool_call_loop_vision_provider_creation_failure() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = NonVisionProvider {
+        let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
         };
 
@@ -4832,13 +4843,13 @@ mod tests {
         let observer = NoopObserver;
 
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
-            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            vision_model_provider: Some("nonexistent-provider-xyz".to_string()),
             vision_model: Some("some-model".to_string()),
             ..Default::default()
         };
 
         let err = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -4867,36 +4878,37 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect_err("should fail when vision provider cannot be created");
+        .expect_err("should fail when vision model_provider cannot be created");
 
         assert!(
-            err.to_string().contains("failed to create vision provider"),
+            err.to_string()
+                .contains("failed to create vision model_provider"),
             "expected creation failure error, got: {}",
             err
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
-    /// Messages without image markers should use the default provider even
-    /// when `vision_provider` is configured.
+    /// Messages without image markers should use the default model_provider even
+    /// when `vision_model_provider` is configured.
     #[tokio::test]
     async fn run_tool_call_loop_no_images_uses_default_provider() {
-        let provider = ScriptedProvider::from_text_responses(vec!["hello world"]);
+        let model_provider = ScriptedModelProvider::from_text_responses(vec!["hello world"]);
 
         let mut history = vec![ChatMessage::user("just text, no images".to_string())];
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
-            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            vision_model_provider: Some("nonexistent-provider-xyz".to_string()),
             vision_model: Some("some-model".to_string()),
             ..Default::default()
         };
 
-        // Even though vision_provider points to a nonexistent provider, this
+        // Even though vision_model_provider points to a nonexistent model_provider, this
         // should succeed because there are no image markers to trigger routing.
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -4925,17 +4937,17 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect("text-only messages should succeed with default provider");
+        .expect("text-only messages should succeed with default model_provider");
 
         assert_eq!(result, "hello world");
     }
 
-    /// When `vision_provider` is set but `vision_model` is not, the default
-    /// model should be used as fallback for the vision provider.
+    /// When `vision_model_provider` is set but `vision_model` is not, the default
+    /// model should be used as fallback for the vision model_provider.
     #[tokio::test]
     async fn run_tool_call_loop_vision_provider_without_model_falls_back() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = NonVisionProvider {
+        let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
         };
 
@@ -4945,17 +4957,17 @@ mod tests {
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
-        // vision_provider set but vision_model is None — the code should
-        // fall back to the default model. Since the provider name is invalid,
-        // we just verify the error path references the correct provider.
+        // vision_model_provider set but vision_model is None — the code should
+        // fall back to the default model. Since the model_provider name is invalid,
+        // we just verify the error path references the correct model_provider.
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
-            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            vision_model_provider: Some("nonexistent-provider-xyz".to_string()),
             vision_model: None,
             ..Default::default()
         };
 
         let err = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -4984,21 +4996,22 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect_err("should fail due to nonexistent vision provider");
+        .expect_err("should fail due to nonexistent vision model_provider");
 
         // Verify the routing was attempted (not the generic capability error).
         assert!(
-            err.to_string().contains("failed to create vision provider"),
+            err.to_string()
+                .contains("failed to create vision model_provider"),
             "expected creation failure, got: {}",
             err
         );
     }
 
     /// Empty `[IMAGE:]` markers (which are preserved as literal text by the
-    /// parser) should not trigger vision provider routing.
+    /// parser) should not trigger vision model_provider routing.
     #[tokio::test]
     async fn run_tool_call_loop_empty_image_markers_use_default_provider() {
-        let provider = ScriptedProvider::from_text_responses(vec!["handled"]);
+        let model_provider = ScriptedModelProvider::from_text_responses(vec!["handled"]);
 
         let mut history = vec![ChatMessage::user(
             "empty marker [IMAGE:] should be ignored".to_string(),
@@ -5007,12 +5020,12 @@ mod tests {
         let observer = NoopObserver;
 
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
-            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            vision_model_provider: Some("nonexistent-provider-xyz".to_string()),
             ..Default::default()
         };
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -5047,11 +5060,11 @@ mod tests {
     }
 
     /// Multiple image markers should still trigger vision routing when
-    /// vision_provider is configured.
+    /// vision_model_provider is configured.
     #[tokio::test]
     async fn run_tool_call_loop_multiple_images_trigger_vision_routing() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = NonVisionProvider {
+        let model_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
         };
 
@@ -5063,13 +5076,13 @@ mod tests {
         let observer = NoopObserver;
 
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
-            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            vision_model_provider: Some("nonexistent-provider-xyz".to_string()),
             vision_model: Some("llava:7b".to_string()),
             ..Default::default()
         };
 
         let err = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -5098,10 +5111,11 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect_err("should attempt vision provider creation for multiple images");
+        .expect_err("should attempt vision model_provider creation for multiple images");
 
         assert!(
-            err.to_string().contains("failed to create vision provider"),
+            err.to_string()
+                .contains("failed to create vision model_provider"),
             "expected creation failure for multiple images, got: {}",
             err
         );
@@ -5169,7 +5183,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_executes_multiple_tools_with_ordered_results() {
-        let provider = ScriptedProvider::from_text_responses(vec![
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"delay_a","arguments":{"value":"A"}}
 </tool_call>
@@ -5209,7 +5223,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -5269,7 +5283,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_injects_channel_delivery_defaults_for_cron_add() {
-        let provider = ScriptedProvider::from_text_responses(vec![
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"cron_add","arguments":{"job_type":"agent","prompt":"remind me later","schedule":{"kind":"every","every_ms":60000}}}
 </tool_call>"#,
@@ -5289,7 +5303,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -5341,7 +5355,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_preserves_explicit_cron_delivery_none() {
-        let provider = ScriptedProvider::from_text_responses(vec![
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"cron_add","arguments":{"job_type":"agent","prompt":"run silently","schedule":{"kind":"every","every_ms":60000},"delivery":{"mode":"none"}}}
 </tool_call>"#,
@@ -5361,7 +5375,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -5405,7 +5419,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_deduplicates_repeated_tool_calls() {
-        let provider = ScriptedProvider::from_text_responses(vec![
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"count_tool","arguments":{"value":"A"}}
 </tool_call>
@@ -5428,7 +5442,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -5479,7 +5493,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_allows_low_risk_shell_in_non_interactive_mode() {
-        let provider = ScriptedProvider::from_text_responses(vec![
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"shell","arguments":{"command":"echo hello"}}
 </tool_call>"#,
@@ -5508,7 +5522,7 @@ mod tests {
         );
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -5554,7 +5568,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_dedup_exempt_allows_repeated_calls() {
-        let provider = ScriptedProvider::from_text_responses(vec![
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"count_tool","arguments":{"value":"A"}}
 </tool_call>
@@ -5578,7 +5592,7 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -5631,7 +5645,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_dedup_exempt_only_affects_listed_tools() {
-        let provider = ScriptedProvider::from_text_responses(vec![
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"count_tool","arguments":{"value":"A"}}
 </tool_call>
@@ -5668,7 +5682,7 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let _result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -5713,7 +5727,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_native_mode_preserves_fallback_tool_call_ids() {
-        let provider = ScriptedProvider::from_text_responses(vec![
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"{"content":"Need to call tool","tool_calls":[{"id":"call_abc","name":"count_tool","arguments":"{\"value\":\"X\"}"}]}"#,
             "done",
         ])
@@ -5732,7 +5746,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -5784,7 +5798,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_relays_native_tool_call_text_via_on_delta() {
-        let provider = ScriptedProvider {
+        let model_provider = ScriptedModelProvider {
             responses: Arc::new(Mutex::new(VecDeque::from(vec![
                 ChatResponse {
                     text: Some("Task started. Waiting 30 seconds before checking status.".into()),
@@ -5824,7 +5838,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -5881,8 +5895,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_consumes_provider_stream_for_final_response() {
-        let provider =
-            StreamingScriptedProvider::from_text_responses(vec!["streamed final answer"]);
+        let model_provider =
+            StreamingScriptedModelProvider::from_text_responses(vec!["streamed final answer"]);
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -5892,7 +5906,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -5921,7 +5935,7 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect("streaming provider should complete");
+        .expect("streaming model_provider should complete");
 
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
@@ -5938,13 +5952,13 @@ mod tests {
             visible_deltas, "streamed final answer",
             "draft should receive upstream deltas once without post-hoc duplication"
         );
-        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(model_provider.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(model_provider.chat_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn run_tool_call_loop_streaming_path_preserves_tool_loop_semantics() {
-        let provider = StreamingScriptedProvider::from_text_responses(vec![
+        let model_provider = StreamingScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"count_tool","arguments":{"value":"A"}}
 </tool_call>"#,
@@ -5963,7 +5977,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -6009,8 +6023,8 @@ mod tests {
             "result should end with 'done', got: {result}"
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(model_provider.stream_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(model_provider.chat_calls.load(Ordering::SeqCst), 0);
         assert_eq!(visible_deltas, "done");
         assert!(
             !visible_deltas.contains("<tool_call"),
@@ -6020,7 +6034,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_streams_native_tool_events_without_chat_fallback() {
-        let provider = StreamingNativeToolEventProvider::with_turns(vec![
+        let model_provider = StreamingNativeToolEventModelProvider::with_turns(vec![
             NativeStreamTurn::ToolCall(ToolCall {
                 id: "call_native_1".to_string(),
                 name: "count_tool".to_string(),
@@ -6042,7 +6056,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -6088,27 +6102,30 @@ mod tests {
             "result should end with 'done', got: {result}"
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(provider.stream_tool_requests.load(Ordering::SeqCst), 2);
-        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(model_provider.stream_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            model_provider.stream_tool_requests.load(Ordering::SeqCst),
+            2
+        );
+        assert_eq!(model_provider.chat_calls.load(Ordering::SeqCst), 0);
         assert_eq!(visible_deltas, "done");
     }
 
     #[tokio::test]
     async fn run_tool_call_loop_routed_streaming_uses_live_provider_deltas_once() {
-        let default_provider = RouteAwareStreamingProvider::new("default answer");
-        let default_stream_calls = Arc::clone(&default_provider.stream_calls);
-        let default_chat_calls = Arc::clone(&default_provider.chat_calls);
+        let default_model_provider = RouteAwareStreamingModelProvider::new("default answer");
+        let default_stream_calls = Arc::clone(&default_model_provider.stream_calls);
+        let default_chat_calls = Arc::clone(&default_model_provider.chat_calls);
 
-        let routed_provider = RouteAwareStreamingProvider::new("routed streamed answer");
-        let routed_stream_calls = Arc::clone(&routed_provider.stream_calls);
-        let routed_chat_calls = Arc::clone(&routed_provider.chat_calls);
-        let routed_last_model = Arc::clone(&routed_provider.last_model);
+        let routed_model_provider = RouteAwareStreamingModelProvider::new("routed streamed answer");
+        let routed_stream_calls = Arc::clone(&routed_model_provider.stream_calls);
+        let routed_chat_calls = Arc::clone(&routed_model_provider.chat_calls);
+        let routed_last_model = Arc::clone(&routed_model_provider.last_model);
 
-        let router = RouterProvider::new(
+        let router = RouterModelProvider::new(
             vec![
-                ("default".to_string(), Box::new(default_provider)),
-                ("fast".to_string(), Box::new(routed_provider)),
+                ("default".to_string(), Box::new(default_model_provider)),
+                ("fast".to_string(), Box::new(routed_model_provider)),
             ],
             vec![(
                 "fast".to_string(),
@@ -6158,7 +6175,7 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect("routed streaming provider should complete");
+        .expect("routed streaming model_provider should complete");
 
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
@@ -6196,7 +6213,7 @@ mod tests {
             .expect("test runtime should initialize");
 
         runtime.block_on(async {
-            let provider = ScriptedProvider::from_text_responses(vec![
+            let model_provider = ScriptedModelProvider::from_text_responses(vec![
                 r#"<tool_call>
 {"name":"pixel__get_api_health","arguments":{"value":"ok"}}
 </tool_call>"#,
@@ -6222,7 +6239,7 @@ mod tests {
             let observer = NoopObserver;
 
             let result = agent_turn(
-                &provider,
+                &model_provider,
                 &mut history,
                 &tools_registry,
                 &observer,
@@ -7070,7 +7087,7 @@ Let me check the result."#;
     /// and replay them on subsequent turns.
     #[tokio::test]
     async fn consume_provider_streaming_response_captures_reasoning_content() {
-        let provider = StreamingNativeToolEventProvider::with_turns(vec![
+        let model_provider = StreamingNativeToolEventModelProvider::with_turns(vec![
             NativeStreamTurn::TextWithReasoning {
                 text: "Listing the directory now.".to_string(),
                 reasoning: "I need to call the shell tool to list files.".to_string(),
@@ -7081,7 +7098,7 @@ Let me check the result."#;
         )];
 
         let outcome = consume_provider_streaming_response(
-            &provider,
+            &model_provider,
             &messages,
             None,
             "deepseek-v4-pro",
@@ -7108,10 +7125,10 @@ Let me check the result."#;
         // Scripted multi-event stream: two reasoning chunks straddling a text
         // delta. The outcome should concatenate the reasoning chunks in order
         // and keep them out of the visible response text.
-        struct MultiChunkProvider;
+        struct MultiChunkModelProvider;
 
         #[async_trait]
-        impl Provider for MultiChunkProvider {
+        impl ModelProvider for MultiChunkModelProvider {
             async fn chat_with_system(
                 &self,
                 _system_prompt: Option<&str>,
@@ -7157,11 +7174,11 @@ Let me check the result."#;
             }
         }
 
-        let provider = MultiChunkProvider;
+        let model_provider = MultiChunkModelProvider;
         let messages = vec![ChatMessage::user("hi")];
 
         let outcome = consume_provider_streaming_response(
-            &provider,
+            &model_provider,
             &messages,
             None,
             "deepseek-v4-flash",
@@ -7327,7 +7344,7 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_surfaces_tool_failure_reason_in_on_delta() {
-        let provider = ScriptedProvider::from_text_responses(vec![
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
             r#"<tool_call>
 {"name":"failing_shell","arguments":{"command":"rm -rf /"}}
 </tool_call>"#,
@@ -7348,7 +7365,7 @@ Let me check the result."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &tools_registry,
             &observer,
@@ -7472,7 +7489,7 @@ Let me check the result."#;
         use crate::observability::noop::NoopObserver;
         use std::collections::HashMap;
 
-        let provider = ScriptedProvider {
+        let model_provider = ScriptedModelProvider {
             responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
                 text: Some("done".to_string()),
                 tool_calls: Vec::new(),
@@ -7504,7 +7521,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(
-                    &provider,
+                    &model_provider,
                     &mut history,
                     &[],
                     &observer,
@@ -7555,7 +7572,8 @@ Let me check the result."#;
         use crate::observability::noop::NoopObserver;
         use std::collections::HashMap;
 
-        let provider = ScriptedProvider::from_text_responses(vec!["should not reach this"]);
+        let model_provider =
+            ScriptedModelProvider::from_text_responses(vec!["should not reach this"]);
         let observer = NoopObserver;
         let workspace = tempfile::TempDir::new().unwrap();
         let cost_config = zeroclaw_config::schema::CostConfig {
@@ -7587,7 +7605,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(
-                    &provider,
+                    &model_provider,
                     &mut history,
                     &[],
                     &observer,
@@ -7631,7 +7649,7 @@ Let me check the result."#;
         use crate::observability::noop::NoopObserver;
 
         // No TOOL_LOOP_COST_TRACKING_CONTEXT scoped — should run fine
-        let provider = ScriptedProvider {
+        let model_provider = ScriptedModelProvider {
             responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
@@ -7648,7 +7666,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(
-            &provider,
+            &model_provider,
             &mut history,
             &[],
             &observer,

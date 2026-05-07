@@ -412,7 +412,7 @@ pub fn all_tools_with_runtime(
     ];
 
     // Register discord_search if any configured Discord alias has
-    // archive enabled. V3 supports multiple Discord aliases (one per
+    // archive enabled. Multiple Discord aliases are supported (one per
     // bot/server set); the search tool reads from a shared archive DB
     // so it's enabled when at least one alias archives.
     if root_config.channels.discord.values().any(|d| d.archive) {
@@ -426,16 +426,16 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // LLM task tool — always registered when a provider is configured
+    // LLM task tool — always registered when a model_provider is configured
     {
         let llm_task_provider = root_config
             .providers
-            .first_provider_type()
+            .first_model_provider_type()
             .unwrap_or("openrouter")
             .to_string();
         let llm_task_model = root_config
             .providers
-            .first_provider()
+            .first_model_provider()
             .and_then(|e| e.model.clone())
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
         let llm_task_runtime_options =
@@ -446,12 +446,12 @@ pub fn all_tools_with_runtime(
             llm_task_model,
             root_config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7),
             root_config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.api_key.clone()),
             llm_task_runtime_options,
         )));
@@ -544,7 +544,7 @@ pub fn all_tools_with_runtime(
     // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {
         tool_arcs.push(Arc::new(WebSearchTool::new_with_config(
-            root_config.web_search.provider.clone(),
+            root_config.web_search.model_provider.clone(),
             root_config.web_search.brave_api_key.clone(),
             root_config.web_search.tavily_api_key.clone(),
             root_config.web_search.searxng_instance_url.clone(),
@@ -919,7 +919,25 @@ pub fn all_tools_with_runtime(
         .with_delegate_config(root_config.delegate.clone())
         .with_workspace_dir(workspace_dir.to_path_buf())
         .with_memory(memory.clone())
-        .with_providers_models(root_config.providers.models.clone())
+        .with_providers_models({
+            // DelegateTool's signature still expects the flat HashMap shape;
+            // collapse the typed ModelProviders container down to base-config
+            // entries here. Family-specific extras (wire_api / requires_openai_auth /
+            // resource / etc.) aren't needed by DelegateTool — it only resolves
+            // baseline fields (model, api_key, uri) for sub-agent dispatch.
+            // Phase 7 will switch DelegateTool to consume Arc<ModelProviders>
+            // directly and drop this collapse.
+            let mut m: std::collections::HashMap<
+                String,
+                std::collections::HashMap<String, zeroclaw_config::schema::ModelProviderConfig>,
+            > = std::collections::HashMap::new();
+            for (t, a, base) in root_config.providers.models.iter_entries() {
+                m.entry(t.to_string())
+                    .or_default()
+                    .insert(a.to_string(), base.clone());
+            }
+            m
+        })
         .with_risk_profiles(root_config.risk_profiles.clone())
         .with_runtime_profiles(root_config.runtime_profiles.clone())
         .with_skill_bundles(root_config.skill_bundles.clone())
@@ -1240,7 +1258,7 @@ mod tests {
         agents.insert(
             "researcher".to_string(),
             DelegateAgentConfig {
-                model_provider: "ollama.researcher".to_string(),
+                model_provider: "ollama.researcher".into(),
                 ..Default::default()
             },
         );

@@ -85,14 +85,14 @@ fn v1_default_provider_target_holds_globals() {
     let entry = cfg
         .providers
         .models
-        .get("openai")
-        .and_then(|m| m.get("default"))
+        .find("openai", "default")
         .expect("openai.default entry synthesized from V1 default_provider");
     assert_eq!(entry.api_key.as_deref(), Some("sk-v1-test-global"));
     assert_eq!(
-        entry.base_url.as_deref(),
-        Some("https://api.example.com/v1"),
-        "V1 api_url renamed to base_url on the per-provider entry"
+        entry.uri.as_deref(),
+        Some("https://api.example.com/v1/chat/completions"),
+        "V1 api_url + api_path merged into the per-provider entry's uri \
+         (uri is now the full endpoint URL; api_path no longer exists)"
     );
     assert_eq!(entry.model.as_deref(), Some("gpt-4o-mini"));
     assert_eq!(entry.temperature, Some(0.5));
@@ -767,8 +767,7 @@ fn cost_prices_dropped_not_folded() {
     let anth = cfg
         .providers
         .models
-        .get("anthropic")
-        .and_then(|m| m.get("default"))
+        .find("anthropic", "default")
         .expect("anthropic.default exists");
     assert!(
         anth.pricing.is_empty(),
@@ -1013,13 +1012,15 @@ channel_ids = ["aaaa"]
 // provider key, then synthesized `model_provider = "<type>:<url>.<alias>"`.
 // V3's `split_once('.')` resolution then tokenized at the first URL dot
 // (e.g. inside `api.z.ai`), making the reference unresolvable. The fix
-// splits the URL into `base_url` on the alias entry and uses only the
-// prefix as the V3 type key, keeping `<type>.<alias>` parseable (#6266
-// review).
+// splits the URL into `uri` on the alias entry and uses only the
+// prefix as the V3 type key, keeping `<type>.<alias>` parseable.
 // ─────────────────────────────────────────────────────────────
 
 #[test]
-fn anthropic_custom_colon_url_default_provider_splits_into_base_url() {
+fn anthropic_custom_colon_url_default_provider_folds_under_anthropic() {
+    // Phase 8 migration sweep: V2 `anthropic-custom:URL` form folds under
+    // providers.models.anthropic.custom with the URL split out onto the
+    // alias entry's `uri` field.
     let raw = r#"
 default_provider = "anthropic-custom:https://api.z.ai/api/anthropic"
 default_model = "claude-sonnet-4"
@@ -1027,25 +1028,21 @@ api_key = "sk-zai-test"
 "#;
     let cfg =
         migrate_to_current(raw).expect("migration succeeds despite colon-URL default_provider");
-    let entry = cfg
-        .providers
-        .models
-        .get("anthropic-custom")
-        .and_then(|m| m.get("default"))
-        .expect(
-            "V3 outer key must be the dot-free prefix `anthropic-custom`, not the raw colon-URL string",
+    let entry =
+        cfg.providers.models.find("anthropic", "custom").expect(
+            "V2 anthropic-custom synonym must fold under providers.models.anthropic.custom",
         );
     assert_eq!(
-        entry.base_url.as_deref(),
+        entry.uri.as_deref(),
         Some("https://api.z.ai/api/anthropic"),
-        "the URL portion of the V2 colon-URL form must land in base_url on the alias entry"
+        "the URL portion of the V2 colon-URL form must land in uri on the alias entry"
     );
     assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4"));
     assert_eq!(entry.api_key.as_deref(), Some("sk-zai-test"));
 }
 
 #[test]
-fn custom_colon_url_default_provider_splits_into_base_url() {
+fn custom_colon_url_default_provider_splits_into_uri() {
     let raw = r#"
 default_provider = "custom:http://localhost:8080/v1"
 default_model = "local-model"
@@ -1055,19 +1052,18 @@ default_model = "local-model"
     let entry = cfg
         .providers
         .models
-        .get("custom")
-        .and_then(|m| m.get("default"))
+        .find("custom", "default")
         .expect("V3 outer key must be `custom`, not the raw colon-URL");
     assert_eq!(
-        entry.base_url.as_deref(),
+        entry.uri.as_deref(),
         Some("http://localhost:8080/v1"),
-        "the URL portion of the V2 colon-URL form must land in base_url"
+        "the URL portion of the V2 colon-URL form must land in uri"
     );
     assert_eq!(entry.model.as_deref(), Some("local-model"));
 }
 
 #[test]
-fn agent_inline_brain_colon_url_provider_splits_into_base_url() {
+fn agent_inline_brain_colon_url_provider_splits_into_uri() {
     // Per-agent colon-URL: synthesize_agent_brains used the raw string as
     // the V3 outer provider key. Same dot-bearing-key bug — must split.
     let raw = r#"
@@ -1107,9 +1103,9 @@ api_key = "sk-zai-agent"
         .and_then(|v| v.get("agent_researcher"))
         .expect("providers.models.anthropic-custom.agent_researcher synthesized");
     assert_eq!(
-        synthesized.get("base_url").and_then(toml::Value::as_str),
+        synthesized.get("uri").and_then(toml::Value::as_str),
         Some("https://api.z.ai/api/anthropic"),
-        "the colon-URL's URL portion must land in base_url on the synthesized alias entry"
+        "the colon-URL's URL portion must land in uri on the synthesized alias entry"
     );
     assert_eq!(
         synthesized.get("model").and_then(toml::Value::as_str),
@@ -1153,4 +1149,112 @@ group_id = "dm"
         signal.group_ids.is_empty(),
         "the \"dm\" sentinel must NOT also land in group_ids[]"
     );
+}
+
+// ─────────────────────────────────────────────────────────────
+// model_routes / embedding_routes — V2 spelled the routing target
+// as `provider`, V3 as `model_provider`. The runtime serde alias was
+// removed; the rename has to happen at migration time.
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn v2_model_routes_provider_field_renamed_to_model_provider() {
+    let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "openai"
+default_model = "gpt-4o"
+
+[[providers.model_routes]]
+hint = "vision"
+provider = "openai"
+model = "gpt-4-vision"
+
+[[providers.model_routes]]
+hint = "fast"
+provider = "groq"
+model = "llama-3.1-8b-instant"
+
+[agents.default]
+model_provider = "openai.default"
+"#;
+    let cfg = migrate_to_current(raw).expect("V2 model_routes migrate");
+    let vision = cfg
+        .providers
+        .model_routes
+        .iter()
+        .find(|r| r.hint == "vision")
+        .expect("vision route");
+    assert_eq!(vision.model_provider, "openai");
+    assert_eq!(vision.model, "gpt-4-vision");
+
+    let fast = cfg
+        .providers
+        .model_routes
+        .iter()
+        .find(|r| r.hint == "fast")
+        .expect("fast route");
+    assert_eq!(fast.model_provider, "groq");
+    assert_eq!(fast.model, "llama-3.1-8b-instant");
+}
+
+#[test]
+fn v2_embedding_routes_provider_field_renamed_to_model_provider() {
+    let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "openai"
+default_model = "gpt-4o"
+
+[[providers.embedding_routes]]
+hint = "semantic"
+provider = "openai"
+model = "text-embedding-3-small"
+dimensions = 1536
+
+[agents.default]
+model_provider = "openai.default"
+"#;
+    let cfg = migrate_to_current(raw).expect("V2 embedding_routes migrate");
+    let semantic = cfg
+        .providers
+        .embedding_routes
+        .iter()
+        .find(|r| r.hint == "semantic")
+        .expect("semantic route");
+    assert_eq!(semantic.model_provider, "openai");
+    assert_eq!(semantic.model, "text-embedding-3-small");
+    assert_eq!(semantic.dimensions, Some(1536));
+}
+
+#[test]
+fn v2_route_rename_idempotent_when_already_v3() {
+    // An operator who already wrote `model_provider` directly (or migration
+    // ran twice) must end up with the V3 field unchanged and no stray
+    // `provider` key floating around.
+    let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "openai"
+default_model = "gpt-4o"
+
+[[providers.model_routes]]
+hint = "vision"
+model_provider = "openai"
+model = "gpt-4-vision"
+
+[agents.default]
+model_provider = "openai.default"
+"#;
+    let cfg = migrate_to_current(raw).expect("idempotent V3-shaped routes migrate");
+    let vision = cfg
+        .providers
+        .model_routes
+        .iter()
+        .find(|r| r.hint == "vision")
+        .expect("vision route");
+    assert_eq!(vision.model_provider, "openai");
 }

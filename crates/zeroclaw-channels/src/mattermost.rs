@@ -138,6 +138,18 @@ impl MattermostChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
+                // Bind the sole registered provider as the agent transcription
+                // provider for the channel-direct ingest path. Multi-provider
+                // setups still resolve via the orchestrator's per-agent
+                // routing (see orchestrator/mod.rs). See wati.rs for full
+                // rationale.
+                let names = m.available_providers();
+                let m = if names.len() == 1 {
+                    let only = names[0].to_string();
+                    m.with_agent_transcription_provider(only)
+                } else {
+                    m
+                };
                 self.transcription_manager = Some(Arc::new(m));
                 self.transcription = Some(config);
             }
@@ -1307,7 +1319,6 @@ mod tests {
         let ch = make_channel(vec!["*".into()], false).with_transcription(
             zeroclaw_config::schema::TranscriptionConfig {
                 enabled: true,
-                default_provider: "groq".to_string(),
                 api_key: Some("test_key".to_string()),
                 api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
                 model: "whisper-large-v3".to_string(),
@@ -1330,7 +1341,6 @@ mod tests {
         let ch = make_channel(vec!["*".into()], false).with_transcription(
             zeroclaw_config::schema::TranscriptionConfig {
                 enabled: true,
-                default_provider: "groq".to_string(),
                 api_key: Some(String::new()),
                 api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
                 model: "whisper-large-v3".to_string(),
@@ -1473,7 +1483,6 @@ mod tests {
         let ch = make_channel(vec!["*".into()], false).with_transcription(
             zeroclaw_config::schema::TranscriptionConfig {
                 enabled: true,
-                default_provider: "groq".to_string(),
                 api_key: Some("test_key".to_string()),
                 api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
                 model: "whisper-large-v3".to_string(),
@@ -1543,7 +1552,6 @@ mod tests {
             )
             .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
                 enabled: true,
-                default_provider: "local_whisper".to_string(),
                 api_key: None,
                 api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
                 model: "whisper-large-v3".to_string(),
@@ -1595,7 +1603,6 @@ mod tests {
             )
             .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
                 enabled: true,
-                default_provider: "local_whisper".to_string(),
                 api_key: None,
                 api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
                 model: "whisper-large-v3".to_string(),

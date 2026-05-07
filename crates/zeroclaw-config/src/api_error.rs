@@ -52,7 +52,7 @@ pub enum ConfigApiCode {
     /// scheme, invalid path prefix, characters outside the allowed set.
     InvalidFormat,
     /// An enum / discriminator field carried a value not in the allowed
-    /// set (e.g. `tunnel.provider` with an unknown name).
+    /// set (e.g. `tunnel.model_provider` with an unknown name).
     InvalidEnumVariant,
     /// A reference to another config entry pointed at something that
     /// doesn't exist (e.g. `agents.<x>.delegate_to` naming a missing agent).

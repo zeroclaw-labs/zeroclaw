@@ -50,7 +50,7 @@ impl Tool for CloudOpsTool {
                 },
                 "cloud": {
                     "type": "string",
-                    "description": "Target cloud provider (aws, azure, gcp). Uses configured default if omitted."
+                    "description": "Target cloud model_provider (aws, azure, gcp). Uses configured default if omitted."
                 }
             },
             "required": ["action", "input"]
@@ -96,7 +96,7 @@ impl Tool for CloudOpsTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Cloud provider '{}' is not in supported_clouds: {:?}",
+                    "Cloud model_provider '{}' is not in supported_clouds: {:?}",
                     cloud, self.config.supported_clouds
                 )),
             });

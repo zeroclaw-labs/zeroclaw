@@ -1580,10 +1580,9 @@ impl SecurityPolicy {
 
     /// Build a `SecurityPolicy` from a resolved risk profile.
     ///
-    /// V3 unified policy entry point: every callsite that used V2's
-    /// `from_config(&autonomy_config, workspace)` now resolves a
+    /// Unified policy entry point: callsites resolve a
     /// [`crate::schema::RiskProfileConfig`] via
-    /// [`crate::schema::Config::active_risk_profile`] and passes it here.
+    /// [`crate::schema::Config::active_risk_profile`] and pass it here.
     pub fn from_risk_profile(
         risk_profile: &crate::schema::RiskProfileConfig,
         workspace_dir: &Path,
@@ -1635,7 +1634,7 @@ impl SecurityPolicy {
     /// Resolve the risk profile owned by `agent_alias` and build a
     /// `SecurityPolicy` from it. Bails when the agent isn't configured or
     /// when its `risk_profile` field doesn't name a configured profile —
-    /// V3 has no global fallback, every security context is per-agent.
+    /// there is no global fallback, every security context is per-agent.
     pub fn for_agent(config: &crate::schema::Config, agent_alias: &str) -> anyhow::Result<Self> {
         let risk_profile = config.risk_profile_for_agent(agent_alias).ok_or_else(|| {
             anyhow::anyhow!(

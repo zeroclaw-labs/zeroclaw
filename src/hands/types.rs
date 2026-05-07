@@ -27,7 +27,7 @@ pub struct Hand {
     /// Tools this hand is allowed to use (None = all available)
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
-    /// Model override for this hand (None = default provider)
+    /// Model override for this hand (None = default model_provider)
     #[serde(default)]
     pub model: Option<String>,
     /// Whether this hand is currently active

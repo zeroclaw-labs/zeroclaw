@@ -35,18 +35,18 @@ mod tests {
         let obs = NoopObserver;
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::AgentStart {
-            provider: "test".into(),
+            model_provider: "test".into(),
             model: "test".into(),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
-            provider: "test".into(),
+            model_provider: "test".into(),
             model: "test".into(),
             duration: Duration::from_millis(100),
             tokens_used: Some(42),
             cost_usd: Some(0.001),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
-            provider: "test".into(),
+            model_provider: "test".into(),
             model: "test".into(),
             duration: Duration::ZERO,
             tokens_used: None,

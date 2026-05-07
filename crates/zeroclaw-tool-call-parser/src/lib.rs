@@ -5,7 +5,7 @@
 //! MiniMax `<invoke>` blocks, Perl-style `[TOOL_CALL]` blocks, markdown fences,
 //! OpenAI native format, and more.
 //!
-//! This crate has no dependency on agent state, memory, providers, or channels.
+//! This crate has no dependency on agent state, memory, model_providers, or channels.
 //! It is pure text transformation.
 
 use regex::Regex;
@@ -30,7 +30,7 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
 }
 
 /// Recursively unwrap stringified JSON objects/arrays nested inside tool arguments.
-/// Why: Gemini (and some other providers) sometimes double-encode nested object/array
+/// Why: Gemini (and some other model_providers) sometimes double-encode nested object/array
 /// parameters as JSON strings inside the outer arguments payload, which breaks tools
 /// that expect `Value::Object` / `Value::Array` at those positions.
 fn unwrap_nested_json_strings(value: serde_json::Value) -> serde_json::Value {
@@ -532,7 +532,7 @@ fn find_json_end(input: &str) -> Option<usize> {
 }
 
 /// Parse XML attribute-style tool calls from response text.
-/// This handles MiniMax and similar providers that output:
+/// This handles MiniMax and similar model_providers that output:
 /// ```xml
 /// <minimax:toolcall>
 /// <invoke name="shell">
@@ -725,7 +725,7 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 }
 
 /// Parse GLM-style tool calls from response text.
-/// Map tool name aliases from various LLM providers to ZeroClaw tool names.
+/// Map tool name aliases from various LLM model_providers to ZeroClaw tool names.
 /// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
 fn map_tool_name_alias(tool_name: &str) -> &str {
     // Strip any dotted namespace prefix (keep only the final segment).
@@ -1012,7 +1012,7 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
 
 // ── Tool-Call Parsing ─────────────────────────────────────────────────────
 // LLM responses may contain tool calls in multiple formats depending on
-// the provider. Parsing follows a priority chain:
+// the model_provider. Parsing follows a priority chain:
 //   1. OpenAI-style JSON with `tool_calls` array (native API)
 //   2. XML tags: <tool_call>, <toolcall>, <tool-call>, <invoke>
 //   3. Markdown code blocks with `tool_call` language
@@ -1047,7 +1047,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     let mut remaining = response;
 
     // First, try to parse as OpenAI-style JSON response with tool_calls array
-    // This handles providers like Minimax that return tool_calls in native JSON format
+    // This handles model_providers like Minimax that return tool_calls in native JSON format
     if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(response.trim()) {
         calls = parse_tool_calls_from_json_value(&json_value);
         if !calls.is_empty() {
@@ -1239,7 +1239,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
-    // Try ```tool <name> format used by some providers (e.g., xAI grok)
+    // Try ```tool <name> format used by some model_providers (e.g., xAI grok)
     // Example: ```tool file_write\n{"path": "...", "content": "..."}\n```
     if calls.is_empty() {
         static MD_TOOL_NAME_RE: LazyLock<Regex> =
@@ -1687,7 +1687,7 @@ After text."#;
 
     #[test]
     fn parse_tool_calls_openai_format_without_content() {
-        // Some providers don't include content field with tool_calls
+        // Some model_providers don't include content field with tool_calls
         let response = r#"{"tool_calls": [{"type": "function", "function": {"name": "memory_recall", "arguments": "{}"}}]}"#;
 
         let (text, calls) = parse_tool_calls(response);

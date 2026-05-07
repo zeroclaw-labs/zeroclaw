@@ -213,7 +213,7 @@ pub async fn run(
             .agents
             .values()
             .filter(|a| a.enabled)
-            .flat_map(|a| a.channels.iter().cloned())
+            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
             .collect();
         let mut mqtt_started = false;
         for (alias, mqtt_config) in &config.channels.mqtt {
@@ -567,7 +567,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 &config.workspace_dir,
                 config
                     .providers
-                    .first_provider()
+                    .first_model_provider()
                     .and_then(|e| e.api_key.as_deref()),
             )
             .ok();
@@ -614,7 +614,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             };
             let temp = config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7);
             let phase2_fut = Box::pin(crate::agent::run(

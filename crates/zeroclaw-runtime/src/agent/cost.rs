@@ -6,9 +6,9 @@ use std::sync::{Arc, OnceLock};
 
 // ── Cost tracking via task-local ──
 
-/// Per-model-provider pricing snapshot consumed by the cost tracker.
+/// Per-provider pricing snapshot consumed by the cost tracker.
 ///
-/// Outer key: model-provider alias (e.g. `openrouter`, `anthropic`,
+/// Outer key: model provider alias (e.g. `openrouter`, `anthropic`,
 /// `azure-openai`). Inner key: user-defined model identifier, optionally
 /// suffixed with `.input` / `.output` to encode pricing dimension. Values
 /// are USD per 1M tokens.
@@ -39,7 +39,7 @@ tokio::task_local! {
 }
 
 /// Resolve `(input, output)` per-1M-token rates for a given model on a given
-/// model-provider's pricing map. Lookup order:
+/// model provider's pricing map. Lookup order:
 ///
 /// 1. Dimension-specific keys: `{model}.input` / `{model}.output`.
 /// 2. Bare model key as a flat fallback applied to whichever dimension
@@ -99,11 +99,11 @@ pub fn record_tool_loop_cost_usage(
     let cost_usage =
         CostTokenUsage::new(model, input_tokens, output_tokens, input_rate, output_rate);
 
-    // Promote first sighting of (provider, model) without pricing to a WARN
+    // Promote first sighting of (model_provider, model) without pricing to a WARN
     // so operators notice the silent zero-cost record before they need to
-    // grep DEBUG logs (#6356). Subsequent sightings stay at DEBUG so the
-    // warn stream doesn't get spammy. V3 form: missing pricing means either
-    // the model_provider has no pricing map at all, or the map exists but
+    // grep DEBUG logs. Subsequent sightings stay at DEBUG so the warn
+    // stream doesn't get spammy. Missing pricing means either the
+    // model_provider has no pricing map at all, or the map exists but
     // produced zero rates for this model.
     if pricing.is_none() || (input_rate == 0.0 && output_rate == 0.0) {
         warn_once_missing_pricing(model_provider_name, model);
@@ -120,20 +120,20 @@ pub fn record_tool_loop_cost_usage(
     Some((cost_usage.total_tokens, cost_usage.cost_usd))
 }
 
-/// Insert `(provider, model)` into `seen`. Returns `true` on first sighting,
+/// Insert `(model_provider, model)` into `seen`. Returns `true` on first sighting,
 /// `false` thereafter. Split out from `warn_once_missing_pricing` so the
 /// dedup contract can be unit-tested with a caller-owned set instead of the
 /// process-static one.
 fn missing_pricing_first_sighting(
     seen: &Mutex<HashSet<(String, String)>>,
-    provider: &str,
+    model_provider: &str,
     model: &str,
 ) -> bool {
     seen.lock()
-        .insert((provider.to_string(), model.to_string()))
+        .insert((model_provider.to_string(), model.to_string()))
 }
 
-/// First-time WARN, subsequent DEBUG, per `(provider, model)` pair.
+/// First-time WARN, subsequent DEBUG, per `(model_provider, model)` pair.
 ///
 /// The default pricing catalog has no entries for most non-OpenAI/Anthropic/
 /// Google models. Operators only realize their cost-tracking surface is
@@ -151,7 +151,7 @@ fn warn_once_missing_pricing(model_provider: &str, model: &str) {
             model,
             "Cost tracking: no pricing entry found for {model_provider}/{model} — \
              token usage will be recorded with zero cost and budget enforcement \
-             is inert for this model. Add a `pricing` table to the model-provider \
+             is inert for this model. Add a `pricing` table to the model provider \
              entry in config.toml (under `[providers.models.\"{model_provider}\"]`) \
              with `\"{model}.input\"` and `\"{model}.output\"` keys (USD per 1M tokens). \
              This warning fires once per (model_provider, model) pair per process.",
@@ -192,7 +192,7 @@ mod tests {
         let seen = fresh_seen();
         assert!(
             missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
-            "first observation of a (provider, model) pair must report first-sighting"
+            "first observation of a (model_provider, model) pair must report first-sighting"
         );
     }
 
@@ -220,13 +220,13 @@ mod tests {
         ));
         assert!(
             missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M3.0"),
-            "different model under same provider is a distinct pair"
+            "different model under same model_provider is a distinct pair"
         );
     }
 
     #[test]
     fn different_providers_for_same_model_are_independent() {
-        // Same model name served by two different providers — operator may
+        // Same model name served by two different model_providers — operator may
         // configure them at different rates, so the warn must fire for each.
         let seen = fresh_seen();
         assert!(missing_pricing_first_sighting(
@@ -236,16 +236,16 @@ mod tests {
         ));
         assert!(
             missing_pricing_first_sighting(&seen, "anthropic", "anthropic/claude-sonnet-4-5"),
-            "different provider for the same model is a distinct pair"
+            "different model_provider for the same model is a distinct pair"
         );
     }
 
     #[test]
     fn empty_strings_dedup_independently() {
-        // Defensive: empty provider or model shouldn't collide with each other.
+        // Defensive: empty model_provider or model shouldn't collide with each other.
         let seen = fresh_seen();
         assert!(missing_pricing_first_sighting(&seen, "", "model"));
-        assert!(missing_pricing_first_sighting(&seen, "provider", ""));
+        assert!(missing_pricing_first_sighting(&seen, "model_provider", ""));
         assert!(missing_pricing_first_sighting(&seen, "", ""));
         assert!(!missing_pricing_first_sighting(&seen, "", ""));
     }

@@ -58,12 +58,38 @@ impl IntegrationCategory {
     }
 }
 
-/// A registered integration
+/// A registered integration.
+///
+/// Activation is data-driven via `model_provider_family`: when set, the entry
+/// is `Active` iff the named typed family slot has any configured alias.
+/// Entries that need richer logic (channels, custom config flags, coming-soon
+/// stubs, multi-family fallbacks) leave `model_provider_family = None` and
+/// supply `status_fn` instead. Setting both is invalid.
 pub struct IntegrationEntry {
     pub name: &'static str,
     pub description: &'static str,
     pub category: IntegrationCategory,
+    /// Typed model_provider family slot whose presence activates this entry.
+    /// `Some("X")` ⇒ `c.providers.models.contains_model_provider_type("X")`.
+    /// AiModel-category entries with a 1:1 family mapping must set this so
+    /// the registry-vs-schema invariant test catches drift.
+    pub model_provider_family: Option<&'static str>,
+    /// Used iff `model_provider_family` is `None`. A no-op stub is fine when
+    /// `model_provider_family` is `Some`.
     pub status_fn: fn(&Config) -> IntegrationStatus,
+}
+
+impl IntegrationEntry {
+    pub fn status(&self, config: &Config) -> IntegrationStatus {
+        if let Some(family) = self.model_provider_family {
+            return if config.providers.models.contains_model_provider_type(family) {
+                IntegrationStatus::Active
+            } else {
+                IntegrationStatus::Available
+            };
+        }
+        (self.status_fn)(config)
+    }
 }
 
 /// Handle the `integrations` CLI command
@@ -73,11 +99,11 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
 
     let Some(entry) = entries.iter().find(|e| e.name.to_lowercase() == name_lower) else {
         anyhow::bail!(
-            "Unknown integration: {name}. Check README for supported integrations or run `zeroclaw onboard` to configure channels/providers."
+            "Unknown integration: {name}. Check README for supported integrations or run `zeroclaw onboard` to configure channels/model_providers."
         );
     };
 
-    let status = (entry.status_fn)(config);
+    let status = entry.status(config);
     let (icon, label) = match status {
         IntegrationStatus::Active => ("✅", "Active"),
         IntegrationStatus::Available => ("⚪", "Available"),
@@ -127,7 +153,7 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("  Setup:");
             println!("    1. Install: brew install ollama");
             println!("    2. Pull a model: ollama pull llama3");
-            println!("    3. Set provider to 'ollama' in config.toml");
+            println!("    3. Set model_provider to 'ollama' in config.toml");
         }
         "iMessage" => {
             println!("  Setup (macOS only):");

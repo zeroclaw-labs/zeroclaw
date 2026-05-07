@@ -22,20 +22,23 @@
 //!   `model_provider = "<provider>.agent_<id>"` alias reference
 //! - **V1/V2 `(custom|anthropic-custom):<url>` colon-URL provider strings**
 //!   → split during migration: the prefix becomes the V3 provider type key,
-//!   the URL lands in the alias entry's `base_url`. This avoids embedding a
+//!   the URL lands in the alias entry's `uri`. This avoids embedding a
 //!   dot-bearing string into the V3 `<type>.<alias>` reference grammar
 //!   (`split_once('.')` would otherwise tokenize at the first URL dot, e.g.
 //!   inside `api.z.ai`, instead of the type/alias boundary).
+//! - **V2 per-entry `base_url` + `api_path` → V3 `uri`** (full endpoint URL).
+//!   Migration concatenates `base_url + api_path` (with leading `/` if needed,
+//!   trailing `/` stripped from base) and writes the result into `uri`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// V1/V2 supported a "colon-URL" provider string form (e.g.
 /// `"anthropic-custom:https://api.z.ai/api/anthropic"`) where the URL was
-/// embedded inline. V3 uses typed `base_url` fields on the per-provider
-/// config entry. This helper splits the colon-URL form into `(type, url)`
+/// embedded inline. V3 uses a typed `uri` field on the per-provider
+/// alias entry. This helper splits the colon-URL form into `(type, url)`
 /// so the migration can use `type` as the V3 provider key and store the
-/// URL in `base_url` on the alias entry. Returns `(type_key, Some(url))`
+/// URL in `uri` on the alias entry. Returns `(type_key, Some(url))`
 /// for colon-URL forms; otherwise `(raw.to_string(), None)`.
 fn split_colon_url_provider(raw: &str) -> (String, Option<String>) {
     if let Some(colon_idx) = raw.find(':') {
@@ -278,11 +281,28 @@ impl V2Config {
             new_providers.insert("models".to_string(), toml::Value::Table(aliased_models));
         }
 
+        // 6'. T13: route-array `provider` → `model_provider` field rename.
+        //     V2 spelled the routing target as `provider` on
+        //     [[providers.model_routes]] and [[providers.embedding_routes]];
+        //     V3 spells it `model_provider` so the qualifier disambiguates
+        //     from TTS / transcription providers. The runtime serde alias was
+        //     stripped, so the rename has to land at migration time.
+        rename_route_provider_field(&mut new_providers, "model_routes");
+        rename_route_provider_field(&mut new_providers, "embedding_routes");
+
         // 6a. T8: TTS subsystem promotion — V2 `[tts.<type>]` per-provider
         //     blocks → V3 `[providers.tts.<type>.<alias>]`. The bare
         //     `tts.default_provider = "openai"` scalar gets rewritten as
         //     dotted alias `"openai.default"` (V3 uses dotted aliases).
         fold_v2_tts_into_providers(&mut passthrough, &mut new_providers);
+
+        // Transcription: V2 `[transcription.<family>]` sub-blocks + the Groq
+        // fields on `[transcription]` directly fold into V3
+        // `[providers.transcription.<family>.default]`. The legacy
+        // `default_provider` / `default_transcription_provider` keys are
+        // dropped — there is no global default-provider concept anymore;
+        // per-agent `agent.<X>.transcription_provider` is the join.
+        fold_v2_transcription_into_providers(&mut passthrough, &mut new_providers);
 
         if !new_providers.is_empty() {
             passthrough.insert("providers".to_string(), toml::Value::Table(new_providers));
@@ -392,12 +412,244 @@ fn restructure_cron(cron_value: toml::Value) -> (toml::Table, toml::Table) {
     (new_cron, scheduler_extras)
 }
 
-/// Convert a V2 `providers.models` flat map (`{id => ModelProviderConfig}`)
-/// into a V3 aliased map (`{provider_type => {alias => ModelProviderConfig}}`).
+/// Normalize a V2 provider type string to its V3 canonical name plus the
+/// extras that the typed family config requires (region endpoint, auth_mode,
+/// alias rename, family-specific fields).
 ///
-/// Rules:
-/// - `claude-code` standalone → `anthropic.claude-code` (per PR body).
-/// - Any other entry `<id>` → `<id>.default` (single alias).
+/// Returns `(canonical_type, alias_key, extras_to_inject)`. `extras_to_inject`
+/// is a vec of `(field_name, toml::Value)` pairs that the migration writes
+/// onto the alias entry table — typically `endpoint = "cn"` for regional
+/// collapses, `auth_mode = "oauth"` for oauth-mode collapses, `wire_api =
+/// "responses"` + `requires_openai_auth = true` for the openai_codex fold.
+///
+/// Built from the upstream/master V2 EOL alias-detector functions verbatim
+/// (`is_moonshot_alias`, `is_qwen_alias`, etc.). SCHEMA IS GOSPEL — every
+/// V2-accepted spelling here was derived by reading the registry match arms
+/// in `git show upstream/master:crates/zeroclaw-providers/src/lib.rs`, not
+/// from doc comments.
+fn normalize_provider_type(
+    raw: &str,
+    incoming_alias: &str,
+) -> (String, String, Vec<(&'static str, toml::Value)>) {
+    let mut extras: Vec<(&'static str, toml::Value)> = Vec::new();
+
+    // Vendor-canonical collapses (synonym kills only; alias unchanged).
+    let synonym_canonical = match raw {
+        // Azure: vendor name; was azure_openai|azure-openai|azure
+        "azure_openai" | "azure-openai" | "azure" => Some("azure"),
+        // xAI: was xai|grok
+        "xai" | "grok" => Some("xai"),
+        // Gemini: vendor product name; was gemini|google|google-gemini
+        "gemini" | "google" | "google-gemini" => Some("gemini"),
+        // Together: was together|together-ai
+        "together" | "together-ai" => Some("together"),
+        // Fireworks: was fireworks|fireworks-ai
+        "fireworks" | "fireworks-ai" => Some("fireworks"),
+        // Vercel AI Gateway: was vercel|vercel-ai
+        "vercel" | "vercel-ai" => Some("vercel"),
+        // Cloudflare AI Gateway: was cloudflare|cloudflare-ai
+        "cloudflare" | "cloudflare-ai" => Some("cloudflare"),
+        // NVIDIA: was nvidia|nvidia-nim|build.nvidia.com
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => Some("nvidia"),
+        // Bedrock: was bedrock|aws-bedrock
+        "bedrock" | "aws-bedrock" => Some("bedrock"),
+        // LMStudio: was lmstudio|lm-studio
+        "lmstudio" | "lm-studio" => Some("lmstudio"),
+        // LiteLLM: was litellm|lite-llm
+        "litellm" | "lite-llm" => Some("litellm"),
+        // HuggingFace: was huggingface|hf
+        "huggingface" | "hf" => Some("huggingface"),
+        // Yi: was yi|01ai|lingyiwanwu
+        "yi" | "01ai" | "lingyiwanwu" => Some("yi"),
+        // Hunyuan: was hunyuan|tencent
+        "hunyuan" | "tencent" => Some("hunyuan"),
+        // Qianfan/Baidu: was qianfan|baidu
+        "qianfan" | "baidu" => Some("qianfan"),
+        // Copilot: was copilot|github-copilot
+        "copilot" | "github-copilot" => Some("copilot"),
+        // OVH: was ovhcloud|ovh
+        "ovhcloud" | "ovh" => Some("ovh"),
+        // OpenCode: was opencode|opencode-zen, opencode-go folded as alias=go
+        "opencode" | "opencode-zen" => Some("opencode"),
+        // llama.cpp: was llamacpp|llama.cpp (dot in key drops)
+        "llamacpp" | "llama.cpp" => Some("llamacpp"),
+        // DeepMyst: was deepmyst|deep-myst
+        "deepmyst" | "deep-myst" => Some("deepmyst"),
+        // SiliconFlow: was siliconflow|silicon-flow
+        "siliconflow" | "silicon-flow" => Some("siliconflow"),
+        // DeepInfra: was deepinfra|deep-infra
+        "deepinfra" | "deep-infra" => Some("deepinfra"),
+        // AI21: was ai21|ai21-labs
+        "ai21" | "ai21-labs" => Some("ai21"),
+        // Friendli: was friendli|friendliai
+        "friendli" | "friendliai" => Some("friendli"),
+        // Lepton: was lepton|lepton-ai
+        "lepton" | "lepton-ai" => Some("lepton"),
+        // Stepfun: was stepfun|step (stepfun-intl handled below as variant)
+        "stepfun" | "step" => Some("stepfun"),
+        // KiloCli: was kilocli|kilo
+        "kilocli" | "kilo" => Some("kilocli"),
+        _ => None,
+    };
+
+    if let Some(canonical) = synonym_canonical {
+        return (canonical.to_string(), incoming_alias.to_string(), extras);
+    }
+
+    // opencode-go folds under opencode as alias=go
+    if raw == "opencode-go" {
+        return ("opencode".to_string(), "go".to_string(), extras);
+    }
+
+    // OpenAI Codex folds under openai with wire_api=responses + requires_openai_auth=true
+    if matches!(raw, "openai-codex" | "openai_codex" | "codex") {
+        extras.push(("wire_api", toml::Value::String("responses".to_string())));
+        extras.push(("requires_openai_auth", toml::Value::Boolean(true)));
+        return ("openai".to_string(), "codex".to_string(), extras);
+    }
+
+    // claude-code folds under anthropic.claude-code (preserved from prior
+    // migration; the canonical name for Anthropic's CLI variant).
+    if raw == "claude-code" {
+        return ("anthropic".to_string(), "claude-code".to_string(), extras);
+    }
+
+    // anthropic-custom is the V1/V2 colon-URL form for "Anthropic-API at
+    // a custom URL" (the URL was already split out into `uri` above by
+    // `alias_provider_models`). Folds under anthropic with alias "custom"
+    // so a stock `anthropic.default` entry and an `anthropic-custom:URL`
+    // entry both migrate cleanly without clobbering each other.
+    if raw == "anthropic-custom" {
+        return ("anthropic".to_string(), "custom".to_string(), extras);
+    }
+
+    // `custom` (the bare V2 placeholder for "user-supplied URL") folds
+    // under the dedicated `custom` typed slot. Preserves the colon-URL
+    // form's URI on the alias entry.
+    if raw == "custom" {
+        return ("custom".to_string(), incoming_alias.to_string(), extras);
+    }
+
+    // Regional + OAuth collapse for Chinese-vendor families. Each block
+    // mirrors the upstream/master V2 alias-detector functions verbatim.
+
+    // Moonshot/Kimi
+    if matches!(
+        raw,
+        "moonshot-intl" | "moonshot-global" | "kimi-intl" | "kimi-global"
+    ) {
+        extras.push(("endpoint", toml::Value::String("intl".to_string())));
+        return ("moonshot".to_string(), incoming_alias.to_string(), extras);
+    }
+    if matches!(raw, "moonshot" | "kimi" | "moonshot-cn" | "kimi-cn") {
+        extras.push(("endpoint", toml::Value::String("cn".to_string())));
+        return ("moonshot".to_string(), incoming_alias.to_string(), extras);
+    }
+    if matches!(raw, "kimi-code" | "kimi_coding" | "kimi_for_coding") {
+        extras.push(("endpoint", toml::Value::String("code".to_string())));
+        return ("moonshot".to_string(), incoming_alias.to_string(), extras);
+    }
+
+    // Qwen / DashScope / Bailian
+    if matches!(raw, "qwen-cn" | "dashscope" | "qwen" | "dashscope-cn") {
+        extras.push(("endpoint", toml::Value::String("cn".to_string())));
+        return ("qwen".to_string(), incoming_alias.to_string(), extras);
+    }
+    if matches!(
+        raw,
+        "qwen-intl" | "dashscope-intl" | "qwen-international" | "dashscope-international"
+    ) {
+        extras.push(("endpoint", toml::Value::String("intl".to_string())));
+        return ("qwen".to_string(), incoming_alias.to_string(), extras);
+    }
+    if matches!(raw, "qwen-us" | "dashscope-us") {
+        extras.push(("endpoint", toml::Value::String("us".to_string())));
+        return ("qwen".to_string(), incoming_alias.to_string(), extras);
+    }
+    if matches!(raw, "qwen-code" | "qwen-oauth" | "qwen_oauth") {
+        extras.push(("endpoint", toml::Value::String("code".to_string())));
+        extras.push(("auth_mode", toml::Value::String("oauth".to_string())));
+        return ("qwen".to_string(), incoming_alias.to_string(), extras);
+    }
+    if matches!(raw, "bailian" | "aliyun-bailian" | "aliyun") {
+        extras.push(("endpoint", toml::Value::String("cn".to_string())));
+        return ("qwen".to_string(), incoming_alias.to_string(), extras);
+    }
+
+    // GLM / Zhipu
+    if matches!(raw, "glm" | "zhipu" | "glm-global" | "zhipu-global") {
+        extras.push(("endpoint", toml::Value::String("global".to_string())));
+        return ("glm".to_string(), incoming_alias.to_string(), extras);
+    }
+    if matches!(raw, "glm-cn" | "zhipu-cn" | "bigmodel") {
+        extras.push(("endpoint", toml::Value::String("cn".to_string())));
+        return ("glm".to_string(), incoming_alias.to_string(), extras);
+    }
+
+    // Z.AI
+    if matches!(raw, "zai" | "z.ai" | "zai-global" | "z.ai-global") {
+        extras.push(("endpoint", toml::Value::String("global".to_string())));
+        return ("zai".to_string(), incoming_alias.to_string(), extras);
+    }
+    if matches!(raw, "zai-cn" | "z.ai-cn") {
+        extras.push(("endpoint", toml::Value::String("cn".to_string())));
+        return ("zai".to_string(), incoming_alias.to_string(), extras);
+    }
+
+    // Minimax (cn/intl + oauth)
+    if matches!(
+        raw,
+        "minimax"
+            | "minimax-intl"
+            | "minimax-io"
+            | "minimax-global"
+            | "minimax-portal"
+            | "minimax-portal-global"
+    ) {
+        extras.push(("endpoint", toml::Value::String("intl".to_string())));
+        return ("minimax".to_string(), incoming_alias.to_string(), extras);
+    }
+    if matches!(raw, "minimax-oauth" | "minimax-oauth-global") {
+        extras.push(("endpoint", toml::Value::String("intl".to_string())));
+        extras.push(("auth_mode", toml::Value::String("oauth".to_string())));
+        return ("minimax".to_string(), incoming_alias.to_string(), extras);
+    }
+    if matches!(raw, "minimax-cn" | "minimaxi" | "minimax-portal-cn") {
+        extras.push(("endpoint", toml::Value::String("cn".to_string())));
+        return ("minimax".to_string(), incoming_alias.to_string(), extras);
+    }
+    if matches!(raw, "minimax-oauth-cn") {
+        extras.push(("endpoint", toml::Value::String("cn".to_string())));
+        extras.push(("auth_mode", toml::Value::String("oauth".to_string())));
+        return ("minimax".to_string(), incoming_alias.to_string(), extras);
+    }
+
+    // Doubao / Volcengine
+    if matches!(raw, "doubao" | "volcengine" | "ark" | "doubao-cn") {
+        return ("doubao".to_string(), incoming_alias.to_string(), extras);
+    }
+
+    // gemini-cli stays as a separate slot (subprocess runtime, not a synonym)
+    if raw == "gemini-cli" {
+        return ("gemini_cli".to_string(), incoming_alias.to_string(), extras);
+    }
+
+    // stepfun-intl folds into stepfun with a different uri
+    if matches!(raw, "stepfun-intl" | "step-intl") {
+        extras.push((
+            "uri",
+            toml::Value::String("https://api.stepfun.com/intl/v1".to_string()),
+        ));
+        return ("stepfun".to_string(), incoming_alias.to_string(), extras);
+    }
+
+    // Unknown/passthrough: keep the raw key. Silent drop will happen at V3
+    // deserialize if it doesn't match any typed slot — that's the migration's
+    // accountability gap, intentional per #6273. Operators with truly novel
+    // names (a forked custom backend) need a slot defined for it.
+    (raw.to_string(), incoming_alias.to_string(), extras)
+}
+
 fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
     let flat = match models {
         Some(toml::Value::Table(t)) => t,
@@ -405,22 +657,27 @@ fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
     };
     let mut aliased = toml::Table::new();
     for (provider_id, mut config) in flat {
-        let (provider_type, alias) = if provider_id == "claude-code" {
-            ("anthropic".to_string(), "claude-code".to_string())
-        } else {
-            // Colon-URL form like `"anthropic-custom:https://..."`: split
-            // the URL out into `base_url` and use only the prefix as the V3
-            // outer key. Avoids dot-bearing keys that would break the
-            // `<type>.<alias>` reference grammar (#6266 review).
-            let (type_key, url) = split_colon_url_provider(&provider_id);
-            if let Some(url) = url
-                && let toml::Value::Table(t) = &mut config
-            {
-                t.entry("base_url".to_string())
-                    .or_insert(toml::Value::String(url));
+        // Colon-URL form like `"anthropic-custom:https://..."`: split the URL
+        // out into `uri` and use only the prefix as the seed for normalization.
+        let (raw_type, url) = split_colon_url_provider(&provider_id);
+        if let Some(url) = url
+            && let toml::Value::Table(t) = &mut config
+        {
+            t.entry("uri".to_string())
+                .or_insert(toml::Value::String(url));
+        }
+
+        let (provider_type, alias, extras) = normalize_provider_type(&raw_type, "default");
+
+        // Inject family-specific extras (endpoint, auth_mode, wire_api,
+        // requires_openai_auth, uri) onto the alias entry table — overrides
+        // by the operator's own config win via .or_insert.
+        if let toml::Value::Table(t) = &mut config {
+            for (field, value) in extras {
+                t.entry(field.to_string()).or_insert(value);
             }
-            (type_key, "default".to_string())
-        };
+        }
+
         let entry = aliased
             .entry(provider_type)
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
@@ -435,7 +692,7 @@ fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
 /// onto the V3 per-provider `ModelProviderConfig` entry.
 ///
 /// Field renames applied during the fold:
-/// - `api_url` → `base_url` (matches V3 `ModelProviderConfig.base_url`)
+/// - `api_url` (+ optional `api_path` suffix) → `uri` (matches V3 `ModelProviderConfig.uri`)
 /// - `default_model` → `model`
 /// - `default_temperature` → `temperature`
 /// - `provider_timeout_secs` → `timeout_secs`
@@ -482,17 +739,29 @@ fn fold_providers_globals_into_models(
     // Determine target (provider_type, alias). For colon-URL forms like
     // `"anthropic-custom:https://..."`, split the URL out of the type key so
     // the V3 reference grammar (`<type>.<alias>`) doesn't tokenize at a URL
-    // dot (#6266 review). The URL is folded into `base_url` below.
-    let (target_type, target_alias, colon_url) =
+    // dot (#6266 review). The URL is folded into `uri` below.
+    //
+    // Then run the V2-EOL provider name through `normalize_provider_type` so
+    // synonym kills + regional/oauth collapses + claude_code/openai_codex
+    // folds happen here too — same canonical-naming gate as
+    // `alias_provider_models`. Without this, an operator with
+    // `default_provider = "grok"` would land in a `grok` slot that doesn't
+    // exist on V3 ModelProviders and silently disappear.
+    let (target_type, target_alias, colon_url, normalized_extras) =
         match g_default_provider.as_ref().and_then(toml::Value::as_str) {
-            Some("claude-code") => ("anthropic".to_string(), "claude-code".to_string(), None),
             Some(s) => {
-                let (type_key, url) = split_colon_url_provider(s);
-                (type_key, "default".to_string(), url)
+                let (raw_type, url) = split_colon_url_provider(s);
+                let (canonical, alias, extras) = normalize_provider_type(&raw_type, "default");
+                (canonical, alias, url, extras)
             }
             None => match aliased_models.keys().next() {
-                Some(k) => (k.clone(), "default".to_string(), None),
-                None => ("openrouter".to_string(), "default".to_string(), None),
+                Some(k) => (k.clone(), "default".to_string(), None, Vec::new()),
+                None => (
+                    "openrouter".to_string(),
+                    "default".to_string(),
+                    None,
+                    Vec::new(),
+                ),
             },
         };
 
@@ -515,13 +784,28 @@ fn fold_providers_globals_into_models(
     // precedence over the global `api_url` field — both originate from V2's
     // top-level providers block, but the colon-URL form was the more specific
     // hint when the user wrote `default_provider = "anthropic-custom:<url>"`.
+    // V3's `uri` field is the full endpoint URL — concatenate any V2 `api_path`
+    // suffix onto it, since `api_path` no longer exists separately.
     let base_url_source = colon_url.map(toml::Value::String).or(g_api_url);
+    let uri_source = match (base_url_source, g_api_path) {
+        (Some(toml::Value::String(b)), Some(toml::Value::String(p))) => {
+            let trimmed_b = b.trim_end_matches('/');
+            let suffix = if p.starts_with('/') {
+                p
+            } else {
+                format!("/{p}")
+            };
+            Some(toml::Value::String(format!("{trimmed_b}{suffix}")))
+        }
+        (Some(b), _) => Some(b),
+        // api_path alone, without a base, has nowhere to live in V3 — drop.
+        (None, _) => None,
+    };
 
     // Per-provider entries take precedence: only fill missing slots.
     for (target_key, source) in [
         ("api_key", g_api_key),
-        ("base_url", base_url_source),
-        ("api_path", g_api_path),
+        ("uri", uri_source),
         ("model", g_default_model),
         ("temperature", g_default_temperature),
         ("timeout_secs", g_provider_timeout_secs),
@@ -532,6 +816,15 @@ fn fold_providers_globals_into_models(
             && !alias_table.contains_key(target_key)
         {
             alias_table.insert(target_key.to_string(), value);
+        }
+    }
+
+    // Inject family-specific extras (endpoint, auth_mode, wire_api,
+    // requires_openai_auth, uri) from the normalize_provider_type call
+    // above. Operator-set fields win — only fill missing slots.
+    for (field, value) in normalized_extras {
+        if !alias_table.contains_key(field) {
+            alias_table.insert(field.to_string(), value);
         }
     }
 
@@ -898,14 +1191,14 @@ fn synthesize_agent_brains(
         let temperature = agent_table.remove("temperature");
         if let Some(toml::Value::String(raw_provider)) = provider {
             // Colon-URL form: split the URL out so the V3 outer key stays
-            // dot-free and the URL lands in `base_url` on the alias entry
+            // dot-free and the URL lands in `uri` on the alias entry
             // (#6266 review — `split_once('.')` would otherwise tokenize at
             // a URL dot like the one inside `api.z.ai`).
             let (provider_type, colon_url) = split_colon_url_provider(&raw_provider);
             let provider_alias = format!("agent_{}", alias);
             let mut entry = toml::Table::new();
             if let Some(url) = colon_url {
-                entry.insert("base_url".to_string(), toml::Value::String(url));
+                entry.insert("uri".to_string(), toml::Value::String(url));
             }
             if let Some(m) = model {
                 entry.insert("model".to_string(), m);
@@ -1270,6 +1563,100 @@ fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut
     }
 }
 
+/// Fold V2 `[transcription]` flat block + per-family sub-blocks into V3's
+/// typed `[providers.transcription.<family>.<alias>]` shape. The Groq
+/// fields lived directly on `[transcription]` in V2 (api_key, api_url,
+/// model, language, initial_prompt) — they migrate to
+/// `[providers.transcription.groq.default]`. Per-family sub-blocks
+/// (`[transcription.openai]`, etc.) migrate to
+/// `[providers.transcription.<family>.default]`.
+///
+/// Behavior fields (`enabled`, `transcribe_non_ptt_audio`,
+/// `max_duration_secs`) stay on `[transcription]`. Legacy default-provider
+/// keys (`default_provider`, `default_model_provider`,
+/// `default_transcription_provider`) are dropped — V3 has no global
+/// default; per-agent `transcription_provider` is the only selector.
+fn fold_v2_transcription_into_providers(
+    passthrough: &mut toml::Table,
+    new_providers: &mut toml::Table,
+) {
+    let Some(toml::Value::Table(transcription_table)) = passthrough.get_mut("transcription") else {
+        return;
+    };
+
+    let mut transcription_aliased = toml::Table::new();
+
+    // Per-family sub-blocks: move to providers.transcription.<family>.default.
+    const V3_TRANSCRIPTION_FAMILIES: &[&str] = &[
+        "openai",
+        "deepgram",
+        "assemblyai",
+        "google",
+        "local_whisper",
+    ];
+    for family in V3_TRANSCRIPTION_FAMILIES {
+        if let Some(value) = transcription_table.remove(*family) {
+            let mut wrapped = toml::Table::new();
+            wrapped.insert("default".to_string(), value);
+            transcription_aliased.insert((*family).to_string(), toml::Value::Table(wrapped));
+        }
+    }
+
+    // Groq lived directly on [transcription] in V2. Extract its fields into
+    // [providers.transcription.groq.default] so V3 can find it via the typed
+    // family slot. Pulled fields: api_key, api_url, model, language,
+    // initial_prompt. Behavior fields (enabled, transcribe_non_ptt_audio,
+    // max_duration_secs) stay on [transcription].
+    let mut groq_entry = toml::Table::new();
+    for groq_field in &["api_key", "api_url", "model", "language", "initial_prompt"] {
+        if let Some(v) = transcription_table.remove(*groq_field) {
+            groq_entry.insert((*groq_field).to_string(), v);
+        }
+    }
+    if !groq_entry.is_empty() {
+        let mut wrapped = toml::Table::new();
+        wrapped.insert("default".to_string(), toml::Value::Table(groq_entry));
+        transcription_aliased.insert("groq".to_string(), toml::Value::Table(wrapped));
+        tracing::info!(
+            target: "migration",
+            "[transcription] Groq fields promoted to [providers.transcription.groq.default]"
+        );
+    }
+
+    // Drop legacy default-provider keys — V3 has no global default-provider
+    // field. Operators select transcription per agent
+    // (`agent.<X>.transcription_provider`).
+    for legacy_default in &[
+        "default_provider",
+        "default_model_provider",
+        "default_transcription_provider",
+    ] {
+        if transcription_table.remove(*legacy_default).is_some() {
+            tracing::info!(
+                target: "migration",
+                "[transcription].{legacy_default} dropped (V3 has no global default-provider; set agent.<X>.transcription_provider instead)"
+            );
+        }
+    }
+
+    if !transcription_aliased.is_empty() {
+        // Merge into existing providers.transcription if any (operator may
+        // have written V3-style entries already).
+        let providers_transcription = new_providers
+            .entry("transcription".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let Some(existing) = providers_transcription.as_table_mut() {
+            for (family, value) in transcription_aliased {
+                existing.entry(family).or_insert(value);
+            }
+        }
+        tracing::info!(
+            target: "migration",
+            "[transcription.<family>] sub-blocks promoted to [providers.transcription.<family>.default]"
+        );
+    }
+}
+
 /// **T9 + T10**: Fold V2 `[memory.qdrant]`, `[memory.postgres]`, and
 /// `[storage.provider.config]` into V3 `[storage.<backend>.<alias>]`.
 ///
@@ -1290,6 +1677,42 @@ fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut
 ///   maps the fields directly).
 ///
 /// `[memory.sqlite_open_timeout_secs]` is dropped (V3 moved it onto
+/// Rename the `provider` field to `model_provider` in each entry of
+/// `providers.<routes_key>` (used for `model_routes` and `embedding_routes`).
+/// V2 spelled the routing target as `provider`; V3 spells it `model_provider`.
+/// The runtime serde alias was eradicated so this rename has to land at
+/// migration time. If `provider` is missing the entry is left untouched —
+/// it is already V3-shaped, dropped, or invalid in a way validation will
+/// catch.
+fn rename_route_provider_field(new_providers: &mut toml::Table, routes_key: &str) {
+    let Some(toml::Value::Array(routes)) = new_providers.get_mut(routes_key) else {
+        return;
+    };
+    let mut renamed = 0usize;
+    for entry in routes.iter_mut() {
+        let toml::Value::Table(t) = entry else {
+            continue;
+        };
+        if t.contains_key("model_provider") {
+            // Already V3-shaped (operator wrote `model_provider` directly,
+            // or migration ran twice). Drop a stray `provider` if present
+            // so downstream serde doesn't trip on an unknown field.
+            t.remove("provider");
+            continue;
+        }
+        if let Some(value) = t.remove("provider") {
+            t.insert("model_provider".to_string(), value);
+            renamed += 1;
+        }
+    }
+    if renamed > 0 {
+        tracing::info!(
+            target: "migration",
+            "[providers.{routes_key}] {renamed} entry/entries: `provider` field renamed to `model_provider`"
+        );
+    }
+}
+
 /// `SqliteStorageConfig.open_timeout_secs`).
 ///
 /// Existing V3-shaped fields take precedence over the legacy fold (so a

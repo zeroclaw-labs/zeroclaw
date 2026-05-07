@@ -9,10 +9,10 @@ struct Backend {
     api_key: Option<String>,
 }
 
-fn resolve_backend(provider: &str) -> anyhow::Result<Backend> {
-    let cfg = read_provider_config(provider)?;
+fn resolve_backend(model_provider: &str) -> anyhow::Result<Backend> {
+    let cfg = read_model_provider_config(model_provider)?;
     let model = cfg.model
-        .ok_or_else(|| anyhow::anyhow!("No model set for provider '{provider}' — add `model = \"...\"` to [providers.models.{provider}] in config.toml"))?;
+        .ok_or_else(|| anyhow::anyhow!("No model set for model_provider '{model_provider}' — add `model = \"...\"` to [providers.models.{model_provider}] in config.toml"))?;
     Ok(Backend {
         base_url: cfg.base_url,
         model,
@@ -23,7 +23,7 @@ fn resolve_backend(provider: &str) -> anyhow::Result<Backend> {
 pub fn run(
     locale: Option<&str>,
     force: bool,
-    provider: Option<&str>,
+    model_provider: Option<&str>,
     batch: Option<usize>,
 ) -> anyhow::Result<()> {
     let root = repo_root();
@@ -39,9 +39,9 @@ pub fn run(
         None => locales().into_iter().filter(|l| l != "en").collect(),
     };
 
-    let provider_name = provider.ok_or_else(|| {
+    let provider_name = model_provider.ok_or_else(|| {
         anyhow::anyhow!(
-            "--provider <name> is required (configured in [providers.models.<name>] in config.toml)"
+            "--model-provider <name> is required (configured in [providers.models.<name>] in config.toml)"
         )
     })?;
     let backend = resolve_backend(provider_name)?;

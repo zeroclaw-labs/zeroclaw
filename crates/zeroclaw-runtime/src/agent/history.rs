@@ -59,7 +59,7 @@ pub fn truncate_tool_result(output: &str, max_chars: usize) -> String {
 /// Truncate a tool message's content, preserving JSON structure when the
 /// message stores `tool_call_id` alongside `content` (native tool-call
 /// format). Without this, `truncate_tool_result` destroys the JSON envelope
-/// and downstream providers receive a `null` `call_id` (#5425).
+/// and downstream model_providers receive a `null` `call_id` (#5425).
 pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
     if max_chars == 0 || msg_content.len() <= max_chars {
         return msg_content.to_string();

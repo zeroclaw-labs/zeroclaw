@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::Result;
 use std::sync::Arc;
 
-use zeroclaw_api::provider::{ChatMessage, Provider};
+use zeroclaw_api::model_provider::{ChatMessage, ModelProvider};
 use zeroclaw_memory::traits::Memory;
 use zeroclaw_providers::multimodal;
 
@@ -46,7 +46,7 @@ fn next_probe_tier(current: usize) -> usize {
 // Error message parsing
 // ---------------------------------------------------------------------------
 
-/// Try to extract the actual context window limit from a provider error message.
+/// Try to extract the actual context window limit from a model_provider error message.
 pub fn parse_context_limit_from_error(msg: &str) -> Option<usize> {
     // Match patterns like "maximum context length is 128000" or "limit of 200000 tokens"
     // or "context window of 131072" or "available context size (8448 tokens)"
@@ -193,7 +193,7 @@ impl ContextCompressor {
     pub async fn compress_if_needed(
         &self,
         history: &mut Vec<ChatMessage>,
-        provider: &dyn Provider,
+        model_provider: &dyn ModelProvider,
         model: &str,
     ) -> Result<CompressionResult> {
         if !self.config.enabled {
@@ -236,7 +236,7 @@ impl ContextCompressor {
 
         let mut passes_used = 0;
         for _ in 0..self.config.max_passes {
-            let did_compress = self.compress_once(history, provider, model).await?;
+            let did_compress = self.compress_once(history, model_provider, model).await?;
             if did_compress {
                 passes_used += 1;
             }
@@ -259,7 +259,7 @@ impl ContextCompressor {
     pub async fn compress_on_error(
         &mut self,
         history: &mut Vec<ChatMessage>,
-        provider: &dyn Provider,
+        model_provider: &dyn ModelProvider,
         model: &str,
         error_msg: &str,
     ) -> Result<bool> {
@@ -276,7 +276,9 @@ impl ContextCompressor {
             "Context limit adjusted, re-compressing"
         );
 
-        let result = self.compress_if_needed(history, provider, model).await?;
+        let result = self
+            .compress_if_needed(history, model_provider, model)
+            .await?;
         Ok(result.compressed)
     }
 
@@ -284,7 +286,7 @@ impl ContextCompressor {
     async fn compress_once(
         &self,
         history: &mut Vec<ChatMessage>,
-        provider: &dyn Provider,
+        model_provider: &dyn ModelProvider,
         model: &str,
     ) -> Result<bool> {
         let n = history.len();
@@ -309,7 +311,7 @@ impl ContextCompressor {
         let transcript = build_summarizer_transcript(
             middle,
             self.config.source_max_chars,
-            provider.supports_vision(),
+            model_provider.supports_vision(),
         );
 
         if transcript.is_empty() {
@@ -334,7 +336,7 @@ impl ContextCompressor {
         let timeout = Duration::from_secs(self.config.timeout_secs);
         let summary_raw = match tokio::time::timeout(
             timeout,
-            provider.chat_with_system(
+            model_provider.chat_with_system(
                 Some(SUMMARIZER_SYSTEM),
                 &user_prompt,
                 summary_model,
@@ -541,13 +543,13 @@ mod tests {
         }
     }
 
-    struct CaptureSummarizerProvider {
+    struct CaptureSummarizerModelProvider {
         supports_vision: bool,
         seen_messages: Mutex<Vec<String>>,
     }
 
     #[async_trait]
-    impl Provider for CaptureSummarizerProvider {
+    impl ModelProvider for CaptureSummarizerModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -561,10 +563,10 @@ mod tests {
 
         async fn chat(
             &self,
-            _request: zeroclaw_api::provider::ChatRequest<'_>,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
             _model: &str,
             _temperature: Option<f64>,
-        ) -> Result<zeroclaw_api::provider::ChatResponse> {
+        ) -> Result<zeroclaw_api::model_provider::ChatResponse> {
             unreachable!("context compressor uses chat_with_system")
         }
 
@@ -800,7 +802,7 @@ mod tests {
             ..Default::default()
         };
         let compressor = ContextCompressor::new(config, 64);
-        let provider = CaptureSummarizerProvider {
+        let model_provider = CaptureSummarizerModelProvider {
             supports_vision: false,
             seen_messages: Mutex::new(Vec::new()),
         };
@@ -812,12 +814,12 @@ mod tests {
         ];
 
         let result = compressor
-            .compress_if_needed(&mut history, &provider, "model")
+            .compress_if_needed(&mut history, &model_provider, "model")
             .await
             .expect("compression should succeed");
 
         assert!(result.compressed);
-        let seen = provider.seen_messages.lock();
+        let seen = model_provider.seen_messages.lock();
         let prompt = seen.last().expect("summarizer should be invoked");
         assert!(!prompt.contains("[IMAGE:"));
         assert!(!prompt.contains("/tmp/example.png"));

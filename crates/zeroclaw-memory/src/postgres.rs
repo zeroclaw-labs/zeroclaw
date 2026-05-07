@@ -2,7 +2,7 @@
 //!
 //! Compiled in only when the crate is built with `--features memory-postgres`.
 //! Selected at runtime by setting `[memory].backend = "postgres"` and
-//! supplying `db_url` under `[storage.provider.config]`. Optional pgvector
+//! supplying `db_url` under `[storage.model_provider.config]`. Optional pgvector
 //! support is enabled via `[memory.postgres].vector_enabled`.
 //!
 //! Designed for multi-instance deployments where several agents need to share

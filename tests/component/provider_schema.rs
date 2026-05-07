@@ -1,10 +1,10 @@
-//! TG7: Provider Schema Conformance Tests
+//! TG7: ModelProvider Schema Conformance Tests
 //!
 //! Prevents: Pattern 7 — External schema compatibility bugs (7% of user bugs).
 //! Issues: #769, #843
 //!
 //! Tests request/response serialization to verify required fields are present
-//! for each provider's API specification. Validates ChatMessage, ChatResponse,
+//! for each model_provider's API specification. Validates ChatMessage, ChatResponse,
 //! ToolCall, and AuthStyle serialization contracts.
 
 use zeroclaw::providers::compatible::AuthStyle;
@@ -250,41 +250,45 @@ fn auth_style_custom_header() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Provider naming consistency
+// ModelProvider naming consistency
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn provider_construction_with_different_names() {
-    use zeroclaw::providers::compatible::OpenAiCompatibleProvider;
+    use zeroclaw::providers::compatible::OpenAiCompatibleModelProvider;
 
     // Construction with various names should succeed
-    let _p1 = OpenAiCompatibleProvider::new(
+    let _p1 = OpenAiCompatibleModelProvider::new(
         "DeepSeek",
         "https://api.deepseek.com",
         Some("test-key"),
         AuthStyle::Bearer,
     );
-    let _p2 =
-        OpenAiCompatibleProvider::new("deepseek", "https://api.test.com", None, AuthStyle::Bearer);
+    let _p2 = OpenAiCompatibleModelProvider::new(
+        "deepseek",
+        "https://api.test.com",
+        None,
+        AuthStyle::Bearer,
+    );
 }
 
 #[test]
 fn provider_construction_with_different_auth_styles() {
-    use zeroclaw::providers::compatible::OpenAiCompatibleProvider;
+    use zeroclaw::providers::compatible::OpenAiCompatibleModelProvider;
 
-    let _bearer = OpenAiCompatibleProvider::new(
+    let _bearer = OpenAiCompatibleModelProvider::new(
         "Test",
         "https://api.test.com",
         Some("key"),
         AuthStyle::Bearer,
     );
-    let _xapi = OpenAiCompatibleProvider::new(
+    let _xapi = OpenAiCompatibleModelProvider::new(
         "Test",
         "https://api.test.com",
         Some("key"),
         AuthStyle::XApiKey,
     );
-    let _custom = OpenAiCompatibleProvider::new(
+    let _custom = OpenAiCompatibleModelProvider::new(
         "Test",
         "https://api.test.com",
         Some("key"),

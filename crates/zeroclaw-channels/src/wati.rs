@@ -58,6 +58,21 @@ impl WatiChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
+                // Per-agent `transcription_provider` routes through the
+                // orchestrator's resolved-runtime path. For the
+                // `try_transcribe_audio` direct path (gateway WS handler /
+                // channel-side ingest), bind to the sole registered provider
+                // when only one is configured so the single-provider case
+                // dispatches without an agent context. Multi-provider setups
+                // still require explicit `agent.<alias>.transcription_provider`
+                // routing through the orchestrator.
+                let names = m.available_providers();
+                let m = if names.len() == 1 {
+                    let only = names[0].to_string();
+                    m.with_agent_transcription_provider(only)
+                } else {
+                    m
+                };
                 self.transcription_manager = Some(std::sync::Arc::new(m));
             }
             Err(e) => {
@@ -717,7 +732,6 @@ mod tests {
     fn wati_manager_some_when_valid_config() {
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_provider: "groq".to_string(),
             api_key: Some("test-key".to_string()),
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "distil-whisper-large-v3-en".to_string(),
@@ -747,7 +761,6 @@ mod tests {
     fn wati_manager_none_and_warn_on_init_failure() {
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_provider: "groq".to_string(),
             api_key: Some(String::new()),
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "distil-whisper-large-v3-en".to_string(),
@@ -790,7 +803,6 @@ mod tests {
     async fn wati_try_transcribe_returns_none_when_no_media_url() {
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: false,
-            default_provider: "groq".to_string(),
             api_key: Some("test-key".to_string()),
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "distil-whisper-large-v3-en".to_string(),
@@ -932,7 +944,6 @@ mod tests {
 
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_provider: "local_whisper".to_string(),
             api_key: None,
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "whisper-1".to_string(),
@@ -985,7 +996,6 @@ mod tests {
 
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_provider: "local_whisper".to_string(),
             api_key: None,
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "whisper-1".to_string(),
@@ -1041,7 +1051,6 @@ mod tests {
     async fn wati_try_transcribe_blocks_host_mismatch() {
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_provider: "local_whisper".into(),
             local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
                 url: "http://localhost:8001/v1/transcribe".into(),
                 bearer_token: Some("test-token".into()),

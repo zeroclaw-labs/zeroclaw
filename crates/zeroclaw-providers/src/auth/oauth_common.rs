@@ -1,4 +1,4 @@
-//! Common OAuth2 utilities shared across providers.
+//! Common OAuth2 utilities shared across model_providers.
 //!
 //! This module contains shared functionality for OAuth2 authentication:
 //! - PKCE (Proof Key for Code Exchange) state generation

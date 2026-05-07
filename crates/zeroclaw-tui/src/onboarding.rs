@@ -604,7 +604,7 @@ impl OnboardUi for RatatuiUi {
     fn heading(&mut self, level: u8, text: &str) {
         // level 1 = section (breadcrumb root). Entering a new section
         // clears subsection, help, and log — the user is in a new phase.
-        // level 2 = subsection (e.g. picked provider / channel). Only
+        // level 2 = subsection (e.g. picked model_provider / channel). Only
         // clears help, since the log may still be carrying status from
         // just-completed subsection work.
         match level {

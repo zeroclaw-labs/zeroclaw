@@ -1680,7 +1680,7 @@ mod tests {
 
     #[test]
     fn declarative_config_parses_from_toml() {
-        // V3 alias-keyed cron map: `[cron.<alias>]` syntax.
+        // Alias-keyed cron map: `[cron.<alias>]` syntax.
         let toml_str = r#"
 [cron.daily-report]
 name = "Daily Report"

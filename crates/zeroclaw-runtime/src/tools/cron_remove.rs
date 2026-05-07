@@ -123,17 +123,14 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
-        config.providers.models.insert(
-            "openrouter".to_string(),
-            std::collections::HashMap::from([(
-                "default".to_string(),
-                zeroclaw_config::schema::ModelProviderConfig::default(),
-            )]),
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::OpenRouterModelProviderConfig::default(),
         );
         config.agents.insert(
             "test-agent".to_string(),
             zeroclaw_config::schema::DelegateAgentConfig {
-                model_provider: "openrouter.default".to_string(),
+                model_provider: "openrouter.default".into(),
                 risk_profile: "default".to_string(),
                 ..Default::default()
             },
@@ -152,13 +149,11 @@ mod tests {
         config
             .providers
             .models
-            .entry("openrouter".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
+            .ensure("openrouter", "default")
+            .expect("known family");
         config.agents.entry("test-agent".to_string()).or_insert(
             zeroclaw_config::schema::DelegateAgentConfig {
-                model_provider: "openrouter.default".to_string(),
+                model_provider: "openrouter.default".into(),
                 risk_profile: "default".to_string(),
                 ..Default::default()
             },

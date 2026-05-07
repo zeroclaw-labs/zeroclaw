@@ -1,63 +1,63 @@
-//! E2E test for vision support in providers.
+//! E2E test for vision support in model_providers.
 //!
 //! This test validates that:
-//! 1. Provider reports vision capability
-//! 2. Provider correctly processes messages with [IMAGE:...] markers
+//! 1. ModelProvider reports vision capability
+//! 2. ModelProvider correctly processes messages with [IMAGE:...] markers
 //! 3. Request is sent to API with proper image_url format
 //!
 //! Requires:
-//! - Live provider OAuth credentials (OpenAI Codex or Gemini)
+//! - Live model_provider OAuth credentials (OpenAI Codex or Gemini)
 //! - Test image at /tmp/test_vision.png
 //!
 //! Run manually: `cargo test provider_vision -- --ignored --nocapture`
 
 use anyhow::Result;
-use zeroclaw::providers::{ChatMessage, ChatRequest, ProviderRuntimeOptions};
+use zeroclaw::providers::{ChatMessage, ChatRequest, ModelProviderRuntimeOptions};
 
 /// Moderate temperature for vision E2E probes; the test asserts on request
 /// shape and success rather than output determinism, so 0.7 (historical
 /// codebase default) keeps behavior matching earlier runs.
 const VISION_PROBE_TEMPERATURE: f64 = 0.7;
 
-/// Tests that provider supports vision input.
+/// Tests that model_provider supports vision input.
 ///
 /// This test:
-/// 1. Creates provider via factory (tries OpenAI Codex, falls back to Gemini)
+/// 1. Creates model_provider via factory (tries OpenAI Codex, falls back to Gemini)
 /// 2. Verifies vision capability is reported
 /// 3. Sends a message with [IMAGE:...] marker
 /// 4. Verifies request succeeds without capability error
 #[tokio::test]
-#[ignore = "requires live provider OAuth credentials"]
+#[ignore = "requires live model_provider OAuth credentials"]
 async fn provider_vision_support() -> Result<()> {
-    // Use Gemini provider (OpenAI Codex is rate-limited until 21 Feb)
-    println!("Creating Gemini provider...");
-    let provider = zeroclaw::providers::create_provider("gemini", None)?;
+    // Use Gemini model_provider (OpenAI Codex is rate-limited until 21 Feb)
+    println!("Creating Gemini model_provider...");
+    let model_provider = zeroclaw::providers::create_model_provider("gemini", None)?;
     let provider_name = "gemini";
     let model = "gemini-2.5-pro";
 
-    println!("✓ Created {} provider", provider_name);
+    println!("✓ Created {} model_provider", provider_name);
 
-    // Warmup provider (for OAuth token refresh if needed)
-    println!("Warming up provider...");
-    provider.warmup().await?;
-    println!("✓ Provider warmed up");
+    // Warmup model_provider (for OAuth token refresh if needed)
+    println!("Warming up model_provider...");
+    model_provider.warmup().await?;
+    println!("✓ ModelProvider warmed up");
 
     // Verify vision capability
-    let capabilities = provider.capabilities();
+    let capabilities = model_provider.capabilities();
     println!(
-        "Provider {} capabilities: vision={}",
+        "ModelProvider {} capabilities: vision={}",
         provider_name, capabilities.vision
     );
 
     if !capabilities.vision {
         anyhow::bail!(
-            "❌ {} provider does not report vision capability! \
-             Check that provider's capabilities() returns vision=true",
+            "❌ {} model_provider does not report vision capability! \
+             Check that model_provider's capabilities() returns vision=true",
             provider_name
         );
     }
 
-    println!("✓ Provider {} reports vision=true", provider_name);
+    println!("✓ ModelProvider {} reports vision=true", provider_name);
 
     // Prepare test image path
     let test_image = "/tmp/test_vision.png";
@@ -93,9 +93,9 @@ async fn provider_vision_support() -> Result<()> {
         tools: None,
     };
 
-    // Send request to provider
+    // Send request to model_provider
     println!("Using model: {}", model);
-    let result = provider
+    let result = model_provider
         .chat(request, model, Some(VISION_PROBE_TEMPERATURE))
         .await;
 
@@ -107,7 +107,7 @@ async fn provider_vision_support() -> Result<()> {
             }
             println!("Tool calls: {}", response.tool_calls.len());
 
-            // Success: provider accepted vision input
+            // Success: model_provider accepted vision input
             println!("\n✅ {} vision support is working!", provider_name);
             Ok(())
         }
@@ -124,7 +124,7 @@ async fn provider_vision_support() -> Result<()> {
                 eprintln!("Possible causes:");
                 eprintln!("  1. Service binary not rebuilt (check timestamp)");
                 eprintln!("  2. Service not restarted with new binary");
-                eprintln!("  3. Provider factory returning wrong implementation");
+                eprintln!("  3. ModelProvider factory returning wrong implementation");
                 anyhow::bail!("Vision capability check failed in agent loop");
             }
 
@@ -142,44 +142,46 @@ async fn provider_vision_support() -> Result<()> {
 /// Tests that OpenAI Codex second profile supports vision input.
 ///
 /// This test:
-/// 1. Creates OpenAI Codex provider with "second" profile override
+/// 1. Creates OpenAI Codex model_provider with "second" profile override
 /// 2. Verifies vision capability is reported
 /// 3. Sends a message with [IMAGE:...] marker
 /// 4. Verifies request succeeds without capability error
 #[tokio::test]
 #[ignore = "requires live OpenAI Codex OAuth credentials (second profile)"]
 async fn openai_codex_second_vision_support() -> Result<()> {
-    println!("Creating OpenAI Codex provider with second profile...");
+    println!("Creating OpenAI Codex model_provider with second profile...");
 
-    // Create provider with profile override
-    let opts = ProviderRuntimeOptions {
+    // Create model_provider with profile override
+    let opts = ModelProviderRuntimeOptions {
         auth_profile_override: Some("second".to_string()),
         secrets_encrypt: false,
+        requires_openai_auth: true,
         ..Default::default()
     };
 
-    let provider = zeroclaw::providers::create_provider_with_options("openai-codex", None, &opts)?;
-    let provider_name = "openai-codex:second";
+    let model_provider =
+        zeroclaw::providers::create_model_provider_with_options("openai", None, &opts)?;
+    let provider_name = "openai.codex:second";
     let model = "gpt-5.3-codex";
 
-    println!("✓ Created {} provider", provider_name);
+    println!("✓ Created {} model_provider", provider_name);
 
     // Verify vision capability
-    let capabilities = provider.capabilities();
+    let capabilities = model_provider.capabilities();
     println!(
-        "Provider {} capabilities: vision={}",
+        "ModelProvider {} capabilities: vision={}",
         provider_name, capabilities.vision
     );
 
     if !capabilities.vision {
         anyhow::bail!(
-            "❌ {} provider does not report vision capability! \
-             Check that provider's capabilities() returns vision=true",
+            "❌ {} model_provider does not report vision capability! \
+             Check that model_provider's capabilities() returns vision=true",
             provider_name
         );
     }
 
-    println!("✓ Provider {} reports vision=true", provider_name);
+    println!("✓ ModelProvider {} reports vision=true", provider_name);
 
     // Prepare test image path
     let test_image = "/tmp/test_vision.png";
@@ -215,9 +217,9 @@ async fn openai_codex_second_vision_support() -> Result<()> {
         tools: None,
     };
 
-    // Send request to provider
+    // Send request to model_provider
     println!("Using model: {}", model);
-    let result = provider
+    let result = model_provider
         .chat(request, model, Some(VISION_PROBE_TEMPERATURE))
         .await;
 
@@ -229,7 +231,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
             }
             println!("Tool calls: {}", response.tool_calls.len());
 
-            // Success: provider accepted vision input
+            // Success: model_provider accepted vision input
             println!("\n✅ {} vision support is working!", provider_name);
             Ok(())
         }

@@ -11,7 +11,7 @@ use uuid::Uuid;
 /// Qdrant vector database memory backend.
 ///
 /// Uses Qdrant's REST API for vector storage and semantic search.
-/// Requires an embedding provider for converting text to vectors.
+/// Requires an embedding model_provider for converting text to vectors.
 pub struct QdrantMemory {
     client: reqwest::Client,
     base_url: String,
@@ -29,7 +29,7 @@ impl QdrantMemory {
     /// * `url` - Qdrant server URL (e.g., `"http://localhost:6333"`)
     /// * `collection` - Collection name for storing memories
     /// * `api_key` - Optional API key for Qdrant Cloud
-    /// * `embedder` - Embedding provider for vector conversion
+    /// * `embedder` - Embedding model_provider for vector conversion
     pub async fn new(
         url: &str,
         collection: &str,

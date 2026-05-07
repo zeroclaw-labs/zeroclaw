@@ -1,8 +1,8 @@
-use crate::ProviderRuntimeOptions;
+use crate::ModelProviderRuntimeOptions;
 use crate::auth::AuthService;
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::multimodal;
-use crate::traits::{ChatMessage, Provider, ProviderCapabilities};
+use crate::traits::{ChatMessage, ModelProvider, ProviderCapabilities};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -18,7 +18,7 @@ const DEFAULT_CODEX_INSTRUCTIONS: &str =
 /// OpenAI Codex speaks the "responses" wire protocol, not chat_completions.
 const WIRE_API: &str = "responses";
 
-pub struct OpenAiCodexProvider {
+pub struct OpenAiCodexModelProvider {
     auth: AuthService,
     auth_profile_override: Option<String>,
     responses_url: String,
@@ -90,9 +90,9 @@ struct ResponsesContent {
     text: Option<String>,
 }
 
-impl OpenAiCodexProvider {
+impl OpenAiCodexModelProvider {
     pub fn new(
-        options: &ProviderRuntimeOptions,
+        options: &ModelProviderRuntimeOptions,
         gateway_api_key: Option<&str>,
     ) -> anyhow::Result<Self> {
         let state_dir = options
@@ -155,7 +155,7 @@ fn build_responses_url(base_or_endpoint: &str) -> anyhow::Result<String> {
     Ok(parsed.to_string())
 }
 
-fn resolve_responses_url(options: &ProviderRuntimeOptions) -> anyhow::Result<String> {
+fn resolve_responses_url(options: &ModelProviderRuntimeOptions) -> anyhow::Result<String> {
     if let Some(endpoint) = std::env::var(CODEX_RESPONSES_URL_ENV)
         .ok()
         .and_then(|value| first_nonempty(Some(&value)))
@@ -592,7 +592,7 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<St
     extract_responses_text(&parsed).ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))
 }
 
-impl OpenAiCodexProvider {
+impl OpenAiCodexModelProvider {
     async fn send_responses_request(
         &self,
         input: Vec<ResponsesInput>,
@@ -641,7 +641,7 @@ impl OpenAiCodexProvider {
         } else {
             Some(oauth_access_token.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`."
+                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --model-provider openai-codex`."
                 )
             })?)
         };
@@ -650,7 +650,7 @@ impl OpenAiCodexProvider {
         } else {
             Some(account_id.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again."
+                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --model-provider openai-codex` again."
                 )
             })?)
         };
@@ -716,8 +716,8 @@ impl OpenAiCodexProvider {
 }
 
 #[async_trait]
-impl Provider for OpenAiCodexProvider {
-    // ── Provider-family defaults ──
+impl ModelProvider for OpenAiCodexModelProvider {
+    // ── ModelProvider-family defaults ──
     fn default_wire_api(&self) -> &str {
         WIRE_API
     }
@@ -832,7 +832,7 @@ mod tests {
         );
         let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, Some("https://base.example.com/v1"));
 
-        let options = ProviderRuntimeOptions::default();
+        let options = ModelProviderRuntimeOptions::default();
         assert_eq!(
             resolve_responses_url(&options).unwrap(),
             "https://env.example.com/v1/responses"
@@ -845,9 +845,9 @@ mod tests {
         let _endpoint_guard = EnvGuard::set(CODEX_RESPONSES_URL_ENV, None);
         let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, None);
 
-        let options = ProviderRuntimeOptions {
+        let options = ModelProviderRuntimeOptions {
             provider_api_url: Some("https://proxy.example.com/v1".to_string()),
-            ..ProviderRuntimeOptions::default()
+            ..ModelProviderRuntimeOptions::default()
         };
 
         assert_eq!(
@@ -869,14 +869,14 @@ mod tests {
 
     #[test]
     fn constructor_enables_custom_endpoint_key_mode() {
-        let options = ProviderRuntimeOptions {
+        let options = ModelProviderRuntimeOptions {
             provider_api_url: Some("https://api.tonsof.blue/v1".to_string()),
-            ..ProviderRuntimeOptions::default()
+            ..ModelProviderRuntimeOptions::default()
         };
 
-        let provider = OpenAiCodexProvider::new(&options, Some("test-key")).unwrap();
-        assert!(provider.custom_endpoint);
-        assert_eq!(provider.gateway_api_key.as_deref(), Some("test-key"));
+        let model_provider = OpenAiCodexModelProvider::new(&options, Some("test-key")).unwrap();
+        assert!(model_provider.custom_endpoint);
+        assert_eq!(model_provider.gateway_api_key.as_deref(), Some("test-key"));
     }
 
     #[test]
@@ -1130,13 +1130,13 @@ data: [DONE]
 
     #[test]
     fn capabilities_includes_vision() {
-        let options = ProviderRuntimeOptions {
+        let options = ModelProviderRuntimeOptions {
             secrets_encrypt: false,
             ..Default::default()
         };
-        let provider =
-            OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
-        let caps = provider.capabilities();
+        let model_provider = OpenAiCodexModelProvider::new(&options, None)
+            .expect("model_provider should initialize");
+        let caps = model_provider.capabilities();
 
         assert!(!caps.native_tool_calling);
         assert!(caps.vision);

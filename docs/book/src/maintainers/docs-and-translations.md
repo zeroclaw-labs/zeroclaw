@@ -17,8 +17,8 @@ Ollama is the current canonical source for docs. Ensure you have [Ollama](https:
 
 ```toml
 # Local via Ollama — free, runs on your machine
-[providers.models.ollama]
-base_url = "http://localhost:11434"
+[providers.models.ollama.default]
+uri   = "http://localhost:11434"
 model = "qwen3.6:35b-a3b" # Current preferred model
 ```
 

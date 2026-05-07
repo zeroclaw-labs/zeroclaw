@@ -23,7 +23,7 @@ impl Tool for ModelSwitchTool {
     }
 
     fn description(&self) -> &str {
-        "Switch the AI model at runtime. Use 'get' to see current model, 'list_providers' to see available providers, 'list_models' to see models for a provider, or 'set' to switch to a different model. The switch takes effect immediately for the current conversation."
+        "Switch the AI model at runtime. Use 'get' to see current model, 'list_model_providers' to see available model_providers, 'list_models' to see models for a model_provider, or 'set' to switch to a different model. The switch takes effect immediately for the current conversation."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -32,12 +32,12 @@ impl Tool for ModelSwitchTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["get", "set", "list_providers", "list_models"],
-                    "description": "Action to perform: get current model, set a new model, list available providers, or list models for a provider"
+                    "enum": ["get", "set", "list_model_providers", "list_models"],
+                    "description": "Action to perform: get current model, set a new model, list available model_providers, or list models for a model_provider"
                 },
-                "provider": {
+                "model_provider": {
                     "type": "string",
-                    "description": "Provider name (e.g., 'openai', 'anthropic', 'groq', 'ollama'). Required for 'set' and 'list_models' actions."
+                    "description": "ModelProvider name (e.g., 'openai', 'anthropic', 'groq', 'ollama'). Required for 'set' and 'list_models' actions."
                 },
                 "model": {
                     "type": "string",
@@ -65,13 +65,13 @@ impl Tool for ModelSwitchTool {
         match action {
             "get" => self.handle_get(),
             "set" => self.handle_set(&args),
-            "list_providers" => self.handle_list_providers(),
+            "list_model_providers" => self.handle_list_providers(),
             "list_models" => self.handle_list_models(&args),
             _ => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Unknown action: {}. Valid actions: get, set, list_providers, list_models",
+                    "Unknown action: {}. Valid actions: get, set, list_model_providers, list_models",
                     action
                 )),
             }),
@@ -88,22 +88,22 @@ impl ModelSwitchTool {
             success: true,
             output: serde_json::to_string_pretty(&json!({
                 "pending_switch": pending,
-                "note": "To switch models, use action 'set' with provider and model parameters"
+                "note": "To switch models, use action 'set' with model_provider and model parameters"
             }))?,
             error: None,
         })
     }
 
     fn handle_set(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
-        let provider = args.get("provider").and_then(|v| v.as_str());
+        let model_provider = args.get("model_provider").and_then(|v| v.as_str());
 
-        let provider = match provider {
+        let model_provider = match model_provider {
             Some(p) => p,
             None => {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some("Missing 'provider' parameter for 'set' action".to_string()),
+                    error: Some("Missing 'model_provider' parameter for 'set' action".to_string()),
                 });
             }
         };
@@ -121,43 +121,38 @@ impl ModelSwitchTool {
             }
         };
 
-        // Validate the provider exists.
-        // Custom URL-based providers (e.g. "custom:https://api.nvidia.com/v1")
-        // and Anthropic-compatible custom endpoints bypass the known-provider
-        // check because they are not in the static provider list.
-        let is_custom_provider =
-            provider.starts_with("custom:") || provider.starts_with("anthropic-custom:");
+        // Validate the model_provider exists. Legacy colon-URL forms
+        // ("custom:https://..." and "anthropic-custom:...") are collapsed at
+        // TOML load by `normalize_model_provider_type` in `schema/v2.rs` into
+        // the typed `custom` family slot, so the runtime only sees canonical
+        // model-provider names. Validate against the static catalog directly.
+        let known_model_providers = zeroclaw_providers::list_model_providers();
+        let model_provider_valid = known_model_providers
+            .iter()
+            .any(|p| p.name.eq_ignore_ascii_case(model_provider));
 
-        if !is_custom_provider {
-            let known_providers = zeroclaw_providers::list_providers();
-            let provider_valid = known_providers.iter().any(|p| {
-                p.name.eq_ignore_ascii_case(provider)
-                    || p.aliases.iter().any(|a| a.eq_ignore_ascii_case(provider))
+        if !model_provider_valid {
+            return Ok(ToolResult {
+                success: false,
+                output: serde_json::to_string_pretty(&json!({
+                    "available_model_providers": known_model_providers.iter().map(|p| p.name).collect::<Vec<_>>()
+                }))?,
+                error: Some(format!(
+                    "Unknown model model_provider: {}. Use 'list_model_providers' to see available options.",
+                    model_provider
+                )),
             });
-
-            if !provider_valid {
-                return Ok(ToolResult {
-                    success: false,
-                    output: serde_json::to_string_pretty(&json!({
-                        "available_providers": known_providers.iter().map(|p| p.name).collect::<Vec<_>>()
-                    }))?,
-                    error: Some(format!(
-                        "Unknown provider: {}. Use 'list_providers' to see available options, or use 'custom:<url>' for custom endpoints.",
-                        provider
-                    )),
-                });
-            }
         }
 
         // Set the global model switch request
         let switch_state = get_model_switch_state();
-        *switch_state.lock().unwrap() = Some((provider.to_string(), model.to_string()));
+        *switch_state.lock().unwrap() = Some((model_provider.to_string(), model.to_string()));
 
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
                 "message": "Model switch requested",
-                "provider": provider,
+                "model_provider": model_provider,
                 "model": model,
                 "note": "The agent will switch to this model on the next turn. Use 'get' to check pending switch."
             }))?,
@@ -166,15 +161,14 @@ impl ModelSwitchTool {
     }
 
     fn handle_list_providers(&self) -> anyhow::Result<ToolResult> {
-        let providers_list = zeroclaw_providers::list_providers();
+        let providers_list = zeroclaw_providers::list_model_providers();
 
-        let providers: Vec<serde_json::Value> = providers_list
+        let model_providers: Vec<serde_json::Value> = providers_list
             .iter()
             .map(|p| {
                 json!({
                     "name": p.name,
                     "display_name": p.display_name,
-                    "aliases": p.aliases,
                     "local": p.local
                 })
             })
@@ -183,32 +177,32 @@ impl ModelSwitchTool {
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
-                "providers": providers,
-                "count": providers.len(),
-                "example": "Use action 'set' with provider and model to switch"
+                "model_providers": model_providers,
+                "count": model_providers.len(),
+                "example": "Use action 'set' with model_provider and model to switch"
             }))?,
             error: None,
         })
     }
 
     fn handle_list_models(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
-        let provider = args.get("provider").and_then(|v| v.as_str());
+        let model_provider = args.get("model_provider").and_then(|v| v.as_str());
 
-        let provider = match provider {
+        let model_provider = match model_provider {
             Some(p) => p,
             None => {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(
-                        "Missing 'provider' parameter for 'list_models' action".to_string(),
+                        "Missing 'model_provider' parameter for 'list_models' action".to_string(),
                     ),
                 });
             }
         };
 
-        // Return common models for known providers
-        let models = match provider.to_lowercase().as_str() {
+        // Return common models for known model_providers
+        let models = match model_provider.to_lowercase().as_str() {
             "openai" => vec![
                 "gpt-4o",
                 "gpt-4o-mini",
@@ -250,9 +244,9 @@ impl ModelSwitchTool {
             return Ok(ToolResult {
                 success: true,
                 output: serde_json::to_string_pretty(&json!({
-                    "provider": provider,
+                    "model_provider": model_provider,
                     "models": [],
-                    "note": "No common models listed for this provider. Check provider documentation for available models."
+                    "note": "No common models listed for this model_provider. Check model_provider documentation for available models."
                 }))?,
                 error: None,
             });
@@ -261,9 +255,9 @@ impl ModelSwitchTool {
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
-                "provider": provider,
+                "model_provider": model_provider,
                 "models": models,
-                "example": "Use action 'set' with this provider and a model ID to switch"
+                "example": "Use action 'set' with this model_provider and a model ID to switch"
             }))?,
             error: None,
         })

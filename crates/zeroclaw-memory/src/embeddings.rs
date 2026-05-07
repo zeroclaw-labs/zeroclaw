@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 
-/// Trait for embedding providers — convert text to vectors
+/// Trait for embedding model_providers — convert text to vectors
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
-    /// Provider name
+    /// ModelProvider name
     fn name(&self) -> &str;
 
     /// Embedding dimensions
@@ -21,7 +21,7 @@ pub trait EmbeddingProvider: Send + Sync {
     }
 }
 
-// ── Noop provider (keyword-only fallback) ────────────────────
+// ── Noop model_provider (keyword-only fallback) ────────────────────
 
 pub struct NoopEmbedding;
 
@@ -40,7 +40,7 @@ impl EmbeddingProvider for NoopEmbedding {
     }
 }
 
-// ── OpenAI-compatible embedding provider ─────────────────────
+// ── OpenAI-compatible embedding model_provider ─────────────────────
 
 pub struct OpenAiEmbedding {
     base_url: String,
@@ -157,12 +157,12 @@ impl EmbeddingProvider for OpenAiEmbedding {
 // ── Factory ──────────────────────────────────────────────────
 
 pub fn create_embedding_provider(
-    provider: &str,
+    model_provider: &str,
     api_key: Option<&str>,
     model: &str,
     dims: usize,
 ) -> Box<dyn EmbeddingProvider> {
-    match provider {
+    match model_provider {
         "openai" => {
             let key = api_key.unwrap_or("");
             Box::new(OpenAiEmbedding::new(

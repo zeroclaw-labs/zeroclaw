@@ -490,7 +490,7 @@ impl AcpServer {
         let default_model = self
             .config
             .providers
-            .first_provider()
+            .first_model_provider()
             .and_then(|e| e.model.clone());
 
         let mut zeroclaw_meta = serde_json::json!({
@@ -556,9 +556,9 @@ impl AcpServer {
             .to_string_lossy()
             .into_owned();
 
-        // V3 has no default agent — every ACP session is bound to an
-        // explicit agent. Accept `agentAlias` (camelCase) or `agent_alias`
-        // / `agent` from the JSON-RPC params object.
+        // No default agent — every ACP session is bound to an explicit
+        // agent. Accept `agentAlias` (camelCase) or `agent_alias` / `agent`
+        // from the JSON-RPC params object.
         let agent_alias = params
             .get("agentAlias")
             .or_else(|| params.get("agent_alias"))
@@ -1257,18 +1257,18 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = Config {
             workspace_dir: cwd.path().to_path_buf(),
-            providers: zeroclaw_config::providers::ProvidersConfig {
-                models: HashMap::from([(
-                    "openrouter".to_string(),
-                    HashMap::from([(
-                        "default".to_string(),
-                        zeroclaw_config::schema::ModelProviderConfig {
+            providers: {
+                let mut p = zeroclaw_config::providers::ProvidersConfig::default();
+                p.models.openrouter.insert(
+                    "default".to_string(),
+                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
+                        base: zeroclaw_config::schema::ModelProviderConfig {
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
-                    )]),
-                )]),
-                ..Default::default()
+                    },
+                );
+                p
             },
             mcp: zeroclaw_config::schema::McpConfig {
                 enabled: true,
@@ -1290,7 +1290,7 @@ mod tests {
         config.agents.insert(
             "test-agent".to_string(),
             zeroclaw_config::schema::DelegateAgentConfig {
-                model_provider: "openrouter.default".to_string(),
+                model_provider: "openrouter.default".into(),
                 risk_profile: "default".to_string(),
                 ..Default::default()
             },
@@ -1393,27 +1393,24 @@ mod tests {
         let result = server.handle_initialize(&serde_json::json!({})).unwrap();
         assert!(
             result["_meta"]["zeroclaw"].get("defaultModel").is_none(),
-            "defaultModel must be absent when no provider is configured, got: {}",
+            "defaultModel must be absent when no model_provider is configured, got: {}",
             result["_meta"]["zeroclaw"]["defaultModel"]
         );
     }
 
     #[test]
     fn handle_initialize_default_model_reflects_configured_provider() {
-        use zeroclaw_config::schema::ModelProviderConfig;
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .entry("myprovider".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                ModelProviderConfig {
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
                     model: Some("llama3.2".to_string()),
                     ..Default::default()
                 },
-            );
+            },
+        );
         let server = AcpServer::new(config, AcpServerConfig::default());
         let result = server.handle_initialize(&serde_json::json!({})).unwrap();
         assert_eq!(result["_meta"]["zeroclaw"]["defaultModel"], "llama3.2");
@@ -1564,18 +1561,18 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = Config {
             workspace_dir: cwd.path().to_path_buf(),
-            providers: zeroclaw_config::providers::ProvidersConfig {
-                models: HashMap::from([(
-                    "anthropic".to_string(),
-                    HashMap::from([(
-                        "default".to_string(),
-                        zeroclaw_config::schema::ModelProviderConfig {
+            providers: {
+                let mut p = zeroclaw_config::providers::ProvidersConfig::default();
+                p.models.anthropic.insert(
+                    "default".to_string(),
+                    zeroclaw_config::schema::AnthropicModelProviderConfig {
+                        base: zeroclaw_config::schema::ModelProviderConfig {
                             model: Some("claude-haiku-4-5".to_string()),
                             ..Default::default()
                         },
-                    )]),
-                )]),
-                ..Default::default()
+                    },
+                );
+                p
             },
             ..Default::default()
         };
@@ -1586,7 +1583,7 @@ mod tests {
         config.agents.insert(
             "test-agent".to_string(),
             zeroclaw_config::schema::DelegateAgentConfig {
-                model_provider: "anthropic.default".to_string(),
+                model_provider: "anthropic.default".into(),
                 risk_profile: "default".to_string(),
                 ..Default::default()
             },
@@ -1637,21 +1634,17 @@ mod tests {
     fn make_test_config(cwd: &std::path::Path) -> Config {
         let mut cfg = Config {
             workspace_dir: cwd.to_path_buf(),
-            providers: zeroclaw_config::providers::ProvidersConfig {
-                models: HashMap::from([(
-                    "anthropic".to_string(),
-                    HashMap::from([(
-                        "default".to_string(),
-                        zeroclaw_config::schema::ModelProviderConfig {
-                            model: Some("claude-haiku-4-5".to_string()),
-                            ..Default::default()
-                        },
-                    )]),
-                )]),
-                ..Default::default()
-            },
             ..Default::default()
         };
+        cfg.providers.models.anthropic.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("claude-haiku-4-5".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
         cfg.risk_profiles.insert(
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1659,7 +1652,7 @@ mod tests {
         cfg.agents.insert(
             "test-agent".to_string(),
             zeroclaw_config::schema::DelegateAgentConfig {
-                model_provider: "anthropic.default".to_string(),
+                model_provider: "anthropic.default".into(),
                 risk_profile: "default".to_string(),
                 ..Default::default()
             },

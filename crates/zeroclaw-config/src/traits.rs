@@ -62,6 +62,25 @@ impl HasPropKind for Vec<String> {
     const PROP_KIND: PropKind = PropKind::StringArray;
 }
 
+// The per-category provider-ref newtypes (defined in `crate::providers`)
+// serialize as plain strings; the schema-tooling layer treats them as
+// strings too.
+impl HasPropKind for crate::providers::ModelProviderRef {
+    const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for crate::providers::TtsProviderRef {
+    const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for crate::providers::TranscriptionProviderRef {
+    const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for crate::providers::ChannelRef {
+    const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for Vec<crate::providers::ChannelRef> {
+    const PROP_KIND: PropKind = PropKind::StringArray;
+}
+
 /// Describes a single property field discovered via `#[derive(Configurable)]`.
 #[derive(Clone)]
 pub struct PropFieldInfo {

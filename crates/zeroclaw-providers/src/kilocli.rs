@@ -1,4 +1,4 @@
-//! KiloCLI subprocess provider.
+//! KiloCLI subprocess model_provider.
 //!
 //! Integrates with the KiloCLI tool, spawning the `kilo` binary
 //! as a subprocess for each inference request. This allows using KiloCLI's AI
@@ -28,13 +28,13 @@
 //! # Authentication
 //!
 //! Authentication is handled by KiloCLI itself (its own credential store).
-//! No explicit API key is required by this provider.
+//! No explicit API key is required by this model_provider.
 //!
 //! # Environment variables
 //!
 //! - `KILO_CLI_PATH` — override the path to the `kilo` binary (default: `"kilo"`)
 
-use crate::traits::{ChatRequest, ChatResponse, Provider, TokenUsage};
+use crate::traits::{ChatRequest, ChatResponse, ModelProvider, TokenUsage};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
@@ -47,7 +47,7 @@ pub const KILO_CLI_PATH_ENV: &str = "KILO_CLI_PATH";
 /// Default `kilo` binary name (resolved via `PATH`).
 const DEFAULT_KILO_CLI_BINARY: &str = "kilo";
 
-/// Model name used to signal "use the provider's own default model".
+/// Model name used to signal "use the model_provider's own default model".
 const DEFAULT_MODEL_MARKER: &str = "default";
 /// KiloCLI requests are bounded to avoid hung subprocesses.
 const KILO_CLI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -57,17 +57,17 @@ const MAX_KILO_CLI_STDERR_CHARS: usize = 512;
 const KILO_CLI_SUPPORTED_TEMPERATURES: [f64; 2] = [0.7, 1.0];
 const TEMP_EPSILON: f64 = 1e-9;
 
-/// Provider that invokes the KiloCLI as a subprocess.
+/// ModelProvider that invokes the KiloCLI as a subprocess.
 ///
 /// Each inference request spawns a fresh `kilo` process. This is the
 /// non-interactive approach: the process handles the prompt and exits.
-pub struct KiloCliProvider {
+pub struct KiloCliModelProvider {
     /// Path to the `kilo` binary.
     binary_path: PathBuf,
 }
 
-impl KiloCliProvider {
-    /// Create a new `KiloCliProvider`.
+impl KiloCliModelProvider {
+    /// Create a new `KiloCliModelProvider`.
     ///
     /// The binary path is resolved from `KILO_CLI_PATH` env var if set,
     /// otherwise defaults to `"kilo"` (found via `PATH`).
@@ -95,7 +95,7 @@ impl KiloCliProvider {
 
     fn validate_temperature(temperature: f64) -> anyhow::Result<()> {
         if !temperature.is_finite() {
-            anyhow::bail!("KiloCLI provider received non-finite temperature value");
+            anyhow::bail!("KiloCLI model_provider received non-finite temperature value");
         }
         if !Self::supports_temperature(temperature) {
             anyhow::bail!(
@@ -187,14 +187,14 @@ impl KiloCliProvider {
     }
 }
 
-impl Default for KiloCliProvider {
+impl Default for KiloCliModelProvider {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl Provider for KiloCliProvider {
+impl ModelProvider for KiloCliModelProvider {
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -245,8 +245,11 @@ mod tests {
         let orig = std::env::var(KILO_CLI_PATH_ENV).ok();
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var(KILO_CLI_PATH_ENV, "/usr/local/bin/kilo") };
-        let provider = KiloCliProvider::new();
-        assert_eq!(provider.binary_path, PathBuf::from("/usr/local/bin/kilo"));
+        let model_provider = KiloCliModelProvider::new();
+        assert_eq!(
+            model_provider.binary_path,
+            PathBuf::from("/usr/local/bin/kilo")
+        );
         match orig {
             // SAFETY: test-only, single-threaded test runner.
             Some(v) => unsafe { std::env::set_var(KILO_CLI_PATH_ENV, v) },
@@ -261,8 +264,8 @@ mod tests {
         let orig = std::env::var(KILO_CLI_PATH_ENV).ok();
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var(KILO_CLI_PATH_ENV) };
-        let provider = KiloCliProvider::new();
-        assert_eq!(provider.binary_path, PathBuf::from("kilo"));
+        let model_provider = KiloCliModelProvider::new();
+        assert_eq!(model_provider.binary_path, PathBuf::from("kilo"));
         if let Some(v) = orig {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var(KILO_CLI_PATH_ENV, v) };
@@ -275,8 +278,8 @@ mod tests {
         let orig = std::env::var(KILO_CLI_PATH_ENV).ok();
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var(KILO_CLI_PATH_ENV, "   ") };
-        let provider = KiloCliProvider::new();
-        assert_eq!(provider.binary_path, PathBuf::from("kilo"));
+        let model_provider = KiloCliModelProvider::new();
+        assert_eq!(model_provider.binary_path, PathBuf::from("kilo"));
         match orig {
             // SAFETY: test-only, single-threaded test runner.
             Some(v) => unsafe { std::env::set_var(KILO_CLI_PATH_ENV, v) },
@@ -287,26 +290,28 @@ mod tests {
 
     #[test]
     fn should_forward_model_standard() {
-        assert!(KiloCliProvider::should_forward_model("some-model"));
-        assert!(KiloCliProvider::should_forward_model("gpt-4o"));
+        assert!(KiloCliModelProvider::should_forward_model("some-model"));
+        assert!(KiloCliModelProvider::should_forward_model("gpt-4o"));
     }
 
     #[test]
     fn should_not_forward_default_model() {
-        assert!(!KiloCliProvider::should_forward_model(DEFAULT_MODEL_MARKER));
-        assert!(!KiloCliProvider::should_forward_model(""));
-        assert!(!KiloCliProvider::should_forward_model("   "));
+        assert!(!KiloCliModelProvider::should_forward_model(
+            DEFAULT_MODEL_MARKER
+        ));
+        assert!(!KiloCliModelProvider::should_forward_model(""));
+        assert!(!KiloCliModelProvider::should_forward_model("   "));
     }
 
     #[test]
     fn validate_temperature_allows_defaults() {
-        assert!(KiloCliProvider::validate_temperature(0.7).is_ok());
-        assert!(KiloCliProvider::validate_temperature(1.0).is_ok());
+        assert!(KiloCliModelProvider::validate_temperature(0.7).is_ok());
+        assert!(KiloCliModelProvider::validate_temperature(1.0).is_ok());
     }
 
     #[test]
     fn validate_temperature_rejects_custom_value() {
-        let err = KiloCliProvider::validate_temperature(0.2).unwrap_err();
+        let err = KiloCliModelProvider::validate_temperature(0.2).unwrap_err();
         assert!(
             err.to_string()
                 .contains("temperature unsupported by KiloCLI")
@@ -315,10 +320,10 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_missing_binary_returns_error() {
-        let provider = KiloCliProvider {
+        let model_provider = KiloCliModelProvider {
             binary_path: PathBuf::from("/nonexistent/path/to/kilo"),
         };
-        let result = provider.invoke_cli("hello", "default").await;
+        let result = model_provider.invoke_cli("hello", "default").await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(

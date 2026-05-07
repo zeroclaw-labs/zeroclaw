@@ -324,7 +324,7 @@ async fn run_agent_job(
             &config.workspace_dir,
             config
                 .providers
-                .first_provider()
+                .first_model_provider()
                 .and_then(|e| e.api_key.as_deref()),
         ) {
             Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
@@ -373,7 +373,7 @@ async fn run_agent_job(
                 model_override,
                 config
                     .providers
-                    .first_provider()
+                    .first_model_provider()
                     .and_then(|e| e.temperature)
                     .unwrap_or(0.7),
                 vec![],
@@ -403,7 +403,7 @@ async fn run_agent_job(
                 &config.workspace_dir,
                 config
                     .providers
-                    .first_provider()
+                    .first_model_provider()
                     .and_then(|e| e.api_key.as_deref()),
             ) {
                 let _ = mem.purge_session(&mem_session_key).await;
@@ -721,17 +721,14 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
-        config.providers.models.insert(
-            "openrouter".to_string(),
-            std::collections::HashMap::from([(
-                "default".to_string(),
-                zeroclaw_config::schema::ModelProviderConfig::default(),
-            )]),
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::OpenRouterModelProviderConfig::default(),
         );
         config.agents.insert(
             "test-agent".to_string(),
             zeroclaw_config::schema::DelegateAgentConfig {
-                model_provider: "openrouter.default".to_string(),
+                model_provider: "openrouter.default".into(),
                 risk_profile: "default".to_string(),
                 ..Default::default()
             },

@@ -491,7 +491,7 @@ impl ChannelConfig for ClawdTalkConfig {
     }
 }
 
-/// Which telephony provider to use.
+/// Which telephony model_provider to use.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
@@ -528,7 +528,7 @@ fn default_max_call_duration() -> u64 {
 #[prefix = "channels.voice-call"]
 pub struct VoiceCallConfig {
     #[serde(default)]
-    pub provider: VoiceProvider,
+    pub model_provider: VoiceProvider,
     pub account_id: String,
     pub auth_token: String,
     pub from_number: String,
@@ -554,7 +554,7 @@ pub struct VoiceCallConfig {
 impl Default for VoiceCallConfig {
     fn default() -> Self {
         Self {
-            provider: VoiceProvider::default(),
+            model_provider: VoiceProvider::default(),
             account_id: String::new(),
             auth_token: String::new(),
             from_number: String::new(),

@@ -95,7 +95,7 @@ async fn probe_models(config: &Config) -> Vec<DiagResult> {
     let mut out = Vec::new();
 
     for provider_name in &targets {
-        let result = match zeroclaw_providers::create_provider(provider_name, None) {
+        let result = match zeroclaw_providers::create_model_provider(provider_name, None) {
             Ok(handle) => handle.list_models().await,
             Err(e) => Err(e),
         };
@@ -215,19 +215,15 @@ fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
 }
 
 fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec<String> {
-    if let Some(provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
-        return vec![provider.to_string()];
+    if let Some(model_provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
+        return vec![model_provider.to_string()];
     }
 
     config
         .providers
         .models
-        .iter()
-        .flat_map(|(type_k, alias_map)| {
-            alias_map
-                .keys()
-                .map(move |alias_k| format!("{type_k}.{alias_k}"))
-        })
+        .iter_entries()
+        .map(|(type_k, alias_k, _)| format!("{type_k}.{alias_k}"))
         .collect()
 }
 
@@ -239,7 +235,9 @@ pub async fn run_models(
     let targets = doctor_model_targets(config, provider_override);
 
     if targets.is_empty() {
-        anyhow::bail!("No configured providers to probe — run `zeroclaw onboard providers` first");
+        anyhow::bail!(
+            "No configured model_providers to probe — run `zeroclaw onboard model_providers` first"
+        );
     }
 
     println!("🩺 ZeroClaw Doctor — Model Catalog Probe");
@@ -255,7 +253,7 @@ pub async fn run_models(
     for provider_name in &targets {
         println!("  [{}]", provider_name);
 
-        let outcome = match zeroclaw_providers::create_provider(provider_name, None) {
+        let outcome = match zeroclaw_providers::create_model_provider(provider_name, None) {
             Ok(handle) => handle.list_models().await,
             Err(e) => Err(e),
         };
@@ -324,19 +322,19 @@ pub async fn run_models(
         println!("  Connectivity matrix:");
         println!(
             "  {:<18} {:<12} {:<8} detail",
-            "provider", "status", "models"
+            "model_provider", "status", "models"
         );
         println!(
             "  {:<18} {:<12} {:<8} ------",
             "------------------", "------------", "--------"
         );
-        for (provider, outcome, models_count, detail) in matrix_rows {
+        for (model_provider, outcome, models_count, detail) in matrix_rows {
             let models_text = models_count
                 .map(|count| count.to_string())
                 .unwrap_or_else(|| "-".to_string());
             println!(
                 "  {:<18} {:<12} {:<8} {}",
-                provider,
+                model_provider,
                 model_probe_status_label(outcome),
                 models_text,
                 detail
@@ -346,12 +344,12 @@ pub async fn run_models(
 
     if auth_count > 0 {
         println!(
-            "  💡 Some providers need valid API keys/plan access before `/models` can be fetched."
+            "  💡 Some model_providers need valid API keys/plan access before `/models` can be fetched."
         );
     }
 
     if provider_override.is_some() && ok_count == 0 {
-        anyhow::bail!("Model probe failed for target provider")
+        anyhow::bail!("Model probe failed for target model_provider")
     }
 
     Ok(())
@@ -457,28 +455,28 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
-    // Provider validity (first configured model provider)
-    let primary_provider_doc = config.providers.first_provider();
-    let primary_provider = config.providers.first_provider_type();
-    if let Some(provider) = primary_provider {
-        if let Some(reason) = provider_validation_error(provider) {
+    // ModelProvider validity (first configured model model_provider)
+    let primary_model_provider_doc = config.providers.first_model_provider();
+    let primary_model_provider = config.providers.first_model_provider_type();
+    if let Some(model_provider) = primary_model_provider {
+        if let Some(reason) = provider_validation_error(model_provider) {
             items.push(DiagItem::error(
                 cat,
-                format!("provider \"{provider}\" is invalid: {reason}"),
+                format!("model_provider \"{model_provider}\" is invalid: {reason}"),
             ));
         } else {
             items.push(DiagItem::ok(
                 cat,
-                format!("provider \"{provider}\" is valid"),
+                format!("model_provider \"{model_provider}\" is valid"),
             ));
         }
     } else {
-        items.push(DiagItem::error(cat, "no model provider configured"));
+        items.push(DiagItem::error(cat, "no model model_provider configured"));
     }
 
     // API key presence
-    if primary_provider != Some("ollama") {
-        if primary_provider_doc
+    if primary_model_provider != Some("ollama") {
+        if primary_model_provider_doc
             .and_then(|e| e.api_key.as_deref())
             .is_some()
         {
@@ -486,13 +484,13 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         } else {
             items.push(DiagItem::warn(
                 cat,
-                "no api_key set (may rely on env vars or provider defaults)",
+                "no api_key set (may rely on env vars or model_provider defaults)",
             ));
         }
     }
 
     // Model configured
-    let primary_model = primary_provider_doc.and_then(|e| e.model.as_deref());
+    let primary_model = primary_model_provider_doc.and_then(|e| e.model.as_deref());
     if primary_model.is_some() {
         items.push(DiagItem::ok(
             cat,
@@ -501,12 +499,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     } else {
         items.push(DiagItem::warn(
             cat,
-            "no model configured on primary provider",
+            "no model configured on primary model_provider",
         ));
     }
 
     // Temperature range
-    let primary_temperature = primary_provider_doc
+    let primary_temperature = primary_model_provider_doc
         .and_then(|e| e.temperature)
         .unwrap_or(0.7);
     if (0.0..=2.0).contains(&primary_temperature) {
@@ -540,12 +538,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
         }
-        if let Some(reason) = provider_validation_error(&route.provider) {
+        if let Some(reason) = provider_validation_error(&route.model_provider) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
-                    "model route \"{}\" uses invalid provider \"{}\": {}",
-                    route.hint, route.provider, reason
+                    "model route \"{}\" uses invalid model_provider \"{}\": {}",
+                    route.hint, route.model_provider, reason
                 ),
             ));
         }
@@ -562,12 +560,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if route.hint.trim().is_empty() {
             items.push(DiagItem::warn(cat, "embedding route with empty hint"));
         }
-        if let Some(reason) = embedding_provider_validation_error(&route.provider) {
+        if let Some(reason) = embedding_provider_validation_error(&route.model_provider) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
-                    "embedding route \"{}\" uses invalid provider \"{}\": {}",
-                    route.hint, route.provider, reason
+                    "embedding route \"{}\" uses invalid model_provider \"{}\": {}",
+                    route.hint, route.model_provider, reason
                 ),
             ));
         }
@@ -621,7 +619,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
-    // Delegate agents: provider validity (resolved from model_provider alias)
+    // Delegate agents: model_provider validity (resolved from model_provider alias)
     let mut agent_names: Vec<_> = config.agents.keys().collect();
     agent_names.sort();
     for name in agent_names {
@@ -636,20 +634,22 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if let Some(reason) = provider_validation_error(provider_type) {
             items.push(DiagItem::warn(
                 cat,
-                format!("agent \"{name}\" uses invalid provider \"{provider_type}\": {reason}",),
+                format!(
+                    "agent \"{name}\" uses invalid model_provider \"{provider_type}\": {reason}",
+                ),
             ));
         }
     }
 }
 
 fn provider_validation_error(name: &str) -> Option<String> {
-    match zeroclaw_providers::create_provider(name, None) {
+    match zeroclaw_providers::create_model_provider(name, None) {
         Ok(_) => None,
         Err(err) => Some(
             err.to_string()
                 .lines()
                 .next()
-                .unwrap_or("invalid provider")
+                .unwrap_or("invalid model_provider")
                 .into(),
         ),
     }
@@ -667,16 +667,16 @@ fn embedding_provider_validation_error(name: &str) -> Option<String> {
 
     let url = url.trim();
     if url.is_empty() {
-        return Some("custom provider requires a non-empty URL after 'custom:'".into());
+        return Some("custom model_provider requires a non-empty URL after 'custom:'".into());
     }
 
     match reqwest::Url::parse(url) {
         Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => None,
         Ok(parsed) => Some(format!(
-            "custom provider URL must use http/https, got '{}'",
+            "custom model_provider URL must use http/https, got '{}'",
             parsed.scheme()
         )),
-        Err(err) => Some(format!("invalid custom provider URL: {err}")),
+        Err(err) => Some(format!("invalid custom model_provider URL: {err}")),
     }
 }
 
@@ -1059,7 +1059,7 @@ mod tests {
         assert!(invalid_custom.contains("requires a URL"));
 
         let invalid_unknown = provider_validation_error("totally-fake").unwrap_or_default();
-        assert!(invalid_unknown.contains("Unknown provider"));
+        assert!(invalid_unknown.contains("Unknown model_provider"));
     }
 
     #[test]
@@ -1071,8 +1071,8 @@ mod tests {
 
     #[test]
     fn config_validation_catches_bad_temperature() {
-        // Single provider entry with an out-of-range temperature so the
-        // doctor's `first_provider()` lookup deterministically picks it
+        // Single model_provider entry with an out-of-range temperature so the
+        // doctor's `first_model_provider()` lookup deterministically picks it
         // (HashMap iteration order is unspecified — multiple entries
         // produce a coin-flip first pick).
         let mut config = Config::default();
@@ -1080,10 +1080,8 @@ mod tests {
         config
             .providers
             .models
-            .entry("default".into())
-            .or_default()
-            .entry("default".to_string())
-            .or_default()
+            .ensure("openrouter", "default")
+            .expect("known model_provider type")
             .temperature = Some(5.0);
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
@@ -1099,17 +1097,8 @@ mod tests {
         config
             .providers
             .models
-            .entry("default.default".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
-        config
-            .providers
-            .models
-            .entry("default".into())
-            .or_default()
-            .entry("default".to_string())
-            .or_default()
+            .ensure("openrouter", "default")
+            .expect("known model_provider type")
             .temperature = Some(0.7);
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
@@ -1130,69 +1119,45 @@ mod tests {
 
     #[test]
     fn config_validation_catches_unknown_provider() {
+        // Typed slots can only hold canonical family names, so an unknown
+        // family can no longer reach `first_model_provider_type()`. The
+        // remaining reachable path is `agent.model_provider`, which is a
+        // free-form `String` an operator can set to any dotted ref.
         let mut config = Config::default();
-        config.providers.models = Default::default();
-        config
-            .providers
-            .models
-            .entry("totally-fake".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
+        config.agents.insert(
+            "broken".to_string(),
+            zeroclaw_config::schema::DelegateAgentConfig {
+                model_provider: "totally-fake.default".into(),
+                risk_profile: "default".to_string(),
+                ..Default::default()
+            },
+        );
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
-        let prov_item = items
-            .iter()
-            .find(|i| i.message.contains("provider \"totally-fake\" is invalid"));
-        assert!(prov_item.is_some());
-        assert_eq!(prov_item.unwrap().severity, Severity::Error);
+        let prov_item = items.iter().find(|i| {
+            i.message
+                .contains("agent \"broken\" uses invalid model_provider \"totally-fake\"")
+        });
+        assert!(
+            prov_item.is_some(),
+            "doctor should flag unknown agent model_provider"
+        );
+        assert_eq!(prov_item.unwrap().severity, Severity::Warn);
     }
 
-    #[test]
-    fn config_validation_catches_malformed_custom_provider() {
-        let mut config = Config::default();
-        config.providers.models = Default::default();
-        config
-            .providers
-            .models
-            .entry("custom:".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
-        let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
-
-        let prov_item = items
-            .iter()
-            .find(|item| item.message.contains("provider \"custom:\" is invalid"));
-        assert!(prov_item.is_some());
-        assert_eq!(prov_item.unwrap().severity, Severity::Error);
-    }
-
-    #[test]
-    fn config_validation_accepts_custom_provider() {
-        let mut config = Config::default();
-        config.providers.models = Default::default();
-        config
-            .providers
-            .models
-            .entry("custom:https://my-api.com".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
-        let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
-        let prov_item = items.iter().find(|i| i.message.contains("is valid"));
-        assert!(prov_item.is_some());
-        assert_eq!(prov_item.unwrap().severity, Severity::Ok);
-    }
+    // The pre-Phase-6 tests `config_validation_catches_malformed_custom_provider`
+    // and `config_validation_accepts_custom_provider` are obsolete: the typed
+    // ModelProviders container can't represent malformed `custom:` outer keys at
+    // all. Custom-URL model_providers now live under the `custom` typed slot with the
+    // operator-supplied URL in `base.uri`. The malformed-custom-key validator
+    // path is unreachable.
 
     #[test]
     fn config_validation_warns_empty_model_route() {
         let mut config = Config::default();
         config.providers.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".into(),
-            provider: "groq".into(),
+            model_provider: "groq".into(),
             model: String::new(),
             api_key: None,
         }];
@@ -1208,7 +1173,7 @@ mod tests {
         let mut config = Config::default();
         config.providers.embedding_routes = vec![zeroclaw_config::schema::EmbeddingRouteConfig {
             hint: "semantic".into(),
-            provider: "openai".into(),
+            model_provider: "openai".into(),
             model: String::new(),
             dimensions: Some(1536),
             api_key: None,
@@ -1229,7 +1194,7 @@ mod tests {
         let mut config = Config::default();
         config.providers.embedding_routes = vec![zeroclaw_config::schema::EmbeddingRouteConfig {
             hint: "semantic".into(),
-            provider: "groq".into(),
+            model_provider: "groq".into(),
             model: "text-embedding-3-small".into(),
             dimensions: None,
             api_key: None,
@@ -1237,9 +1202,10 @@ mod tests {
 
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
-        let route_item = items
-            .iter()
-            .find(|item| item.message.contains("uses invalid provider \"groq\""));
+        let route_item = items.iter().find(|item| {
+            item.message
+                .contains("uses invalid model_provider \"groq\"")
+        });
         assert!(route_item.is_some());
         assert_eq!(route_item.unwrap().severity, Severity::Warn);
     }

@@ -1,12 +1,12 @@
 //! JSON Schema cleaning and validation for LLM tool-calling compatibility.
 //!
-//! Different providers support different subsets of JSON Schema. This module
+//! Different model_providers support different subsets of JSON Schema. This module
 //! normalizes tool schemas to improve cross-provider compatibility while
 //! preserving semantic intent.
 //!
 //! ## What this module does
 //!
-//! 1. Removes unsupported keywords per provider strategy
+//! 1. Removes unsupported keywords per model_provider strategy
 //! 2. Resolves local `$ref` entries from `$defs` and `definitions`
 //! 3. Flattens literal `anyOf` / `oneOf` unions into `enum`
 //! 4. Strips nullable variants from unions and `type` arrays
@@ -88,7 +88,7 @@ pub const GEMINI_UNSUPPORTED_KEYWORDS: &[&str] = &[
 /// Keywords that should be preserved during cleaning (metadata).
 const SCHEMA_META_KEYS: &[&str] = &["description", "title", "default"];
 
-/// Schema cleaning strategies for different LLM providers.
+/// Schema cleaning strategies for different LLM model_providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleaningStrategy {
     /// Gemini (Google AI / Vertex AI) - Most restrictive

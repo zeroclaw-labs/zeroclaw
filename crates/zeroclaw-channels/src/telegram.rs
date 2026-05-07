@@ -526,7 +526,7 @@ impl TelegramChannel {
 
     /// Configure text-to-speech for outgoing voice replies.
     ///
-    /// Builds a [`super::tts::TtsManager`] from the V3
+    /// Builds a [`super::tts::TtsManager`] from the
     /// `[providers.tts.<type>.<alias>]` map. Disabled when `[tts].enabled = false`
     /// or when the manager fails to construct (logged at warn).
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
@@ -693,7 +693,7 @@ impl TelegramChannel {
             serde_json::json!({ "command": "new",    "description": "Start a new conversation session" }),
             serde_json::json!({ "command": "stop",   "description": "Cancel the current in-flight task" }),
             serde_json::json!({ "command": "model",  "description": "Show or switch the current model" }),
-            serde_json::json!({ "command": "models", "description": "List available providers or switch provider" }),
+            serde_json::json!({ "command": "models", "description": "List available model_providers or switch model_provider" }),
             serde_json::json!({ "command": "config", "description": "Show current configuration" }),
         ];
 
@@ -5048,7 +5048,7 @@ mod tests {
     // ── Attachment content format tests ──────────────────────────────
 
     /// Photo attachments with image extension must use `[IMAGE:/path]` marker
-    /// so the multimodal pipeline validates vision capability on the provider.
+    /// so the multimodal pipeline validates vision capability on the model_provider.
     #[test]
     fn attachment_photo_content_uses_image_marker() {
         let local_path = std::path::Path::new("/tmp/workspace/photo_123_45.jpg");
@@ -5301,17 +5301,17 @@ mod tests {
         );
     }
 
-    // ── Groq provider rejects photo with vision error ────────────────
+    // ── Groq model_provider rejects photo with vision error ────────────────
 
-    /// Verify that the Groq provider (OpenAI-compatible) does not support
+    /// Verify that the Groq model_provider (OpenAI-compatible) does not support
     /// vision, so the existing `count_image_markers > 0 && !supports_vision()`
     /// guard in `agent/loop_.rs` will reject photo messages.
     #[test]
     fn groq_provider_rejects_photo_with_vision_error() {
-        use zeroclaw_providers::Provider;
-        use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
+        use zeroclaw_providers::ModelProvider;
+        use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
 
-        let groq = OpenAiCompatibleProvider::new(
+        let groq = OpenAiCompatibleModelProvider::new(
             "Groq",
             "https://api.groq.com/openai",
             Some("fake_key"),
@@ -5321,7 +5321,7 @@ mod tests {
         // Groq must not support vision.
         assert!(
             !groq.supports_vision(),
-            "Groq provider must not support vision"
+            "Groq model_provider must not support vision"
         );
 
         // Build a message with an [IMAGE:] marker (as photo attachment would).
@@ -5333,7 +5333,7 @@ mod tests {
 
         // The combination of marker_count > 0 && !supports_vision() means
         // the agent loop will return ProviderCapabilityError before calling
-        // the provider, and the channel will send "⚠️ Error: ..." to the user.
+        // the model_provider, and the channel will send "⚠️ Error: ..." to the user.
     }
 
     #[test]
@@ -5517,7 +5517,7 @@ mod tests {
                 { "command": "new",    "description": "Start a new conversation session" },
                 { "command": "stop",   "description": "Cancel the current in-flight task" },
                 { "command": "model",  "description": "Show or switch the current model" },
-                { "command": "models", "description": "List available providers or switch provider" },
+                { "command": "models", "description": "List available model_providers or switch model_provider" },
                 { "command": "config", "description": "Show current configuration" },
             ]
         });
@@ -5666,7 +5666,7 @@ mod tests {
                 { "command": "new",     "description": "Start a new conversation session" },
                 { "command": "stop",    "description": "Cancel the current in-flight task" },
                 { "command": "model",   "description": "Show or switch the current model" },
-                { "command": "models",  "description": "List available providers or switch provider" },
+                { "command": "models",  "description": "List available model_providers or switch model_provider" },
                 { "command": "config",  "description": "Show current configuration" },
                 { "command": "weather", "description": "Check the weather forecast" },
             ]
@@ -5702,7 +5702,7 @@ mod tests {
                 { "command": "new",       "description": "Start a new conversation session" },
                 { "command": "stop",      "description": "Cancel the current in-flight task" },
                 { "command": "model",     "description": "Show or switch the current model" },
-                { "command": "models",    "description": "List available providers or switch provider" },
+                { "command": "models",    "description": "List available model_providers or switch model_provider" },
                 { "command": "config",    "description": "Show current configuration" },
                 { "command": "test_tool", "description": "A test tool" },
             ]

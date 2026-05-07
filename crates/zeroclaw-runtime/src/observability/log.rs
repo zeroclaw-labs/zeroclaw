@@ -20,18 +20,21 @@ impl LogObserver {
 impl Observer for LogObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {
-            ObserverEvent::AgentStart { provider, model } => {
-                info!(provider = %provider, model = %model, "agent.start");
+            ObserverEvent::AgentStart {
+                model_provider,
+                model,
+            } => {
+                info!(model_provider = %model_provider, model = %model, "agent.start");
             }
             ObserverEvent::AgentEnd {
-                provider,
+                model_provider,
                 model,
                 duration,
                 tokens_used,
                 cost_usd,
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-                info!(provider = %provider, model = %model, duration_ms = ms, tokens = ?tokens_used, cost_usd = ?cost_usd, "agent.end");
+                info!(model_provider = %model_provider, model = %model, duration_ms = ms, tokens = ?tokens_used, cost_usd = ?cost_usd, "agent.end");
             }
             ObserverEvent::ToolCallStart { tool, .. } => {
                 info!(tool = %tool, "tool.start");
@@ -66,19 +69,19 @@ impl Observer for LogObserver {
                 info!(component = %component, error = %message, "error");
             }
             ObserverEvent::LlmRequest {
-                provider,
+                model_provider,
                 model,
                 messages_count,
             } => {
                 info!(
-                    provider = %provider,
+                    model_provider = %model_provider,
                     model = %model,
                     messages_count = messages_count,
                     "llm.request"
                 );
             }
             ObserverEvent::LlmResponse {
-                provider,
+                model_provider,
                 model,
                 duration,
                 success,
@@ -88,7 +91,7 @@ impl Observer for LogObserver {
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 info!(
-                    provider = %provider,
+                    model_provider = %model_provider,
                     model = %model,
                     duration_ms = ms,
                     success = success,
@@ -195,25 +198,25 @@ mod tests {
     fn log_observer_all_events_no_panic() {
         let obs = LogObserver::new();
         obs.record_event(&ObserverEvent::AgentStart {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
             cost_usd: Some(0.0015),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::ZERO,
             tokens_used: None,
             cost_usd: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(150),
             success: true,
@@ -222,7 +225,7 @@ mod tests {
             output_tokens: Some(50),
         });
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(200),
             success: false,
@@ -241,7 +244,7 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::Error {
-            component: "provider".into(),
+            component: "model_provider".into(),
             message: "timeout".into(),
         });
     }

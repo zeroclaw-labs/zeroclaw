@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::time::Duration;
 
 use zeroclaw_api::channel::ChannelMessage;
-use zeroclaw_api::provider::{ChatMessage, ChatResponse};
+use zeroclaw_api::model_provider::{ChatMessage, ChatResponse};
 use zeroclaw_api::tool::ToolResult;
 
 /// Result of a modifying hook — continue with (possibly modified) data, or cancel.
@@ -42,10 +42,10 @@ pub trait HookHandler: Send + Sync {
     // --- Modifying hooks (sequential by priority, can cancel) ---
     async fn before_model_resolve(
         &self,
-        provider: String,
+        model_provider: String,
         model: String,
     ) -> HookResult<(String, String)> {
-        HookResult::Continue((provider, model))
+        HookResult::Continue((model_provider, model))
     }
 
     async fn before_prompt_build(&self, prompt: String) -> HookResult<String> {

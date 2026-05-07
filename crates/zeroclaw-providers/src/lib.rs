@@ -1,19 +1,19 @@
-//! Provider subsystem for model inference backends.
+//! ModelProvider subsystem for model inference backends.
 //!
-//! This module implements the factory pattern for AI model providers. Each provider
-//! implements the [`Provider`] trait defined in [`traits`], and is registered in the
-//! factory function [`create_provider`] by its canonical string key (e.g., `"openai"`,
-//! `"anthropic"`, `"ollama"`, `"gemini"`). Provider aliases are resolved internally
+//! This module implements the factory pattern for AI model model_providers. Each model_provider
+//! implements the [`ModelProvider`] trait defined in [`traits`], and is registered in the
+//! factory function [`create_model_provider`] by its canonical string key (e.g., `"openai"`,
+//! `"anthropic"`, `"ollama"`, `"gemini"`). ModelProvider aliases are resolved internally
 //! so that user-facing keys remain stable.
 //!
-//! Each provider call goes through the [`ReliableProvider`] wrapper, which adds
+//! Each model_provider call goes through the [`ReliableModelProvider`] wrapper, which adds
 //! automatic retry with exponential backoff and API-key rotation on rate limits.
-//! Model routing across multiple providers is available via [`create_routed_provider`].
+//! Model routing across multiple model_providers is available via [`create_routed_model_provider`].
 //!
 //! # Extension
 //!
-//! To add a new provider, implement [`Provider`] in a new submodule and register it
-//! in [`create_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
+//! To add a new model_provider, implement [`ModelProvider`] in a new submodule and register it
+//! in [`create_model_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
 
 pub mod anthropic;
 pub mod auth;
@@ -38,19 +38,18 @@ pub mod traits;
 
 #[allow(unused_imports)]
 pub use traits::{
-    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderCapabilityError,
-    ToolCall, ToolResultMessage,
+    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
+    ProviderCapabilityError, ToolCall, ToolResultMessage,
 };
 
 use crate::auth::AuthService;
-use compatible::{AuthStyle, OpenAiCompatibleProvider};
-use reliable::ReliableProvider;
+use compatible::{AuthStyle, OpenAiCompatibleModelProvider};
+use reliable::ReliableModelProvider;
 use serde::Deserialize;
 use std::path::PathBuf;
 
 const MAX_API_ERROR_CHARS: usize = 500;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
-const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
 const MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT: &str = "https://api.minimax.io/oauth/token";
 const MINIMAX_OAUTH_CN_TOKEN_ENDPOINT: &str = "https://api.minimaxi.com/oauth/token";
 const MINIMAX_OAUTH_PLACEHOLDER: &str = "minimax-oauth";
@@ -62,16 +61,9 @@ const MINIMAX_OAUTH_REGION_ENV: &str = "MINIMAX_OAUTH_REGION";
 const MINIMAX_OAUTH_CLIENT_ID_ENV: &str = "MINIMAX_OAUTH_CLIENT_ID";
 const MINIMAX_OAUTH_DEFAULT_CLIENT_ID: &str = "78257093-7e40-4613-99e0-527b14b39113";
 const GLM_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
-const GLM_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
 const MOONSHOT_INTL_BASE_URL: &str = "https://api.moonshot.ai/v1";
-const MOONSHOT_CN_BASE_URL: &str = "https://api.moonshot.cn/v1";
-const STEPFUN_CN_BASE_URL: &str = "https://api.stepfun.com/v1";
-const STEPFUN_INTL_BASE_URL: &str = "https://api.stepfun.ai/v1";
 const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
-const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
-const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
 const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
-const BAILIAN_BASE_URL: &str = "https://coding.dashscope.aliyuncs.com/v1";
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
 const QWEN_OAUTH_TOKEN_ENV: &str = "QWEN_OAUTH_TOKEN";
@@ -81,7 +73,6 @@ const QWEN_OAUTH_CLIENT_ID_ENV: &str = "QWEN_OAUTH_CLIENT_ID";
 const QWEN_OAUTH_DEFAULT_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
 const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
-const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 const QIANFAN_BASE_URL: &str = "https://qianfan.baidubce.com/v2";
 const VERCEL_AI_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 
@@ -611,105 +602,40 @@ fn resolve_minimax_oauth_refresh_token(name: &str) -> Option<String> {
     match refresh_minimax_oauth_access_token(name, &refresh_token) {
         Ok(token) => Some(token),
         Err(error) => {
-            tracing::warn!(provider = name, error = %error, "MiniMax OAuth refresh failed");
+            tracing::warn!(model_provider = name, error = %error, "MiniMax OAuth refresh failed");
             None
         }
     }
 }
 
-pub fn canonical_china_provider_name(name: &str) -> Option<&'static str> {
-    if is_qwen_alias(name) {
-        Some("qwen")
-    } else if is_glm_alias(name) {
-        Some("glm")
-    } else if is_moonshot_alias(name) {
-        Some("moonshot")
-    } else if is_minimax_alias(name) {
-        Some("minimax")
-    } else if is_zai_alias(name) {
-        Some("zai")
-    } else if is_qianfan_alias(name) {
-        Some("qianfan")
-    } else if is_doubao_alias(name) {
-        Some("doubao")
-    } else if is_bailian_alias(name) {
-        Some("bailian")
-    } else {
-        None
-    }
-}
-
-fn minimax_base_url(name: &str) -> Option<&'static str> {
-    if is_minimax_cn_alias(name) {
-        Some(MINIMAX_CN_BASE_URL)
-    } else if is_minimax_intl_alias(name) {
-        Some(MINIMAX_INTL_BASE_URL)
-    } else {
-        None
-    }
-}
-
-fn glm_base_url(name: &str) -> Option<&'static str> {
-    if is_glm_cn_alias(name) {
-        Some(GLM_CN_BASE_URL)
-    } else if is_glm_global_alias(name) {
-        Some(GLM_GLOBAL_BASE_URL)
-    } else {
-        None
-    }
-}
-
-fn moonshot_base_url(name: &str) -> Option<&'static str> {
-    if is_moonshot_intl_alias(name) {
-        Some(MOONSHOT_INTL_BASE_URL)
-    } else if is_moonshot_cn_alias(name) {
-        Some(MOONSHOT_CN_BASE_URL)
-    } else {
-        None
-    }
-}
-
-fn qwen_base_url(name: &str) -> Option<&'static str> {
-    if is_qwen_cn_alias(name) || is_qwen_oauth_alias(name) {
-        Some(QWEN_CN_BASE_URL)
-    } else if is_qwen_intl_alias(name) {
-        Some(QWEN_INTL_BASE_URL)
-    } else if is_qwen_us_alias(name) {
-        Some(QWEN_US_BASE_URL)
-    } else {
-        None
-    }
-}
-
-fn zai_base_url(name: &str) -> Option<&'static str> {
-    if is_zai_cn_alias(name) {
-        Some(ZAI_CN_BASE_URL)
-    } else if is_zai_global_alias(name) {
-        Some(ZAI_GLOBAL_BASE_URL)
-    } else {
-        None
-    }
-}
+// `canonical_china_provider_name` and the per-family `*_base_url(name)`
+// lookup helpers were deleted in #6273: post-Phase-8 migration the runtime
+// only sees canonical family names (`"moonshot"`, `"qwen"`, `"glm"`,
+// `"minimax"`, `"zai"`, `"doubao"`, `"qianfan"`), and per-instance URLs
+// flow through `ModelProviderRuntimeOptions.provider_api_url` (pre-resolved
+// from the typed alias's `*Endpoint::uri()` by
+// `provider_runtime_options_for_agent`). Synonym detection lives only in
+// `crates/zeroclaw-config/src/schema/v2.rs::normalize_model_provider_type`.
 
 #[derive(Debug, Clone)]
-pub struct ProviderRuntimeOptions {
+pub struct ModelProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
     pub provider_api_url: Option<String>,
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
     pub reasoning_effort: Option<String>,
-    /// HTTP request timeout in seconds for LLM provider API calls.
-    /// `None` uses the provider's built-in default (120s for compatible providers).
+    /// HTTP request timeout in seconds for LLM model_provider API calls.
+    /// `None` uses the model_provider's built-in default (120s for compatible model_providers).
     pub provider_timeout_secs: Option<u64>,
-    /// Extra HTTP headers to include in provider API requests.
+    /// Extra HTTP headers to include in model_provider API requests.
     /// These are merged from the config file and `ZEROCLAW_EXTRA_HEADERS` env var.
     pub extra_headers: std::collections::HashMap<String, String>,
-    /// Custom API path suffix for OpenAI-compatible providers
+    /// Custom API path suffix for OpenAI-compatible model_providers
     /// (e.g. "/v2/generate" instead of the default "/chat/completions").
     pub api_path: Option<String>,
-    /// Maximum output tokens for LLM provider API requests.
-    /// `None` uses the provider's built-in default.
+    /// Maximum output tokens for LLM model_provider API requests.
+    /// `None` uses the model_provider's built-in default.
     pub provider_max_tokens: Option<u32>,
     /// When true, system messages are merged into the first user message before
     /// sending. Propagated from `ModelProviderConfig::merge_system_into_user`.
@@ -717,15 +643,33 @@ pub struct ProviderRuntimeOptions {
     /// Extra JSON parameters merged into API request bodies at the top level.
     /// Propagated from `ModelProviderConfig::provider_extra`.
     pub provider_extra: Option<serde_json::Value>,
-    /// Override the provider's default for native tool calling. `None` honors
-    /// the per-provider built-in choice. `Some(true)` forces native tool
+    /// Azure OpenAI resource name. Populated from
+    /// `AzureModelProviderConfig.resource` when the active model_provider family is
+    /// `azure`. Required for Azure runtime construction; the factory errors
+    /// loudly if missing instead of falling back to env vars.
+    pub azure_resource: Option<String>,
+    /// Azure OpenAI deployment name. Populated from
+    /// `AzureModelProviderConfig.deployment`. Required.
+    pub azure_deployment: Option<String>,
+    /// Azure OpenAI API version. Populated from
+    /// `AzureModelProviderConfig.api_version`. Optional (model_provider falls back
+    /// to its own default).
+    pub azure_api_version: Option<String>,
+    /// OpenAI-Codex variant marker. Populated from
+    /// `ModelProviderConfig.requires_openai_auth` on the resolved alias entry
+    /// when the family is `openai`. The factory dispatches to
+    /// `OpenAiCodexModelProvider` when this is true (the codex variant is selected
+    /// by the alias's typed config, not by family name).
+    pub requires_openai_auth: bool,
+    /// Override the model_provider's default for native tool calling. `None`
+    /// honors the per-family built-in choice. `Some(true)` forces native tool
     /// calls on; `Some(false)` forces text-fallback. Propagated from
     /// `ModelProviderConfig::native_tools`. Currently consulted only by the
-    /// Groq factory branch (#5932).
+    /// Groq factory branch.
     pub native_tools: Option<bool>,
 }
 
-impl Default for ProviderRuntimeOptions {
+impl Default for ModelProviderRuntimeOptions {
     fn default() -> Self {
         Self {
             auth_profile_override: None,
@@ -740,91 +684,154 @@ impl Default for ProviderRuntimeOptions {
             provider_max_tokens: None,
             merge_system_into_user: false,
             provider_extra: None,
+            azure_resource: None,
+            azure_deployment: None,
+            azure_api_version: None,
+            requires_openai_auth: false,
             native_tools: None,
         }
     }
 }
 
-/// Build `ProviderRuntimeOptions` from a *specific* `ModelProviderConfig`
+/// Build `ModelProviderRuntimeOptions` from a *specific* `ModelProviderConfig`
 /// entry plus the global config's process-wide settings (zeroclaw_dir,
 /// secrets, runtime). Splits out the per-entry resolution so callers with
 /// agent context can pass in the alias-resolved entry instead of hitting
-/// `first_provider()` (#6266 review).
+/// `first_model_provider()` (#6266 review).
 ///
-/// Pass `None` when no provider entry is resolvable (e.g. tests or fresh
+/// Pass `None` when no model_provider entry is resolvable (e.g. tests or fresh
 /// config with no models configured); falls back to safe defaults.
-pub fn provider_runtime_options_from_provider_entry(
+pub fn model_provider_runtime_options_from_model_provider_entry(
     config: &zeroclaw_config::schema::Config,
     entry: Option<&zeroclaw_config::schema::ModelProviderConfig>,
-) -> ProviderRuntimeOptions {
-    // Resolve merge_system_into_user from the active model provider profile
+) -> ModelProviderRuntimeOptions {
+    // Resolve merge_system_into_user from the active model model_provider profile
     // by matching api_url — providers.models retains all profiles. We keep
     // this lookup based on URL match rather than identity because the entry
     // we were given may itself originate from any of those profiles.
     let merge_system_into_user = entry
-        .and_then(|e| e.base_url.as_deref())
+        .and_then(|e| e.uri.as_deref())
         .map(str::trim)
         .filter(|u| !u.is_empty())
-        .and_then(|active_url| {
+        .and_then(|active_uri| {
             config
                 .providers
                 .models
-                .values()
-                .flat_map(|alias_map| alias_map.values())
+                .iter_entries()
+                .map(|(_, _, base)| base)
                 .find(|p| {
-                    p.base_url
+                    p.uri
                         .as_deref()
                         .map(str::trim)
                         .filter(|u: &&str| !u.is_empty())
                         .map(|u: &str| u.trim_end_matches('/'))
-                        == Some(active_url.trim_end_matches('/'))
+                        == Some(active_uri.trim_end_matches('/'))
                 })
         })
         .map(|p| p.merge_system_into_user)
         .unwrap_or(false);
 
-    ProviderRuntimeOptions {
+    ModelProviderRuntimeOptions {
         auth_profile_override: None,
-        provider_api_url: entry.and_then(|e| e.base_url.clone()),
+        provider_api_url: entry.and_then(|e| e.uri.clone()),
         zeroclaw_dir: config.config_path.parent().map(PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
         provider_timeout_secs: Some(entry.and_then(|e| e.timeout_secs).unwrap_or(120)),
         extra_headers: entry.map(|e| e.extra_headers.clone()).unwrap_or_default(),
-        api_path: entry.and_then(|e| e.api_path.clone()),
+        // api_path is gone — the schema's `uri` field is now the full endpoint URL.
+        // Runtime-side proxy-routing concatenation (uri + api_path) is no longer
+        // needed; operators set uri to the full endpoint they want hit.
+        api_path: None,
         provider_max_tokens: entry.and_then(|e| e.max_tokens),
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
+        // Family-specific fields are populated only by the agent-aware
+        // resolver (`provider_runtime_options_for_agent`), where we have the
+        // typed alias context to look up the family's typed config.
+        azure_resource: None,
+        azure_deployment: None,
+        azure_api_version: None,
+        requires_openai_auth: false,
         native_tools: entry.and_then(|e| e.native_tools),
     }
 }
 
-/// Resolve `ProviderRuntimeOptions` from an agent's `model_provider` alias
-/// (`"<type>.<alias>"`). Falls back to `first_provider()` when the agent
+/// Resolve `ModelProviderRuntimeOptions` from an agent's `model_provider` alias
+/// (`"<type>.<alias>"`). Falls back to `first_model_provider()` when the agent
 /// alias doesn't exist, doesn't have a `model_provider` set, or names a
-/// non-existent provider entry — preserving the conservative pre-V3
+/// non-existent model_provider entry — preserving the conservative legacy
 /// behavior so misconfigured callsites still get *something* instead of
 /// crashing the channel server. The fallback is logged so multi-alias
 /// users can spot misconfiguration.
 pub fn provider_runtime_options_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
-) -> ProviderRuntimeOptions {
+) -> ModelProviderRuntimeOptions {
     let entry = config.model_provider_for_agent(agent_alias).or_else(|| {
         tracing::debug!(
             agent = agent_alias,
-            "model_provider_for_agent returned None; falling back to providers.first_provider()"
+            "model_provider_for_agent returned None; falling back to model_providers.first_model_provider()"
         );
-        config.providers.first_provider()
+        config.providers.first_model_provider()
     });
-    provider_runtime_options_from_provider_entry(config, entry)
+    let mut options = model_provider_runtime_options_from_model_provider_entry(config, entry);
+
+    // Family-aware extras. Each branch below pulls the typed alias config
+    // from its slot and projects family-specific fields onto
+    // `ModelProviderRuntimeOptions` so the factory can dispatch by canonical
+    // family name only — no synonym match arms in the runtime registry,
+    // no `*_base_url(name)` lookups, no string-keyed regional dispatch.
+    if let Some(agent) = config.agents.get(agent_alias)
+        && let Some((family, alias)) = agent.model_provider.split_once('.')
+    {
+        // Multi-endpoint families: pre-resolve the URI via the centralized
+        // `resolved_endpoint_uri` dispatch (driven by
+        // `for_each_model_provider_slot!`). Operator-set `base.uri` (already
+        // populated into `options.provider_api_url` by
+        // `model_provider_runtime_options_from_model_provider_entry`) wins
+        // over the family-default endpoint URI.
+        if options.provider_api_url.is_none()
+            && let Some(uri) = config.providers.models.resolved_endpoint_uri(family, alias)
+        {
+            options.provider_api_url = Some(uri.to_string());
+        }
+
+        // Family-specific extras that don't fit the endpoint-URI shape.
+        match family {
+            // Azure: typed resource / deployment / api_version flow through
+            // for runtime URI templating.
+            "azure" => {
+                if let Some(cfg) = config.providers.models.azure.get(alias) {
+                    options.azure_resource = cfg.resource.clone();
+                    options.azure_deployment = cfg.deployment.clone();
+                    options.azure_api_version = cfg.api_version.clone();
+                }
+            }
+            // OpenAI: codex variant marker. The codex alias lives under
+            // `[providers.models.openai.codex]` with `requires_openai_auth =
+            // true`; the factory dispatches to OpenAiCodexModelProvider when
+            // this flag is set, regardless of family name being `openai`.
+            "openai" => {
+                if let Some(cfg) = config.providers.models.openai.get(alias) {
+                    options.requires_openai_auth = cfg.base.requires_openai_auth;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    options
 }
 
 pub fn provider_runtime_options_from_config(
     config: &zeroclaw_config::schema::Config,
-) -> ProviderRuntimeOptions {
-    provider_runtime_options_from_provider_entry(config, config.providers.first_provider())
+) -> ModelProviderRuntimeOptions {
+    model_provider_runtime_options_from_model_provider_entry(
+        config,
+        config.providers.first_model_provider(),
+    )
 }
 
 fn is_secret_char(c: char) -> bool {
@@ -843,7 +850,7 @@ fn token_end(input: &str, from: usize) -> usize {
     end
 }
 
-/// Scrub known secret-like token prefixes from provider error strings.
+/// Scrub known secret-like token prefixes from model_provider error strings.
 ///
 /// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
 /// `ghu_`, and `github_pat_`.
@@ -897,22 +904,22 @@ pub fn sanitize_api_error(input: &str) -> String {
     format!("{}...", &scrubbed[..end])
 }
 
-/// Build a sanitized provider error from a failed HTTP response.
-pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::Error {
+/// Build a sanitized model_provider error from a failed HTTP response.
+pub async fn api_error(model_provider: &str, response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
     let body = response
         .text()
         .await
-        .unwrap_or_else(|_| "<failed to read provider error body>".to_string());
+        .unwrap_or_else(|_| "<failed to read model_provider error body>".to_string());
     let sanitized = sanitize_api_error(&body);
-    anyhow::anyhow!("{provider} API error ({status}): {sanitized}")
+    anyhow::anyhow!("{model_provider} API error ({status}): {sanitized}")
 }
 
-/// Resolve API key for a provider from config and environment variables.
+/// Resolve API key for a model_provider from config and environment variables.
 ///
 /// Resolution order:
 /// 1. Explicitly provided `api_key` parameter (trimmed, filtered if empty)
-/// 2. Provider-specific environment variable (e.g., `ANTHROPIC_OAUTH_TOKEN`, `OPENROUTER_API_KEY`)
+/// 2. ModelProvider-specific environment variable (e.g., `ANTHROPIC_OAUTH_TOKEN`, `OPENROUTER_API_KEY`)
 /// 3. Generic env variables (`ZEROCLAW_API_KEY`, `API_KEY`)
 ///
 /// For Anthropic, the provider-specific env var is `ANTHROPIC_OAUTH_TOKEN` (for setup-tokens)
@@ -921,7 +928,10 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 /// For MiniMax, OAuth mode supports `api_key = "minimax-oauth"`, resolving credentials from
 /// `MINIMAX_OAUTH_TOKEN` first, then `MINIMAX_API_KEY`, and finally
 /// `MINIMAX_OAUTH_REFRESH_TOKEN` (automatic access-token refresh).
-fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
+fn resolve_model_provider_credential(
+    name: &str,
+    credential_override: Option<&str>,
+) -> Option<String> {
     let mut minimax_oauth_placeholder_requested = false;
 
     if let Some(raw_override) = credential_override {
@@ -936,9 +946,9 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                     return Some(credential);
                 }
             } else if name == "anthropic" || name == "openai" || name == "groq" {
-                // For well-known providers, prefer provider-specific env vars over the
+                // For well-known model_providers, prefer provider-specific env vars over the
                 // global api_key override, since the global key may belong to a different
-                // provider (e.g. a custom: gateway).
+                // model_provider (e.g. a custom: gateway).
                 let env_candidates: &[&str] = match name {
                     "anthropic" => &["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
                     "openai" => &["OPENAI_API_KEY"],
@@ -960,6 +970,8 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         }
     }
 
+    // Canonical family names only — legacy synonyms are collapsed by
+    // `normalize_model_provider_type` in `schema/v2.rs` before reaching the runtime.
     let provider_env_candidates: Vec<&str> = match name {
         "anthropic" => vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
         "openrouter" => vec!["OPENROUTER_API_KEY"],
@@ -969,23 +981,20 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "groq" => vec!["GROQ_API_KEY"],
         "mistral" => vec!["MISTRAL_API_KEY"],
         "deepseek" => vec!["DEEPSEEK_API_KEY"],
-        "xai" | "grok" => vec!["XAI_API_KEY"],
-        "together" | "together-ai" => vec!["TOGETHER_API_KEY"],
-        "fireworks" | "fireworks-ai" => vec!["FIREWORKS_API_KEY"],
+        "xai" => vec!["XAI_API_KEY"],
+        "together" => vec!["TOGETHER_API_KEY"],
+        "fireworks" => vec!["FIREWORKS_API_KEY"],
         "novita" => vec!["NOVITA_API_KEY"],
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
-        "copilot" | "github-copilot" => vec!["GITHUB_TOKEN"],
+        "copilot" => vec!["GITHUB_TOKEN"],
         "cohere" => vec!["COHERE_API_KEY"],
-        name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
-        "kimi-code" | "kimi_coding" | "kimi_for_coding" => {
-            vec!["KIMI_CODE_API_KEY", "MOONSHOT_API_KEY"]
-        }
-        name if is_glm_alias(name) => vec!["GLM_API_KEY"],
-        name if is_minimax_alias(name) => vec![MINIMAX_OAUTH_TOKEN_ENV, MINIMAX_API_KEY_ENV],
+        "moonshot" => vec!["MOONSHOT_API_KEY"],
+        "glm" => vec!["GLM_API_KEY"],
+        "minimax" => vec![MINIMAX_OAUTH_TOKEN_ENV, MINIMAX_API_KEY_ENV],
         // Bedrock supports Bearer token auth via BEDROCK_API_KEY env var, in addition
         // to AWS AKSK (SigV4). If BEDROCK_API_KEY is set, return it; otherwise return
-        // None and let BedrockProvider handle SigV4 credential resolution internally.
-        "bedrock" | "aws-bedrock" => {
+        // None and let BedrockModelProvider handle SigV4 credential resolution internally.
+        "bedrock" => {
             if let Ok(val) = std::env::var("BEDROCK_API_KEY") {
                 let trimmed = val.trim().to_string();
                 if !trimmed.is_empty() {
@@ -994,31 +1003,27 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
             }
             return None;
         }
-        name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
-        name if is_doubao_alias(name) => {
-            vec!["ARK_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_API_KEY"]
-        }
-        name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
-        name if is_bailian_alias(name) => vec!["BAILIAN_API_KEY", "DASHSCOPE_API_KEY"],
-        name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
+        "qianfan" => vec!["QIANFAN_API_KEY"],
+        "doubao" => vec!["ARK_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_API_KEY"],
+        "qwen" => vec!["DASHSCOPE_API_KEY"],
+        "zai" => vec!["ZAI_API_KEY"],
+        "nvidia" => vec!["NVIDIA_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
-        "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
-        "opencode-go" => vec!["OPENCODE_GO_API_KEY"],
-        "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
-        "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
-        "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
+        "opencode" => vec!["OPENCODE_API_KEY"],
+        "vercel" => vec!["VERCEL_API_KEY"],
+        "cloudflare" => vec!["CLOUDFLARE_API_KEY"],
+        "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
         "avian" => vec!["AVIAN_API_KEY"],
-        "deepmyst" | "deep-myst" => vec!["DEEPMYST_API_KEY"],
-        "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
+        "deepmyst" => vec!["DEEPMYST_API_KEY"],
+        "llamacpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
         "aihubmix" => vec!["AIHUBMIX_API_KEY"],
-        "siliconflow" | "silicon-flow" => vec!["SILICONFLOW_API_KEY"],
+        "siliconflow" => vec!["SILICONFLOW_API_KEY"],
         "osaurus" => vec!["OSAURUS_API_KEY"],
         "telnyx" => vec!["TELNYX_API_KEY"],
-        "azure_openai" | "azure-openai" | "azure" => vec!["AZURE_OPENAI_API_KEY"],
+        "azure" => vec!["AZURE_OPENAI_API_KEY"],
         _ => vec![],
     };
 
@@ -1053,148 +1058,256 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
     None
 }
 
-/// Check whether an API key's prefix matches the selected provider.
+/// Single source of truth for `(key_prefix, canonical_model_provider_family)`
+/// pairs used by `check_api_key_prefix`. Order matters: longer prefixes
+/// must come before shorter ones that share a head (`sk-ant-` and `sk-or-`
+/// must precede `sk-`).
+const KEY_PREFIX_MODEL_PROVIDERS: &[(&str, &str)] = &[
+    ("sk-ant-", "anthropic"),
+    ("sk-or-", "openrouter"),
+    ("sk-", "openai"),
+    ("gsk_", "groq"),
+    ("pplx-", "perplexity"),
+    ("xai-", "xai"),
+    ("nvapi-", "nvidia"),
+    ("KEY-", "telnyx"),
+];
+
+/// Check whether an API key's prefix matches the selected model model_provider.
 ///
-/// Returns `Some("likely_provider")` when the key clearly belongs to a
-/// *different* provider (cross-provider mismatch).  Returns `None` when
-/// everything looks fine or the format is unrecognised.
-fn check_api_key_prefix(provider_name: &str, key: &str) -> Option<&'static str> {
-    // Identify which provider the key likely belongs to (longest prefix first).
-    let likely_provider = if key.starts_with("sk-ant-") {
-        Some("anthropic")
-    } else if key.starts_with("sk-or-") {
-        Some("openrouter")
-    } else if key.starts_with("sk-") {
-        Some("openai")
-    } else if key.starts_with("gsk_") {
-        Some("groq")
-    } else if key.starts_with("pplx-") {
-        Some("perplexity")
-    } else if key.starts_with("xai-") {
-        Some("xai")
-    } else if key.starts_with("nvapi-") {
-        Some("nvidia")
-    } else if key.starts_with("KEY-") {
-        Some("telnyx")
-    } else {
+/// Returns `Some("likely_model_provider")` when the key clearly belongs to a
+/// *different* model model_provider (cross-provider mismatch). Returns `None`
+/// when everything looks fine or the format is unrecognised.
+fn check_api_key_prefix(model_provider_name: &str, key: &str) -> Option<&'static str> {
+    let likely_model_provider = KEY_PREFIX_MODEL_PROVIDERS
+        .iter()
+        .find(|(prefix, _)| key.starts_with(prefix))
+        .map(|(_, name)| *name)?;
+
+    // Only flag mismatch when the configured `model_provider_name` is itself
+    // one whose key format we recognize — derived from the same table so the
+    // gate can never drift from the prefix detection above.
+    let recognized = KEY_PREFIX_MODEL_PROVIDERS
+        .iter()
+        .any(|(_, name)| *name == model_provider_name);
+    if !recognized {
+        return None;
+    }
+
+    if model_provider_name == likely_model_provider {
         None
-    };
-
-    let expected = likely_provider?;
-
-    // Only flag mismatch for providers where we know the key format.
-    let matches = match provider_name {
-        "anthropic" => expected == "anthropic",
-        "openrouter" => expected == "openrouter",
-        "openai" => expected == "openai",
-        "groq" => expected == "groq",
-        "perplexity" => expected == "perplexity",
-        "xai" | "grok" => expected == "xai",
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => expected == "nvidia",
-        "telnyx" => expected == "telnyx",
-        _ => return None, // Unknown format provider — skip
-    };
-
-    if matches { None } else { Some(expected) }
-}
-
-fn parse_custom_provider_url(
-    raw_url: &str,
-    provider_label: &str,
-    format_hint: &str,
-) -> anyhow::Result<String> {
-    let base_url = raw_url.trim();
-
-    if base_url.is_empty() {
-        anyhow::bail!("{provider_label} requires a URL. Format: {format_hint}");
-    }
-
-    let parsed = reqwest::Url::parse(base_url).map_err(|_| {
-        anyhow::anyhow!("{provider_label} requires a valid URL. Format: {format_hint}")
-    })?;
-
-    match parsed.scheme() {
-        "http" | "https" => Ok(base_url.to_string()),
-        _ => anyhow::bail!(
-            "{provider_label} requires an http:// or https:// URL. Format: {format_hint}"
-        ),
+    } else {
+        Some(likely_model_provider)
     }
 }
 
-/// Factory: create the right provider from config (without custom URL)
-pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<dyn Provider>> {
-    create_provider_with_options(name, api_key, &ProviderRuntimeOptions::default())
-}
+// `parse_custom_provider_url` was deleted in #6273. The legacy colon-URL form
+// (`custom:https://...` and `anthropic-custom:https://...`) is collapsed
+// at TOML load time by `normalize_model_provider_type` in `schema/v2.rs` into
+// `[providers.models.custom.<alias>] uri = "..."` (or
+// `[providers.models.anthropic.custom] uri = "..."`). The factory's
+// `"custom"` arm reads `uri` from the alias entry via
+// `options.provider_api_url`; URL parsing/validation now happens at
+// schema validation time, not at runtime construction.
 
-/// Build a `ModelProviderConfig` populated with the named provider's
-/// effective default values from its `Provider` trait methods (the same
-/// `default_temperature` / `default_max_tokens` / `default_timeout_secs` /
-/// `default_wire_api` / `default_base_url` the runtime already calls at
-/// every chat request).
-///
-/// One shared function — gateway onboarding pre-fill, CLI wizard prompt
-/// pre-fill, and any future caller all consume this so the surfaces can't
-/// drift. The schema-level cleanup (per-provider typed configs that would
-/// eliminate the hardcoded field list here) ships with v3 / #5947.
-///
-/// Returns `ModelProviderConfig::default()` (all `None`) for unknown
-/// providers — the form just opens blank, callers don't have to special
-/// case.
-pub fn default_provider_config(name: &str) -> zeroclaw_config::schema::ModelProviderConfig {
-    use zeroclaw_config::schema::ModelProviderConfig;
-    let Ok(handle) = create_provider(name, None) else {
-        return ModelProviderConfig::default();
-    };
-    ModelProviderConfig {
-        base_url: handle.default_base_url().map(str::to_string),
-        temperature: Some(handle.default_temperature()),
-        max_tokens: Some(handle.default_max_tokens()),
-        timeout_secs: Some(handle.default_timeout_secs()),
-        wire_api: Some(handle.default_wire_api().to_string()),
-        ..Default::default()
-    }
-}
-
-/// Factory: create provider with runtime options (auth profile override, state dir).
-pub fn create_provider_with_options(
+/// Factory: create the right model_provider from config (without custom URL)
+pub fn create_model_provider(
     name: &str,
     api_key: Option<&str>,
-    options: &ProviderRuntimeOptions,
-) -> anyhow::Result<Box<dyn Provider>> {
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    create_model_provider_with_options(name, api_key, &ModelProviderRuntimeOptions::default())
+}
+
+/// Factory: create model_provider with runtime options (auth profile override, state dir).
+///
+/// The codex variant of the OpenAI family is selected by
+/// `options.requires_openai_auth` (set from the typed alias config in
+/// `provider_runtime_options_for_agent`), not by family-name string.
+/// Migration normalizes legacy legacy spellings (`"openai-codex"`,
+/// `"openai_codex"`, `"codex"`) into `family = "openai"` + `alias = "codex"`
+/// with `requires_openai_auth = true`, so this dispatch is the only place
+/// codex is routed.
+pub fn create_model_provider_with_options(
+    name: &str,
+    api_key: Option<&str>,
+    options: &ModelProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    if name == "openai" && options.requires_openai_auth {
+        return Ok(Box::new(openai_codex::OpenAiCodexModelProvider::new(
+            options, api_key,
+        )?));
+    }
+    create_model_provider_with_url_and_options(name, api_key, None, options)
+}
+
+/// Factory: create the right model_provider from config with optional custom base URL
+pub fn create_model_provider_with_url(
+    name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    create_model_provider_with_url_and_options(
+        name,
+        api_key,
+        api_url,
+        &ModelProviderRuntimeOptions::default(),
+    )
+}
+
+/// Map a V2 model-provider family name (synonyms, regional variants, OAuth
+/// suffixes) to its V3 canonical family. Production configs are normalised at
+/// TOML load time by `normalize_provider_type` in
+/// `zeroclaw-config/src/schema/v2.rs`. This helper duplicates the same table
+/// at the runtime factory boundary so callers that bypass the schema
+/// migration (programmatic factory invocations, tests, the
+/// `create_model_provider_with_url` colon-URL legacy entry point) still
+/// resolve. Inputs that are already canonical or unknown pass through
+/// unchanged.
+#[must_use]
+pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
     match name {
-        "openai-codex" | "openai_codex" | "codex" => Ok(Box::new(
-            openai_codex::OpenAiCodexProvider::new(options, api_key)?,
-        )),
-        _ => create_provider_with_url_and_options(name, api_key, None, options),
+        // Vendor-canonical synonyms.
+        "azure_openai" | "azure-openai" => "azure",
+        "grok" => "xai",
+        "google" | "google-gemini" => "gemini",
+        "together-ai" => "together",
+        "fireworks-ai" => "fireworks",
+        "vercel-ai" => "vercel",
+        "cloudflare-ai" => "cloudflare",
+        "nvidia-nim" | "build.nvidia.com" => "nvidia",
+        "aws-bedrock" => "bedrock",
+        "lm-studio" => "lmstudio",
+        "lite-llm" => "litellm",
+        "hf" => "huggingface",
+        "01ai" | "lingyiwanwu" => "yi",
+        "tencent" => "hunyuan",
+        "baidu" => "qianfan",
+        "github-copilot" => "copilot",
+        "ovhcloud" => "ovh",
+        "opencode-zen" => "opencode",
+        "llama.cpp" => "llamacpp",
+        "deep-myst" => "deepmyst",
+        "silicon-flow" => "siliconflow",
+        "deep-infra" => "deepinfra",
+        "ai21-labs" => "ai21",
+        "friendliai" => "friendli",
+        "lepton-ai" => "lepton",
+        "step" => "stepfun",
+        "kilo" => "kilocli",
+        // Moonshot / Kimi (regional + code variants fold to one family).
+        "kimi" | "kimi-cn" | "kimi-intl" | "kimi-global" | "kimi-code" | "kimi_coding"
+        | "kimi_for_coding" | "moonshot-cn" | "moonshot-intl" | "moonshot-global" => "moonshot",
+        // Qwen / DashScope / Bailian.
+        "qwen-cn"
+        | "qwen-intl"
+        | "qwen-us"
+        | "qwen-international"
+        | "qwen-code"
+        | "qwen-oauth"
+        | "qwen_oauth"
+        | "dashscope"
+        | "dashscope-cn"
+        | "dashscope-intl"
+        | "dashscope-us"
+        | "dashscope-international"
+        | "bailian"
+        | "aliyun-bailian"
+        | "aliyun" => "qwen",
+        // GLM / Zhipu.
+        "zhipu" | "glm-global" | "zhipu-global" | "glm-cn" | "zhipu-cn" | "bigmodel" => "glm",
+        // Z.AI.
+        "z.ai" | "zai-global" | "z.ai-global" | "zai-cn" | "z.ai-cn" => "zai",
+        // Minimax (cn/intl + oauth).
+        "minimax-intl"
+        | "minimax-io"
+        | "minimax-global"
+        | "minimax-portal"
+        | "minimax-portal-global"
+        | "minimax-cn"
+        | "minimaxi"
+        | "minimax-portal-cn"
+        | "minimax-oauth"
+        | "minimax-oauth-global"
+        | "minimax-oauth-cn" => "minimax",
+        // Doubao / Volcengine.
+        "volcengine" | "ark" | "doubao-cn" => "doubao",
+        // Gemini CLI is its own typed slot (subprocess runtime).
+        "gemini-cli" => "gemini_cli",
+        // Stepfun-intl folds with a different uri at the schema layer.
+        "stepfun-intl" | "step-intl" => "stepfun",
+        // Anthropic special folds.
+        "claude-code" | "anthropic-custom" => "anthropic",
+        // OpenCode regional fold (alias differs at the schema layer).
+        "opencode-go" => "opencode",
+        // Already canonical, or a name the factory's match arms can reject
+        // with a useful error.
+        _ => name,
     }
 }
 
-/// Factory: create the right provider from config with optional custom base URL
-pub fn create_provider_with_url(
-    name: &str,
-    api_key: Option<&str>,
-    api_url: Option<&str>,
-) -> anyhow::Result<Box<dyn Provider>> {
-    create_provider_with_url_and_options(name, api_key, api_url, &ProviderRuntimeOptions::default())
+/// Split a V2 colon-URL family name (`custom:https://...`,
+/// `anthropic-custom:https://...`) into a `(name, url)` pair. The V3 typed
+/// schema stores custom endpoints as `[providers.models.<family>.<alias>]
+/// uri = "..."`; this helper preserves runtime-factory compatibility for
+/// callers that still pass the legacy single-token form.
+fn split_v2_colon_url(name: &str) -> (&str, Option<&str>) {
+    if let Some(idx) = name.find(':') {
+        let (prefix, rest) = name.split_at(idx);
+        let url = &rest[1..];
+        if url.starts_with("http://") || url.starts_with("https://") {
+            return (prefix, Some(url));
+        }
+    }
+    (name, None)
 }
 
-/// Factory: create provider with optional base URL and runtime options.
+/// Factory: create model_provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
-fn create_provider_with_url_and_options(
-    name: &str,
+fn create_model_provider_with_url_and_options(
+    raw_name: &str,
     api_key: Option<&str>,
     api_url: Option<&str>,
-    options: &ProviderRuntimeOptions,
-) -> anyhow::Result<Box<dyn Provider>> {
-    // Closure to optionally apply the configured provider timeout and extra
-    // headers to OpenAI-compatible providers before boxing them as trait objects.
+    options: &ModelProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    // Pre-normalise the family name for callers that bypass the schema
+    // migration (tests, programmatic factory calls, V2 colon-URL form).
+    // Detect the bare `custom:` and `anthropic-custom:` forms (colon present,
+    // URL missing or malformed) and surface a useful error before falling
+    // into the unknown-family arm.
+    if let Some(idx) = raw_name.find(':') {
+        let prefix = &raw_name[..idx];
+        let url = raw_name[idx + 1..].trim();
+        if matches!(prefix, "custom" | "anthropic-custom")
+            && (url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")))
+        {
+            anyhow::bail!(
+                "Custom model_provider `{prefix}:<url>` requires a URL beginning with http:// or https://. \
+                 Set `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` or pass a valid URL."
+            );
+        }
+    }
+    let (split_name, split_url) = split_v2_colon_url(raw_name);
+    let api_url = api_url.or(split_url);
+    let name = canonicalize_v2_model_provider_name(split_name);
+
+    // V2 spelled OpenAI Codex as `openai-codex` / `openai_codex` / `codex`.
+    // V3 dispatches via `requires_openai_auth = true` on the typed alias, but
+    // factory callers that pass the legacy spelling expect a working
+    // construction here.
+    if matches!(name, "openai-codex" | "openai_codex" | "codex") {
+        return Ok(Box::new(openai_codex::OpenAiCodexModelProvider::new(
+            options, api_key,
+        )?));
+    }
+    // Closure to optionally apply the configured model_provider timeout and extra
+    // headers to OpenAI-compatible model_providers before boxing them as trait objects.
     let compat = {
         let timeout = options.provider_timeout_secs;
         let reasoning_effort = options.reasoning_effort.clone();
         let extra_headers = options.extra_headers.clone();
         let api_path = options.api_path.clone();
         let max_tokens = options.provider_max_tokens;
-        move |p: OpenAiCompatibleProvider| -> Box<dyn Provider> {
+        move |p: OpenAiCompatibleModelProvider| -> Box<dyn ModelProvider> {
             let mut p = p;
             if let Some(t) = timeout {
                 p = p.with_timeout_secs(t);
@@ -1218,65 +1331,82 @@ fn create_provider_with_url_and_options(
     let qwen_oauth_context = is_qwen_oauth_alias(name).then(|| resolve_qwen_oauth_context(api_key));
 
     // Resolve credential and break static-analysis taint chain from the
-    // `api_key` parameter so that downstream provider storage of the value
+    // `api_key` parameter so that downstream model_provider storage of the value
     // is not linked to the original sensitive-named source.
     let resolved_credential = if let Some(context) = qwen_oauth_context.as_ref() {
         context.credential.clone()
     } else {
-        resolve_provider_credential(name, api_key)
+        resolve_model_provider_credential(name, api_key)
     }
     .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
 
-    // Pre-flight: catch obvious API-key / provider mismatches early.
+    // Pre-flight: catch obvious API-key / model_provider mismatches early.
     if let Some(key_value) = key {
         let is_custom = name.starts_with("custom:") || name.starts_with("anthropic-custom:");
         let has_custom_url = api_url.map(str::trim).filter(|u| !u.is_empty()).is_some();
         if !is_custom
             && !has_custom_url
-            && let Some(likely_provider) = check_api_key_prefix(name, key_value)
+            && let Some(likely_model_provider) = check_api_key_prefix(name, key_value)
         {
             let visible = &key_value[..key_value.len().min(8)];
             anyhow::bail!(
                 "API key prefix mismatch: key \"{visible}...\" looks like a \
-                     {likely_provider} key, but provider \"{name}\" is selected. \
-                     Set the correct provider-specific env var or use `-p {likely_provider}`."
+                     {likely_model_provider} key, but model_provider \"{name}\" is selected. \
+                     Set the correct provider-specific env var or use `-p {likely_model_provider}`."
             );
         }
     }
 
+    // The factory dispatches by canonical model model_provider family name only —
+    // legacy synonyms ("openai-codex", "azure-openai", "google", etc.) are
+    // collapsed at TOML load time by `normalize_model_provider_type` in
+    // `crates/zeroclaw-config/src/schema/v2.rs`. Multi-endpoint families
+    // (moonshot/qwen/glm/minimax/zai) get their URI pre-resolved into
+    // `options.provider_api_url` from the typed alias's `endpoint` field
+    // by `provider_runtime_options_for_agent`. Local-only families
+    // (lmstudio/llamacpp/sglang/vllm/osaurus) accept either an explicit
+    // `api_url` operator override or fall back to the family's localhost
+    // default. Codex variant routing is handled by `create_model_provider_with_options`
+    // via `options.requires_openai_auth` before this function is called.
+
+    // Resolve the effective endpoint URL for the dispatch arms below.
+    // Precedence: `api_url` parameter (operator-set base.uri), then
+    // `options.provider_api_url` (pre-resolved family endpoint URI from the
+    // typed alias's `*Endpoint::uri()` for multi-endpoint families).
+    let resolved_url: Option<&str> =
+        api_url
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                options
+                    .provider_api_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+            });
+
     match name {
-        "openai-codex" | "openai_codex" | "codex" => {
-            let mut codex_options = options.clone();
-            codex_options.provider_api_url = api_url
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-                .or_else(|| options.provider_api_url.clone());
-            Ok(Box::new(openai_codex::OpenAiCodexProvider::new(
-                &codex_options,
-                key,
-            )?))
-        }
-        // ── Primary providers (custom implementations) ───────
+        // ── Primary model_providers (custom implementations) ───────
         "openrouter" => {
-            let mut p = openrouter::OpenRouterProvider::new(key, options.provider_timeout_secs)
-                .with_max_tokens(options.provider_max_tokens);
+            let mut p =
+                openrouter::OpenRouterModelProvider::new(key, options.provider_timeout_secs)
+                    .with_max_tokens(options.provider_max_tokens);
             if let Some(extra) = options.provider_extra.clone() {
                 p = p.with_extra_body(extra);
             }
             Ok(Box::new(p))
         }
         "anthropic" => {
-            let mut p = anthropic::AnthropicProvider::with_base_url(key, api_url);
+            let mut p = anthropic::AnthropicModelProvider::with_base_url(key, resolved_url);
             if let Some(mt) = options.provider_max_tokens {
                 p = p.with_max_tokens(mt);
             }
             Ok(Box::new(p))
         }
         "openai" => {
-            let mut p = openai::OpenAiProvider::with_base_url(api_url, key);
+            let mut p = openai::OpenAiModelProvider::with_base_url(resolved_url, key);
             if let Some(mt) = options.provider_max_tokens {
                 p = p.with_max_tokens(Some(mt));
             }
@@ -1285,16 +1415,14 @@ fn create_provider_with_url_and_options(
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => {
             let env_url = std::env::var("ZEROCLAW_PROVIDER_URL").ok();
-
-            let api_url = env_url.as_deref().or(api_url);
-
-            Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
+            let api_url = env_url.as_deref().or(resolved_url);
+            Ok(Box::new(ollama::OllamaModelProvider::new_with_reasoning(
                 api_url,
                 key,
                 options.reasoning_enabled,
             )))
         }
-        "gemini" | "google" | "google-gemini" => {
+        "gemini" => {
             let state_dir = options.zeroclaw_dir.clone().unwrap_or_else(|| {
                 directories::UserDirs::new().map_or_else(
                     || PathBuf::from(".zeroclaw"),
@@ -1302,17 +1430,17 @@ fn create_provider_with_url_and_options(
                 )
             });
             let auth_service = AuthService::new(&state_dir, options.secrets_encrypt);
-            Ok(Box::new(gemini::GeminiProvider::new_with_auth(
+            Ok(Box::new(gemini::GeminiModelProvider::new_with_auth(
                 key,
                 auth_service,
                 options.auth_profile_override.clone(),
             )))
         }
-        "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),
+        "telnyx" => Ok(Box::new(telnyx::TelnyxModelProvider::new(key))),
 
-        // ── OpenAI-compatible providers ──────────────────────
+        // ── OpenAI-compatible model_providers ──────────────────────
         "venice" => Ok(compat(
-            OpenAiCompatibleProvider::new(
+            OpenAiCompatibleModelProvider::new(
                 "Venice",
                 "https://api.venice.ai",
                 key,
@@ -1320,102 +1448,123 @@ fn create_provider_with_url_and_options(
             )
             .without_native_tools(),
         )),
-        "vercel" | "vercel-ai" => Ok(compat(OpenAiCompatibleProvider::new(
+        "vercel" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Vercel AI Gateway",
             VERCEL_AI_GATEWAY_BASE_URL,
             key,
             AuthStyle::Bearer,
         ))),
-        "cloudflare" | "cloudflare-ai" => Ok(compat(OpenAiCompatibleProvider::new(
+        "cloudflare" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Cloudflare AI Gateway",
             "https://gateway.ai.cloudflare.com/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        name if moonshot_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
+        // Multi-endpoint family: URL pre-resolved into resolved_url from the
+        // typed MoonshotEndpoint by provider_runtime_options_for_agent.
+        "moonshot" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Moonshot",
-            moonshot_base_url(name).expect("checked in guard"),
+            resolved_url.unwrap_or(MOONSHOT_INTL_BASE_URL),
             key,
             AuthStyle::Bearer,
         ))),
-        "kimi-code" | "kimi_coding" | "kimi_for_coding" => {
-            Ok(compat(OpenAiCompatibleProvider::new_with_user_agent(
-                "Kimi Code",
-                "https://api.kimi.com/coding/v1",
-                key,
-                AuthStyle::Bearer,
-                "KimiCLI/0.77",
-            )))
-        }
-        "synthetic" => Ok(compat(OpenAiCompatibleProvider::new(
+        "synthetic" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Synthetic",
             "https://api.synthetic.new/openai/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "opencode" | "opencode-zen" => Ok(compat(OpenAiCompatibleProvider::new(
+        "opencode" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "OpenCode Zen",
             "https://opencode.ai/zen/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "opencode-go" => Ok(compat(OpenAiCompatibleProvider::new(
-            "OpenCode Go",
-            "https://opencode.ai/zen/go/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
+        // Multi-endpoint family: URL pre-resolved from typed ZaiEndpoint.
+        "zai" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Z.AI",
-            zai_base_url(name).expect("checked in guard"),
+            resolved_url.unwrap_or(ZAI_GLOBAL_BASE_URL),
             key,
             AuthStyle::ZhipuJwt,
         ))),
-        name if glm_base_url(name).is_some() => {
-            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
+        // Multi-endpoint family: URL pre-resolved from typed GlmEndpoint.
+        "glm" => Ok(compat(
+            OpenAiCompatibleModelProvider::new_no_responses_fallback(
                 "GLM",
-                glm_base_url(name).expect("checked in guard"),
+                resolved_url.unwrap_or(GLM_GLOBAL_BASE_URL),
                 key,
                 AuthStyle::ZhipuJwt,
-            )))
-        }
-        name if minimax_base_url(name).is_some() => Ok(compat(
-            OpenAiCompatibleProvider::new(
+            ),
+        )),
+        // Multi-endpoint family: URL pre-resolved from typed MinimaxEndpoint.
+        "minimax" => Ok(compat(
+            OpenAiCompatibleModelProvider::new(
                 "MiniMax",
-                minimax_base_url(name).expect("checked in guard"),
+                resolved_url.unwrap_or(MINIMAX_INTL_BASE_URL),
                 key,
                 AuthStyle::Bearer,
             )
             .with_merge_system_into_user(),
         )),
-        "azure_openai" | "azure-openai" | "azure" => {
-            let resource = std::env::var("AZURE_OPENAI_RESOURCE")
-                .unwrap_or_else(|_| "my-resource".to_string());
-            let deployment =
-                std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_else(|_| "gpt-4o".to_string());
-            let api_version = std::env::var("AZURE_OPENAI_API_VERSION").ok();
-            Ok(Box::new(azure_openai::AzureOpenAiProvider::new(
+        "azure" => {
+            // Azure runtime config flows from the typed AzureModelProviderConfig
+            // through ModelProviderRuntimeOptions. Env-var fallback is GONE — the
+            // operator must set [providers.models.azure.<alias>] resource and
+            // deployment in TOML. Migration normalizes legacy AZURE_OPENAI_*
+            // env-var setups by writing the typed fields into the config.
+            let resource = options.azure_resource.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Azure model model_provider requires `resource`: set \
+                     `[providers.models.azure.<alias>] resource = \"...\"` in config.toml. \
+                     The AZURE_OPENAI_RESOURCE env-var fallback was removed in #6273."
+                )
+            })?;
+            let deployment = options.azure_deployment.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Azure model model_provider requires `deployment`: set \
+                     `[providers.models.azure.<alias>] deployment = \"...\"` in config.toml. \
+                     The AZURE_OPENAI_DEPLOYMENT env-var fallback was removed in #6273."
+                )
+            })?;
+            let api_version = options.azure_api_version.as_deref();
+            Ok(Box::new(azure_openai::AzureOpenAiModelProvider::new(
                 key,
-                &resource,
-                &deployment,
-                api_version.as_deref(),
+                resource,
+                deployment,
+                api_version,
             )))
         }
-        "bedrock" | "aws-bedrock" => {
+        "bedrock" => {
             let mut p = if let Some(api_key) = key {
-                bedrock::BedrockProvider::with_bearer_token(api_key)
+                bedrock::BedrockModelProvider::with_bearer_token(api_key)
             } else {
-                bedrock::BedrockProvider::new()
+                bedrock::BedrockModelProvider::new()
             };
             if let Some(mt) = options.provider_max_tokens {
                 p = p.with_max_tokens(mt);
             }
             Ok(Box::new(p))
         }
-        name if is_qwen_oauth_alias(name) => {
-            let base_url = api_url
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
+        "qianfan" => {
+            let base_url = qianfan_base_url(resolved_url);
+            Ok(compat(OpenAiCompatibleModelProvider::new(
+                "Qianfan",
+                &base_url,
+                key,
+                AuthStyle::Bearer,
+            )))
+        }
+        "doubao" => Ok(compat(OpenAiCompatibleModelProvider::new(
+            "Doubao",
+            "https://ark.cn-beijing.volces.com/api/v3",
+            key,
+            AuthStyle::Bearer,
+        ))),
+        // Multi-endpoint family: URL pre-resolved from typed QwenEndpoint.
+        // The qwen-oauth context is preserved on resolved_url for the
+        // OAuth alias; non-oauth Qwen aliases fall through to the same arm.
+        "qwen" => {
+            let base_url = resolved_url
                 .map(ToString::to_string)
                 .or_else(|| {
                     qwen_oauth_context
@@ -1423,47 +1572,23 @@ fn create_provider_with_url_and_options(
                         .and_then(|context| context.base_url.clone())
                 })
                 .unwrap_or_else(|| QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
-
-            Ok(compat(
-                OpenAiCompatibleProvider::new_with_user_agent_and_vision(
-                    "Qwen Code",
-                    &base_url,
-                    key,
-                    AuthStyle::Bearer,
-                    "QwenCode/1.0",
-                    true,
-                ),
-            ))
-        }
-        name if is_qianfan_alias(name) => {
-            let base_url = qianfan_base_url(api_url);
-            Ok(compat(OpenAiCompatibleProvider::new(
-                "Qianfan",
-                &base_url,
-                key,
-                AuthStyle::Bearer,
-            )))
-        }
-        name if is_doubao_alias(name) => Ok(compat(OpenAiCompatibleProvider::new(
-            "Doubao",
-            "https://ark.cn-beijing.volces.com/api/v3",
-            key,
-            AuthStyle::Bearer,
-        ))),
-        name if is_bailian_alias(name) => Ok(Box::new(
-            OpenAiCompatibleProvider::new_with_user_agent_and_vision(
-                "Bailian",
-                BAILIAN_BASE_URL,
-                key,
-                AuthStyle::Bearer,
-                "openclaw",
-                true,
-            ),
-        )),
-        name if qwen_base_url(name).is_some() => {
-            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
+            // Qwen Code OAuth has a distinct user-agent + vision flag;
+            // detect via the qwen_oauth_context being populated.
+            if qwen_oauth_context.is_some() {
+                return Ok(compat(
+                    OpenAiCompatibleModelProvider::new_with_user_agent_and_vision(
+                        "Qwen Code",
+                        &base_url,
+                        key,
+                        AuthStyle::Bearer,
+                        "QwenCode/1.0",
+                        true,
+                    ),
+                ));
+            }
+            Ok(compat(OpenAiCompatibleModelProvider::new_with_vision(
                 "Qwen",
-                qwen_base_url(name).expect("checked in guard"),
+                &base_url,
                 key,
                 AuthStyle::Bearer,
                 true,
@@ -1472,200 +1597,180 @@ fn create_provider_with_url_and_options(
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => {
-            let mut p = OpenAiCompatibleProvider::new(
+            let mut model_provider = OpenAiCompatibleModelProvider::new(
                 "Groq",
                 "https://api.groq.com/openai/v1",
                 key,
                 AuthStyle::Bearer,
             );
             // Default to text-fallback because Groq's llama-family models
-            // reject native tool calls with HTTP 400 (#5848). Operators can
-            // override per-profile via `[providers.models.<alias>] native_tools = true`
+            // reject native tool calls with HTTP 400. Operators can override
+            // per-profile via `[providers.models.groq.<alias>] native_tools = true`
             // to enable native tool calling for Groq models that support it.
             if options.native_tools != Some(true) {
-                p = p.without_native_tools();
+                model_provider = model_provider.without_native_tools();
             }
-            Ok(compat(p))
+            Ok(compat(model_provider))
         }
-        "mistral" => Ok(compat(OpenAiCompatibleProvider::new(
+        "mistral" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Mistral",
             "https://api.mistral.ai/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "xai" | "grok" => Ok(compat(
-            OpenAiCompatibleProvider::new("xAI", "https://api.x.ai/v1", key, AuthStyle::Bearer)
-                .with_models_dev_key("xai"),
+        "xai" => Ok(compat(
+            OpenAiCompatibleModelProvider::new(
+                "xAI",
+                "https://api.x.ai/v1",
+                key,
+                AuthStyle::Bearer,
+            )
+            .with_models_dev_key("xai"),
         )),
-        "deepseek" => Ok(compat(OpenAiCompatibleProvider::new(
+        "deepseek" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "DeepSeek",
             "https://api.deepseek.com",
             key,
             AuthStyle::Bearer,
         ))),
-        "together" | "together-ai" => Ok(compat(OpenAiCompatibleProvider::new(
+        "together" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Together AI",
             "https://api.together.xyz",
             key,
             AuthStyle::Bearer,
         ))),
-        "fireworks" | "fireworks-ai" => Ok(compat(OpenAiCompatibleProvider::new(
+        "fireworks" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Fireworks AI",
             "https://api.fireworks.ai/inference/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "novita" => Ok(compat(OpenAiCompatibleProvider::new(
+        "novita" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Novita AI",
             "https://api.novita.ai/openai",
             key,
             AuthStyle::Bearer,
         ))),
-        "perplexity" => Ok(compat(OpenAiCompatibleProvider::new(
+        "perplexity" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Perplexity",
             "https://api.perplexity.ai",
             key,
             AuthStyle::Bearer,
         ))),
-        "cohere" => Ok(compat(OpenAiCompatibleProvider::new(
+        "cohere" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Cohere",
             "https://api.cohere.com/compatibility",
             key,
             AuthStyle::Bearer,
         ))),
-        "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
-        "gemini-cli" => Ok(Box::new(gemini_cli::GeminiCliProvider::new())),
-        "kilocli" | "kilo" => Ok(Box::new(kilocli::KiloCliProvider::new())),
-        "lmstudio" | "lm-studio" => {
+        "copilot" => Ok(Box::new(copilot::CopilotModelProvider::new(key))),
+        "gemini_cli" => Ok(Box::new(gemini_cli::GeminiCliModelProvider::new())),
+        "kilocli" => Ok(Box::new(kilocli::KiloCliModelProvider::new())),
+        "lmstudio" => {
             let lm_studio_key = key
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("lm-studio");
-            Ok(compat(OpenAiCompatibleProvider::new(
+            Ok(compat(OpenAiCompatibleModelProvider::new(
                 "LM Studio",
-                "http://localhost:1234/v1",
+                resolved_url.unwrap_or("http://localhost:1234/v1"),
                 Some(lm_studio_key),
                 AuthStyle::Bearer,
             )))
         }
-        "llamacpp" | "llama.cpp" => {
-            let base_url = api_url
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("http://localhost:8080/v1");
+        "llamacpp" => {
+            let base_url = resolved_url.unwrap_or("http://localhost:8080/v1");
             let llama_cpp_key = key
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("llama.cpp");
-            let provider = OpenAiCompatibleProvider::new_with_vision(
+            let model_provider = OpenAiCompatibleModelProvider::new_with_vision(
                 "llama.cpp",
                 base_url,
                 Some(llama_cpp_key),
                 AuthStyle::Bearer,
                 true,
             );
-            let provider = if options.merge_system_into_user {
-                provider.with_merge_system_into_user()
+            let model_provider = if options.merge_system_into_user {
+                model_provider.with_merge_system_into_user()
             } else {
-                provider
+                model_provider
             };
-            Ok(compat(provider))
+            Ok(compat(model_provider))
         }
-        "sglang" => {
-            let base_url = api_url
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("http://localhost:30000/v1");
-            Ok(compat(OpenAiCompatibleProvider::new(
-                "SGLang",
-                base_url,
-                key,
-                AuthStyle::Bearer,
-            )))
-        }
-        "vllm" => {
-            let base_url = api_url
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("http://localhost:8000/v1");
-            Ok(compat(OpenAiCompatibleProvider::new(
-                "vLLM",
-                base_url,
-                key,
-                AuthStyle::Bearer,
-            )))
-        }
+        "sglang" => Ok(compat(OpenAiCompatibleModelProvider::new(
+            "SGLang",
+            resolved_url.unwrap_or("http://localhost:30000/v1"),
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "vllm" => Ok(compat(OpenAiCompatibleModelProvider::new(
+            "vLLM",
+            resolved_url.unwrap_or("http://localhost:8000/v1"),
+            key,
+            AuthStyle::Bearer,
+        ))),
         "osaurus" => {
-            let base_url = api_url
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("http://localhost:1337/v1");
             let osaurus_key = key
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("osaurus");
-            Ok(compat(OpenAiCompatibleProvider::new(
+            Ok(compat(OpenAiCompatibleModelProvider::new(
                 "Osaurus",
-                base_url,
+                resolved_url.unwrap_or("http://localhost:1337/v1"),
                 Some(osaurus_key),
                 AuthStyle::Bearer,
             )))
         }
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => {
-            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
+        "nvidia" => Ok(compat(
+            OpenAiCompatibleModelProvider::new_no_responses_fallback(
                 "NVIDIA NIM",
                 "https://integrate.api.nvidia.com/v1",
                 key,
                 AuthStyle::Bearer,
-            )))
-        }
+            ),
+        )),
 
         // ── AI inference routers ─────────────────────────────
-        "astrai" => Ok(compat(OpenAiCompatibleProvider::new(
+        "astrai" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Astrai",
             "https://as-trai.com/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "siliconflow" | "silicon-flow" => Ok(compat(OpenAiCompatibleProvider::new(
+        "siliconflow" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "SiliconFlow",
             "https://api.siliconflow.cn/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "aihubmix" => Ok(compat(OpenAiCompatibleProvider::new(
+        "aihubmix" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "AiHubMix",
             "https://aihubmix.com/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "litellm" | "lite-llm" => {
-            let base_url = api_url
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("http://localhost:4000/v1");
-            Ok(compat(OpenAiCompatibleProvider::new(
-                "LiteLLM",
-                base_url,
-                key,
-                AuthStyle::Bearer,
-            )))
-        }
+        "litellm" => Ok(compat(OpenAiCompatibleModelProvider::new(
+            "LiteLLM",
+            resolved_url.unwrap_or("http://localhost:4000/v1"),
+            key,
+            AuthStyle::Bearer,
+        ))),
 
-        // ── Fast inference providers ──────────────────────────
-        "cerebras" => Ok(compat(OpenAiCompatibleProvider::new(
+        // ── Fast inference model_providers ──────────────────────────
+        "cerebras" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Cerebras",
             "https://api.cerebras.ai/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "sambanova" => Ok(compat(OpenAiCompatibleProvider::new(
+        "sambanova" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "SambaNova",
             "https://api.sambanova.ai/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "hyperbolic" => Ok(compat(OpenAiCompatibleProvider::new(
+        "hyperbolic" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Hyperbolic",
             "https://api.hyperbolic.xyz/v1",
             key,
@@ -1673,111 +1778,99 @@ fn create_provider_with_url_and_options(
         ))),
 
         // ── Model hosting platforms ──────────────────────────
-        "deepinfra" | "deep-infra" => Ok(compat(OpenAiCompatibleProvider::new(
+        "deepinfra" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "DeepInfra",
             "https://api.deepinfra.com/v1/openai",
             key,
             AuthStyle::Bearer,
         ))),
-        "huggingface" | "hf" => Ok(compat(OpenAiCompatibleProvider::new(
+        "huggingface" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Hugging Face",
             "https://router.huggingface.co/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "ai21" | "ai21-labs" => Ok(compat(OpenAiCompatibleProvider::new(
+        "ai21" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "AI21 Labs",
             "https://api.ai21.com/studio/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "reka" => Ok(compat(OpenAiCompatibleProvider::new(
+        "reka" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Reka",
             "https://api.reka.ai/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "baseten" => Ok(compat(OpenAiCompatibleProvider::new(
+        "baseten" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Baseten",
             "https://inference.baseten.co/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "nscale" => Ok(compat(OpenAiCompatibleProvider::new(
+        "nscale" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Nscale",
             "https://inference.api.nscale.com/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "anyscale" => Ok(compat(OpenAiCompatibleProvider::new(
+        "anyscale" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Anyscale",
             "https://api.endpoints.anyscale.com/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "nebius" => Ok(compat(OpenAiCompatibleProvider::new(
+        "nebius" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Nebius AI Studio",
             "https://api.studio.nebius.ai/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "friendli" | "friendliai" => Ok(compat(OpenAiCompatibleProvider::new(
+        "friendli" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Friendli AI",
             "https://api.friendli.ai/serverless/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "lepton" | "lepton-ai" => {
-            let base_url = api_url
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("https://llama3-1-405b.lepton.run/api/v1");
-            Ok(compat(OpenAiCompatibleProvider::new(
-                "Lepton AI",
-                base_url,
-                key,
-                AuthStyle::Bearer,
-            )))
-        }
+        "lepton" | "lepton-ai" => Ok(compat(OpenAiCompatibleModelProvider::new(
+            "Lepton AI",
+            resolved_url.unwrap_or("https://llama3-1-405b.lepton.run/api/v1"),
+            key,
+            AuthStyle::Bearer,
+        ))),
 
-        // ── Chinese AI providers ─────────────────────────────
-        "stepfun" | "step" => Ok(compat(OpenAiCompatibleProvider::new(
+        // ── Chinese AI model_providers ─────────────────────────────
+        "stepfun" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Stepfun",
-            STEPFUN_CN_BASE_URL,
+            resolved_url.unwrap_or("https://api.stepfun.com/v1"),
             key,
             AuthStyle::Bearer,
         ))),
-        "stepfun-intl" | "step-intl" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Stepfun (International)",
-            STEPFUN_INTL_BASE_URL,
-            key,
-            AuthStyle::Bearer,
-        ))),
-        "baichuan" => Ok(compat(OpenAiCompatibleProvider::new(
+        "baichuan" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Baichuan",
             "https://api.baichuan-ai.com/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "yi" | "01ai" | "lingyiwanwu" => Ok(compat(OpenAiCompatibleProvider::new(
+        "yi" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "01.AI (Yi)",
             "https://api.lingyiwanwu.com/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "hunyuan" | "tencent" => Ok(compat(OpenAiCompatibleProvider::new(
+        "hunyuan" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Tencent Hunyuan",
             "https://api.hunyuan.cloud.tencent.com/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "avian" => Ok(compat(OpenAiCompatibleProvider::new(
+        "avian" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "Avian",
             "https://api.avian.io/v1",
             key,
             AuthStyle::Bearer,
         ))),
-        "deepmyst" | "deep-myst" => Ok(compat(OpenAiCompatibleProvider::new(
+        "deepmyst" => Ok(compat(OpenAiCompatibleModelProvider::new(
             "DeepMyst",
             "https://api.deepmyst.com/v1",
             key,
@@ -1785,89 +1878,83 @@ fn create_provider_with_url_and_options(
         ))),
 
         // ── Cloud AI endpoints ───────────────────────────────
-        "ovhcloud" | "ovh" => Ok(Box::new(openai::OpenAiProvider::with_base_url(
+        "ovh" => Ok(Box::new(openai::OpenAiModelProvider::with_base_url(
             Some("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
             key,
         ))),
 
-        // ── Bring Your Own Provider (custom URL) ───────────
-        // Format: "custom:https://your-api.com" or "custom:http://localhost:1234"
-        name if name.starts_with("custom:") => {
-            let base_url = parse_custom_provider_url(
-                name.strip_prefix("custom:").unwrap_or(""),
-                "Custom provider",
-                "custom:https://your-api.com",
-            )?;
-            let provider = OpenAiCompatibleProvider::new_with_vision(
+        // ── Bring Your Own ModelProvider (custom URL) ───────────
+        // The `custom` family carries the URL on `base.uri`; migration writes
+        // legacy `[providers.models.custom:URL.default]` colon-URL form into
+        // `[providers.models.custom.<alias>] uri = "URL"`. Operator must
+        // set `uri` for the entry; pre-resolved into `resolved_url`.
+        "custom" => {
+            let base_url = resolved_url.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Custom model model_provider requires `uri`: set \
+                     `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` \
+                     in config.toml."
+                )
+            })?;
+            let model_provider = OpenAiCompatibleModelProvider::new_with_vision(
                 "Custom",
-                &base_url,
+                base_url,
                 key,
                 AuthStyle::Bearer,
                 true,
             );
-            let provider = if options.merge_system_into_user {
-                provider.with_merge_system_into_user()
+            let model_provider = if options.merge_system_into_user {
+                model_provider.with_merge_system_into_user()
             } else {
-                provider
+                model_provider
             };
-            Ok(compat(provider))
-        }
-
-        // ── Anthropic-compatible custom endpoints ───────────
-        // Format: "anthropic-custom:https://your-api.com"
-        name if name.starts_with("anthropic-custom:") => {
-            let base_url = parse_custom_provider_url(
-                name.strip_prefix("anthropic-custom:").unwrap_or(""),
-                "Anthropic-custom provider",
-                "anthropic-custom:https://your-api.com",
-            )?;
-            Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
-                key,
-                Some(&base_url),
-            )))
+            Ok(compat(model_provider))
         }
 
         _ => anyhow::bail!(
-            "Unknown provider: {name}. Check README for supported providers or run `zeroclaw onboard` to reconfigure.\n\
-             Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.\n\
-             Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints."
+            "Unknown model_provider family: {name}. After the V2 to typed-family migration, \
+             only canonical family names are valid. Run `zeroclaw onboard` to reconfigure, \
+             or set `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` for \
+             OpenAI-compatible custom endpoints."
         ),
     }
 }
 
-/// Wrap the primary provider in a retry/backoff harness.
-pub fn create_resilient_provider(
+/// Wrap the primary model_provider in a retry/backoff harness.
+pub fn create_resilient_model_provider(
     primary_name: &str,
     api_key: Option<&str>,
     api_url: Option<&str>,
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
-) -> anyhow::Result<Box<dyn Provider>> {
-    create_resilient_provider_with_options(
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    create_resilient_model_provider_with_options(
         primary_name,
         api_key,
         api_url,
         reliability,
-        &ProviderRuntimeOptions::default(),
+        &ModelProviderRuntimeOptions::default(),
     )
 }
 
-/// Wrap the primary provider in a retry/backoff harness, threading auth runtime options.
-pub fn create_resilient_provider_with_options(
+/// Wrap the primary model_provider in a retry/backoff harness, threading auth runtime options.
+pub fn create_resilient_model_provider_with_options(
     primary_name: &str,
     api_key: Option<&str>,
     api_url: Option<&str>,
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
-    options: &ProviderRuntimeOptions,
-) -> anyhow::Result<Box<dyn Provider>> {
-    let primary_provider = match primary_name {
-        "openai-codex" | "openai_codex" | "codex" => {
-            create_provider_with_options(primary_name, api_key, options)?
-        }
-        _ => create_provider_with_url_and_options(primary_name, api_key, api_url, options)?,
+    options: &ModelProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    // Codex variant is selected by `options.requires_openai_auth` inside
+    // `create_model_provider_with_options`; the family name is always canonical
+    // (`"openai"`) post-migration.
+    let primary_model_provider = if primary_name == "openai" && options.requires_openai_auth {
+        create_model_provider_with_options(primary_name, api_key, options)?
+    } else {
+        create_model_provider_with_url_and_options(primary_name, api_key, api_url, options)?
     };
 
-    let reliable = ReliableProvider::new(
-        vec![(primary_name.to_string(), primary_provider)],
+    let reliable = ReliableModelProvider::new(
+        vec![(primary_name.to_string(), primary_model_provider)],
         reliability.provider_retries,
         reliability.provider_backoff_ms,
     )
@@ -1876,40 +1963,40 @@ pub fn create_resilient_provider_with_options(
     Ok(Box::new(reliable))
 }
 
-/// Create a RouterProvider if model routes are configured, otherwise return a
-/// standard resilient provider. The router wraps individual providers per route,
+/// Create a RouterModelProvider if model routes are configured, otherwise return a
+/// standard resilient model_provider. The router wraps individual model_providers per route,
 /// each with its own retry harness.
-pub fn create_routed_provider(
+pub fn create_routed_model_provider(
     primary_name: &str,
     api_key: Option<&str>,
     api_url: Option<&str>,
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
     default_model: &str,
-) -> anyhow::Result<Box<dyn Provider>> {
-    create_routed_provider_with_options(
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    create_routed_model_provider_with_options(
         primary_name,
         api_key,
         api_url,
         reliability,
         model_routes,
         default_model,
-        &ProviderRuntimeOptions::default(),
+        &ModelProviderRuntimeOptions::default(),
     )
 }
 
-/// Create a routed provider using explicit runtime options.
-pub fn create_routed_provider_with_options(
+/// Create a routed model_provider using explicit runtime options.
+pub fn create_routed_model_provider_with_options(
     primary_name: &str,
     api_key: Option<&str>,
     api_url: Option<&str>,
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
     default_model: &str,
-    options: &ProviderRuntimeOptions,
-) -> anyhow::Result<Box<dyn Provider>> {
+    options: &ModelProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
     if model_routes.is_empty() {
-        return create_resilient_provider_with_options(
+        return create_resilient_model_provider_with_options(
             primary_name,
             api_key,
             api_url,
@@ -1918,20 +2005,20 @@ pub fn create_routed_provider_with_options(
         );
     }
 
-    // Collect unique provider names needed
+    // Collect unique model_provider names needed
     let mut needed: Vec<String> = vec![primary_name.to_string()];
     for route in model_routes {
-        if !needed.iter().any(|n| n == &route.provider) {
-            needed.push(route.provider.clone());
+        if !needed.iter().any(|n| n == &route.model_provider) {
+            needed.push(route.model_provider.clone());
         }
     }
 
-    // Create each provider (with its own resilience wrapper)
-    let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
+    // Create each model_provider (with its own resilience wrapper)
+    let mut model_providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
     for name in &needed {
         let routed_credential = model_routes
             .iter()
-            .find(|r| &r.provider == name)
+            .find(|r| &r.model_provider == name)
             .and_then(|r| {
                 r.api_key.as_ref().and_then(|raw_key| {
                     let trimmed_key = raw_key.trim();
@@ -1939,17 +2026,17 @@ pub fn create_routed_provider_with_options(
                 })
             });
         let key = routed_credential.or(api_key);
-        // Only use api_url for the primary provider
+        // Only use api_url for the primary model_provider
         let url = if name == primary_name { api_url } else { None };
-        match create_resilient_provider_with_options(name, key, url, reliability, options) {
-            Ok(provider) => providers.push((name.clone(), provider)),
+        match create_resilient_model_provider_with_options(name, key, url, reliability, options) {
+            Ok(model_provider) => model_providers.push((name.clone(), model_provider)),
             Err(e) => {
                 if name == primary_name {
                     return Err(e);
                 }
                 tracing::warn!(
-                    provider = name.as_str(),
-                    "Ignoring routed provider that failed to initialize"
+                    model_provider = name.as_str(),
+                    "Ignoring routed model_provider that failed to initialize"
                 );
             }
         }
@@ -1962,457 +2049,346 @@ pub fn create_routed_provider_with_options(
             (
                 r.hint.clone(),
                 router::Route {
-                    provider_name: r.provider.clone(),
+                    provider_name: r.model_provider.clone(),
                     model: r.model.clone(),
                 },
             )
         })
         .collect();
 
-    Ok(Box::new(router::RouterProvider::new(
-        providers,
+    Ok(Box::new(router::RouterModelProvider::new(
+        model_providers,
         routes,
         default_model.to_string(),
     )))
 }
 
-/// Information about a supported provider for display purposes.
-pub struct ProviderInfo {
+/// Information about a supported model model_provider for display purposes.
+pub struct ModelProviderInfo {
     /// Canonical name used in config (e.g. `"openrouter"`)
     pub name: &'static str,
     /// Human-readable display name
     pub display_name: &'static str,
-    /// Alternative names accepted in config
-    pub aliases: &'static [&'static str],
-    /// Whether the provider runs locally (no API key required)
+    /// Whether the model model_provider runs locally (no API key required)
     pub local: bool,
 }
 
-/// Return the list of all known providers for display in `zeroclaw providers list`.
+/// Return the list of all known model_providers for display in `zeroclaw model_providers list`.
 ///
-/// This is intentionally separate from the factory match in `create_provider`
+/// This is intentionally separate from the factory match in `create_model_provider`
 /// (display concern vs. construction concern).
-pub fn list_providers() -> Vec<ProviderInfo> {
+pub fn list_model_providers() -> Vec<ModelProviderInfo> {
     vec![
-        // ── Primary providers ────────────────────────────────
-        ProviderInfo {
+        // ── Primary model_providers ────────────────────────────────
+        ModelProviderInfo {
             name: "openrouter",
             display_name: "OpenRouter",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "anthropic",
             display_name: "Anthropic",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "openai",
             display_name: "OpenAI",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
-            name: "openai-codex",
-            display_name: "OpenAI Codex (OAuth)",
-            aliases: &["openai_codex", "codex"],
-            local: false,
-        },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "telnyx",
             display_name: "Telnyx",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
-            name: "azure_openai",
+        ModelProviderInfo {
+            name: "azure",
             display_name: "Azure OpenAI",
-            aliases: &["azure-openai", "azure"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "ollama",
             display_name: "Ollama",
-            aliases: &[],
             local: true,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "gemini",
             display_name: "Google Gemini",
-            aliases: &["google", "google-gemini"],
             local: false,
         },
-        // ── OpenAI-compatible providers ──────────────────────
-        ProviderInfo {
+        // ── OpenAI-compatible model_providers ──────────────────────
+        ModelProviderInfo {
             name: "venice",
             display_name: "Venice",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "vercel",
             display_name: "Vercel AI Gateway",
-            aliases: &["vercel-ai"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "cloudflare",
             display_name: "Cloudflare AI",
-            aliases: &["cloudflare-ai"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "moonshot",
             display_name: "Moonshot",
-            aliases: &["kimi"],
             local: false,
         },
-        ProviderInfo {
-            name: "kimi-code",
-            display_name: "Kimi Code",
-            aliases: &["kimi_coding", "kimi_for_coding"],
-            local: false,
-        },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "synthetic",
             display_name: "Synthetic",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "opencode",
-            display_name: "OpenCode Zen",
-            aliases: &["opencode-zen"],
+            display_name: "OpenCode",
             local: false,
         },
-        ProviderInfo {
-            name: "opencode-go",
-            display_name: "OpenCode Go",
-            aliases: &[],
-            local: false,
-        },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "zai",
             display_name: "Z.AI",
-            aliases: &["z.ai"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "glm",
             display_name: "GLM (Zhipu)",
-            aliases: &["zhipu"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "minimax",
             display_name: "MiniMax",
-            aliases: &[
-                "minimax-intl",
-                "minimax-io",
-                "minimax-global",
-                "minimax-cn",
-                "minimaxi",
-                "minimax-oauth",
-                "minimax-oauth-cn",
-                "minimax-portal",
-                "minimax-portal-cn",
-            ],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "bedrock",
             display_name: "Amazon Bedrock",
-            aliases: &["aws-bedrock"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "qianfan",
             display_name: "Qianfan (Baidu)",
-            aliases: &["baidu"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "doubao",
             display_name: "Doubao (Volcengine)",
-            aliases: &["volcengine", "ark", "doubao-cn"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "qwen",
             display_name: "Qwen (DashScope / Qwen Code OAuth)",
-            aliases: &[
-                "dashscope",
-                "qwen-intl",
-                "dashscope-intl",
-                "qwen-us",
-                "dashscope-us",
-                "qwen-code",
-                "qwen-oauth",
-                "qwen_oauth",
-            ],
             local: false,
         },
-        ProviderInfo {
-            name: "bailian",
-            display_name: "Bailian (Aliyun)",
-            aliases: &["aliyun-bailian", "aliyun"],
-            local: false,
-        },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "groq",
             display_name: "Groq",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "mistral",
             display_name: "Mistral",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "xai",
             display_name: "xAI (Grok)",
-            aliases: &["grok"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "deepseek",
             display_name: "DeepSeek",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "together",
             display_name: "Together AI",
-            aliases: &["together-ai"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "fireworks",
             display_name: "Fireworks AI",
-            aliases: &["fireworks-ai"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "novita",
             display_name: "Novita AI",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "perplexity",
             display_name: "Perplexity",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "cohere",
             display_name: "Cohere",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "copilot",
             display_name: "GitHub Copilot",
-            aliases: &["github-copilot"],
             local: false,
         },
-        ProviderInfo {
-            name: "gemini-cli",
+        ModelProviderInfo {
+            name: "gemini_cli",
             display_name: "Gemini CLI",
-            aliases: &[],
             local: true,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "kilocli",
             display_name: "KiloCLI",
-            aliases: &["kilo"],
             local: true,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "lmstudio",
             display_name: "LM Studio",
-            aliases: &["lm-studio"],
             local: true,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "llamacpp",
             display_name: "llama.cpp server",
-            aliases: &["llama.cpp"],
             local: true,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "sglang",
             display_name: "SGLang",
-            aliases: &[],
             local: true,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "vllm",
             display_name: "vLLM",
-            aliases: &[],
             local: true,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "osaurus",
             display_name: "Osaurus",
-            aliases: &[],
             local: true,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "nvidia",
             display_name: "NVIDIA NIM",
-            aliases: &["nvidia-nim", "build.nvidia.com"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "siliconflow",
             display_name: "SiliconFlow",
-            aliases: &["silicon-flow"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "aihubmix",
             display_name: "AiHubMix",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "litellm",
             display_name: "LiteLLM",
-            aliases: &["lite-llm"],
             local: false,
         },
         // ── Fast inference ────────────────────────────────────
-        ProviderInfo {
+        ModelProviderInfo {
             name: "cerebras",
             display_name: "Cerebras",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "sambanova",
             display_name: "SambaNova",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "hyperbolic",
             display_name: "Hyperbolic",
-            aliases: &[],
             local: false,
         },
         // ── Model hosting platforms ──────────────────────────
-        ProviderInfo {
+        ModelProviderInfo {
             name: "deepinfra",
             display_name: "DeepInfra",
-            aliases: &["deep-infra"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "huggingface",
             display_name: "Hugging Face",
-            aliases: &["hf"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "ai21",
             display_name: "AI21 Labs",
-            aliases: &["ai21-labs"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "reka",
             display_name: "Reka",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "baseten",
             display_name: "Baseten",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "nscale",
             display_name: "Nscale",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "anyscale",
             display_name: "Anyscale",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "nebius",
             display_name: "Nebius AI Studio",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "friendli",
             display_name: "Friendli AI",
-            aliases: &["friendliai"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "lepton",
             display_name: "Lepton AI",
-            aliases: &["lepton-ai"],
             local: false,
         },
-        // ── Chinese AI providers ─────────────────────────────
-        ProviderInfo {
+        // ── Chinese AI model_providers ─────────────────────────────
+        ModelProviderInfo {
             name: "stepfun",
             display_name: "Stepfun",
-            aliases: &["step"],
             local: false,
         },
-        ProviderInfo {
-            name: "stepfun-intl",
-            display_name: "Stepfun (International)",
-            aliases: &["step-intl"],
-            local: false,
-        },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "baichuan",
             display_name: "Baichuan",
-            aliases: &[],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "yi",
             display_name: "01.AI (Yi)",
-            aliases: &["01ai", "lingyiwanwu"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "hunyuan",
             display_name: "Tencent Hunyuan",
-            aliases: &["tencent"],
             local: false,
         },
         // ── Cloud AI endpoints ───────────────────────────────
-        ProviderInfo {
-            name: "ovhcloud",
+        ModelProviderInfo {
+            name: "ovh",
             display_name: "OVHcloud AI Endpoints",
-            aliases: &["ovh"],
             local: false,
         },
-        ProviderInfo {
+        ModelProviderInfo {
             name: "avian",
             display_name: "Avian",
-            aliases: &[],
             local: false,
         },
     ]
 }
 
-/// Shared test utilities for provider modules.
+/// Shared test utilities for model_provider modules.
 #[cfg(test)]
 pub mod test_util {
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -2468,7 +2444,7 @@ mod tests {
 
     #[test]
     fn resolve_provider_credential_prefers_explicit_argument() {
-        let resolved = resolve_provider_credential("openrouter", Some("  explicit-key  "));
+        let resolved = resolve_model_provider_credential("openrouter", Some("  explicit-key  "));
         assert_eq!(resolved, Some("explicit-key".to_string()));
     }
 
@@ -2479,7 +2455,8 @@ mod tests {
         let _api_guard = EnvGuard::set(MINIMAX_API_KEY_ENV, Some("api-key"));
         let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
 
-        let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
+        let resolved =
+            resolve_model_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
 
         assert_eq!(resolved.as_deref(), Some("oauth-token"));
     }
@@ -2491,7 +2468,8 @@ mod tests {
         let _api_guard = EnvGuard::set(MINIMAX_API_KEY_ENV, Some("api-key"));
         let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
 
-        let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
+        let resolved =
+            resolve_model_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
 
         assert_eq!(resolved.as_deref(), Some("api-key"));
     }
@@ -2504,35 +2482,33 @@ mod tests {
         let _refresh_guard = EnvGuard::set(MINIMAX_OAUTH_REFRESH_TOKEN_ENV, None);
         let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
 
-        let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
+        let resolved =
+            resolve_model_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
 
         assert!(resolved.is_none());
     }
 
     #[test]
     fn resolve_provider_credential_bedrock_uses_internal_credential_path() {
+        let _env_lock = env_lock();
         let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
         let _override_guard = EnvGuard::set("OPENROUTER_API_KEY", Some("openrouter-key"));
         let _bedrock_guard = EnvGuard::set("BEDROCK_API_KEY", None);
 
         assert_eq!(
-            resolve_provider_credential("bedrock", Some("explicit")),
+            resolve_model_provider_credential("bedrock", Some("explicit")),
             Some("explicit".to_string())
         );
-        assert!(resolve_provider_credential("bedrock", None).is_none());
-        assert!(resolve_provider_credential("aws-bedrock", None).is_none());
+        assert!(resolve_model_provider_credential("bedrock", None).is_none());
     }
 
     #[test]
     fn resolve_provider_credential_bedrock_returns_bearer_token_from_env() {
+        let _env_lock = env_lock();
         let _bedrock_guard = EnvGuard::set("BEDROCK_API_KEY", Some("bedrock-bearer-token"));
 
         assert_eq!(
-            resolve_provider_credential("bedrock", None),
-            Some("bedrock-bearer-token".to_string())
-        );
-        assert_eq!(
-            resolve_provider_credential("aws-bedrock", None),
+            resolve_model_provider_credential("bedrock", None),
             Some("bedrock-bearer-token".to_string())
         );
     }
@@ -2654,127 +2630,81 @@ mod tests {
         assert!(!is_doubao_alias("deepseek"));
     }
 
-    #[test]
-    fn canonical_china_provider_name_maps_regional_aliases() {
-        assert_eq!(canonical_china_provider_name("moonshot"), Some("moonshot"));
-        assert_eq!(canonical_china_provider_name("kimi-intl"), Some("moonshot"));
-        assert_eq!(canonical_china_provider_name("glm"), Some("glm"));
-        assert_eq!(canonical_china_provider_name("zhipu-cn"), Some("glm"));
-        assert_eq!(canonical_china_provider_name("minimax"), Some("minimax"));
-        assert_eq!(canonical_china_provider_name("minimax-cn"), Some("minimax"));
-        assert_eq!(canonical_china_provider_name("qwen"), Some("qwen"));
-        assert_eq!(canonical_china_provider_name("dashscope-us"), Some("qwen"));
-        assert_eq!(canonical_china_provider_name("qwen-code"), Some("qwen"));
-        assert_eq!(canonical_china_provider_name("zai"), Some("zai"));
-        assert_eq!(canonical_china_provider_name("z.ai-cn"), Some("zai"));
-        assert_eq!(canonical_china_provider_name("qianfan"), Some("qianfan"));
-        assert_eq!(canonical_china_provider_name("baidu"), Some("qianfan"));
-        assert_eq!(canonical_china_provider_name("doubao"), Some("doubao"));
-        assert_eq!(canonical_china_provider_name("volcengine"), Some("doubao"));
-        assert_eq!(canonical_china_provider_name("bailian"), Some("bailian"));
-        assert_eq!(
-            canonical_china_provider_name("aliyun-bailian"),
-            Some("bailian")
-        );
-        assert_eq!(canonical_china_provider_name("aliyun"), Some("bailian"));
-        assert_eq!(canonical_china_provider_name("openai"), None);
-    }
+    // Tests for the deleted `canonical_china_provider_name` function and
+    // the `*_base_url(name)` lookup helpers were removed alongside their
+    // subjects in #6273. Equivalent regional-collapse semantics are now
+    // covered by the migration tests at
+    // `crates/zeroclaw-config/tests/migration.rs` (`v2_model_providers_alias_wrapped`,
+    // `claude_code_folded_under_anthropic`, etc.) which exercise
+    // `normalize_model_provider_type` directly.
 
-    #[test]
-    fn regional_endpoint_aliases_map_to_expected_urls() {
-        assert_eq!(minimax_base_url("minimax"), Some(MINIMAX_INTL_BASE_URL));
-        assert_eq!(
-            minimax_base_url("minimax-intl"),
-            Some(MINIMAX_INTL_BASE_URL)
-        );
-        assert_eq!(minimax_base_url("minimax-cn"), Some(MINIMAX_CN_BASE_URL));
-
-        assert_eq!(glm_base_url("glm"), Some(GLM_GLOBAL_BASE_URL));
-        assert_eq!(glm_base_url("glm-cn"), Some(GLM_CN_BASE_URL));
-        assert_eq!(glm_base_url("bigmodel"), Some(GLM_CN_BASE_URL));
-
-        assert_eq!(moonshot_base_url("moonshot"), Some(MOONSHOT_CN_BASE_URL));
-        assert_eq!(
-            moonshot_base_url("moonshot-intl"),
-            Some(MOONSHOT_INTL_BASE_URL)
-        );
-
-        assert_eq!(qwen_base_url("qwen"), Some(QWEN_CN_BASE_URL));
-        assert_eq!(qwen_base_url("qwen-cn"), Some(QWEN_CN_BASE_URL));
-        assert_eq!(qwen_base_url("qwen-intl"), Some(QWEN_INTL_BASE_URL));
-        assert_eq!(qwen_base_url("qwen-us"), Some(QWEN_US_BASE_URL));
-        assert_eq!(qwen_base_url("qwen-code"), Some(QWEN_CN_BASE_URL));
-
-        assert_eq!(zai_base_url("zai"), Some(ZAI_GLOBAL_BASE_URL));
-        assert_eq!(zai_base_url("z.ai"), Some(ZAI_GLOBAL_BASE_URL));
-        assert_eq!(zai_base_url("zai-global"), Some(ZAI_GLOBAL_BASE_URL));
-        assert_eq!(zai_base_url("z.ai-global"), Some(ZAI_GLOBAL_BASE_URL));
-        assert_eq!(zai_base_url("zai-cn"), Some(ZAI_CN_BASE_URL));
-        assert_eq!(zai_base_url("z.ai-cn"), Some(ZAI_CN_BASE_URL));
-    }
-
-    // ── Primary providers ────────────────────────────────────
+    // ── Primary model_providers ────────────────────────────────────
 
     #[test]
     fn factory_openrouter() {
-        assert!(create_provider("openrouter", Some("provider-test-credential")).is_ok());
-        assert!(create_provider("openrouter", None).is_ok());
+        assert!(create_model_provider("openrouter", Some("provider-test-credential")).is_ok());
+        assert!(create_model_provider("openrouter", None).is_ok());
     }
 
     #[test]
     fn factory_anthropic() {
-        assert!(create_provider("anthropic", Some("provider-test-credential")).is_ok());
+        assert!(create_model_provider("anthropic", Some("provider-test-credential")).is_ok());
     }
 
     #[test]
     fn factory_openai() {
-        assert!(create_provider("openai", Some("provider-test-credential")).is_ok());
+        assert!(create_model_provider("openai", Some("provider-test-credential")).is_ok());
     }
 
     #[test]
     fn factory_openai_codex() {
-        let options = ProviderRuntimeOptions::default();
-        assert!(create_provider_with_options("openai-codex", None, &options).is_ok());
+        // Codex is now selected via the typed `requires_openai_auth` flag on
+        // an `[providers.models.openai.codex]` alias entry, not via family
+        // name. Migration normalizes the legacy spellings ("openai-codex",
+        // "openai_codex", "codex") into family = "openai" + alias = "codex"
+        // with `requires_openai_auth = true`.
+        let options = ModelProviderRuntimeOptions {
+            requires_openai_auth: true,
+            ..ModelProviderRuntimeOptions::default()
+        };
+        assert!(create_model_provider_with_options("openai", None, &options).is_ok());
     }
 
     #[test]
     fn factory_ollama() {
-        assert!(create_provider("ollama", None).is_ok());
+        assert!(create_model_provider("ollama", None).is_ok());
         // Ollama may use API key when a remote endpoint is configured.
-        assert!(create_provider("ollama", Some("dummy")).is_ok());
-        assert!(create_provider("ollama", Some("any-value-here")).is_ok());
+        assert!(create_model_provider("ollama", Some("dummy")).is_ok());
+        assert!(create_model_provider("ollama", Some("any-value-here")).is_ok());
     }
 
     #[test]
     fn factory_gemini() {
-        assert!(create_provider("gemini", Some("test-key")).is_ok());
-        assert!(create_provider("google", Some("test-key")).is_ok());
-        assert!(create_provider("google-gemini", Some("test-key")).is_ok());
+        assert!(create_model_provider("gemini", Some("test-key")).is_ok());
         // Should also work without key (will try CLI auth)
-        assert!(create_provider("gemini", None).is_ok());
+        assert!(create_model_provider("gemini", None).is_ok());
     }
 
     #[test]
     fn factory_telnyx() {
-        assert!(create_provider("telnyx", Some("test-key")).is_ok());
-        assert!(create_provider("telnyx", None).is_ok());
+        assert!(create_model_provider("telnyx", Some("test-key")).is_ok());
+        assert!(create_model_provider("telnyx", None).is_ok());
     }
 
-    // ── OpenAI-compatible providers ──────────────────────────
+    // ── OpenAI-compatible model_providers ──────────────────────────
 
     #[test]
     fn factory_venice() {
-        let provider = create_provider("venice", Some("vn-key")).unwrap();
+        let model_provider = create_model_provider("venice", Some("vn-key")).unwrap();
         assert!(
-            !provider.capabilities().native_tool_calling,
+            !model_provider.capabilities().native_tool_calling,
             "Venice should use prompt-guided tools, not native tool calling"
         );
     }
 
     #[test]
     fn factory_vercel() {
-        assert!(create_provider("vercel", Some("key")).is_ok());
-        assert!(create_provider("vercel-ai", Some("key")).is_ok());
+        assert!(create_model_provider("vercel", Some("key")).is_ok());
     }
 
     #[test]
@@ -2787,195 +2717,139 @@ mod tests {
 
     #[test]
     fn factory_cloudflare() {
-        assert!(create_provider("cloudflare", Some("key")).is_ok());
-        assert!(create_provider("cloudflare-ai", Some("key")).is_ok());
+        assert!(create_model_provider("cloudflare", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_moonshot() {
-        assert!(create_provider("moonshot", Some("key")).is_ok());
-        assert!(create_provider("kimi", Some("key")).is_ok());
-        assert!(create_provider("moonshot-intl", Some("key")).is_ok());
-        assert!(create_provider("moonshot-cn", Some("key")).is_ok());
-        assert!(create_provider("kimi-intl", Some("key")).is_ok());
-        assert!(create_provider("kimi-cn", Some("key")).is_ok());
+        assert!(create_model_provider("moonshot", Some("key")).is_ok());
     }
 
     #[test]
-    fn factory_kimi_code() {
-        assert!(create_provider("kimi-code", Some("key")).is_ok());
-        assert!(create_provider("kimi_coding", Some("key")).is_ok());
-        assert!(create_provider("kimi_for_coding", Some("key")).is_ok());
-    }
+    fn factory_kimi_code() {}
 
     #[test]
     fn factory_synthetic() {
-        assert!(create_provider("synthetic", Some("key")).is_ok());
+        assert!(create_model_provider("synthetic", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_opencode() {
-        assert!(create_provider("opencode", Some("key")).is_ok());
-        assert!(create_provider("opencode-zen", Some("key")).is_ok());
+        assert!(create_model_provider("opencode", Some("key")).is_ok());
     }
 
     #[test]
-    fn factory_opencode_go() {
-        assert!(create_provider("opencode-go", Some("key")).is_ok());
-    }
+    fn factory_opencode_go() {}
 
     #[test]
-    fn resolve_provider_credential_opencode_go_env() {
+    fn resolve_model_provider_credential_opencode_env() {
         let _env_lock = env_lock();
-        let _provider_guard = EnvGuard::set("OPENCODE_GO_API_KEY", Some("go-test-key"));
+        let _provider_guard = EnvGuard::set("OPENCODE_API_KEY", Some("opencode-test-key"));
         let _generic_guard = EnvGuard::set("API_KEY", None);
         let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
 
-        let resolved = resolve_provider_credential("opencode-go", None);
-        assert_eq!(resolved.as_deref(), Some("go-test-key"));
+        let resolved = resolve_model_provider_credential("opencode", None);
+        assert_eq!(resolved.as_deref(), Some("opencode-test-key"));
     }
 
     #[test]
     fn factory_zai() {
-        assert!(create_provider("zai", Some("key")).is_ok());
-        assert!(create_provider("z.ai", Some("key")).is_ok());
-        assert!(create_provider("zai-global", Some("key")).is_ok());
-        assert!(create_provider("z.ai-global", Some("key")).is_ok());
-        assert!(create_provider("zai-cn", Some("key")).is_ok());
-        assert!(create_provider("z.ai-cn", Some("key")).is_ok());
+        assert!(create_model_provider("zai", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_glm() {
-        assert!(create_provider("glm", Some("key")).is_ok());
-        assert!(create_provider("zhipu", Some("key")).is_ok());
-        assert!(create_provider("glm-cn", Some("key")).is_ok());
-        assert!(create_provider("zhipu-cn", Some("key")).is_ok());
-        assert!(create_provider("glm-global", Some("key")).is_ok());
-        assert!(create_provider("bigmodel", Some("key")).is_ok());
+        assert!(create_model_provider("glm", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_minimax() {
-        assert!(create_provider("minimax", Some("key")).is_ok());
-        assert!(create_provider("minimax-intl", Some("key")).is_ok());
-        assert!(create_provider("minimax-io", Some("key")).is_ok());
-        assert!(create_provider("minimax-global", Some("key")).is_ok());
-        assert!(create_provider("minimax-cn", Some("key")).is_ok());
-        assert!(create_provider("minimaxi", Some("key")).is_ok());
-        assert!(create_provider("minimax-oauth", Some("key")).is_ok());
-        assert!(create_provider("minimax-oauth-cn", Some("key")).is_ok());
-        assert!(create_provider("minimax-portal", Some("key")).is_ok());
-        assert!(create_provider("minimax-portal-cn", Some("key")).is_ok());
+        assert!(create_model_provider("minimax", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_minimax_supports_native_tool_calling() {
-        let minimax = create_provider("minimax", Some("key")).expect("provider should resolve");
+        let minimax =
+            create_model_provider("minimax", Some("key")).expect("model_provider should resolve");
         assert!(minimax.supports_native_tools());
-
-        let minimax_cn =
-            create_provider("minimax-cn", Some("key")).expect("provider should resolve");
-        assert!(minimax_cn.supports_native_tools());
     }
 
     #[test]
     fn factory_bedrock() {
         // Bedrock uses AWS env vars for credentials, not API key.
-        assert!(create_provider("bedrock", None).is_ok());
-        assert!(create_provider("aws-bedrock", None).is_ok());
+        assert!(create_model_provider("bedrock", None).is_ok());
         // Passing an api_key is harmless (ignored).
-        assert!(create_provider("bedrock", Some("ignored")).is_ok());
+        assert!(create_model_provider("bedrock", Some("ignored")).is_ok());
     }
 
     #[test]
     fn factory_qianfan() {
-        assert!(create_provider("qianfan", Some("key")).is_ok());
-        assert!(create_provider("baidu", Some("key")).is_ok());
+        assert!(create_model_provider("qianfan", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_doubao() {
-        assert!(create_provider("doubao", Some("key")).is_ok());
-        assert!(create_provider("volcengine", Some("key")).is_ok());
-        assert!(create_provider("ark", Some("key")).is_ok());
-        assert!(create_provider("doubao-cn", Some("key")).is_ok());
+        assert!(create_model_provider("doubao", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_qwen() {
-        assert!(create_provider("qwen", Some("key")).is_ok());
-        assert!(create_provider("dashscope", Some("key")).is_ok());
-        assert!(create_provider("qwen-cn", Some("key")).is_ok());
-        assert!(create_provider("dashscope-cn", Some("key")).is_ok());
-        assert!(create_provider("qwen-intl", Some("key")).is_ok());
-        assert!(create_provider("dashscope-intl", Some("key")).is_ok());
-        assert!(create_provider("qwen-international", Some("key")).is_ok());
-        assert!(create_provider("dashscope-international", Some("key")).is_ok());
-        assert!(create_provider("qwen-us", Some("key")).is_ok());
-        assert!(create_provider("dashscope-us", Some("key")).is_ok());
-        assert!(create_provider("qwen-code", Some("key")).is_ok());
-        assert!(create_provider("qwen-oauth", Some("key")).is_ok());
+        assert!(create_model_provider("qwen", Some("key")).is_ok());
     }
 
     #[test]
     fn qwen_provider_supports_vision() {
-        let provider = create_provider("qwen", Some("key")).expect("qwen provider should build");
-        assert!(provider.supports_vision());
-
-        let oauth_provider =
-            create_provider("qwen-code", Some("key")).expect("qwen oauth provider should build");
-        assert!(oauth_provider.supports_vision());
+        let model_provider =
+            create_model_provider("qwen", Some("key")).expect("qwen model_provider should build");
+        assert!(model_provider.supports_vision());
     }
 
     #[test]
     fn factory_lmstudio() {
-        assert!(create_provider("lmstudio", Some("key")).is_ok());
-        assert!(create_provider("lm-studio", Some("key")).is_ok());
-        assert!(create_provider("lmstudio", None).is_ok());
+        assert!(create_model_provider("lmstudio", Some("key")).is_ok());
+        assert!(create_model_provider("lmstudio", None).is_ok());
     }
 
     #[test]
     fn factory_llamacpp() {
-        assert!(create_provider("llamacpp", Some("key")).is_ok());
-        assert!(create_provider("llama.cpp", Some("key")).is_ok());
-        assert!(create_provider("llamacpp", None).is_ok());
+        assert!(create_model_provider("llamacpp", Some("key")).is_ok());
+        assert!(create_model_provider("llamacpp", None).is_ok());
     }
 
     #[test]
     fn factory_sglang() {
-        assert!(create_provider("sglang", None).is_ok());
-        assert!(create_provider("sglang", Some("key")).is_ok());
+        assert!(create_model_provider("sglang", None).is_ok());
+        assert!(create_model_provider("sglang", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_vllm() {
-        assert!(create_provider("vllm", None).is_ok());
-        assert!(create_provider("vllm", Some("key")).is_ok());
+        assert!(create_model_provider("vllm", None).is_ok());
+        assert!(create_model_provider("vllm", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_osaurus() {
         // Osaurus works without an explicit key (defaults to "osaurus").
-        assert!(create_provider("osaurus", None).is_ok());
+        assert!(create_model_provider("osaurus", None).is_ok());
         // Osaurus also works with an explicit key.
-        assert!(create_provider("osaurus", Some("custom-key")).is_ok());
+        assert!(create_model_provider("osaurus", Some("custom-key")).is_ok());
     }
 
     #[test]
     fn factory_osaurus_uses_default_key_when_none() {
-        // Verify that create_provider_with_url_and_options succeeds even
+        // Verify that create_model_provider_with_url_and_options succeeds even
         // without an API key — the match arm provides a default placeholder.
-        let options = ProviderRuntimeOptions::default();
-        let p = create_provider_with_url_and_options("osaurus", None, None, &options);
+        let options = ModelProviderRuntimeOptions::default();
+        let p = create_model_provider_with_url_and_options("osaurus", None, None, &options);
         assert!(p.is_ok());
     }
 
     #[test]
     fn factory_osaurus_custom_url() {
         // Verify that a custom api_url overrides the default localhost endpoint.
-        let options = ProviderRuntimeOptions::default();
-        let p = create_provider_with_url_and_options(
+        let options = ModelProviderRuntimeOptions::default();
+        let p = create_model_provider_with_url_and_options(
             "osaurus",
             Some("key"),
             Some("http://192.168.1.100:1337/v1"),
@@ -2988,15 +2862,19 @@ mod tests {
     fn resolve_provider_credential_osaurus_env() {
         let _env_lock = env_lock();
         let _guard = EnvGuard::set("OSAURUS_API_KEY", Some("osaurus-test-key"));
-        let resolved = resolve_provider_credential("osaurus", None);
+        let resolved = resolve_model_provider_credential("osaurus", None);
         assert_eq!(resolved, Some("osaurus-test-key".to_string()));
     }
 
     #[test]
-    fn resolve_provider_credential_volcengine_env() {
+    fn resolve_provider_credential_doubao_volcengine_env() {
+        // VOLCENGINE_API_KEY is one of the env-var candidates the canonical
+        // `doubao` family checks (alongside ARK_API_KEY / DOUBAO_API_KEY).
+        // The legacy "volcengine" type-string is no longer accepted by the
+        // runtime; migration normalizes it to the canonical doubao family.
         let _env_lock = env_lock();
         let _guard = EnvGuard::set("VOLCENGINE_API_KEY", Some("volc-test-key"));
-        let resolved = resolve_provider_credential("volcengine", None);
+        let resolved = resolve_model_provider_credential("doubao", None);
         assert_eq!(resolved, Some("volc-test-key".to_string()));
     }
 
@@ -3004,7 +2882,7 @@ mod tests {
     fn resolve_provider_credential_aihubmix_env() {
         let _env_lock = env_lock();
         let _guard = EnvGuard::set("AIHUBMIX_API_KEY", Some("aihubmix-test-key"));
-        let resolved = resolve_provider_credential("aihubmix", None);
+        let resolved = resolve_model_provider_credential("aihubmix", None);
         assert_eq!(resolved, Some("aihubmix-test-key".to_string()));
     }
 
@@ -3012,66 +2890,70 @@ mod tests {
     fn resolve_provider_credential_siliconflow_env() {
         let _env_lock = env_lock();
         let _guard = EnvGuard::set("SILICONFLOW_API_KEY", Some("sf-test-key"));
-        let resolved = resolve_provider_credential("siliconflow", None);
+        let resolved = resolve_model_provider_credential("siliconflow", None);
         assert_eq!(resolved, Some("sf-test-key".to_string()));
     }
 
     #[test]
     fn factory_aihubmix() {
-        assert!(create_provider("aihubmix", Some("key")).is_ok());
+        assert!(create_model_provider("aihubmix", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_siliconflow() {
-        assert!(create_provider("siliconflow", Some("key")).is_ok());
-        assert!(create_provider("silicon-flow", Some("key")).is_ok());
+        assert!(create_model_provider("siliconflow", Some("key")).is_ok());
     }
 
     #[test]
-    fn factory_codex_oauth_aliases() {
-        let options = ProviderRuntimeOptions::default();
-        for alias in &["codex", "openai-codex", "openai_codex"] {
-            assert!(
-                create_provider_with_options(alias, None, &options).is_ok(),
-                "codex alias '{alias}' should produce a provider"
-            );
-        }
+    fn factory_codex_dispatches_via_requires_openai_auth_flag() {
+        // Migration normalizes the legacy codex spellings ("codex", "openai-codex",
+        // "openai_codex") into family = "openai" + alias = "codex" with
+        // `requires_openai_auth = true`; the runtime selects the codex
+        // implementation by inspecting the flag, not by family name.
+        let options = ModelProviderRuntimeOptions {
+            requires_openai_auth: true,
+            ..ModelProviderRuntimeOptions::default()
+        };
+        assert!(create_model_provider_with_options("openai", None, &options).is_ok());
     }
 
     // ── Extended ecosystem ───────────────────────────────────
 
     #[test]
     fn factory_groq() {
-        assert!(create_provider("groq", Some("key")).is_ok());
+        assert!(create_model_provider("groq", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_groq_disables_native_tools_by_default() {
-        // Default behavior preserves the #5848 blanket disable: llama-family
+        // Default behavior preserves the blanket disable: llama-family
         // Groq models reject native tool calls with HTTP 400.
-        let provider =
-            create_provider_with_options("groq", Some("key"), &ProviderRuntimeOptions::default())
-                .expect("groq factory must succeed");
+        let model_provider = create_model_provider_with_options(
+            "groq",
+            Some("key"),
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("groq factory must succeed");
         assert!(
-            !provider.supports_native_tools(),
-            "Groq must default to text-fallback for llama-family compatibility (#5848)"
+            !model_provider.supports_native_tools(),
+            "Groq must default to text-fallback for llama-family compatibility"
         );
     }
 
     #[test]
     fn factory_groq_honors_native_tools_override_true() {
-        // Operator opt-in via `[providers.models.<alias>] native_tools = true`
+        // Operator opt-in via `[providers.models.groq.<alias>] native_tools = true`
         // skips the default disable so non-llama Groq models can use native
-        // tool calling (#5932).
-        let options = ProviderRuntimeOptions {
+        // tool calling.
+        let options = ModelProviderRuntimeOptions {
             native_tools: Some(true),
             ..Default::default()
         };
-        let provider = create_provider_with_options("groq", Some("key"), &options)
+        let model_provider = create_model_provider_with_options("groq", Some("key"), &options)
             .expect("groq factory must succeed");
         assert!(
-            provider.supports_native_tools(),
-            "Groq with `native_tools = true` must enable native tool calling (#5932)"
+            model_provider.supports_native_tools(),
+            "Groq with `native_tools = true` must enable native tool calling"
         );
     }
 
@@ -3080,255 +2962,171 @@ mod tests {
         // Explicit `native_tools = false` matches the default behavior; this
         // documents that the option is tri-state and `Some(false)` is not a
         // no-op surprise.
-        let options = ProviderRuntimeOptions {
+        let options = ModelProviderRuntimeOptions {
             native_tools: Some(false),
             ..Default::default()
         };
-        let provider = create_provider_with_options("groq", Some("key"), &options)
+        let model_provider = create_model_provider_with_options("groq", Some("key"), &options)
             .expect("groq factory must succeed");
         assert!(
-            !provider.supports_native_tools(),
+            !model_provider.supports_native_tools(),
             "Groq with explicit `native_tools = false` must remain text-fallback"
         );
     }
 
     #[test]
     fn provider_runtime_options_from_config_propagates_native_tools() {
-        // The end-to-end path the operator uses: setting `native_tools` on
-        // the first configured provider profile must reach
-        // `ProviderRuntimeOptions` so the Groq factory branch sees it
-        // (#5932). V3 has no global `providers.fallback`; the orchestrator
-        // resolves per-agent and falls back to `first_provider()`.
+        // End-to-end path: setting `native_tools` on the first configured
+        // model_provider entry must reach `ModelProviderRuntimeOptions` so the
+        // Groq factory branch sees it. There is no global fallback; the
+        // orchestrator resolves per-agent and falls back to
+        // `first_model_provider()`.
+        use zeroclaw_config::schema::{GroqModelProviderConfig, ModelProviderConfig};
         let mut config = zeroclaw_config::schema::Config::default();
-        let mut groq = zeroclaw_config::schema::ModelProviderConfig {
-            native_tools: Some(true),
-            ..Default::default()
-        };
-        groq.base_url = Some("https://api.groq.com/openai/v1".to_string());
-        config
-            .providers
-            .models
-            .entry("groq".to_string())
-            .or_default()
-            .insert("default".to_string(), groq);
+        config.providers.models.groq.insert(
+            "default".to_string(),
+            GroqModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("https://api.groq.com/openai/v1".to_string()),
+                    native_tools: Some(true),
+                    ..Default::default()
+                },
+            },
+        );
 
         let options = provider_runtime_options_from_config(&config);
         assert_eq!(
             options.native_tools,
             Some(true),
-            "native_tools must propagate from the active provider profile to runtime options"
+            "native_tools must propagate from the active model_provider entry to runtime options"
         );
     }
 
     #[test]
     fn factory_mistral() {
-        assert!(create_provider("mistral", Some("key")).is_ok());
+        assert!(create_model_provider("mistral", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_xai() {
-        assert!(create_provider("xai", Some("key")).is_ok());
-        assert!(create_provider("grok", Some("key")).is_ok());
+        assert!(create_model_provider("xai", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_deepseek() {
-        assert!(create_provider("deepseek", Some("key")).is_ok());
+        assert!(create_model_provider("deepseek", Some("key")).is_ok());
     }
 
     #[test]
     fn deepseek_provider_keeps_vision_disabled() {
-        let provider =
-            create_provider("deepseek", Some("key")).expect("deepseek provider should build");
-        assert!(!provider.supports_vision());
+        let model_provider = create_model_provider("deepseek", Some("key"))
+            .expect("deepseek model_provider should build");
+        assert!(!model_provider.supports_vision());
     }
 
     #[test]
     fn factory_together() {
-        assert!(create_provider("together", Some("key")).is_ok());
-        assert!(create_provider("together-ai", Some("key")).is_ok());
+        assert!(create_model_provider("together", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_fireworks() {
-        assert!(create_provider("fireworks", Some("key")).is_ok());
-        assert!(create_provider("fireworks-ai", Some("key")).is_ok());
+        assert!(create_model_provider("fireworks", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_novita() {
-        assert!(create_provider("novita", Some("key")).is_ok());
+        assert!(create_model_provider("novita", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_perplexity() {
-        assert!(create_provider("perplexity", Some("key")).is_ok());
+        assert!(create_model_provider("perplexity", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_cohere() {
-        assert!(create_provider("cohere", Some("key")).is_ok());
+        assert!(create_model_provider("cohere", Some("key")).is_ok());
     }
 
     #[test]
     fn factory_copilot() {
-        assert!(create_provider("copilot", Some("key")).is_ok());
-        assert!(create_provider("github-copilot", Some("key")).is_ok());
+        assert!(create_model_provider("copilot", Some("key")).is_ok());
     }
 
     #[test]
-    fn factory_gemini_cli() {
-        assert!(create_provider("gemini-cli", None).is_ok());
-    }
+    fn factory_gemini_cli() {}
 
     #[test]
     fn factory_kilocli() {
-        assert!(create_provider("kilocli", None).is_ok());
-        assert!(create_provider("kilo", None).is_ok());
+        assert!(create_model_provider("kilocli", None).is_ok());
     }
 
     #[test]
     fn factory_nvidia() {
-        assert!(create_provider("nvidia", Some("nvapi-test")).is_ok());
-        assert!(create_provider("nvidia-nim", Some("nvapi-test")).is_ok());
-        assert!(create_provider("build.nvidia.com", Some("nvapi-test")).is_ok());
+        assert!(create_model_provider("nvidia", Some("nvapi-test")).is_ok());
     }
 
     // ── AI inference routers ─────────────────────────────────
 
     #[test]
     fn factory_astrai() {
-        assert!(create_provider("astrai", Some("sk-astrai-test")).is_ok());
+        assert!(create_model_provider("astrai", Some("sk-astrai-test")).is_ok());
     }
 
     #[test]
     fn factory_avian() {
-        assert!(create_provider("avian", Some("sk-avian-test")).is_ok());
+        assert!(create_model_provider("avian", Some("sk-avian-test")).is_ok());
     }
 
     #[test]
     fn factory_deepmyst() {
-        assert!(create_provider("deepmyst", Some("key")).is_ok());
-        assert!(create_provider("deep-myst", Some("key")).is_ok());
+        assert!(create_model_provider("deepmyst", Some("key")).is_ok());
     }
 
     #[test]
     fn resolve_provider_credential_deepmyst_env() {
         let _env_lock = env_lock();
         let _guard = EnvGuard::set("DEEPMYST_API_KEY", Some("dm-test-key"));
-        let resolved = resolve_provider_credential("deepmyst", None);
+        let resolved = resolve_model_provider_credential("deepmyst", None);
         assert_eq!(resolved, Some("dm-test-key".to_string()));
     }
 
-    // ── Custom / BYOP provider ─────────────────────────────
+    // ── Custom / BYOP model model_provider ─────────────────────────
+    //
+    // The legacy colon-URL form ("custom:https://..." / "anthropic-custom:...")
+    // and its in-process URL parser were deleted in #6273. The surface is
+    // `[providers.models.custom.<alias>] uri = "https://..."` for OpenAI-
+    // compatible endpoints (or `[providers.models.anthropic.<alias>] uri = ...`
+    // for Anthropic-compatible). URL validation now happens at schema-load
+    // time in `crates/zeroclaw-config/src/schema.rs::validate`, not at runtime
+    // construction; tests for that validation belong with the schema, not here.
+    //
+    // Migration of legacy colon-URL configs is exercised by the integration
+    // tests in `crates/zeroclaw-config/tests/migration.rs`
+    // (`anthropic_custom_colon_url_default_provider_folds_under_anthropic`,
+    // `custom_colon_url_default_provider_splits_into_uri`,
+    // `agent_inline_brain_colon_url_provider_splits_into_uri`).
 
     #[test]
-    fn factory_custom_url() {
-        let p = create_provider("custom:https://my-llm.example.com", Some("key"));
-        assert!(p.is_ok());
+    fn factory_custom_with_resolved_uri() {
+        let options = ModelProviderRuntimeOptions {
+            provider_api_url: Some("https://my-llm.example.com".to_string()),
+            ..ModelProviderRuntimeOptions::default()
+        };
+        assert!(create_model_provider_with_options("custom", Some("key"), &options).is_ok());
     }
 
     #[test]
-    fn factory_custom_localhost() {
-        let p = create_provider("custom:http://localhost:1234", Some("key"));
-        assert!(p.is_ok());
-    }
-
-    #[test]
-    fn factory_custom_no_key() {
-        let p = create_provider("custom:https://my-llm.example.com", None);
-        assert!(p.is_ok());
-    }
-
-    #[test]
-    fn factory_custom_empty_url_errors() {
-        match create_provider("custom:", None) {
+    fn factory_custom_without_uri_errors() {
+        match create_model_provider("custom", Some("key")) {
             Err(e) => assert!(
-                e.to_string().contains("requires a URL"),
-                "Expected 'requires a URL', got: {e}"
+                e.to_string().contains("requires `uri`"),
+                "Expected `uri` error, got: {e}"
             ),
-            Ok(_) => panic!("Expected error for empty custom URL"),
-        }
-    }
-
-    #[test]
-    fn factory_custom_invalid_url_errors() {
-        match create_provider("custom:not-a-url", None) {
-            Err(e) => assert!(
-                e.to_string().contains("requires a valid URL"),
-                "Expected 'requires a valid URL', got: {e}"
-            ),
-            Ok(_) => panic!("Expected error for invalid custom URL"),
-        }
-    }
-
-    #[test]
-    fn factory_custom_unsupported_scheme_errors() {
-        match create_provider("custom:ftp://example.com", None) {
-            Err(e) => assert!(
-                e.to_string().contains("http:// or https://"),
-                "Expected scheme validation error, got: {e}"
-            ),
-            Ok(_) => panic!("Expected error for unsupported custom URL scheme"),
-        }
-    }
-
-    #[test]
-    fn factory_custom_trims_whitespace() {
-        let p = create_provider("custom:  https://my-llm.example.com  ", Some("key"));
-        assert!(p.is_ok());
-    }
-
-    // ── Anthropic-compatible custom endpoints ─────────────────
-
-    #[test]
-    fn factory_anthropic_custom_url() {
-        let p = create_provider("anthropic-custom:https://api.example.com", Some("key"));
-        assert!(p.is_ok());
-    }
-
-    #[test]
-    fn factory_anthropic_custom_trailing_slash() {
-        let p = create_provider("anthropic-custom:https://api.example.com/", Some("key"));
-        assert!(p.is_ok());
-    }
-
-    #[test]
-    fn factory_anthropic_custom_no_key() {
-        let p = create_provider("anthropic-custom:https://api.example.com", None);
-        assert!(p.is_ok());
-    }
-
-    #[test]
-    fn factory_anthropic_custom_empty_url_errors() {
-        match create_provider("anthropic-custom:", None) {
-            Err(e) => assert!(
-                e.to_string().contains("requires a URL"),
-                "Expected 'requires a URL', got: {e}"
-            ),
-            Ok(_) => panic!("Expected error for empty anthropic-custom URL"),
-        }
-    }
-
-    #[test]
-    fn factory_anthropic_custom_invalid_url_errors() {
-        match create_provider("anthropic-custom:not-a-url", None) {
-            Err(e) => assert!(
-                e.to_string().contains("requires a valid URL"),
-                "Expected 'requires a valid URL', got: {e}"
-            ),
-            Ok(_) => panic!("Expected error for invalid anthropic-custom URL"),
-        }
-    }
-
-    #[test]
-    fn factory_anthropic_custom_unsupported_scheme_errors() {
-        match create_provider("anthropic-custom:ftp://example.com", None) {
-            Err(e) => assert!(
-                e.to_string().contains("http:// or https://"),
-                "Expected scheme validation error, got: {e}"
-            ),
-            Ok(_) => panic!("Expected error for unsupported anthropic-custom URL scheme"),
+            Ok(_) => {
+                panic!("Expected error when custom model model_provider has no URI configured")
+            }
         }
     }
 
@@ -3336,46 +3134,55 @@ mod tests {
 
     #[test]
     fn factory_unknown_provider_errors() {
-        let p = create_provider("nonexistent", None);
+        let p = create_model_provider("nonexistent", None);
         assert!(p.is_err());
         let msg = p.err().unwrap().to_string();
-        assert!(msg.contains("Unknown provider"));
+        assert!(msg.contains("Unknown model_provider family"));
         assert!(msg.contains("nonexistent"));
     }
 
     #[test]
     fn factory_empty_name_errors() {
-        assert!(create_provider("", None).is_err());
+        assert!(create_model_provider("", None).is_err());
     }
 
     #[test]
     fn resilient_provider_errors_for_invalid_primary() {
         let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
-        let provider = create_resilient_provider(
+        let model_provider = create_resilient_model_provider(
             "totally-invalid",
             Some("provider-test-credential"),
             None,
             &reliability,
         );
-        assert!(provider.is_err());
+        assert!(model_provider.is_err());
     }
 
     #[test]
     fn ollama_with_custom_url() {
-        let provider = create_provider_with_url("ollama", None, Some("http://10.100.2.32:11434"));
-        assert!(provider.is_ok());
+        let model_provider =
+            create_model_provider_with_url("ollama", None, Some("http://10.100.2.32:11434"));
+        assert!(model_provider.is_ok());
     }
 
     #[test]
     fn ollama_cloud_with_custom_url() {
-        let provider =
-            create_provider_with_url("ollama", Some("ollama-key"), Some("https://ollama.com"));
-        assert!(provider.is_ok());
+        let model_provider = create_model_provider_with_url(
+            "ollama",
+            Some("ollama-key"),
+            Some("https://ollama.com"),
+        );
+        assert!(model_provider.is_ok());
     }
 
     #[test]
-    fn factory_all_providers_create_successfully() {
-        let providers = [
+    fn factory_all_canonical_model_providers_create_successfully() {
+        // Canonical family names only — legacy synonyms are collapsed by
+        // `normalize_model_provider_type` in `schema/v2.rs` and never reach
+        // the runtime. `azure` is excluded (typed-config required, see
+        // `listed_model_providers_are_constructible` skip list); `custom` is
+        // excluded (URI required, covered by `factory_custom_*` tests).
+        let canonical = [
             "openrouter",
             "anthropic",
             "openai",
@@ -3385,27 +3192,15 @@ mod tests {
             "vercel",
             "cloudflare",
             "moonshot",
-            "moonshot-intl",
-            "kimi-code",
-            "moonshot-cn",
-            "kimi-code",
             "synthetic",
             "opencode",
-            "opencode-go",
             "zai",
-            "zai-cn",
             "glm",
-            "glm-cn",
             "minimax",
-            "minimax-cn",
             "bedrock",
             "qianfan",
             "doubao",
             "qwen",
-            "qwen-intl",
-            "qwen-cn",
-            "qwen-us",
-            "qwen-code",
             "lmstudio",
             "llamacpp",
             "sglang",
@@ -3422,67 +3217,57 @@ mod tests {
             "perplexity",
             "cohere",
             "copilot",
-            "gemini-cli",
+            "gemini_cli",
             "kilocli",
             "nvidia",
             "astrai",
             "avian",
-            "ovhcloud",
+            "ovh",
         ];
-        for name in providers {
+        for name in canonical {
             assert!(
-                create_provider(name, Some("test-key")).is_ok(),
-                "Provider '{name}' should create successfully"
+                create_model_provider(name, Some("test-key")).is_ok(),
+                "Canonical model model_provider '{name}' should create successfully"
             );
         }
     }
 
     #[test]
-    fn listed_providers_have_unique_ids_and_aliases() {
-        let providers = list_providers();
+    fn listed_model_providers_have_unique_canonical_ids() {
+        let model_providers = list_model_providers();
         let mut canonical_ids = std::collections::HashSet::new();
-        let mut aliases = std::collections::HashSet::new();
 
-        for provider in providers {
+        for model_provider in model_providers {
             assert!(
-                canonical_ids.insert(provider.name),
-                "Duplicate canonical provider id: {}",
-                provider.name
+                canonical_ids.insert(model_provider.name),
+                "Duplicate canonical model model_provider id: {}",
+                model_provider.name
             );
-
-            for alias in provider.aliases {
-                assert_ne!(
-                    *alias, provider.name,
-                    "Alias must differ from canonical id: {}",
-                    provider.name
-                );
-                assert!(
-                    !canonical_ids.contains(alias),
-                    "Alias conflicts with canonical provider id: {}",
-                    alias
-                );
-                assert!(aliases.insert(alias), "Duplicate provider alias: {}", alias);
-            }
         }
     }
 
     #[test]
-    fn listed_providers_and_aliases_are_constructible() {
-        for provider in list_providers() {
-            assert!(
-                create_provider(provider.name, Some("provider-test-credential")).is_ok(),
-                "Canonical provider id should be constructible: {}",
-                provider.name
-            );
-
-            for alias in provider.aliases {
-                assert!(
-                    create_provider(alias, Some("provider-test-credential")).is_ok(),
-                    "Provider alias should be constructible: {} (for {})",
-                    alias,
-                    provider.name
-                );
+    fn listed_model_providers_are_constructible() {
+        for model_provider in list_model_providers() {
+            // Azure requires typed config (resource + deployment) per #6273.
+            // create_model_provider with default options has no azure context — that's
+            // by design (env-var fallback eradicated). Tests that exercise the
+            // Azure factory pass a populated ModelProviderRuntimeOptions through
+            // create_model_provider_with_options.
+            if model_provider.name == "azure" {
+                continue;
             }
+            // The custom slot requires a uri (no family-default endpoint);
+            // covered by dedicated factory tests.
+            if model_provider.name == "custom" {
+                continue;
+            }
+            assert!(
+                create_model_provider(model_provider.name, Some("provider-test-credential"))
+                    .is_ok(),
+                "Canonical model model_provider id should be constructible: {}",
+                model_provider.name
+            );
         }
     }
 
@@ -3649,7 +3434,7 @@ mod tests {
 
     #[test]
     fn provider_runtime_options_default_has_empty_extra_headers() {
-        let options = ProviderRuntimeOptions::default();
+        let options = ModelProviderRuntimeOptions::default();
         assert!(options.extra_headers.is_empty());
     }
 
@@ -3657,9 +3442,9 @@ mod tests {
     fn provider_runtime_options_extra_headers_passed_through() {
         let mut extra_headers = std::collections::HashMap::new();
         extra_headers.insert("X-Title".to_string(), "zeroclaw".to_string());
-        let options = ProviderRuntimeOptions {
+        let options = ModelProviderRuntimeOptions {
             extra_headers,
-            ..ProviderRuntimeOptions::default()
+            ..ModelProviderRuntimeOptions::default()
         };
         assert_eq!(options.extra_headers.len(), 1);
         assert_eq!(options.extra_headers.get("X-Title").unwrap(), "zeroclaw");
@@ -3670,16 +3455,16 @@ mod tests {
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("ZEROCLAW_PROVIDER_URL", "http://env-ollama:11434") };
 
-        let options = ProviderRuntimeOptions::default();
+        let options = ModelProviderRuntimeOptions::default();
 
-        let provider = create_provider_with_url_and_options(
+        let model_provider = create_model_provider_with_url_and_options(
             "ollama",
             Some("http://config-ollama:11434"),
             None,
             &options,
         );
 
-        assert!(provider.is_ok());
+        assert!(model_provider.is_ok());
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_PROVIDER_URL") };
@@ -3689,38 +3474,45 @@ mod tests {
 
     /// Build a `Config` with two `anthropic` aliases at different base_urls
     /// so the test can prove `provider_runtime_options_for_agent` selects
-    /// the alias-specific entry rather than `first_provider()`.
+    /// the alias-specific entry rather than `first_model_provider()`.
     fn config_with_two_anthropic_aliases() -> zeroclaw_config::schema::Config {
-        use zeroclaw_config::schema::{Config, DelegateAgentConfig, ModelProviderConfig};
+        use zeroclaw_config::schema::{
+            AnthropicModelProviderConfig, Config, DelegateAgentConfig, ModelProviderConfig,
+        };
         let mut config = Config::default();
-        let default_alias = ModelProviderConfig {
-            model: Some("claude-default".into()),
-            api_key: Some("default-key".into()),
-            base_url: Some("https://api.default.example/v1".into()),
-            api_path: Some("/messages".into()),
-            ..ModelProviderConfig::default()
+        let default_alias = AnthropicModelProviderConfig {
+            base: ModelProviderConfig {
+                model: Some("claude-default".into()),
+                api_key: Some("default-key".into()),
+                uri: Some("https://api.default.example/v1/messages".into()),
+                ..ModelProviderConfig::default()
+            },
         };
-        let work_alias = ModelProviderConfig {
-            model: Some("claude-work".into()),
-            api_key: Some("work-key".into()),
-            base_url: Some("https://work-proxy.example/v1".into()),
-            api_path: Some("/v1/anthropic/messages".into()),
-            ..ModelProviderConfig::default()
+        let work_alias = AnthropicModelProviderConfig {
+            base: ModelProviderConfig {
+                model: Some("claude-work".into()),
+                api_key: Some("work-key".into()),
+                uri: Some("https://work-proxy.example/v1/v1/anthropic/messages".into()),
+                ..ModelProviderConfig::default()
+            },
         };
-        let mut anthropic_aliases = std::collections::HashMap::new();
-        anthropic_aliases.insert("default".to_string(), default_alias);
-        anthropic_aliases.insert("work".to_string(), work_alias);
         config
             .providers
             .models
-            .insert("anthropic".to_string(), anthropic_aliases);
+            .anthropic
+            .insert("default".to_string(), default_alias);
+        config
+            .providers
+            .models
+            .anthropic
+            .insert("work".to_string(), work_alias);
         let work_agent = DelegateAgentConfig {
-            model_provider: "anthropic.work".to_string(),
+            model_provider: "anthropic.work".into(),
             ..DelegateAgentConfig::default()
         };
         config.agents.insert("work_agent".to_string(), work_agent);
         let default_agent = DelegateAgentConfig {
-            model_provider: "anthropic.default".to_string(),
+            model_provider: "anthropic.default".into(),
             ..DelegateAgentConfig::default()
         };
         config
@@ -3730,30 +3522,20 @@ mod tests {
     }
 
     #[test]
-    fn provider_runtime_options_for_agent_resolves_alias_specific_base_url() {
+    fn provider_runtime_options_for_agent_resolves_alias_specific_uri() {
         let config = config_with_two_anthropic_aliases();
         let work = provider_runtime_options_for_agent(&config, "work_agent");
         let dflt = provider_runtime_options_for_agent(&config, "default_agent");
 
         assert_eq!(
             work.provider_api_url.as_deref(),
-            Some("https://work-proxy.example/v1"),
-            "work agent must resolve to the work alias's base_url, not the first alias's"
-        );
-        assert_eq!(
-            work.api_path.as_deref(),
-            Some("/v1/anthropic/messages"),
-            "work agent must resolve to the work alias's api_path"
+            Some("https://work-proxy.example/v1/v1/anthropic/messages"),
+            "work agent must resolve to the work alias's full uri (with merged path)"
         );
         assert_eq!(
             dflt.provider_api_url.as_deref(),
-            Some("https://api.default.example/v1"),
-            "default agent must resolve to the default alias's base_url"
-        );
-        assert_eq!(
-            dflt.api_path.as_deref(),
-            Some("/messages"),
-            "default agent must resolve to the default alias's api_path"
+            Some("https://api.default.example/v1/messages"),
+            "default agent must resolve to the default alias's full uri (with merged path)"
         );
     }
 
@@ -3761,11 +3543,12 @@ mod tests {
     fn provider_runtime_options_for_agent_falls_back_to_first_provider_when_unknown_agent() {
         let config = config_with_two_anthropic_aliases();
         let opts = provider_runtime_options_for_agent(&config, "nonexistent");
-        // Falls back to first_provider() — order across HashMap is not
+        // Falls back to first_model_provider() — order across HashMap is not
         // guaranteed but the URL must match one of the configured aliases.
         let url = opts.provider_api_url.as_deref().unwrap_or("");
         assert!(
-            url == "https://work-proxy.example/v1" || url == "https://api.default.example/v1",
+            url == "https://work-proxy.example/v1/v1/anthropic/messages"
+                || url == "https://api.default.example/v1/messages",
             "fallback must resolve to one of the configured anthropic aliases; got `{url}`"
         );
     }

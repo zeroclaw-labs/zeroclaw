@@ -38,7 +38,7 @@ pub struct RuntimeTraceEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
+    pub model_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -196,7 +196,7 @@ pub fn init_from_config(config: &ObservabilityConfig, workspace_dir: &Path) {
 pub fn record_event(
     event_type: &str,
     channel: Option<&str>,
-    provider: Option<&str>,
+    model_provider: Option<&str>,
     model: Option<&str>,
     turn_id: Option<&str>,
     success: Option<bool>,
@@ -216,7 +216,7 @@ pub fn record_event(
         timestamp: Local::now().to_rfc3339(),
         event_type: event_type.to_string(),
         channel: channel.map(str::to_string),
-        provider: provider.map(str::to_string),
+        model_provider: model_provider.map(str::to_string),
         model: model.map(str::to_string),
         turn_id: turn_id.map(str::to_string),
         success,
@@ -272,8 +272,8 @@ pub fn load_events(
             if let Some(channel) = &event.channel {
                 haystack.push_str(channel);
             }
-            if let Some(provider) = &event.provider {
-                haystack.push_str(provider);
+            if let Some(model_provider) = &event.model_provider {
+                haystack.push_str(model_provider);
             }
             if let Some(model) = &event.model {
                 haystack.push_str(model);
@@ -371,7 +371,7 @@ mod tests {
                 timestamp: Utc::now().to_rfc3339(),
                 event_type: "test".into(),
                 channel: None,
-                provider: None,
+                model_provider: None,
                 model: None,
                 turn_id: None,
                 success: None,
@@ -399,7 +399,7 @@ mod tests {
             timestamp: Utc::now().to_rfc3339(),
             event_type: "tool_call_result".into(),
             channel: Some("telegram".into()),
-            provider: Some("openrouter".into()),
+            model_provider: Some("openrouter".into()),
             model: Some("x".into()),
             turn_id: Some("turn-1".into()),
             success: Some(false),

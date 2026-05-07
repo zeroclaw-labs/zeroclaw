@@ -215,7 +215,7 @@ impl ModelRoutingConfigTool {
 
         json!({
             "hint": route.hint,
-            "provider": route.provider,
+            "model_provider": route.model_provider,
             "model": route.model,
             "api_key_configured": route
                 .api_key
@@ -278,9 +278,9 @@ impl ModelRoutingConfigTool {
 
         json!({
             "default": {
-                "provider": cfg.providers.first_provider_type(),
-                "model": cfg.providers.first_provider().and_then(|e| e.model.as_deref()),
-                "temperature": cfg.providers.first_provider().and_then(|e| e.temperature).unwrap_or(0.7),
+                "model_provider": cfg.providers.first_model_provider_type(),
+                "model": cfg.providers.first_model_provider().and_then(|e| e.model.as_deref()),
+                "temperature": cfg.providers.first_model_provider().and_then(|e| e.temperature).unwrap_or(0.7),
             },
             "query_classification": {
                 "enabled": cfg.query_classification.enabled,
@@ -357,14 +357,14 @@ impl ModelRoutingConfigTool {
                     "conversation": {
                         "action": "upsert_scenario",
                         "hint": "conversation",
-                        "provider": "kimi",
+                        "model_provider": "kimi",
                         "model": "moonshot-v1-8k",
                         "classification_enabled": false
                     },
                     "coding": {
                         "action": "upsert_scenario",
                         "hint": "coding",
-                        "provider": "openai",
+                        "model_provider": "openai",
                         "model": "gpt-5.3-codex",
                         "classification_enabled": true,
                         "keywords": ["code", "bug", "refactor", "test"],
@@ -378,7 +378,7 @@ impl ModelRoutingConfigTool {
     }
 
     async fn handle_set_default(&self, args: &Value) -> anyhow::Result<ToolResult> {
-        let provider_update = Self::parse_optional_string_update(args, "provider")?;
+        let provider_update = Self::parse_optional_string_update(args, "model_provider")?;
         let model_update = Self::parse_optional_string_update(args, "model")?;
         let temperature_update = Self::parse_optional_f64_update(args, "temperature")?;
 
@@ -387,37 +387,41 @@ impl ModelRoutingConfigTool {
             || !matches!(temperature_update, MaybeSet::Unset);
 
         if !any_update {
-            anyhow::bail!("set_default requires at least one of: provider, model, temperature");
+            anyhow::bail!(
+                "set_default requires at least one of: model_provider, model, temperature"
+            );
         }
 
         let mut cfg = self.load_config_without_env()?;
 
         // Capture previous first-provider entry for rollback on probe failure.
-        let previous_first_provider = cfg.providers.first_provider().cloned();
+        let previous_first_model_provider = cfg.providers.first_model_provider().cloned();
 
         // Determine which models entry to update.
         let (type_k, alias_k) = match &provider_update {
-            MaybeSet::Set(provider) => provider
+            MaybeSet::Set(model_provider) => model_provider
                 .split_once('.')
                 .map(|(t, a)| (t.to_string(), a.to_string()))
-                .unwrap_or_else(|| (provider.clone(), "default".to_string())),
+                .unwrap_or_else(|| (model_provider.clone(), "default".to_string())),
             MaybeSet::Null | MaybeSet::Unset => {
                 // Update whichever entry is already first, or create a placeholder.
                 cfg.providers
                     .models
-                    .iter()
+                    .iter_entries()
                     .next()
-                    .and_then(|(t, aliases)| aliases.keys().next().map(|a| (t.clone(), a.clone())))
-                    .unwrap_or_else(|| ("default".to_string(), "default".to_string()))
+                    .map(|(t, a, _)| (t.to_string(), a.to_string()))
+                    .unwrap_or_else(|| ("custom".to_string(), "default".to_string()))
             }
         };
         let entry = cfg
             .providers
             .models
-            .entry(type_k.clone())
-            .or_default()
-            .entry(alias_k.clone())
-            .or_default();
+            .ensure(&type_k, &alias_k)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown model_provider type `{type_k}` — no typed slot in ModelProviders"
+                )
+            })?;
 
         match model_update {
             MaybeSet::Set(model) => entry.model = Some(model),
@@ -442,25 +446,30 @@ impl ModelRoutingConfigTool {
 
         // Probe the new model with a minimal API call to catch invalid model IDs
         // before the channel hot-reload picks up the change.
-        let current_model = cfg.providers.first_provider().and_then(|e| e.model.clone());
+        let current_model = cfg
+            .providers
+            .first_model_provider()
+            .and_then(|e| e.model.clone());
         let provider_name = format!("{type_k}.{alias_k}");
         if let Some(model_name) = current_model
             && let Err(probe_err) = self.probe_model(&provider_name, &model_name).await
         {
             if zeroclaw_providers::reliable::is_non_retryable(&probe_err) {
-                let reverted_model = previous_first_provider
+                let reverted_model = previous_first_model_provider
                     .as_ref()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("(none)")
                     .to_string();
 
-                // Rollback: restore the previous entry for this type.alias slot.
-                if let Some(prev_entry) = previous_first_provider {
-                    cfg.providers
-                        .models
-                        .entry(type_k)
-                        .or_default()
-                        .insert(alias_k, prev_entry);
+                // Rollback: restore the previous entry's baseline fields for
+                // this type.alias slot. Family-specific extras on the typed
+                // family config are NOT touched — they survive the modify+
+                // restore cycle because we only ever mutated baseline fields
+                // (model, temperature, api_key) above.
+                if let Some(prev_entry) = previous_first_model_provider
+                    && let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k)
+                {
+                    *slot = prev_entry;
                 }
                 cfg.save().await?;
 
@@ -483,7 +492,7 @@ impl ModelRoutingConfigTool {
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
-                "message": "Default provider/model settings updated",
+                "message": "Default model_provider/model settings updated",
                 "config": Self::snapshot(&cfg),
             }))?,
             error: None,
@@ -493,26 +502,26 @@ impl ModelRoutingConfigTool {
     /// Send a minimal 1-token chat request to verify the model is accessible.
     /// Returns `Ok(())` if the probe succeeds **or** if no API key is available
     /// (the probe would fail with an auth error unrelated to model validity).
-    /// Provider construction failures are also treated as non-fatal.
+    /// ModelProvider construction failures are also treated as non-fatal.
     async fn probe_model(&self, provider_name: &str, model: &str) -> anyhow::Result<()> {
         // Use the runtime config's API key (which includes env-sourced keys),
         // not the on-disk config (which may have no key at all).
         let api_key = self
             .config
             .providers
-            .first_provider()
+            .first_model_provider()
             .and_then(|e| e.api_key.as_deref());
         if api_key.is_none_or(|k| k.trim().is_empty()) {
             return Ok(());
         }
 
-        let provider = match zeroclaw_providers::create_provider_with_url(
+        let model_provider = match zeroclaw_providers::create_model_provider_with_url(
             provider_name,
             api_key,
             self.config
                 .providers
-                .first_provider()
-                .and_then(|e| e.base_url.as_deref()),
+                .first_model_provider()
+                .and_then(|e| e.uri.as_deref()),
         ) {
             Ok(p) => p,
             Err(_) => return Ok(()),
@@ -520,7 +529,7 @@ impl ModelRoutingConfigTool {
 
         // Greedy sampling: the ping is a liveness check, not a generation task.
         const PING_TEMPERATURE: f64 = 0.0;
-        provider
+        model_provider
             .chat_with_system(
                 Some("Respond with OK."),
                 "ping",
@@ -534,7 +543,7 @@ impl ModelRoutingConfigTool {
 
     async fn handle_upsert_scenario(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let hint = Self::parse_non_empty_string(args, "hint")?;
-        let provider = Self::parse_non_empty_string(args, "provider")?;
+        let model_provider = Self::parse_non_empty_string(args, "model_provider")?;
         let model = Self::parse_non_empty_string(args, "model")?;
         let api_key_update = Self::parse_optional_string_update(args, "api_key")?;
 
@@ -571,13 +580,13 @@ impl ModelRoutingConfigTool {
 
         let mut next_route = existing_route.unwrap_or(ModelRouteConfig {
             hint: hint.clone(),
-            provider: provider.clone(),
+            model_provider: model_provider.clone(),
             model: model.clone(),
             api_key: None,
         });
 
         next_route.hint = hint.clone();
-        next_route.provider = provider;
+        next_route.model_provider = model_provider;
         next_route.model = model;
 
         match api_key_update {
@@ -717,7 +726,7 @@ impl ModelRoutingConfigTool {
 
     async fn handle_upsert_agent(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let name = Self::parse_non_empty_string(args, "name")?;
-        let provider = Self::parse_non_empty_string(args, "provider")?;
+        let model_provider = Self::parse_non_empty_string(args, "model_provider")?;
         let model = Self::parse_non_empty_string(args, "model")?;
 
         let system_prompt_update = Self::parse_optional_string_update(args, "system_prompt")?;
@@ -735,16 +744,21 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        // V3: synthesize providers.models[provider][name] from inline brain params.
-        let model_provider = format!("{provider}.{name}");
+        // synthesize providers.models[model_provider_family][name] from inline brain params.
+        // The arg is the family name (e.g. "openai"); the agent's `model_provider`
+        // reference becomes the dotted form (e.g. "openai.coder").
+        let model_provider_family = model_provider;
+        let agent_model_provider_ref = format!("{model_provider_family}.{name}");
         {
-            let provider_entry = cfg
-                .providers
-                .models
-                .entry(provider.clone())
-                .or_default()
-                .entry(name.clone())
-                .or_default();
+            let provider_entry =
+                cfg.providers
+                    .models
+                    .ensure(&model_provider_family, &name)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown model_provider type `{model_provider_family}` — no typed slot in ModelProviders"
+                        )
+                    })?;
             provider_entry.model = Some(model.clone());
             match api_key_update {
                 MaybeSet::Set(ref v) => provider_entry.api_key = Some(v.clone()),
@@ -763,7 +777,7 @@ impl ModelRoutingConfigTool {
             }
         }
 
-        // V3: synthesize risk_profiles[name] from max_depth.
+        // synthesize risk_profiles[name] from max_depth.
         {
             let risk = cfg.risk_profiles.entry(name.clone()).or_default();
             if let MaybeSet::Set(depth) = max_depth_update {
@@ -776,7 +790,7 @@ impl ModelRoutingConfigTool {
             }
         }
 
-        // V3: synthesize runtime_profiles[name] from agentic/max_iterations/allowed_tools.
+        // synthesize runtime_profiles[name] from agentic/max_iterations/allowed_tools.
         {
             let runtime = cfg.runtime_profiles.entry(name.clone()).or_default();
             if let Some(agentic) = agentic_update {
@@ -798,9 +812,9 @@ impl ModelRoutingConfigTool {
             }
         }
 
-        // Get or create the agent and wire up V3 alias references.
+        // Get or create the agent and wire up alias references.
         let next_agent = cfg.agents.entry(name.clone()).or_default();
-        next_agent.model_provider = model_provider;
+        next_agent.model_provider = agent_model_provider_ref.into();
         next_agent.risk_profile = name.clone();
         next_agent.runtime_profile = name.clone();
         match system_prompt_update {
@@ -851,7 +865,7 @@ impl Tool for ModelRoutingConfigTool {
     }
 
     fn description(&self) -> &str {
-        "Manage default model settings, scenario-based provider/model routes, classification rules, and delegate sub-agent profiles"
+        "Manage default model settings, scenario-based model_provider/model routes, classification rules, and delegate sub-agent profiles"
     }
 
     fn parameters_schema(&self) -> Value {
@@ -875,9 +889,9 @@ impl Tool for ModelRoutingConfigTool {
                     "type": "string",
                     "description": "Scenario hint name (for example: conversation, coding, reasoning)"
                 },
-                "provider": {
+                "model_provider": {
                     "type": "string",
-                    "description": "Provider for set_default/upsert_scenario/upsert_agent"
+                    "description": "ModelProvider for set_default/upsert_scenario/upsert_agent"
                 },
                 "model": {
                     "type": "string",
@@ -1043,7 +1057,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "provider": "kimi",
+                "model_provider": "moonshot",
                 "model": "moonshot-v1-8k",
                 "temperature": 0.2
             }))
@@ -1053,8 +1067,8 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         let output: Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(
-            output["config"]["default"]["provider"].as_str(),
-            Some("kimi")
+            output["config"]["default"]["model_provider"].as_str(),
+            Some("moonshot")
         );
         assert_eq!(
             output["config"]["default"]["model"].as_str(),
@@ -1075,7 +1089,7 @@ mod tests {
             .execute(json!({
                 "action": "upsert_scenario",
                 "hint": "coding",
-                "provider": "openai",
+                "model_provider": "openai",
                 "model": "gpt-5.3-codex",
                 "classification_enabled": true,
                 "keywords": ["code", "bug", "refactor"],
@@ -1096,7 +1110,7 @@ mod tests {
         let scenarios = output["scenarios"].as_array().unwrap();
         assert!(scenarios.iter().any(|item| {
             item["hint"] == json!("coding")
-                && item["provider"] == json!("openai")
+                && item["model_provider"] == json!("openai")
                 && item["model"] == json!("gpt-5.3-codex")
         }));
     }
@@ -1110,7 +1124,7 @@ mod tests {
             .execute(json!({
                 "action": "upsert_scenario",
                 "hint": "coding",
-                "provider": "openai",
+                "model_provider": "openai",
                 "model": "gpt-5.3-codex",
                 "classification_enabled": true,
                 "keywords": ["code"]
@@ -1142,7 +1156,7 @@ mod tests {
             .execute(json!({
                 "action": "upsert_agent",
                 "name": "coder",
-                "provider": "openai",
+                "model_provider": "openai",
                 "model": "gpt-5.3-codex",
                 "agentic": true,
                 "allowed_tools": ["file_read", "file_write", "shell"],
@@ -1186,7 +1200,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "provider": "openai"
+                "model_provider": "openai"
             }))
             .await
             .unwrap();
@@ -1206,7 +1220,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "provider": "anthropic",
+                "model_provider": "anthropic",
                 "model": "totally-fake-model-12345"
             }))
             .await
@@ -1223,7 +1237,7 @@ mod tests {
     #[tokio::test]
     async fn set_default_temperature_only_skips_probe() {
         // Temperature-only changes don't set a new model, so the probe should
-        // not fire at all (no provider/model to probe).
+        // not fire at all (no model_provider/model to probe).
         let tmp = TempDir::new().unwrap();
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 

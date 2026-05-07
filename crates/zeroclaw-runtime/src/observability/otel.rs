@@ -112,12 +112,12 @@ impl OtelObserver {
 
         let llm_calls = meter
             .u64_counter("zeroclaw.llm.calls")
-            .with_description("Total LLM provider calls")
+            .with_description("Total LLM model_provider calls")
             .build();
 
         let llm_duration = meter
             .f64_histogram("zeroclaw.llm.duration")
-            .with_description("LLM provider call duration in seconds")
+            .with_description("LLM model_provider call duration in seconds")
             .with_unit("s")
             .build();
 
@@ -212,11 +212,14 @@ impl Observer for OtelObserver {
         let tracer = global::tracer("zeroclaw");
 
         match event {
-            ObserverEvent::AgentStart { provider, model } => {
+            ObserverEvent::AgentStart {
+                model_provider,
+                model,
+            } => {
                 self.agent_starts.add(
                     1,
                     &[
-                        KeyValue::new("provider", provider.clone()),
+                        KeyValue::new("model_provider", model_provider.clone()),
                         KeyValue::new("model", model.clone()),
                     ],
                 );
@@ -227,7 +230,7 @@ impl Observer for OtelObserver {
             | ObserverEvent::CacheHit { .. }
             | ObserverEvent::CacheMiss { .. } => {}
             ObserverEvent::LlmResponse {
-                provider,
+                model_provider,
                 model,
                 duration,
                 success,
@@ -237,7 +240,7 @@ impl Observer for OtelObserver {
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
-                    KeyValue::new("provider", provider.clone()),
+                    KeyValue::new("model_provider", model_provider.clone()),
                     KeyValue::new("model", model.clone()),
                     KeyValue::new("success", success.to_string()),
                 ];
@@ -253,7 +256,7 @@ impl Observer for OtelObserver {
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
+                            KeyValue::new("model_provider", model_provider.clone()),
                             KeyValue::new("model", model.clone()),
                             KeyValue::new("success", *success),
                             KeyValue::new("duration_s", secs),
@@ -267,7 +270,7 @@ impl Observer for OtelObserver {
                 span.end();
             }
             ObserverEvent::AgentEnd {
-                provider,
+                model_provider,
                 model,
                 duration,
                 tokens_used,
@@ -284,7 +287,7 @@ impl Observer for OtelObserver {
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
+                            KeyValue::new("model_provider", model_provider.clone()),
                             KeyValue::new("model", model.clone()),
                             KeyValue::new("duration_s", secs),
                         ]),
@@ -300,7 +303,7 @@ impl Observer for OtelObserver {
                 self.agent_duration.record(
                     secs,
                     &[
-                        KeyValue::new("provider", provider.clone()),
+                        KeyValue::new("model_provider", model_provider.clone()),
                         KeyValue::new("model", model.clone()),
                     ],
                 );
@@ -541,16 +544,16 @@ mod tests {
     fn records_all_events_without_panic() {
         let obs = test_observer();
         obs.record_event(&ObserverEvent::AgentStart {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
         });
         obs.record_event(&ObserverEvent::LlmRequest {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             messages_count: 2,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(250),
             success: true,
@@ -559,14 +562,14 @@ mod tests {
             output_tokens: Some(50),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(500),
             tokens_used: Some(100),
             cost_usd: Some(0.0015),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::ZERO,
             tokens_used: None,
@@ -593,7 +596,7 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::Error {
-            component: "provider".into(),
+            component: "model_provider".into(),
             message: "timeout".into(),
         });
     }
@@ -622,7 +625,7 @@ mod tests {
         let obs = test_observer();
         // Simulate an error event — should not panic even with unreachable endpoint
         obs.record_event(&ObserverEvent::Error {
-            component: "provider".into(),
+            component: "model_provider".into(),
             message: "connection refused to model endpoint".into(),
         });
     }
@@ -631,7 +634,7 @@ mod tests {
     fn otel_records_llm_failure_without_panic() {
         let obs = test_observer();
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "missing-model".into(),
             duration: Duration::from_millis(0),
             success: false,
@@ -723,7 +726,7 @@ mod tests {
         let obs = OtelObserver::new(Some("http://127.0.0.1:19999"), Some("test"), Some(headers))
             .expect("creation should succeed");
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "anthropic".into(),
+            model_provider: "anthropic".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(100),
             success: true,

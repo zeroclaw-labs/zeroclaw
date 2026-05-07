@@ -1,8 +1,4 @@
 use super::{IntegrationCategory, IntegrationEntry, IntegrationStatus};
-use zeroclaw_providers::{
-    is_glm_alias, is_minimax_alias, is_moonshot_alias, is_qianfan_alias, is_qwen_alias,
-    is_zai_alias,
-};
 
 /// Returns the full catalog of integrations
 #[allow(clippy::too_many_lines)]
@@ -13,6 +9,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Telegram",
             description: "Bot API — long-polling",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |c| {
                 if !c.channels.telegram.is_empty() {
                     IntegrationStatus::Active
@@ -25,6 +22,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Discord",
             description: "Servers, channels & DMs",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |c| {
                 if !c.channels.discord.is_empty() {
                     IntegrationStatus::Active
@@ -37,6 +35,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Slack",
             description: "Workspace apps via Web API",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |c| {
                 if !c.channels.slack.is_empty() {
                     IntegrationStatus::Active
@@ -49,6 +48,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Webhooks",
             description: "HTTP endpoint for triggers",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |c| {
                 if !c.channels.webhook.is_empty() {
                     IntegrationStatus::Active
@@ -61,6 +61,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "WhatsApp",
             description: "Meta Cloud API via webhook",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |c| {
                 if !c.channels.whatsapp.is_empty() {
                     IntegrationStatus::Active
@@ -73,6 +74,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Signal",
             description: "Privacy-focused via signal-cli",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |c| {
                 if !c.channels.signal.is_empty() {
                     IntegrationStatus::Active
@@ -85,6 +87,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "iMessage",
             description: "macOS AppleScript bridge",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |c| {
                 if !c.channels.imessage.is_empty() {
                     IntegrationStatus::Active
@@ -97,12 +100,14 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Microsoft Teams",
             description: "Enterprise chat support",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Matrix",
             description: "Matrix protocol (Element)",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |c| {
                 if !c.channels.matrix.is_empty() {
                     IntegrationStatus::Active
@@ -115,30 +120,35 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Nostr",
             description: "Decentralized DMs (NIP-04)",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "WebChat",
             description: "Browser-based chat UI",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Nextcloud Talk",
             description: "Self-hosted Nextcloud chat",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Zalo",
             description: "Zalo Bot API",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "DingTalk",
             description: "DingTalk Stream Mode",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |c| {
                 if !c.channels.dingtalk.is_empty() {
                     IntegrationStatus::Active
@@ -151,6 +161,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "QQ Official",
             description: "Tencent QQ Bot SDK",
             category: IntegrationCategory::Chat,
+            model_provider_family: None,
             status_fn: |c| {
                 if !c.channels.qq.is_empty() {
                     IntegrationStatus::Active
@@ -164,13 +175,17 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "OpenRouter",
             description: "200+ models, 1 API key",
             category: IntegrationCategory::AiModel,
+            model_provider_family: None,
             status_fn: |c| {
-                if c.providers.models.contains_key("openrouter")
+                if c.providers
+                    .models
+                    .contains_model_provider_type("openrouter")
                     && c.providers
                         .models
-                        .get("openrouter")
-                        .and_then(|m| m.values().next())
-                        .and_then(|e| e.api_key.as_ref())
+                        .openrouter
+                        .values()
+                        .next()
+                        .and_then(|e| e.base.api_key.as_ref())
                         .is_some()
                 {
                     IntegrationStatus::Active
@@ -183,33 +198,24 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Anthropic",
             description: "Claude 3.5/4 Sonnet & Opus",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("anthropic") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("anthropic"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "OpenAI",
             description: "GPT-4o, GPT-5, o1",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("openai") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("openai"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Google",
             description: "Gemini 2.5 Pro/Flash",
             category: IntegrationCategory::AiModel,
+            model_provider_family: None,
             status_fn: |c| {
                 if c.providers
-                    .first_provider()
+                    .first_model_provider()
                     .and_then(|e| e.model.as_deref())
                     .is_some_and(|m| m.starts_with("google/"))
                 {
@@ -223,83 +229,46 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "DeepSeek",
             description: "DeepSeek V3 & R1",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers
-                    .first_provider()
-                    .and_then(|e| e.model.as_deref())
-                    .is_some_and(|m| m.starts_with("deepseek/"))
-                {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("deepseek"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "xAI",
             description: "Grok 3 & 4",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers
-                    .first_provider()
-                    .and_then(|e| e.model.as_deref())
-                    .is_some_and(|m| m.starts_with("x-ai/"))
-                {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("xai"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Mistral",
             description: "Mistral Large & Codestral",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers
-                    .first_provider()
-                    .and_then(|e| e.model.as_deref())
-                    .is_some_and(|m| m.starts_with("mistral"))
-                {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("mistral"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Ollama",
             description: "Local models (Llama, etc.)",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("ollama") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("ollama"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Perplexity",
             description: "Search-augmented AI",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("perplexity") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("perplexity"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Hugging Face",
             description: "Open-source models",
             category: IntegrationCategory::AiModel,
+            model_provider_family: None,
             status_fn: |c| {
-                if c.providers
-                    .models
-                    .keys()
-                    .any(|k| matches!(k.as_str(), "huggingface" | "hf"))
+                if ["huggingface", "hf"]
+                    .iter()
+                    .any(|p| c.providers.models.contains_model_provider_type(p))
                 {
                     IntegrationStatus::Active
                 } else {
@@ -311,11 +280,11 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "LM Studio",
             description: "Local model server",
             category: IntegrationCategory::AiModel,
+            model_provider_family: None,
             status_fn: |c| {
-                if c.providers
-                    .models
-                    .keys()
-                    .any(|k| matches!(k.as_str(), "lmstudio" | "lm-studio"))
+                if ["lmstudio", "lm-studio"]
+                    .iter()
+                    .any(|p| c.providers.models.contains_model_provider_type(p))
                 {
                     IntegrationStatus::Active
                 } else {
@@ -327,84 +296,55 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Venice",
             description: "Privacy-first inference (Llama, Opus)",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("venice") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("venice"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Vercel AI",
             description: "Vercel AI Gateway",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("vercel") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("vercel"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Cloudflare AI",
             description: "Cloudflare AI Gateway",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("cloudflare") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("cloudflare"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Moonshot",
             description: "Kimi & Kimi Coding",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers
-                    .models
-                    .keys()
-                    .any(|k| is_moonshot_alias(k.as_str()))
-                {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("moonshot"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Synthetic",
             description: "Synthetic AI models",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("synthetic") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("synthetic"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "OpenCode Zen",
             description: "Code-focused AI models",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("opencode") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("opencode"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
+            // Legacy `opencode-go` was folded into the `opencode` family
+            // under alias `go` by the V2->V3 migration; activation depends
+            // on alias presence, not just family presence, so this entry
+            // stays on a custom status_fn.
             name: "OpenCode Go",
             description: "Subsidized Code-focused AI models",
             category: IntegrationCategory::AiModel,
+            model_provider_family: None,
             status_fn: |c| {
-                if c.providers.models.contains_key("opencode-go") {
+                if c.providers.models.opencode.contains_key("go") {
                     IntegrationStatus::Active
                 } else {
                     IntegrationStatus::Available
@@ -415,147 +355,85 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Z.AI",
             description: "Z.AI inference",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.keys().any(|k| is_zai_alias(k.as_str())) {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("zai"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "GLM",
             description: "ChatGLM / Zhipu models",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.keys().any(|k| is_glm_alias(k.as_str())) {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("glm"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "MiniMax",
             description: "MiniMax AI models",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers
-                    .models
-                    .keys()
-                    .any(|k| is_minimax_alias(k.as_str()))
-                {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("minimax"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Qwen",
             description: "Alibaba DashScope Qwen models",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.keys().any(|k| is_qwen_alias(k.as_str())) {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("qwen"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Amazon Bedrock",
             description: "AWS managed model access",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("bedrock") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("bedrock"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Qianfan",
             description: "Baidu AI models",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers
-                    .models
-                    .keys()
-                    .any(|k| is_qianfan_alias(k.as_str()))
-                {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("qianfan"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Groq",
             description: "Ultra-fast LPU inference",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("groq") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("groq"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Together AI",
             description: "Open-source model hosting",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("together") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("together"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Fireworks AI",
             description: "Fast open-source inference",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("fireworks") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("fireworks"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Novita AI",
             description: "Affordable open-source inference",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("novita") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("novita"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Cohere",
             description: "Command R+ & embeddings",
             category: IntegrationCategory::AiModel,
-            status_fn: |c| {
-                if c.providers.models.contains_key("cohere") {
-                    IntegrationStatus::Active
-                } else {
-                    IntegrationStatus::Available
-                }
-            },
+            model_provider_family: Some("cohere"),
+            status_fn: |_| IntegrationStatus::Available,
         },
         // ── Productivity ────────────────────────────────────────
         IntegrationEntry {
             name: "Google Workspace",
             description: "Drive, Gmail, Calendar, Sheets, Docs via gws CLI",
             category: IntegrationCategory::Productivity,
+            model_provider_family: None,
             status_fn: |c| {
                 if c.google_workspace.enabled {
                     IntegrationStatus::Active
@@ -568,54 +446,63 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "GitHub",
             description: "Code, issues, PRs",
             category: IntegrationCategory::Productivity,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Notion",
             description: "Workspace & databases",
             category: IntegrationCategory::Productivity,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Apple Notes",
             description: "Native macOS/iOS notes",
             category: IntegrationCategory::Productivity,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Apple Reminders",
             description: "Task management",
             category: IntegrationCategory::Productivity,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Obsidian",
             description: "Knowledge graph notes",
             category: IntegrationCategory::Productivity,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Things 3",
             description: "GTD task manager",
             category: IntegrationCategory::Productivity,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Bear Notes",
             description: "Markdown notes",
             category: IntegrationCategory::Productivity,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Trello",
             description: "Kanban boards",
             category: IntegrationCategory::Productivity,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Linear",
             description: "Issue tracking",
             category: IntegrationCategory::Productivity,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         // ── Music & Audio ───────────────────────────────────────
@@ -623,18 +510,21 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Spotify",
             description: "Music playback control",
             category: IntegrationCategory::MusicAudio,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Sonos",
             description: "Multi-room audio",
             category: IntegrationCategory::MusicAudio,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Shazam",
             description: "Song recognition",
             category: IntegrationCategory::MusicAudio,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         // ── Smart Home ──────────────────────────────────────────
@@ -642,18 +532,21 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Home Assistant",
             description: "Home automation hub",
             category: IntegrationCategory::SmartHome,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Philips Hue",
             description: "Smart lighting",
             category: IntegrationCategory::SmartHome,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "8Sleep",
             description: "Smart mattress",
             category: IntegrationCategory::SmartHome,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         // ── Tools & Automation ──────────────────────────────────
@@ -661,6 +554,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Browser",
             description: "Chrome/Chromium control",
             category: IntegrationCategory::ToolsAutomation,
+            model_provider_family: None,
             status_fn: |c| {
                 if c.browser.enabled {
                     IntegrationStatus::Active
@@ -673,18 +567,21 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Shell",
             description: "Terminal command execution",
             category: IntegrationCategory::ToolsAutomation,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::Active,
         },
         IntegrationEntry {
             name: "File System",
             description: "Read/write files",
             category: IntegrationCategory::ToolsAutomation,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::Active,
         },
         IntegrationEntry {
             name: "Cron",
             description: "Scheduled tasks",
             category: IntegrationCategory::ToolsAutomation,
+            model_provider_family: None,
             status_fn: |c| {
                 if c.scheduler.enabled {
                     IntegrationStatus::Active
@@ -697,30 +594,35 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Voice",
             description: "Voice wake + talk mode",
             category: IntegrationCategory::ToolsAutomation,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Gmail",
             description: "Email triggers & send",
             category: IntegrationCategory::ToolsAutomation,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "1Password",
             description: "Secure credentials",
             category: IntegrationCategory::ToolsAutomation,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Weather",
             description: "Forecasts & conditions",
             category: IntegrationCategory::ToolsAutomation,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::Active,
         },
         IntegrationEntry {
             name: "Canvas",
             description: "Visual workspace + A2UI",
             category: IntegrationCategory::ToolsAutomation,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         // ── Media & Creative ────────────────────────────────────
@@ -728,24 +630,28 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Image Gen",
             description: "AI image generation",
             category: IntegrationCategory::MediaCreative,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "GIF Search",
             description: "Find the perfect GIF",
             category: IntegrationCategory::MediaCreative,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Screen Capture",
             description: "Screenshot & screen control",
             category: IntegrationCategory::MediaCreative,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Camera",
             description: "Photo/video capture",
             category: IntegrationCategory::MediaCreative,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         // ── Social ──────────────────────────────────────────────
@@ -753,12 +659,14 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Twitter/X",
             description: "Tweet, reply, search",
             category: IntegrationCategory::Social,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::ComingSoon,
         },
         IntegrationEntry {
             name: "Email",
             description: "IMAP/SMTP email channel",
             category: IntegrationCategory::Social,
+            model_provider_family: None,
             status_fn: |c| {
                 if !c.channels.email.is_empty() {
                     IntegrationStatus::Active
@@ -772,6 +680,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "macOS",
             description: "Native support + AppleScript",
             category: IntegrationCategory::Platform,
+            model_provider_family: None,
             status_fn: |_| {
                 if cfg!(target_os = "macos") {
                     IntegrationStatus::Active
@@ -784,6 +693,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Linux",
             description: "Native support",
             category: IntegrationCategory::Platform,
+            model_provider_family: None,
             status_fn: |_| {
                 if cfg!(target_os = "linux") {
                     IntegrationStatus::Active
@@ -796,18 +706,21 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Windows",
             description: "WSL2 recommended",
             category: IntegrationCategory::Platform,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "iOS",
             description: "Chat via Telegram/Discord",
             category: IntegrationCategory::Platform,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::Available,
         },
         IntegrationEntry {
             name: "Android",
             description: "Chat via Telegram/Discord",
             category: IntegrationCategory::Platform,
+            model_provider_family: None,
             status_fn: |_| IntegrationStatus::Available,
         },
     ]
@@ -1105,92 +1018,33 @@ mod tests {
     }
 
     #[test]
-    fn regional_provider_aliases_activate_expected_ai_integrations() {
-        let entries = all_integrations();
-        let mut config = Config::default();
-        config.providers.models = Default::default();
-        config
-            .providers
-            .models
-            .entry("minimax-cn".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
-
-        let minimax = entries.iter().find(|e| e.name == "MiniMax").unwrap();
-        assert!(matches!(
-            (minimax.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
-
-        config.providers.models = Default::default();
-        config
-            .providers
-            .models
-            .entry("glm-cn".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
-        let glm = entries.iter().find(|e| e.name == "GLM").unwrap();
-        assert!(matches!(
-            (glm.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
-
-        config.providers.models = Default::default();
-        config
-            .providers
-            .models
-            .entry("moonshot-intl".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
-        let moonshot = entries.iter().find(|e| e.name == "Moonshot").unwrap();
-        assert!(matches!(
-            (moonshot.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
-
-        config.providers.models = Default::default();
-        config
-            .providers
-            .models
-            .entry("qwen-intl".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
-        let qwen = entries.iter().find(|e| e.name == "Qwen").unwrap();
-        assert!(matches!(
-            (qwen.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
-
-        config.providers.models = Default::default();
-        config
-            .providers
-            .models
-            .entry("zai-cn".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
-        let zai = entries.iter().find(|e| e.name == "Z.AI").unwrap();
-        assert!(matches!(
-            (zai.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
-
-        config.providers.models = Default::default();
-        config
-            .providers
-            .models
-            .entry("baidu".to_string())
-            .or_default()
-            .entry("default".to_string())
-            .or_default();
-        let qianfan = entries.iter().find(|e| e.name == "Qianfan").unwrap();
-        assert!(matches!(
-            (qianfan.status_fn)(&config),
-            IntegrationStatus::Active
-        ));
+    fn declared_model_provider_family_activates_integration() {
+        // Drift detector: every IntegrationEntry that declares a typed
+        // model_provider family must report `Active` once that slot has any
+        // configured alias. Adding a new family-mapped integration auto-joins
+        // the loop; mistyping the family name fails the typed-slot ensure.
+        for entry in all_integrations() {
+            let Some(family) = entry.model_provider_family else {
+                continue;
+            };
+            let mut config = Config::default();
+            config.providers.models = Default::default();
+            config
+                .providers
+                .models
+                .ensure(family, "default")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "integration {:?} declares model_provider_family = {family:?}, \
+                         but no typed slot of that name exists",
+                        entry.name,
+                    )
+                });
+            assert!(
+                matches!(entry.status(&config), IntegrationStatus::Active),
+                "configuring family {family} should activate integration {:?}",
+                entry.name,
+            );
+        }
     }
 }

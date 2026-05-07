@@ -1,4 +1,4 @@
-//! GitHub Copilot provider with OAuth device-flow authentication.
+//! GitHub Copilot model_provider with OAuth device-flow authentication.
 //!
 //! Authenticates via GitHub's device code flow (same as VS Code Copilot),
 //! then exchanges the OAuth token for short-lived Copilot API keys.
@@ -13,7 +13,7 @@
 
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, TokenUsage, ToolCall as ProviderToolCall,
+    ModelProvider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use reqwest::Client;
@@ -181,14 +181,14 @@ struct ResponseMessage {
     tool_calls: Option<Vec<NativeToolCall>>,
 }
 
-// ── Provider ─────────────────────────────────────────────────────
+// ── ModelProvider ─────────────────────────────────────────────────────
 
-/// GitHub Copilot provider with automatic OAuth and token refresh.
+/// GitHub Copilot model_provider with automatic OAuth and token refresh.
 ///
 /// On first use, prompts the user to visit github.com/login/device.
 /// Tokens are cached to `~/.config/zeroclaw/copilot/` and refreshed
 /// automatically.
-pub struct CopilotProvider {
+pub struct CopilotModelProvider {
     github_token: Option<String>,
     /// Mutex ensures only one caller refreshes tokens at a time,
     /// preventing duplicate device flow prompts or redundant API calls.
@@ -196,7 +196,7 @@ pub struct CopilotProvider {
     token_dir: PathBuf,
 }
 
-impl CopilotProvider {
+impl CopilotModelProvider {
     pub fn new(github_token: Option<&str>) -> Self {
         let token_dir = directories::ProjectDirs::from("", "", "zeroclaw")
             .map(|dir| dir.config_dir().join("copilot"))
@@ -241,7 +241,7 @@ impl CopilotProvider {
 
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "provider.copilot",
+            "model_provider.copilot",
             120,
             10,
         )
@@ -650,8 +650,8 @@ async fn write_file_secure(path: &Path, content: &str) {
 }
 
 #[async_trait]
-impl Provider for CopilotProvider {
-    // ── Provider-family defaults ──
+impl ModelProvider for CopilotModelProvider {
+    // ── ModelProvider-family defaults ──
     fn default_base_url(&self) -> Option<&str> {
         Some(DEFAULT_API)
     }
@@ -732,32 +732,32 @@ mod tests {
 
     #[test]
     fn new_without_token() {
-        let provider = CopilotProvider::new(None);
-        assert!(provider.github_token.is_none());
+        let model_provider = CopilotModelProvider::new(None);
+        assert!(model_provider.github_token.is_none());
     }
 
     #[test]
     fn new_with_token() {
-        let provider = CopilotProvider::new(Some("ghp_test"));
-        assert_eq!(provider.github_token.as_deref(), Some("ghp_test"));
+        let model_provider = CopilotModelProvider::new(Some("ghp_test"));
+        assert_eq!(model_provider.github_token.as_deref(), Some("ghp_test"));
     }
 
     #[test]
     fn empty_token_treated_as_none() {
-        let provider = CopilotProvider::new(Some(""));
-        assert!(provider.github_token.is_none());
+        let model_provider = CopilotModelProvider::new(Some(""));
+        assert!(model_provider.github_token.is_none());
     }
 
     #[tokio::test]
     async fn cache_starts_empty() {
-        let provider = CopilotProvider::new(None);
-        let cached = provider.refresh_lock.lock().await;
+        let model_provider = CopilotModelProvider::new(None);
+        let cached = model_provider.refresh_lock.lock().await;
         assert!(cached.is_none());
     }
 
     #[test]
     fn copilot_headers_include_required_fields() {
-        let headers = CopilotProvider::COPILOT_HEADERS;
+        let headers = CopilotModelProvider::COPILOT_HEADERS;
         assert!(
             headers
                 .iter()
@@ -779,8 +779,8 @@ mod tests {
 
     #[test]
     fn supports_native_tools() {
-        let provider = CopilotProvider::new(None);
-        assert!(provider.supports_native_tools());
+        let model_provider = CopilotModelProvider::new(None);
+        assert!(model_provider.supports_native_tools());
     }
 
     #[test]
@@ -805,7 +805,7 @@ mod tests {
     #[test]
     fn to_api_content_user_with_image_returns_parts() {
         let content = "describe this [IMAGE:data:image/png;base64,abc123]";
-        let result = CopilotProvider::to_api_content("user", content).unwrap();
+        let result = CopilotModelProvider::to_api_content("user", content).unwrap();
         match result {
             ApiContent::Parts(parts) => {
                 assert_eq!(parts.len(), 2);
@@ -822,16 +822,16 @@ mod tests {
 
     #[test]
     fn to_api_content_user_plain_returns_text() {
-        let result = CopilotProvider::to_api_content("user", "hello world").unwrap();
+        let result = CopilotModelProvider::to_api_content("user", "hello world").unwrap();
         assert!(matches!(result, ApiContent::Text(ref s) if s == "hello world"));
     }
 
     #[test]
     fn to_api_content_non_user_returns_text() {
-        let result = CopilotProvider::to_api_content("system", "you are helpful").unwrap();
+        let result = CopilotModelProvider::to_api_content("system", "you are helpful").unwrap();
         assert!(matches!(result, ApiContent::Text(ref s) if s == "you are helpful"));
 
-        let result = CopilotProvider::to_api_content("assistant", "sure").unwrap();
+        let result = CopilotModelProvider::to_api_content("assistant", "sure").unwrap();
         assert!(matches!(result, ApiContent::Text(ref s) if s == "sure"));
     }
 }

@@ -6,7 +6,7 @@
 //! Requires `ZAI_API_KEY` env var set (format: `id.secret`).
 //! Run: `ZAI_API_KEY=... cargo test live_zai -- --ignored --nocapture`
 
-use zeroclaw::providers::create_provider;
+use zeroclaw::providers::create_model_provider;
 use zeroclaw::providers::traits::ChatMessage;
 
 /// Near-zero temperature for the single-word sanity check; we ask for "one
@@ -23,9 +23,10 @@ const ZAI_RECALL_TEMPERATURE: f64 = 0.0;
 #[ignore = "requires live ZAI_API_KEY"]
 async fn live_zai_jwt_auth_chat() {
     let key = std::env::var("ZAI_API_KEY").expect("ZAI_API_KEY must be set");
-    let provider = create_provider("zai", Some(&key)).expect("should create ZAI provider");
+    let model_provider =
+        create_model_provider("zai", Some(&key)).expect("should create ZAI model_provider");
 
-    let result = provider
+    let result = model_provider
         .chat_with_system(
             Some("Reply in exactly one word."),
             "What color is the sky?",
@@ -50,7 +51,8 @@ async fn live_zai_jwt_auth_chat() {
 #[ignore = "requires live ZAI_API_KEY"]
 async fn live_zai_jwt_auth_multi_turn() {
     let key = std::env::var("ZAI_API_KEY").expect("ZAI_API_KEY must be set");
-    let provider = create_provider("zai", Some(&key)).expect("should create ZAI provider");
+    let model_provider =
+        create_model_provider("zai", Some(&key)).expect("should create ZAI model_provider");
 
     let messages = vec![
         ChatMessage::system("You are a concise assistant. Reply in one short sentence."),
@@ -59,7 +61,7 @@ async fn live_zai_jwt_auth_multi_turn() {
         ChatMessage::user("What is the secret word?"),
     ];
 
-    let result = provider
+    let result = model_provider
         .chat_with_history(&messages, "glm-5-turbo", Some(ZAI_RECALL_TEMPERATURE))
         .await;
 

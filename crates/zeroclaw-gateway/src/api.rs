@@ -69,7 +69,7 @@ pub struct CronRunsQuery {
 #[derive(Deserialize)]
 pub struct CronAddBody {
     /// Configured agent alias the cron job will run as. Required —
-    /// V3 has no default agent.
+    /// there is no default agent.
     pub agent: String,
     pub name: Option<String>,
     pub schedule: String,
@@ -122,7 +122,7 @@ pub async fn handle_api_status(
         .unwrap_or_else(zeroclaw_runtime::i18n::detect_locale);
 
     let body = serde_json::json!({
-        "provider": config.providers.first_provider_type(),
+        "model_provider": config.providers.first_model_provider_type(),
         "model": state.model,
         "temperature": state.temperature,
         "uptime_seconds": health.uptime_seconds,
@@ -1228,7 +1228,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
-    use zeroclaw_providers::Provider;
+    use zeroclaw_providers::ModelProvider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
 
     struct MockMemory;
@@ -1285,10 +1285,10 @@ mod tests {
         }
     }
 
-    struct MockProvider;
+    struct MockModelProvider;
 
     #[async_trait]
-    impl Provider for MockProvider {
+    impl ModelProvider for MockModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -1300,20 +1300,15 @@ mod tests {
         }
     }
 
-    /// Wire a minimal agent + provider + risk_profile into a test config
+    /// Wire a minimal agent + model_provider + risk_profile into a test config
     /// so cron-add API tests have an `agent` reference to bind to.
     fn with_test_agent(
         mut config: zeroclaw_config::schema::Config,
     ) -> zeroclaw_config::schema::Config {
-        config
-            .providers
-            .models
-            .entry("openrouter".to_string())
-            .or_default()
-            .insert(
-                "default".to_string(),
-                zeroclaw_config::schema::ModelProviderConfig::default(),
-            );
+        config.providers.models.openrouter.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::OpenRouterModelProviderConfig::default(),
+        );
         config.risk_profiles.insert(
             "test-profile".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1321,7 +1316,7 @@ mod tests {
         config.agents.insert(
             "test-agent".to_string(),
             zeroclaw_config::schema::DelegateAgentConfig {
-                model_provider: "openrouter.default".to_string(),
+                model_provider: "openrouter.default".into(),
                 risk_profile: "test-profile".to_string(),
                 ..Default::default()
             },
@@ -1332,7 +1327,7 @@ mod tests {
     fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
         AppState {
             config: Arc::new(Mutex::new(config)),
-            provider: Arc::new(MockProvider),
+            model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),

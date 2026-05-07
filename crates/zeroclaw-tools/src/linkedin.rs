@@ -143,7 +143,7 @@ impl Tool for LinkedInTool {
                 },
                 "generate_image": {
                     "type": "boolean",
-                    "description": "Generate an AI image for the post (requires [linkedin.image] config). Falls back to branded SVG card if all providers fail."
+                    "description": "Generate an AI image for the post (requires [linkedin.image] config). Falls back to branded SVG card if all model_providers fail."
                 },
                 "image_prompt": {
                     "type": "string",

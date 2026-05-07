@@ -6,7 +6,7 @@
 //! crate can import another without going through these interfaces.
 //!
 //! ## Traits
-//! - [`provider::Provider`] — LLM inference backends
+//! - [`model_provider::ModelProvider`] — LLM inference backends
 //! - [`channel::Channel`] — messaging platform integrations
 //! - [`tool::Tool`] — agent-callable capabilities
 //! - [`memory_traits::Memory`] — conversation memory backends
@@ -18,9 +18,9 @@ pub mod agent;
 pub mod channel;
 pub mod media;
 pub mod memory_traits;
+pub mod model_provider;
 pub mod observability_traits;
 pub mod peripherals_traits;
-pub mod provider;
 pub mod runtime_traits;
 pub mod schema;
 pub mod tool;
@@ -32,7 +32,7 @@ tokio::task_local! {
     pub static TOOL_LOOP_THREAD_ID: Option<String>;
 
     /// Override for tool choice mode, set by the agent loop.
-    /// Read by providers that support native tool calling.
+    /// Read by model_providers that support native tool calling.
     pub static TOOL_CHOICE_OVERRIDE: Option<String>;
 
     /// Session key for the currently active session.
