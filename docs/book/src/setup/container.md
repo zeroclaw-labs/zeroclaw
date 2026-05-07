@@ -7,7 +7,7 @@ Run ZeroClaw in Docker, Podman, Kubernetes, or any OCI runtime.
 Pushed to Docker Hub on every stable release:
 
 - `zeroclawlabs/zeroclaw:latest` — latest stable
-- `zeroclawlabs/zeroclaw:v0.7.4` — pinned
+- `zeroclawlabs/zeroclaw:v0.7.5` — pinned
 - `zeroclawlabs/zeroclaw:debian` — Debian-based image (larger, broader glibc support)
 
 Multi-arch: `linux/amd64`, `linux/arm64`.
@@ -91,7 +91,7 @@ spec:
     spec:
       containers:
         - name: zeroclaw
-          image: zeroclawlabs/zeroclaw:v0.7.4
+          image: zeroclawlabs/zeroclaw:v0.7.5
           ports:
             - containerPort: 42617
           volumeMounts:
