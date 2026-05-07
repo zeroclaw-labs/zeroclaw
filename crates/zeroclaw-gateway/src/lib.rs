@@ -61,6 +61,7 @@ use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, Provider};
 use zeroclaw_runtime::cost::CostTracker;
+use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use zeroclaw_runtime::tools;
@@ -1530,11 +1531,13 @@ fn is_needs_onboarding_err(e: &anyhow::Error) -> bool {
 }
 
 /// Reply text sent over a channel SDK when chat dispatch refuses
-/// because the gateway has no model configured. More informative
-/// than the generic LLM-error fallback so the end user understands
-/// why nothing is happening.
-const NEEDS_ONBOARDING_CHANNEL_REPLY: &str = "This agent isn't fully set up yet. The operator needs to complete \
-     onboarding before I can reply.";
+/// because the gateway has no model configured. Resolved through the
+/// shared Fluent catalog (`channel-needs-onboarding-reply` in
+/// `crates/zeroclaw-runtime/locales/<locale>/cli.ftl`) so non-English
+/// operators see localized text instead of a Rust-side English literal.
+fn needs_onboarding_channel_reply() -> String {
+    i18n::get_required_cli_string("channel-needs-onboarding-reply")
+}
 
 /// Full-featured chat with tools for channel and webhook handlers.
 async fn run_gateway_chat_with_tools(
@@ -2016,10 +2019,10 @@ async fn handle_whatsapp_message(
                         "WhatsApp chat refused: gateway has no model configured; \
                          visit /onboard"
                     );
-                    NEEDS_ONBOARDING_CHANNEL_REPLY
+                    needs_onboarding_channel_reply()
                 } else {
                     tracing::error!("LLM error for WhatsApp message: {e:#}");
-                    "Sorry, I couldn't process your message right now."
+                    "Sorry, I couldn't process your message right now.".to_string()
                 };
                 let _ = wa.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
@@ -2140,10 +2143,10 @@ async fn handle_linq_webhook(
                         "Linq chat refused: gateway has no model configured; \
                          visit /onboard"
                     );
-                    NEEDS_ONBOARDING_CHANNEL_REPLY
+                    needs_onboarding_channel_reply()
                 } else {
                     tracing::error!("LLM error for Linq message: {e:#}");
-                    "Sorry, I couldn't process your message right now."
+                    "Sorry, I couldn't process your message right now.".to_string()
                 };
                 let _ = linq.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
@@ -2259,10 +2262,10 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
                         "WATI chat refused: gateway has no model configured; \
                          visit /onboard"
                     );
-                    NEEDS_ONBOARDING_CHANNEL_REPLY
+                    needs_onboarding_channel_reply()
                 } else {
                     tracing::error!("LLM error for WATI message: {e:#}");
-                    "Sorry, I couldn't process your message right now."
+                    "Sorry, I couldn't process your message right now.".to_string()
                 };
                 let _ = wati.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
@@ -2378,10 +2381,10 @@ async fn handle_nextcloud_talk_webhook(
                         "Nextcloud Talk chat refused: gateway has no model configured; \
                          visit /onboard"
                     );
-                    NEEDS_ONBOARDING_CHANNEL_REPLY
+                    needs_onboarding_channel_reply()
                 } else {
                     tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
-                    "Sorry, I couldn't process your message right now."
+                    "Sorry, I couldn't process your message right now.".to_string()
                 };
                 let _ = nextcloud_talk
                     .send(&SendMessage::new(reply, &msg.reply_target))
@@ -4276,5 +4279,24 @@ mod tests {
         // anyhow::Error::context) must not break the check.
         let err = anyhow::anyhow!("provider call failed").context("needs_onboarding: empty model");
         assert!(is_needs_onboarding_err(&err));
+    }
+
+    #[test]
+    fn needs_onboarding_channel_reply_resolves_via_fluent() {
+        // The Fluent key channel-needs-onboarding-reply must resolve
+        // to real text from the embedded en/cli.ftl, not the missing-
+        // key fallback `{channel-needs-onboarding-reply}` that
+        // `missing_cli_string` produces. Guarding this in a test
+        // keeps the i18n contract from quietly drifting if the key
+        // gets renamed in lib.rs without a matching ftl edit.
+        let reply = needs_onboarding_channel_reply();
+        assert!(
+            !reply.starts_with('{') && !reply.ends_with('}'),
+            "fluent missing-key fallback leaked into channel reply: {reply:?}"
+        );
+        assert!(
+            reply.to_lowercase().contains("onboarding"),
+            "channel reply must mention onboarding so users know what's missing: {reply:?}"
+        );
     }
 }
