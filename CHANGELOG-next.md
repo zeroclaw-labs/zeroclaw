@@ -221,9 +221,8 @@
 
 - **Installer presets, gateway flags, TTY feature picker, web/dist build,
   onboarding gate** (#6385). The TTY feature picker now writes its prompts
-  to stderr (so command substitution doesn't capture them and freeze the
-  terminal) and redraws the menu in place rather than scrolling on every
-  toggle (#6496).
+  to stderr so command substitution doesn't capture them and freeze the
+  terminal (#6496).
 - **MUSL static binaries restored** for the Linux release artifacts (#6411).
 - **Platform-correct web data directory** on macOS and Windows (78d2cd6c0).
 - **Web dashboard extraction restored** in the prebuilt install path
@@ -276,7 +275,7 @@
 | Config | Preserve dotted provider map keys (#6317); surface `.secret_key` mismatch on enc2 decrypt (#6379). |
 | Docker | Unbreak workspace-member resolution in `Dockerfile` and `Dockerfile.debian` (#6305). |
 | Gateway | Record cost and token usage on every turn (#6159); evict `cancel_tokens` when a session is deleted mid-turn (#6216); fail-loud model resolution mirrored across gateway and channels (#6215); daemon boots without a configured model so `/onboard` stays reachable on fresh installs and partially-configured states, with `POST /webhook` returning `503 needs_onboarding` and channel handlers sending a Fluent-localized reply (#6493). |
-| Installation | Use platform-correct web data directory on macOS and Windows (78d2cd6c0); restore web-dashboard extraction in prebuilt install (821fbfcfc, a2c1e2bb2); installer feature picker no longer freezes the terminal (prompts now go to stderr instead of being captured by `$()`) and redraws in place rather than scrolling on every toggle (#6496). |
+| Installation | Use platform-correct web data directory on macOS and Windows (78d2cd6c0); restore web-dashboard extraction in prebuilt install (821fbfcfc, a2c1e2bb2); installer feature picker no longer freezes the terminal (prompts now go to stderr instead of being captured by `$()`) (#6496). |
 | Providers (Anthropic) | Respect `base_url` config for the default provider (#6314). |
 | Providers (compatible) | Preserve `tool_call` `extra_content` so Gemini `thoughtSignature` round-trips cleanly (#6264). |
 | Providers (xAI) | Restore model listing (9bd95a0c9). |
