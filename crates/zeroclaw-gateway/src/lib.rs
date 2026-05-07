@@ -1521,6 +1521,21 @@ fn needs_onboarding_for(model: &str) -> Option<anyhow::Error> {
     }
 }
 
+/// True when `e` carries the marker produced by `needs_onboarding_for`.
+/// Used by chat-dispatch error paths to map the marker to a 503
+/// `needs_onboarding` HTTP response or a more accurate channel-side
+/// reply, instead of the generic 500 / "sorry" catch-all.
+fn is_needs_onboarding_err(e: &anyhow::Error) -> bool {
+    e.to_string().contains("needs_onboarding")
+}
+
+/// Reply text sent over a channel SDK when chat dispatch refuses
+/// because the gateway has no model configured. More informative
+/// than the generic LLM-error fallback so the end user understands
+/// why nothing is happening.
+const NEEDS_ONBOARDING_CHANNEL_REPLY: &str = "This agent isn't fully set up yet. The operator needs to complete \
+     onboarding before I can reply.";
+
 /// Full-featured chat with tools for channel and webhook handlers.
 async fn run_gateway_chat_with_tools(
     state: &AppState,
@@ -1810,9 +1825,21 @@ async fn handle_webhook(
                 },
             );
 
-            tracing::error!("Webhook provider error: {}", sanitized);
-            let err = serde_json::json!({"error": "LLM request failed"});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+            if is_needs_onboarding_err(&e) {
+                tracing::warn!(
+                    "Webhook chat refused: gateway has no model configured; \
+                     visit /onboard"
+                );
+                let body = serde_json::json!({
+                    "error": "needs_onboarding",
+                    "url": "/onboard"
+                });
+                (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+            } else {
+                tracing::error!("Webhook provider error: {}", sanitized);
+                let err = serde_json::json!({"error": "LLM request failed"});
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+            }
         }
     }
 }
@@ -1984,13 +2011,17 @@ async fn handle_whatsapp_message(
                 }
             }
             Err(e) => {
-                tracing::error!("LLM error for WhatsApp message: {e:#}");
-                let _ = wa
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
+                let reply = if is_needs_onboarding_err(&e) {
+                    tracing::warn!(
+                        "WhatsApp chat refused: gateway has no model configured; \
+                         visit /onboard"
+                    );
+                    NEEDS_ONBOARDING_CHANNEL_REPLY
+                } else {
+                    tracing::error!("LLM error for WhatsApp message: {e:#}");
+                    "Sorry, I couldn't process your message right now."
+                };
+                let _ = wa.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
         }
     }
@@ -2104,13 +2135,17 @@ async fn handle_linq_webhook(
                 }
             }
             Err(e) => {
-                tracing::error!("LLM error for Linq message: {e:#}");
-                let _ = linq
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
+                let reply = if is_needs_onboarding_err(&e) {
+                    tracing::warn!(
+                        "Linq chat refused: gateway has no model configured; \
+                         visit /onboard"
+                    );
+                    NEEDS_ONBOARDING_CHANNEL_REPLY
+                } else {
+                    tracing::error!("LLM error for Linq message: {e:#}");
+                    "Sorry, I couldn't process your message right now."
+                };
+                let _ = linq.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
         }
     }
@@ -2219,13 +2254,17 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
                 }
             }
             Err(e) => {
-                tracing::error!("LLM error for WATI message: {e:#}");
-                let _ = wati
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
+                let reply = if is_needs_onboarding_err(&e) {
+                    tracing::warn!(
+                        "WATI chat refused: gateway has no model configured; \
+                         visit /onboard"
+                    );
+                    NEEDS_ONBOARDING_CHANNEL_REPLY
+                } else {
+                    tracing::error!("LLM error for WATI message: {e:#}");
+                    "Sorry, I couldn't process your message right now."
+                };
+                let _ = wati.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
         }
     }
@@ -2334,12 +2373,18 @@ async fn handle_nextcloud_talk_webhook(
                 }
             }
             Err(e) => {
-                tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
+                let reply = if is_needs_onboarding_err(&e) {
+                    tracing::warn!(
+                        "Nextcloud Talk chat refused: gateway has no model configured; \
+                         visit /onboard"
+                    );
+                    NEEDS_ONBOARDING_CHANNEL_REPLY
+                } else {
+                    tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
+                    "Sorry, I couldn't process your message right now."
+                };
                 let _ = nextcloud_talk
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
+                    .send(&SendMessage::new(reply, &msg.reply_target))
                     .await;
             }
         }
@@ -4202,5 +4247,34 @@ mod tests {
             needs_onboarding_for("  gpt-4  ").is_none(),
             "leading/trailing whitespace around a real model id must not be flagged"
         );
+    }
+
+    #[test]
+    fn is_needs_onboarding_err_detects_marker_from_helper() {
+        let err = needs_onboarding_for("").expect("empty model produces marker");
+        assert!(
+            is_needs_onboarding_err(&err),
+            "the marker emitted by needs_onboarding_for must be detected"
+        );
+    }
+
+    #[test]
+    fn is_needs_onboarding_err_ignores_unrelated_errors() {
+        let err = anyhow::anyhow!("upstream timeout: provider returned 504");
+        assert!(
+            !is_needs_onboarding_err(&err),
+            "unrelated errors must not be misclassified as needs_onboarding"
+        );
+        let err = anyhow::anyhow!("invalid api key");
+        assert!(!is_needs_onboarding_err(&err));
+    }
+
+    #[test]
+    fn is_needs_onboarding_err_detects_via_substring() {
+        // Defends the contract that the substring marker is the
+        // detection key — not the exact string. Wrappers (e.g.
+        // anyhow::Error::context) must not break the check.
+        let err = anyhow::anyhow!("provider call failed").context("needs_onboarding: empty model");
+        assert!(is_needs_onboarding_err(&err));
     }
 }
