@@ -159,6 +159,7 @@ Verified endpoints:
 | Cloudflare Gateway | `https://gateway.ai.cloudflare.com/v1/.../.../chat/completions` | per model |
 | OpenCode | `https://api.opencode.ai` | per model |
 | Synthetic | `https://api.synthetic.ai` | per model |
+| Atomic Chat | `http://localhost:1337/v1` | per model |
 
 Any endpoint that claims OpenAI chat-completions compatibility should work — if it doesn't, file an issue with a minimal reproducer.
 

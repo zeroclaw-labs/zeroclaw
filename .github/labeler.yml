@@ -306,6 +306,11 @@
   - changed-files:
       - any-glob-to-any-file:
           - "src/providers/telnyx.rs"
+          
+"provider:atomic-chat":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/atomic_chat.rs"
 
 "service":
   - changed-files:

@@ -26,6 +26,7 @@ pub mod copilot;
 pub mod gemini;
 pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
+pub mod atomic_chat;
 pub mod kilocli;
 pub mod models_dev;
 pub mod multimodal;
@@ -1433,6 +1434,17 @@ fn create_provider_with_url_and_options(
                 true,
             )))
         }
+        "atomic-chat" | "atomic_chat" | "atomic" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .unwrap_or("http://127.0.0.1:1337/v1");
+
+            Ok(compat(
+                OpenAiCompatibleProvider::new("Atomic Chat", base_url, key, AuthStyle::Bearer)
+                    .without_native_tools(),
+            ))
+        }
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => {
@@ -2437,6 +2449,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             activation: ProviderActivation::FallbackKey,
             local: false,
         },
+        ProviderInfo {
+            name: "atomic-chat",
+            display_name: "Atomic Chat",
+            aliases: &["atomic_chat"],
+            local: true,
+        },
         // ── Fast inference ────────────────────────────────────
         ProviderInfo {
             name: "cerebras",
@@ -3228,6 +3246,45 @@ mod tests {
                 "codex alias '{alias}' should produce a provider"
             );
         }
+    }
+
+    #[test]
+    fn factory_atomic_chat() {
+        let provider = create_provider("atomic-chat", Some("test-key")).unwrap();
+        assert!(provider.capabilities().streaming);
+        let caps = provider.capabilities();
+        assert!(caps.streaming, "AtomicChat should support streaming");
+    }
+
+    #[test]
+    fn factory_atomic_chat() {
+        let provider =
+            create_provider("atomic-chat", Some("key")).expect("atomic-chat provider should build");
+
+        assert!(provider.capabilities().streaming);
+    }
+
+    #[test]
+    fn factory_atomic_chat_aliases() {
+        assert!(create_provider("atomic-chat", Some("key")).is_ok());
+        assert!(create_provider("atomic_chat", Some("key")).is_ok());
+        assert!(create_provider("atomicchat", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_atomic_chat_allows_missing_key() {
+        let result = create_provider("atomic-chat", None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn atomic_chat_capabilities() {
+        let provider = create_provider("atomic-chat", Some("key")).expect("provider should exist");
+
+        let caps = provider.capabilities();
+
+        assert!(caps.streaming, "must support streaming");
+        assert!(!caps.tools, "atomic chat does not use native tools");
     }
 
     // ── Extended ecosystem ───────────────────────────────────
