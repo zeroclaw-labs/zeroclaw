@@ -171,6 +171,31 @@ impl SessionBackend for SessionStore {
         self.list_sessions()
     }
 
+    /// Override the trait default so JSONL-backed channel hydration picks
+    /// the most-recent sessions when truncating to MAX_CONVERSATION_SENDERS.
+    /// The trait default stamps every key with `Utc::now()`, which makes
+    /// the orchestrator's `sort_by_key(|m| Reverse(m.last_activity))`
+    /// arbitrary once more than that many sessions are persisted.
+    fn list_sessions_with_metadata(&self) -> Vec<crate::session_backend::SessionMetadata> {
+        use chrono::{DateTime, Utc};
+        self.list_sessions()
+            .into_iter()
+            .map(|key| {
+                let last_activity: DateTime<Utc> = self
+                    .session_mtime(&key)
+                    .map(DateTime::<Utc>::from)
+                    .unwrap_or_else(Utc::now);
+                crate::session_backend::SessionMetadata {
+                    name: None,
+                    created_at: last_activity,
+                    last_activity,
+                    message_count: 0,
+                    key,
+                }
+            })
+            .collect()
+    }
+
     fn compact(&self, session_key: &str) -> std::io::Result<()> {
         self.compact(session_key)
     }
