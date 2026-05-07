@@ -11,13 +11,14 @@ Last verified: **May 2026** (v0.7.4 cycle).
 
 ---
 
-## The process in five steps
+## The process in six steps
 
 1. Generate `CHANGELOG-next.md` using the changelog skill
 2. Open and merge a version bump PR
-3. Trigger the `Release Stable` workflow via manual dispatch
-4. Approve the three environment gates when prompted
-5. Verify the release exists and assets are downloadable
+3. Dry-run the release workflows locally with `act`
+4. Trigger the `Release Stable` workflow via manual dispatch
+5. Approve the three environment gates when prompted
+6. Verify the release exists and assets are downloadable
 
 That is the entire process. Everything else (Docker, crates.io, Scoop, AUR,
 Homebrew, Discord, tweet) runs automatically as downstream jobs. You do not
@@ -78,7 +79,124 @@ git show origin/master:Cargo.toml | grep '^version'
 
 ---
 
-## Step 3 — Trigger the release
+## Step 3 — Dry-run the release workflows locally with `act`
+
+The `Release Stable` workflow is a GitHub Actions job graph that consumes
+your environment-gate approval window the moment you click **Run workflow**.
+If a workflow step is broken — a missing build artifact, a stale path, a
+codegen step that someone removed without updating CI — the failure surfaces
+*after* you have committed to a release window, with the version PR already
+merged and master at the new version. Recovery means landing an emergency
+fix branch, re-running CI, and shipping under time pressure on a tree that
+already advertises itself as a fully-released version.
+
+The cheap insurance against this is to run the same job graph locally first,
+on the exact merged master commit, before opening the GitHub Actions form.
+[`act`](https://nektosact.com/) executes GitHub Actions workflows inside
+Docker containers using the same `actions/*` ecosystem GitHub does. It does
+not perfectly mirror the cloud runner — it cannot reach the artifact upload
+runtime, GitHub-issued OIDC tokens, environment secrets, or jobs that depend
+on a real release tag — but it does run the build and test steps that
+account for nearly every release-time CI failure we have ever hit.
+
+This step is a 15–20 minute investment per release. It has caught real
+defects that the regular per-PR CI did not surface (because the failing
+workflow only runs on `workflow_dispatch`, not on `push`).
+
+### One-time setup
+
+Install `act` via any of the methods documented at
+[nektosact.com/installation](https://nektosact.com/installation/index.html).
+Common paths:
+
+```bash
+# Bash script (Linux / macOS)
+curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash
+
+# macOS (Homebrew)
+brew install act
+
+# Windows (winget or Chocolatey)
+winget install nektos.act
+choco install act-cli
+
+# As a gh extension
+gh extension install https://github.com/nektos/gh-act
+```
+
+Or download a static binary directly from
+[github.com/nektos/act/releases](https://github.com/nektos/act/releases) and
+drop it on your `PATH`.
+
+`act` requires a Docker-compatible container runtime. Install Docker Engine
+or Docker Desktop using the official instructions at
+[docs.docker.com/engine/install](https://docs.docker.com/engine/install/),
+then ensure your user can reach the daemon without `sudo` (typically by
+adding yourself to the `docker` group and re-logging in). `act` also
+supports Podman and Colima as alternatives — see the act runners
+documentation for configuration.
+
+The repository ships a pre-configured `.actrc` at the root that pins the
+Linux runner image to `catthehacker/ubuntu:act-latest`, forces amd64
+architecture, and references a `.secrets` file. Create the secrets file
+once (it is gitignored, never committed):
+
+```bash
+touch .secrets
+```
+
+Add provider-specific secrets only if you are testing a workflow that
+actually uses them.
+
+### Per-release dry-run
+
+Make sure your working tree matches the merged master tip from step 2:
+
+```bash
+git fetch upstream
+git checkout upstream/master
+```
+
+List the workflows so you can pick the right job:
+
+```bash
+act -W .github/workflows/release-stable-manual.yml -l
+```
+
+Run the build-shaped jobs that exercise codegen and compilation. The first
+run pulls the runner image (~1.5 GB) and primes the Rust cache; subsequent
+runs are much faster.
+
+```bash
+# Builds the web dashboard end-to-end (gen-api → tsc → vite).
+act -j web -W .github/workflows/release-stable-manual.yml
+
+# Cross-platform binary builds (slowest job; consider running only one
+# matrix entry locally if you want to validate compile shape without
+# burning an hour on every target).
+act -j build -W .github/workflows/release-stable-manual.yml
+```
+
+What you are looking for: the build steps complete successfully. Two
+classes of failure are *expected* under `act` and do not indicate a real
+problem:
+
+- `actions/upload-artifact@v4` failing with
+  `Unable to get the ACTIONS_RUNTIME_TOKEN env variable`. `act` does not
+  implement GitHub's runtime artifact API; uploads only work on real CI.
+- Jobs that depend on a release tag, a GitHub-issued OIDC token, or an
+  environment secret you have not put in `.secrets`. Skip these with
+  `act -j <other-job>` or accept that they will not run locally.
+
+Anything else — a `tsc` error, a missing file, a Rust compile failure, a
+`cargo` lockfile mismatch — is a real defect. Do not click **Run workflow**
+on the GitHub Actions form until those are fixed and merged. If a fix is
+required, it goes through the standard PR flow on a branch off master, just
+like any other CI fix.
+
+---
+
+## Step 4 — Trigger the release
 
 Go to:
 
@@ -99,7 +217,7 @@ re-trigger. Do not try to work around it.
 
 ---
 
-## Step 4 — Approve the environment gates
+## Step 5 — Approve the environment gates
 
 Three jobs are gated by GitHub environment protection rules. When each becomes
 pending you will see a **"Waiting for review"** banner in the workflow run.
@@ -117,7 +235,7 @@ job from the workflow run page — you do not need to restart from scratch.
 
 ---
 
-## Step 5 — Verify the release
+## Step 6 — Verify the release
 
 Once `publish` completes, confirm:
 
