@@ -1444,6 +1444,7 @@ fn create_provider_with_url_and_options(
                     .without_native_tools(),
             ))
         }
+
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => {
             let mut p = OpenAiCompatibleProvider::new(
@@ -2450,7 +2451,9 @@ pub fn list_providers() -> Vec<ProviderInfo> {
         ProviderInfo {
             name: "atomic-chat",
             display_name: "Atomic Chat",
-            aliases: &["atomic_chat"],
+            description: "Atomic Chat / Jan local runtime",
+            aliases: &["atomic_chat", "atomic"],
+            activation: ProviderActivation::FallbackKey,
             local: true,
         },
         // ── Fast inference ────────────────────────────────────
@@ -4139,3 +4142,4 @@ mod tests {
         unsafe { std::env::remove_var("ZEROCLAW_PROVIDER_URL") };
     }
 }
+
