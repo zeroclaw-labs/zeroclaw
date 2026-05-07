@@ -10265,13 +10265,23 @@ impl Config {
     /// row in this method. The integrations registry consumes the result
     /// without per-vendor branches.
     pub fn integration_descriptors(&self) -> Vec<crate::config::IntegrationDescriptor> {
-        // V3 doesn't yet annotate BrowserConfig / GoogleWorkspaceConfig
-        // with `#[integration(...)]`, and cron has been flattened to a
-        // HashMap with no enable toggle. The `toggles` chain in the
-        // integration registry will pick up entries here once those
-        // schema attributes are added (tracked separately as a follow-up
-        // to the v0.7.5 → v0.8.0 merge).
-        Vec::new()
+        // BrowserConfig and GoogleWorkspaceConfig carry
+        // `#[integration(...)]` annotations on V3, so the macro emits
+        // `integration_descriptor()` on each. Cron has been flattened
+        // to `HashMap<String, CronJobDecl>` with no enable toggle, so
+        // it gets a hand-crafted descriptor whose `active` reflects
+        // whether any job is configured. Display copy lives next to
+        // the field so the registry never branches on a category name.
+        vec![
+            self.browser.integration_descriptor(),
+            self.google_workspace.integration_descriptor(),
+            crate::config::IntegrationDescriptor {
+                display_name: "Cron",
+                description: "Scheduled tasks",
+                category: "ToolsAutomation",
+                active: !self.cron.is_empty(),
+            },
+        ]
     }
 
     /// Return top-level TOML keys in `raw_toml` that Config does not recognise.

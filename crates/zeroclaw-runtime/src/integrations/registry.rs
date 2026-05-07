@@ -5,11 +5,10 @@
 //!   channel field surfaces as one entry; `ChannelConfig::name()` and
 //!   `ChannelConfig::desc()` are the source of display text).
 //! - Toggle integrations: `Config::integration_descriptors()` (per-struct
-//!   `#[integration(...)]` attribute on `BrowserConfig` / `CronConfig` /
-//!   `GoogleWorkspaceConfig`). V3 currently returns an empty list here
-//!   because those structs have not yet been ported to the
-//!   `#[integration(...)]` schema annotation; tracked for the
-//!   v0.7.5 → v0.8.0 follow-on or PR #6403's conflict-resolution pass.
+//!   `#[integration(...)]` attribute on `BrowserConfig` /
+//!   `GoogleWorkspaceConfig`, plus an inline descriptor for `cron` whose
+//!   `active` reflects whether any job is configured — cron is now a
+//!   `HashMap<String, CronJobDecl>` with no enable toggle struct).
 //! - AI providers: `zeroclaw_providers::list_providers()` (each
 //!   `ProviderInfo` row carries `display_name`, `description`, and a
 //!   `ProviderActivation` strategy).
@@ -206,41 +205,45 @@ mod tests {
 
     #[test]
     fn channel_entries_carry_per_field_metadata_from_schema() {
-        // Schema-driven contract: every Option<XConfig> on ChannelsConfig
-        // surfaces as a Chat entry whose display_name and description
-        // come from the field's `#[display_name = ...]` /
-        // `#[description = ...]` attributes — no override table here.
+        // Schema-driven contract: every channel registered through
+        // `ChannelsConfig::channels()` surfaces as a Chat entry whose
+        // display_name and description come from the channel's
+        // `ChannelConfig::name()` / `desc()` methods — no override
+        // table lives here. V3 channels are HashMap<alias, XConfig>
+        // (one entry per channel type at the registry level), so the
+        // count must equal the number of (handle, _) pairs returned.
         let config = Config::default();
         let entries = all_integrations(&config);
         let channel_count = entries
             .iter()
             .filter(|e| e.category == IntegrationCategory::Chat)
             .count();
-        let nested_count = config.channels.nested_option_entries().len();
+        let handles = config.channels.channels();
         assert_eq!(
-            channel_count, nested_count,
-            "every Option<XConfig> field should produce exactly one Chat entry",
+            channel_count,
+            handles.len(),
+            "every ChannelsConfig::channels() handle should produce exactly one Chat entry",
         );
-        for nested in config.channels.nested_option_entries() {
+        for (handle, _active) in &handles {
             let entry = entries
                 .iter()
-                .find(|e| e.name == nested.display_name)
+                .find(|e| e.name == handle.name())
                 .unwrap_or_else(|| {
                     panic!(
-                        "channel field {:?} (display {:?}) missing from registry",
-                        nested.field, nested.display_name,
+                        "channel {:?} ({:?}) missing from registry",
+                        handle.name(),
+                        handle.desc(),
                     )
                 });
             assert!(
                 !entry.name.is_empty(),
-                "channel field {:?} produced empty display name",
-                nested.field
+                "channel {:?} produced empty display name",
+                handle.name(),
             );
             assert!(
                 !entry.description.is_empty(),
-                "channel field {:?} (display {:?}) missing #[description = ...] attribute",
-                nested.field,
-                nested.display_name,
+                "channel {:?} missing description text",
+                handle.name(),
             );
         }
     }
@@ -273,16 +276,8 @@ mod tests {
     fn telegram_available_when_not_configured() {
         let config = Config::default();
         let entries = all_integrations(&config);
-        let nested = config
-            .channels
-            .nested_option_entries()
-            .into_iter()
-            .find(|e| e.field == "telegram")
-            .expect("telegram field declared on ChannelsConfig");
-        let tg = entries
-            .iter()
-            .find(|e| e.name == nested.display_name)
-            .unwrap();
+        let display_name = <TelegramConfig as ChannelConfig>::name();
+        let tg = entries.iter().find(|e| e.name == display_name).unwrap();
         assert!(matches!(tg.status, IntegrationStatus::Available));
     }
 
@@ -342,14 +337,94 @@ mod tests {
         assert!(matches!(mx.status, IntegrationStatus::Active));
     }
 
-    // V3 doesn't yet annotate BrowserConfig / CronConfig /
-    // GoogleWorkspaceConfig with `#[integration(...)]`, so
-    // `Config::integration_descriptors()` returns empty and the
-    // `toggles` chain in the registry produces no entries today.
-    // The cron / browser / google-workspace integration_descriptor
-    // tests that landed on master are intentionally omitted until
-    // those schema attributes are ported forward (tracked as a
-    // follow-up to the v0.7.5 → v0.8.0 merge).
+    /// Look up a toggle integration's status by its descriptor display
+    /// name. Each call to `Config::integration_descriptors()` is the
+    /// schema-side source of truth, so the helper resolves the entry
+    /// dynamically rather than hardcoding the display string.
+    fn toggle_status(config: &Config, field_filter: impl Fn(&str) -> bool) -> IntegrationStatus {
+        let descriptor = config
+            .integration_descriptors()
+            .into_iter()
+            .find(|d| field_filter(d.display_name))
+            .unwrap_or_else(|| panic!("expected toggle integration descriptor not present"));
+        let entries = all_integrations(config);
+        let entry = entries
+            .iter()
+            .find(|e| e.name == descriptor.display_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "registry missing toggle integration entry for {:?}",
+                    descriptor.display_name,
+                )
+            });
+        entry.status
+    }
+
+    #[test]
+    fn browser_active_in_default_config() {
+        // BrowserConfig::default() has enabled=true, so the toggle
+        // should be Active in the unconfigured registry.
+        let config = Config::default();
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Browser"),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn browser_available_when_disabled() {
+        let mut config = Config::default();
+        config.browser.enabled = false;
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Browser"),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn google_workspace_available_in_default_config() {
+        // GoogleWorkspaceConfig defaults to enabled=false.
+        let config = Config::default();
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Google Workspace"),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn google_workspace_active_when_enabled() {
+        let mut config = Config::default();
+        config.google_workspace.enabled = true;
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Google Workspace"),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn cron_available_when_no_jobs_configured() {
+        let config = Config::default();
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Cron"),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn cron_active_when_any_job_configured() {
+        // Cron is HashMap<String, CronJobDecl>; the descriptor's
+        // `active` reflects `!cron.is_empty()`, so a single entry
+        // (default-constructed) flips the toggle to Active.
+        let mut config = Config::default();
+        config.cron.insert(
+            "daily-digest".to_string(),
+            zeroclaw_config::schema::CronJobDecl::default(),
+        );
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Cron"),
+            IntegrationStatus::Active
+        ));
+    }
 
     #[test]
     fn builtin_tool_integrations_always_active() {
