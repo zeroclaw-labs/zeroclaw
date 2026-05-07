@@ -33,6 +33,17 @@ impl FileReadTool {
 
         let p = std::path::Path::new(path);
         if p.is_absolute() {
+            #[cfg(not(target_os = "windows"))]
+            if p == std::path::Path::new("/dev/null") {
+                return Ok(p.to_path_buf());
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let lower = path.to_ascii_lowercase();
+                if lower == "nul" || lower == r"\\.\nul" {
+                    return Ok(p.to_path_buf());
+                }
+            }
             let workspace_canonical = workspace_dir
                 .canonicalize()
                 .unwrap_or_else(|_| workspace_dir.clone());
