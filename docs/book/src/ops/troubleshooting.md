@@ -113,6 +113,35 @@ ln -s "$HOMEBREW_PREFIX/var/zeroclaw" ~/.zeroclaw
 
 ## Runtime
 
+### OpenAI Codex subscription auth warns about config or streaming
+
+Symptoms:
+
+- `default_provider = "openai-codex"` is set, but runs still feel misconfigured
+- Config loading warns about unknown top-level `api_key` / `api_url`
+- Agent logs `provider streaming failed, falling back to non-streaming chat`
+
+Checks:
+
+```bash
+zeroclaw auth status
+zeroclaw auth login --provider openai-codex --device-code
+zeroclaw agent --provider openai-codex -m "hello"
+```
+
+Use this minimal `config.toml` shape for normal subscription auth:
+
+```toml
+default_provider = "openai-codex"
+default_model = "gpt-5-codex"
+```
+
+Notes:
+
+- Standard OpenAI Codex subscription auth uses stored auth profiles, so top-level `api_key` / `api_url` should usually stay unset.
+- `api_key` / `api_url` are only needed for custom OpenAI-compatible gateways or other explicit endpoint overrides.
+- The streaming fallback warning by itself is not an auth failure; ZeroClaw retries the request in non-streaming mode.
+
 ### Daemon starts, then immediately exits
 
 Check journald / the platform log (see [Logs & observability](./observability.md)) for the actual error. Common causes:
@@ -234,6 +263,12 @@ Playwright downloads Chromium (~150 MB) on first launch. Let it finish. If it ke
 zeroclaw service start
 zeroclaw service status
 ```
+
+Use `zeroclaw service logs` to tail the installed service logs. Add `--follow` to stream new entries or `--lines <count>` to change how much history is shown. If the wrapper is unavailable or you need to inspect the platform directly, use:
+
+- Linux: `journalctl --user -u zeroclaw.service -f`
+- macOS: `log stream --predicate 'process == "zeroclaw"'`
+- If you are running `zeroclaw daemon` directly in a terminal, use that foreground output instead of service log commands.
 
 If that succeeds interactively but the service dies in the background, it's almost always config or permissions — read the journal:
 
