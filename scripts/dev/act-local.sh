@@ -9,13 +9,16 @@
 # token is exported into the environment so act resolves it via
 # `-s GITHUB_TOKEN` (no token value lands in argv or process tables).
 #
-# Mutating release jobs (publish, docker push, external dispatch) are
-# excluded from --all by default — act does not honor GitHub's
-# environment-protection gates, so a successful local run with a real
-# token could perform a real release. Use --include-mutating only when
-# you have explicitly confirmed the workflow steps will not reach a
-# mutation surface, or pass the explicit <wf>:<job> form (which always
-# runs what you ask for).
+# --all enforces a hardcoded allowlist of dry-run-safe jobs. Anything
+# off the allowlist (publish, docker push, gh-pages deploys, external
+# dispatches, social posts, issue/PR/label writes — across every
+# workflow file, not just release-stable-manual.yml) is skipped from
+# --all by default and requires the explicit <wf>:<job> form or
+# --no-allowlist to run. act does not honor GitHub's environment-
+# protection gates, so a successful local run with the threaded real
+# GITHUB_TOKEN could perform the real mutation. The allowlist is
+# fail-closed: a new workflow added to the repo is treated as
+# potentially mutating until it's reviewed and explicitly added.
 #
 # POSIX sh — no bash required. Works on dash, busybox ash, mksh.
 #
@@ -24,9 +27,9 @@
 #   ./scripts/dev/act-local.sh --list                # list discovered jobs
 #   ./scripts/dev/act-local.sh <wf>:<job>            # explicit (e.g. release-stable-manual:web)
 #   ./scripts/dev/act-local.sh <job>                 # short form (errors on collision)
-#   ./scripts/dev/act-local.sh --all                 # every act-runnable job (mutating skipped)
-#   ./scripts/dev/act-local.sh --all --include-mutating
-#                                                    # combined: also runs publish/docker/dispatch
+#   ./scripts/dev/act-local.sh --all                 # every dry-run-safe job (allowlist enforced)
+#   ./scripts/dev/act-local.sh --all --no-allowlist
+#                                                    # combined: also runs jobs not on the allowlist
 #   ./scripts/dev/act-local.sh --no-prefetch         # skip the SHA pre-fetch
 #   ./scripts/dev/act-local.sh --help
 
@@ -36,36 +39,48 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ARTIFACT_DIR="${ACT_LOCAL_ARTIFACT_DIR:-/tmp/act-artifacts}"
 ACT_CACHE_DIR="${HOME}/.cache/act"
 PREFETCH=true
-INCLUDE_MUTATING=false
+NO_ALLOWLIST=false
 # Resolved at setup time. Prefers a standalone `act` on PATH, falls
 # back to `gh act` (the gh-act extension) — that's the install path
 # the runbook recommends, so make sure it works without forcing a
 # second download.
 ACT_BIN=""
 
-# Jobs that mutate external state when run with a real GITHUB_TOKEN —
-# create GitHub releases, push container images, or dispatch to other
-# repositories. act does NOT honor the environment-protection gates
-# that guard these on real GitHub Actions, so reaching them locally
-# with a real token can perform the real mutation. --all skips this
-# list by default; --include-mutating opts back in (and the explicit
-# <wf>:<job> form always runs what you ask for, on the assumption you
-# meant it).
-MUTATING_JOBS="\
-release-stable-manual:publish
-release-stable-manual:docker
-release-stable-manual:redeploy-website"
+# Jobs proven safe to run locally under act with a real GITHUB_TOKEN.
+# Every entry here makes NO real-world side effects — no GitHub
+# Releases, no package pushes, no external dispatches, no
+# issue/PR/label/branch writes, no social posts. The contents are
+# limited to: artifact-only builds, semver validation, output-only
+# release-notes generation, and similar read/local-write steps.
+#
+# discover_jobs walks every standalone .github/workflows/*.yml in
+# the repo, including ones outside release-stable-manual.yml. A
+# denylist would be fail-open: a new workflow with a write surface
+# (gh-pages publish, issue creation, package-manager dispatch) added
+# without updating this list would silently get invoked by --all
+# with the maintainer's real GITHUB_TOKEN. An allowlist is
+# fail-closed — new workflows are treated as potentially mutating
+# until a maintainer reviews them and explicitly adds the safe job
+# IDs here.
+DRY_RUN_SAFE_JOBS="\
+cross-platform-build-manual:web
+cross-platform-build-manual:build
+release-stable-manual:validate
+release-stable-manual:web
+release-stable-manual:release-notes
+release-stable-manual:build
+release-stable-manual:build-desktop"
 
 log()  { printf '==> %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '4,31p' "$0" | sed 's/^#//; s/^ //'
+  sed -n '4,33p' "$0" | sed 's/^#//; s/^ //'
   exit 0
 }
 
-is_mutating_job() {
-  printf '%s\n' "$MUTATING_JOBS" | grep -qx "$1"
+is_dry_run_safe_job() {
+  printf '%s\n' "$DRY_RUN_SAFE_JOBS" | grep -qx "$1"
 }
 
 require_tool() {
@@ -245,11 +260,12 @@ run_one() {
   GITHUB_TOKEN=$(gh auth token)
   export GITHUB_TOKEN
 
-  if is_mutating_job "$pair"; then
-    log "WARNING: ${pair} is a mutating release job (publishes / pushes / dispatches)."
-    log "         act does not honor environment-protection gates; a successful run"
-    log "         with this token could create a real release. Continuing because"
-    log "         you asked for this job explicitly."
+  if ! is_dry_run_safe_job "$pair"; then
+    log "WARNING: ${pair} is not on the dry-run-safe allowlist."
+    log "         act does not honor environment-protection gates; this job"
+    log "         may publish, push, dispatch, post, or open issues against"
+    log "         real targets with the GITHUB_TOKEN threaded into this run."
+    log "         Continuing because you asked for this job explicitly."
   fi
 
   # Build the act command via positional params (POSIX sh has no arrays).
@@ -271,15 +287,15 @@ run_one() {
 }
 
 run_all() {
-  if [ "$INCLUDE_MUTATING" = true ]; then
-    log "running all act-runnable jobs (including mutating release jobs)"
+  if [ "$NO_ALLOWLIST" = true ]; then
+    log "running all act-runnable jobs (allowlist filter disabled)"
   else
-    log "running all act-runnable jobs (mutating release jobs skipped)"
+    log "running dry-run-safe jobs only (others skipped — pass --no-allowlist or run explicitly to override)"
   fi
   discover_jobs | while IFS= read -r pair; do
     [ -n "$pair" ] || continue
-    if [ "$INCLUDE_MUTATING" != true ] && is_mutating_job "$pair"; then
-      log "skip ${pair} (mutating; pass --include-mutating or run explicitly to override)"
+    if [ "$NO_ALLOWLIST" != true ] && ! is_dry_run_safe_job "$pair"; then
+      log "skip ${pair} (not on dry-run-safe allowlist)"
       continue
     fi
     run_one "$pair"
@@ -329,8 +345,8 @@ main() {
       shift
       main "$@"
       ;;
-    --include-mutating)
-      INCLUDE_MUTATING=true
+    --no-allowlist)
+      NO_ALLOWLIST=true
       shift
       main "$@"
       ;;

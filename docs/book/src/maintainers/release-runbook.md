@@ -162,34 +162,49 @@ value never lands in argv), and sets `--artifact-server-path` so
 jobs. All of that is plain `act` underneath — the script just removes
 the flag soup.
 
-### Mutating jobs are excluded from `--all`
+### `--all` only runs jobs on a dry-run-safe allowlist
 
 `act` does **not** honor GitHub's environment-protection gates. With
 the maintainer's real `GITHUB_TOKEN` threaded into the run, a
-successful local invocation of a mutating job (a `publish` that calls
-`gh release create`, a `docker` job that pushes to GHCR, a
-`redeploy-website` that dispatches to another repo) could perform the
-real mutation on first try.
+successful local invocation of a job that writes to GitHub (a `publish`
+that calls `gh release create`, a `docker` job that pushes to GHCR, a
+`docs-deploy` that force-pushes `gh-pages`, a `daily-audit` that opens
+an issue, a `tweet-release` or `discord-release` that posts to a
+webhook) could perform the real-world side effect on first try.
 
-`--all` therefore skips a curated list of mutating jobs by default.
-The script logs each skip:
+`--all` therefore enforces a hardcoded allowlist of jobs proven safe
+to run locally — currently the artifact-only build steps in
+`release-stable-manual.yml` and `cross-platform-build-manual.yml`
+(`validate`, `web`, `release-notes`, `build`, `build-desktop`).
+Everything else is skipped with a logged reason:
 
 ```
-==> skip release-stable-manual:publish (mutating; pass --include-mutating or run explicitly to override)
-==> skip release-stable-manual:docker (mutating; ...)
-==> skip release-stable-manual:redeploy-website (mutating; ...)
+==> skip release-stable-manual:publish (not on dry-run-safe allowlist)
+==> skip release-stable-manual:docker (not on dry-run-safe allowlist)
+==> skip release-stable-manual:redeploy-website (not on dry-run-safe allowlist)
+==> skip docs-deploy:deploy (not on dry-run-safe allowlist)
+==> skip daily-audit:audit (not on dry-run-safe allowlist)
+==> skip tweet-release:tweet (not on dry-run-safe allowlist)
 ```
+
+The allowlist is **fail-closed**: a new workflow added to the repo is
+treated as potentially mutating until a maintainer reviews it and adds
+the safe job IDs to `DRY_RUN_SAFE_JOBS` in
+`scripts/dev/act-local.sh`. This matters because `discover_jobs` walks
+every `.github/workflows/*.yml`, not just the release workflows — a
+denylist would silently let a future write-surface workflow through.
 
 Two escape hatches exist for the rare case where you have a reason to
-attempt one of these locally:
+attempt a non-allowlisted job locally:
 
 - `./scripts/dev/act-local.sh release-stable-manual:publish` — the
   explicit `<wf>:<job>` form runs what you ask for and prints a loud
-  warning before invoking `act`.
-- `./scripts/dev/act-local.sh --all --include-mutating` — opts the
-  whole run back into the mutating list (used only when you've already
-  verified the workflow steps will not reach a mutation surface, e.g.
-  on a fork with no real registry credentials).
+  warning before invoking `act` if the target isn't on the allowlist.
+- `./scripts/dev/act-local.sh --all --no-allowlist` — disables the
+  allowlist filter for an entire `--all` run (used only when you've
+  already verified the workflow steps will not reach a mutation
+  surface, e.g. on a fork with no real registry credentials and an
+  empty `.secrets` file).
 
 ### What's expected to fail under `act` (and is fine)
 
