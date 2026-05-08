@@ -142,13 +142,13 @@ List what's runnable across every workflow file:
 ./scripts/dev/act-local.sh --list
 ```
 
-Run a specific job, pick interactively, or run everything that's
-act-runnable:
+Run a specific job, pick interactively, or run every dry-run-safe
+job:
 
 ```bash
 ./scripts/dev/act-local.sh release-stable-manual:web   # one job
 ./scripts/dev/act-local.sh                              # interactive picker
-./scripts/dev/act-local.sh --all                        # every act-runnable job
+./scripts/dev/act-local.sh --all                        # every dry-run-safe job
 ```
 
 The first run pulls the runner image (~1.5 GB) and primes the Rust build
@@ -156,10 +156,40 @@ cache via `Swatinem/rust-cache`; subsequent runs are much faster. The
 script auto-creates the gitignored `.secrets` file, pre-fetches every
 pinned action SHA into `~/.cache/act/` (act's shallow clone can't
 resolve arbitrary commits otherwise), threads `GITHUB_TOKEN` from your
-`gh` auth into the run, and sets `--artifact-server-path` so
+`gh` auth into the run via the parent process environment (the token
+value never lands in argv), and sets `--artifact-server-path` so
 `actions/upload-artifact` and `actions/download-artifact` work between
 jobs. All of that is plain `act` underneath — the script just removes
 the flag soup.
+
+### Mutating jobs are excluded from `--all`
+
+`act` does **not** honor GitHub's environment-protection gates. With
+the maintainer's real `GITHUB_TOKEN` threaded into the run, a
+successful local invocation of a mutating job (a `publish` that calls
+`gh release create`, a `docker` job that pushes to GHCR, a
+`redeploy-website` that dispatches to another repo) could perform the
+real mutation on first try.
+
+`--all` therefore skips a curated list of mutating jobs by default.
+The script logs each skip:
+
+```
+==> skip release-stable-manual:publish (mutating; pass --include-mutating or run explicitly to override)
+==> skip release-stable-manual:docker (mutating; ...)
+==> skip release-stable-manual:redeploy-website (mutating; ...)
+```
+
+Two escape hatches exist for the rare case where you have a reason to
+attempt one of these locally:
+
+- `./scripts/dev/act-local.sh release-stable-manual:publish` — the
+  explicit `<wf>:<job>` form runs what you ask for and prints a loud
+  warning before invoking `act`.
+- `./scripts/dev/act-local.sh --all --include-mutating` — opts the
+  whole run back into the mutating list (used only when you've already
+  verified the workflow steps will not reach a mutation surface, e.g.
+  on a fork with no real registry credentials).
 
 ### What's expected to fail under `act` (and is fine)
 

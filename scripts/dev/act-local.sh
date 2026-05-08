@@ -5,17 +5,29 @@
 # locally" instruction. Walks .github/workflows/, lets a maintainer pick
 # a job (or --all), pre-fetches pinned action SHAs that act's shallow
 # clone can't resolve, ensures .secrets exists, and threads
-# --artifact-server-path plus a real GITHUB_TOKEN into every run.
+# --artifact-server-path plus a real GITHUB_TOKEN into every run. The
+# token is exported into the environment so act resolves it via
+# `-s GITHUB_TOKEN` (no token value lands in argv or process tables).
+#
+# Mutating release jobs (publish, docker push, external dispatch) are
+# excluded from --all by default — act does not honor GitHub's
+# environment-protection gates, so a successful local run with a real
+# token could perform a real release. Use --include-mutating only when
+# you have explicitly confirmed the workflow steps will not reach a
+# mutation surface, or pass the explicit <wf>:<job> form (which always
+# runs what you ask for).
 #
 # POSIX sh — no bash required. Works on dash, busybox ash, mksh.
 #
 # Usage:
-#   ./scripts/dev/act-local.sh                  # interactive picker
-#   ./scripts/dev/act-local.sh --list           # list discovered jobs
-#   ./scripts/dev/act-local.sh <wf>:<job>       # explicit (e.g. release-stable-manual:web)
-#   ./scripts/dev/act-local.sh <job>            # short form (errors on collision)
-#   ./scripts/dev/act-local.sh --all            # every act-runnable job
-#   ./scripts/dev/act-local.sh --no-prefetch    # skip the SHA pre-fetch
+#   ./scripts/dev/act-local.sh                       # interactive picker
+#   ./scripts/dev/act-local.sh --list                # list discovered jobs
+#   ./scripts/dev/act-local.sh <wf>:<job>            # explicit (e.g. release-stable-manual:web)
+#   ./scripts/dev/act-local.sh <job>                 # short form (errors on collision)
+#   ./scripts/dev/act-local.sh --all                 # every act-runnable job (mutating skipped)
+#   ./scripts/dev/act-local.sh --all --include-mutating
+#                                                    # combined: also runs publish/docker/dispatch
+#   ./scripts/dev/act-local.sh --no-prefetch         # skip the SHA pre-fetch
 #   ./scripts/dev/act-local.sh --help
 
 set -eu
@@ -24,18 +36,36 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ARTIFACT_DIR="${ACT_LOCAL_ARTIFACT_DIR:-/tmp/act-artifacts}"
 ACT_CACHE_DIR="${HOME}/.cache/act"
 PREFETCH=true
+INCLUDE_MUTATING=false
 # Resolved at setup time. Prefers a standalone `act` on PATH, falls
 # back to `gh act` (the gh-act extension) — that's the install path
 # the runbook recommends, so make sure it works without forcing a
 # second download.
 ACT_BIN=""
 
+# Jobs that mutate external state when run with a real GITHUB_TOKEN —
+# create GitHub releases, push container images, or dispatch to other
+# repositories. act does NOT honor the environment-protection gates
+# that guard these on real GitHub Actions, so reaching them locally
+# with a real token can perform the real mutation. --all skips this
+# list by default; --include-mutating opts back in (and the explicit
+# <wf>:<job> form always runs what you ask for, on the assumption you
+# meant it).
+MUTATING_JOBS="\
+release-stable-manual:publish
+release-stable-manual:docker
+release-stable-manual:redeploy-website"
+
 log()  { printf '==> %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '4,18p' "$0" | sed 's/^#//; s/^ //'
+  sed -n '4,31p' "$0" | sed 's/^#//; s/^ //'
   exit 0
+}
+
+is_mutating_job() {
+  printf '%s\n' "$MUTATING_JOBS" | grep -qx "$1"
 }
 
 require_tool() {
@@ -209,11 +239,24 @@ run_one() {
   workflow_file="$REPO_ROOT/.github/workflows/$stem.yml"
   [ -f "$workflow_file" ] || die "workflow file missing: $workflow_file"
 
+  # Export the token into the environment so act resolves `-s
+  # GITHUB_TOKEN` (no value) from getenv. Keeps the credential out of
+  # argv, the shell history, and the kernel's process table.
+  GITHUB_TOKEN=$(gh auth token)
+  export GITHUB_TOKEN
+
+  if is_mutating_job "$pair"; then
+    log "WARNING: ${pair} is a mutating release job (publishes / pushes / dispatches)."
+    log "         act does not honor environment-protection gates; a successful run"
+    log "         with this token could create a real release. Continuing because"
+    log "         you asked for this job explicitly."
+  fi
+
   # Build the act command via positional params (POSIX sh has no arrays).
   set -- workflow_dispatch \
          -j "$job" \
          -W "$workflow_file" \
-         -s "GITHUB_TOKEN=$(gh auth token)" \
+         -s GITHUB_TOKEN \
          --artifact-server-path "$ARTIFACT_DIR"
 
   if workflow_has_version_input "$workflow_file"; then
@@ -228,9 +271,17 @@ run_one() {
 }
 
 run_all() {
-  log "running all act-runnable jobs"
+  if [ "$INCLUDE_MUTATING" = true ]; then
+    log "running all act-runnable jobs (including mutating release jobs)"
+  else
+    log "running all act-runnable jobs (mutating release jobs skipped)"
+  fi
   discover_jobs | while IFS= read -r pair; do
     [ -n "$pair" ] || continue
+    if [ "$INCLUDE_MUTATING" != true ] && is_mutating_job "$pair"; then
+      log "skip ${pair} (mutating; pass --include-mutating or run explicitly to override)"
+      continue
+    fi
     run_one "$pair"
   done
 }
@@ -275,6 +326,11 @@ main() {
       ;;
     --no-prefetch)
       PREFETCH=false
+      shift
+      main "$@"
+      ;;
+    --include-mutating)
+      INCLUDE_MUTATING=true
       shift
       main "$@"
       ;;
