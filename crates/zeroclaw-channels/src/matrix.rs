@@ -1497,16 +1497,10 @@ mod inbound {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            // Reply anchor: use the existing thread root when present,
-            // otherwise (when reply_in_thread is on) anchor a brand-new thread
-            // on this very event so the bot's reply opens a thread.
-            thread_ts: thread_id.as_ref().map(|t| t.to_string()).or_else(|| {
-                if ctx.config.reply_in_thread {
-                    Some(ev.event_id.to_string())
-                } else {
-                    None
-                }
-            }),
+            // Reply anchor: only carry an existing Matrix thread root. A root
+            // timeline event is not a thread, even when outbound replies are
+            // configured to preserve thread context.
+            thread_ts: inbound_thread_ts(thread_id.as_ref()),
             // Interruption scope is for cancellation grouping — only set when
             // the inbound is genuinely *inside* a reply thread.
             interruption_scope_id: thread_id.as_ref().map(|t| t.to_string()),
@@ -1543,6 +1537,10 @@ mod inbound {
         }
         let root = relates.get("event_id")?.as_str()?;
         root.parse().ok()
+    }
+
+    pub(super) fn inbound_thread_ts(thread_id: Option<&OwnedEventId>) -> Option<String> {
+        thread_id.map(ToString::to_string)
     }
 
     /// Pull the `m.in_reply_to.event_id` from a raw event. This is Matrix's
@@ -3788,7 +3786,9 @@ mod tests {
     }
 
     mod thread_extraction {
-        use super::super::inbound::{extract_mentions_user_ids, extract_thread_id};
+        use super::super::inbound::{
+            extract_mentions_user_ids, extract_thread_id, inbound_thread_ts,
+        };
         use matrix_sdk::event_handler::RawEvent;
         use matrix_sdk::ruma::serde::Raw;
 
@@ -3819,6 +3819,21 @@ mod tests {
                 "content": { "msgtype": "m.text", "body": "hi" }
             }));
             assert!(extract_thread_id(&r).is_none());
+        }
+
+        #[test]
+        fn root_message_does_not_become_thread_when_reply_in_thread_enabled() {
+            assert_eq!(inbound_thread_ts(None), None);
+        }
+
+        #[test]
+        fn threaded_message_uses_existing_thread_root() {
+            let root_id = "$root:server".parse().expect("event id");
+
+            assert_eq!(
+                inbound_thread_ts(Some(&root_id)).as_deref(),
+                Some("$root:server")
+            );
         }
 
         #[test]
