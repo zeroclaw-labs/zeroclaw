@@ -132,6 +132,52 @@ for wf in \
     "(e.g. v${VERSION})"
 done
 
+# ── Docs book examples + matching i18n catalogs ────────────────────
+# Two surgical patterns, both anchored enough to skip release-runbook
+# history lines like "Last verified: May 2026 (v0.7.4 cycle)" or
+# "scheduled for deletion in v0.7.4 (#5915)" which intentionally pin
+# to the version they were written for:
+#   - container image tags    `zeroclawlabs/zeroclaw:vX.Y.Z`
+#   - /health response example `"version": "X.Y.Z"`
+# Sweeping `docs/book/src/**/*.md` keeps user-facing examples in step
+# with the release; `docs/book/po/*.po` mirrors the same swap into the
+# translation catalogs that the i18n pipeline reads.
+echo "Docs book examples..."
+docs_files=()
+while IFS= read -r -d '' f; do
+  docs_files+=("$f")
+done < <(find "$REPO_ROOT/docs/book/src" -type f -name '*.md' -print0)
+while IFS= read -r -d '' f; do
+  docs_files+=("$f")
+done < <(find "$REPO_ROOT/docs/book/po" -type f -name '*.po' -print0 2>/dev/null)
+for f in "${docs_files[@]}"; do
+  rel="${f#$REPO_ROOT/}"
+  # Image tags share one form across .md and .po (no quotes involved).
+  bump "$rel" \
+    'zeroclawlabs/zeroclaw:v[0-9]+\.[0-9]+\.[0-9]+' \
+    "zeroclawlabs/zeroclaw:v${VERSION}"
+  # Version literal needs per-format dispatch: the unescaped pattern is
+  # a strict substring of the escaped one, so running both blindly
+  # would have the unescaped pass clobber the .po backslashes and
+  # leave malformed gettext strings.
+  case "$f" in
+    *.md)
+      bump "$rel" \
+        '"version": "[0-9]+\.[0-9]+\.[0-9]+"' \
+        "\"version\": \"${VERSION}\""
+      ;;
+    *.po)
+      # Single-quoted replacement so the literal backslashes survive
+      # bash *and* sed: sed sees `\\"` in the substitution, which it
+      # emits as a single backslash followed by a quote, restoring
+      # the gettext escaped form.
+      bump "$rel" \
+        '\\"version\\": \\"[0-9]+\.[0-9]+\.[0-9]+\\"' \
+        '\\"version\\": \\"'"${VERSION}"'\\"'
+      ;;
+  esac
+done
+
 echo ""
 if [[ $changed -gt 0 ]]; then
   echo "Done — $changed file(s) updated to v$VERSION."

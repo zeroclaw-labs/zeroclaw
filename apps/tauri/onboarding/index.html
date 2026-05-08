@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Welcome to ZeroClaw</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #0e1116;
+        --panel: #161b22;
+        --panel-2: #1c2129;
+        --text: #e6edf3;
+        --muted: #8b949e;
+        --border: #30363d;
+        --accent: #2f81f7;
+        --accent-hover: #4493f8;
+        --good: #3fb950;
+        --warn: #d29922;
+        --bad: #f85149;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f6f8fa;
+          --panel: #ffffff;
+          --panel-2: #f0f3f6;
+          --text: #1f2328;
+          --muted: #59636e;
+          --border: #d1d9e0;
+        }
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        -webkit-font-smoothing: antialiased;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+      }
+      .progress {
+        display: flex;
+        gap: 8px;
+        justify-content: center;
+        padding: 18px 24px 6px;
+      }
+      .progress-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--border);
+        transition: background 0.2s ease, transform 0.2s ease;
+      }
+      .progress-dot.active {
+        background: var(--accent);
+        transform: scale(1.3);
+      }
+      .progress-dot.done {
+        background: var(--good);
+      }
+      main {
+        flex: 1 1 auto;
+        display: flex;
+        flex-direction: column;
+        padding: 12px 40px 16px;
+        overflow-y: auto;
+        animation: fade 0.25s ease;
+      }
+      @keyframes fade {
+        from { opacity: 0; transform: translateY(8px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+      .step-icon {
+        font-size: 56px;
+        text-align: center;
+        margin: 8px 0 16px;
+        line-height: 1;
+      }
+      .step-title {
+        font-size: 26px;
+        font-weight: 600;
+        text-align: center;
+        margin: 0 0 10px;
+      }
+      .step-subtitle {
+        font-size: 14px;
+        color: var(--muted);
+        text-align: center;
+        line-height: 1.55;
+        max-width: 540px;
+        margin: 0 auto 24px;
+      }
+      .perm-list {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        max-width: 560px;
+        width: 100%;
+        margin: 0 auto;
+      }
+      .perm {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 14px 16px;
+        border-radius: 10px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+      }
+      .perm-text { flex: 1 1 auto; min-width: 0; }
+      .perm-text .label {
+        font-weight: 600;
+        font-size: 14px;
+        margin: 0 0 2px;
+      }
+      .perm-text .desc {
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.4;
+        margin: 0;
+      }
+      .pill {
+        font-size: 10px;
+        font-weight: 600;
+        padding: 3px 8px;
+        border-radius: 999px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        white-space: nowrap;
+      }
+      .pill.granted { background: rgba(63, 185, 80, 0.15); color: var(--good); }
+      .pill.denied { background: rgba(248, 81, 73, 0.15); color: var(--bad); }
+      .pill.pending { background: rgba(210, 153, 34, 0.15); color: var(--warn); }
+      button {
+        font-family: inherit;
+        font-size: 13px;
+        font-weight: 500;
+        padding: 7px 14px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: var(--panel-2);
+        color: var(--text);
+        cursor: pointer;
+        transition: background 0.12s ease, border-color 0.12s ease;
+      }
+      button:hover:not(:disabled) {
+        background: var(--border);
+      }
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #ffffff;
+      }
+      button.primary:hover:not(:disabled) {
+        background: var(--accent-hover);
+        border-color: var(--accent-hover);
+      }
+      button.primary.large {
+        padding: 10px 22px;
+        font-size: 14px;
+      }
+      button:disabled { opacity: 0.5; cursor: default; }
+      .step-cta {
+        display: flex;
+        justify-content: center;
+        margin-top: 28px;
+      }
+      footer {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 14px 24px;
+        border-top: 1px solid var(--border);
+        background: var(--bg);
+      }
+      footer .left { color: var(--muted); font-size: 12px; min-width: 120px; }
+      footer .center { display: flex; gap: 8px; }
+      footer .right { display: flex; gap: 10px; min-width: 120px; justify-content: flex-end; }
+      .check-list {
+        list-style: none;
+        padding: 0;
+        margin: 0 auto;
+        max-width: 460px;
+      }
+      .check-list li {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 6px 0;
+        font-size: 14px;
+      }
+      .check-list .icon { width: 20px; text-align: center; }
+      .check-list .icon.granted { color: var(--good); }
+      .check-list .icon.denied { color: var(--bad); }
+      .check-list .icon.pending { color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <div class="progress" id="progress"></div>
+    <main id="main"></main>
+    <footer>
+      <div class="left" id="footer-status">&nbsp;</div>
+      <div class="center"></div>
+      <div class="right">
+        <button id="back-btn">Back</button>
+        <button id="skip-btn">Skip</button>
+        <button id="next-btn" class="primary">Continue</button>
+      </div>
+    </footer>
+
+    <script>
+      const STEPS = [
+        {
+          id: "welcome",
+          icon: "👋",
+          title: "Welcome to ZeroClaw",
+          subtitle:
+            "ZeroClaw is a menu-bar agent that can act on your Mac on your behalf. " +
+            "On the next few screens you'll grant the macOS permissions it needs. " +
+            "You can change any of these later in System Settings.",
+          perms: [],
+          ctaLabel: "Get Started",
+        },
+        {
+          id: "accessibility",
+          icon: "🖱️",
+          title: "Accessibility",
+          subtitle:
+            "Lets ZeroClaw click, type, and read other apps' UI on your behalf. " +
+            "This is the most important permission for an agent that controls your Mac. " +
+            "Click Grant to open System Settings → Privacy & Security → Accessibility, then toggle ZeroClaw on.",
+          perms: [
+            { name: "accessibility", label: "Accessibility" },
+          ],
+        },
+        {
+          id: "screen_input",
+          icon: "🖥️",
+          title: "See & observe the screen",
+          subtitle:
+            "Screen Recording lets the agent see what's on screen so it can act on the current context. " +
+            "Input Monitoring lets it receive global hotkeys and observe keyboard/mouse activity outside its own windows.",
+          perms: [
+            { name: "screen_recording", label: "Screen Recording" },
+            { name: "input_monitoring", label: "Input Monitoring" },
+          ],
+        },
+        {
+          id: "automation",
+          icon: "🤖",
+          title: "Drive other apps",
+          subtitle:
+            "Automation lets ZeroClaw control Finder, Mail, Safari, Calendar, Reminders, Notes, Music, and other " +
+            "scriptable apps via AppleScript. macOS asks for confirmation per-app the first time you use it.",
+          perms: [
+            { name: "automation", label: "Automation (AppleScript)" },
+          ],
+        },
+        {
+          id: "voice_vision",
+          icon: "🎙️",
+          title: "Voice & vision",
+          subtitle:
+            "Enable voice commands and vision input. " +
+            "Optional — skip if you only use the chat by typing.",
+          perms: [
+            { name: "microphone", label: "Microphone" },
+            { name: "camera", label: "Camera" },
+            { name: "speech_recognition", label: "Speech Recognition" },
+          ],
+          optional: true,
+        },
+        {
+          id: "notifications",
+          icon: "🔔",
+          title: "Notifications",
+          subtitle:
+            "Let ZeroClaw notify you when long-running tasks finish or attention is needed. " +
+            "macOS will show banner alerts; you can configure delivery in System Settings.",
+          perms: [
+            { name: "notifications", label: "Notifications" },
+          ],
+          optional: true,
+        },
+        {
+          id: "advanced",
+          icon: "⚙️",
+          title: "Advanced (optional)",
+          subtitle:
+            "These give the agent broader access to your system. " +
+            "Most users can skip — you can grant them later from System Settings if a feature needs them.",
+          perms: [
+            { name: "full_disk_access", label: "Full Disk Access" },
+            { name: "local_network", label: "Local Network" },
+          ],
+          optional: true,
+        },
+        {
+          id: "done",
+          icon: "✅",
+          title: "You're ready",
+          subtitle:
+            "ZeroClaw lives in your menu bar. Click the icon up top anytime to start a chat. " +
+            "Below is what you granted just now — you can revisit any of these in System Settings.",
+          perms: [],
+          isFinal: true,
+        },
+      ];
+
+      function resolveInvoke() {
+        return window.__TAURI__?.core?.invoke ?? null;
+      }
+
+      async function callInvoke(cmd, args) {
+        const invoke = resolveInvoke();
+        if (!invoke) {
+          throw new Error(
+            "Tauri IPC bridge not available (window.__TAURI__.core.invoke is missing)."
+          );
+        }
+        return invoke(cmd, args);
+      }
+
+      const progressEl = document.getElementById("progress");
+      const mainEl = document.getElementById("main");
+      const footerStatus = document.getElementById("footer-status");
+      const backBtn = document.getElementById("back-btn");
+      const skipBtn = document.getElementById("skip-btn");
+      const nextBtn = document.getElementById("next-btn");
+
+      let currentIndex = 0;
+      let statusMap = {};
+
+      function el(tag, className, text) {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined) node.textContent = text;
+        return node;
+      }
+
+      function pillClass(status) {
+        if (status === "granted") return "granted";
+        if (status === "denied") return "denied";
+        return "pending";
+      }
+      function pillText(status) {
+        if (status === "granted") return "Granted";
+        if (status === "denied") return "Denied";
+        if (status === "not_determined") return "Not Set";
+        return "Checking";
+      }
+
+      function renderProgress() {
+        while (progressEl.firstChild) progressEl.removeChild(progressEl.firstChild);
+        STEPS.forEach((_, i) => {
+          const dot = el("div", "progress-dot");
+          if (i < currentIndex) dot.classList.add("done");
+          if (i === currentIndex) dot.classList.add("active");
+          progressEl.appendChild(dot);
+        });
+      }
+
+      function renderPermRow(p) {
+        const status = statusMap[p.name] ?? "pending";
+        const row = el("div", "perm");
+
+        const textWrap = el("div", "perm-text");
+        textWrap.appendChild(el("p", "label", p.label));
+        textWrap.appendChild(el("p", "desc", p.desc ?? ""));
+        row.appendChild(textWrap);
+
+        row.appendChild(el("span", `pill ${pillClass(status)}`, pillText(status)));
+
+        const btn = el("button", null, status === "granted" ? "Granted" : "Grant");
+        if (status === "granted") btn.disabled = true;
+        btn.addEventListener("click", () => grant(p.name));
+        row.appendChild(btn);
+
+        return row;
+      }
+
+      function renderFinalChecklist() {
+        const list = el("ul", "check-list");
+        const allPerms = STEPS.flatMap((s) => s.perms ?? []);
+        const seen = new Set();
+        for (const p of allPerms) {
+          if (seen.has(p.name)) continue;
+          seen.add(p.name);
+          const status = statusMap[p.name] ?? "pending";
+          const item = el("li");
+          const icon = el("span", `icon ${pillClass(status)}`,
+            status === "granted" ? "✓" : status === "denied" ? "✗" : "—");
+          item.appendChild(icon);
+          item.appendChild(el("span", null, p.label));
+          item.appendChild(el("span", `pill ${pillClass(status)}`, pillText(status)));
+          item.querySelector(".pill").style.marginLeft = "auto";
+          list.appendChild(item);
+        }
+        return list;
+      }
+
+      function renderStep() {
+        const step = STEPS[currentIndex];
+        while (mainEl.firstChild) mainEl.removeChild(mainEl.firstChild);
+
+        if (step.icon) mainEl.appendChild(el("div", "step-icon", step.icon));
+        mainEl.appendChild(el("h1", "step-title", step.title));
+        mainEl.appendChild(el("p", "step-subtitle", step.subtitle));
+
+        if (step.isFinal) {
+          mainEl.appendChild(renderFinalChecklist());
+        } else if (step.perms && step.perms.length > 0) {
+          const list = el("div", "perm-list");
+          for (const p of step.perms) list.appendChild(renderPermRow(p));
+          mainEl.appendChild(list);
+        }
+
+        // Footer button states
+        backBtn.style.visibility = currentIndex === 0 ? "hidden" : "visible";
+        if (step.id === "welcome") {
+          skipBtn.style.display = "none";
+          nextBtn.textContent = step.ctaLabel ?? "Get Started";
+          nextBtn.classList.add("large");
+        } else if (step.isFinal) {
+          skipBtn.style.display = "none";
+          nextBtn.textContent = "Start ZeroClaw";
+          nextBtn.classList.add("large");
+        } else {
+          skipBtn.style.display = step.optional ? "inline-flex" : "none";
+          nextBtn.textContent = "Continue";
+          nextBtn.classList.remove("large");
+        }
+
+        // Footer status text
+        if (step.perms && step.perms.length > 0) {
+          const granted = step.perms.filter(
+            (p) => statusMap[p.name] === "granted"
+          ).length;
+          footerStatus.textContent = `${granted} of ${step.perms.length} granted`;
+        } else if (step.isFinal) {
+          const allEssential = STEPS
+            .filter((s) => !s.optional && !s.isFinal && s.id !== "welcome")
+            .flatMap((s) => s.perms ?? []);
+          const granted = allEssential.filter(
+            (p) => statusMap[p.name] === "granted"
+          ).length;
+          footerStatus.textContent = `${granted} of ${allEssential.length} essentials granted`;
+        } else {
+          footerStatus.textContent = `Step ${currentIndex + 1} of ${STEPS.length}`;
+        }
+
+        renderProgress();
+      }
+
+      async function refresh() {
+        try {
+          const list = await callInvoke("get_permissions_status");
+          const map = {};
+          for (const p of list) map[p.name] = p.status;
+          statusMap = map;
+          renderStep();
+        } catch (err) {
+          footerStatus.textContent = String(err.message ?? err);
+          footerStatus.style.color = "var(--bad)";
+        }
+      }
+
+      async function grant(name) {
+        try {
+          await callInvoke("request_permission", { name });
+        } catch (err) {
+          console.error("request_permission failed:", err);
+          footerStatus.textContent = `Grant ${name}: ${String(err.message ?? err)}`;
+          footerStatus.style.color = "var(--bad)";
+        }
+        refresh();
+      }
+
+      function next() {
+        if (currentIndex < STEPS.length - 1) {
+          currentIndex++;
+          renderStep();
+        } else {
+          // Final step CTA → close wizard.
+          callInvoke("complete_onboarding").catch((err) => {
+            footerStatus.textContent = String(err.message ?? err);
+            footerStatus.style.color = "var(--bad)";
+          });
+        }
+      }
+
+      function back() {
+        if (currentIndex > 0) {
+          currentIndex--;
+          renderStep();
+        }
+      }
+
+      function skip() {
+        // Same as next but ensures we move forward even on optional steps without granting.
+        next();
+      }
+
+      backBtn.addEventListener("click", back);
+      skipBtn.addEventListener("click", skip);
+      nextBtn.addEventListener("click", next);
+
+      // Initial render + polling.
+      renderStep();
+      refresh();
+      setInterval(refresh, 2000);
+    </script>
+  </body>
+</html>
