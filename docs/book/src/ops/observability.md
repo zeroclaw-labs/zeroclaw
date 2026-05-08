@@ -175,7 +175,7 @@ Token fields are `null` when the upstream provider does not surface usage in str
 The gateway exposes three health views:
 
 ```bash
-curl -s http://localhost:42617/health              # { "status": "ok", "version": "0.7.4" }
+curl -s http://localhost:42617/health              # { "status": "ok", "version": "0.7.5" }
 curl -s http://localhost:42617/health/channels     # per-channel status
 curl -s http://localhost:42617/health/providers    # per-provider status + error rate
 ```
