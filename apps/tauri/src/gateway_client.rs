@@ -130,6 +130,27 @@ impl GatewayClient {
         self.pair_with_code(&code).await
     }
 
+    /// Push the device's currently-granted capabilities to the gateway so the agent
+    /// knows what this Mac can do without waiting for a /ws/nodes connection.
+    /// Requires a valid bearer token; the gateway uses its hash to identify the row.
+    pub async fn update_capabilities(&self, capabilities: &[String]) -> Result<()> {
+        let mut req = self
+            .client
+            .post(format!("{}/api/devices/me/capabilities", self.base_url))
+            .json(&serde_json::json!({ "capabilities": capabilities }));
+        if let Some(auth) = self.auth_header() {
+            req = req.header("Authorization", auth);
+        }
+        let resp = req
+            .send()
+            .await
+            .context("update_capabilities request failed")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("update_capabilities returned {}", resp.status());
+        }
+        Ok(())
+    }
+
     pub async fn send_webhook_message(&self, message: &str) -> Result<serde_json::Value> {
         let mut req = self
             .client

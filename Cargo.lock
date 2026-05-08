@@ -13337,6 +13337,7 @@ name = "zeroclaw-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
