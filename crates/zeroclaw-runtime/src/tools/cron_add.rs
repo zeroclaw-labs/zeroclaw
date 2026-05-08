@@ -58,7 +58,7 @@ impl Tool for CronAddTool {
     fn description(&self) -> &str {
         "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
          Use job_type='agent' with a prompt to run the AI agent on schedule. \
-         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix, QQ), set \
+         To deliver output to a channel, set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
          This is the preferred tool for sending scheduled/delayed messages to users via channels."
     }
@@ -146,7 +146,7 @@ impl Tool for CronAddTool {
                         },
                         "channel": {
                             "type": "string",
-                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq"],
+                            "enum": cron::SUPPORTED_DELIVERY_CHANNELS,
                             "description": "Channel type to deliver output to"
                         },
                         "to": {
@@ -735,18 +735,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_schema_includes_matrix_channel() {
+    async fn delivery_schema_uses_supported_delivery_channels() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
-        let values =
+        let values: Vec<&str> =
             tool.parameters_schema()["properties"]["delivery"]["properties"]["channel"]["enum"]
                 .as_array()
-                .cloned()
-                .unwrap_or_default();
+                .expect("delivery.channel must have an enum")
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect();
 
-        assert!(values.iter().any(|value| value == "matrix"));
+        assert_eq!(values.as_slice(), cron::SUPPORTED_DELIVERY_CHANNELS);
     }
 
     #[test]

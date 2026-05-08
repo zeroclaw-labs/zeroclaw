@@ -22,6 +22,17 @@ pub use types::{
     deserialize_maybe_stringified,
 };
 
+pub const SUPPORTED_DELIVERY_CHANNELS: &[&str] = &[
+    "telegram",
+    "discord",
+    "slack",
+    "mattermost",
+    "signal",
+    "matrix",
+    "qq",
+    "dingtalk",
+];
+
 /// Validate a shell command against the full security policy (allowlist + risk gate).
 ///
 /// Returns `Ok(())` if the command passes all checks, or an error describing
@@ -61,9 +72,9 @@ pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()>
     let Some(channel) = channel.filter(|value| !value.is_empty()) else {
         bail!("delivery.channel is required for announce mode");
     };
-    match channel.to_ascii_lowercase().as_str() {
-        "telegram" | "discord" | "slack" | "mattermost" | "signal" | "matrix" | "qq" => {}
-        other => bail!("unsupported delivery channel: {other}"),
+    let normalized = channel.to_ascii_lowercase();
+    if !SUPPORTED_DELIVERY_CHANNELS.contains(&normalized.as_str()) {
+        bail!("unsupported delivery channel: {normalized}");
     }
 
     let has_target = delivery

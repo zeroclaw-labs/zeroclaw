@@ -1037,6 +1037,17 @@ mod tests {
     }
 
     #[test]
+    fn validate_delivery_config_accepts_dingtalk() {
+        validate_delivery_config(Some(&DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("dingtalk".into()),
+            to: Some("conversation-id".into()),
+            best_effort: true,
+        }))
+        .unwrap();
+    }
+
+    #[test]
     fn add_agent_job_rejects_invalid_announce_delivery() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);

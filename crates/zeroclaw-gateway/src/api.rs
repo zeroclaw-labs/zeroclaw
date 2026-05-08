@@ -1313,7 +1313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cron_api_shell_roundtrip_includes_delivery() {
+    async fn cron_api_accepts_dingtalk_delivery() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -1333,8 +1333,8 @@ mod tests {
                     "command": "echo hello",
                     "delivery": {
                         "mode": "announce",
-                        "channel": "discord",
-                        "to": "1234567890",
+                        "channel": "dingtalk",
+                        "to": "conversation-id",
                         "best_effort": true
                     }
                 }))
@@ -1347,8 +1347,8 @@ mod tests {
         let add_json = response_json(add_response).await;
         assert_eq!(add_json["status"], "ok");
         assert_eq!(add_json["job"]["delivery"]["mode"], "announce");
-        assert_eq!(add_json["job"]["delivery"]["channel"], "discord");
-        assert_eq!(add_json["job"]["delivery"]["to"], "1234567890");
+        assert_eq!(add_json["job"]["delivery"]["channel"], "dingtalk");
+        assert_eq!(add_json["job"]["delivery"]["to"], "conversation-id");
 
         let list_response = handle_api_cron_list(State(state), HeaderMap::new())
             .await
@@ -1357,8 +1357,8 @@ mod tests {
         let jobs = list_json["jobs"].as_array().expect("jobs array");
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0]["delivery"]["mode"], "announce");
-        assert_eq!(jobs[0]["delivery"]["channel"], "discord");
-        assert_eq!(jobs[0]["delivery"]["to"], "1234567890");
+        assert_eq!(jobs[0]["delivery"]["channel"], "dingtalk");
+        assert_eq!(jobs[0]["delivery"]["to"], "conversation-id");
     }
 
     #[tokio::test]

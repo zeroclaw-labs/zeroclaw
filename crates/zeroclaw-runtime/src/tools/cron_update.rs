@@ -151,7 +151,7 @@ impl Tool for CronUpdateTool {
                                 },
                                 "channel": {
                                     "type": "string",
-                                    "enum": ["telegram", "discord", "slack", "mattermost", "matrix"],
+                                    "enum": cron::SUPPORTED_DELIVERY_CHANNELS,
                                     "description": "Channel type to deliver output to"
                                 },
                                 "to": {
@@ -245,6 +245,7 @@ impl Tool for CronUpdateTool {
 mod tests {
     use super::*;
     use crate::security::AutonomyLevel;
+    use crate::tools::cron_add::CronAddTool;
     use tempfile::TempDir;
     use zeroclaw_config::schema::Config;
 
@@ -475,9 +476,31 @@ mod tests {
             .as_array()
             .expect("patch.delivery.channel must have an enum");
         let channel_strs: Vec<&str> = channel_enum.iter().filter_map(|v| v.as_str()).collect();
-        for ch in &["telegram", "discord", "slack", "mattermost", "matrix"] {
+        for ch in cron::SUPPORTED_DELIVERY_CHANNELS {
             assert!(channel_strs.contains(ch), "delivery.channel missing: {ch}");
         }
+    }
+
+    #[tokio::test]
+    async fn delivery_channel_schema_matches_cron_add() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let security = test_security(&cfg);
+        let add_tool = CronAddTool::new(cfg.clone(), security.clone());
+        let update_tool = CronUpdateTool::new(cfg, security);
+
+        let add_channels =
+            &add_tool.parameters_schema()["properties"]["delivery"]["properties"]["channel"]
+                ["enum"];
+        let update_channels = &update_tool.parameters_schema()["properties"]["patch"]["properties"]
+            ["delivery"]["properties"]["channel"]["enum"];
+
+        assert_eq!(add_channels, update_channels);
+        assert!(add_channels
+            .as_array()
+            .expect("delivery.channel must have an enum")
+            .iter()
+            .any(|value| value == "dingtalk"));
     }
 
     #[tokio::test]
