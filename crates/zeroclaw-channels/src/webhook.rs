@@ -638,9 +638,9 @@ mod tests {
 
     #[test]
     fn incoming_payload_without_thread() {
-        let json = r#"{"sender": "bob", "content": "hi"}"#;
+        let json = r#"{"sender": "zeroclaw_user", "content": "hi"}"#;
         let payload: IncomingWebhook = serde_json::from_str(json).unwrap();
-        assert_eq!(payload.sender, "bob");
+        assert_eq!(payload.sender, "zeroclaw_user");
         assert_eq!(payload.content, "hi");
         assert!(payload.thread_id.is_none());
     }
