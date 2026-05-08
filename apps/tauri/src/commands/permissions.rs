@@ -99,10 +99,7 @@ pub fn get_permissions_status() -> Vec<PermissionInfo> {
 
 /// Request a specific permission or open its System Settings pane.
 #[tauri::command]
-pub fn request_permission<R: Runtime>(
-    app: AppHandle<R>,
-    name: String,
-) -> Result<String, String> {
+pub fn request_permission<R: Runtime>(app: AppHandle<R>, name: String) -> Result<String, String> {
     let result: Result<String, String>;
 
     #[cfg(target_os = "macos")]
