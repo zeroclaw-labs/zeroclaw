@@ -10149,6 +10149,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -10247,6 +10249,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let started = Instant::now();
