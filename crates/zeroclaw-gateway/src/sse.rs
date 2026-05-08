@@ -108,13 +108,16 @@ pub async fn handle_events_history(
 /// `observability::create_observer` — including the per-call observer the
 /// agent loop creates inside `process_message` — also reach `/api/events`
 /// clients.
-pub struct BroadcastObserver {
+///
+/// Crate-private: the constructor signature is intentionally not part of any
+/// stable surface, since it is wired directly into `run_gateway`.
+pub(crate) struct BroadcastObserver {
     tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     buffer: Arc<EventBuffer>,
 }
 
 impl BroadcastObserver {
-    pub fn new(
+    pub(crate) fn new(
         tx: tokio::sync::broadcast::Sender<serde_json::Value>,
         buffer: Arc<EventBuffer>,
     ) -> Self {
@@ -264,5 +267,56 @@ mod tests {
 
         assert!(rx.try_recv().is_err(), "heartbeat should not broadcast");
         assert!(buffer.snapshot().is_empty());
+    }
+
+    /// End-to-end coverage of the wiring `run_gateway` performs at startup:
+    /// installing `BroadcastObserver` as the process-wide broadcast hook and
+    /// then building an observer through `create_observer` (the path the
+    /// agent loop takes inside `process_message`) must surface events on the
+    /// SSE broadcast channel. Codifies the load-bearing ordering so that
+    /// reordering or dropping `set_broadcast_hook` in `run_gateway` is caught
+    /// by `cargo test`, not by a silent regression in production.
+    #[test]
+    fn factory_observer_events_reach_broadcast_hook() {
+        // The broadcast hook is process-wide; serialize hook-touching tests
+        // within this test binary so they don't observe each other's state.
+        static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _guard = HOOK_TEST_LOCK.lock();
+
+        zeroclaw_runtime::observability::clear_broadcast_hook();
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let buffer = Arc::new(EventBuffer::new(16));
+        let bo: Arc<dyn Observer> = Arc::new(BroadcastObserver::new(tx, buffer.clone()));
+        zeroclaw_runtime::observability::set_broadcast_hook(bo);
+
+        // Same factory call site as `process_message` in the agent loop.
+        let cfg = zeroclaw_config::schema::ObservabilityConfig {
+            backend: "noop".into(),
+            ..Default::default()
+        };
+        let observer = zeroclaw_runtime::observability::create_observer(&cfg);
+
+        observer.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            duration: std::time::Duration::from_millis(7),
+            success: true,
+        });
+
+        let value = rx
+            .try_recv()
+            .expect("factory-built observer event must reach the SSE broadcast channel");
+        assert_eq!(value["type"], "tool_call");
+        assert_eq!(value["tool"], "shell");
+        assert_eq!(value["success"], true);
+
+        let snap = buffer.snapshot();
+        assert_eq!(
+            snap.len(),
+            1,
+            "broadcast events must also land in the buffer"
+        );
+
+        zeroclaw_runtime::observability::clear_broadcast_hook();
     }
 }

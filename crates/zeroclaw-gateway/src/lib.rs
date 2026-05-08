@@ -963,7 +963,11 @@ pub async fn run_gateway(
     );
     zeroclaw_runtime::observability::set_broadcast_hook(broadcast_layer);
 
-    let broadcast_observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::from(
+    // Bound into AppState. Not a broadcaster — the broadcaster is the
+    // `broadcast_layer` installed above as the global hook. This is the
+    // configured backend (Log/Prometheus/...) wrapped by `TeeObserver`,
+    // which tees events into the hook on every record.
+    let state_observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::from(
         zeroclaw_runtime::observability::create_observer(&config.observability),
     );
 
@@ -1009,7 +1013,7 @@ pub async fn run_gateway(
         nextcloud_talk_webhook_secret,
         wati: wati_channel,
         gmail_push: gmail_push_channel,
-        observer: broadcast_observer,
+        observer: state_observer,
         tools_registry,
         cost_tracker,
         event_tx,
