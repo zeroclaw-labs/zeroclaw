@@ -301,13 +301,8 @@ impl Tool for WebFetchTool {
             });
         }
 
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod).
 
         let url = match self.validate_url(url) {
             Ok(v) => v,
@@ -946,29 +941,6 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("read-only"));
-    }
-
-    #[tokio::test]
-    async fn blocks_rate_limited() {
-        let security = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        });
-        let tool = WebFetchTool::new(
-            security,
-            vec!["example.com".into()],
-            vec![],
-            500_000,
-            30,
-            FirecrawlConfig::default(),
-            vec![],
-        );
-        let result = tool
-            .execute(json!({"url": "https://example.com"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("rate limit"));
     }
 
     // ── Response truncation ──────────────────────────────────────

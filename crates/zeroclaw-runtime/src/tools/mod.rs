@@ -498,23 +498,26 @@ pub fn all_tools_with_runtime(
             browser_config.allowed_domains.clone(),
         )));
         // Add full browser automation tool (pluggable backend)
-        tool_arcs.push(Arc::new(BrowserTool::new_with_backend(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            BrowserTool::new_with_backend(
+                security.clone(),
+                browser_config.allowed_domains.clone(),
+                browser_config.session_name.clone(),
+                browser_config.backend.clone(),
+                browser_config.native_headless,
+                browser_config.native_webdriver_url.clone(),
+                browser_config.native_chrome_path.clone(),
+                ComputerUseConfig {
+                    endpoint: browser_config.computer_use.endpoint.clone(),
+                    api_key: browser_config.computer_use.api_key.clone(),
+                    timeout_ms: browser_config.computer_use.timeout_ms,
+                    allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
+                    window_allowlist: browser_config.computer_use.window_allowlist.clone(),
+                    max_coordinate_x: browser_config.computer_use.max_coordinate_x,
+                    max_coordinate_y: browser_config.computer_use.max_coordinate_y,
+                },
+            ),
             security.clone(),
-            browser_config.allowed_domains.clone(),
-            browser_config.session_name.clone(),
-            browser_config.backend.clone(),
-            browser_config.native_headless,
-            browser_config.native_webdriver_url.clone(),
-            browser_config.native_chrome_path.clone(),
-            ComputerUseConfig {
-                endpoint: browser_config.computer_use.endpoint.clone(),
-                api_key: browser_config.computer_use.api_key.clone(),
-                timeout_ms: browser_config.computer_use.timeout_ms,
-                allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
-                window_allowlist: browser_config.computer_use.window_allowlist.clone(),
-                max_coordinate_x: browser_config.computer_use.max_coordinate_x,
-                max_coordinate_y: browser_config.computer_use.max_coordinate_y,
-            },
         )));
     }
 
@@ -533,24 +536,30 @@ pub fn all_tools_with_runtime(
     }
 
     if http_config.enabled {
-        tool_arcs.push(Arc::new(HttpRequestTool::new(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            HttpRequestTool::new(
+                security.clone(),
+                http_config.allowed_domains.clone(),
+                http_config.max_response_size,
+                http_config.timeout_secs,
+                http_config.allow_private_hosts,
+            ),
             security.clone(),
-            http_config.allowed_domains.clone(),
-            http_config.max_response_size,
-            http_config.timeout_secs,
-            http_config.allow_private_hosts,
         )));
     }
 
     if web_fetch_config.enabled {
-        tool_arcs.push(Arc::new(WebFetchTool::new(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            WebFetchTool::new(
+                security.clone(),
+                web_fetch_config.allowed_domains.clone(),
+                web_fetch_config.blocked_domains.clone(),
+                web_fetch_config.max_response_size,
+                web_fetch_config.timeout_secs,
+                web_fetch_config.firecrawl.clone(),
+                web_fetch_config.allowed_private_hosts.clone(),
+            ),
             security.clone(),
-            web_fetch_config.allowed_domains.clone(),
-            web_fetch_config.blocked_domains.clone(),
-            web_fetch_config.max_response_size,
-            web_fetch_config.timeout_secs,
-            web_fetch_config.firecrawl.clone(),
-            web_fetch_config.allowed_private_hosts.clone(),
         )));
     }
 
