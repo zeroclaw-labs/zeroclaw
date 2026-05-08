@@ -1,32 +1,101 @@
-# Default owner for all files
-* @theonlyhennygod @JordanTheJet
+# CODEOWNERS — auto-requests reviews on matching paths.
+# Order matters: the last matching rule wins (the entire owner list is
+# replaced, not merged with earlier rules).
 
-# Important functional modules
-/src/agent/** @theonlyhennygod @JordanTheJet
-/src/providers/** @theonlyhennygod @JordanTheJet
-/src/channels/** @theonlyhennygod @JordanTheJet
-/src/tools/** @theonlyhennygod @JordanTheJet
-/src/gateway/** @theonlyhennygod @JordanTheJet
-/src/runtime/** @theonlyhennygod @JordanTheJet
-/src/memory/** @theonlyhennygod @JordanTheJet
-/Cargo.toml @theonlyhennygod @JordanTheJet
-/Cargo.lock @theonlyhennygod @JordanTheJet
+# ---------------------------------------------------------------------------
+# Default
+# ---------------------------------------------------------------------------
+* @WareWolf-MoonWall @Audacity88
 
-# Security / tests / CI-CD ownership
-/src/security/** @theonlyhennygod @JordanTheJet
-/tests/** @theonlyhennygod @JordanTheJet
-/.github/** @theonlyhennygod @JordanTheJet
-/.github/workflows/** @theonlyhennygod @JordanTheJet
-/.github/codeql/** @theonlyhennygod @JordanTheJet
-/.github/dependabot.yml @theonlyhennygod @JordanTheJet
-/SECURITY.md @theonlyhennygod @JordanTheJet
-/docs/actions-source-policy.md @theonlyhennygod @JordanTheJet
-/docs/ci-map.md @theonlyhennygod @JordanTheJet
+# ---------------------------------------------------------------------------
+# Source code (workspace crates, root crate, app binaries)
+# ---------------------------------------------------------------------------
+/crates/** @WareWolf-MoonWall @Audacity88
+/src/**    @WareWolf-MoonWall @Audacity88
+/apps/**   @WareWolf-MoonWall @Audacity88
 
-# Docs & governance
-/docs/** @theonlyhennygod @JordanTheJet
-/AGENTS.md @theonlyhennygod @JordanTheJet
-/CLAUDE.md @theonlyhennygod @JordanTheJet
-/CONTRIBUTING.md @theonlyhennygod @JordanTheJet
-/docs/pr-workflow.md @theonlyhennygod @JordanTheJet
-/docs/reviewer-playbook.md @theonlyhennygod @JordanTheJet
+# ---------------------------------------------------------------------------
+# Build, release, CI (Cargo manifests handled below)
+# ---------------------------------------------------------------------------
+/build.rs           @WareWolf-MoonWall @Audacity88
+/Justfile           @WareWolf-MoonWall @Audacity88
+/release-plz.toml   @WareWolf-MoonWall @Audacity88
+/rustfmt.toml       @WareWolf-MoonWall @Audacity88
+/clippy.toml        @WareWolf-MoonWall @Audacity88
+/taplo.toml         @WareWolf-MoonWall @Audacity88
+/flake.nix          @WareWolf-MoonWall @Audacity88
+/flake.lock         @WareWolf-MoonWall @Audacity88
+/Dockerfile*        @WareWolf-MoonWall @Audacity88
+/docker-compose.yml @WareWolf-MoonWall @Audacity88
+/install.sh         @WareWolf-MoonWall @Audacity88
+/setup.bat          @WareWolf-MoonWall @Audacity88
+/.github/**         @WareWolf-MoonWall @Audacity88
+/xtask/**           @WareWolf-MoonWall @Audacity88
+/scripts/**         @WareWolf-MoonWall @Audacity88
+/deploy-k8s/**      @WareWolf-MoonWall @Audacity88
+
+# ---------------------------------------------------------------------------
+# Tests, benches, fuzz
+# ---------------------------------------------------------------------------
+/tests/**   @WareWolf-MoonWall @Audacity88
+/benches/** @WareWolf-MoonWall @Audacity88
+/fuzz/**    @WareWolf-MoonWall @Audacity88
+
+# ---------------------------------------------------------------------------
+# Security and supply chain (SECURITY.md handled with top-level docs below)
+# ---------------------------------------------------------------------------
+/deny.toml                               @singlerider @WareWolf-MoonWall @Audacity88
+/.github/codeql/**                       @singlerider @WareWolf-MoonWall @Audacity88
+/.github/dependabot.yml                  @singlerider @WareWolf-MoonWall @Audacity88
+/src/security/**                         @singlerider @WareWolf-MoonWall @Audacity88
+/crates/zeroclaw-runtime/src/security/** @singlerider @WareWolf-MoonWall @Audacity88
+
+# ---------------------------------------------------------------------------
+# Documentation (docs tree)
+# ---------------------------------------------------------------------------
+/docs/** @singlerider @WareWolf-MoonWall @Audacity88
+
+# ---------------------------------------------------------------------------
+# Internationalization (locales, i18n; TRANSLATIONS.md handled below)
+# ---------------------------------------------------------------------------
+/locales.toml                       @singlerider @WareWolf-MoonWall @Audacity88
+/src/i18n.rs                        @singlerider @WareWolf-MoonWall @Audacity88
+/crates/zeroclaw-runtime/locales/** @singlerider @WareWolf-MoonWall @Audacity88
+/tools/fill-translations/**         @singlerider @WareWolf-MoonWall @Audacity88
+
+# ---------------------------------------------------------------------------
+# Channels (zeroclaw-channels crate)
+# ---------------------------------------------------------------------------
+/crates/zeroclaw-channels/** @singlerider @WareWolf-MoonWall @Audacity88
+
+# ---------------------------------------------------------------------------
+# Cargo manifests at any depth (root + every workspace member, plugin, app, firmware)
+# ---------------------------------------------------------------------------
+Cargo.toml @JordanTheJet @theonlyhennygod @WareWolf-MoonWall @Audacity88
+Cargo.lock @JordanTheJet @theonlyhennygod @WareWolf-MoonWall @Audacity88
+
+# ---------------------------------------------------------------------------
+# Top-level Markdown, license, and notice files
+# ---------------------------------------------------------------------------
+/README.md          @JordanTheJet @theonlyhennygod @WareWolf-MoonWall @Audacity88
+/AGENTS.md          @JordanTheJet @theonlyhennygod @WareWolf-MoonWall @Audacity88
+/CLAUDE.md          @JordanTheJet @theonlyhennygod @WareWolf-MoonWall @Audacity88
+/CONTRIBUTING.md    @JordanTheJet @theonlyhennygod @WareWolf-MoonWall @Audacity88
+/CODE_OF_CONDUCT.md @JordanTheJet @theonlyhennygod @WareWolf-MoonWall @Audacity88
+/CHANGELOG-next.md  @JordanTheJet @theonlyhennygod @WareWolf-MoonWall @Audacity88
+/NOTICE             @JordanTheJet @theonlyhennygod @WareWolf-MoonWall @Audacity88
+/LICENSE-APACHE     @JordanTheJet @theonlyhennygod @WareWolf-MoonWall @Audacity88
+/LICENSE-MIT        @JordanTheJet @theonlyhennygod @WareWolf-MoonWall @Audacity88
+
+# Top-level MDs that also belong to another section — combined owner sets
+/SECURITY.md     @singlerider @JordanTheJet @theonlyhennygod @WareWolf-MoonWall @Audacity88
+/TRANSLATIONS.md @singlerider @JordanTheJet @theonlyhennygod @WareWolf-MoonWall @Audacity88
+
+# ---------------------------------------------------------------------------
+# Specific file overrides (must be last)
+# ---------------------------------------------------------------------------
+# zeroclaw-channels Cargo.toml: channels owner + legacy stewards
+/crates/zeroclaw-channels/Cargo.toml @singlerider @JordanTheJet @theonlyhennygod @WareWolf-MoonWall @Audacity88
+
+# Matrix backend: dedicated reviewer
+/crates/zeroclaw-channels/src/matrix.rs @tidux @singlerider @WareWolf-MoonWall @Audacity88
