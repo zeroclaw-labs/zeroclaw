@@ -838,17 +838,16 @@ fn parse_sse_responses(
                     // stream character-by-character deltas.
                     "response.output_text.done" => {
                         let item_id = event.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
-                        if !text_delta_seen.contains(item_id) {
-                            if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
-                                if !text.is_empty() {
-                                    let mut chunk = StreamChunk::delta(text.to_string());
-                                    if count_tokens {
-                                        chunk = chunk.with_token_estimate();
-                                    }
-                                    if tx.send(Ok(StreamEvent::TextDelta(chunk))).await.is_err() {
-                                        return;
-                                    }
-                                }
+                        if !text_delta_seen.contains(item_id)
+                            && let Some(text) = event.get("text").and_then(|v| v.as_str())
+                            && !text.is_empty()
+                        {
+                            let mut chunk = StreamChunk::delta(text.to_string());
+                            if count_tokens {
+                                chunk = chunk.with_token_estimate();
+                            }
+                            if tx.send(Ok(StreamEvent::TextDelta(chunk))).await.is_err() {
+                                return;
                             }
                         }
                     }
@@ -861,36 +860,32 @@ fn parse_sse_responses(
                         if let Some(item_id) = event.get("item_id").and_then(|v| v.as_str()) {
                             reasoning_delta_seen.insert(item_id.to_string());
                         }
-                        if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                            if !delta.is_empty() {
-                                if tx
-                                    .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
-                                        delta.to_string(),
-                                    ))))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
+                        if let Some(delta) = event.get("delta").and_then(|v| v.as_str())
+                            && !delta.is_empty()
+                            && tx
+                                .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
+                                    delta.to_string(),
+                                ))))
+                                .await
+                                .is_err()
+                        {
+                            return;
                         }
                     }
                     // Fallback for non-streaming reasoning output.
                     "response.reasoning_text.done" | "response.reasoning.done" => {
                         let item_id = event.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
-                        if !reasoning_delta_seen.contains(item_id) {
-                            if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
-                                if !text.is_empty()
-                                    && tx
-                                        .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
-                                            text.to_string(),
-                                        ))))
-                                        .await
-                                        .is_err()
-                                {
-                                    return;
-                                }
-                            }
+                        if !reasoning_delta_seen.contains(item_id)
+                            && let Some(text) = event.get("text").and_then(|v| v.as_str())
+                            && !text.is_empty()
+                            && tx
+                                .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
+                                    text.to_string(),
+                                ))))
+                                .await
+                                .is_err()
+                        {
+                            return;
                         }
                     }
                     "response.output_item.added" => {
