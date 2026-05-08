@@ -392,14 +392,18 @@ impl Channel for WuKongIMChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let content = match message.content.as_str() {
+            "ERR:context_window_exceeded" => "⚠️ 模型服务暂时遇到问题，请稍后重试。",
+            other => other,
+        };
         tracing::debug!(
             "WuKongIM: sending message to {}: {}",
             message.recipient,
-            message.content
+            content
         );
         let payload_obj = serde_json::json!({
             "type": 1,
-            "content": message.content,
+            "content": content,
         });
 
         let payload_json = serde_json::to_string(&payload_obj)?;

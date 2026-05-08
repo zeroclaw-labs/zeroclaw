@@ -3727,15 +3727,19 @@ async fn process_channel_message(
                 }
             } else if is_context_window_overflow_error(&e) {
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
-                let error_text = if compacted {
-                    "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
-                } else {
-                    "⚠️ Context window exceeded for this conversation. Please resend your last message."
-                };
+                let error_text = "ERR:context_window_exceeded";
                 eprintln!(
                     "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
                     started_at.elapsed().as_millis(),
                     compacted
+                );
+                tracing::warn!(
+                    provider = route.provider.as_str(),
+                    model = route.model.as_str(),
+                    sender = %msg.sender,
+                    history_compacted = compacted,
+                    error = %e,
+                    "Context window exceeded — response detail and token counts above"
                 );
                 runtime_trace::record_event(
                     "channel_message_error",
