@@ -489,18 +489,19 @@ mod tests {
         let add_tool = CronAddTool::new(cfg.clone(), security.clone());
         let update_tool = CronUpdateTool::new(cfg, security);
 
-        let add_channels =
-            &add_tool.parameters_schema()["properties"]["delivery"]["properties"]["channel"]
-                ["enum"];
+        let add_channels = &add_tool.parameters_schema()["properties"]["delivery"]["properties"]["channel"]
+            ["enum"];
         let update_channels = &update_tool.parameters_schema()["properties"]["patch"]["properties"]
             ["delivery"]["properties"]["channel"]["enum"];
 
         assert_eq!(add_channels, update_channels);
-        assert!(add_channels
-            .as_array()
-            .expect("delivery.channel must have an enum")
-            .iter()
-            .any(|value| value == "dingtalk"));
+        assert!(
+            add_channels
+                .as_array()
+                .expect("delivery.channel must have an enum")
+                .iter()
+                .any(|value| value == "dingtalk")
+        );
     }
 
     #[tokio::test]
