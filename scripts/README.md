@@ -35,6 +35,7 @@ This keeps deployment separate from the existing `/home/quant/quanclaw` networki
 | `/home/quant/quantclaw_rust_app/.env` | Provider credentials |
 | `/home/quant/.quantclaw/config.toml` | Rendered runtime config |
 | `/etc/systemd/system/quantclaw.service` | Boot-time service |
+| `/swapfile_quantclaw` | Bootstrap-managed swap file for low-memory installs |
 
 The gateway binds to `0.0.0.0:42617` by default. The webhook example port is `42618` to stay clear of `8080`.
 
@@ -76,15 +77,18 @@ The bootstrap script will:
 
 1. Remove failed archive-install leftovers from `/tmp`
 2. Clear the old installer cache under `/home/quant/.cache/quantclaw-install`
-3. Clone the repository into `/home/quant/quantclaw_rust_app/repo` if it does not exist
-4. Otherwise fetch and fast-forward `master`
-5. Run `scripts/install-pi.sh` from the checked-out repository
+3. Create and enable `/swapfile_quantclaw` if swap is missing
+4. Install system packages required for Rust builds
+5. Install Rust `1.87.0` with a minimal profile and low-memory unpack settings when needed
+6. Clone the repository into `/home/quant/quantclaw_rust_app/repo` if it does not exist
+7. Otherwise fetch and fast-forward `master`
+8. Run `scripts/install-pi.sh` from the checked-out repository
 
 ### 4. What the installer does
 
 `install-pi.sh` will:
 
-1. Build `quantclaw` from the repository with `cargo build --release --features hardware,peripheral-rpi`
+1. Build `quantclaw` from the repository root with `cargo build --release --features hardware,peripheral-rpi`
 2. Install the binary to `/home/quant/quantclaw_rust_app/quantclaw`
 3. Create `/home/quant/quantclaw_rust_app/.env` if missing
 4. Render `rpi-config.toml` to `/home/quant/.quantclaw/config.toml`
@@ -107,6 +111,13 @@ If an incomplete repo directory already exists and you want a clean re-clone:
 
 ```bash
 rm -rf /home/quant/quantclaw_rust_app/repo
+```
+
+If you also want to reset the bootstrap-managed swap file:
+
+```bash
+sudo swapoff /swapfile_quantclaw || true
+sudo rm -f /swapfile_quantclaw
 ```
 
 ---
@@ -217,6 +228,16 @@ Check whether the Pi can access the Gitea repository and whether credentials are
 git ls-remote https://gitea.tangledup-ai.com/Therianclouds/QuantClaw_Rust.git
 ```
 
+### Rust install failed on low memory
+
+The bootstrap script automatically provisions swap and installs Rust `1.87.0` with a minimal profile. If you need to retry manually:
+
+```bash
+export RUSTUP_IO_THREADS=1
+export RUSTUP_UNPACK_RAM=67108864
+/tmp/bootstrap-pi-git.sh
+```
+
 ### GPIO permissions
 
 If hardware access matters, confirm the deploy user is in the `gpio` group:
@@ -237,3 +258,4 @@ groups quant
 - Runtime config path: `/home/quant/.quantclaw/config.toml`
 - App directory: `/home/quant/quantclaw_rust_app`
 - Repo directory: `/home/quant/quantclaw_rust_app/repo`
+- Managed swap file: `/swapfile_quantclaw`

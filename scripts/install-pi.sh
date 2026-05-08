@@ -61,6 +61,32 @@ locate_first() {
   find "${search_root}" -type f -path "${pattern}" | head -n 1
 }
 
+resolve_source_root() {
+  local search_root="$1"
+  local manifest=""
+
+  if [[ -f "${search_root}/Cargo.toml" ]]; then
+    echo "${search_root}"
+    return
+  fi
+
+  manifest="$(grep -Rsl '^\[workspace\]' "${search_root}" --include Cargo.toml | head -n 1 || true)"
+  if [[ -n "${manifest}" ]]; then
+    dirname "${manifest}"
+    return
+  fi
+
+  manifest="$(grep -Rsl '^name = "quantspeed"' "${search_root}" --include Cargo.toml | head -n 1 || true)"
+  if [[ -n "${manifest}" ]]; then
+    dirname "${manifest}"
+    return
+  fi
+
+  manifest="$(locate_first "${search_root}" "*/Cargo.toml")"
+  [[ -n "${manifest}" ]] || die "Input contains neither a quantclaw binary nor a Cargo.toml source tree"
+  dirname "${manifest}"
+}
+
 render_template() {
   local source="$1"
   local destination="$2"
@@ -136,9 +162,7 @@ RULES_SOURCE="$(locate_first "${SEARCH_ROOT}" "*/scripts/99-act-led.rules" || tr
 [[ -n "${CONFIG_TEMPLATE}" ]] || die "Input does not contain scripts/rpi-config.toml"
 
 if [[ -z "${BINARY_SOURCE}" ]]; then
-  CARGO_TOML="$(locate_first "${SEARCH_ROOT}" "*/Cargo.toml")"
-  [[ -n "${CARGO_TOML}" ]] || die "Input contains neither a quantclaw binary nor a Cargo.toml source tree"
-  SOURCE_ROOT="$(dirname "${CARGO_TOML}")"
+  SOURCE_ROOT="$(resolve_source_root "${SEARCH_ROOT}")"
   build_from_source "${SOURCE_ROOT}"
   BINARY_SOURCE="${SOURCE_ROOT}/target/release/quantclaw"
 fi
