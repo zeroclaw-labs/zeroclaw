@@ -898,6 +898,14 @@ pub fn skills_to_prompt_with_mode(
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
+
+        // 新增：添加 skill_directory 元素
+        if let Some(ref location) = skill.location {
+            if let Some(skill_dir) = location.parent() {
+                write_xml_text_element(&mut prompt, 4, "skill_directory", &skill_dir.display().to_string());
+            }
+        }
+
         let location = render_skill_location(
             skill,
             workspace_dir,
@@ -921,6 +929,27 @@ pub fn skills_to_prompt_with_mode(
                 write_xml_text_element(&mut prompt, 6, "instruction", instruction);
             }
             let _ = writeln!(prompt, "    </instructions>");
+
+            // 为纯指令型 skills 添加使用指导
+            if skill.tools.is_empty() {
+                if let Some(ref location) = skill.location {
+                    if let Some(skill_dir) = location.parent() {
+                        let _ = writeln!(prompt, "    <usage>");
+                        let _ = writeln!(
+                            prompt,
+                            "      When executing shell commands for this skill, \
+                             always use the working_dir parameter with the skill_directory value."
+                        );
+                        let _ = writeln!(
+                            prompt,
+                            "      Example: {{\"command\":\"bash scripts/make.sh run\",\
+                             \"working_dir\":\"{}\"}}",
+                            skill_dir.display()
+                        );
+                        let _ = writeln!(prompt, "    </usage>");
+                    }
+                }
+            }
         }
 
         if !skill.tools.is_empty() {

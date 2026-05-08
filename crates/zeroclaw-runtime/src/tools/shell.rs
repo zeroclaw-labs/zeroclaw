@@ -4,6 +4,7 @@ use crate::security::traits::Sandbox;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -125,6 +126,11 @@ impl Tool for ShellTool {
                     "type": "string",
                     "description": "The shell command to execute"
                 },
+                "working_dir": {
+                    "type": "string",
+                    "description": "Optional working directory for command execution. Use skill's <skill_directory> when executing skill instructions with relative paths. Defaults to workspace root if not provided.",
+                    "default": null
+                },
                 "approved": {
                     "type": "boolean",
                     "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
@@ -145,6 +151,35 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // 解析可选的 working_dir 参数
+        let working_dir = args
+            .get("working_dir")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+
+        // 确定最终的工作目录
+        let exec_dir = if let Some(dir) = working_dir {
+            // 安全验证：working_dir 必须在 workspace 或 skills 目录内
+            if !dir.starts_with(&self.security.workspace_dir) {
+                // 检查是否在 skills 目录（workspace_dir/skills/）
+                let skills_dir = self.security.workspace_dir.join("skills");
+                if !dir.starts_with(&skills_dir) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "working_dir must be within workspace directory: {}. Provided: {}",
+                            self.security.workspace_dir.display(),
+                            dir.display()
+                        )),
+                    });
+                }
+            }
+            dir
+        } else {
+            self.security.workspace_dir.clone()
+        };
+
         match self.security.validate_command_execution(command, approved) {
             Ok(_) => {}
             Err(reason) => {
@@ -161,7 +196,7 @@ impl Tool for ShellTool {
         // (CWE-200), then re-add only safe, functional variables.
         let mut cmd = match self
             .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
+            .build_shell_command(command, &exec_dir)  // 使用 exec_dir 替换 workspace_dir
         {
             Ok(cmd) => cmd,
             Err(e) => {
