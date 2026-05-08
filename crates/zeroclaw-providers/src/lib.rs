@@ -744,10 +744,14 @@ pub struct ProviderRuntimeOptions {
     /// by the `ollama` factory arm. `None` falls back to the framework
     /// default constant.
     pub ollama_num_predict: Option<i32>,
-    /// Override for the default temperature stored in the Ollama provider's
-    /// tuning struct. Only consumed by the `ollama` factory arm. `None`
-    /// falls back to the framework default constant. The per-call
-    /// temperature passed through `Provider::chat_with_system` still wins.
+    /// Override the temperature sent on every Ollama `/api/chat` request.
+    /// Only consumed by the `ollama` factory arm. When `None` (default), the
+    /// per-call temperature passed through `Provider::chat_with_system`
+    /// wins — this field is preserved as `None` straight through to
+    /// `OllamaTuning::temperature_override`, and the request builder uses
+    /// `temperature_override.unwrap_or(temperature)`. When `Some(v)`, every
+    /// request to this Ollama provider uses `v` regardless of the per-call
+    /// argument. There is no framework-constant fallback for this field.
     pub ollama_temperature_override: Option<f64>,
 }
 
