@@ -47,6 +47,14 @@ credentials.json
 # Coverage artifacts
 lcov.info
 
+# Local deployment artifacts
+dist/
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+erro.txt
+
 # IDE's stuff
 .idea
 

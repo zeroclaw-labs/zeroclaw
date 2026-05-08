@@ -1,9 +1,9 @@
 # QuantClaw — Raspberry Pi production configuration
 #
-# Copy this to ~/.quantclaw/config.toml on the Pi.
-# deploy-rpi.sh does this automatically.
+# Render and copy this to ~/.quantclaw/config.toml on the Pi.
+# install-pi.sh and deploy-rpi.sh both do this automatically.
 #
-# API key is loaded from ~/.quantclaw/.env (EnvironmentFile in systemd).
+# API key is loaded from __RPI_DIR__/.env (EnvironmentFile in systemd).
 # Set it there as: ANTHROPIC_API_KEY=your-key-here
 # Or set api_key directly below (not recommended for version control).
 
@@ -384,7 +384,7 @@ cli = true
 message_timeout_secs = 300
 
 [channels_config.webhook]
-port = 8080
+port = __CHANNEL_WEBHOOK_PORT__
 secret = "mytoken123"
 
 [channels_config.ack_reaction]
@@ -425,8 +425,8 @@ tls = false
 provider = "none"
 
 [gateway]
-port = 8080
-host = "0.0.0.0"
+port = __GATEWAY_PORT__
+host = "__GATEWAY_HOST__"
 require_pairing = false
 trusted_ips = ["0.0.0.0/0"]
 allow_public_bind = true

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy-rpi.sh — cross-compile QuantClaw for Raspberry Pi and deploy via SSH.
+# deploy-rpi.sh — auxiliary helper for cross-compiling QuantClaw and pushing it to a Raspberry Pi.
 #
 # Cross-compilation (pick ONE — the script auto-detects):
 #
@@ -12,22 +12,26 @@
 #     cargo install cross
 #
 # Usage:
-#   RPI_HOST=raspberrypi.local RPI_USER=pi ./scripts/deploy-rpi.sh
+#   RPI_HOST=raspberrypi.local RPI_USER=quant ./scripts/deploy-rpi.sh
 #
 # Optional env vars:
 #   RPI_HOST        — hostname or IP of the Pi        (default: raspberrypi.local)
-#   RPI_USER        — SSH user on the Pi              (default: pi)
+#   RPI_USER        — SSH user on the Pi              (default: quant)
 #   RPI_PORT        — SSH port                        (default: 22)
-#   RPI_DIR         — remote deployment dir           (default: /home/$RPI_USER/quantclaw)
+#   RPI_DIR         — remote deployment dir           (default: /home/$RPI_USER/quantclaw_rust_app)
 #   RPI_PASS        — SSH password (uses sshpass)     (default: prompt interactively)
 #   CROSS_TOOL      — force "zigbuild" or "cross"     (default: auto-detect)
 
 set -euo pipefail
 
 RPI_HOST="${RPI_HOST:-raspberrypi.local}"
-RPI_USER="${RPI_USER:-pi}"
+RPI_USER="${RPI_USER:-quant}"
 RPI_PORT="${RPI_PORT:-22}"
-RPI_DIR="${RPI_DIR:-/home/${RPI_USER}/quantclaw}"
+RPI_DIR="${RPI_DIR:-/home/${RPI_USER}/quantclaw_rust_app}"
+RPI_HOME="/home/${RPI_USER}"
+GATEWAY_HOST="${GATEWAY_HOST:-0.0.0.0}"
+GATEWAY_PORT="${GATEWAY_PORT:-42617}"
+CHANNEL_WEBHOOK_PORT="${CHANNEL_WEBHOOK_PORT:-42618}"
 TARGET="aarch64-unknown-linux-gnu"
 FEATURES="hardware,peripheral-rpi"
 BINARY="target/${TARGET}/release/quantclaw"
@@ -51,6 +55,7 @@ fi
 echo "==> Building QuantClaw for Raspberry Pi (${TARGET})"
 echo "    Features: ${FEATURES}"
 echo "    Target host: ${RPI_USER}@${RPI_HOST}:${RPI_PORT}"
+echo "    Gateway bind: http://${GATEWAY_HOST}:${GATEWAY_PORT}"
 echo ""
 
 # ── 1. Cross-compile — auto-detect best available tool ───────────────────────
@@ -160,15 +165,23 @@ fi
 
 # ── 5. Deploy config ─────────────────────────────────────────────────────────
 CONFIG_DEST="/home/${RPI_USER}/.quantclaw/config.toml"
+TMP_CONFIG="$(mktemp)"
 echo ""
 echo "==> Deploying config to ${CONFIG_DEST}"
 # shellcheck disable=SC2029
-${SSH_CMD} ${SSH_OPTS} "${RPI_USER}@${RPI_HOST}" "mkdir -p /home/${RPI_USER}/.quantclaw"
+${SSH_CMD} ${SSH_OPTS} "${RPI_USER}@${RPI_HOST}" "mkdir -p ${RPI_HOME}/.quantclaw"
 # Preserve existing api_key from the remote config if present.
 # shellcheck disable=SC2029
 EXISTING_API_KEY=$(${SSH_CMD} ${SSH_OPTS} "${RPI_USER}@${RPI_HOST}" \
   "grep -m1 '^api_key' ${CONFIG_DEST} 2>/dev/null || true")
-${SCP_CMD} ${SCP_OPTS} "scripts/rpi-config.toml" "${RPI_USER}@${RPI_HOST}:${CONFIG_DEST}"
+sed \
+  -e "s|__RPI_DIR__|${RPI_DIR}|g" \
+  -e "s|__GATEWAY_HOST__|${GATEWAY_HOST}|g" \
+  -e "s|__GATEWAY_PORT__|${GATEWAY_PORT}|g" \
+  -e "s|__CHANNEL_WEBHOOK_PORT__|${CHANNEL_WEBHOOK_PORT}|g" \
+  "scripts/rpi-config.toml" > "${TMP_CONFIG}"
+trap 'rm -f "${TMP_CONFIG}" "${TMP_SERVICE:-}"' EXIT
+${SCP_CMD} ${SCP_OPTS} "${TMP_CONFIG}" "${RPI_USER}@${RPI_HOST}:${CONFIG_DEST}"
 if [[ -n "${EXISTING_API_KEY}" ]]; then
   echo "    Restoring existing api_key from previous config"
   # shellcheck disable=SC2029
@@ -178,9 +191,17 @@ fi
 
 # ── 6. Deploy and enable systemd service ─────────────────────────────────────
 SERVICE_DEST="/etc/systemd/system/quantclaw.service"
+TMP_SERVICE="$(mktemp)"
 echo ""
 echo "==> Installing systemd service (requires sudo on the Pi)"
-${SCP_CMD} ${SCP_OPTS} "scripts/quantclaw.service" "${RPI_USER}@${RPI_HOST}:/tmp/quantclaw.service"
+sed \
+  -e "s|__RPI_USER__|${RPI_USER}|g" \
+  -e "s|__RPI_DIR__|${RPI_DIR}|g" \
+  -e "s|__RPI_HOME__|${RPI_HOME}|g" \
+  -e "s|__GATEWAY_HOST__|${GATEWAY_HOST}|g" \
+  -e "s|__GATEWAY_PORT__|${GATEWAY_PORT}|g" \
+  "scripts/quantclaw.service" > "${TMP_SERVICE}"
+${SCP_CMD} ${SCP_OPTS} "${TMP_SERVICE}" "${RPI_USER}@${RPI_HOST}:/tmp/quantclaw.service"
 # shellcheck disable=SC2029
 ${SSH_CMD} ${SSH_OPTS} "${RPI_USER}@${RPI_HOST}" \
   "sudo mv /tmp/quantclaw.service ${SERVICE_DEST} && \
@@ -216,7 +237,7 @@ ${SSH_CMD} ${SSH_OPTS} "${RPI_USER}@${RPI_HOST}" \
 echo ""
 echo "==> Deployment complete!"
 echo ""
-echo "    QuantClaw is running at http://${RPI_HOST}:8080"
+echo "    QuantClaw is running at http://${RPI_HOST}:${GATEWAY_PORT}"
 echo "    POST /api/chat  — chat with the agent"
 echo "    GET  /health    — health check"
 echo ""

@@ -6,17 +6,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
+User=__RPI_USER__
 SupplementaryGroups=gpio spi i2c
-WorkingDirectory=/home/pi/quantclaw
-ExecStart=/home/pi/quantclaw/quantclaw gateway --host 0.0.0.0 --port 8080
+WorkingDirectory=__RPI_DIR__
+ExecStart=__RPI_DIR__/quantclaw gateway --host __GATEWAY_HOST__ --port __GATEWAY_PORT__
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=/home/pi/quantclaw/.env
+EnvironmentFile=__RPI_DIR__/.env
 Environment=RUST_LOG=info
 
-# Expand ~ in config path
-Environment=HOME=/home/pi
+# HOME is injected by the install/render script to match the selected SSH user.
+Environment=HOME=__RPI_HOME__
 
 [Install]
 WantedBy=multi-user.target
