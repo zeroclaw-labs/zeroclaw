@@ -327,28 +327,45 @@ interactive_pick() {
 # ── Main ───────────────────────────────────────────────────────────
 
 main() {
-  cmd="${1:-}"
-  case "$cmd" in
-    -h|--help)
-      usage
-      ;;
-  esac
+  # Parse all flags first regardless of position, then dispatch on the
+  # action (--list / --all / explicit job / interactive). The previous
+  # implementation dispatched on $1 immediately, so flags trailing
+  # `--all` (e.g. `--all --no-allowlist`) were silently ignored — the
+  # documented opt-out command-line worked one way and not the other.
+  action=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        usage
+        ;;
+      --no-prefetch)
+        PREFETCH=false
+        ;;
+      --no-allowlist)
+        NO_ALLOWLIST=true
+        ;;
+      -l|--list|-a|--all)
+        [ -z "$action" ] && action="$1"
+        ;;
+      -*)
+        die "unknown flag: $1"
+        ;;
+      *)
+        if [ -z "$action" ]; then
+          action="$1"
+        else
+          die "extra positional argument: $1 (already have action: $action)"
+        fi
+        ;;
+    esac
+    shift
+  done
 
   ensure_setup
 
-  case "$cmd" in
+  case "$action" in
     -l|--list)
       list_jobs
-      ;;
-    --no-prefetch)
-      PREFETCH=false
-      shift
-      main "$@"
-      ;;
-    --no-allowlist)
-      NO_ALLOWLIST=true
-      shift
-      main "$@"
       ;;
     -a|--all)
       prefetch_actions
@@ -359,7 +376,7 @@ main() {
       interactive_pick
       ;;
     *)
-      pair=$(resolve_job "$cmd")
+      pair=$(resolve_job "$action")
       prefetch_actions
       run_one "$pair"
       ;;
