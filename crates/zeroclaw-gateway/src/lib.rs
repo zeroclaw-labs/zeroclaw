@@ -953,13 +953,19 @@ pub async fn run_gateway(
         hooks.fire_gateway_start(host, actual_port).await;
     }
 
-    // Wrap observer with broadcast capability for SSE
-    let broadcast_observer: Arc<dyn zeroclaw_runtime::observability::Observer> =
-        Arc::new(sse::BroadcastObserver::new(
-            zeroclaw_runtime::observability::create_observer(&config.observability),
-            event_tx.clone(),
-            event_buffer.clone(),
-        ));
+    // Install the SSE broadcast hook before building any observer so that
+    // events emitted by the agent's per-call observer (built inside
+    // `process_message`) also reach `/api/events`. The state-level observer
+    // is just the configured backend — `TeeObserver` (created by
+    // `create_observer`) tees its events into the hook automatically.
+    let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(
+        sse::BroadcastObserver::new(event_tx.clone(), event_buffer.clone()),
+    );
+    zeroclaw_runtime::observability::set_broadcast_hook(broadcast_layer);
+
+    let broadcast_observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::from(
+        zeroclaw_runtime::observability::create_observer(&config.observability),
+    );
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -1391,20 +1397,12 @@ fn prometheus_disabled_hint() -> String {
 fn prometheus_observer_from_state(
     observer: &dyn zeroclaw_runtime::observability::Observer,
 ) -> Option<&zeroclaw_runtime::observability::PrometheusObserver> {
+    // `TeeObserver::as_any` returns the primary observer, so a single direct
+    // downcast finds the PrometheusObserver whether the state observer is the
+    // raw backend or wrapped by the factory tee.
     observer
         .as_any()
         .downcast_ref::<zeroclaw_runtime::observability::PrometheusObserver>()
-        .or_else(|| {
-            observer
-                .as_any()
-                .downcast_ref::<sse::BroadcastObserver>()
-                .and_then(|broadcast| {
-                    broadcast
-                        .inner()
-                        .as_any()
-                        .downcast_ref::<zeroclaw_runtime::observability::PrometheusObserver>()
-                })
-        })
 }
 
 /// GET /metrics — Prometheus text exposition format
@@ -2862,18 +2860,13 @@ mod tests {
     #[tokio::test]
     async fn metrics_endpoint_renders_prometheus_output() {
         let event_tx = tokio::sync::broadcast::channel(16).0;
-        let event_buffer = Arc::new(sse::EventBuffer::new(16));
-        let wrapped = sse::BroadcastObserver::new(
-            Box::new(zeroclaw_runtime::observability::PrometheusObserver::new()),
-            event_tx.clone(),
-            event_buffer,
-        );
+        let prom = zeroclaw_runtime::observability::PrometheusObserver::new();
         zeroclaw_runtime::observability::Observer::record_event(
-            &wrapped,
+            &prom,
             &zeroclaw_runtime::observability::ObserverEvent::HeartbeatTick,
         );
 
-        let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(wrapped);
+        let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(prom);
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider: Arc::new(MockProvider::default()),

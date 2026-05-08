@@ -101,33 +101,33 @@ pub async fn handle_events_history(
     Json(serde_json::json!({ "events": events })).into_response()
 }
 
-/// Broadcast observer that forwards events to the SSE broadcast channel.
+/// Broadcast observer that fans events out to SSE subscribers.
+///
+/// Installed as the process-wide broadcast hook by [`crate::run_gateway`] so
+/// that events recorded by *any* observer built through
+/// `observability::create_observer` — including the per-call observer the
+/// agent loop creates inside `process_message` — also reach `/api/events`
+/// clients.
 pub struct BroadcastObserver {
-    inner: Box<dyn zeroclaw_runtime::observability::Observer>,
     tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     buffer: Arc<EventBuffer>,
 }
 
 impl BroadcastObserver {
     pub fn new(
-        inner: Box<dyn zeroclaw_runtime::observability::Observer>,
         tx: tokio::sync::broadcast::Sender<serde_json::Value>,
         buffer: Arc<EventBuffer>,
     ) -> Self {
-        Self { inner, tx, buffer }
-    }
-
-    pub fn inner(&self) -> &dyn zeroclaw_runtime::observability::Observer {
-        self.inner.as_ref()
+        Self { tx, buffer }
     }
 }
 
 impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
     fn record_event(&self, event: &zeroclaw_runtime::observability::ObserverEvent) {
-        // Forward to inner observer
-        self.inner.record_event(event);
-
-        // Broadcast to SSE subscribers
+        // Recording into the primary observer (logs / Prometheus) is the
+        // responsibility of whoever built the event source; `TeeObserver`
+        // takes care of that fan-out. Here we only translate to JSON and
+        // ship to SSE subscribers.
         let json = match event {
             zeroclaw_runtime::observability::ObserverEvent::LlmRequest {
                 provider, model, ..
@@ -193,12 +193,8 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
         let _ = self.tx.send(json);
     }
 
-    fn record_metric(&self, metric: &zeroclaw_runtime::observability::traits::ObserverMetric) {
-        self.inner.record_metric(metric);
-    }
-
-    fn flush(&self) {
-        self.inner.flush();
+    fn record_metric(&self, _metric: &zeroclaw_runtime::observability::traits::ObserverMetric) {
+        // Metrics are not broadcast over SSE; the primary observer records them.
     }
 
     fn name(&self) -> &str {
@@ -207,5 +203,66 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_runtime::observability::{Observer, ObserverEvent};
+
+    fn make_broadcast() -> (
+        Arc<BroadcastObserver>,
+        tokio::sync::broadcast::Receiver<serde_json::Value>,
+        Arc<EventBuffer>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let buffer = Arc::new(EventBuffer::new(16));
+        let obs = Arc::new(BroadcastObserver::new(tx, buffer.clone()));
+        (obs, rx, buffer)
+    }
+
+    #[test]
+    fn tool_call_event_is_broadcast_and_buffered() {
+        let (obs, mut rx, buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            duration: std::time::Duration::from_millis(42),
+            success: true,
+        });
+
+        let value = rx.try_recv().expect("event should be broadcast");
+        assert_eq!(value["type"], "tool_call");
+        assert_eq!(value["tool"], "shell");
+        assert_eq!(value["success"], true);
+
+        let snap = buffer.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0]["type"], "tool_call");
+    }
+
+    #[test]
+    fn tool_call_start_event_is_broadcast() {
+        let (obs, mut rx, _buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::ToolCallStart {
+            tool: "mcp_filesystem__read_file".into(),
+            arguments: None,
+        });
+
+        let value = rx.try_recv().expect("event should be broadcast");
+        assert_eq!(value["type"], "tool_call_start");
+        assert_eq!(value["tool"], "mcp_filesystem__read_file");
+    }
+
+    #[test]
+    fn unmapped_events_are_skipped() {
+        let (obs, mut rx, buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::HeartbeatTick);
+
+        assert!(rx.try_recv().is_err(), "heartbeat should not broadcast");
+        assert!(buffer.snapshot().is_empty());
     }
 }
