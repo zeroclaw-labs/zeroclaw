@@ -849,6 +849,7 @@ fn parse_sse_responses(
                             if tx.send(Ok(StreamEvent::TextDelta(chunk))).await.is_err() {
                                 return;
                             }
+                            text_delta_seen.insert(item_id.to_string());
                         }
                     }
                     // content_part.done duplicates output_text.done for text parts; discard.
@@ -878,14 +879,17 @@ fn parse_sse_responses(
                         if !reasoning_delta_seen.contains(item_id)
                             && let Some(text) = event.get("text").and_then(|v| v.as_str())
                             && !text.is_empty()
-                            && tx
+                        {
+                            if tx
                                 .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
                                     text.to_string(),
                                 ))))
                                 .await
                                 .is_err()
-                        {
-                            return;
+                            {
+                                return;
+                            }
+                            reasoning_delta_seen.insert(item_id.to_string());
                         }
                     }
                     "response.output_item.added" => {

@@ -153,39 +153,12 @@ impl Tool for FileReadTool {
             }
         };
 
-        // /dev/null (NUL on Windows) is a non-data sink — unconditionally allowed,
-        // same as in resolve_candidate. Skip the workspace boundary check.
-        let is_null_device = {
-            #[cfg(not(target_os = "windows"))]
-            { resolved_path == std::path::Path::new("/dev/null") }
-            #[cfg(target_os = "windows")]
-            {
-                let s = resolved_path.to_str().unwrap_or("").to_ascii_lowercase();
-                s == "nul" || s == r"\\.\nul"
-            }
-        };
-
-        if !is_null_device {
-            let workspace_canonical = self
-                .security
-                .workspace_dir
-                .canonicalize()
-                .unwrap_or_else(|_| self.security.workspace_dir.clone());
-
-            let in_workspace = resolved_path.starts_with(&workspace_canonical);
-            let in_allowed_root = !in_workspace
-                && self.security.allowed_roots.iter().any(|root| {
-                    let rc = root.canonicalize().unwrap_or_else(|_| root.clone());
-                    resolved_path.starts_with(&rc)
-                });
-
-            if !in_workspace && !in_allowed_root {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Path escapes workspace directory: {path}")),
-                });
-            }
+        if !self.security.is_resolved_path_allowed(&resolved_path) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Path escapes workspace directory: {path}")),
+            });
         }
 
         // Check file size AFTER canonicalization to prevent TOCTOU symlink bypass

@@ -2294,6 +2294,40 @@ mod tests {
         );
     }
 
+    /// When a per-session cwd overrides the sandbox root, workspace files must
+    /// stay readable. Regression guard for the `allowed_roots.push` fix in
+    /// `from_config_with_session_cwd` (issue #6516).
+    #[test]
+    fn session_cwd_keeps_workspace_in_allowed_roots() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_session_cwd_workspace");
+        let session = std::env::temp_dir().join("zeroclaw_test_session_cwd_session");
+        let _ = std::fs::create_dir_all(&workspace);
+        let _ = std::fs::create_dir_all(&session);
+
+        let skill_file = workspace.join("SKILL.md");
+        let _ = std::fs::write(&skill_file, "body");
+        // is_resolved_path_allowed expects a canonicalized path (symlinks resolved).
+        let skill_resolved = std::fs::canonicalize(&skill_file).unwrap_or(skill_file);
+
+        let autonomy = zeroclaw_config::schema::AutonomyConfig::default();
+
+        // Policy WITH the fix: workspace pushed into allowed_roots.
+        let mut policy = SecurityPolicy::from_config(&autonomy, &session);
+        policy.allowed_roots.push(workspace.clone());
+        assert!(
+            policy.is_resolved_path_allowed(&skill_resolved),
+            "workspace skills must remain readable when session_cwd differs"
+        );
+
+        // Without the push the same path must be denied, confirming the push
+        // is the load-bearing fix rather than an incidental side-effect.
+        let policy_no_push = SecurityPolicy::from_config(&autonomy, &session);
+        assert!(
+            !policy_no_push.is_resolved_path_allowed(&skill_resolved),
+            "without allowed_roots.push, workspace files must be outside the sandbox"
+        );
+    }
+
     #[test]
     fn seed_history_prepends_system_and_skips_system_from_seed() {
         let provider = Box::new(MockProvider {
