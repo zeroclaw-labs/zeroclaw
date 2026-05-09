@@ -16,6 +16,7 @@
 //! Channel-scoped variants (e.g. `telegram_user_msg_*`, `discord_*`) are
 //! **not** filtered — they use different prefixes and are handled separately.
 
+pub mod agent_scoped;
 pub mod audit;
 pub mod backend;
 pub mod chunker;
@@ -42,6 +43,7 @@ pub mod sqlite;
 pub mod traits;
 pub mod vector;
 
+pub use agent_scoped::AgentScopedMemory;
 #[allow(unused_imports)]
 pub use audit::AuditedMemory;
 #[allow(unused_imports)]
