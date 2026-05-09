@@ -293,12 +293,62 @@ impl ImageGenTool {
         let mut workflow: serde_json::Value = serde_json::from_str(&template_content)
             .context("Failed to parse ComfyUI workflow template as JSON")?;
 
+        // Detect if the user accidentally exported the non-API format.
+        if workflow.get("nodes").is_some() && workflow.get("last_node_id").is_some() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "Invalid workflow template format. It looks like you used 'Save' instead of 'Save (API format)'. \
+                     Please enable Dev mode in ComfyUI settings and use 'Save (API format)' to export your workflow.".into()
+                ),
+            });
+        }
+
         // ── Inject prompt ──────────────────────────────────────────
         let node_id = &self.config.runpod_prompt_node_id;
         let field = &self.config.runpod_prompt_node_field;
+        let node_id_str = node_id.as_str();
 
-        if let Some(inputs) = workflow.get_mut(node_id).and_then(|n| n.get_mut("inputs")) {
-            inputs[field] = json!(prompt);
+        // Find the node to inject the prompt into. It could be at the root, or nested
+        // inside common RunPod wrapper structures like "input" or "workflow".
+        let node = if workflow.get(node_id_str).is_some() {
+            workflow.get_mut(node_id_str)
+        } else if workflow
+            .pointer(&format!("/input/workflow/{node_id_str}"))
+            .is_some()
+        {
+            workflow.pointer_mut(&format!("/input/workflow/{node_id_str}"))
+        } else if workflow
+            .pointer(&format!("/input/prompt/{node_id_str}"))
+            .is_some()
+        {
+            workflow.pointer_mut(&format!("/input/prompt/{node_id_str}"))
+        } else if workflow
+            .pointer(&format!("/workflow/{node_id_str}"))
+            .is_some()
+        {
+            workflow.pointer_mut(&format!("/workflow/{node_id_str}"))
+        } else if workflow
+            .pointer(&format!("/prompt/{node_id_str}"))
+            .is_some()
+        {
+            workflow.pointer_mut(&format!("/prompt/{node_id_str}"))
+        } else {
+            None
+        };
+
+        if let Some(inputs) = node.and_then(|n| n.get_mut("inputs")) {
+            // Safely insert or update the field within the inputs object.
+            if let Some(obj) = inputs.as_object_mut() {
+                obj.insert(field.clone(), json!(prompt));
+            } else {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Node '{}' 'inputs' is not a JSON object.", node_id)),
+                });
+            }
         } else {
             return Ok(ToolResult {
                 success: false,
@@ -314,11 +364,22 @@ impl ImageGenTool {
         let client = Self::http_client();
         let url = format!("https://api.runpod.ai/v2/{endpoint_id}/runsync");
 
-        let body = json!({
-            "input": {
-                "workflow": workflow
-            }
-        });
+        // Construct the payload body. If the user already provided the "input"
+        // wrapper, we use it as-is. Otherwise, we wrap it to ensure it matches
+        // the RunPod serverless ComfyUI worker API.
+        let body = if workflow.get("input").is_some() {
+            workflow // Already wrapped by the user
+        } else if workflow.get("workflow").is_some() || workflow.get("prompt").is_some() {
+            json!({
+                "input": workflow
+            })
+        } else {
+            json!({
+                "input": {
+                    "workflow": workflow
+                }
+            })
+        };
 
         let resp = client
             .post(&url)
@@ -688,6 +749,67 @@ mod tests {
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("RUNPOD_API_KEY_TEST") };
+    }
+
+    #[tokio::test]
+    async fn runpod_injects_prompt_into_wrapped_workflow() {
+        use std::io::Write;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workflow_path = temp_dir.path().join("comfyui_wrapped.json");
+
+        // This is the default format shown in RunPod ComfyUI docs
+        let wrapped_workflow = json!({
+            "input": {
+                "workflow": {
+                    "6": {
+                        "inputs": {
+                            "text": "original prompt"
+                        },
+                        "class_type": "CLIPTextEncode"
+                    }
+                }
+            }
+        });
+
+        let mut file = std::fs::File::create(&workflow_path).unwrap();
+        file.write_all(wrapped_workflow.to_string().as_bytes())
+            .unwrap();
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("RUNPOD_API_KEY_WRAP_TEST", "dummy_key") };
+
+        let tool = ImageGenTool::new(
+            test_security(),
+            temp_dir.path().to_path_buf(),
+            ImageGenConfig {
+                enabled: true,
+                provider: ImageGenProviderType::Runpod,
+                runpod_api_key_env: "RUNPOD_API_KEY_WRAP_TEST".into(),
+                runpod_endpoint_id: Some("test-endpoint".into()),
+                runpod_workflow_template: "comfyui_wrapped.json".into(),
+                ..ImageGenConfig::default()
+            },
+        );
+
+        // We can't easily mock the network call here without wiremock,
+        // but we can at least verify the logic doesn't return the "Could not find node" error
+        // when the workflow is wrapped.
+        let result = tool
+            .execute(json!({"prompt": "a futuristic city"}))
+            .await
+            .unwrap();
+
+        // It will fail because the endpoint is "test-endpoint" (DNS fail or 404),
+        // but it should NOT fail with the "Could not find node '6'" error.
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap();
+        assert!(
+            !err.contains("Could not find node '6'"),
+            "Error should not be about missing node: {err}"
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("RUNPOD_API_KEY_WRAP_TEST") };
     }
 
     #[test]
