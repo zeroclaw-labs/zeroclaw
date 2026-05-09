@@ -2088,4 +2088,52 @@ mod tests {
                 .contains("not in deterministic mode")
         );
     }
+
+    #[test]
+    fn new_engine_without_sops_dir_stays_empty() {
+        let config = SopConfig {
+            sops_dir: None,
+            ..Default::default()
+        };
+        let engine = SopEngine::new(config);
+        assert!(
+            engine.sops().is_empty(),
+            "engine without sops_dir must have no SOPs"
+        );
+    }
+
+    #[test]
+    fn reload_loads_sops_when_sops_dir_is_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sops_dir = tmp.path().join("my_sops");
+        let sop_subdir = sops_dir.join("test-sop");
+        std::fs::create_dir_all(&sop_subdir).unwrap();
+
+        std::fs::write(
+            sop_subdir.join("SOP.toml"),
+            r#"
+[sop]
+name = "test-sop"
+description = "A test SOP"
+version = "1.0.0"
+
+[[triggers]]
+type = "manual"
+"#,
+        )
+        .unwrap();
+
+        let config = SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let mut engine = SopEngine::new(config);
+        engine.reload(tmp.path());
+        assert_eq!(
+            engine.sops().len(),
+            1,
+            "reload must populate SOPs from disk"
+        );
+        assert_eq!(engine.sops()[0].name, "test-sop");
+    }
 }
