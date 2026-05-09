@@ -313,32 +313,41 @@ impl OpenAiCompatibleProvider {
         self
     }
 
-    /// Collect all `system` role messages, concatenate their content,
-    /// and prepend to the first `user` message. Drop all system messages.
-    /// Used for providers (e.g. MiniMax) that reject `role: system`.
+    /// Collect all `system` role messages and keep them in a provider-safe
+    /// shape. Strict OpenAI-compatible endpoints accept a leading system
+    /// message but reject system messages later in the history.
     fn flatten_system_messages(messages: &[ChatMessage], merge: bool) -> Vec<ChatMessage> {
+        let mut saw_system = false;
+        let mut system_content = String::new();
+        let mut result: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+
+        for message in messages {
+            if message.role == "system" {
+                saw_system = true;
+                if !message.content.is_empty() {
+                    if !system_content.is_empty() {
+                        system_content.push_str("\n\n");
+                    }
+                    system_content.push_str(&message.content);
+                }
+            } else {
+                result.push(message.clone());
+            }
+        }
+
+        if !saw_system {
+            return messages.to_vec();
+        }
+
         if !merge {
-            return messages.to_vec();
+            result.insert(0, ChatMessage::system(system_content));
+            return result;
         }
-        let system_content: String = messages
-            .iter()
-            .filter(|m| m.role == "system")
-            .map(|m| m.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-
-        if system_content.is_empty() {
-            return messages.to_vec();
-        }
-
-        let mut result: Vec<ChatMessage> = messages
-            .iter()
-            .filter(|m| m.role != "system")
-            .cloned()
-            .collect();
 
         if let Some(first_user) = result.iter_mut().find(|m| m.role == "user") {
-            first_user.content = format!("{system_content}\n\n{}", first_user.content);
+            if !system_content.is_empty() {
+                first_user.content = format!("{system_content}\n\n{}", first_user.content);
+            }
         } else {
             // No user message found: insert a synthetic user message with system content
             result.insert(0, ChatMessage::user(&system_content));
@@ -3851,6 +3860,35 @@ mod tests {
         assert_eq!(flattened[1].role, "user");
         assert_eq!(flattened[2].role, "tool");
         assert!(!flattened.iter().any(|m| m.role == "system"));
+    }
+
+    #[test]
+    fn flatten_system_messages_keeps_system_only_at_start_without_user_merge() {
+        let messages = vec![
+            ChatMessage::system("System A"),
+            ChatMessage::user("User turn"),
+            ChatMessage::assistant("Assistant turn"),
+            ChatMessage::system("System B"),
+            ChatMessage::user("Follow-up"),
+        ];
+
+        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages, false);
+        assert_eq!(
+            flattened
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["system", "user", "assistant", "user"]
+        );
+        assert_eq!(
+            flattened
+                .iter()
+                .filter(|message| message.role == "system")
+                .count(),
+            1
+        );
+        assert!(flattened[0].content.contains("System A"));
+        assert!(flattened[0].content.contains("System B"));
     }
 
     #[test]
