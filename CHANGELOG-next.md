@@ -317,12 +317,15 @@ ollama_temperature_override = 0.1   # optional; when unset, per-call temperature
 The new defaults are sent on every `/api/chat` request unless lower numeric
 values are pinned via `ollama_num_ctx` / `ollama_num_predict` as shown above.
 There is no in-config way to omit these keys from the wire body in this
-release, so operators running an older Ollama build that does not recognise
-`num_ctx` / `num_predict` should pin both fields to values their server
-accepts. (`ollama_temperature_override` is the one knob with a true `None`
-semantic — when it is unset, the per-call temperature passed through
-`Provider::chat_with_system` wins and `temperature` on the wire continues to
-reflect the call site rather than this config.)
+release: VRAM-constrained operators (or operators whose server caps these
+values lower than `8192` / `2048`) should pin lower supported numerics via
+the fields above. Operators running an Ollama build old enough to outright
+reject the keys themselves will need to upgrade Ollama or wait on a
+follow-up that introduces a true omit mode. (`ollama_temperature_override`
+is the one knob with a true `None` semantic — when it is unset, the
+per-call temperature passed through `Provider::chat_with_system` wins and
+`temperature` on the wire continues to reflect the call site rather than
+this config.)
 
 ---
 
