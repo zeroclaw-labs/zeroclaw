@@ -17,6 +17,7 @@
 //! **not** filtered — they use different prefixes and are handled separately.
 
 pub mod agent_scoped;
+pub mod agent_scoped_markdown;
 pub mod audit;
 pub mod backend;
 pub mod chunker;
@@ -44,6 +45,7 @@ pub mod traits;
 pub mod vector;
 
 pub use agent_scoped::AgentScopedMemory;
+pub use agent_scoped_markdown::{AgentScopedMarkdownMemory, MarkdownPeer};
 #[allow(unused_imports)]
 pub use audit::AuditedMemory;
 #[allow(unused_imports)]
