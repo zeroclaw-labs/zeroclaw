@@ -3931,11 +3931,22 @@ impl Default for ImageProviderFluxConfig {
 
 // ── Standalone Image Generation ─────────────────────────────────
 
+/// Image generation provider type.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ImageGenProviderType {
+    /// fal.ai (Flux / Nano Banana models).
+    #[default]
+    FalAi,
+    /// RunPod ComfyUI Serverless.
+    Runpod,
+}
+
 /// Standalone image generation tool configuration (`[image_gen]`).
 ///
 /// When enabled, registers an `image_gen` tool that generates images via
-/// fal.ai's synchronous API (Flux / Nano Banana models) and saves them
-/// to the workspace `images/` directory.
+/// fal.ai's synchronous API or RunPod ComfyUI Serverless.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "image-gen"]
@@ -3944,6 +3955,10 @@ pub struct ImageGenConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Which provider to use. Default: "fal_ai".
+    #[serde(default)]
+    pub provider: ImageGenProviderType,
+
     /// Default fal.ai model identifier.
     #[serde(default = "default_image_gen_model")]
     pub default_model: String,
@@ -3951,6 +3966,27 @@ pub struct ImageGenConfig {
     /// Environment variable name holding the fal.ai API key.
     #[serde(default = "default_image_gen_api_key_env")]
     pub api_key_env: String,
+
+    /// RunPod specific: the endpoint ID for the ComfyUI worker.
+    #[serde(default)]
+    pub runpod_endpoint_id: Option<String>,
+
+    /// RunPod specific: path to the workflow.json template.
+    /// Resolved relative to the workspace directory.
+    #[serde(default = "default_runpod_workflow_template")]
+    pub runpod_workflow_template: String,
+
+    /// RunPod specific: the node ID in the workflow to inject the prompt. Default: "6".
+    #[serde(default = "default_runpod_prompt_node")]
+    pub runpod_prompt_node_id: String,
+
+    /// RunPod specific: the field within the node's inputs to replace with the prompt. Default: "text".
+    #[serde(default = "default_runpod_prompt_field")]
+    pub runpod_prompt_node_field: String,
+
+    /// Environment variable name holding the RunPod API key.
+    #[serde(default = "default_runpod_api_key_env")]
+    pub runpod_api_key_env: String,
 }
 
 fn default_image_gen_model() -> String {
@@ -3961,12 +3997,34 @@ fn default_image_gen_api_key_env() -> String {
     "FAL_API_KEY".into()
 }
 
+fn default_runpod_workflow_template() -> String {
+    "comfyui_workflow.json".into()
+}
+
+fn default_runpod_prompt_node() -> String {
+    "6".into()
+}
+
+fn default_runpod_prompt_field() -> String {
+    "text".into()
+}
+
+fn default_runpod_api_key_env() -> String {
+    "RUNPOD_API_KEY".into()
+}
+
 impl Default for ImageGenConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: ImageGenProviderType::default(),
             default_model: default_image_gen_model(),
             api_key_env: default_image_gen_api_key_env(),
+            runpod_endpoint_id: None,
+            runpod_workflow_template: default_runpod_workflow_template(),
+            runpod_prompt_node_id: default_runpod_prompt_node(),
+            runpod_prompt_node_field: default_runpod_prompt_field(),
+            runpod_api_key_env: default_runpod_api_key_env(),
         }
     }
 }
@@ -11954,6 +12012,7 @@ impl_enum_prop_kind!(
     OtpMethod,
     SandboxBackend,
     AutonomyLevel,
+    ImageGenProviderType,
 );
 
 impl HasPropKind for ModelPricing {

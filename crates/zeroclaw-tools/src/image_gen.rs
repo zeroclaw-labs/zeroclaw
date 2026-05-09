@@ -7,31 +7,27 @@ use uuid::Uuid;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
+use zeroclaw_config::schema::{ImageGenConfig, ImageGenProviderType};
 
-/// Standalone image generation tool using fal.ai (Flux / Nano Banana models).
+/// Standalone image generation tool using fal.ai or RunPod ComfyUI.
 ///
-/// Reads the API key from an environment variable (default: `FAL_API_KEY`),
-/// calls the fal.ai synchronous endpoint, downloads the resulting image,
-/// and saves it to `{workspace}/images/{prefix}_{short_id}.png`.
+/// Saves images to `{workspace}/images/{prefix}_{short_id}.png`.
 pub struct ImageGenTool {
     security: Arc<SecurityPolicy>,
     workspace_dir: PathBuf,
-    default_model: String,
-    api_key_env: String,
+    config: ImageGenConfig,
 }
 
 impl ImageGenTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
         workspace_dir: PathBuf,
-        default_model: String,
-        api_key_env: String,
+        config: ImageGenConfig,
     ) -> Self {
         Self {
             security,
             workspace_dir,
-            default_model,
-            api_key_env,
+            config,
         }
     }
 
@@ -52,7 +48,7 @@ impl ImageGenTool {
             .ok_or_else(|| format!("Missing API key: set the {env_var} environment variable"))
     }
 
-    /// Core generation logic: call fal.ai, download image, save to disk.
+    /// Core generation logic: branches between fal.ai and RunPod.
     async fn generate(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         // ── Parse parameters ───────────────────────────────────────
         let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
@@ -81,6 +77,18 @@ impl ImageGenTool {
         let short_id = &Uuid::new_v4().to_string()[..6];
         let safe_name = format!("{prefix}_{short_id}");
 
+        match self.config.provider {
+            ImageGenProviderType::FalAi => self.generate_fal_ai(args, &prompt, &safe_name).await,
+            ImageGenProviderType::Runpod => self.generate_runpod(&prompt, &safe_name).await,
+        }
+    }
+
+    async fn generate_fal_ai(
+        &self,
+        args: serde_json::Value,
+        prompt: &str,
+        safe_name: &str,
+    ) -> anyhow::Result<ToolResult> {
         let size = args
             .get("size")
             .and_then(|v| v.as_str())
@@ -109,7 +117,7 @@ impl ImageGenTool {
             .get("model")
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or(&self.default_model);
+            .unwrap_or(&self.config.default_model);
 
         // Validate model identifier: must look like a fal.ai model path
         // (e.g. "fal-ai/flux/schnell"). Reject values with "..", query
@@ -131,7 +139,7 @@ impl ImageGenTool {
         }
 
         // ── Read API key ───────────────────────────────────────────
-        let api_key = match Self::read_api_key(&self.api_key_env) {
+        let api_key = match Self::read_api_key(&self.config.api_key_env) {
             Ok(k) => k,
             Err(msg) => {
                 return Ok(ToolResult {
@@ -220,7 +228,7 @@ impl ImageGenTool {
         Ok(ToolResult {
             success: true,
             output: format!(
-                "Image generated successfully.\n\
+                "Image generated successfully via fal.ai.\n\
                  File: {}\n\
                  Size: {} KB\n\
                  Model: {}\n\
@@ -228,6 +236,156 @@ impl ImageGenTool {
                 output_path.display(),
                 size_kb,
                 model,
+                prompt,
+            ),
+            error: None,
+        })
+    }
+
+    async fn generate_runpod(&self, prompt: &str, safe_name: &str) -> anyhow::Result<ToolResult> {
+        // ── Read API key ───────────────────────────────────────────
+        let api_key = match Self::read_api_key(&self.config.runpod_api_key_env) {
+            Ok(k) => k,
+            Err(msg) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(msg),
+                });
+            }
+        };
+
+        let endpoint_id = match &self.config.runpod_endpoint_id {
+            Some(id) if !id.trim().is_empty() => id.trim(),
+            _ => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("Missing RunPod endpoint ID in configuration".into()),
+                });
+            }
+        };
+
+        // ── Resolve workflow template ──────────────────────────────
+        let template_path = if PathBuf::from(&self.config.runpod_workflow_template).is_absolute() {
+            PathBuf::from(&self.config.runpod_workflow_template)
+        } else {
+            self.workspace_dir
+                .join(&self.config.runpod_workflow_template)
+        };
+
+        if !template_path.exists() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "ComfyUI workflow template not found at: {}\n\
+                     Please place your ComfyUI API exported JSON file at this location.",
+                    template_path.display()
+                )),
+            });
+        }
+
+        let template_content = tokio::fs::read_to_string(&template_path)
+            .await
+            .context("Failed to read ComfyUI workflow template")?;
+
+        let mut workflow: serde_json::Value = serde_json::from_str(&template_content)
+            .context("Failed to parse ComfyUI workflow template as JSON")?;
+
+        // ── Inject prompt ──────────────────────────────────────────
+        let node_id = &self.config.runpod_prompt_node_id;
+        let field = &self.config.runpod_prompt_node_field;
+
+        if let Some(inputs) = workflow.get_mut(node_id).and_then(|n| n.get_mut("inputs")) {
+            inputs[field] = json!(prompt);
+        } else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Could not find node '{}' with 'inputs' in workflow template to inject prompt.",
+                    node_id
+                )),
+            });
+        }
+
+        // ── Call RunPod ────────────────────────────────────────────
+        let client = Self::http_client();
+        let url = format!("https://api.runpod.ai/v2/{endpoint_id}/runsync");
+
+        let body = json!({
+            "input": {
+                "workflow": workflow
+            }
+        });
+
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&body)
+            .send()
+            .await
+            .context("RunPod request failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("RunPod API error ({status}): {body_text}")),
+            });
+        }
+
+        let resp_json: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse RunPod response as JSON")?;
+
+        // ── Extract image ──────────────────────────────────────────
+        // worker-comfyui returns output.images as an array of objects.
+        let image_data_base64 = resp_json
+            .pointer("/output/images/0/data")
+            .or_else(|| resp_json.pointer("/output/images/0/image"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No image data in RunPod response. \
+                     Ensure your ComfyUI workflow has a 'Save Image' node. \
+                     Response: {}",
+                    resp_json
+                )
+            })?;
+
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            image_data_base64,
+        )
+        .context("Failed to decode base64 image data from RunPod")?;
+
+        // ── Save to disk ───────────────────────────────────────────
+        let images_dir = self.workspace_dir.join("images");
+        tokio::fs::create_dir_all(&images_dir)
+            .await
+            .context("Failed to create images directory")?;
+
+        let output_path = images_dir.join(format!("{safe_name}.png"));
+        tokio::fs::write(&output_path, &bytes)
+            .await
+            .context("Failed to write image file")?;
+
+        let size_kb = bytes.len() / 1024;
+
+        Ok(ToolResult {
+            success: true,
+            output: format!(
+                "Image generated successfully via RunPod ComfyUI.\n\
+                 File: {}\n\
+                 Size: {} KB\n\
+                 Prompt: {}",
+                output_path.display(),
+                size_kb,
                 prompt,
             ),
             error: None,
@@ -242,7 +400,7 @@ impl Tool for ImageGenTool {
     }
 
     fn description(&self) -> &str {
-        "Generate an image from a text prompt using fal.ai (Flux models). \
+        "Generate an image from a text prompt. \
          Saves the result to the workspace images directory and returns the file path. \
          IMPORTANT: To send the image in Telegram or other channels, you MUST include the marker [IMAGE:<path>] in your reply text."
     }
@@ -263,11 +421,11 @@ impl Tool for ImageGenTool {
                 "size": {
                     "type": "string",
                     "enum": ["square_hd", "landscape_4_3", "portrait_4_3", "landscape_16_9", "portrait_16_9"],
-                    "description": "Image aspect ratio / size preset (default: 'square_hd')."
+                    "description": "Image aspect ratio / size preset (used for fal.ai, may be ignored by RunPod/ComfyUI)."
                 },
                 "model": {
                     "type": "string",
-                    "description": "fal.ai model identifier (default: 'fal-ai/flux/schnell')."
+                    "description": "Model identifier (used for fal.ai, may be ignored by RunPod/ComfyUI)."
                 }
             }
         })
@@ -308,8 +466,13 @@ mod tests {
         ImageGenTool::new(
             test_security(),
             std::env::temp_dir(),
-            "fal-ai/flux/schnell".into(),
-            "FAL_API_KEY".into(),
+            ImageGenConfig {
+                enabled: true,
+                provider: ImageGenProviderType::FalAi,
+                default_model: "fal-ai/flux/schnell".into(),
+                api_key_env: "FAL_API_KEY".into(),
+                ..ImageGenConfig::default()
+            },
         )
     }
 
@@ -378,8 +541,13 @@ mod tests {
         let tool = ImageGenTool::new(
             test_security(),
             std::env::temp_dir(),
-            "fal-ai/flux/schnell".into(),
-            "FAL_API_KEY_TEST_IMAGE_GEN".into(),
+            ImageGenConfig {
+                enabled: true,
+                provider: ImageGenProviderType::FalAi,
+                default_model: "fal-ai/flux/schnell".into(),
+                api_key_env: "FAL_API_KEY_TEST_IMAGE_GEN".into(),
+                ..ImageGenConfig::default()
+            },
         );
         let result = tool
             .execute(json!({"prompt": "a sunset over the ocean"}))
@@ -410,8 +578,13 @@ mod tests {
         let tool = ImageGenTool::new(
             test_security(),
             std::env::temp_dir(),
-            "fal-ai/flux/schnell".into(),
-            "FAL_API_KEY_TEST_SIZE".into(),
+            ImageGenConfig {
+                enabled: true,
+                provider: ImageGenProviderType::FalAi,
+                default_model: "fal-ai/flux/schnell".into(),
+                api_key_env: "FAL_API_KEY_TEST_SIZE".into(),
+                ..ImageGenConfig::default()
+            },
         );
         let result = tool
             .execute(json!({"prompt": "test", "size": "invalid_size"}))
@@ -434,8 +607,13 @@ mod tests {
         let tool = ImageGenTool::new(
             security,
             std::env::temp_dir(),
-            "fal-ai/flux/schnell".into(),
-            "FAL_API_KEY".into(),
+            ImageGenConfig {
+                enabled: true,
+                provider: ImageGenProviderType::FalAi,
+                default_model: "fal-ai/flux/schnell".into(),
+                api_key_env: "FAL_API_KEY".into(),
+                ..ImageGenConfig::default()
+            },
         );
         let result = tool.execute(json!({"prompt": "test image"})).await.unwrap();
         assert!(!result.success);
@@ -454,8 +632,13 @@ mod tests {
         let tool = ImageGenTool::new(
             test_security(),
             std::env::temp_dir(),
-            "fal-ai/flux/schnell".into(),
-            "FAL_API_KEY_TEST_MODEL".into(),
+            ImageGenConfig {
+                enabled: true,
+                provider: ImageGenProviderType::FalAi,
+                default_model: "fal-ai/flux/schnell".into(),
+                api_key_env: "FAL_API_KEY_TEST_MODEL".into(),
+                ..ImageGenConfig::default()
+            },
         );
         let result = tool
             .execute(json!({"prompt": "test", "model": "../../evil-endpoint"}))
@@ -472,6 +655,39 @@ mod tests {
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("FAL_API_KEY_TEST_MODEL") };
+    }
+
+    #[tokio::test]
+    async fn runpod_missing_workflow_returns_error() {
+        // Set a dummy key.
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("RUNPOD_API_KEY_TEST", "dummy_key") };
+
+        let tool = ImageGenTool::new(
+            test_security(),
+            std::env::temp_dir(),
+            ImageGenConfig {
+                enabled: true,
+                provider: ImageGenProviderType::Runpod,
+                runpod_api_key_env: "RUNPOD_API_KEY_TEST".into(),
+                runpod_endpoint_id: Some("test-endpoint".into()),
+                runpod_workflow_template: "nonexistent_workflow.json".into(),
+                ..ImageGenConfig::default()
+            },
+        );
+        let result = tool.execute(json!({"prompt": "a sunset"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("not found"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("nonexistent_workflow.json")
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("RUNPOD_API_KEY_TEST") };
     }
 
     #[test]

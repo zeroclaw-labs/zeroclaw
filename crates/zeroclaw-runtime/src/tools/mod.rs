@@ -756,8 +756,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(ImageGenTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
-            root_config.image_gen.default_model.clone(),
-            root_config.image_gen.api_key_env.clone(),
+            root_config.image_gen.clone(),
         )));
     }
 
