@@ -314,6 +314,66 @@ pub(crate) fn default_forbidden_paths() -> Vec<String> {
     ]
 }
 
+/// Specific kind of escalation violation returned by
+/// [`SecurityPolicy::ensure_no_escalation_beyond`]. Each variant names
+/// the field that violated subset semantics so the SubAgent spawn
+/// path can produce a precise error to the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EscalationViolation {
+    /// `child.allowed_roots` contains a path the parent cannot rw.
+    ReadWriteRootNotInParent { path: PathBuf },
+    /// `child.allowed_roots_read_only` contains a path the parent
+    /// cannot read at all (not in parent rw or read-only lists).
+    ReadOnlyRootNotInParent { path: PathBuf },
+    /// `child.allowed_commands` contains a shell command the parent
+    /// has no allowance for.
+    CommandNotInParent { command: String },
+    /// Parent enforces workspace_only but the child override tries to
+    /// turn it off.
+    WorkspaceOnlyDisabledByChild,
+    /// Child override raises `max_actions_per_hour` above the
+    /// parent's ceiling.
+    MaxActionsExceeded { child: u32, parent: u32 },
+    /// Child override raises `max_cost_per_day_cents` above the
+    /// parent's ceiling.
+    MaxCostExceeded { child: u32, parent: u32 },
+}
+
+impl std::fmt::Display for EscalationViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadWriteRootNotInParent { path } => {
+                write!(
+                    f,
+                    "subagent allowed_roots entry {path:?} is not present on the parent's allowed_roots"
+                )
+            }
+            Self::ReadOnlyRootNotInParent { path } => write!(
+                f,
+                "subagent allowed_roots_read_only entry {path:?} is not present on the parent's allowed_roots or allowed_roots_read_only"
+            ),
+            Self::CommandNotInParent { command } => write!(
+                f,
+                "subagent allowed_commands entry {command:?} is not present on the parent's allowed_commands"
+            ),
+            Self::WorkspaceOnlyDisabledByChild => write!(
+                f,
+                "subagent attempts to disable workspace_only but the parent enforces it"
+            ),
+            Self::MaxActionsExceeded { child, parent } => write!(
+                f,
+                "subagent max_actions_per_hour={child} exceeds parent's {parent}"
+            ),
+            Self::MaxCostExceeded { child, parent } => write!(
+                f,
+                "subagent max_cost_per_day_cents={child} exceeds parent's {parent}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EscalationViolation {}
+
 /// Shared helper for the two `is_under_*_allowed_root` checks: returns
 /// `true` when `expanded` falls under any entry of `roots`. Each entry
 /// is canonicalized when possible so symlinked roots match the on-disk
@@ -1637,6 +1697,72 @@ impl SecurityPolicy {
     #[must_use]
     pub fn is_under_any_allowed_root(&self, path: &str) -> bool {
         self.is_under_allowed_root(path) || self.is_under_read_only_allowed_root(path)
+    }
+
+    /// Verify this policy does not escalate any permission beyond
+    /// `parent` (#6272 P10 — SubAgent inheritance).
+    ///
+    /// Subset rules:
+    /// - Every `allowed_roots` entry on `self` must appear on
+    ///   `parent.allowed_roots`. (Read+write grants can never be
+    ///   wider than the parent's read+write list.)
+    /// - Every `allowed_roots_read_only` entry on `self` must appear
+    ///   on `parent.allowed_roots` OR on
+    ///   `parent.allowed_roots_read_only`. (A SubAgent can downgrade
+    ///   a parent's rw root to read-only, but it cannot grant read
+    ///   access to a path the parent could not even read.)
+    /// - Every `allowed_commands` entry on `self` must appear on
+    ///   `parent.allowed_commands`.
+    /// - `self.workspace_only` must be `true` whenever
+    ///   `parent.workspace_only` is `true`. A SubAgent cannot disable
+    ///   workspace_only when the parent enforces it.
+    /// - `self.max_actions_per_hour <= parent.max_actions_per_hour`
+    ///   and `self.max_cost_per_day_cents <=
+    ///   parent.max_cost_per_day_cents`. A SubAgent cannot raise the
+    ///   parent's rate or cost ceiling.
+    ///
+    /// Returns `Err(EscalationViolation)` describing the first
+    /// violation found. Callers should reject the spawn on `Err` so
+    /// a misconfigured override never lands as a constructed policy.
+    pub fn ensure_no_escalation_beyond(
+        &self,
+        parent: &SecurityPolicy,
+    ) -> Result<(), EscalationViolation> {
+        for root in &self.allowed_roots {
+            if !parent.allowed_roots.iter().any(|p| p == root) {
+                return Err(EscalationViolation::ReadWriteRootNotInParent { path: root.clone() });
+            }
+        }
+        for root in &self.allowed_roots_read_only {
+            let in_parent_rw = parent.allowed_roots.iter().any(|p| p == root);
+            let in_parent_ro = parent.allowed_roots_read_only.iter().any(|p| p == root);
+            if !in_parent_rw && !in_parent_ro {
+                return Err(EscalationViolation::ReadOnlyRootNotInParent { path: root.clone() });
+            }
+        }
+        for cmd in &self.allowed_commands {
+            if !parent.allowed_commands.iter().any(|p| p == cmd) {
+                return Err(EscalationViolation::CommandNotInParent {
+                    command: cmd.clone(),
+                });
+            }
+        }
+        if parent.workspace_only && !self.workspace_only {
+            return Err(EscalationViolation::WorkspaceOnlyDisabledByChild);
+        }
+        if self.max_actions_per_hour > parent.max_actions_per_hour {
+            return Err(EscalationViolation::MaxActionsExceeded {
+                child: self.max_actions_per_hour,
+                parent: parent.max_actions_per_hour,
+            });
+        }
+        if self.max_cost_per_day_cents > parent.max_cost_per_day_cents {
+            return Err(EscalationViolation::MaxCostExceeded {
+                child: self.max_cost_per_day_cents,
+                parent: parent.max_cost_per_day_cents,
+            });
+        }
+        Ok(())
     }
 
     /// Build a `SecurityPolicy` from a resolved risk profile.
@@ -3516,6 +3642,154 @@ mod tests {
         };
         assert!(!p.is_under_allowed_root("/ro-shared/notes.md"));
         assert!(p.is_under_any_allowed_root("/ro-shared/notes.md"));
+    }
+
+    // ── #6272 P10 prep: SubAgent escalation validator ───────────────
+
+    fn parent_policy_for_escalation_tests() -> SecurityPolicy {
+        SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            workspace_only: true,
+            allowed_roots: vec![PathBuf::from("/projects"), PathBuf::from("/data")],
+            allowed_roots_read_only: vec![PathBuf::from("/shared-docs")],
+            allowed_commands: vec!["git".into(), "cargo".into(), "ls".into()],
+            max_actions_per_hour: 100,
+            max_cost_per_day_cents: 500,
+            ..SecurityPolicy::default()
+        }
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_identical_policy() {
+        let parent = parent_policy_for_escalation_tests();
+        let child = parent.clone();
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_narrowed_child() {
+        // Child drops one rw root and one command; reduces caps. All
+        // allowed.
+        let parent = parent_policy_for_escalation_tests();
+        let child = SecurityPolicy {
+            allowed_roots: vec![PathBuf::from("/projects")],
+            allowed_roots_read_only: vec![PathBuf::from("/shared-docs")],
+            allowed_commands: vec!["git".into()],
+            max_actions_per_hour: 50,
+            max_cost_per_day_cents: 250,
+            ..parent.clone()
+        };
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_rw_root_downgraded_to_read_only_on_child() {
+        // Parent has /projects as rw; child claims it only as read-only.
+        // Allowed: a SubAgent giving up its write privilege is a
+        // narrowing, not an escalation.
+        let parent = parent_policy_for_escalation_tests();
+        let child = SecurityPolicy {
+            allowed_roots: Vec::new(),
+            allowed_roots_read_only: vec![PathBuf::from("/projects")],
+            ..parent.clone()
+        };
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_new_rw_root_not_in_parent() {
+        let parent = parent_policy_for_escalation_tests();
+        let child = SecurityPolicy {
+            allowed_roots: vec![PathBuf::from("/projects"), PathBuf::from("/secrets")],
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("new rw root must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::ReadWriteRootNotInParent { ref path }
+            if path == &PathBuf::from("/secrets")
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_new_read_only_root_not_in_parent() {
+        let parent = parent_policy_for_escalation_tests();
+        let child = SecurityPolicy {
+            allowed_roots_read_only: vec![PathBuf::from("/etc")],
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("new read-only root must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::ReadOnlyRootNotInParent { ref path }
+            if path == &PathBuf::from("/etc")
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_new_command_not_in_parent() {
+        let parent = parent_policy_for_escalation_tests();
+        let child = SecurityPolicy {
+            allowed_commands: vec!["git".into(), "rm".into()],
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("new command must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::CommandNotInParent { ref command }
+            if command == "rm"
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_workspace_only_disabled_by_child() {
+        let parent = parent_policy_for_escalation_tests();
+        let child = SecurityPolicy {
+            workspace_only: false,
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("disabling workspace_only when parent enforces it must be rejected");
+        assert_eq!(err, EscalationViolation::WorkspaceOnlyDisabledByChild);
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_higher_max_actions() {
+        let parent = parent_policy_for_escalation_tests();
+        let child = SecurityPolicy {
+            max_actions_per_hour: 200,
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("higher max_actions_per_hour must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::MaxActionsExceeded { child, parent } if child == 200 && parent == 100
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_higher_max_cost() {
+        let parent = parent_policy_for_escalation_tests();
+        let child = SecurityPolicy {
+            max_cost_per_day_cents: 1000,
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("higher max_cost_per_day_cents must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::MaxCostExceeded { child, parent } if child == 1000 && parent == 500
+        ));
     }
 
     #[test]
