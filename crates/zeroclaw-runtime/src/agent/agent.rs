@@ -444,6 +444,24 @@ impl Agent {
         }
     }
 
+    /// Hydrate the agent with a full `ConversationMessage` history (e.g. restored
+    /// from an ACP session store). Preserves all variants including `AssistantToolCalls`
+    /// and `ToolResults` — use this for ACP restore; use `seed_history` for flat
+    /// channel session hydration.
+    pub fn seed_conversation_history(&mut self, messages: Vec<ConversationMessage>) {
+        if self.history.is_empty() && let Ok(sys) = self.build_system_prompt() {
+            self.history
+                .push(ConversationMessage::Chat(ChatMessage::system(sys)));
+        }
+        for msg in messages {
+            // Skip system messages from the seed — the system prompt is already prepended above.
+            if matches!(&msg, ConversationMessage::Chat(m) if m.role == "system") {
+                continue;
+            }
+            self.history.push(msg);
+        }
+    }
+
     pub async fn from_config(config: &Config) -> Result<Self> {
         Self::from_config_with_session_cwd(config, None).await
     }
@@ -2372,6 +2390,67 @@ mod tests {
             matches!(&history[2], ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi there")
         );
         assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn seed_conversation_history_preserves_tool_call_variants() {
+        use zeroclaw_api::provider::{ChatMessage, ConversationMessage, ToolCall, ToolResultMessage};
+
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("run it")),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "tc-1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc-1".into(),
+                content: "ok".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::assistant("done")),
+        ];
+
+        agent.seed_conversation_history(messages);
+
+        // System prompt may have been prepended; find non-system messages
+        let non_system: Vec<_> = agent
+            .history()
+            .iter()
+            .filter(|m| !matches!(m, ConversationMessage::Chat(c) if c.role == "system"))
+            .collect();
+
+        assert_eq!(non_system.len(), 4);
+        assert!(matches!(non_system[1], ConversationMessage::AssistantToolCalls { tool_calls, .. } if tool_calls[0].id == "tc-1"));
+        assert!(matches!(non_system[2], ConversationMessage::ToolResults(r) if r[0].tool_call_id == "tc-1"));
     }
 
     /// Mock provider that captures whether tool specs were passed to `stream_chat`
