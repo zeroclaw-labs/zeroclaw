@@ -37,6 +37,8 @@ use std::sync::Arc;
 use tokio::select;
 use wa_rs_proto::whatsapp::device_props::PlatformType;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+#[cfg(not(feature = "whatsapp-web"))]
+use zeroclaw_runtime::i18n;
 
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
@@ -1754,19 +1756,15 @@ impl Channel for WhatsAppWebChannel {
     }
 
     async fn send(&self, _message: &SendMessage) -> Result<()> {
-        anyhow::bail!(
-            "WhatsApp Web channel requires the 'whatsapp-web' feature. \
-            Enable with: cargo build --features whatsapp-web \
-            (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)"
-        );
+        anyhow::bail!(i18n::get_required_cli_string(
+            "channel-whatsapp-web-feature-missing-error"
+        ));
     }
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        anyhow::bail!(
-            "WhatsApp Web channel requires the 'whatsapp-web' feature. \
-            Enable with: cargo build --features whatsapp-web \
-            (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)"
-        );
+        anyhow::bail!(i18n::get_required_cli_string(
+            "channel-whatsapp-web-feature-missing-error"
+        ));
     }
 
     async fn health_check(&self) -> bool {
@@ -1774,19 +1772,15 @@ impl Channel for WhatsAppWebChannel {
     }
 
     async fn start_typing(&self, _recipient: &str) -> Result<()> {
-        anyhow::bail!(
-            "WhatsApp Web channel requires the 'whatsapp-web' feature. \
-            Enable with: cargo build --features whatsapp-web \
-            (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)"
-        );
+        anyhow::bail!(i18n::get_required_cli_string(
+            "channel-whatsapp-web-feature-missing-error"
+        ));
     }
 
     async fn stop_typing(&self, _recipient: &str) -> Result<()> {
-        anyhow::bail!(
-            "WhatsApp Web channel requires the 'whatsapp-web' feature. \
-            Enable with: cargo build --features whatsapp-web \
-            (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)"
-        );
+        anyhow::bail!(i18n::get_required_cli_string(
+            "channel-whatsapp-web-feature-missing-error"
+        ));
     }
 }
 
