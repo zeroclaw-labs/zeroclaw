@@ -486,6 +486,7 @@ impl AcpServer {
             "initialize" => self.handle_initialize(&request.params),
             "session/new" => self.handle_session_new(&request.params).await,
             "session/load" => self.handle_session_load(&request.params).await,
+            "session/resume" => self.handle_session_resume(&request.params).await,
             "session/prompt" => self.handle_session_prompt(&request.params, &id).await,
             "session/stop" => self.handle_session_stop(&request.params).await,
             "session/cancel" => self.handle_session_cancel(&request.params).await,
@@ -743,6 +744,99 @@ impl AcpServer {
 
         debug!("Loaded session {session_id} ({} messages)", data.messages.len());
         Ok(Value::Null)
+    }
+
+    async fn handle_session_resume(&self, params: &Value) -> RpcResult {
+        let session_id = params
+            .get("sessionId")
+            .or_else(|| params.get("session_id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcError {
+                code: INVALID_PARAMS,
+                message: "Missing required parameter: sessionId".to_string(),
+                data: None,
+            })?
+            .to_string();
+
+        let store = self.store.as_ref().ok_or_else(|| RpcError {
+            code: SESSION_NOT_FOUND,
+            message: format!("Session not found: {session_id}"),
+            data: None,
+        })?;
+
+        {
+            let sessions = self.sessions.lock().await;
+            if sessions.contains_key(&session_id) {
+                return Err(RpcError {
+                    code: INVALID_PARAMS,
+                    message: format!(
+                        "Session already active: {session_id}. Call session/close first."
+                    ),
+                    data: None,
+                });
+            }
+        }
+
+        let data = store
+            .load_session(&session_id)
+            .map_err(|e| RpcError {
+                code: INTERNAL_ERROR,
+                message: format!("Failed to load session: {e}"),
+                data: None,
+            })?
+            .ok_or_else(|| RpcError {
+                code: SESSION_NOT_FOUND,
+                message: format!("Session not found: {session_id}"),
+                data: None,
+            })?;
+
+        let requested_cwd = params
+            .get("cwd")
+            .or_else(|| params.get("workspaceDir"))
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(&data.workspace_dir));
+
+        let workspace_dir = std::fs::canonicalize(&requested_cwd)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&data.workspace_dir));
+
+        let mut agent = Agent::from_config_with_session_cwd_and_mcp(
+            &self.config,
+            Some(&workspace_dir),
+            false,
+        )
+        .await
+        .map_err(|e| RpcError {
+            code: INTERNAL_ERROR,
+            message: format!("Failed to create agent: {e}"),
+            data: None,
+        })?;
+
+        agent.seed_conversation_history(data.messages);
+
+        let acp_channel = Arc::new(AcpChannel::new(
+            "acp",
+            session_id.clone(),
+            Arc::clone(&self.rpc),
+            Duration::from_secs(self.acp_config.session_timeout_secs),
+        ));
+        agent.channel_handles().register_channel("acp", acp_channel);
+
+        let now = Instant::now();
+        {
+            let mut sessions = self.sessions.lock().await;
+            sessions.insert(
+                session_id.clone(),
+                Arc::new(Mutex::new(Session {
+                    agent,
+                    created_at: now,
+                    last_active: now,
+                })),
+            );
+        }
+
+        debug!("Resumed session {session_id}");
+        Ok(serde_json::json!({}))
     }
 
     fn requested_session_cwd(&self, params: &Value) -> PathBuf {
@@ -2251,5 +2345,53 @@ mod tests {
             .expect_err("session/load for active session must fail");
 
         assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn session_resume_restores_without_replay() {
+        use zeroclaw_api::provider::{ChatMessage, ConversationMessage};
+        let cwd = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap(),
+        );
+
+        let session_id = "sess-resume-test";
+        store
+            .create_session(session_id, &cwd.path().to_string_lossy())
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &[ConversationMessage::Chat(ChatMessage::user("hello"))],
+            )
+            .unwrap();
+
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        let result = server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/resume must succeed");
+
+        // Result is empty object
+        assert_eq!(result, serde_json::json!({}));
+
+        // Session must be in memory
+        assert!(server.sessions.lock().await.contains_key(session_id));
+
+        // No notifications must have been emitted
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "session/resume must not emit session/update notifications"
+        );
     }
 }
