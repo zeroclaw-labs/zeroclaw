@@ -219,6 +219,9 @@ impl ImageGenTool {
             .context("Failed to create images directory")?;
 
         let output_path = images_dir.join(format!("{safe_name}.png"));
+        // Ensure path is absolute for downstream consumers (e.g. Telegram)
+        let output_path = std::path::absolute(&output_path).unwrap_or(output_path);
+
         tokio::fs::write(&output_path, &bytes)
             .await
             .context("Failed to write image file")?;
@@ -432,6 +435,9 @@ impl ImageGenTool {
             .context("Failed to create images directory")?;
 
         let output_path = images_dir.join(format!("{safe_name}.png"));
+        // Ensure path is absolute for downstream consumers (e.g. Telegram)
+        let output_path = std::path::absolute(&output_path).unwrap_or(output_path);
+
         tokio::fs::write(&output_path, &bytes)
             .await
             .context("Failed to write image file")?;
