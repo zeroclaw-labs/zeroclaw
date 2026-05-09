@@ -1847,4 +1847,47 @@ prompts = ["from-skill-section"]
             vec!["from-skill-section".to_string(), "from-root".to_string(),]
         );
     }
+
+    #[test]
+    fn enabled_false_is_parsed_from_md_frontmatter() {
+        let content = "---\nname: test-skill\ndescription: test\nenabled: false\n---\n\nBody";
+        let parsed = parse_skill_markdown(content);
+        assert_eq!(parsed.meta.enabled, Some(false));
+    }
+
+    #[test]
+    fn enabled_true_is_parsed_from_md_frontmatter() {
+        let content = "---\nname: test-skill\ndescription: test\nenabled: true\n---\n\nBody";
+        let parsed = parse_skill_markdown(content);
+        assert_eq!(parsed.meta.enabled, Some(true));
+    }
+
+    #[test]
+    fn enabled_defaults_to_none_when_absent() {
+        let content = "---\nname: test-skill\ndescription: test\n---\n\nBody";
+        let parsed = parse_skill_markdown(content);
+        assert_eq!(parsed.meta.enabled, None); // None → caller defaults to true
+    }
+
+    #[test]
+    fn disabled_skill_excluded_from_prompt() {
+        let tmp = TempDir::new().unwrap();
+        // Write a disabled skill
+        let skill_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: disabled\nenabled: false\n---\n\nDo stuff.",
+        )
+        .unwrap();
+
+        let skills = load_skills_from_directory(tmp.path(), false);
+        // skill is loaded
+        assert_eq!(skills.len(), 1);
+        assert!(!skills[0].enabled);
+
+        // but excluded from prompt
+        let prompt = skills_to_prompt(&skills, tmp.path());
+        assert!(!prompt.contains("my-skill"), "disabled skill must not appear in prompt");
+    }
 }
