@@ -1880,7 +1880,36 @@ impl SecurityPolicy {
         // file_read/write/edit and the shell tool jail to the agent's
         // own dir, not the install-wide legacy path.
         let agent_workspace = config.agent_workspace_dir(agent_alias);
-        Ok(Self::from_risk_profile(risk_profile, &agent_workspace))
+        let mut policy = Self::from_risk_profile(risk_profile, &agent_workspace);
+
+        // Cross-agent filesystem access: the agent's
+        // [agents.<alias>.workspace.access] map declares which sibling
+        // workspaces this agent may read or write. Resolve each
+        // sibling's workspace dir and append to the appropriate
+        // allowlist tier.
+        if let Some(agent_cfg) = config.agents.get(agent_alias) {
+            for (sibling_alias, mode) in &agent_cfg.workspace.access {
+                let sibling_dir = config.agent_workspace_dir(sibling_alias.as_str());
+                match mode {
+                    crate::multi_agent::AccessMode::Read => {
+                        policy.allowed_roots_read_only.push(sibling_dir);
+                    }
+                    crate::multi_agent::AccessMode::Write
+                    | crate::multi_agent::AccessMode::ReadWrite => {
+                        policy.allowed_roots.push(sibling_dir);
+                    }
+                }
+            }
+
+            // The escape-hatch flag retains its all-paths semantics —
+            // agents that genuinely need to read or write outside any
+            // per-agent scope opt in here. Defaults to false.
+            if agent_cfg.workspace.unrestricted_filesystem {
+                policy.workspace_only = false;
+            }
+        }
+
+        Ok(policy)
     }
 
     /// Render a human-readable summary of the active security constraints
@@ -3313,6 +3342,117 @@ mod tests {
         assert!(
             !p.is_resolved_path_allowed(&canonical_inside),
             "read-only allowlist entries must NOT be writable via is_resolved_path_allowed"
+        );
+    }
+
+    // ── for_agent: workspace.access populates allowlist tiers ──
+
+    #[test]
+    fn for_agent_routes_workspace_access_into_correct_allowlist_tier() {
+        use crate::multi_agent::{AccessMode, AgentAlias};
+        use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let mut cfg = Config {
+            workspace_dir: PathBuf::from("/tmp/zeroclaw-for-agent-test"),
+            config_path: PathBuf::from("/tmp/zeroclaw-for-agent-test/config.toml"),
+            ..Config::default()
+        };
+        cfg.risk_profiles.insert(
+            "default".into(),
+            RiskProfileConfig {
+                workspace_only: true,
+                ..RiskProfileConfig::default()
+            },
+        );
+
+        // Sibling agents the test agent will reference.
+        cfg.agents.insert(
+            "writable_sibling".into(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        cfg.agents.insert(
+            "readonly_sibling".into(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        // Test agent: write access to one sibling, read-only to another.
+        let mut test_agent = AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        test_agent
+            .workspace
+            .access
+            .insert(AgentAlias::from("writable_sibling"), AccessMode::Write);
+        test_agent
+            .workspace
+            .access
+            .insert(AgentAlias::from("readonly_sibling"), AccessMode::Read);
+        cfg.agents.insert("test_agent".into(), test_agent);
+
+        let policy = SecurityPolicy::for_agent(&cfg, "test_agent").unwrap();
+
+        let writable_sibling_dir = cfg.agent_workspace_dir("writable_sibling");
+        let readonly_sibling_dir = cfg.agent_workspace_dir("readonly_sibling");
+
+        assert!(
+            policy.allowed_roots.contains(&writable_sibling_dir),
+            "AccessMode::Write must land in allowed_roots; got {:?}",
+            policy.allowed_roots
+        );
+        assert!(
+            policy
+                .allowed_roots_read_only
+                .contains(&readonly_sibling_dir),
+            "AccessMode::Read must land in allowed_roots_read_only; got {:?}",
+            policy.allowed_roots_read_only
+        );
+        assert!(
+            !policy
+                .allowed_roots_read_only
+                .contains(&writable_sibling_dir),
+            "Write-mode entry must NOT also appear on the read-only list"
+        );
+        assert!(
+            policy.workspace_only,
+            "unrestricted_filesystem stays default-false → workspace_only stays true"
+        );
+    }
+
+    #[test]
+    fn for_agent_unrestricted_filesystem_disables_workspace_only() {
+        use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let mut cfg = Config {
+            workspace_dir: PathBuf::from("/tmp/zeroclaw-for-agent-unrestricted"),
+            config_path: PathBuf::from("/tmp/zeroclaw-for-agent-unrestricted/config.toml"),
+            ..Config::default()
+        };
+        cfg.risk_profiles.insert(
+            "default".into(),
+            RiskProfileConfig {
+                workspace_only: true,
+                ..RiskProfileConfig::default()
+            },
+        );
+        let mut test_agent = AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        test_agent.workspace.unrestricted_filesystem = true;
+        cfg.agents.insert("test_agent".into(), test_agent);
+
+        let policy = SecurityPolicy::for_agent(&cfg, "test_agent").unwrap();
+
+        assert!(
+            !policy.workspace_only,
+            "unrestricted_filesystem=true must flip workspace_only off at the policy level"
         );
     }
 
