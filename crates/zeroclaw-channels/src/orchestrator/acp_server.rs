@@ -30,6 +30,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 use zeroclaw_config::schema::Config;
+use zeroclaw_infra::acp_session_store::AcpSessionStore;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
 
 use crate::acp_channel::AcpChannel;
@@ -287,12 +288,13 @@ pub struct AcpServer {
     /// rejected before it can overwrite the active turn's token. If pipelining
     /// is needed in the future, the key should become `(session_id, turn_id)`.
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    store: Option<Arc<AcpSessionStore>>,
 }
 
 impl AcpServer {
     pub fn new(config: Config, acp_config: AcpServerConfig) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
-        Self::with_writer(config, acp_config, writer_tx, Some(writer_rx))
+        Self::with_writer(config, acp_config, writer_tx, Some(writer_rx), None)
     }
 
     pub fn new_with_writer(
@@ -300,7 +302,25 @@ impl AcpServer {
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
     ) -> Self {
-        Self::with_writer(config, acp_config, writer_tx, None)
+        Self::with_writer(config, acp_config, writer_tx, None, None)
+    }
+
+    pub fn new_with_store(
+        config: Config,
+        acp_config: AcpServerConfig,
+        store: Arc<AcpSessionStore>,
+    ) -> Self {
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
+        Self::with_writer(config, acp_config, writer_tx, Some(writer_rx), Some(store))
+    }
+
+    pub fn new_with_writer_and_store(
+        config: Config,
+        acp_config: AcpServerConfig,
+        writer_tx: mpsc::Sender<String>,
+        store: Arc<AcpSessionStore>,
+    ) -> Self {
+        Self::with_writer(config, acp_config, writer_tx, None, Some(store))
     }
 
     fn with_writer(
@@ -308,6 +328,7 @@ impl AcpServer {
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
         writer_rx: Option<mpsc::Receiver<String>>,
+        store: Option<Arc<AcpSessionStore>>,
     ) -> Self {
         Self {
             config,
@@ -316,6 +337,7 @@ impl AcpServer {
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
             writer_rx: std::sync::Mutex::new(writer_rx),
             cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            store,
         }
     }
 
@@ -499,10 +521,16 @@ impl AcpServer {
             zeroclaw_meta["defaultModel"] = serde_json::json!(model);
         }
 
+        let session_capabilities = if self.store.is_some() {
+            serde_json::json!({ "resume": true, "close": true })
+        } else {
+            serde_json::json!({})
+        };
+
         Ok(serde_json::json!({
             "protocolVersion": ACP_PROTOCOL_VERSION,
             "agentCapabilities": {
-                "loadSession": false,
+                "loadSession": self.store.is_some(),
                 "promptCapabilities": {
                     "image": false,
                     "audio": false,
@@ -512,7 +540,7 @@ impl AcpServer {
                     "http": false,
                     "sse": false,
                 },
-                "sessionCapabilities": {},
+                "sessionCapabilities": session_capabilities,
             },
             "agentInfo": {
                 "name": "zeroclaw-acp",
@@ -1236,6 +1264,23 @@ mod tests {
         );
         assert!(result.get("serverInfo").is_none());
         assert!(result.get("capabilities").is_none());
+    }
+
+    #[test]
+    fn initialize_advertises_load_session_when_store_present() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap(),
+        );
+        let server = AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            store,
+        );
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+        assert_eq!(result["agentCapabilities"]["loadSession"], true);
+        assert_eq!(result["agentCapabilities"]["sessionCapabilities"]["resume"], true);
+        assert_eq!(result["agentCapabilities"]["sessionCapabilities"]["close"], true);
     }
 
     #[test]
