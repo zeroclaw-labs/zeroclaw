@@ -468,8 +468,9 @@ impl Tool for ImageGenTool {
 
     fn description(&self) -> &str {
         "Generate an image from a text prompt. \
-         Saves the result to the workspace images directory and returns the file path. \
-         IMPORTANT: To send the image in Telegram or other channels, you MUST include the marker [IMAGE:<path>] in your reply text."
+         Saves the result to the workspace images directory and returns the absolute file path. \
+         IMPORTANT: To send the image in Telegram or other channels, you MUST include the marker [IMAGE:<path>] in your reply text. \
+         Replace <path> with the EXACT, FULL ABSOLUTE PATH returned by this tool. Do NOT shorten, truncate, or modify the path."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
