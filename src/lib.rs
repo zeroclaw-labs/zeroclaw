@@ -165,11 +165,20 @@ was previously paired (useful for adding additional clients).
 
 Examples:
   zeroclaw gateway get-paircode       # show current pairing code
-  zeroclaw gateway get-paircode --new # generate a new pairing code")]
+  zeroclaw gateway get-paircode --new # generate a new pairing code
+  zeroclaw gateway get-paircode --new --port 3001 # target alternate-port gateway")]
     GetPaircode {
         /// Generate a new pairing code (even if already paired)
         #[arg(long)]
         new: bool,
+
+        /// Port of the running gateway to query; defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host of the running gateway to query; defaults to config gateway.host
+        #[arg(long)]
+        host: Option<String>,
     },
 }
 
