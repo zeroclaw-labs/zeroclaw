@@ -49,6 +49,8 @@ pub struct Skill {
     pub tools: Vec<SkillTool>,
     #[serde(default)]
     pub prompts: Vec<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(skip)]
     pub location: Option<PathBuf>,
 }
@@ -88,6 +90,8 @@ struct SkillMeta {
     tags: Vec<String>,
     #[serde(default)]
     prompts: Vec<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -97,10 +101,15 @@ struct SkillMarkdownMeta {
     version: Option<String>,
     author: Option<String>,
     tags: Vec<String>,
+    enabled: Option<bool>,
 }
 
 fn default_version() -> String {
     "0.1.0".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Emit a user-visible warning when a skill directory is skipped due to audit
