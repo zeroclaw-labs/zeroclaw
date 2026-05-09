@@ -176,6 +176,31 @@ impl AcpSessionStore {
         tx.commit().context("Failed to commit append_turn")?;
         Ok(())
     }
+
+    /// Delete a session and all its messages. Returns `true` if the session existed.
+    /// Intended for operator tooling — not triggered by `session/close`.
+    pub fn delete_session(&self, session_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "DELETE FROM acp_sessions WHERE session_id = ?1",
+                params![session_id],
+            )
+            .context("Failed to delete ACP session")?;
+        Ok(rows > 0)
+    }
+
+    /// Update `last_activity` without appending messages.
+    pub fn touch_session(&self, session_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE acp_sessions SET last_activity = ?1 WHERE session_id = ?2",
+            params![now, session_id],
+        )
+        .context("Failed to touch ACP session")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -329,5 +354,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn delete_session_removes_session_and_messages() {
+        let tmp = TempDir::new().unwrap();
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        store.create_session("sess-del", "/tmp/proj").unwrap();
+        let msg = ConversationMessage::Chat(zeroclaw_api::provider::ChatMessage::user("hi"));
+        store.append_turn("sess-del", &[msg]).unwrap();
+
+        let deleted = store.delete_session("sess-del").unwrap();
+        assert!(deleted);
+        assert!(store.load_session("sess-del").unwrap().is_none());
+
+        // Cascade: messages gone too
+        let conn = store.conn.lock();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_messages WHERE session_id = 'sess-del'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn delete_nonexistent_session_returns_false() {
+        let tmp = TempDir::new().unwrap();
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert!(!store.delete_session("ghost").unwrap());
+    }
+
+    #[test]
+    fn touch_session_updates_last_activity() {
+        let tmp = TempDir::new().unwrap();
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        store.create_session("sess-touch", "/tmp/proj").unwrap();
+
+        let before = store.load_session("sess-touch").unwrap().unwrap().last_activity;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.touch_session("sess-touch").unwrap();
+        let after = store.load_session("sess-touch").unwrap().unwrap().last_activity;
+
+        assert!(after >= before);
     }
 }
