@@ -141,6 +141,41 @@ impl AcpSessionStore {
             messages,
         }))
     }
+
+    /// Append all ConversationMessages from one completed turn.
+    /// Single transaction: N message INSERTs + last_activity UPDATE.
+    /// Returns early without writing if `messages` is empty.
+    pub fn append_turn(&self, session_id: &str, messages: &[ConversationMessage]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("Failed to begin append_turn transaction")?;
+
+        for msg in messages {
+            let json =
+                serde_json::to_string(msg).context("Failed to serialize ConversationMessage")?;
+            tx.execute(
+                "INSERT INTO acp_messages (session_id, message_json, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params![session_id, json, now],
+            )
+            .context("Failed to insert ACP message")?;
+        }
+
+        tx.execute(
+            "UPDATE acp_sessions SET last_activity = ?1 WHERE session_id = ?2",
+            params![now, session_id],
+        )
+        .context("Failed to update last_activity")?;
+
+        tx.commit().context("Failed to commit append_turn")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -190,5 +225,109 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = AcpSessionStore::new(tmp.path()).unwrap();
         assert!(store.load_session("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn append_turn_and_load_messages() {
+        let tmp = TempDir::new().unwrap();
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        store.create_session("sess-msgs", "/tmp/proj").unwrap();
+
+        let msgs = vec![
+            ConversationMessage::Chat(zeroclaw_api::provider::ChatMessage::user("hello")),
+            ConversationMessage::Chat(zeroclaw_api::provider::ChatMessage::assistant("hi")),
+        ];
+        store.append_turn("sess-msgs", &msgs).unwrap();
+
+        let data = store.load_session("sess-msgs").unwrap().unwrap();
+        assert_eq!(data.messages.len(), 2);
+        assert!(matches!(&data.messages[0], ConversationMessage::Chat(m) if m.role == "user" && m.content == "hello"));
+        assert!(matches!(&data.messages[1], ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi"));
+    }
+
+    #[test]
+    fn all_conversation_message_variants_round_trip() {
+        use zeroclaw_api::provider::{ChatMessage, ToolCall, ToolResultMessage};
+        let tmp = TempDir::new().unwrap();
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        store.create_session("sess-variants", "/tmp/proj").unwrap();
+
+        let msgs = vec![
+            ConversationMessage::Chat(ChatMessage::user("task")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("calling shell".into()),
+                tool_calls: vec![ToolCall {
+                    id: "tc-1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc-1".into(),
+                content: "file.txt\n".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::assistant("done")),
+        ];
+        store.append_turn("sess-variants", &msgs).unwrap();
+
+        let data = store.load_session("sess-variants").unwrap().unwrap();
+        assert_eq!(data.messages.len(), 4);
+        assert!(matches!(&data.messages[1], ConversationMessage::AssistantToolCalls { tool_calls, .. } if tool_calls[0].id == "tc-1"));
+        assert!(matches!(&data.messages[2], ConversationMessage::ToolResults(r) if r[0].content == "file.txt\n"));
+    }
+
+    #[test]
+    fn append_turn_empty_slice_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        store.create_session("sess-empty", "/tmp/proj").unwrap();
+
+        store.append_turn("sess-empty", &[]).unwrap();
+
+        let data = store.load_session("sess-empty").unwrap().unwrap();
+        assert!(data.messages.is_empty());
+    }
+
+    #[test]
+    fn last_activity_updated_on_append() {
+        let tmp = TempDir::new().unwrap();
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        store.create_session("sess-activity", "/tmp/proj").unwrap();
+
+        let before = store.load_session("sess-activity").unwrap().unwrap().last_activity;
+
+        // Brief sleep to ensure timestamp advances
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let msg = ConversationMessage::Chat(zeroclaw_api::provider::ChatMessage::user("hi"));
+        store.append_turn("sess-activity", &[msg]).unwrap();
+
+        let after = store.load_session("sess-activity").unwrap().unwrap().last_activity;
+        assert!(after >= before);
+    }
+
+    #[test]
+    fn append_turn_rolls_back_on_unknown_session() {
+        // Foreign key constraint: inserting messages for a nonexistent session
+        // must fail atomically — no orphaned message rows.
+        let tmp = TempDir::new().unwrap();
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+
+        let msg = ConversationMessage::Chat(zeroclaw_api::provider::ChatMessage::user("hello"));
+        let result = store.append_turn("does-not-exist", &[msg]);
+        assert!(result.is_err());
+
+        // No orphaned rows
+        let conn = store.conn.lock();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_messages WHERE session_id = 'does-not-exist'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }
