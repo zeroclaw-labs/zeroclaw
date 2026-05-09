@@ -101,7 +101,7 @@ const INVALID_PARAMS: i32 = -32602;
 const INTERNAL_ERROR: i32 = -32603;
 
 // Custom error codes
-pub const SESSION_NOT_FOUND: i32 = -32000;
+const SESSION_NOT_FOUND: i32 = -32000;
 const SESSION_LIMIT_REACHED: i32 = -32001;
 const SESSION_BUSY: i32 = -32002;
 const ACP_PROTOCOL_VERSION: u64 = 1;
@@ -261,7 +261,7 @@ impl RpcOutbound {
 
 // ── Session state ────────────────────────────────────────────────
 
-pub struct Session {
+struct Session {
     agent: Agent,
     #[allow(dead_code)] // WIP: intended for session expiry logic
     created_at: Instant,
@@ -273,7 +273,7 @@ pub struct Session {
 pub struct AcpServer {
     config: Config,
     acp_config: AcpServerConfig,
-    pub sessions: Arc<Mutex<HashMap<String, Arc<Mutex<Session>>>>>,
+    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<Session>>>>>,
     rpc: Arc<RpcOutbound>,
     /// Receiver for the writer task. Pulled out (replaced with `None`) the
     /// first time `run()` starts the writer loop.
@@ -558,7 +558,7 @@ impl AcpServer {
         }))
     }
 
-    pub async fn handle_session_new(&self, params: &Value) -> RpcResult {
+    async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let mut sessions = self.sessions.lock().await;
 
         if sessions.len() >= self.acp_config.max_sessions {
@@ -848,7 +848,7 @@ impl AcpServer {
     ///
     /// Returns an empty object on success, or SESSION_NOT_FOUND if the session
     /// is not in the in-memory map (it may still exist in the store).
-    pub async fn handle_session_close(&self, params: &Value) -> RpcResult {
+    async fn handle_session_close(&self, params: &Value) -> RpcResult {
         let session_id = params
             .get("sessionId")
             .or_else(|| params.get("session_id"))
@@ -1503,11 +1503,11 @@ fn history_notifications_for_message(
 // ── Error helper ─────────────────────────────────────────────────
 
 #[derive(Debug)]
-pub struct RpcError {
-    pub code: i32,
-    pub message: String,
+struct RpcError {
+    code: i32,
+    message: String,
     #[allow(dead_code)] // JSON-RPC spec field, used for structured error data
-    pub data: Option<Value>,
+    data: Option<Value>,
 }
 
 type RpcResult = std::result::Result<Value, RpcError>;
@@ -2442,6 +2442,56 @@ mod tests {
             writer_rx.try_recv().is_err(),
             "session/resume must not emit session/update notifications"
         );
+    }
+
+    #[tokio::test]
+    async fn session_close_releases_memory_but_keeps_store_record() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap(),
+        );
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+
+        let new_result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = new_result["sessionId"].as_str().unwrap().to_string();
+
+        assert!(server.sessions.lock().await.contains_key(&session_id));
+
+        let result = server
+            .handle_session_close(&serde_json::json!({ "sessionId": &session_id }))
+            .await
+            .expect("session/close must succeed");
+
+        assert_eq!(result, serde_json::json!({}));
+
+        // Session gone from in-memory map
+        assert!(!server.sessions.lock().await.contains_key(&session_id));
+
+        // Session record still on disk
+        let data = store.load_session(&session_id).unwrap();
+        assert!(data.is_some(), "session/close must not delete the DB record");
+    }
+
+    #[tokio::test]
+    async fn session_close_returns_not_found_for_unknown_session() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = AcpServer::new(make_test_config(cwd.path()), AcpServerConfig::default());
+
+        let err = server
+            .handle_session_close(&serde_json::json!({ "sessionId": "ghost" }))
+            .await
+            .expect_err("unknown session must fail");
+
+        assert_eq!(err.code, SESSION_NOT_FOUND);
     }
 
 }
