@@ -31,9 +31,12 @@
 //!
 //! - `CLAUDE_CODE_PATH` — override the path to the `claude` binary (default: `"claude"`)
 
-use crate::traits::{ChatMessage, ChatRequest, ChatResponse, Provider, TokenUsage};
+use crate::traits::{
+    ChatMessage, ChatRequest, ChatResponse, Provider, ProviderCapabilities, TokenUsage,
+};
 use async_trait::async_trait;
-use std::path::PathBuf;
+use base64::Engine as _;
+use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
@@ -206,6 +209,304 @@ impl ClaudeCodeProvider {
 
         Ok((raw.trim().to_string(), None))
     }
+
+    /// Fold a multi-turn message slice into one user prompt string, mirroring
+    /// the format expected by `claude --print` text input. Image markers are
+    /// stripped from each user message; the data is forwarded as separate
+    /// content blocks via [`Self::invoke_cli_with_images`].
+    fn fold_messages_into_prompt(messages: &[ChatMessage]) -> (Option<String>, String) {
+        let system = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.clone());
+
+        let turns: Vec<&ChatMessage> = messages.iter().filter(|m| m.role != "system").collect();
+
+        let prompt = if turns.len() <= 1 {
+            turns
+                .first()
+                .map(|m| Self::strip_image_markers_for_text(&m.content))
+                .unwrap_or_default()
+        } else {
+            let mut parts = Vec::with_capacity(turns.len() + 1);
+            for msg in &turns {
+                let label = match msg.role.as_str() {
+                    "user" => "[user]",
+                    "assistant" => "[assistant]",
+                    other => other,
+                };
+                let body = if msg.role == "user" {
+                    Self::strip_image_markers_for_text(&msg.content)
+                } else {
+                    msg.content.clone()
+                };
+                parts.push(format!("{label}\n{body}"));
+            }
+            parts.push("[assistant]".to_string());
+            parts.join("\n\n")
+        };
+
+        (system, prompt)
+    }
+
+    /// Remove `[IMAGE:...]` markers from a user message but keep surrounding
+    /// text (caption, prior turn body) intact. The base64 / file path payloads
+    /// would only inflate the prompt — actual image data flows through
+    /// streaming JSON content blocks.
+    fn strip_image_markers_for_text(content: &str) -> String {
+        crate::multimodal::parse_image_markers(content).0
+    }
+
+    /// Collect image references from the **latest** user message only.
+    ///
+    /// Each `claude --print` invocation is stateless: there's no API-side
+    /// prompt cache that would amortise older image content blocks across
+    /// turns, so re-attaching prior images on every turn would re-pay the
+    /// full input-token cost of each base64 payload — eventually crossing
+    /// the CLI's input cap and erroring out. The assistant's prior textual
+    /// reply already carries the relevant context; if the user wants to
+    /// reference an older image again they can re-share it.
+    fn collect_image_refs(messages: &[ChatMessage]) -> Vec<String> {
+        messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| crate::multimodal::parse_image_markers(&m.content).1)
+            .unwrap_or_default()
+    }
+
+    /// Decode an image marker payload into `(media_type, base64_data)`.
+    /// Accepts `data:` URIs (already base64) and absolute file paths
+    /// (loaded and base64-encoded here).
+    async fn decode_image_ref(image_ref: &str) -> anyhow::Result<(String, String)> {
+        let trimmed = image_ref.trim();
+        if let Some(rest) = trimmed.strip_prefix("data:") {
+            let comma = rest
+                .find(',')
+                .ok_or_else(|| anyhow::anyhow!("data URI missing payload separator"))?;
+            let header = &rest[..comma];
+            if !header.contains(";base64") {
+                anyhow::bail!("Claude Code provider only accepts base64 data URIs");
+            }
+            let mime = header
+                .split(';')
+                .next()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("data URI missing media type"))?;
+            let payload = rest[comma + 1..].trim().to_string();
+            return Ok((mime, payload));
+        }
+
+        let path = Path::new(trimmed);
+        if !path.is_absolute() || !path.is_file() {
+            anyhow::bail!(
+                "Claude Code provider cannot resolve image reference '{image_ref}': \
+                 expected a `data:` URI or an absolute file path"
+            );
+        }
+        let bytes = tokio::fs::read(path).await?;
+        let mime = Self::mime_for_path(path, &bytes).ok_or_else(|| {
+            anyhow::anyhow!("Unsupported image type for {image_ref}; expected png/jpeg/gif/webp")
+        })?;
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok((mime, data))
+    }
+
+    fn mime_for_path(path: &Path, bytes: &[u8]) -> Option<String> {
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            match ext.to_ascii_lowercase().as_str() {
+                "png" => return Some("image/png".to_string()),
+                "jpg" | "jpeg" => return Some("image/jpeg".to_string()),
+                "gif" => return Some("image/gif".to_string()),
+                "webp" => return Some("image/webp".to_string()),
+                _ => {}
+            }
+        }
+        if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+            return Some("image/png".to_string());
+        }
+        if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            return Some("image/jpeg".to_string());
+        }
+        if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            return Some("image/gif".to_string());
+        }
+        if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+            return Some("image/webp".to_string());
+        }
+        None
+    }
+
+    /// Build the single-line streaming-JSON user message that Claude Code's
+    /// `--input-format stream-json` consumes. Text comes first, then each
+    /// image as a `base64` source block in conversation order.
+    async fn build_stream_json_user_message(
+        prompt_text: &str,
+        image_refs: &[String],
+    ) -> anyhow::Result<String> {
+        let mut content: Vec<serde_json::Value> = Vec::with_capacity(image_refs.len() + 1);
+        if !prompt_text.is_empty() {
+            content.push(serde_json::json!({ "type": "text", "text": prompt_text }));
+        }
+        for image_ref in image_refs {
+            let (mime, data) = Self::decode_image_ref(image_ref).await?;
+            content.push(serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": mime, "data": data },
+            }));
+        }
+        if content.is_empty() {
+            anyhow::bail!("Claude Code stream-json payload would be empty");
+        }
+        let envelope = serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": content },
+        });
+        Ok(serde_json::to_string(&envelope)?)
+    }
+
+    /// Run claude in agent mode with stream-json input/output. Returns the
+    /// final result text and usage metadata extracted from the terminal
+    /// `{"type":"result"}` event in the JSONL stream.
+    async fn invoke_cli_with_images(
+        &self,
+        prompt_text: &str,
+        image_refs: &[String],
+        model: &str,
+        system_prompt: Option<&str>,
+    ) -> anyhow::Result<(String, Option<TokenUsage>)> {
+        let stdin_payload = Self::build_stream_json_user_message(prompt_text, image_refs).await?;
+
+        let mut cmd = Command::new(&self.binary_path);
+        cmd.arg("--print");
+        cmd.arg("--dangerously-skip-permissions");
+        cmd.arg("--input-format").arg("stream-json");
+        cmd.arg("--output-format").arg("stream-json");
+        cmd.arg("--verbose");
+
+        if Self::should_forward_model(model) {
+            cmd.arg("--model").arg(model);
+        }
+
+        if let Some(sp) = system_prompt
+            && !sp.is_empty()
+        {
+            cmd.arg("--append-system-prompt").arg(sp);
+        }
+
+        cmd.kill_on_drop(true);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|err| {
+            anyhow::anyhow!(
+                "Failed to spawn Claude Code binary at {}: {err}. \
+                 Ensure `claude` is installed and in PATH, or set CLAUDE_CODE_PATH.",
+                self.binary_path.display()
+            )
+        })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(stdin_payload.as_bytes())
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!("Failed to write stream-json payload to Claude Code: {err}")
+                })?;
+            stdin.write_all(b"\n").await.ok();
+            stdin.shutdown().await.map_err(|err| {
+                anyhow::anyhow!("Failed to finalize Claude Code stdin stream: {err}")
+            })?;
+        }
+
+        let output = timeout(CLAUDE_CODE_REQUEST_TIMEOUT, child.wait_with_output())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Claude Code request timed out after {:?} (binary: {})",
+                    CLAUDE_CODE_REQUEST_TIMEOUT,
+                    self.binary_path.display()
+                )
+            })?
+            .map_err(|err| anyhow::anyhow!("Claude Code process failed: {err}"))?;
+
+        if !output.status.success() {
+            let code = output.status.code().unwrap_or(-1);
+            let stderr_excerpt = Self::redact_stderr(&output.stderr);
+            let stderr_note = if stderr_excerpt.is_empty() {
+                String::new()
+            } else {
+                format!(" Stderr: {stderr_excerpt}")
+            };
+            anyhow::bail!(
+                "Claude Code exited with non-zero status {code} (stream-json mode).{stderr_note}"
+            );
+        }
+
+        let raw = String::from_utf8(output.stdout)
+            .map_err(|err| anyhow::anyhow!("Claude Code produced non-UTF-8 output: {err}"))?;
+
+        Self::parse_stream_json_result(&raw)
+    }
+
+    /// Scan stream-json output for the terminal `{"type":"result"}` event.
+    /// The CLI emits init/assistant/rate_limit/result events as JSONL; only
+    /// the result line carries the final text plus token usage. Surfacing the
+    /// `is_error` field as a hard error keeps a silent partial response from
+    /// being treated as success.
+    fn parse_stream_json_result(raw: &str) -> anyhow::Result<(String, Option<TokenUsage>)> {
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if value.get("type").and_then(|t| t.as_str()) != Some("result") {
+                continue;
+            }
+            if value.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
+                let detail = value
+                    .get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("(no detail)");
+                anyhow::bail!("Claude Code returned an error result: {detail}");
+            }
+            let text = value
+                .get("result")
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let usage = value.get("usage").map(|u| TokenUsage {
+                input_tokens: u.get("input_tokens").and_then(|v| v.as_u64()),
+                output_tokens: u.get("output_tokens").and_then(|v| v.as_u64()),
+                cached_input_tokens: u.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+            });
+            return Ok((text, usage));
+        }
+        anyhow::bail!("Claude Code stream-json output did not include a terminal `result` event");
+    }
+
+    async fn dispatch_messages(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+    ) -> anyhow::Result<(String, Option<TokenUsage>)> {
+        let (system, prompt) = Self::fold_messages_into_prompt(messages);
+        let images = Self::collect_image_refs(messages);
+        if images.is_empty() {
+            self.invoke_cli(&prompt, model, system.as_deref(), true)
+                .await
+        } else {
+            self.invoke_cli_with_images(&prompt, &images, model, system.as_deref())
+                .await
+        }
+    }
 }
 
 impl Default for ClaudeCodeProvider {
@@ -216,6 +517,14 @@ impl Default for ClaudeCodeProvider {
 
 #[async_trait]
 impl Provider for ClaudeCodeProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: false,
+            vision: true,
+            prompt_caching: false,
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -226,7 +535,11 @@ impl Provider for ClaudeCodeProvider {
         let temperature = temperature.unwrap_or(self.default_temperature());
         Self::validate_temperature(temperature)?;
 
-        let (text, _usage) = self.invoke_cli(message, model, system_prompt, true).await?;
+        let messages = match system_prompt {
+            Some(sp) if !sp.is_empty() => vec![ChatMessage::system(sp), ChatMessage::user(message)],
+            _ => vec![ChatMessage::user(message)],
+        };
+        let (text, _usage) = self.dispatch_messages(&messages, model).await?;
         Ok(text)
     }
 
@@ -239,30 +552,7 @@ impl Provider for ClaudeCodeProvider {
         let temperature = temperature.unwrap_or(self.default_temperature());
         Self::validate_temperature(temperature)?;
 
-        let system = messages
-            .iter()
-            .find(|m| m.role == "system")
-            .map(|m| m.content.as_str());
-
-        let turns: Vec<&ChatMessage> = messages.iter().filter(|m| m.role != "system").collect();
-
-        let user_message = if turns.len() <= 1 {
-            turns.first().map(|m| m.content.clone()).unwrap_or_default()
-        } else {
-            let mut parts = Vec::new();
-            for msg in &turns {
-                let label = match msg.role.as_str() {
-                    "user" => "[user]",
-                    "assistant" => "[assistant]",
-                    other => other,
-                };
-                parts.push(format!("{label}\n{}", msg.content));
-            }
-            parts.push("[assistant]".to_string());
-            parts.join("\n\n")
-        };
-
-        let (text, _usage) = self.invoke_cli(&user_message, model, system, true).await?;
+        let (text, _usage) = self.dispatch_messages(messages, model).await?;
         Ok(text)
     }
 
@@ -275,35 +565,7 @@ impl Provider for ClaudeCodeProvider {
         let temperature = temperature.unwrap_or(self.default_temperature());
         Self::validate_temperature(temperature)?;
 
-        let system = request
-            .messages
-            .iter()
-            .find(|m| m.role == "system")
-            .map(|m| m.content.as_str());
-
-        let turns: Vec<&ChatMessage> = request
-            .messages
-            .iter()
-            .filter(|m| m.role != "system")
-            .collect();
-
-        let user_message = if turns.len() <= 1 {
-            turns.first().map(|m| m.content.clone()).unwrap_or_default()
-        } else {
-            let mut parts = Vec::new();
-            for msg in &turns {
-                let label = match msg.role.as_str() {
-                    "user" => "[user]",
-                    "assistant" => "[assistant]",
-                    other => other,
-                };
-                parts.push(format!("{label}\n{}", msg.content));
-            }
-            parts.push("[assistant]".to_string());
-            parts.join("\n\n")
-        };
-
-        let (text, usage) = self.invoke_cli(&user_message, model, system, true).await?;
+        let (text, usage) = self.dispatch_messages(request.messages, model).await?;
 
         Ok(ChatResponse {
             text: Some(text),
@@ -552,5 +814,259 @@ mod tests {
             .chat_with_history(&messages, "default", Some(f64::NAN))
             .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn capabilities_declare_vision() {
+        let provider = ClaudeCodeProvider::new();
+        let caps = provider.capabilities();
+        assert!(caps.vision, "Claude Code supports image inputs in -p mode");
+        assert!(
+            !caps.native_tool_calling,
+            "Tool calls are handled by the CLI itself, not exposed via API"
+        );
+        assert!(provider.supports_vision());
+    }
+
+    #[test]
+    fn fold_messages_strips_image_markers_from_user_text() {
+        let messages = vec![
+            ChatMessage::system("Be helpful."),
+            ChatMessage::user("Look at [IMAGE:/tmp/photo.jpg] and summarize"),
+        ];
+        let (system, prompt) = ClaudeCodeProvider::fold_messages_into_prompt(&messages);
+        assert_eq!(system.as_deref(), Some("Be helpful."));
+        assert!(
+            !prompt.contains("[IMAGE:"),
+            "image marker leaked into folded prompt: {prompt}"
+        );
+        assert!(prompt.contains("summarize"));
+    }
+
+    #[test]
+    fn fold_messages_preserves_assistant_turn_text() {
+        let messages = vec![
+            ChatMessage::user("First [IMAGE:/tmp/a.png]"),
+            ChatMessage::assistant("Saw a cat."),
+            ChatMessage::user("Now this [IMAGE:/tmp/b.png]"),
+        ];
+        let (_, prompt) = ClaudeCodeProvider::fold_messages_into_prompt(&messages);
+        assert!(prompt.contains("[user]\nFirst"));
+        assert!(prompt.contains("[assistant]\nSaw a cat."));
+        assert!(prompt.contains("[user]\nNow this"));
+        assert!(prompt.ends_with("[assistant]"));
+        assert!(!prompt.contains("[IMAGE:"));
+    }
+
+    #[test]
+    fn collect_image_refs_only_pulls_from_latest_user_message() {
+        let messages = vec![
+            ChatMessage::user("Old [IMAGE:/tmp/old.png]"),
+            ChatMessage::assistant("Saw an old picture."),
+            ChatMessage::user("New [IMAGE:/tmp/new.png] also [IMAGE:/tmp/extra.jpg]"),
+        ];
+        let refs = ClaudeCodeProvider::collect_image_refs(&messages);
+        assert_eq!(
+            refs,
+            vec!["/tmp/new.png", "/tmp/extra.jpg"],
+            "older user messages must not contribute image content blocks — claude-code is \
+             stateless per invocation and re-sending old images on every turn would re-pay \
+             the full input-token cost"
+        );
+    }
+
+    #[test]
+    fn collect_image_refs_returns_empty_when_latest_user_message_has_no_images() {
+        let messages = vec![
+            ChatMessage::user("Old [IMAGE:/tmp/old.png]"),
+            ChatMessage::assistant("Saw the picture."),
+            ChatMessage::user("now a follow-up question, no new image"),
+        ];
+        let refs = ClaudeCodeProvider::collect_image_refs(&messages);
+        assert!(
+            refs.is_empty(),
+            "no image attached on the current turn → no image block should be sent, \
+             regardless of history: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn collect_image_refs_ignores_assistant_messages() {
+        let messages = vec![
+            ChatMessage::user("just text"),
+            ChatMessage::assistant("[IMAGE:/tmp/forged.png]"),
+        ];
+        let refs = ClaudeCodeProvider::collect_image_refs(&messages);
+        assert!(
+            refs.is_empty(),
+            "assistant messages must not contribute image content blocks: {refs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_image_ref_accepts_base64_data_uri() {
+        let payload = base64::engine::general_purpose::STANDARD.encode([0xff, 0xd8, 0xff]);
+        let uri = format!("data:image/jpeg;base64,{payload}");
+        let (mime, data) = ClaudeCodeProvider::decode_image_ref(&uri).await.unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(data, payload);
+    }
+
+    #[tokio::test]
+    async fn decode_image_ref_rejects_non_base64_data_uri() {
+        let result = ClaudeCodeProvider::decode_image_ref("data:image/png,raw").await;
+        let err = result.expect_err("non-base64 data URIs are unsupported");
+        assert!(
+            err.to_string().contains("base64"),
+            "error should explain the limitation: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_image_ref_rejects_relative_path() {
+        let result = ClaudeCodeProvider::decode_image_ref("relative/photo.png").await;
+        assert!(
+            result.is_err(),
+            "relative paths must be rejected to avoid CWD ambiguity"
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_image_ref_loads_local_png_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pixel.png");
+        let png_bytes: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&path, png_bytes).unwrap();
+
+        let path_str = path.to_str().unwrap();
+        let (mime, data) = ClaudeCodeProvider::decode_image_ref(path_str)
+            .await
+            .unwrap();
+        assert_eq!(mime, "image/png");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        assert_eq!(decoded, png_bytes);
+    }
+
+    #[tokio::test]
+    async fn build_stream_json_user_message_contains_text_then_image_blocks() {
+        let payload = base64::engine::general_purpose::STANDARD.encode([0xff, 0xd8, 0xff]);
+        let uri = format!("data:image/jpeg;base64,{payload}");
+        let json_line = ClaudeCodeProvider::build_stream_json_user_message(
+            "describe",
+            std::slice::from_ref(&uri),
+        )
+        .await
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&json_line).unwrap();
+        assert_eq!(value["type"], "user");
+        assert_eq!(value["message"]["role"], "user");
+
+        let content = value["message"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "describe");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(content[1]["source"]["data"], payload);
+    }
+
+    #[tokio::test]
+    async fn build_stream_json_user_message_omits_text_block_when_prompt_empty() {
+        let payload = base64::engine::general_purpose::STANDARD.encode([0xff, 0xd8, 0xff]);
+        let uri = format!("data:image/jpeg;base64,{payload}");
+        let json_line = ClaudeCodeProvider::build_stream_json_user_message("", &[uri])
+            .await
+            .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&json_line).unwrap();
+        let content = value["message"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image");
+    }
+
+    #[tokio::test]
+    async fn build_stream_json_user_message_rejects_empty_input() {
+        let result = ClaudeCodeProvider::build_stream_json_user_message("", &[]).await;
+        assert!(
+            result.is_err(),
+            "must reject building a request with neither text nor images"
+        );
+    }
+
+    #[test]
+    fn parse_stream_json_result_extracts_terminal_event() {
+        let raw = "\
+{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"abc\"}
+{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"partial\"}]}}
+{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"A blue test image with text.\",\"usage\":{\"input_tokens\":12,\"output_tokens\":34,\"cache_read_input_tokens\":56}}";
+        let (text, usage) = ClaudeCodeProvider::parse_stream_json_result(raw).unwrap();
+        assert_eq!(text, "A blue test image with text.");
+        let u = usage.expect("usage block should be present");
+        assert_eq!(u.input_tokens, Some(12));
+        assert_eq!(u.output_tokens, Some(34));
+        assert_eq!(u.cached_input_tokens, Some(56));
+    }
+
+    #[test]
+    fn parse_stream_json_result_surfaces_is_error_true() {
+        let raw = "{\"type\":\"result\",\"is_error\":true,\"result\":\"rate limited\"}";
+        let err = ClaudeCodeProvider::parse_stream_json_result(raw).unwrap_err();
+        assert!(err.to_string().contains("rate limited"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_stream_json_result_errors_when_no_terminal_event_present() {
+        let raw = "{\"type\":\"system\",\"subtype\":\"init\"}";
+        let err = ClaudeCodeProvider::parse_stream_json_result(raw).unwrap_err();
+        assert!(err.to_string().contains("terminal"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_stream_json_result_skips_malformed_lines_between_events() {
+        let raw = "\
+{\"type\":\"system\",\"subtype\":\"init\"}
+not-json-at-all
+{\"type\":\"result\",\"is_error\":false,\"result\":\"hi\"}";
+        let (text, _) = ClaudeCodeProvider::parse_stream_json_result(raw).unwrap();
+        assert_eq!(text, "hi");
+    }
+
+    #[tokio::test]
+    async fn dispatch_messages_routes_to_text_path_when_no_images() {
+        let _lock = script_mutex().lock().await;
+        let provider = echo_provider();
+        let messages = vec![ChatMessage::user("plain text only")];
+        let (text, _) = provider
+            .dispatch_messages(&messages, "default")
+            .await
+            .unwrap();
+        assert_eq!(text, "plain text only");
+        assert!(
+            !text.contains("\"type\":\"user\""),
+            "no-image case must not switch to stream-json envelope: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_messages_emits_stream_json_envelope_with_image() {
+        let _lock = script_mutex().lock().await;
+        let provider = echo_provider();
+        let payload = base64::engine::general_purpose::STANDARD.encode([0xff, 0xd8, 0xff]);
+        let uri = format!("data:image/jpeg;base64,{payload}");
+        let messages = vec![ChatMessage::user(format!("see [IMAGE:{uri}]"))];
+
+        let result = provider.dispatch_messages(&messages, "default").await;
+        let err = result.expect_err(
+            "echo provider does not emit a result event, so parse should fail — the test \
+             assertion is on the error message, not success",
+        );
+        assert!(
+            err.to_string().contains("terminal"),
+            "expected terminal-event error from echoed payload: {err}"
+        );
     }
 }
