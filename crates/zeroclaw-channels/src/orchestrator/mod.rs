@@ -13019,5 +13019,4 @@ This is an example JSON object for profile settings."#;
         assert!(prompt_b.contains("sender=user_bbb"));
         assert_ne!(prompt_a, prompt_b);
     }
-
 }

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 use zeroclaw_api::provider::ConversationMessage;
 
@@ -21,8 +21,7 @@ pub struct AcpSessionData {
 impl AcpSessionStore {
     pub fn new(workspace_dir: &Path) -> Result<Self> {
         let sessions_dir = workspace_dir.join("sessions");
-        std::fs::create_dir_all(&sessions_dir)
-            .context("Failed to create sessions directory")?;
+        std::fs::create_dir_all(&sessions_dir).context("Failed to create sessions directory")?;
         let db_path = sessions_dir.join("acp-sessions.db");
 
         let conn = Connection::open(&db_path)
@@ -123,7 +122,9 @@ impl AcpSessionStore {
                 Ok(json) => match serde_json::from_str::<ConversationMessage>(&json) {
                     Ok(msg) => Some(msg),
                     Err(e) => {
-                        tracing::warn!("Skipping corrupt ACP message for session {session_id}: {e}");
+                        tracing::warn!(
+                            "Skipping corrupt ACP message for session {session_id}: {e}"
+                        );
                         None
                     }
                 },
@@ -238,7 +239,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = AcpSessionStore::new(tmp.path()).unwrap();
 
-        store.create_session("sess-abc", "/home/user/project").unwrap();
+        store
+            .create_session("sess-abc", "/home/user/project")
+            .unwrap();
 
         let data = store.load_session("sess-abc").unwrap().unwrap();
         assert_eq!(data.workspace_dir, "/home/user/project");
@@ -266,8 +269,12 @@ mod tests {
 
         let data = store.load_session("sess-msgs").unwrap().unwrap();
         assert_eq!(data.messages.len(), 2);
-        assert!(matches!(&data.messages[0], ConversationMessage::Chat(m) if m.role == "user" && m.content == "hello"));
-        assert!(matches!(&data.messages[1], ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi"));
+        assert!(
+            matches!(&data.messages[0], ConversationMessage::Chat(m) if m.role == "user" && m.content == "hello")
+        );
+        assert!(
+            matches!(&data.messages[1], ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi")
+        );
     }
 
     #[test]
@@ -299,8 +306,12 @@ mod tests {
 
         let data = store.load_session("sess-variants").unwrap().unwrap();
         assert_eq!(data.messages.len(), 4);
-        assert!(matches!(&data.messages[1], ConversationMessage::AssistantToolCalls { tool_calls, .. } if tool_calls[0].id == "tc-1"));
-        assert!(matches!(&data.messages[2], ConversationMessage::ToolResults(r) if r[0].content == "file.txt\n"));
+        assert!(
+            matches!(&data.messages[1], ConversationMessage::AssistantToolCalls { tool_calls, .. } if tool_calls[0].id == "tc-1")
+        );
+        assert!(
+            matches!(&data.messages[2], ConversationMessage::ToolResults(r) if r[0].content == "file.txt\n")
+        );
     }
 
     #[test]
@@ -321,7 +332,11 @@ mod tests {
         let store = AcpSessionStore::new(tmp.path()).unwrap();
         store.create_session("sess-activity", "/tmp/proj").unwrap();
 
-        let before = store.load_session("sess-activity").unwrap().unwrap().last_activity;
+        let before = store
+            .load_session("sess-activity")
+            .unwrap()
+            .unwrap()
+            .last_activity;
 
         // Brief sleep to ensure timestamp advances
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -329,7 +344,11 @@ mod tests {
         let msg = ConversationMessage::Chat(zeroclaw_api::provider::ChatMessage::user("hi"));
         store.append_turn("sess-activity", &[msg]).unwrap();
 
-        let after = store.load_session("sess-activity").unwrap().unwrap().last_activity;
+        let after = store
+            .load_session("sess-activity")
+            .unwrap()
+            .unwrap()
+            .last_activity;
         assert!(after >= before);
     }
 
@@ -393,10 +412,18 @@ mod tests {
         let store = AcpSessionStore::new(tmp.path()).unwrap();
         store.create_session("sess-touch", "/tmp/proj").unwrap();
 
-        let before = store.load_session("sess-touch").unwrap().unwrap().last_activity;
+        let before = store
+            .load_session("sess-touch")
+            .unwrap()
+            .unwrap()
+            .last_activity;
         std::thread::sleep(std::time::Duration::from_millis(10));
         store.touch_session("sess-touch").unwrap();
-        let after = store.load_session("sess-touch").unwrap().unwrap().last_activity;
+        let after = store
+            .load_session("sess-touch")
+            .unwrap()
+            .unwrap()
+            .last_activity;
 
         assert!(after >= before);
     }

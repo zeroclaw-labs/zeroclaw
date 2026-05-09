@@ -29,8 +29,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
-use zeroclaw_config::schema::Config;
 use zeroclaw_api::provider::ConversationMessage;
+use zeroclaw_config::schema::Config;
 use zeroclaw_infra::acp_session_store::AcpSessionStore;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
 
@@ -701,17 +701,14 @@ impl AcpServer {
         let workspace_dir = std::fs::canonicalize(&requested_cwd)
             .unwrap_or_else(|_| std::path::PathBuf::from(&data.workspace_dir));
 
-        let mut agent = Agent::from_config_with_session_cwd_and_mcp(
-            &self.config,
-            Some(&workspace_dir),
-            false,
-        )
-        .await
-        .map_err(|e| RpcError {
-            code: INTERNAL_ERROR,
-            message: format!("Failed to create agent: {e}"),
-            data: None,
-        })?;
+        let mut agent =
+            Agent::from_config_with_session_cwd_and_mcp(&self.config, Some(&workspace_dir), false)
+                .await
+                .map_err(|e| RpcError {
+                    code: INTERNAL_ERROR,
+                    message: format!("Failed to create agent: {e}"),
+                    data: None,
+                })?;
 
         agent.seed_conversation_history(data.messages.clone());
 
@@ -743,7 +740,10 @@ impl AcpServer {
             }
         }
 
-        debug!("Loaded session {session_id} ({} messages)", data.messages.len());
+        debug!(
+            "Loaded session {session_id} ({} messages)",
+            data.messages.len()
+        );
         Ok(Value::Null)
     }
 
@@ -801,17 +801,14 @@ impl AcpServer {
         let workspace_dir = std::fs::canonicalize(&requested_cwd)
             .unwrap_or_else(|_| std::path::PathBuf::from(&data.workspace_dir));
 
-        let mut agent = Agent::from_config_with_session_cwd_and_mcp(
-            &self.config,
-            Some(&workspace_dir),
-            false,
-        )
-        .await
-        .map_err(|e| RpcError {
-            code: INTERNAL_ERROR,
-            message: format!("Failed to create agent: {e}"),
-            data: None,
-        })?;
+        let mut agent =
+            Agent::from_config_with_session_cwd_and_mcp(&self.config, Some(&workspace_dir), false)
+                .await
+                .map_err(|e| RpcError {
+                    code: INTERNAL_ERROR,
+                    message: format!("Failed to create agent: {e}"),
+                    data: None,
+                })?;
 
         agent.seed_conversation_history(data.messages);
 
@@ -1456,8 +1453,8 @@ fn history_notifications_for_message(
         ConversationMessage::AssistantToolCalls { tool_calls, .. } => tool_calls
             .iter()
             .map(|tc| {
-                let args: serde_json::Value = serde_json::from_str(&tc.arguments)
-                    .unwrap_or(serde_json::Value::Null);
+                let args: serde_json::Value =
+                    serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
                 JsonRpcNotification {
                     jsonrpc: "2.0",
                     method: "session/update",
@@ -1622,9 +1619,8 @@ mod tests {
     #[test]
     fn initialize_advertises_load_session_when_store_present() {
         let cwd = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap(),
-        );
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let server = AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -1632,8 +1628,14 @@ mod tests {
         );
         let result = server.handle_initialize(&serde_json::json!({})).unwrap();
         assert_eq!(result["agentCapabilities"]["loadSession"], true);
-        assert_eq!(result["agentCapabilities"]["sessionCapabilities"]["resume"], true);
-        assert_eq!(result["agentCapabilities"]["sessionCapabilities"]["close"], true);
+        assert_eq!(
+            result["agentCapabilities"]["sessionCapabilities"]["resume"],
+            true
+        );
+        assert_eq!(
+            result["agentCapabilities"]["sessionCapabilities"]["close"],
+            true
+        );
     }
 
     #[test]
@@ -2038,9 +2040,8 @@ mod tests {
     #[tokio::test]
     async fn session_new_persists_to_store() {
         let cwd = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap(),
-        );
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let server = Arc::new(AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -2058,7 +2059,10 @@ mod tests {
 
         // Session must appear in the store
         let data = store.load_session(session_id).unwrap();
-        assert!(data.is_some(), "session/new must persist to AcpSessionStore");
+        assert!(
+            data.is_some(),
+            "session/new must persist to AcpSessionStore"
+        );
     }
 
     #[tokio::test]
@@ -2283,9 +2287,8 @@ mod tests {
     async fn session_load_restores_history_and_streams_notifications() {
         use zeroclaw_api::provider::{ChatMessage, ConversationMessage};
         let cwd = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap(),
-        );
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
 
         let session_id = "sess-load-test";
         store
@@ -2329,21 +2332,30 @@ mod tests {
         }
 
         // Expect two session/update notifications: user then assistant
-        assert_eq!(notifications.len(), 2, "expected 2 notifications, got: {notifications:?}");
+        assert_eq!(
+            notifications.len(),
+            2,
+            "expected 2 notifications, got: {notifications:?}"
+        );
         let n0: serde_json::Value = serde_json::from_str(&notifications[0]).unwrap();
-        assert_eq!(n0["params"]["update"]["sessionUpdate"], "user_message_chunk");
+        assert_eq!(
+            n0["params"]["update"]["sessionUpdate"],
+            "user_message_chunk"
+        );
         assert_eq!(n0["params"]["update"]["content"]["text"], "hello");
         let n1: serde_json::Value = serde_json::from_str(&notifications[1]).unwrap();
-        assert_eq!(n1["params"]["update"]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(
+            n1["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
         assert_eq!(n1["params"]["update"]["content"]["text"], "hi there");
     }
 
     #[tokio::test]
     async fn session_load_returns_not_found_for_unknown_id() {
         let cwd = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap(),
-        );
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
         let server = AcpServer::new_with_writer_and_store(
             make_test_config(cwd.path()),
@@ -2363,9 +2375,8 @@ mod tests {
     #[tokio::test]
     async fn session_load_rejects_already_active_session() {
         let cwd = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap(),
-        );
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
             make_test_config(cwd.path()),
@@ -2400,9 +2411,8 @@ mod tests {
     async fn session_resume_restores_without_replay() {
         use zeroclaw_api::provider::{ChatMessage, ConversationMessage};
         let cwd = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap(),
-        );
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
 
         let session_id = "sess-resume-test";
         store
@@ -2447,9 +2457,8 @@ mod tests {
     #[tokio::test]
     async fn session_close_releases_memory_but_keeps_store_record() {
         let cwd = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap(),
-        );
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let server = Arc::new(AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -2478,7 +2487,10 @@ mod tests {
 
         // Session record still on disk
         let data = store.load_session(&session_id).unwrap();
-        assert!(data.is_some(), "session/close must not delete the DB record");
+        assert!(
+            data.is_some(),
+            "session/close must not delete the DB record"
+        );
     }
 
     #[tokio::test]
@@ -2493,5 +2505,4 @@ mod tests {
 
         assert_eq!(err.code, SESSION_NOT_FOUND);
     }
-
 }

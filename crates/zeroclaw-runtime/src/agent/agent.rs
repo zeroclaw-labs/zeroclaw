@@ -449,7 +449,9 @@ impl Agent {
     /// and `ToolResults` — use this for ACP restore; use `seed_history` for flat
     /// channel session hydration.
     pub fn seed_conversation_history(&mut self, messages: Vec<ConversationMessage>) {
-        if self.history.is_empty() && let Ok(sys) = self.build_system_prompt() {
+        if self.history.is_empty()
+            && let Ok(sys) = self.build_system_prompt()
+        {
             self.history
                 .push(ConversationMessage::Chat(ChatMessage::system(sys)));
         }
@@ -2394,7 +2396,9 @@ mod tests {
 
     #[test]
     fn seed_conversation_history_preserves_tool_call_variants() {
-        use zeroclaw_api::provider::{ChatMessage, ConversationMessage, ToolCall, ToolResultMessage};
+        use zeroclaw_api::provider::{
+            ChatMessage, ConversationMessage, ToolCall, ToolResultMessage,
+        };
 
         let provider = Box::new(MockProvider {
             responses: Mutex::new(vec![]),
@@ -2449,8 +2453,12 @@ mod tests {
             .collect();
 
         assert_eq!(non_system.len(), 4);
-        assert!(matches!(non_system[1], ConversationMessage::AssistantToolCalls { tool_calls, .. } if tool_calls[0].id == "tc-1"));
-        assert!(matches!(non_system[2], ConversationMessage::ToolResults(r) if r[0].tool_call_id == "tc-1"));
+        assert!(
+            matches!(non_system[1], ConversationMessage::AssistantToolCalls { tool_calls, .. } if tool_calls[0].id == "tc-1")
+        );
+        assert!(
+            matches!(non_system[2], ConversationMessage::ToolResults(r) if r[0].tool_call_id == "tc-1")
+        );
     }
 
     /// Mock provider that captures whether tool specs were passed to `stream_chat`
