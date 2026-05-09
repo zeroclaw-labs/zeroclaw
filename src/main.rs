@@ -42,7 +42,112 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 use tracing::{info, warn};
+use tracing_subscriber::field::Visit;
+use tracing_subscriber::fmt::FormatFields;
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{EnvFilter, fmt};
+
+/// Custom tracing event formatter that prefixes each log line with
+/// the active agent's alias, e.g. `[default] starting agent loop`,
+/// `[research-bot] tool.call tool=glob_search`. When no
+/// `agent_alias` field is present anywhere in the span scope, the
+/// line is prefixed with `[system]` so boot, migration, and other
+/// install-wide messages are visually distinct from per-agent
+/// activity (#6272).
+struct AgentAliasFormatter {
+    inner: tracing_subscriber::fmt::format::Format<
+        tracing_subscriber::fmt::format::Full,
+        tracing_subscriber::fmt::time::SystemTime,
+    >,
+}
+
+impl AgentAliasFormatter {
+    fn new() -> Self {
+        Self {
+            inner: tracing_subscriber::fmt::format::Format::default(),
+        }
+    }
+}
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for AgentAliasFormatter
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        // Walk up the span stack looking for an `agent_alias` field.
+        // The agent loop binds it once at entry; SubAgent spawn sites
+        // and cron dispatch bind their own. The closest enclosing
+        // span wins, which is the right semantic for nested spans.
+        let alias = ctx.event_scope().and_then(|scope| {
+            // Default Scope iteration is leaf→root, so the first hit
+            // is the closest enclosing span — exactly the right
+            // semantic for nested SubAgent / cron spans.
+            scope.into_iter().find_map(|span| {
+                span.extensions()
+                    .get::<AgentAliasField>()
+                    .map(|f| f.alias.clone())
+            })
+        });
+
+        let label = alias.unwrap_or_else(|| "system".to_string());
+        write!(writer, "[{label}] ")?;
+        self.inner.format_event(ctx, writer, event)
+    }
+}
+
+/// Span extension carrying the agent_alias value extracted at
+/// span-creation time. Stored once in span extensions to avoid
+/// per-event field-walk overhead.
+#[derive(Clone)]
+struct AgentAliasField {
+    alias: String,
+}
+
+/// Layer that captures `agent_alias` field on span creation and
+/// stashes it in the span's extensions for the formatter to find.
+struct AgentAliasCaptureLayer;
+
+impl<S> tracing_subscriber::Layer<S> for AgentAliasCaptureLayer
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct AliasVisitor {
+            alias: Option<String>,
+        }
+        impl Visit for AliasVisitor {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "agent_alias" || field.name() == "parent_alias" {
+                    self.alias = Some(value.to_string());
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "agent_alias" || field.name() == "parent_alias" {
+                    self.alias = Some(format!("{value:?}").trim_matches('"').to_string());
+                }
+            }
+        }
+        let mut visitor = AliasVisitor { alias: None };
+        attrs.record(&mut visitor);
+        if let Some(alias) = visitor.alias
+            && let Some(span) = ctx.span(id)
+        {
+            span.extensions_mut().insert(AgentAliasField { alias });
+        }
+    }
+}
 
 /// Decorate the value at `path` in `config.toml` with a leading `# {comment}`
 /// line, preserving any non-comment whitespace. Mirrors the gateway's
@@ -1255,12 +1360,15 @@ async fn main() -> Result<()> {
         "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn"
     };
 
+    use tracing_subscriber::layer::SubscriberExt;
     let subscriber = fmt::Subscriber::builder()
         .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level)),
         )
-        .finish();
+        .event_format(AgentAliasFormatter::new())
+        .finish()
+        .with(AgentAliasCaptureLayer);
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 

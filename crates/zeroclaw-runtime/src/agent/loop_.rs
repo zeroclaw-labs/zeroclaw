@@ -2095,6 +2095,10 @@ pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
 // and hard trimming to keep the context window bounded.
 
 #[allow(clippy::too_many_lines)]
+#[tracing::instrument(
+    skip_all,
+    fields(agent_alias = %agent_alias)
+)]
 pub async fn run(
     config: Config,
     agent_alias: &str,
@@ -3140,6 +3144,10 @@ pub async fn run(
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
+#[tracing::instrument(
+    skip_all,
+    fields(agent_alias = %agent_alias)
+)]
 pub async fn process_message(
     config: Config,
     agent_alias: &str,
