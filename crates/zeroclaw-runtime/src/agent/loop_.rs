@@ -49,7 +49,9 @@ use uuid::Uuid;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::provider::StreamEvent;
 use zeroclaw_config::schema::Config;
-use zeroclaw_memory::{self, Memory, MemoryCategory, decay};
+use zeroclaw_memory::{
+    self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, decay,
+};
 use zeroclaw_providers::multimodal;
 use zeroclaw_providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
@@ -363,7 +365,7 @@ async fn build_context(
             .collect();
 
         if !relevant.is_empty() {
-            context.push_str("[Memory context]\n");
+            let mut included = false;
             for entry in &relevant {
                 // Scheduled (cron / heartbeat) runs must not see chat-origin
                 // memories. The autosave-key checks below catch the agent's
@@ -391,12 +393,16 @@ async fn build_context(
                 if entry.content.contains("<tool_result") {
                     continue;
                 }
+                if !included {
+                    context.push_str(MEMORY_CONTEXT_OPEN);
+                    context.push('\n');
+                    included = true;
+                }
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
-            if context == "[Memory context]\n" {
-                context.clear();
-            } else {
-                context.push_str("[/Memory context]\n\n");
+            if included {
+                context.push_str(MEMORY_CONTEXT_CLOSE);
+                context.push_str("\n\n");
             }
         }
     }

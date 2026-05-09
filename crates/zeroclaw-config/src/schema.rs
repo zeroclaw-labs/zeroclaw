@@ -620,6 +620,39 @@ pub struct ModelProviderConfig {
     /// tool calling for Groq models that support it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
+    /// Enable or disable chain-of-thought thinking for models that support it
+    /// (e.g. Qwen3, GLM-4). `true` turns thinking on, `false` turns it off.
+    /// `None` (default) lets the model decide. Forwarded as `enable_thinking`
+    /// in the request body; mirrors the Ollama provider's `think` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
+    /// Arbitrary key/value pairs forwarded verbatim as `chat_template_kwargs`
+    /// in the request body (llama.cpp-specific). Use this to pass model-family
+    /// template variables that control behaviour not exposed by other fields.
+    /// Example (Qwen3 thinking suppression):
+    ///   `chat_template_kwargs = { enable_thinking = false }`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Override the Ollama `num_ctx` (context window, in tokens) sent on
+    /// every `/api/chat` request. Only consulted when this profile resolves
+    /// to the `ollama` provider. Defaults to the framework constant
+    /// (`OLLAMA_DEFAULT_NUM_CTX`) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_num_ctx: Option<u32>,
+    /// Override the Ollama `num_predict` (max output tokens) sent on every
+    /// `/api/chat` request. Only consulted when this profile resolves to
+    /// the `ollama` provider. Defaults to the framework constant
+    /// (`OLLAMA_DEFAULT_NUM_PREDICT`) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_num_predict: Option<i32>,
+    /// Force every Ollama `/api/chat` request to use this temperature,
+    /// overriding the per-call value passed through
+    /// `Provider::chat_with_system(.., temperature)`. When unset
+    /// (`None`, the default), the per-call temperature wins — full
+    /// backward compatibility. Only consulted when this profile
+    /// resolves to the `ollama` provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_temperature_override: Option<f64>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -7886,6 +7919,17 @@ pub struct NextcloudTalkConfig {
     /// If not set, defaults to an empty string (no self-message filtering by name).
     #[serde(default)]
     pub bot_name: Option<String>,
+    /// Controls whether and how streaming draft updates are delivered.
+    ///
+    /// - `"off"` (default) — responses are sent as a single final message.
+    /// - `"partial"` — a placeholder is posted first and edited incrementally
+    ///   as tokens arrive, making long responses visible in real time.
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+    /// Minimum interval in milliseconds between consecutive OCS edit calls per
+    /// room when `stream_mode = "partial"`. Default: 1000 ms.
+    #[serde(default = "default_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
 }
 
 impl ChannelConfig for NextcloudTalkConfig {
@@ -12477,6 +12521,36 @@ auto_save = true
     }
 
     #[test]
+    async fn model_provider_config_ollama_tuning_fields_roundtrip() {
+        let toml = r#"
+            ollama_num_ctx = 16384
+            ollama_num_predict = 4096
+            ollama_temperature_override = 0.5
+        "#;
+        let parsed: ModelProviderConfig = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.ollama_num_ctx, Some(16384));
+        assert_eq!(parsed.ollama_num_predict, Some(4096));
+        assert_eq!(parsed.ollama_temperature_override, Some(0.5));
+
+        let serialized = toml::to_string(&parsed).unwrap();
+        let reparsed: ModelProviderConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.ollama_num_ctx, Some(16384));
+        assert_eq!(reparsed.ollama_num_predict, Some(4096));
+        assert_eq!(reparsed.ollama_temperature_override, Some(0.5));
+    }
+
+    #[test]
+    async fn model_provider_config_ollama_tuning_fields_default_to_none() {
+        let toml = r#"
+            api_key = "sk-test"
+        "#;
+        let parsed: ModelProviderConfig = toml::from_str(toml).unwrap();
+        assert!(parsed.ollama_num_ctx.is_none());
+        assert!(parsed.ollama_num_predict.is_none());
+        assert!(parsed.ollama_temperature_override.is_none());
+    }
+
+    #[test]
     async fn channels_default() {
         let c = ChannelsConfig::default();
         assert!(c.cli);
@@ -16657,6 +16731,8 @@ group_policy = "disabled"
             allowed_users: vec!["user_a".into(), "*".into()],
             proxy_url: None,
             bot_name: None,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
 
         let json = serde_json::to_string(&nc).unwrap();

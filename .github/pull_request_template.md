@@ -4,7 +4,11 @@
 - **What changed and why:** (2–5 bullets — the diff shows *what*, you explain *why*)
 - **Scope boundary:** (what this PR explicitly does NOT change)
 - **Blast radius:** (what other subsystems or consumers could be affected)
-- **Linked issue(s):** `Closes #`, `Related #`, `Depends on #` (stacked), `Supersedes #` (replacing older PR)
+- **Linked issue(s):** Use plain text outside backticks. Use `Closes #`,
+  `Fixes #`, or `Resolves #` only for issues this PR fully resolves. Use
+  `Related #`, `Depends on #`, or `Supersedes #` for non-closing relationships.
+- **Labels:** Snapshot the current GitHub labels after labels are applied, for
+  example `type: docs`, `risk: low`, `size: S`, `docs`.
 
 ## Validation Evidence (required)
 
@@ -57,8 +61,11 @@ Medium/high-risk PRs must fill:
 
 ---
 
-**Labels** live in the GitHub label UI, not in the body. Set `risk:*`, `size:*`, and scope labels via the sidebar. Auto-label corrections: add `risk: manual` and the intended label.
+**Labels** live in the GitHub label UI, not in the body. Maintainers and reviewers with label permissions set `risk:*`, `size:*`, and scope labels via the sidebar. If auto-labels need correction, add `risk: manual` and the intended label. Contributors without label permission can note the mismatch in a comment.
 
-**Commit trailers** capture AI-assisted collaboration (`Co-Authored-By: Claude ...`) — no separate section needed.
+**Do not add bot/AI attribution footers** such as `Co-authored-by: Claude ...`
+or `Created with Claude Code` to the PR body or commit-message tail. Human
+co-author trailers are appropriate only for incorporated contributor work under
+the supersede-attribution section and privacy contract.
 
 **Privacy contract** (`docs/book/src/contributing/privacy.md`) is a merge gate. Never commit real identities, secrets, personal emails, or PII in diff, tests, fixtures, or docs.

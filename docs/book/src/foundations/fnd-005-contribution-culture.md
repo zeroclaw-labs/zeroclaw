@@ -174,10 +174,10 @@ patterns to repeat. Generic praise ("great work!") teaches nothing. Specific pra
 this logic in isolation without standing up the whole agent loop") teaches the principle
 and reinforces the decision.
 
-**Use the feedback taxonomy.** The four-bucket model in Section 5 gives every comment a
-clear weight. Reviewers who mix blocking issues with minor suggestions without
-distinguishing between them force the author to guess which things actually need to
-change. Do not make people guess.
+**Use the feedback taxonomy.** The taxonomy in Section 5 gives every comment a clear
+weight. Reviewers who mix blocking issues with minor suggestions without distinguishing
+between them force the author to guess which things actually need to change. Do not make
+people guess.
 
 ---
 
@@ -522,8 +522,15 @@ work and explain why. That combination is rare. It is worth taking seriously.
 
 ## 5. The feedback taxonomy
 
-Every review comment on this project carries one of four weights. Using them consistently
-means reviewers communicate clearly and authors know exactly what requires action.
+Every review comment on this project carries an explicit weight. Using those weights
+consistently means reviewers communicate clearly and authors know exactly what requires
+action.
+
+The categories below describe the project's review intent. PR reviews render
+that intent through the review protocol's emoji headings: 🔴 blocking,
+🟡 warning, 🔵 suggestion, 🟢 praise, and ✅ resolved. Use
+`docs/book/src/contributing/pr-review-protocol.md` for the exact PR-review
+format.
 
 ---
 

@@ -18,6 +18,12 @@ const MAX_LINE_BYTES: usize = 4 * 1024 * 1024; // 4 MB
 /// Timeout for init/list operations.
 const RECV_TIMEOUT_SECS: u64 = 30;
 
+/// Legacy default HTTP request timeout for non-tool MCP HTTP/SSE requests.
+const DEFAULT_HTTP_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+/// JSON-RPC method name for MCP tool calls.
+const TOOLS_CALL_METHOD: &str = "tools/call";
+
 /// Streamable HTTP Accept header required by MCP HTTP transport.
 const MCP_STREAMABLE_ACCEPT: &str = "application/json, text/event-stream";
 
@@ -25,6 +31,39 @@ const MCP_STREAMABLE_ACCEPT: &str = "application/json, text/event-stream";
 const MCP_JSON_CONTENT_TYPE: &str = "application/json";
 /// Streamable HTTP session header used to preserve MCP server state.
 const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
+
+fn http_request_timeout_secs(
+    request: &JsonRpcRequest,
+    tool_timeout_secs: Option<u64>,
+) -> Option<u64> {
+    if request.method == TOOLS_CALL_METHOD {
+        tool_timeout_secs
+    } else {
+        Some(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS)
+    }
+}
+
+fn http_sse_read_timeout_secs(
+    request: &JsonRpcRequest,
+    tool_timeout_secs: Option<u64>,
+) -> Option<u64> {
+    if request.method == TOOLS_CALL_METHOD {
+        tool_timeout_secs
+    } else {
+        Some(RECV_TIMEOUT_SECS)
+    }
+}
+
+fn apply_request_timeout(
+    req: reqwest::RequestBuilder,
+    timeout_secs: Option<u64>,
+) -> reqwest::RequestBuilder {
+    if let Some(timeout_secs) = timeout_secs {
+        req.timeout(Duration::from_secs(timeout_secs))
+    } else {
+        req
+    }
+}
 
 // ── Transport Trait ──────────────────────────────────────────────────────
 
@@ -149,21 +188,14 @@ impl McpTransportConn for StdioTransport {
 /// HTTP-based transport (POST requests).
 pub struct HttpTransport {
     url: String,
-    /// Per-server tool-call SSE read timeout, from `McpServerConfig.tool_timeout_secs`.
-    /// `None` falls back to `RECV_TIMEOUT_SECS` for init/list operations.
-    /// Also drives the reqwest client-wide timeout via `http_client_timeout_secs`
-    /// so the client never fires before the configured per-call budget.
+    /// Per-server tool-call timeout, from `McpServerConfig.tool_timeout_secs`.
+    /// Non-tool requests keep the legacy HTTP request timeout and short SSE
+    /// read timeout. Tool calls use the configured budget when present; when
+    /// absent, the client layer's outer tool-call timeout owns the budget.
     tool_timeout_secs: Option<u64>,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
     session_id: Option<String>,
-}
-
-/// Compute the reqwest client-wide timeout so it never undercuts the configured
-/// tool budget. The client timeout must be at least as large as `tool_timeout_secs`
-/// so it does not fire before the per-call SSE read wrapper.
-fn http_client_timeout_secs(tool_timeout_secs: Option<u64>) -> u64 {
-    tool_timeout_secs.unwrap_or(120).max(120)
 }
 
 impl HttpTransport {
@@ -175,9 +207,6 @@ impl HttpTransport {
             .clone();
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(http_client_timeout_secs(
-                config.tool_timeout_secs,
-            )))
             .build()
             .context("failed to build HTTP client")?;
 
@@ -224,7 +253,10 @@ impl McpTransportConn for HttpTransport {
             .keys()
             .any(|k| k.eq_ignore_ascii_case("Content-Type"));
 
-        let mut req = self.client.post(&self.url).body(body);
+        let mut req = apply_request_timeout(
+            self.client.post(&self.url).body(body),
+            http_request_timeout_secs(request, self.tool_timeout_secs),
+        );
         if !has_content_type {
             req = req.header("Content-Type", MCP_JSON_CONTENT_TYPE);
         }
@@ -262,13 +294,16 @@ impl McpTransportConn for HttpTransport {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
         if is_sse {
-            let sse_timeout = self.tool_timeout_secs.unwrap_or(RECV_TIMEOUT_SECS);
-            let maybe_resp = timeout(
-                Duration::from_secs(sse_timeout),
-                read_first_jsonrpc_from_sse_response(resp),
-            )
-            .await
-            .context("timeout waiting for MCP response from streamable HTTP SSE stream")??;
+            let read_response = read_first_jsonrpc_from_sse_response(resp);
+            let maybe_resp = if let Some(sse_timeout) =
+                http_sse_read_timeout_secs(request, self.tool_timeout_secs)
+            {
+                timeout(Duration::from_secs(sse_timeout), read_response)
+                    .await
+                    .context("timeout waiting for MCP response from streamable HTTP SSE stream")??
+            } else {
+                read_response.await?
+            };
             return maybe_resp
                 .ok_or_else(|| anyhow!("MCP server returned no response in SSE stream"));
         }
@@ -295,6 +330,7 @@ enum SseStreamState {
 pub struct SseTransport {
     sse_url: String,
     server_name: String,
+    tool_timeout_secs: Option<u64>,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
     stream_state: SseStreamState,
@@ -319,6 +355,7 @@ impl SseTransport {
         Ok(Self {
             sse_url,
             server_name: config.name.clone(),
+            tool_timeout_secs: config.tool_timeout_secs,
             client,
             headers: config.headers.clone(),
             stream_state: SseStreamState::Unknown,
@@ -789,11 +826,10 @@ impl McpTransportConn for SseTransport {
                 .headers
                 .keys()
                 .any(|k| k.eq_ignore_ascii_case("Content-Type"));
-            let mut req = self
-                .client
-                .post(&url)
-                .timeout(Duration::from_secs(120))
-                .body(body.clone());
+            let mut req = apply_request_timeout(
+                self.client.post(&url).body(body.clone()),
+                http_request_timeout_secs(request, self.tool_timeout_secs),
+            );
             if !has_content_type {
                 req = req.header("Content-Type", MCP_JSON_CONTENT_TYPE);
             }
@@ -967,6 +1003,95 @@ mod tests {
     }
 
     #[test]
+    fn http_request_timeout_defaults_non_tool_requests_to_legacy_value() {
+        let request = JsonRpcRequest::new(1, "initialize", serde_json::json!({}));
+        assert_eq!(
+            http_request_timeout_secs(&request, None),
+            Some(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn http_request_timeout_does_not_shorten_non_tool_requests_from_tool_config() {
+        let request = JsonRpcRequest::new(1, "tools/list", serde_json::json!({}));
+        assert_eq!(
+            http_request_timeout_secs(&request, Some(5)),
+            Some(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn http_request_timeout_honors_configured_tool_call_timeout_above_legacy_value() {
+        let request = JsonRpcRequest::new(1, TOOLS_CALL_METHOD, serde_json::json!({}));
+        assert_eq!(
+            http_request_timeout_secs(&request, Some(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS + 60)),
+            Some(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS + 60)
+        );
+    }
+
+    #[test]
+    fn http_request_timeout_leaves_default_tool_call_budget_to_client_wrapper() {
+        let request = JsonRpcRequest::new(1, TOOLS_CALL_METHOD, serde_json::json!({}));
+        assert_eq!(http_request_timeout_secs(&request, None), None);
+    }
+
+    #[test]
+    fn http_sse_read_timeout_defaults_non_tool_requests_to_recv_timeout() {
+        let request = JsonRpcRequest::new(1, "initialize", serde_json::json!({}));
+        assert_eq!(
+            http_sse_read_timeout_secs(&request, None),
+            Some(RECV_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn http_sse_read_timeout_honors_configured_tool_call_timeout() {
+        let request = JsonRpcRequest::new(1, TOOLS_CALL_METHOD, serde_json::json!({}));
+        assert_eq!(
+            http_sse_read_timeout_secs(&request, Some(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS + 60)),
+            Some(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS + 60)
+        );
+    }
+
+    #[test]
+    fn http_sse_read_timeout_leaves_default_tool_call_budget_to_client_wrapper() {
+        let request = JsonRpcRequest::new(1, TOOLS_CALL_METHOD, serde_json::json!({}));
+        assert_eq!(http_sse_read_timeout_secs(&request, None), None);
+    }
+
+    #[test]
+    fn http_transport_stores_configured_tool_timeout() {
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some("http://localhost/mcp".into()),
+            tool_timeout_secs: Some(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS + 60),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).expect("build transport");
+        assert_eq!(
+            transport.tool_timeout_secs,
+            Some(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS + 60)
+        );
+    }
+
+    #[test]
+    fn sse_transport_stores_configured_tool_timeout() {
+        let config = McpServerConfig {
+            name: "test-sse".into(),
+            transport: McpTransport::Sse,
+            url: Some("http://localhost/sse".into()),
+            tool_timeout_secs: Some(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS + 60),
+            ..Default::default()
+        };
+        let transport = SseTransport::new(&config).expect("build transport");
+        assert_eq!(
+            transport.tool_timeout_secs,
+            Some(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS + 60)
+        );
+    }
+
+    #[test]
     fn test_extract_json_from_sse_data_no_space() {
         let input = "data:{\"jsonrpc\":\"2.0\",\"result\":{}}\n\n";
         let extracted = extract_json_from_sse_text(input);
@@ -1072,37 +1197,6 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("session-xyz")
         );
-    }
-
-    // ── http_client_timeout_secs tests ───────────────────────────────────────
-
-    #[test]
-    fn http_client_timeout_defaults_to_120_when_tool_timeout_unset() {
-        assert_eq!(http_client_timeout_secs(None), 120);
-    }
-
-    #[test]
-    fn http_client_timeout_uses_tool_timeout_when_above_120() {
-        assert_eq!(http_client_timeout_secs(Some(300)), 300);
-        assert_eq!(http_client_timeout_secs(Some(600)), 600);
-    }
-
-    #[test]
-    fn http_client_timeout_keeps_120_floor_when_tool_timeout_below_120() {
-        assert_eq!(http_client_timeout_secs(Some(30)), 120);
-        assert_eq!(http_client_timeout_secs(Some(1)), 120);
-    }
-
-    #[test]
-    fn http_transport_builds_successfully_with_high_tool_timeout() {
-        let config = McpServerConfig {
-            name: "test-http-slow".into(),
-            transport: McpTransport::Http,
-            url: Some("http://localhost/mcp".into()),
-            tool_timeout_secs: Some(300),
-            ..Default::default()
-        };
-        assert!(HttpTransport::new(&config).is_ok());
     }
 
     // ── derive_message_url tests ──────────────────────────────────────────────

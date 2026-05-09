@@ -33,6 +33,17 @@ impl FileReadTool {
 
         let p = std::path::Path::new(path);
         if p.is_absolute() {
+            #[cfg(not(target_os = "windows"))]
+            if p == std::path::Path::new("/dev/null") {
+                return Ok(p.to_path_buf());
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let lower = path.to_ascii_lowercase();
+                if lower == "nul" || lower == r"\\.\nul" {
+                    return Ok(p.to_path_buf());
+                }
+            }
             let workspace_canonical = workspace_dir
                 .canonicalize()
                 .unwrap_or_else(|_| workspace_dir.clone());
@@ -142,20 +153,7 @@ impl Tool for FileReadTool {
             }
         };
 
-        let workspace_canonical = self
-            .security
-            .workspace_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.security.workspace_dir.clone());
-
-        let in_workspace = resolved_path.starts_with(&workspace_canonical);
-        let in_allowed_root = !in_workspace
-            && self.security.allowed_roots.iter().any(|root| {
-                let rc = root.canonicalize().unwrap_or_else(|_| root.clone());
-                resolved_path.starts_with(&rc)
-            });
-
-        if !in_workspace && !in_allowed_root {
+        if !self.security.is_resolved_path_allowed(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -1094,6 +1092,26 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_read_allows_dev_null() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_dev_null");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "/dev/null"})).await.unwrap();
+
+        assert!(
+            result.success,
+            "file_read of /dev/null must succeed, error: {:?}",
+            result.error
+        );
+        assert_eq!(result.output, "", "/dev/null must read as empty");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

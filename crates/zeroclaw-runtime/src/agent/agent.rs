@@ -479,10 +479,20 @@ impl Agent {
             Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
-            session_cwd.unwrap_or(&config.workspace_dir),
-        ));
+        let security = Arc::new({
+            let mut policy = SecurityPolicy::from_config(
+                &config.autonomy,
+                session_cwd.unwrap_or(&config.workspace_dir),
+            );
+            // When a per-session cwd overrides the sandbox root, ensure the
+            // ZeroClaw workspace (where skills, identity, and config data live)
+            // remains readable. Without this, file_read and search tools are
+            // locked out of the workspace the moment the session cwd differs.
+            if session_cwd.is_some() {
+                policy.allowed_roots.push(config.workspace_dir.clone());
+            }
+            policy
+        });
 
         let fallback_provider_ag = config.providers.fallback_provider();
         let memory: Arc<dyn Memory> =
@@ -1337,7 +1347,8 @@ impl Agent {
             // forward deltas.  Otherwise fall back to non-streaming chat.
             use futures_util::StreamExt;
 
-            let stream_opts = zeroclaw_providers::traits::StreamOptions::new(true);
+            let stream_opts =
+                zeroclaw_providers::traits::StreamOptions::new(self.provider.supports_streaming());
             let mut stream = self.provider.stream_chat(
                 zeroclaw_providers::ChatRequest {
                     messages: &messages,
@@ -2280,6 +2291,40 @@ mod tests {
         assert!(
             agent.tool_specs.is_empty(),
             "No tools should match a non-existent allowlist entry"
+        );
+    }
+
+    /// When a per-session cwd overrides the sandbox root, workspace files must
+    /// stay readable. Regression guard for the `allowed_roots.push` fix in
+    /// `from_config_with_session_cwd` (issue #6516).
+    #[test]
+    fn session_cwd_keeps_workspace_in_allowed_roots() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_session_cwd_workspace");
+        let session = std::env::temp_dir().join("zeroclaw_test_session_cwd_session");
+        let _ = std::fs::create_dir_all(&workspace);
+        let _ = std::fs::create_dir_all(&session);
+
+        let skill_file = workspace.join("SKILL.md");
+        let _ = std::fs::write(&skill_file, "body");
+        // is_resolved_path_allowed expects a canonicalized path (symlinks resolved).
+        let skill_resolved = std::fs::canonicalize(&skill_file).unwrap_or(skill_file);
+
+        let autonomy = zeroclaw_config::schema::AutonomyConfig::default();
+
+        // Policy WITH the fix: workspace pushed into allowed_roots.
+        let mut policy = SecurityPolicy::from_config(&autonomy, &session);
+        policy.allowed_roots.push(workspace.clone());
+        assert!(
+            policy.is_resolved_path_allowed(&skill_resolved),
+            "workspace skills must remain readable when session_cwd differs"
+        );
+
+        // Without the push the same path must be denied, confirming the push
+        // is the load-bearing fix rather than an incidental side-effect.
+        let policy_no_push = SecurityPolicy::from_config(&autonomy, &session);
+        assert!(
+            !policy_no_push.is_resolved_path_allowed(&skill_resolved),
+            "without allowed_roots.push, workspace files must be outside the sandbox"
         );
     }
 

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use std::fmt::Write;
-use zeroclaw_memory::{self, Memory, decay};
+use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, decay};
 
 #[async_trait]
 pub trait MemoryLoader: Send + Sync {
@@ -53,7 +53,8 @@ impl MemoryLoader for DefaultMemoryLoader {
         // Apply time decay: older non-Core memories score lower
         decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
 
-        let mut context = String::from("[Memory context]\n");
+        let mut context = String::new();
+        let mut included = false;
         for entry in entries {
             if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
                 continue;
@@ -69,15 +70,21 @@ impl MemoryLoader for DefaultMemoryLoader {
             {
                 continue;
             }
+            if !included {
+                context.push_str(MEMORY_CONTEXT_OPEN);
+                context.push('\n');
+                included = true;
+            }
             let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
         }
 
         // If all entries were below threshold, return empty
-        if context == "[Memory context]\n" {
+        if !included {
             return Ok(String::new());
         }
 
-        context.push_str("[/Memory context]\n\n");
+        context.push_str(MEMORY_CONTEXT_CLOSE);
+        context.push_str("\n\n");
         Ok(context)
     }
 }
@@ -86,7 +93,9 @@ impl MemoryLoader for DefaultMemoryLoader {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
+    use zeroclaw_memory::{
+        MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, MemoryEntry,
+    };
 
     struct MockMemory;
     struct MockMemoryWithEntries {
@@ -218,8 +227,10 @@ mod tests {
             .load_context(&MockMemory, "hello", None)
             .await
             .unwrap();
-        assert!(context.contains("[Memory context]"));
-        assert!(context.contains("- k: v"));
+        assert_eq!(
+            context,
+            format!("{MEMORY_CONTEXT_OPEN}\n- k: v\n{MEMORY_CONTEXT_CLOSE}\n\n")
+        );
     }
 
     #[tokio::test]
