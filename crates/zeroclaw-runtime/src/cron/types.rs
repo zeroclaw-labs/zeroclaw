@@ -229,6 +229,13 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_schedule_from_raw_cron_string() {
+        let val = serde_json::json!("0 10 * * *");
+        let sched = deserialize_maybe_stringified::<Schedule>(&val).unwrap();
+        assert!(matches!(sched, Schedule::Cron { ref expr, .. } if expr == "0 10 * * *"));
+    }
+
+    #[test]
     fn deserialize_invalid_string_returns_error() {
         let val = serde_json::Value::String("not json at all".to_string());
         assert!(deserialize_maybe_stringified::<Schedule>(&val).is_err());

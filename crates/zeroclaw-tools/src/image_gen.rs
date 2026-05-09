@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
+use uuid::Uuid;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
@@ -11,7 +12,7 @@ use zeroclaw_config::policy::ToolOperation;
 ///
 /// Reads the API key from an environment variable (default: `FAL_API_KEY`),
 /// calls the fal.ai synchronous endpoint, downloads the resulting image,
-/// and saves it to `{workspace}/images/{filename}.png`.
+/// and saves it to `{workspace}/images/{prefix}_{short_id}.png`.
 pub struct ImageGenTool {
     security: Arc<SecurityPolicy>,
     workspace_dir: PathBuf,
@@ -65,17 +66,20 @@ impl ImageGenTool {
             }
         };
 
-        let filename = args
+        // Generate a short unique filename.
+        let prefix = args
             .get("filename")
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or("generated_image");
+            .map(|s| {
+                PathBuf::from(s)
+                    .file_name()
+                    .map_or_else(|| "img".to_string(), |n| n.to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| "img".to_string());
 
-        // Sanitize filename — strip path components to prevent traversal.
-        let safe_name = PathBuf::from(filename).file_name().map_or_else(
-            || "generated_image".to_string(),
-            |n| n.to_string_lossy().to_string(),
-        );
+        let short_id = &Uuid::new_v4().to_string()[..6];
+        let safe_name = format!("{prefix}_{short_id}");
 
         let size = args
             .get("size")
@@ -239,7 +243,8 @@ impl Tool for ImageGenTool {
 
     fn description(&self) -> &str {
         "Generate an image from a text prompt using fal.ai (Flux models). \
-         Saves the result to the workspace images directory and returns the file path."
+         Saves the result to the workspace images directory and returns the file path. \
+         IMPORTANT: To send the image in Telegram or other channels, you MUST include the marker [IMAGE:<path>] in your reply text."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -253,7 +258,7 @@ impl Tool for ImageGenTool {
                 },
                 "filename": {
                     "type": "string",
-                    "description": "Output filename without extension (default: 'generated_image'). Saved as PNG in workspace/images/."
+                    "description": "Optional prefix for the generated filename. A unique ID will always be appended. (e.g. 'my_art' becomes 'my_art_a1b2c3')."
                 },
                 "size": {
                     "type": "string",
@@ -319,6 +324,7 @@ mod tests {
         let tool = test_tool();
         assert!(!tool.description().is_empty());
         assert!(tool.description().contains("image"));
+        assert!(tool.description().contains("[IMAGE:<path>]"));
     }
 
     #[test]
@@ -482,18 +488,16 @@ mod tests {
     #[test]
     fn filename_traversal_is_sanitized() {
         // Verify that path traversal in filenames is stripped to just the final component.
-        let sanitized = PathBuf::from("../../etc/passwd").file_name().map_or_else(
-            || "generated_image".to_string(),
-            |n| n.to_string_lossy().to_string(),
-        );
+        let sanitized = PathBuf::from("../../etc/passwd")
+            .file_name()
+            .map_or_else(|| "img".to_string(), |n| n.to_string_lossy().to_string());
         assert_eq!(sanitized, "passwd");
 
         // ".." alone has no file_name, falls back to default.
-        let sanitized = PathBuf::from("..").file_name().map_or_else(
-            || "generated_image".to_string(),
-            |n| n.to_string_lossy().to_string(),
-        );
-        assert_eq!(sanitized, "generated_image");
+        let sanitized = PathBuf::from("..")
+            .file_name()
+            .map_or_else(|| "img".to_string(), |n| n.to_string_lossy().to_string());
+        assert_eq!(sanitized, "img");
     }
 
     #[test]
