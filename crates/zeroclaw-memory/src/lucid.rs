@@ -229,6 +229,7 @@ impl LucidMemory {
                 namespace: "default".into(),
                 importance: None,
                 superseded_by: None,
+                agent_id: None,
             });
         }
 

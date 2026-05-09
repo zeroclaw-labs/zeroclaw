@@ -63,7 +63,12 @@ impl SqliteMemory {
         }
         let conn = Self::open_connection(&db_path, None)?;
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
+            // foreign_keys is OFF by default in SQLite and is a
+            // per-connection PRAGMA, so the multi-agent migration's
+            // `REFERENCES agents(id)` constraint would be unenforced
+            // without this. Set it before any writes flow through.
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
              PRAGMA synchronous  = NORMAL;
              PRAGMA mmap_size    = 8388608;
              PRAGMA cache_size   = -2000;
@@ -105,13 +110,17 @@ impl SqliteMemory {
         let conn = Self::open_connection(&db_path, open_timeout_secs)?;
 
         // ── Production-grade PRAGMA tuning ──────────────────────
+        // foreign_keys ON: SQLite defaults FKs OFF per-connection;
+        //                  the multi-agent migration's REFERENCES
+        //                  agents(id) is unenforced without it.
         // WAL mode: concurrent reads during writes, crash-safe
         // normal sync: 2× write speed, still durable on WAL
         // mmap 8 MB: let the OS page-cache serve hot reads
         // cache 2 MB: keep ~500 hot pages in-process
         // temp_store memory: temp tables never hit disk
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
              PRAGMA synchronous  = NORMAL;
              PRAGMA mmap_size    = 8388608;
              PRAGMA cache_size   = -2000;
@@ -267,116 +276,145 @@ impl SqliteMemory {
             Self::backup_for_multi_agent_migration(db_path)?;
         }
 
-        // 1. Create the agents table. UUID primary key, alias column
-        //    UNIQUE for human reference and rename surface, created_at
-        //    timestamp for audit.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS agents (
-                id          TEXT PRIMARY KEY,
-                alias       TEXT NOT NULL UNIQUE,
-                created_at  TEXT NOT NULL
-             );",
-        )?;
-
-        // 2. Synthesize the `default` agent's row if it is missing,
-        //    so the backfill below can attribute every legacy row.
-        let default_uuid = Self::ensure_default_agent_uuid(conn)?;
-
-        // 3. Add the column nullable + backfill if the column doesn't
-        //    yet exist. SQLite's `ALTER TABLE ... ADD COLUMN` cannot
-        //    create a NOT NULL FK column on a populated table; the
-        //    rebuild in step 4 promotes it.
-        if !Self::memories_has_agent_id_column(conn)? {
-            conn.execute_batch("ALTER TABLE memories ADD COLUMN agent_id TEXT;")?;
-            conn.execute(
-                "UPDATE memories SET agent_id = ?1 WHERE agent_id IS NULL",
-                params![default_uuid],
+        // The whole rebuild runs inside an explicit IMMEDIATE
+        // transaction. Without it, `execute_batch` auto-commits each
+        // statement, so a crash between `DROP TABLE memories` and
+        // `RENAME TO memories` would leave the DB without a memories
+        // table at all (recoverable only from the timestamped backup
+        // above). IMMEDIATE acquires the write lock up front so a
+        // concurrent writer can't slip in between the backfill and the
+        // rebuild. `defer_foreign_keys = ON` lets the FK constraint
+        // settle at COMMIT time so the intra-tx state (memories_new
+        // rows referencing agents that exist; old `memories` table
+        // dropped before the rename) doesn't trip the FK enforcement
+        // mid-flight.
+        conn.execute_batch("BEGIN IMMEDIATE; PRAGMA defer_foreign_keys = ON;")?;
+        let result = (|| -> anyhow::Result<()> {
+            // 1. Create the agents table. UUID primary key, alias column
+            //    UNIQUE for human reference and rename surface, created_at
+            //    timestamp for audit.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS agents (
+                    id          TEXT PRIMARY KEY,
+                    alias       TEXT NOT NULL UNIQUE,
+                    created_at  TEXT NOT NULL
+                 );",
             )?;
-        } else {
-            // Column existed (e.g. from a partial earlier migration);
-            // backfill any remaining NULLs before the rebuild.
-            conn.execute(
-                "UPDATE memories SET agent_id = ?1 WHERE agent_id IS NULL",
-                params![default_uuid],
+
+            // 2. Synthesize the `default` agent's row if it is missing,
+            //    so the backfill below can attribute every legacy row.
+            let default_uuid = Self::ensure_default_agent_uuid(conn)?;
+
+            // 3. Add the column nullable + backfill if the column doesn't
+            //    yet exist. SQLite's `ALTER TABLE ... ADD COLUMN` cannot
+            //    create a NOT NULL FK column on a populated table; the
+            //    rebuild in step 4 promotes it.
+            if !Self::memories_has_agent_id_column(conn)? {
+                conn.execute_batch("ALTER TABLE memories ADD COLUMN agent_id TEXT;")?;
+                conn.execute(
+                    "UPDATE memories SET agent_id = ?1 WHERE agent_id IS NULL",
+                    params![default_uuid],
+                )?;
+            } else {
+                // Column existed (e.g. from a partial earlier migration);
+                // backfill any remaining NULLs before the rebuild.
+                conn.execute(
+                    "UPDATE memories SET agent_id = ?1 WHERE agent_id IS NULL",
+                    params![default_uuid],
+                )?;
+            }
+
+            // 4. Rebuild the memories table so `agent_id` is `NOT NULL
+            //    REFERENCES agents(id)`. SQLite has no `ALTER TABLE ...
+            //    ALTER COLUMN`, so the standard pattern is: drop FTS, copy
+            //    rows into a new table with the correct constraints, drop
+            //    the old, rename. The FTS5 contentless table is recreated
+            //    after the rename and rebuilt from the new memories rows.
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS memories_ai;
+                 DROP TRIGGER IF EXISTS memories_ad;
+                 DROP TRIGGER IF EXISTS memories_au;
+                 DROP TABLE IF EXISTS memories_fts;
+
+                 CREATE TABLE memories_new (
+                    id            TEXT PRIMARY KEY,
+                    key           TEXT NOT NULL UNIQUE,
+                    content       TEXT NOT NULL,
+                    category      TEXT NOT NULL DEFAULT 'core',
+                    embedding     BLOB,
+                    created_at    TEXT NOT NULL,
+                    updated_at    TEXT NOT NULL,
+                    session_id    TEXT,
+                    namespace     TEXT DEFAULT 'default',
+                    importance    REAL DEFAULT 0.5,
+                    superseded_by TEXT,
+                    agent_id      TEXT NOT NULL REFERENCES agents(id)
+                 );
+
+                 INSERT INTO memories_new (
+                    id, key, content, category, embedding, created_at, updated_at,
+                    session_id, namespace, importance, superseded_by, agent_id
+                 )
+                 SELECT
+                    id, key, content, category, embedding, created_at, updated_at,
+                    session_id, namespace, importance, superseded_by, agent_id
+                 FROM memories;
+
+                 DROP TABLE memories;
+                 ALTER TABLE memories_new RENAME TO memories;
+
+                 CREATE INDEX IF NOT EXISTS idx_memories_category  ON memories(category);
+                 CREATE INDEX IF NOT EXISTS idx_memories_key       ON memories(key);
+                 CREATE INDEX IF NOT EXISTS idx_memories_session   ON memories(session_id);
+                 CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);
+                 CREATE INDEX IF NOT EXISTS idx_memories_agent_id  ON memories(agent_id);
+
+                 CREATE VIRTUAL TABLE memories_fts USING fts5(
+                    key, content, content=memories, content_rowid=rowid
+                 );
+                 INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
+
+                 CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+                    INSERT INTO memories_fts(rowid, key, content)
+                    VALUES (new.rowid, new.key, new.content);
+                 END;
+                 CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, key, content)
+                    VALUES ('delete', old.rowid, old.key, old.content);
+                 END;
+                 CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, key, content)
+                    VALUES ('delete', old.rowid, old.key, old.content);
+                    INSERT INTO memories_fts(rowid, key, content)
+                    VALUES (new.rowid, new.key, new.content);
+                 END;",
             )?;
+
+            // 5. Stamp the schema version so future migrations can detect
+            //    on-disk shape without parsing `sqlite_master`.
+            Self::ensure_schema_version_table(conn)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version (component, version, applied_at) \
+                 VALUES ('memories', ?1, ?2)",
+                params![CURRENT_SCHEMA_VERSION, chrono::Utc::now().to_rfc3339()],
+            )?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(e) => {
+                // Best-effort rollback; the timestamped backup is the
+                // authoritative recovery surface if the rollback also
+                // fails (e.g. the connection is already poisoned).
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
         }
-
-        // 4. Rebuild the memories table so `agent_id` is `NOT NULL
-        //    REFERENCES agents(id)`. SQLite has no `ALTER TABLE ...
-        //    ALTER COLUMN`, so the standard pattern is: drop FTS, copy
-        //    rows into a new table with the correct constraints, drop
-        //    the old, rename. The FTS5 contentless table is recreated
-        //    after the rename and rebuilt from the new memories rows.
-        conn.execute_batch(
-            "DROP TRIGGER IF EXISTS memories_ai;
-             DROP TRIGGER IF EXISTS memories_ad;
-             DROP TRIGGER IF EXISTS memories_au;
-             DROP TABLE IF EXISTS memories_fts;
-
-             CREATE TABLE memories_new (
-                id            TEXT PRIMARY KEY,
-                key           TEXT NOT NULL UNIQUE,
-                content       TEXT NOT NULL,
-                category      TEXT NOT NULL DEFAULT 'core',
-                embedding     BLOB,
-                created_at    TEXT NOT NULL,
-                updated_at    TEXT NOT NULL,
-                session_id    TEXT,
-                namespace     TEXT DEFAULT 'default',
-                importance    REAL DEFAULT 0.5,
-                superseded_by TEXT,
-                agent_id      TEXT NOT NULL REFERENCES agents(id)
-             );
-
-             INSERT INTO memories_new (
-                id, key, content, category, embedding, created_at, updated_at,
-                session_id, namespace, importance, superseded_by, agent_id
-             )
-             SELECT
-                id, key, content, category, embedding, created_at, updated_at,
-                session_id, namespace, importance, superseded_by, agent_id
-             FROM memories;
-
-             DROP TABLE memories;
-             ALTER TABLE memories_new RENAME TO memories;
-
-             CREATE INDEX IF NOT EXISTS idx_memories_category  ON memories(category);
-             CREATE INDEX IF NOT EXISTS idx_memories_key       ON memories(key);
-             CREATE INDEX IF NOT EXISTS idx_memories_session   ON memories(session_id);
-             CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);
-             CREATE INDEX IF NOT EXISTS idx_memories_agent_id  ON memories(agent_id);
-
-             CREATE VIRTUAL TABLE memories_fts USING fts5(
-                key, content, content=memories, content_rowid=rowid
-             );
-             INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
-
-             CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
-                INSERT INTO memories_fts(rowid, key, content)
-                VALUES (new.rowid, new.key, new.content);
-             END;
-             CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, key, content)
-                VALUES ('delete', old.rowid, old.key, old.content);
-             END;
-             CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, key, content)
-                VALUES ('delete', old.rowid, old.key, old.content);
-                INSERT INTO memories_fts(rowid, key, content)
-                VALUES (new.rowid, new.key, new.content);
-             END;",
-        )?;
-
-        // 5. Stamp the schema version so future migrations can detect
-        //    on-disk shape without parsing `sqlite_master`.
-        Self::ensure_schema_version_table(conn)?;
-        conn.execute(
-            "INSERT OR REPLACE INTO schema_version (component, version, applied_at) \
-             VALUES ('memories', ?1, ?2)",
-            params![CURRENT_SCHEMA_VERSION, chrono::Utc::now().to_rfc3339()],
-        )?;
-
-        Ok(())
     }
 
     fn ensure_schema_version_table(conn: &Connection) -> anyhow::Result<()> {
@@ -390,35 +428,52 @@ impl SqliteMemory {
         Ok(())
     }
 
+    /// True iff `memories.agent_id` exists, is NOT NULL, and has a
+    /// foreign-key reference to `agents(id)`. Uses `PRAGMA table_info`
+    /// and `PRAGMA foreign_key_list` for structured detection — the
+    /// previous substring-on-DDL check would silently misclassify
+    /// reformatted CREATE statements (whitespace, `ON DELETE` clauses,
+    /// identifier quoting variants).
     fn memories_agent_id_is_not_null(conn: &Connection) -> anyhow::Result<bool> {
-        let schema_sql: Option<String> = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='memories' LIMIT 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        // The rebuild emits the literal substring "agent_id      TEXT
-        // NOT NULL REFERENCES agents(id)"; collapse whitespace before
-        // matching so reformatted DDL still satisfies the check.
-        Ok(schema_sql
-            .as_deref()
-            .map(|sql| {
-                let collapsed: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-                collapsed.contains("agent_id TEXT NOT NULL REFERENCES agents(id)")
-            })
-            .unwrap_or(false))
+        let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+        let agent_id_notnull: Option<bool> = stmt
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                let notnull: i64 = row.get(3)?;
+                Ok((name, notnull != 0))
+            })?
+            .filter_map(Result::ok)
+            .find(|(name, _)| name == "agent_id")
+            .map(|(_, notnull)| notnull);
+
+        let Some(true) = agent_id_notnull else {
+            return Ok(false);
+        };
+
+        // Confirm the FK is wired through. `PRAGMA foreign_key_list`
+        // returns one row per FK constraint with `from` (column on
+        // memories) and `table` (target).
+        let mut fk_stmt = conn.prepare("PRAGMA foreign_key_list(memories)")?;
+        let has_fk = fk_stmt
+            .query_map([], |row| {
+                let target_table: String = row.get(2)?;
+                let from_col: String = row.get(3)?;
+                Ok((target_table, from_col))
+            })?
+            .filter_map(Result::ok)
+            .any(|(target, from)| target == "agents" && from == "agent_id");
+        Ok(has_fk)
     }
 
+    /// True iff `memories.agent_id` exists as a column, regardless of
+    /// nullability or FK status. Used by the migration's "is the
+    /// column there but unconstrained?" branch.
     fn memories_has_agent_id_column(conn: &Connection) -> anyhow::Result<bool> {
-        let schema_sql: Option<String> = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='memories' LIMIT 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        Ok(schema_sql.is_some_and(|sql| sql.contains("agent_id")))
+        let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+        Ok(stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == "agent_id"))
     }
 
     fn memories_row_count(conn: &Connection) -> anyhow::Result<i64> {
@@ -745,7 +800,7 @@ impl SqliteMemory {
             let until_ref = until_owned.as_deref();
 
             let mut sql =
-                "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by FROM memories \
+                "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by, agent_id FROM memories \
                            WHERE superseded_by IS NULL AND 1=1"
                     .to_string();
             let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -785,6 +840,7 @@ impl SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
+                    agent_id: row.get(9)?,
                 })
             })?;
 
@@ -914,7 +970,7 @@ impl Memory for SqliteMemory {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!(
-                    "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by \
+                    "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by, agent_id \
                      FROM memories WHERE superseded_by IS NULL AND id IN ({placeholders})"
                 );
                 let mut stmt = conn.prepare(&sql)?;
@@ -935,17 +991,18 @@ impl Memory for SqliteMemory {
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<f64>>(7)?,
                         row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
                     ))
                 })?;
 
                 let mut entry_map = std::collections::HashMap::new();
                 for row in rows {
-                    let (id, key, content, cat, ts, sid, ns, imp, sup) = row?;
-                    entry_map.insert(id, (key, content, cat, ts, sid, ns, imp, sup));
+                    let (id, key, content, cat, ts, sid, ns, imp, sup, aid) = row?;
+                    entry_map.insert(id, (key, content, cat, ts, sid, ns, imp, sup, aid));
                 }
 
                 for scored in &merged {
-                    if let Some((key, content, cat, ts, sid, ns, imp, sup)) = entry_map.remove(&scored.id) {
+                    if let Some((key, content, cat, ts, sid, ns, imp, sup, aid)) = entry_map.remove(&scored.id) {
                         if let Some(s) = since_ref
                             && ts.as_str() < s {
                                 continue;
@@ -965,6 +1022,7 @@ impl Memory for SqliteMemory {
                             namespace: ns.unwrap_or_else(|| "default".into()),
                             importance: imp,
                             superseded_by: sup,
+                            agent_id: aid,
                         };
                         if let Some(filter_sid) = session_ref
                             && entry.session_id.as_deref() != Some(filter_sid) {
@@ -1019,7 +1077,7 @@ impl Memory for SqliteMemory {
                         param_idx += 1;
                     }
                     let sql = format!(
-                        "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by FROM memories
+                        "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by, agent_id FROM memories
                          WHERE superseded_by IS NULL AND ({where_clause}){time_conditions}
                          ORDER BY updated_at DESC
                          LIMIT ?{param_idx}"
@@ -1052,6 +1110,7 @@ impl Memory for SqliteMemory {
                             namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                             importance: row.get(7)?,
                             superseded_by: row.get(8)?,
+                            agent_id: row.get(9)?,
                         })
                     })?;
                     for row in rows {
@@ -1089,7 +1148,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by FROM memories WHERE key = ?1",
+                "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by, agent_id FROM memories WHERE key = ?1",
             )?;
 
             let mut rows = stmt.query_map(params![key], |row| {
@@ -1104,6 +1163,7 @@ impl Memory for SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
+                    agent_id: row.get(9)?,
                 })
             })?;
 
@@ -1143,13 +1203,14 @@ impl Memory for SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
+                    agent_id: row.get(9)?,
                 })
             };
 
             if let Some(ref cat) = category {
                 let cat_str = Self::category_to_str(cat);
                 let mut stmt = conn.prepare(
-                    "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by FROM memories
+                    "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by, agent_id FROM memories
                      WHERE superseded_by IS NULL AND category = ?1 ORDER BY updated_at DESC LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![cat_str, DEFAULT_LIST_LIMIT], row_mapper)?;
@@ -1163,7 +1224,7 @@ impl Memory for SqliteMemory {
                 }
             } else {
                 let mut stmt = conn.prepare(
-                    "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by FROM memories
+                    "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by, agent_id FROM memories
                      WHERE superseded_by IS NULL ORDER BY updated_at DESC LIMIT ?1",
                 )?;
                 let rows = stmt.query_map(params![DEFAULT_LIST_LIMIT], row_mapper)?;
@@ -1315,7 +1376,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let mut sql =
-                "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by \
+                "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by, agent_id \
                  FROM memories WHERE 1=1"
                     .to_string();
             let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -1363,6 +1424,7 @@ impl Memory for SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
+                    agent_id: row.get(9)?,
                 })
             })?;
 

@@ -44,6 +44,15 @@ pub struct MemoryEntry {
     /// If this entry was superseded by a newer conflicting entry.
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// The UUID of the agent this row is attributed to, when the
+    /// backend tracks per-agent attribution. Backends without per-agent
+    /// columns (Markdown, Qdrant payload-less variants, None) leave
+    /// this `None`; SQL-backed stores populate it from the
+    /// `memories.agent_id` column. `AgentScopedMemory` uses this field
+    /// to enforce the bound + allowlist boundary on read paths the
+    /// trait does not expose an agent-aware form for (`get`, `list`).
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 fn default_namespace() -> String {
@@ -61,6 +70,7 @@ impl std::fmt::Debug for MemoryEntry {
             .field("score", &self.score)
             .field("namespace", &self.namespace)
             .field("importance", &self.importance)
+            .field("agent_id", &self.agent_id)
             .finish_non_exhaustive()
     }
 }
@@ -401,6 +411,7 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: None,
+            agent_id: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();

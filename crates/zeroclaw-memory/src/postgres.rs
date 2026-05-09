@@ -192,15 +192,39 @@ impl PostgresMemory {
             &[&default_uuid],
         )?;
 
-        // Promote agent_id to NOT NULL REFERENCES agents(id). Both
-        // operations are idempotent: SET NOT NULL is a no-op when the
-        // column is already NOT NULL, and the FK constraint is created
-        // inside a DO block so a re-run skips the duplicate. The DROP
-        // CONSTRAINT IF EXISTS guard handles the rare case where a
-        // previous failed migration left a half-created constraint.
+        // Promote agent_id to NOT NULL REFERENCES agents(id) using the
+        // low-lock pattern so operators with populated production
+        // databases don't take an ACCESS EXCLUSIVE during the upgrade:
+        //
+        //  1. Add a CHECK (agent_id IS NOT NULL) NOT VALID — catalog-
+        //     only, no scan, brief lock.
+        //  2. VALIDATE CONSTRAINT in its own statement — SHARE UPDATE
+        //     EXCLUSIVE lock; concurrent reads and writes continue.
+        //  3. Once the CHECK is validated, ALTER COLUMN ... SET NOT
+        //     NULL becomes metadata-only on PostgreSQL 12+: the
+        //     planner uses the validated CHECK as proof and skips the
+        //     full table scan that would otherwise hold ACCESS
+        //     EXCLUSIVE for minutes on a large table.
+        //  4. The FK is added NOT VALID for the same reason, then
+        //     validated in a separate statement.
+        //
+        // Each step is idempotent (DO-block guard against re-runs);
+        // the migration is safe to re-run after a partial failure.
         let qualified_agents = format!("{schema_ident}.agents");
         client.batch_execute(&format!(
             "
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'memories_agent_id_notnull_chk'
+                ) THEN
+                    ALTER TABLE {qualified_table}
+                        ADD CONSTRAINT memories_agent_id_notnull_chk
+                        CHECK (agent_id IS NOT NULL) NOT VALID;
+                END IF;
+            END$$;
+            ALTER TABLE {qualified_table} VALIDATE CONSTRAINT memories_agent_id_notnull_chk;
             ALTER TABLE {qualified_table} ALTER COLUMN agent_id SET NOT NULL;
             DO $$
             BEGIN
@@ -210,9 +234,10 @@ impl PostgresMemory {
                 ) THEN
                     ALTER TABLE {qualified_table}
                         ADD CONSTRAINT memories_agent_id_fk
-                        FOREIGN KEY (agent_id) REFERENCES {qualified_agents}(id);
+                        FOREIGN KEY (agent_id) REFERENCES {qualified_agents}(id) NOT VALID;
                 END IF;
             END$$;
+            ALTER TABLE {qualified_table} VALIDATE CONSTRAINT memories_agent_id_fk;
             "
         ))?;
 
@@ -322,6 +347,7 @@ impl PostgresMemory {
                 .unwrap_or_else(|_| "default".into()),
             importance: row.try_get("importance").ok(),
             superseded_by: None,
+            agent_id: row.try_get("agent_id").ok(),
         })
     }
 }
@@ -452,7 +478,7 @@ impl Memory for PostgresMemory {
 
             let stmt = format!(
                 "
-                SELECT id, key, content, category, created_at, session_id,
+                SELECT id, key, content, category, created_at, session_id, agent_id,
                        (
                          CASE WHEN to_tsvector('simple', key) @@ plainto_tsquery('simple', $1)
                            THEN ts_rank_cd(to_tsvector('simple', key), plainto_tsquery('simple', $1)) * 2.0
@@ -495,7 +521,7 @@ impl Memory for PostgresMemory {
             let mut client = client.lock();
             let stmt = format!(
                 "
-                SELECT id, key, content, category, created_at, session_id
+                SELECT id, key, content, category, created_at, session_id, agent_id
                 FROM {qualified_table}
                 WHERE key = $1
                 LIMIT 1
@@ -522,7 +548,7 @@ impl Memory for PostgresMemory {
             let mut client = client.lock();
             let stmt = format!(
                 "
-                SELECT id, key, content, category, created_at, session_id
+                SELECT id, key, content, category, created_at, session_id, agent_id
                 FROM {qualified_table}
                 WHERE ($1::TEXT IS NULL OR category = $1)
                   AND ($2::TEXT IS NULL OR session_id = $2)

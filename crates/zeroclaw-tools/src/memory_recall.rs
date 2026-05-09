@@ -190,6 +190,7 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    agent_id: None,
                 }])
             } else {
                 Ok(Vec::new())

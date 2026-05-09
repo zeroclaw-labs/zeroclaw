@@ -21,7 +21,7 @@
 //! `allowed_agent_ids` set.
 
 use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry, ProceduralMessage};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -154,13 +154,20 @@ impl Memory for AgentScopedMemory {
         importance: Option<f64>,
         agent_id: Option<&str>,
     ) -> Result<()> {
-        // A wrapper-internal caller of `store_with_agent` may try to
-        // override the bound agent. We refuse silently and stamp the
-        // bound agent's id instead — the wrapper's whole purpose is
-        // to make every persisted row attributable to one agent. If a
-        // caller really wants a different agent, they should
-        // construct a different wrapper.
-        let _ = agent_id;
+        // The wrapper's whole purpose is to make every persisted row
+        // attributable to its bound agent. A caller passing an
+        // explicit `agent_id` that does not match is a bug; refuse
+        // loudly so the misuse is debuggable rather than silently
+        // misattributed.
+        if let Some(requested) = agent_id
+            && requested != self.agent_id
+        {
+            return Err(anyhow!(
+                "AgentScopedMemory bound to agent_id {bound:?} refuses store_with_agent for foreign agent_id {requested:?}; \
+                 use a wrapper bound to the target agent",
+                bound = self.agent_id,
+            ));
+        }
         self.inner
             .store_with_agent(
                 key,
@@ -227,10 +234,19 @@ impl Memory for AgentScopedMemory {
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
-        // Keyed lookup — the trait does not yet expose an agent-scoped
-        // form. Cross-agent key collisions are prevented by the
-        // unique-key DB index, so passthrough is safe.
-        self.inner.get(key).await
+        // Keyed lookup — the trait does not expose an agent-scoped
+        // form, so post-filter on `MemoryEntry::agent_id`. Backends
+        // that don't track per-agent attribution (Markdown, NoneMemory,
+        // and pre-multi-agent Lucid rows) populate `agent_id` as
+        // `None`; treat that as "not in any allowlist" and refuse to
+        // surface, so a wrapper-using caller never reads cross-agent
+        // rows by guessed key.
+        let entry = self.inner.get(key).await?;
+        Ok(entry.filter(|e| {
+            e.agent_id
+                .as_deref()
+                .is_some_and(|aid| self.allowed_agent_ids.contains(aid))
+        }))
     }
 
     async fn list(
@@ -238,28 +254,91 @@ impl Memory for AgentScopedMemory {
         category: Option<&MemoryCategory>,
         session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        // Admin-shaped; the trait does not currently filter on
-        // agent_id. Passthrough.
-        self.inner.list(category, session_id).await
+        // Inner.list returns rows across every agent on the install;
+        // post-filter by the bound + allowlisted set so a wrapper-using
+        // caller cannot inspect sibling rows it did not opt into via
+        // `read_memory_from`.
+        let entries = self.inner.list(category, session_id).await?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| {
+                e.agent_id
+                    .as_deref()
+                    .is_some_and(|aid| self.allowed_agent_ids.contains(aid))
+            })
+            .collect())
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
-        self.inner.forget(key).await
+        // Only the bound agent's own rows may be deleted. Sibling rows
+        // visible via `read_memory_from` are read-only by design — the
+        // allowlist grants recall, never delete. Look up the row,
+        // confirm attribution, and refuse anything else.
+        let Some(entry) = self.inner.get(key).await? else {
+            return Ok(false);
+        };
+        match entry.agent_id.as_deref() {
+            Some(aid) if aid == self.agent_id => self.inner.forget(key).await,
+            Some(other) => Err(anyhow!(
+                "AgentScopedMemory refuses to forget key {key:?}: row is attributed to agent {other:?}, \
+                 not the bound agent {bound:?}",
+                bound = self.agent_id,
+            )),
+            None => Err(anyhow!(
+                "AgentScopedMemory refuses to forget key {key:?}: row has no agent attribution \
+                 (legacy or backend without per-agent tracking); resolve via an admin Memory handle"
+            )),
+        }
     }
 
     async fn count(&self) -> Result<usize> {
-        self.inner.count().await
+        // Scope to the bound + allowlisted agents so a wrapper-using
+        // caller does not see the install-wide row total.
+        let entries = self.inner.list(None, None).await?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| {
+                e.agent_id
+                    .as_deref()
+                    .is_some_and(|aid| self.allowed_agent_ids.contains(aid))
+            })
+            .count())
     }
 
     async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
-        self.inner.purge_namespace(namespace).await
+        // Bulk cross-agent destruction has no agent-scoped form on the
+        // trait. Refuse rather than passing through; the operator path
+        // for purges is an admin Memory handle, not an agent loop.
+        let _ = namespace;
+        Err(anyhow!(
+            "AgentScopedMemory refuses purge_namespace: cross-agent bulk delete must run through an admin Memory handle, \
+             not an agent-scoped wrapper"
+        ))
     }
 
     async fn purge_session(&self, session_id: &str) -> Result<usize> {
-        self.inner.purge_session(session_id).await
+        // The trait's `purge_session` is install-wide; an agent
+        // calling it would clear sibling rows that share the session
+        // id. Restrict to the bound agent's own rows by enumerating
+        // the session's memberships, filtering, and forgetting one by
+        // one. Slower than a bulk DELETE but safe by construction.
+        let candidates = self.inner.list(None, Some(session_id)).await?;
+        let mut purged = 0;
+        for entry in candidates {
+            if entry.agent_id.as_deref() == Some(self.agent_id.as_str())
+                && self.inner.forget(&entry.key).await?
+            {
+                purged += 1;
+            }
+        }
+        Ok(purged)
     }
 
     async fn reindex(&self) -> Result<usize> {
+        // Reindex is an admin-shaped op (rebuilds FTS / re-embeds
+        // missing vectors). Touching the inner backend here is
+        // contained: it does not mutate row attribution or expose
+        // cross-agent content to the caller.
         self.inner.reindex().await
     }
 
@@ -280,13 +359,52 @@ impl Memory for AgentScopedMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        self.inner
-            .recall_namespaced(namespace, query, limit, session_id, since, until)
-            .await
+        // Recall through the agent-scoped recall path so the bound +
+        // allowlisted UUIDs filter at the SQL boundary, then
+        // post-filter for the namespace match. The default trait impl
+        // would route through `recall` which the wrapper has already
+        // overridden, but routing explicitly here keeps the read shape
+        // visible to anyone tracing the call chain.
+        let entries = self
+            .recall(query, limit * 2, session_id, since, until)
+            .await?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| e.namespace == namespace)
+            .take(limit)
+            .collect())
     }
 
     async fn export(&self, filter: &ExportFilter) -> Result<Vec<MemoryEntry>> {
-        self.inner.export(filter).await
+        // Export is the GDPR data-portability path. An agent-scoped
+        // export sees only the bound + allowlisted agents' rows. The
+        // wrapper's `list` already does the per-agent filtering;
+        // delegate to it and apply the rest of the export filter
+        // post-fetch.
+        let entries = self
+            .list(filter.category.as_ref(), filter.session_id.as_deref())
+            .await?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| {
+                if let Some(ref ns) = filter.namespace
+                    && e.namespace != *ns
+                {
+                    return false;
+                }
+                if let Some(ref since) = filter.since
+                    && e.timestamp.as_str() < since.as_str()
+                {
+                    return false;
+                }
+                if let Some(ref until) = filter.until
+                    && e.timestamp.as_str() > until.as_str()
+                {
+                    return false;
+                }
+                true
+            })
+            .collect())
     }
 
     async fn ensure_agent_uuid(&self, alias: &str) -> Result<String> {
@@ -403,6 +521,185 @@ mod tests {
         assert!(
             hits.iter().any(|e| e.key == "sibling-key"),
             "rows attributed to an allowlisted sibling must surface"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_filters_cross_agent_rows_by_attribution() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+
+        // beta writes a row; alpha's wrapper must not see it via get().
+        inner
+            .store_with_agent(
+                "beta-only",
+                "secret",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(beta_uuid),
+            )
+            .await
+            .unwrap();
+
+        let wrapper = AgentScopedMemory::new(as_dyn(inner), alpha_uuid, Vec::<String>::new());
+
+        let hit = wrapper.get("beta-only").await.unwrap();
+        assert!(
+            hit.is_none(),
+            "get must filter out rows attributed to non-allowlisted agents"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_refuses_to_delete_sibling_rows() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+
+        // beta writes a row; alpha's wrapper has read access to beta
+        // (via the allowlist) but must still refuse to forget the row.
+        inner
+            .store_with_agent(
+                "beta-row",
+                "v",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(beta_uuid),
+            )
+            .await
+            .unwrap();
+
+        let wrapper = AgentScopedMemory::new(as_dyn(inner), alpha_uuid, vec![beta_uuid.clone()]);
+
+        let err = wrapper
+            .forget("beta-row")
+            .await
+            .expect_err("forget must refuse cross-agent delete even with read allowlist");
+        assert!(
+            err.to_string().contains("attributed to agent"),
+            "expected sibling-attribution refusal, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_filters_to_bound_and_allowlisted_agents() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta", "rogue"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+        let rogue_uuid = &uuids[2];
+
+        for (key, owner) in [("alpha-row", alpha_uuid), ("rogue-row", rogue_uuid)] {
+            inner
+                .store_with_agent(
+                    key,
+                    "v",
+                    MemoryCategory::Core,
+                    None,
+                    None,
+                    None,
+                    Some(owner),
+                )
+                .await
+                .unwrap();
+        }
+
+        let wrapper = AgentScopedMemory::new(as_dyn(inner), alpha_uuid, vec![beta_uuid.clone()]);
+
+        let entries = wrapper.list(None, None).await.unwrap();
+        assert!(entries.iter().any(|e| e.key == "alpha-row"));
+        assert!(
+            !entries.iter().any(|e| e.key == "rogue-row"),
+            "list must drop rows attributed to non-allowlisted agents"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_with_agent_refuses_foreign_agent_id() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "rogue"]).await;
+        let alpha_uuid = &uuids[0];
+        let rogue_uuid = &uuids[1];
+
+        let wrapper = AgentScopedMemory::new(as_dyn(inner), alpha_uuid, Vec::<String>::new());
+
+        let err = wrapper
+            .store_with_agent(
+                "k",
+                "v",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(rogue_uuid),
+            )
+            .await
+            .expect_err(
+                "store_with_agent must refuse a foreign agent_id rather than silently override",
+            );
+        assert!(
+            err.to_string().contains("foreign agent_id"),
+            "expected foreign-agent refusal, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_namespace_is_refused() {
+        let (_tmp, inner) = fresh_sqlite();
+        let alpha = inner.ensure_agent_uuid("alpha").await.unwrap();
+        let wrapper = AgentScopedMemory::new(as_dyn(inner), &alpha, Vec::<String>::new());
+
+        let err = wrapper
+            .purge_namespace("default")
+            .await
+            .expect_err("purge_namespace must be refused on a wrapper");
+        assert!(
+            err.to_string().contains("admin Memory handle"),
+            "expected admin-only refusal, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_session_only_clears_bound_agents_rows() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "rogue"]).await;
+        let alpha_uuid = &uuids[0];
+        let rogue_uuid = &uuids[1];
+
+        let session = "shared-session";
+        for (key, owner) in [("alpha-row", alpha_uuid), ("rogue-row", rogue_uuid)] {
+            inner
+                .store_with_agent(
+                    key,
+                    "v",
+                    MemoryCategory::Core,
+                    Some(session),
+                    None,
+                    None,
+                    Some(owner),
+                )
+                .await
+                .unwrap();
+        }
+
+        let wrapper =
+            AgentScopedMemory::new(as_dyn(inner.clone()), alpha_uuid, Vec::<String>::new());
+        let purged = wrapper.purge_session(session).await.unwrap();
+        assert_eq!(purged, 1, "wrapper must purge only the bound agent's row");
+
+        // rogue's row must survive.
+        let rogue_wrapper = AgentScopedMemory::new(as_dyn(inner), rogue_uuid, Vec::<String>::new());
+        let rogue_hit = rogue_wrapper.get("rogue-row").await.unwrap();
+        assert!(
+            rogue_hit.is_some(),
+            "purge_session on the alpha wrapper must not touch rogue's rows"
         );
     }
 
