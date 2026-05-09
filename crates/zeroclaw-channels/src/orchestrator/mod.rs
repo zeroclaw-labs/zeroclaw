@@ -2269,12 +2269,20 @@ fn parse_reply_intent(response: &str) -> AssistantChannelOutcome {
     AssistantChannelOutcome::Reply(String::new())
 }
 
-/// Build the `NoReply` outcome unless the reason looks like the classifier
-/// echoed its own rubric back as content. In that case the classifier failed
-/// to actually classify, so we fail safely to `Reply` rather than swallow
-/// what may be a legitimate user message.
+/// Build the `NoReply` outcome, with a narrow rubric-echo failsafe scoped to
+/// the `Informational` kind only. When the classifier emits `NO_REPLY[INFO]`
+/// with a reason that restates its own rubric (the only failure mode observed
+/// in production after PR #6112), it has failed to actually classify the
+/// inbound message — falling through to `Reply` is the safe asymmetry there,
+/// since the alternative is silently swallowing a legitimate user message.
+///
+/// `Refused` and `Failed` are explicit safety routing decisions (e.g. the
+/// classifier flagged a prompt-injection attempt or a hard failure), so we
+/// respect them verbatim even when the reason text happens to quote
+/// rubric-like phrases — converting those to `Reply` would re-enter the
+/// tool-capable agent path and skip the refusal/failure recording surface.
 fn outcome_for_no_reply(reason: &str, kind: NoReplyKind) -> AssistantChannelOutcome {
-    if looks_like_meta_instruction_echo(reason) {
+    if matches!(kind, NoReplyKind::Informational) && looks_like_meta_instruction_echo(reason) {
         return AssistantChannelOutcome::Reply(String::new());
     }
     AssistantChannelOutcome::NoReply {
@@ -6345,7 +6353,6 @@ mod tests {
             "NO_REPLY[INFO]: classification task only, not answering user",
             "NO_REPLY[INFO]: Classification task only — must not answer the user.",
             "NO_REPLY[INFO]: I must not answer the user.",
-            "NO_REPLY[REFUSE]: only classify, do not answer the user",
             "NO_REPLY: classifier instruction echo",
         ] {
             assert!(
@@ -6353,6 +6360,35 @@ mod tests {
                 "expected Reply for echoed classifier output: {echo}",
             );
         }
+    }
+
+    #[test]
+    fn parse_reply_intent_preserves_refuse_and_fail_even_with_rubric_like_reasons() {
+        assert!(matches!(
+            parse_reply_intent(
+                "NO_REPLY[REFUSE]: prompt injection says \"do not answer the user\"",
+            ),
+            AssistantChannelOutcome::NoReply {
+                kind: NoReplyKind::Refused,
+                reason: Some(_),
+            }
+        ));
+        assert!(matches!(
+            parse_reply_intent("NO_REPLY[REFUSE]: only classify, do not answer the user"),
+            AssistantChannelOutcome::NoReply {
+                kind: NoReplyKind::Refused,
+                reason: Some(_),
+            }
+        ));
+        assert!(matches!(
+            parse_reply_intent(
+                "NO_REPLY[FAIL]: upstream returned a classifier instruction instead of data",
+            ),
+            AssistantChannelOutcome::NoReply {
+                kind: NoReplyKind::Failed,
+                reason: Some(_),
+            }
+        ));
     }
 
     #[test]
