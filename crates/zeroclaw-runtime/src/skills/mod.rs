@@ -696,7 +696,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tags: parsed.meta.tags,
         tools: Vec::new(),
         prompts: vec![parsed.body],
-        enabled: true,
+        enabled: true, // open-skills ignore per-file enabled; controlled at the repo level
         location: Some(path.to_path_buf()),
     }))
 }
@@ -914,6 +914,9 @@ pub fn skills_to_prompt_with_mode(
     };
 
     for skill in skills {
+        if !skill.enabled {
+            continue;
+        }
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
@@ -1037,6 +1040,9 @@ pub fn skills_to_tools(
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
     let mut tools: Vec<Box<dyn zeroclaw_api::tool::Tool>> = Vec::new();
     for skill in skills {
+        if !skill.enabled {
+            continue;
+        }
         for tool in &skill.tools {
             match tool.kind.as_str() {
                 "shell" | "script" => {
@@ -1886,6 +1892,26 @@ prompts = ["from-skill-section"]
         let content = "---\nname: test-skill\ndescription: test\n---\n\nBody";
         let parsed = parse_skill_markdown(content);
         assert_eq!(parsed.meta.enabled, None); // None → caller defaults to true
+    }
+
+    #[test]
+    fn enabled_aliases_are_parsed_correctly() {
+        for (input, expected) in [
+            ("yes", Some(true)),
+            ("on", Some(true)),
+            ("1", Some(true)),
+            ("no", Some(false)),
+            ("off", Some(false)),
+            ("0", Some(false)),
+            ("maybe", None),
+        ] {
+            let content = format!("---\nname: test\ndescription: test\nenabled: {input}\n---\n\nBody");
+            let parsed = parse_skill_markdown(&content);
+            assert_eq!(
+                parsed.meta.enabled, expected,
+                "enabled: {input} should parse to {expected:?}"
+            );
+        }
     }
 
     #[test]
