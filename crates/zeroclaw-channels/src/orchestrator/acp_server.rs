@@ -101,7 +101,7 @@ const INVALID_PARAMS: i32 = -32602;
 const INTERNAL_ERROR: i32 = -32603;
 
 // Custom error codes
-const SESSION_NOT_FOUND: i32 = -32000;
+pub const SESSION_NOT_FOUND: i32 = -32000;
 const SESSION_LIMIT_REACHED: i32 = -32001;
 const SESSION_BUSY: i32 = -32002;
 const ACP_PROTOCOL_VERSION: u64 = 1;
@@ -261,7 +261,7 @@ impl RpcOutbound {
 
 // ── Session state ────────────────────────────────────────────────
 
-struct Session {
+pub struct Session {
     agent: Agent,
     #[allow(dead_code)] // WIP: intended for session expiry logic
     created_at: Instant,
@@ -273,7 +273,7 @@ struct Session {
 pub struct AcpServer {
     config: Config,
     acp_config: AcpServerConfig,
-    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<Session>>>>>,
+    pub sessions: Arc<Mutex<HashMap<String, Arc<Mutex<Session>>>>>,
     rpc: Arc<RpcOutbound>,
     /// Receiver for the writer task. Pulled out (replaced with `None`) the
     /// first time `run()` starts the writer loop.
@@ -487,6 +487,7 @@ impl AcpServer {
             "session/new" => self.handle_session_new(&request.params).await,
             "session/load" => self.handle_session_load(&request.params).await,
             "session/resume" => self.handle_session_resume(&request.params).await,
+            "session/close" => self.handle_session_close(&request.params).await,
             "session/prompt" => self.handle_session_prompt(&request.params, &id).await,
             "session/stop" => self.handle_session_stop(&request.params).await,
             "session/cancel" => self.handle_session_cancel(&request.params).await,
@@ -557,7 +558,7 @@ impl AcpServer {
         }))
     }
 
-    async fn handle_session_new(&self, params: &Value) -> RpcResult {
+    pub async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let mut sessions = self.sessions.lock().await;
 
         if sessions.len() >= self.acp_config.max_sessions {
@@ -836,6 +837,54 @@ impl AcpServer {
         }
 
         debug!("Resumed session {session_id}");
+        Ok(serde_json::json!({}))
+    }
+
+    /// Handle `session/close` requests (ACP spec §Session Management).
+    ///
+    /// Closes a session: fires the cancel token to interrupt any in-flight turn,
+    /// removes the session from the in-memory map, and unregisters the ACP channel.
+    /// The session record in the persistent store is NOT deleted.
+    ///
+    /// Returns an empty object on success, or SESSION_NOT_FOUND if the session
+    /// is not in the in-memory map (it may still exist in the store).
+    pub async fn handle_session_close(&self, params: &Value) -> RpcResult {
+        let session_id = params
+            .get("sessionId")
+            .or_else(|| params.get("session_id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcError {
+                code: INVALID_PARAMS,
+                message: "Missing required parameter: sessionId".to_string(),
+                data: None,
+            })?;
+
+        // Fire the cancel token for any in-flight turn before acquiring the session lock.
+        let token = self
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
+            .get(session_id)
+            .cloned();
+        if let Some(token) = token {
+            token.cancel();
+            debug!("Cancelled active turn for closing session {session_id}");
+        }
+
+        let session_arc = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(session_id).ok_or_else(|| RpcError {
+                code: SESSION_NOT_FOUND,
+                message: format!("Session not found: {session_id}"),
+                data: None,
+            })?
+        };
+
+        // Wait for any in-flight turn to finish (the cancel token may have already stopped it).
+        let session = session_arc.lock().await;
+        session.agent.channel_handles().unregister_channel("acp");
+        debug!("Closed session {session_id}");
+
         Ok(serde_json::json!({}))
     }
 
@@ -1454,11 +1503,11 @@ fn history_notifications_for_message(
 // ── Error helper ─────────────────────────────────────────────────
 
 #[derive(Debug)]
-struct RpcError {
-    code: i32,
-    message: String,
+pub struct RpcError {
+    pub code: i32,
+    pub message: String,
     #[allow(dead_code)] // JSON-RPC spec field, used for structured error data
-    data: Option<Value>,
+    pub data: Option<Value>,
 }
 
 type RpcResult = std::result::Result<Value, RpcError>;
@@ -2394,4 +2443,5 @@ mod tests {
             "session/resume must not emit session/update notifications"
         );
     }
+
 }
