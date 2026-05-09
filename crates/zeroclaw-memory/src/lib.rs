@@ -16,6 +16,11 @@
 //! Channel-scoped variants (e.g. `telegram_user_msg_*`, `discord_*`) are
 //! **not** filtered — they use different prefixes and are handled separately.
 
+/// Opening delimiter for recalled memory injected into provider context.
+pub const MEMORY_CONTEXT_OPEN: &str = "[Memory context]";
+/// Closing delimiter for recalled memory injected into provider context.
+pub const MEMORY_CONTEXT_CLOSE: &str = "[/Memory context]";
+
 pub mod audit;
 pub mod backend;
 pub mod chunker;
@@ -189,8 +194,14 @@ pub fn should_skip_autosave_content(content: &str) -> bool {
     lowered.starts_with("[cron:")
         || lowered.starts_with("[heartbeat task")
         || lowered.starts_with("[distilled_")
-        || lowered.starts_with("[memory context]")
+        || starts_with_ignore_ascii_case(normalized, MEMORY_CONTEXT_OPEN)
         || lowered.contains("distilled_index_sig:")
+}
+
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -536,9 +547,9 @@ mod tests {
         assert!(should_skip_autosave_content(
             "[Heartbeat Task | high] Execute scheduled patrol"
         ));
-        assert!(should_skip_autosave_content(
-            "[Memory context]\n- user_msg_abc: some recalled memory\n[/Memory context]\n\n[cron:uuid job] prompt"
-        ));
+        assert!(should_skip_autosave_content(&format!(
+            "{MEMORY_CONTEXT_OPEN}\n- user_msg_abc: some recalled memory\n{MEMORY_CONTEXT_CLOSE}\n\n[cron:uuid job] prompt"
+        )));
         assert!(!should_skip_autosave_content(
             "User prefers concise answers."
         ));

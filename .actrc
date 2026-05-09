@@ -14,3 +14,8 @@
 # Force amd64 container architecture (Apple Silicon hosts otherwise pull
 # arm64 images that lack many tools).
 --container-architecture linux/amd64
+
+# Run a local artifact server so actions/upload-artifact and
+# actions/download-artifact work between jobs. The directory is
+# auto-created by scripts/dev/act-local.sh on first run.
+--artifact-server-path /tmp/act-artifacts

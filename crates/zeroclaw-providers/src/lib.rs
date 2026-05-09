@@ -27,6 +27,7 @@ pub mod gemini;
 pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
+pub mod llamacpp;
 pub mod models_dev;
 pub mod multimodal;
 pub mod ollama;
@@ -725,6 +726,33 @@ pub struct ProviderRuntimeOptions {
     /// `ModelProviderConfig::native_tools`. Currently consulted only by the
     /// Groq factory branch (#5932).
     pub native_tools: Option<bool>,
+    /// Wire protocol to use for this provider.
+    /// `Some("responses")` routes the provider through the OpenResponses
+    /// `/v1/responses` API instead of chat_completions.  `None` uses the
+    /// provider's built-in default (chat_completions for most providers).
+    pub wire_api: Option<String>,
+    /// Enable or disable chain-of-thought thinking. Forwarded as
+    /// `enable_thinking` in the request body. `None` lets the model decide.
+    pub think: Option<bool>,
+    /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
+    pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Override for the Ollama `num_ctx` request option. Only consumed by
+    /// the `ollama` factory arm. `None` falls back to the framework
+    /// default constant.
+    pub ollama_num_ctx: Option<u32>,
+    /// Override for the Ollama `num_predict` request option. Only consumed
+    /// by the `ollama` factory arm. `None` falls back to the framework
+    /// default constant.
+    pub ollama_num_predict: Option<i32>,
+    /// Override the temperature sent on every Ollama `/api/chat` request.
+    /// Only consumed by the `ollama` factory arm. When `None` (default), the
+    /// per-call temperature passed through `Provider::chat_with_system`
+    /// wins — this field is preserved as `None` straight through to
+    /// `OllamaTuning::temperature_override`, and the request builder uses
+    /// `temperature_override.unwrap_or(temperature)`. When `Some(v)`, every
+    /// request to this Ollama provider uses `v` regardless of the per-call
+    /// argument. There is no framework-constant fallback for this field.
+    pub ollama_temperature_override: Option<f64>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -743,6 +771,12 @@ impl Default for ProviderRuntimeOptions {
             merge_system_into_user: false,
             provider_extra: None,
             native_tools: None,
+            wire_api: None,
+            think: None,
+            chat_template_kwargs: None,
+            ollama_num_ctx: None,
+            ollama_num_predict: None,
+            ollama_temperature_override: None,
         }
     }
 }
@@ -787,6 +821,12 @@ pub fn provider_runtime_options_from_config(
         merge_system_into_user,
         provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
         native_tools: fallback.and_then(|e| e.native_tools),
+        wire_api: fallback.and_then(|e| e.wire_api.clone()),
+        think: fallback.and_then(|e| e.think),
+        chat_template_kwargs: fallback.and_then(|e| e.chat_template_kwargs.clone()),
+        ollama_num_ctx: fallback.and_then(|e| e.ollama_num_ctx),
+        ollama_num_predict: fallback.and_then(|e| e.ollama_num_predict),
+        ollama_temperature_override: fallback.and_then(|e| e.ollama_temperature_override),
     }
 }
 
@@ -1252,11 +1292,16 @@ fn create_provider_with_url_and_options(
 
             let api_url = env_url.as_deref().or(api_url);
 
-            Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
-                api_url,
-                key,
-                options.reasoning_enabled,
-            )))
+            let tuning = ollama::OllamaTuning::from_runtime_overrides(
+                options.ollama_num_ctx,
+                options.ollama_num_predict,
+                options.ollama_temperature_override,
+            );
+
+            Ok(Box::new(
+                ollama::OllamaProvider::new_with_reasoning(api_url, key, options.reasoning_enabled)
+                    .with_tuning(tuning),
+            ))
         }
         "gemini" | "google" | "google-gemini" => {
             let state_dir = options.zeroclaw_dir.clone().unwrap_or_else(|| {
@@ -1518,23 +1563,27 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("http://localhost:8080/v1");
-            let llama_cpp_key = key
+            let credential = key
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("llama.cpp");
-            let provider = OpenAiCompatibleProvider::new_with_vision(
-                "llama.cpp",
-                base_url,
-                Some(llama_cpp_key),
-                AuthStyle::Bearer,
-                true,
-            );
-            let provider = if options.merge_system_into_user {
-                provider.with_merge_system_into_user()
-            } else {
-                provider
-            };
-            Ok(compat(provider))
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let mut provider = llamacpp::LlamaCppProvider::new(base_url, credential.as_deref());
+            if let Some(t) = options.provider_timeout_secs {
+                provider = provider.with_timeout_secs(t);
+            }
+            if !options.extra_headers.is_empty() {
+                provider = provider.with_extra_headers(options.extra_headers.clone());
+            }
+            if let Some(mt) = options.provider_max_tokens {
+                provider = provider.with_max_tokens(Some(mt));
+            }
+            if options.think.is_some() {
+                provider = provider.with_think(options.think);
+            }
+            if options.chat_template_kwargs.is_some() {
+                provider = provider.with_chat_template_kwargs(options.chat_template_kwargs.clone());
+            }
+            Ok(Box::new(provider))
         }
         "sglang" => {
             let base_url = api_url
@@ -4089,5 +4138,52 @@ mod tests {
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_PROVIDER_URL") };
+    }
+
+    #[test]
+    fn ollama_runtime_overrides_populate_tuning_struct() {
+        // Mirror the factory's tuning derivation: the same expression used
+        // inside `create_provider_with_url_and_options`'s "ollama" arm.
+        // Asserting on the resulting struct gives us downcast-free coverage
+        // that the three runtime-option fields actually reach the provider.
+        let options = ProviderRuntimeOptions {
+            ollama_num_ctx: Some(16384),
+            ollama_num_predict: Some(4096),
+            ollama_temperature_override: Some(0.5),
+            ..ProviderRuntimeOptions::default()
+        };
+
+        let tuning = ollama::OllamaTuning::from_runtime_overrides(
+            options.ollama_num_ctx,
+            options.ollama_num_predict,
+            options.ollama_temperature_override,
+        );
+        assert_eq!(tuning.num_ctx, 16384);
+        assert_eq!(tuning.num_predict, 4096);
+        assert_eq!(tuning.temperature_override, Some(0.5));
+
+        let provider = ollama::OllamaProvider::new(None, None).with_tuning(tuning);
+        assert_eq!(provider.tuning(), tuning);
+
+        // The factory itself must succeed with the same options.
+        let factory_provider = create_provider_with_url_and_options("ollama", None, None, &options);
+        assert!(factory_provider.is_ok());
+    }
+
+    #[test]
+    fn ollama_runtime_overrides_default_to_none_temperature_override() {
+        // Default options must produce a tuning that leaves
+        // `temperature_override = None` so per-call temperature wins —
+        // the backward-compat guarantee for operators who never set the
+        // override in config.toml.
+        let options = ProviderRuntimeOptions::default();
+        let tuning = ollama::OllamaTuning::from_runtime_overrides(
+            options.ollama_num_ctx,
+            options.ollama_num_predict,
+            options.ollama_temperature_override,
+        );
+        assert!(tuning.temperature_override.is_none());
+        assert_eq!(tuning.num_ctx, ollama::OLLAMA_DEFAULT_NUM_CTX);
+        assert_eq!(tuning.num_predict, ollama::OLLAMA_DEFAULT_NUM_PREDICT);
     }
 }

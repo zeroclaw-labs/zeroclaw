@@ -27,6 +27,8 @@ When uncertain, treat as higher risk.
 
 If the path-labeler's risk inference is contextually wrong, apply `risk: manual` and set the final `risk:*` label explicitly — manual freezes any future automated recalculation.
 
+Labels are maintainer metadata. If the correct label is obvious and you have permission, fix it yourself before finalizing the review. Ask the author only when the right label choice is ambiguous or nobody with label permissions is available.
+
 ## Standard workflow
 
 ### Five-minute intake

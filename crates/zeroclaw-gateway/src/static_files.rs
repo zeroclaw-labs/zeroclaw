@@ -41,7 +41,7 @@ pub async fn handle_spa_fallback(State(state): State<AppState>) -> Response {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Web dashboard not available. Set gateway.web_dist_dir in your config \
-             and build the frontend with: cd web && npm ci && npm run build",
+             and build the frontend with: cargo web build",
         )
             .into_response();
     };
