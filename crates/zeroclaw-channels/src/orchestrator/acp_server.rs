@@ -622,6 +622,18 @@ impl AcpServer {
             })),
         );
 
+        if let Some(store) = &self.store
+            && let Err(e) = store.create_session(&session_id, &workspace_dir)
+        {
+            // Roll back: remove the session we just inserted and surface the error.
+            sessions.remove(&session_id);
+            return Err(RpcError {
+                code: INTERNAL_ERROR,
+                message: format!("Failed to persist session: {e}"),
+                data: None,
+            });
+        }
+
         debug!("Created session {session_id} (workspace: {workspace_dir})");
 
         Ok(serde_json::json!({
@@ -677,6 +689,14 @@ impl AcpServer {
         let cancel_token = tokio_util::sync::CancellationToken::new();
         self.register_cancel_token(&session_id, cancel_token.clone())?;
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
+
+        // Snapshot history length before the turn so we can slice the new
+        // messages afterwards without re-running the full history.
+        let pre_len = {
+            let session = session_arc.lock().await;
+            session.agent.history().len()
+        };
+        let session_arc_for_persist = Arc::clone(&session_arc);
 
         // Move the Arc into the spawned task and lock inside it.  The inner
         // Mutex stays locked for the duration of the turn, preventing
@@ -742,6 +762,23 @@ impl AcpServer {
             message: format!("Agent turn failed: {e}"),
             data: None,
         })?;
+
+        // Persist new messages on successful, non-cancelled turns.
+        if let Some(store) = &self.store {
+            let new_messages: Vec<_> = {
+                let session = session_arc_for_persist.lock().await;
+                session.agent.history()[pre_len..].to_vec()
+            };
+            if !new_messages.is_empty()
+                && let Err(e) = store.append_turn(&session_id, &new_messages)
+            {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Failed to persist turn; session continues in memory"
+                );
+            }
+        }
 
         Ok(Self::prompt_result(session_id, "end_turn", result))
     }
@@ -1680,6 +1717,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn session_new_persists_to_store() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap(),
+        );
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+
+        // Session must appear in the store
+        let data = store.load_session(session_id).unwrap();
+        assert!(data.is_some(), "session/new must persist to AcpSessionStore");
+    }
+
+    #[tokio::test]
+    async fn session_new_without_store_still_works() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+        ));
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed without a store");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        assert!(server.sessions.lock().await.contains_key(session_id));
     }
 
     fn make_test_config(cwd: &std::path::Path) -> Config {
