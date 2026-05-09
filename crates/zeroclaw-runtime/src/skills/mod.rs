@@ -629,6 +629,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         tags: manifest.skill.tags,
         tools: manifest.tools,
         prompts,
+        enabled: manifest.skill.enabled,
         location: Some(path.to_path_buf()),
     })
 }
@@ -655,6 +656,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tags: parsed.meta.tags,
         tools: Vec::new(),
         prompts: vec![parsed.body],
+        enabled: parsed.meta.enabled.unwrap_or(true),
         location: Some(path.to_path_buf()),
     })
 }
@@ -694,6 +696,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tags: parsed.meta.tags,
         tools: Vec::new(),
         prompts: vec![parsed.body],
+        enabled: true,
         location: Some(path.to_path_buf()),
     }))
 }
@@ -790,6 +793,13 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
                         .filter(|t| !t.is_empty())
                         .collect();
                 }
+            }
+            "enabled" => {
+                meta.enabled = match val.to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" | "on" => Some(true),
+                    "false" | "0" | "no" | "off" => Some(false),
+                    _ => None,
+                };
             }
             _ => {}
         }
