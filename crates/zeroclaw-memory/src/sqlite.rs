@@ -289,26 +289,22 @@ impl SqliteMemory {
             "session_id",
             "ALTER TABLE memories ADD COLUMN session_id TEXT;",
         )?;
-        if memories_has_column(conn, "session_id")? {
-            execute_batch_retry(
-                conn,
-                "CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);",
-            )
-            .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_session")?;
-        }
+        execute_batch_retry(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_session")?;
 
         add_memories_column_if_missing(
             conn,
             "namespace",
             "ALTER TABLE memories ADD COLUMN namespace TEXT DEFAULT 'default';",
         )?;
-        if memories_has_column(conn, "namespace")? {
-            execute_batch_retry(
-                conn,
-                "CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);",
-            )
-            .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_namespace")?;
-        }
+        execute_batch_retry(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_namespace")?;
 
         add_memories_column_if_missing(
             conn,
