@@ -1882,7 +1882,8 @@ prompts = ["from-skill-section"]
         .unwrap();
 
         let skills = load_skills_from_directory(tmp.path(), false);
-        // skill is loaded
+        // Disabled skills must still be loaded (so `skills list` can show them as [disabled]).
+        // The filtering happens in skills_to_prompt, not in load_skills_from_directory.
         assert_eq!(skills.len(), 1);
         assert!(!skills[0].enabled);
 
