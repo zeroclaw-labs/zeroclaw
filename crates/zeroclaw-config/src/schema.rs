@@ -363,6 +363,16 @@ pub struct Config {
     #[nested]
     pub mcp_bundles: HashMap<String, McpBundleConfig>,
 
+    /// Named peer groups (`[peer_groups.<name>]`). Each entry binds a
+    /// channel, a list of member agents, and optional non-agent
+    /// (external) members and a per-group blocklist. Mutual opt-in:
+    /// two agents become peers only when both appear in the same
+    /// group's `agents`. Empty by default for single-agent installs.
+    /// See `crate::multi_agent::PeerGroupConfig`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub peer_groups: HashMap<String, crate::multi_agent::PeerGroupConfig>,
+
     /// Hooks configuration (lifecycle hooks and built-in hook toggles).
     #[serde(default)]
     #[nested]
@@ -2731,6 +2741,23 @@ pub struct AliasedAgentConfig {
     #[nested]
     #[serde(default)]
     pub tool_receipts: ToolReceiptsConfig,
+
+    /// Per-agent workspace block (`[agents.<alias>.workspace]`).
+    /// Holds the agent's filesystem path, cross-agent access allowlist,
+    /// filesystem-escape boolean, and cross-agent memory allowlist.
+    /// Default is fully jailed (no cross-agent access). See
+    /// `crate::multi_agent::AgentWorkspaceConfig`.
+    #[serde(default)]
+    #[nested]
+    pub workspace: crate::multi_agent::AgentWorkspaceConfig,
+
+    /// Per-agent memory backend selection (`[agents.<alias>.memory]`).
+    /// The `backend` field is locked at agent creation and immutable on
+    /// subsequent loads. Defaults to `Sqlite`. See
+    /// `crate::multi_agent::AgentMemoryConfig`.
+    #[serde(default)]
+    #[nested]
+    pub memory: crate::multi_agent::AgentMemoryConfig,
 }
 
 fn default_agent_compact_context() -> bool {
@@ -2771,6 +2798,8 @@ impl Default for AliasedAgentConfig {
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
             tool_receipts: ToolReceiptsConfig::default(),
+            workspace: crate::multi_agent::AgentWorkspaceConfig::default(),
+            memory: crate::multi_agent::AgentMemoryConfig::default(),
         }
     }
 }
@@ -12067,6 +12096,7 @@ impl Default for Config {
             memory_namespaces: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
+            peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
@@ -14671,6 +14701,7 @@ auto_save = true
             memory_namespaces: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
+            peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
@@ -15244,6 +15275,7 @@ default_temperature = 0.7
             memory_namespaces: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
+            peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),

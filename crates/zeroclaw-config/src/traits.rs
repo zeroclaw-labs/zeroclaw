@@ -87,6 +87,41 @@ impl HasPropKind for Vec<crate::providers::ChannelRef> {
     const PROP_KIND: PropKind = PropKind::StringArray;
 }
 
+// Multi-agent (#6272) typed primitives. AgentAlias / PeerGroupName /
+// PeerUsername round-trip as plain strings; AccessMode and
+// MemoryBackendKind are enums; PeerExternal is a struct (object) that
+// serializes as a single-field TOML table.
+impl HasPropKind for crate::multi_agent::AgentAlias {
+    const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for crate::multi_agent::PeerGroupName {
+    const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for crate::multi_agent::PeerUsername {
+    const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for crate::multi_agent::AccessMode {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+impl HasPropKind for crate::multi_agent::MemoryBackendKind {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+impl HasPropKind for crate::multi_agent::PeerExternal {
+    const PROP_KIND: PropKind = PropKind::Object;
+}
+impl HasPropKind for Vec<crate::multi_agent::AgentAlias> {
+    const PROP_KIND: PropKind = PropKind::StringArray;
+}
+impl HasPropKind for Vec<crate::multi_agent::PeerExternal> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+impl HasPropKind
+    for std::collections::BTreeMap<crate::multi_agent::AgentAlias, crate::multi_agent::AccessMode>
+{
+    // Serialized as a TOML inline table: `{ beta = "read", gamma = "read_write" }`.
+    const PROP_KIND: PropKind = PropKind::Object;
+}
+
 /// Describes a single property field discovered via `#[derive(Configurable)]`.
 #[derive(Clone)]
 pub struct PropFieldInfo {

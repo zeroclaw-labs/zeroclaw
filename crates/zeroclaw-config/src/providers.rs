@@ -62,7 +62,9 @@ macro_rules! define_provider_ref {
         ///
         /// Empty value means "no preference" (opt-out). Non-empty values must
         /// resolve to a configured alias; `Config::validate()` enforces this.
-        #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(
+            Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[serde(transparent)]
         pub struct $name(pub String);
