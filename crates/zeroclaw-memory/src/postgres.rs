@@ -50,49 +50,22 @@ impl PostgresMemory {
         let table_ident = quote_identifier(table);
         let qualified_table = format!("{schema_ident}.{table_ident}");
 
-        let client = Self::initialize_client(
-            db_url.to_string(),
-            connect_timeout_secs,
-            schema_ident.clone(),
-            qualified_table.clone(),
-        )?;
-
         let pgvector_enabled = pgvector_enabled.unwrap_or(false);
         let pgvector_dimensions = pgvector_dimensions.unwrap_or(1536);
 
-        if pgvector_enabled {
-            let client_ref = Arc::new(Mutex::new(client));
-            let ext_ok = {
-                let mut c = client_ref.lock();
-                Self::try_enable_pgvector(&mut c, &qualified_table, pgvector_dimensions).is_ok()
-            };
-            if !ext_ok {
-                tracing::warn!(
-                    "pgvector extension not available; falling back to keyword-only recall"
-                );
-            }
-            Ok(Self {
-                client: client_ref,
-                qualified_table,
-            })
-        } else {
-            Ok(Self {
-                client: Arc::new(Mutex::new(client)),
-                qualified_table,
-            })
-        }
-    }
+        // Convert borrowed values to owned before spawning thread.
+        let db_url_owned = db_url.to_string();
+        let qualified_table_for_thread = qualified_table.clone();
 
-    fn initialize_client(
-        db_url: String,
-        connect_timeout_secs: Option<u64>,
-        schema_ident: String,
-        qualified_table: String,
-    ) -> Result<Client> {
+        // All postgres operations (connect, init_schema, try_enable_pgvector) must run
+        // on a plain OS thread to avoid nested Tokio runtime panics. The sync `postgres`
+        // crate internally calls `Runtime::block_on()`, which conflicts with Tokio worker
+        // threads. We bundle everything into a single thread spawn so that callers can
+        // invoke `PostgresMemory::new()` from any context (including inside a Tokio runtime).
         let init_handle = std::thread::Builder::new()
             .name("postgres-memory-init".to_string())
-            .spawn(move || -> Result<Client> {
-                let mut config: postgres::Config = db_url
+            .spawn(move || -> Result<(Client, bool)> {
+                let mut config: postgres::Config = db_url_owned
                     .parse()
                     .context("invalid PostgreSQL connection URL")?;
 
@@ -105,14 +78,37 @@ impl PostgresMemory {
                     .connect(NoTls)
                     .context("failed to connect to PostgreSQL memory backend")?;
 
-                Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
-                Ok(client)
+                Self::init_schema(&mut client, &schema_ident, &qualified_table_for_thread)?;
+
+                // Attempt pgvector setup if requested; record success/failure so we can
+                // emit a warning back on the caller thread without touching postgres again.
+                let pgvector_ok = if pgvector_enabled {
+                    Self::try_enable_pgvector(
+                        &mut client,
+                        &qualified_table_for_thread,
+                        pgvector_dimensions,
+                    )
+                    .is_ok()
+                } else {
+                    false
+                };
+
+                Ok((client, pgvector_ok))
             })
             .context("failed to spawn PostgreSQL initializer thread")?;
 
-        init_handle
+        let (client, pgvector_ok) = init_handle
             .join()
-            .map_err(|_| anyhow::anyhow!("PostgreSQL initializer thread panicked"))?
+            .map_err(|_| anyhow::anyhow!("PostgreSQL initializer thread panicked"))??;
+
+        if pgvector_enabled && !pgvector_ok {
+            tracing::warn!("pgvector extension not available; falling back to keyword-only recall");
+        }
+
+        Ok(Self {
+            client: Arc::new(Mutex::new(client)),
+            qualified_table,
+        })
     }
 
     fn init_schema(client: &mut Client, schema_ident: &str, qualified_table: &str) -> Result<()> {
