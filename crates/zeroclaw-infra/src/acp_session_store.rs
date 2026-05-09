@@ -5,9 +5,6 @@ use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use zeroclaw_api::provider::ConversationMessage;
 
-use serde_json;
-use tracing;
-
 pub struct AcpSessionStore {
     conn: Mutex<Connection>,
     #[allow(dead_code)]
@@ -102,12 +99,16 @@ impl AcpSessionStore {
             Err(e) => return Err(e).context("Failed to query ACP session"),
         };
 
-        let created_at = created_at_str
-            .parse::<DateTime<Utc>>()
-            .unwrap_or_else(|_| Utc::now());
+        let created_at = created_at_str.parse::<DateTime<Utc>>().unwrap_or_else(|e| {
+            tracing::warn!("Failed to parse created_at for session {session_id}: {e}");
+            Utc::now()
+        });
         let last_activity = last_activity_str
             .parse::<DateTime<Utc>>()
-            .unwrap_or_else(|_| Utc::now());
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to parse last_activity for session {session_id}: {e}");
+                Utc::now()
+            });
 
         let mut stmt = conn
             .prepare(
