@@ -26,7 +26,9 @@
 # does not depend on a working ZeroClaw build. The stub validates everything
 # we need from the *module*: unit generation, file rendering, user creation,
 # hardening defaults.
-{ pkgs ? import <nixpkgs> { } }:
+{
+  pkgs ? import <nixpkgs> { },
+}:
 
 let
   # Stub `zeroclaw` binary: ignore arguments, sleep forever so systemd's
@@ -41,48 +43,55 @@ let
 
   # Wrap the script so `${cfg.package}/bin/zeroclaw` resolves to it, and so
   # `lib.getExe` (which reads `meta.mainProgram`) finds a single binary.
-  stubPackage = pkgs.runCommand "zeroclaw-stub"
-    {
-      meta.mainProgram = "zeroclaw";
-    }
-    ''
-      mkdir -p $out/bin
-      cp ${zeroclawStub}/bin/zeroclaw $out/bin/zeroclaw
-    '';
+  stubPackage =
+    pkgs.runCommand "zeroclaw-stub"
+      {
+        meta.mainProgram = "zeroclaw";
+      }
+      ''
+        mkdir -p $out/bin
+        cp ${zeroclawStub}/bin/zeroclaw $out/bin/zeroclaw
+      '';
 
   moduleUnderTest = ./module.nix;
 
-in {
+in
+{
   name = "zeroclaw-module";
 
-  nodes.machine = { config, pkgs, ... }: {
-    imports = [ moduleUnderTest ];
+  nodes.machine =
+    { config, pkgs, ... }:
+    {
+      imports = [ moduleUnderTest ];
 
-    services.zeroclaw.instances.test = {
-      package = stubPackage;
-      settings = {
-        default_provider = "anthropic";
-        default_model = "claude-sonnet-4-6";
-        default_temperature = 0.4;
-        channels.telegram = {
-          enabled = true;
-          bot_token = "fake-token-for-test";
-          allowed_users = [ "12345" ];
+      services.zeroclaw.instances.test = {
+        package = stubPackage;
+        settings = {
+          default_provider = "anthropic";
+          default_model = "claude-sonnet-4-6";
+          default_temperature = 0.4;
+          channels.telegram = {
+            enabled = true;
+            bot_token = "fake-token-for-test";
+            allowed_users = [ "12345" ];
+          };
         };
       };
-    };
 
-    services.zeroclaw.instances.other = {
-      package = stubPackage;
-      settings = {
-        default_provider = "anthropic";
-        default_model = "claude-haiku-4-6";
+      services.zeroclaw.instances.other = {
+        package = stubPackage;
+        settings = {
+          default_provider = "anthropic";
+          default_model = "claude-haiku-4-6";
+        };
       };
-    };
 
-    # `yq-go -p toml` parses the rendered TOML for the round-trip check.
-    environment.systemPackages = [ pkgs.yq-go pkgs.coreutils ];
-  };
+      # `yq-go -p toml` parses the rendered TOML for the round-trip check.
+      environment.systemPackages = [
+        pkgs.yq-go
+        pkgs.coreutils
+      ];
+    };
 
   testScript = ''
     machine.start()

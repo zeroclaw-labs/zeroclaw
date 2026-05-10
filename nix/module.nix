@@ -40,7 +40,12 @@
 #     environmentFile = "/run/secrets/${n}/identity.env";
 #     settings = (import ./shared-settings.nix) { slot = n; };
 #   });
-{ config, lib, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 
 let
   inherit (lib)
@@ -68,140 +73,142 @@ let
   # Per-instance submodule. `name` is the attrset key — we use it to default
   # user, group, and dataDir so a caller who only sets `settings` gets
   # sensible, collision-free defaults.
-  instanceModule = { name, config, ... }: {
-    options = {
-      package = mkPackageOption pkgs "zeroclaw" { };
+  instanceModule =
+    { name, config, ... }:
+    {
+      options = {
+        package = mkPackageOption pkgs "zeroclaw" { };
 
-      user = mkOption {
-        type = types.str;
-        default = "zeroclaw-${name}";
-        defaultText = literalExpression ''"zeroclaw-''${name}"'';
-        description = ''
-          System user the instance runs as. Created by the module unless
-          {option}`createUser` is `false`.
-        '';
-      };
-
-      group = mkOption {
-        type = types.str;
-        default = "zeroclaw-${name}";
-        defaultText = literalExpression ''"zeroclaw-''${name}"'';
-        description = ''
-          System group the instance runs as. Created by the module unless
-          {option}`createUser` is `false`.
-        '';
-      };
-
-      createUser = mkOption {
-        type = types.bool;
-        default = true;
-        description = ''
-          Whether the module should create the {option}`user` and
-          {option}`group`. Set to `false` to bring your own user — for
-          example, a shared system user already declared elsewhere.
-        '';
-      };
-
-      dataDir = mkOption {
-        type = types.path;
-        default = "/var/lib/zeroclaw-${name}";
-        defaultText = literalExpression ''"/var/lib/zeroclaw-''${name}"'';
-        description = ''
-          State directory. Holds `config.toml`, the workspace at
-          `''${dataDir}/workspace`, and ZeroClaw's SQLite databases.
-          Created by systemd's `StateDirectory=` with mode `0750` owned by
-          {option}`user`:{option}`group`.
-        '';
-      };
-
-      settings = mkOption {
-        type = types.submodule {
-          # RFC-42 shape: typed options for the popular knobs go here later
-          # once the surface stabilises; `freeformType` lets every other
-          # ZeroClaw config key flow through with TOML's value-model
-          # validation. No string-of-doom escape hatch needed for the
-          # common case.
-          freeformType = tomlFormat.type;
+        user = mkOption {
+          type = types.str;
+          default = "zeroclaw-${name}";
+          defaultText = literalExpression ''"zeroclaw-''${name}"'';
+          description = ''
+            System user the instance runs as. Created by the module unless
+            {option}`createUser` is `false`.
+          '';
         };
-        default = { };
-        example = literalExpression ''
-          {
-            default_provider = "anthropic";
-            default_model = "claude-sonnet-4-6";
-            channels.telegram = {
-              enabled = true;
-              bot_token = "$BOT_TOKEN";
-              allowed_users = [ "12345" ];
-            };
-          }
-        '';
-        description = ''
-          ZeroClaw configuration as a Nix attrset. Rendered to TOML at
-          `''${dataDir}/config.toml` via `(pkgs.formats.toml { }).generate`.
 
-          String values may contain `$VAR` or `''${VAR}` references which
-          ZeroClaw resolves at process start against its environment
-          (populated by {option}`environmentFile`). This is the recommended
-          path for secrets — the rendered TOML in the world-readable
-          `/nix/store` should never contain a real credential.
+        group = mkOption {
+          type = types.str;
+          default = "zeroclaw-${name}";
+          defaultText = literalExpression ''"zeroclaw-''${name}"'';
+          description = ''
+            System group the instance runs as. Created by the module unless
+            {option}`createUser` is `false`.
+          '';
+        };
 
-          See ZeroClaw's `config.toml.example` upstream for the full key
-          surface; only the shape we render here is module-contractual.
-        '';
-      };
+        createUser = mkOption {
+          type = types.bool;
+          default = true;
+          description = ''
+            Whether the module should create the {option}`user` and
+            {option}`group`. Set to `false` to bring your own user — for
+            example, a shared system user already declared elsewhere.
+          '';
+        };
 
-      environmentFile = mkOption {
-        type = types.nullOr types.path;
-        default = null;
-        example = "/run/agenix/zeroclaw-bot-token";
-        description = ''
-          Path to a file containing `KEY=VALUE` lines, loaded into the
-          unit's environment via systemd `EnvironmentFile=` (see
-          {manpage}`systemd.exec(5)`). Variables become available for
-          `$VAR` substitution in {option}`settings` strings at process
-          start.
+        dataDir = mkOption {
+          type = types.path;
+          default = "/var/lib/zeroclaw-${name}";
+          defaultText = literalExpression ''"/var/lib/zeroclaw-''${name}"'';
+          description = ''
+            State directory. Holds `config.toml`, the workspace at
+            `''${dataDir}/workspace`, and ZeroClaw's SQLite databases.
+            Created by systemd's `StateDirectory=` with mode `0750` owned by
+            {option}`user`:{option}`group`.
+          '';
+        };
 
-          Typical: an agenix- or sops-decrypted file at `/run/agenix/...`.
+        settings = mkOption {
+          type = types.submodule {
+            # RFC-42 shape: typed options for the popular knobs go here later
+            # once the surface stabilises; `freeformType` lets every other
+            # ZeroClaw config key flow through with TOML's value-model
+            # validation. No string-of-doom escape hatch needed for the
+            # common case.
+            freeformType = tomlFormat.type;
+          };
+          default = { };
+          example = literalExpression ''
+            {
+              default_provider = "anthropic";
+              default_model = "claude-sonnet-4-6";
+              channels.telegram = {
+                enabled = true;
+                bot_token = "$BOT_TOKEN";
+                allowed_users = [ "12345" ];
+              };
+            }
+          '';
+          description = ''
+            ZeroClaw configuration as a Nix attrset. Rendered to TOML at
+            `''${dataDir}/config.toml` via `(pkgs.formats.toml { }).generate`.
 
-          When this option is set, the unit declares
-          `ConditionPathExists=` on the path, so the unit stays inactive
-          (rather than failing) until the secret materialises — useful for
-          sops-nix / agenix activation timing.
-        '';
-      };
+            String values may contain `$VAR` or `''${VAR}` references which
+            ZeroClaw resolves at process start against its environment
+            (populated by {option}`environmentFile`). This is the recommended
+            path for secrets — the rendered TOML in the world-readable
+            `/nix/store` should never contain a real credential.
 
-      extraConfig = mkOption {
-        type = types.lines;
-        default = "";
-        example = ''
-          [experimental]
-          new_knob = true
-        '';
-        description = ''
-          Raw TOML appended verbatim after the rendered {option}`settings`
-          block. Documented escape hatch (per RFC-42) for ZeroClaw config
-          keys whose shape isn't yet covered by the typed `settings`
-          surface — most things should go through `settings` instead.
-        '';
-      };
+            See ZeroClaw's `config.toml.example` upstream for the full key
+            surface; only the shape we render here is module-contractual.
+          '';
+        };
 
-      bindReadOnlyPaths = mkOption {
-        type = types.attrsOf types.path;
-        default = { };
-        example = literalExpression ''
-          {
-            "/var/lib/zeroclaw-me/workspace/skills/git" = "/etc/zeroclaw-skills/git";
-          }
-        '';
-        description = ''
-          Read-only bind-mounts to thread into the unit's namespace via
-          systemd `BindReadOnlyPaths=`. Map of `target = source`. Useful
-          for declarative skill bundles, CA bundles, or other operator-
-          managed read-only assets.
-        '';
+        environmentFile = mkOption {
+          type = types.nullOr types.path;
+          default = null;
+          example = "/run/agenix/zeroclaw-bot-token";
+          description = ''
+            Path to a file containing `KEY=VALUE` lines, loaded into the
+            unit's environment via systemd `EnvironmentFile=` (see
+            {manpage}`systemd.exec(5)`). Variables become available for
+            `$VAR` substitution in {option}`settings` strings at process
+            start.
+
+            Typical: an agenix- or sops-decrypted file at `/run/agenix/...`.
+
+            When this option is set, the unit declares
+            `ConditionPathExists=` on the path, so the unit stays inactive
+            (rather than failing) until the secret materialises — useful for
+            sops-nix / agenix activation timing.
+          '';
+        };
+
+        extraConfig = mkOption {
+          type = types.lines;
+          default = "";
+          example = ''
+            [experimental]
+            new_knob = true
+          '';
+          description = ''
+            Raw TOML appended verbatim after the rendered {option}`settings`
+            block. Documented escape hatch (per RFC-42) for ZeroClaw config
+            keys whose shape isn't yet covered by the typed `settings`
+            surface — most things should go through `settings` instead.
+          '';
+        };
+
+        bindReadOnlyPaths = mkOption {
+          type = types.attrsOf types.path;
+          default = { };
+          example = literalExpression ''
+            {
+              "/var/lib/zeroclaw-me/workspace/skills/git" = "/etc/zeroclaw-skills/git";
+            }
+          '';
+          description = ''
+            Read-only bind-mounts to thread into the unit's namespace via
+            systemd `BindReadOnlyPaths=`. Map of `target = source`. Useful
+            for declarative skill bundles, CA bundles, or other operator-
+            managed read-only assets.
+          '';
+        };
       };
     };
-  };
 
   # If a caller needs an escape hatch beyond the typed options, the
   # standard NixOS pattern is:
@@ -214,24 +221,26 @@ let
   # contradictions) and isn't standard nixpkgs shape.
 
   # Render config.toml = formats.toml.generate settings (+ optional extraConfig).
-  renderConfigFile = name: instanceCfg:
+  renderConfigFile =
+    name: instanceCfg:
     let
       base = tomlFormat.generate "zeroclaw-${name}-config.toml" instanceCfg.settings;
     in
-      if instanceCfg.extraConfig == ""
-      then base
-      else
-        pkgs.runCommand "zeroclaw-${name}-config.toml" { } ''
-          cat ${base} > $out
-          cat <<'ZEROCLAW_EXTRA_CONFIG_EOF' >> $out
+    if instanceCfg.extraConfig == "" then
+      base
+    else
+      pkgs.runCommand "zeroclaw-${name}-config.toml" { } ''
+        cat ${base} > $out
+        cat <<'ZEROCLAW_EXTRA_CONFIG_EOF' >> $out
 
-          ${instanceCfg.extraConfig}
-          ZEROCLAW_EXTRA_CONFIG_EOF
-        '';
+        ${instanceCfg.extraConfig}
+        ZEROCLAW_EXTRA_CONFIG_EOF
+      '';
 
   # Build one systemd service from one instance entry. Mirrors the shape of
   # `services.restic.backups`'s mapAttrs' generator.
-  mkInstanceService = name: instanceCfg:
+  mkInstanceService =
+    name: instanceCfg:
     let
       configFile = renderConfigFile name instanceCfg;
     in
@@ -320,22 +329,32 @@ let
         RestrictNamespaces = true;
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
-        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+        RestrictAddressFamilies = [
+          "AF_INET"
+          "AF_INET6"
+          "AF_UNIX"
+        ];
         LockPersonality = true;
         SystemCallArchitectures = "native";
         CapabilityBoundingSet = [ "" ];
         AmbientCapabilities = [ "" ];
-        SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+        SystemCallFilter = [
+          "@system-service"
+          "~@privileged"
+          "~@resources"
+        ];
         UMask = "0077";
 
         ReadWritePaths = [ instanceCfg.dataDir ];
 
-        BindReadOnlyPaths = mkIf (instanceCfg.bindReadOnlyPaths != { })
-          (mapAttrsToList (target: source: "${source}:${target}") instanceCfg.bindReadOnlyPaths);
+        BindReadOnlyPaths = mkIf (instanceCfg.bindReadOnlyPaths != { }) (
+          mapAttrsToList (target: source: "${source}:${target}") instanceCfg.bindReadOnlyPaths
+        );
       };
     };
 
-in {
+in
+{
   options.services.zeroclaw = {
     instances = mkOption {
       type = types.attrsOf (types.submodule instanceModule);
@@ -371,19 +390,20 @@ in {
 
   config = mkIf (cfg.instances != { }) {
     # Per-instance users (only those with createUser = true).
-    users.users = mapAttrs' (name: instanceCfg:
+    users.users = mapAttrs' (
+      name: instanceCfg:
       nameValuePair instanceCfg.user {
         isSystemUser = true;
         group = instanceCfg.group;
         home = instanceCfg.dataDir;
-        createHome = false;  # systemd's StateDirectory= owns home creation.
+        createHome = false; # systemd's StateDirectory= owns home creation.
         description = "ZeroClaw instance ${name}";
       }
     ) (filterAttrs (_: i: i.createUser) cfg.instances);
 
-    users.groups = mapAttrs' (_: instanceCfg:
-      nameValuePair instanceCfg.group { }
-    ) (filterAttrs (_: i: i.createUser) cfg.instances);
+    users.groups = mapAttrs' (_: instanceCfg: nameValuePair instanceCfg.group { }) (
+      filterAttrs (_: i: i.createUser) cfg.instances
+    );
 
     # One systemd unit per instance.
     systemd.services = mapAttrs' mkInstanceService cfg.instances;
@@ -400,7 +420,8 @@ in {
 
         dirs = mapAttrsToList (_: i: i.dataDir) cfg.instances;
         users = mapAttrsToList (_: i: i.user) cfg.instances;
-      in [
+      in
+      [
         {
           assertion = badNames == [ ];
           message = ''
