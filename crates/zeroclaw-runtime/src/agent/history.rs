@@ -1,13 +1,19 @@
 use crate::agent::history_pruner::remove_orphaned_tool_messages;
 use anyhow::Result;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::LazyLock;
 use zeroclaw_providers::ChatMessage;
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
+
+static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"/[^\s<>'"`\]\)]+?\.(?i:png|jpe?g|webp|gif|bmp)"#).expect("valid image path regex")
+});
 
 /// Find the largest byte index `<= i` that is a valid char boundary.
 /// MSRV-compatible replacement for `str::floor_char_boundary` (stable in 1.91).
@@ -54,6 +60,60 @@ pub fn truncate_tool_result(output: &str, max_chars: usize) -> String {
         truncated_chars,
         &output[tail_start..]
     )
+}
+
+fn is_existing_local_image_path(path: &str) -> bool {
+    let candidate = Path::new(path);
+    candidate.is_absolute()
+        && candidate.is_file()
+        && candidate
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
+                )
+            })
+}
+
+/// Rewrite real local image file paths in tool output into `[IMAGE:...]`
+/// markers so the multimodal pipeline can normalize them before the next
+/// provider call. This targets shell/skill outputs that print filesystem
+/// paths directly rather than returning explicit media markers.
+pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
+    let mut rewritten = String::with_capacity(output.len());
+    let mut cursor = 0usize;
+    let mut changed = false;
+
+    for mat in LOCAL_IMAGE_PATH_RE.find_iter(output) {
+        let start = mat.start();
+        let end = mat.end();
+        let path = &output[start..end];
+
+        // Skip paths that are already part of an explicit media marker.
+        if output[..start].ends_with("[IMAGE:") {
+            continue;
+        }
+
+        if !is_existing_local_image_path(path) {
+            continue;
+        }
+
+        rewritten.push_str(&output[cursor..start]);
+        rewritten.push_str("[IMAGE:");
+        rewritten.push_str(path);
+        rewritten.push(']');
+        cursor = end;
+        changed = true;
+    }
+
+    if !changed {
+        return output.to_string();
+    }
+
+    rewritten.push_str(&output[cursor..]);
+    rewritten
 }
 
 /// Truncate a tool message's content, preserving JSON structure when the
@@ -214,4 +274,36 @@ pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) ->
     let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
     std::fs::write(path, payload)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonicalize_tool_result_media_markers_wraps_existing_local_image_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("generated.png");
+        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+
+        let input = format!("Image generated successfully.\nFile: {}", image.display());
+        let output = canonicalize_tool_result_media_markers(&input);
+
+        assert!(output.contains("[IMAGE:"));
+        assert!(output.contains(&format!("[IMAGE:{}]", image.display())));
+    }
+
+    #[test]
+    fn canonicalize_tool_result_media_markers_ignores_missing_paths() {
+        let input = "File: /tmp/definitely-missing-zeroclaw-image.png";
+        let output = canonicalize_tool_result_media_markers(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn canonicalize_tool_result_media_markers_preserves_existing_markers() {
+        let input = "Already tagged [IMAGE:/tmp/already-tagged.png]";
+        let output = canonicalize_tool_result_media_markers(input);
+        assert_eq!(output, input);
+    }
 }
