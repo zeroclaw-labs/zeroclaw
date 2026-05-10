@@ -31,6 +31,7 @@ pub struct WuKongIMChannel {
     pub(crate) uid: String,
     pub(crate) token: String,
     pub(crate) device_id: String,
+    pub(crate) device_flag: i32,
     pub(crate) allowed_users: Vec<String>,
     pub(crate) approval_timeout_secs: u64,
     pub(crate) mention_only: bool,
@@ -46,7 +47,8 @@ impl WuKongIMChannel {
             ws_url: config.ws_url.clone(),
             uid: config.uid.clone(),
             token: config.token.clone(),
-            device_id: format!("zeroclaw-{}", &Uuid::new_v4().to_string()[..8]),
+            device_id: config.device_id.clone(),
+            device_flag: config.device_flag,
             allowed_users: config.allowed_users.clone(),
             approval_timeout_secs: config.approval_timeout_secs,
             mention_only: config.mention_only,
@@ -173,7 +175,7 @@ impl Channel for WuKongIMChannel {
                     uid: self.uid.clone(),
                     token: self.token.clone(),
                     device_id: self.device_id.clone(),
-                    device_flag: 1,
+                    device_flag: self.device_flag,
                     version: Some(2),
                 },
             };
@@ -394,6 +396,8 @@ mod tests {
             ws_url: "ws://localhost:5200".to_string(),
             uid: "bot001".to_string(),
             token: "tok".to_string(),
+            device_id: "web-001".to_string(),
+            device_flag: 2,
             allowed_users: allowed,
             mention_only,
             approval_timeout_secs: 300,
@@ -405,6 +409,8 @@ mod tests {
         let ch = WuKongIMChannel::from_config(&make_config(vec!["*".to_string()], true));
         assert_eq!(ch.ws_url, "ws://localhost:5200");
         assert_eq!(ch.uid, "bot001");
+        assert_eq!(ch.device_id, "web-001");
+        assert_eq!(ch.device_flag, 2);
         assert!(ch.mention_only);
         assert_eq!(ch.approval_timeout_secs, 300);
     }
