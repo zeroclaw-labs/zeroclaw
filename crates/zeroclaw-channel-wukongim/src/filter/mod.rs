@@ -33,13 +33,13 @@ pub fn is_mentioned(bot_uid: &str, payload_json: &serde_json::Value, content: &s
                 return true;
             }
         }
-        if let Some(uids) = mention.get("uids").and_then(|v| v.as_array()) {
-            if uids.iter().any(|u| {
+        if let Some(uids) = mention.get("uids").and_then(|v| v.as_array())
+            && uids.iter().any(|u| {
                 u.as_str() == Some(bot_uid)
                     || u.as_u64().map(|n| n.to_string()).as_deref() == Some(bot_uid)
-            }) {
-                return true;
-            }
+            })
+        {
+            return true;
         }
     }
     content.contains(&format!("@{}", bot_uid)) || content.contains("@all")

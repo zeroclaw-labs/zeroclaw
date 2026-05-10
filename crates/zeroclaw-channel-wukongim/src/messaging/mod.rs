@@ -20,7 +20,9 @@ mod tests {
     #[test]
     fn encode_text_payload_is_valid_base64_json() {
         let b64 = encode_text_payload("hello").unwrap();
-        let decoded = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .unwrap();
         let val: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
         assert_eq!(val["type"], 1);
         assert_eq!(val["content"], "hello");

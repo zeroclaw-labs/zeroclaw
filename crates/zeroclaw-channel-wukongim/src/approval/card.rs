@@ -1,7 +1,7 @@
 // src/approval/card.rs
+use crate::connection::WkMessageType;
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::channel::ChannelApprovalRequest;
-use crate::connection::WkMessageType;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WkApprovalCard {
@@ -55,12 +55,12 @@ pub fn build_approval_card(
             .last()
             .unwrap_or("按计划执行")
             .to_string();
-        if time_info.contains("\"at\":") {
-            if let Some(start) = time_info.find("\"at\":\"") {
-                let rest = &time_info[start + 6..];
-                if let Some(end) = rest.find('"') {
-                    time_info = rest[..end].replace('T', " ").replace('Z', " (UTC)");
-                }
+        if time_info.contains("\"at\":")
+            && let Some(start) = time_info.find("\"at\":\"")
+        {
+            let rest = &time_info[start + 6..];
+            if let Some(end) = rest.find('"') {
+                time_info = rest[..end].replace('T', " ").replace('Z', " (UTC)");
             }
         }
         (
@@ -85,10 +85,20 @@ pub fn build_approval_card(
         approval_id: approval_id.to_string(),
         timeout_secs,
         title: title.to_string(),
-        body: WkApprovalBody { content: content.to_string() },
+        body: WkApprovalBody {
+            content: content.to_string(),
+        },
         actions: Some(vec![
-            WkAction { text: "同意".to_string(), value: "approve".to_string(), style: "primary".to_string() },
-            WkAction { text: "拒绝".to_string(), value: "deny".to_string(), style: "danger".to_string() },
+            WkAction {
+                text: "同意".to_string(),
+                value: "approve".to_string(),
+                style: "primary".to_string(),
+            },
+            WkAction {
+                text: "拒绝".to_string(),
+                value: "deny".to_string(),
+                style: "danger".to_string(),
+            },
         ]),
     }
 }
@@ -124,7 +134,10 @@ mod tests {
     fn cron_add_card_localizes_job_type() {
         let card = build_approval_card(
             "id3",
-            &req("cron_add", "job_type: agent, name: daily, schedule: 0 9 * * *"),
+            &req(
+                "cron_add",
+                "job_type: agent, name: daily, schedule: 0 9 * * *",
+            ),
             300,
         );
         assert!(card.body.content.contains("智能体"));

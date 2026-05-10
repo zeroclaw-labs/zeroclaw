@@ -922,10 +922,15 @@ pub fn skills_to_prompt_with_mode(
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
 
         // 新增：添加 skill_directory 元素
-        if let Some(ref location) = skill.location {
-            if let Some(skill_dir) = location.parent() {
-                write_xml_text_element(&mut prompt, 4, "skill_directory", &skill_dir.display().to_string());
-            }
+        if let Some(ref location) = skill.location
+            && let Some(skill_dir) = location.parent()
+        {
+            write_xml_text_element(
+                &mut prompt,
+                4,
+                "skill_directory",
+                &skill_dir.display().to_string(),
+            );
         }
 
         let location = render_skill_location(
@@ -953,24 +958,23 @@ pub fn skills_to_prompt_with_mode(
             let _ = writeln!(prompt, "    </instructions>");
 
             // 为纯指令型 skills 添加使用指导
-            if skill.tools.is_empty() {
-                if let Some(ref location) = skill.location {
-                    if let Some(skill_dir) = location.parent() {
-                        let _ = writeln!(prompt, "    <usage>");
-                        let _ = writeln!(
-                            prompt,
-                            "      When executing shell commands for this skill, \
-                             always use the working_dir parameter with the skill_directory value."
-                        );
-                        let _ = writeln!(
-                            prompt,
-                            "      Example: {{\"command\":\"bash scripts/make.sh run\",\
-                             \"working_dir\":\"{}\"}}",
-                            skill_dir.display()
-                        );
-                        let _ = writeln!(prompt, "    </usage>");
-                    }
-                }
+            if skill.tools.is_empty()
+                && let Some(ref location) = skill.location
+                && let Some(skill_dir) = location.parent()
+            {
+                let _ = writeln!(prompt, "    <usage>");
+                let _ = writeln!(
+                    prompt,
+                    "      When executing shell commands for this skill, \
+                     always use the working_dir parameter with the skill_directory value."
+                );
+                let _ = writeln!(
+                    prompt,
+                    "      Example: {{\"command\":\"bash scripts/make.sh run\",\
+                     \"working_dir\":\"{}\"}}",
+                    skill_dir.display()
+                );
+                let _ = writeln!(prompt, "    </usage>");
             }
         }
 
@@ -1905,7 +1909,8 @@ prompts = ["from-skill-section"]
             ("0", Some(false)),
             ("maybe", None),
         ] {
-            let content = format!("---\nname: test\ndescription: test\nenabled: {input}\n---\n\nBody");
+            let content =
+                format!("---\nname: test\ndescription: test\nenabled: {input}\n---\n\nBody");
             let parsed = parse_skill_markdown(&content);
             assert_eq!(
                 parsed.meta.enabled, expected,
@@ -1934,6 +1939,9 @@ prompts = ["from-skill-section"]
 
         // but excluded from prompt
         let prompt = skills_to_prompt(&skills, tmp.path());
-        assert!(!prompt.contains("my-skill"), "disabled skill must not appear in prompt");
+        assert!(
+            !prompt.contains("my-skill"),
+            "disabled skill must not appear in prompt"
+        );
     }
 }

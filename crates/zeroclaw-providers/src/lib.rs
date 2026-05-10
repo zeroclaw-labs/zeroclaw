@@ -2025,7 +2025,11 @@ pub fn create_routed_provider_with_options(
             });
         let key = routed_credential.or(api_key);
         // Only use api_url for the primary provider
-        let url = if actual_name == primary_name { api_url } else { None };
+        let url = if actual_name == primary_name {
+            api_url
+        } else {
+            None
+        };
         // Clone options so per-route max_tokens doesn't bleed into other instances
         let mut route_options = options.clone();
         if let Some(mt) = max_tokens_override {
@@ -2055,8 +2059,8 @@ pub fn create_routed_provider_with_options(
     let routes: Vec<(String, router::Route)> = model_routes
         .iter()
         .map(|r| {
-            let provider_name = if r.max_tokens.is_some() {
-                format!("{}::max_tokens::{}", r.provider, r.max_tokens.unwrap())
+            let provider_name = if let Some(mt) = r.max_tokens {
+                format!("{}::max_tokens::{}", r.provider, mt)
             } else {
                 r.provider.clone()
             };

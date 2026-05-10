@@ -16,9 +16,9 @@ use zeroclaw_api::channel::{
 use crate::approval::{PendingApprovals, WkApprovalAction, build_approval_card};
 use crate::config::WuKongIMConfig;
 use crate::connection::{
-    ConnectParams, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    RecvAckParams, RecvNotificationParams, SendParams, WkChannelType, WkMessageType,
-    WsSink, HEARTBEAT_TIMEOUT, PING_INTERVAL, WUKONGIM_RPC_VERSION,
+    ConnectParams, HEARTBEAT_TIMEOUT, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    PING_INTERVAL, RecvAckParams, RecvNotificationParams, SendParams, WUKONGIM_RPC_VERSION,
+    WkChannelType, WkMessageType, WsSink,
 };
 use crate::filter::{is_mentioned, is_user_allowed, parse_recipient};
 use crate::messaging::{
@@ -93,7 +93,8 @@ impl WuKongIMChannel {
                 if let Some(err) = resp.error {
                     anyhow::bail!("WuKongIM RPC error: {} (code {})", err.message, err.code);
                 }
-                resp.result.ok_or_else(|| anyhow::anyhow!("WuKongIM RPC: missing result"))
+                resp.result
+                    .ok_or_else(|| anyhow::anyhow!("WuKongIM RPC: missing result"))
             }
             Ok(Err(_)) => {
                 // Sender dropped — remove stale entry (already removed by listen loop, but be safe)
@@ -111,7 +112,10 @@ impl WuKongIMChannel {
         let req = JsonRpcNotification {
             jsonrpc: WUKONGIM_RPC_VERSION.to_string(),
             method: "recvack".to_string(),
-            params: RecvAckParams { message_id, message_seq },
+            params: RecvAckParams {
+                message_id,
+                message_seq,
+            },
         };
         let msg = serde_json::to_string(&req)?;
         let mut g = self.ws_sink.write().await;
@@ -205,10 +209,10 @@ impl Channel for WuKongIMChannel {
                         id: Uuid::new_v4().to_string(),
                         params: serde_json::json!({}),
                     };
-                    if let Ok(msg) = serde_json::to_string(&ping) {
-                        if let Some(s) = self.ws_sink.write().await.as_mut() {
-                            let _ = s.send(WsMsg::Text(msg.into())).await;
-                        }
+                    if let Ok(msg) = serde_json::to_string(&ping)
+                        && let Some(s) = self.ws_sink.write().await.as_mut()
+                    {
+                        let _ = s.send(WsMsg::Text(msg.into())).await;
                     }
                 }
                 frame = read.next() => {
@@ -226,11 +230,11 @@ impl Channel for WuKongIMChannel {
                         else if i.is_number() { Some(i.to_string()) }
                         else { None }
                     });
-                    if let Some(id) = msg_id {
-                        if let Some(resp_tx) = self.pending_responses.write().await.remove(&id) {
-                            let _ = resp_tx.send(val);
-                            continue;
-                        }
+                    if let Some(id) = msg_id
+                        && let Some(resp_tx) = self.pending_responses.write().await.remove(&id)
+                    {
+                        let _ = resp_tx.send(val);
+                        continue;
                     }
 
                     // Inbound message notification
@@ -264,10 +268,10 @@ impl Channel for WuKongIMChannel {
                                 "always"  => Some(ChannelApprovalResponse::AlwaysApprove),
                                 _         => None,
                             };
-                            if let Some(r) = resp {
-                                if let Some(ptx) = self.pending_approvals.write().await.remove(&action.approval_id) {
-                                    let _ = ptx.send(r);
-                                }
+                            if let Some(r) = resp
+                                && let Some(ptx) = self.pending_approvals.write().await.remove(&action.approval_id)
+                            {
+                                let _ = ptx.send(r);
                             }
                         }
                         continue;
@@ -363,8 +367,12 @@ impl Channel for WuKongIMChannel {
             topic: None,
         };
         let (otx, orx) = tokio::sync::oneshot::channel();
-        self.pending_approvals.write().await.insert(approval_id.clone(), otx);
-        self.send_rpc::<_, serde_json::Value>("send", params).await?;
+        self.pending_approvals
+            .write()
+            .await
+            .insert(approval_id.clone(), otx);
+        self.send_rpc::<_, serde_json::Value>("send", params)
+            .await?;
         match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), orx).await {
             Ok(Ok(resp)) => Ok(Some(resp)),
             _ => {

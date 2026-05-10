@@ -23,6 +23,8 @@ pub mod media_pipeline;
 pub mod mqtt;
 
 // Channel types imported directly from source crates (no shim files)
+#[cfg(feature = "channel-wukongim")]
+pub use crate::WuKongIMChannel;
 pub use crate::bluesky::BlueskyChannel;
 pub use crate::clawdtalk::ClawdTalkChannel;
 pub use crate::dingtalk::DingTalkChannel;
@@ -62,8 +64,6 @@ pub use crate::webhook::WebhookChannel;
 pub use crate::wechat::WeChatChannel;
 pub use crate::wecom::WeComChannel;
 pub use crate::whatsapp::WhatsAppChannel;
-#[cfg(feature = "channel-wukongim")]
-pub use crate::WuKongIMChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;

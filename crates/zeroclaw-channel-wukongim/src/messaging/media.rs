@@ -4,21 +4,22 @@ use std::time::Duration;
 
 const IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 
-const SUPPORTED_IMAGE_MIMES: &[&str] =
-    &["image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"];
+const SUPPORTED_IMAGE_MIMES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+];
 
 pub fn detect_image_mime(content_type: Option<&str>, bytes: &[u8]) -> Option<String> {
-    if bytes.len() >= 8
-        && bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'])
-    {
+    if bytes.len() >= 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
         return Some("image/png".to_string());
     }
     if bytes.len() >= 3 && bytes.starts_with(&[0xff, 0xd8, 0xff]) {
         return Some("image/jpeg".to_string());
     }
-    if bytes.len() >= 6
-        && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"))
-    {
+    if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
         return Some("image/gif".to_string());
     }
     if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
@@ -94,12 +95,12 @@ pub fn extract_markdown_images(text: &str) -> Vec<(String, String)> {
         if let Some(cb) = after.find(']') {
             let alt = after[..cb].to_string();
             let tail = &after[cb + 1..];
-            if let Some(inner) = tail.strip_prefix('(') {
-                if let Some(pe) = inner.find(')') {
-                    images.push((alt, inner[..pe].to_string()));
-                    rest = &tail[pe + 1..];
-                    continue;
-                }
+            if let Some(inner) = tail.strip_prefix('(')
+                && let Some(pe) = inner.find(')')
+            {
+                images.push((alt, inner[..pe].to_string()));
+                rest = &tail[pe + 1..];
+                continue;
             }
         }
         break;
