@@ -50,4 +50,5 @@ tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 default = ["schema-export"]
 schema-export = ["dep:schemars"]
 channel-nostr = []
+channel-wukongim = []
 voice-wake = []

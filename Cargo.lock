@@ -13223,6 +13223,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-channel-wukongim"
+version = "0.7.5"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tracing",
+ "url",
+ "uuid",
+ "zeroclaw-api",
+ "zeroclaw-config",
+]
+
+[[package]]
 name = "zeroclaw-channels"
 version = "0.7.5"
 dependencies = [
@@ -13284,6 +13304,7 @@ dependencies = [
  "webpki-roots 1.0.7",
  "wiremock",
  "zeroclaw-api",
+ "zeroclaw-channel-wukongim",
  "zeroclaw-config",
  "zeroclaw-infra",
  "zeroclaw-memory",

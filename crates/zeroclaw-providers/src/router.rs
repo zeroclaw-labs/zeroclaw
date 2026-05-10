@@ -89,10 +89,10 @@ impl RouterProvider {
     /// Return the effective temperature for a request: use the per-route override
     /// when the model string is a matching hint, otherwise fall back to the caller value.
     fn effective_temperature(&self, model: &str, temperature: Option<f64>) -> Option<f64> {
-        if let Some(hint) = model.strip_prefix("hint:") {
-            if let Some(&t) = self.temperature_overrides.get(hint) {
-                return Some(t);
-            }
+        if let Some(hint) = model.strip_prefix("hint:")
+            && let Some(&t) = self.temperature_overrides.get(hint)
+        {
+            return Some(t);
         }
         temperature
     }
