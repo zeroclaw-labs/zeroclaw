@@ -486,11 +486,7 @@ fn build_transcript(messages: &[ChatMessage], max_chars: usize) -> String {
     let mut transcript = String::new();
     for msg in messages {
         let role = msg.role.to_uppercase();
-        // Strip media markers — the summarizer auxiliary call does not need
-        // image content, and forwarding `[IMAGE:/local/path]` would reach
-        // the provider as a malformed `image_url.url` and trigger 400 errors.
-        let safe_content = zeroclaw_providers::multimodal::strip_media_markers(msg.content.trim());
-        let _ = writeln!(transcript, "{role}: {safe_content}");
+        let _ = writeln!(transcript, "{role}: {}", msg.content.trim());
     }
 
     if transcript.len() > max_chars {
@@ -507,11 +503,17 @@ fn build_summarizer_transcript(
 ) -> String {
     let transcript = build_transcript(messages, max_chars);
     if supports_vision {
+        // Vision-capable summarizer can read media markers; preserve them so
+        // visual content is reflected in the summary (per #6189 contract).
         return transcript;
     }
 
-    let (cleaned, refs) = multimodal::parse_image_markers(&transcript);
-    if refs.is_empty() { transcript } else { cleaned }
+    // Non-vision summarizer cannot consume media markers. Strip ALL inbound
+    // attachment-kind markers (IMAGE, PHOTO, DOCUMENT, FILE, VIDEO, VOICE,
+    // AUDIO — case-insensitive) instead of just `[IMAGE:...]`, otherwise a
+    // local filesystem path can leak into the auxiliary `chat_with_system`
+    // payload and the upstream API rejects it as a malformed `image_url.url`.
+    multimodal::strip_media_markers(&transcript)
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -731,26 +733,40 @@ mod tests {
     }
 
     #[test]
-    fn test_build_transcript_strips_media_markers() {
-        // Regression: image markers in history must be stripped so that
-        // local file paths do not reach the summarizer auxiliary call and
-        // fail with `unsupported image url: /local/path` 400 errors.
-        let messages = vec![
-            msg(
-                "user",
-                "Look at [IMAGE:/zeroclaw-data/workspace/telegram_files/photo_1.jpg]",
-            ),
-            msg("assistant", "Cute cat!"),
-        ];
-        let t = build_transcript(&messages, 10_000);
+    fn test_build_summarizer_transcript_strips_all_attachment_kinds_for_non_vision_provider() {
+        // The non-vision summarizer branch must strip every inbound
+        // attachment-kind alias the channel parsers can emit, not just
+        // `[IMAGE:]`. Mirrors `ATTACHMENT_KINDS` in
+        // `crates/zeroclaw-channels/src/util.rs`. Regression: a `[PHOTO:]`
+        // or `[DOCUMENT:]` marker still leaking through would surface a
+        // local filesystem path in the auxiliary `chat_with_system` payload
+        // and the upstream API would reject it.
+        let messages = vec![msg(
+            "user",
+            "Take a look at [IMAGE:/a.jpg] [PHOTO:/b.jpg] [DOCUMENT:/c.pdf] \
+             [FILE:/d.zip] [VIDEO:/e.mp4] [VOICE:/f.ogg] [AUDIO:/g.wav] please",
+        )];
+        let transcript = build_summarizer_transcript(&messages, 10_000, false);
+        for prefix in [
+            "[IMAGE:",
+            "[PHOTO:",
+            "[DOCUMENT:",
+            "[FILE:",
+            "[VIDEO:",
+            "[VOICE:",
+            "[AUDIO:",
+        ] {
+            assert!(
+                !transcript.contains(prefix),
+                "non-vision transcript should not contain raw {prefix} marker: {transcript}"
+            );
+        }
         assert!(
-            !t.contains("[IMAGE:"),
-            "transcript should not contain raw IMAGE marker: {t}"
+            transcript.contains("[media attachment]"),
+            "non-vision transcript should contain placeholder: {transcript}"
         );
-        assert!(
-            t.contains("[media attachment]"),
-            "transcript should contain placeholder: {t}"
-        );
+        assert!(transcript.contains("Take a look at"));
+        assert!(transcript.contains("please"));
     }
 
     #[test]
