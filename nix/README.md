@@ -165,7 +165,14 @@ be flagged in the changelog.
 Resource caps (`MemoryMax`, `CPUQuota`, etc.) are intentionally **not** set
 in the module — Rust servers have widely varying resource profiles
 depending on workload, and per-host tuning belongs in the caller's config.
-Use `extraServiceConfig` to add them.
+To add them, override the generated unit directly:
+
+```nix
+systemd.services."zeroclaw-me".serviceConfig = {
+  MemoryMax = "1G";
+  CPUQuota = "200%";
+};
+```
 
 ## Running the test
 
