@@ -54,6 +54,16 @@ pub trait CompatFamilySpec {
     const DEFAULT_URL: &'static str;
     const AUTH: AuthStyle;
 
+    /// `models.dev` catalog key for this provider, when present in the
+    /// public catalog. Lets `list_models()` pre-populate the model
+    /// picker without a credential — the gateway and TUI both surface
+    /// the cataloged IDs even before the operator pastes their API key.
+    /// Set to `None` for providers that don't have a `models.dev`
+    /// entry; their picker stays empty until a credential unlocks the
+    /// live `/models` endpoint, which the dashboard already falls back
+    /// to a free-text input for.
+    const MODELS_DEV_KEY: Option<&'static str> = None;
+
     /// Build the underlying compat provider. Default uses `new()`; override
     /// for families that chain modifiers or need a different constructor
     /// variant.
@@ -62,12 +72,16 @@ pub trait CompatFamilySpec {
         key: Option<&str>,
         api_url: Option<&str>,
     ) -> OpenAiCompatibleModelProvider {
-        OpenAiCompatibleModelProvider::new(
+        let mut p = OpenAiCompatibleModelProvider::new(
             Self::DISPLAY,
             api_url.unwrap_or(Self::DEFAULT_URL),
             key,
             Self::AUTH,
-        )
+        );
+        if let Some(catalog_key) = Self::MODELS_DEV_KEY {
+            p = p.with_models_dev_key(catalog_key);
+        }
+        p
     }
 }
 
@@ -223,36 +237,43 @@ impl CompatFamilySpec for MistralModelProviderConfig {
     const DISPLAY: &'static str = "Mistral";
     const DEFAULT_URL: &'static str = "https://api.mistral.ai/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("mistral");
 }
 impl CompatFamilySpec for DeepseekModelProviderConfig {
     const DISPLAY: &'static str = "DeepSeek";
     const DEFAULT_URL: &'static str = "https://api.deepseek.com";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("deepseek");
 }
 impl CompatFamilySpec for TogetherModelProviderConfig {
     const DISPLAY: &'static str = "Together AI";
     const DEFAULT_URL: &'static str = "https://api.together.xyz";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("togetherai");
 }
 impl CompatFamilySpec for FireworksModelProviderConfig {
     const DISPLAY: &'static str = "Fireworks AI";
     const DEFAULT_URL: &'static str = "https://api.fireworks.ai/inference/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("fireworks-ai");
 }
 impl CompatFamilySpec for NovitaModelProviderConfig {
     const DISPLAY: &'static str = "Novita AI";
     const DEFAULT_URL: &'static str = "https://api.novita.ai/openai";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("novita");
 }
 impl CompatFamilySpec for PerplexityModelProviderConfig {
     const DISPLAY: &'static str = "Perplexity";
     const DEFAULT_URL: &'static str = "https://api.perplexity.ai";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("perplexity");
 }
 impl CompatFamilySpec for CohereModelProviderConfig {
     const DISPLAY: &'static str = "Cohere";
     const DEFAULT_URL: &'static str = "https://api.cohere.com/compatibility";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("cohere");
 }
 impl CompatFamilySpec for SglangModelProviderConfig {
     const DISPLAY: &'static str = "SGLang";
@@ -288,26 +309,31 @@ impl CompatFamilySpec for CerebrasModelProviderConfig {
     const DISPLAY: &'static str = "Cerebras";
     const DEFAULT_URL: &'static str = "https://api.cerebras.ai/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("cerebras");
 }
 impl CompatFamilySpec for SambanovaModelProviderConfig {
     const DISPLAY: &'static str = "SambaNova";
     const DEFAULT_URL: &'static str = "https://api.sambanova.ai/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("sambanova");
 }
 impl CompatFamilySpec for HyperbolicModelProviderConfig {
     const DISPLAY: &'static str = "Hyperbolic";
     const DEFAULT_URL: &'static str = "https://api.hyperbolic.xyz/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("hyperbolic");
 }
 impl CompatFamilySpec for DeepinfraModelProviderConfig {
     const DISPLAY: &'static str = "DeepInfra";
     const DEFAULT_URL: &'static str = "https://api.deepinfra.com/v1/openai";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("deepinfra");
 }
 impl CompatFamilySpec for HuggingfaceModelProviderConfig {
     const DISPLAY: &'static str = "Hugging Face";
     const DEFAULT_URL: &'static str = "https://router.huggingface.co/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("huggingface");
 }
 impl CompatFamilySpec for Ai21ModelProviderConfig {
     const DISPLAY: &'static str = "AI21 Labs";
@@ -383,6 +409,7 @@ impl CompatFamilySpec for MoonshotModelProviderConfig {
     const DISPLAY: &'static str = "Moonshot";
     const DEFAULT_URL: &'static str = crate::MOONSHOT_INTL_BASE_URL;
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("moonshotai");
 }
 
 // ── Compat families with build_compat overrides ────────────────────────
@@ -412,19 +439,7 @@ impl CompatFamilySpec for XaiModelProviderConfig {
     const DISPLAY: &'static str = "xAI";
     const DEFAULT_URL: &'static str = "https://api.x.ai/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
-    fn build_compat(
-        &self,
-        key: Option<&str>,
-        api_url: Option<&str>,
-    ) -> OpenAiCompatibleModelProvider {
-        OpenAiCompatibleModelProvider::new(
-            Self::DISPLAY,
-            api_url.unwrap_or(Self::DEFAULT_URL),
-            key,
-            Self::AUTH,
-        )
-        .with_models_dev_key("xai")
-    }
+    const MODELS_DEV_KEY: Option<&'static str> = Some("xai");
 }
 
 impl FamilyProviderFactory for MinimaxModelProviderConfig {
