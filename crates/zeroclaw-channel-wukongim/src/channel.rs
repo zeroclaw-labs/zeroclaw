@@ -70,16 +70,22 @@ impl WuKongIMChannel {
             params,
         };
         self.pending_responses.write().await.insert(id.clone(), tx);
-        let msg = serde_json::to_string(&req)?;
-        {
+        let send_result: anyhow::Result<()> = async {
+            let msg = serde_json::to_string(&req)?;
             let mut g = self.ws_sink.write().await;
-            if let Some(s) = g.as_mut() {
-                tracing::info!("WuKongIM: RPC {} id={}", method, id);
-                s.send(WsMsg::Text(msg.into())).await?;
-            } else {
-                self.pending_responses.write().await.remove(&id);
-                anyhow::bail!("WuKongIM: WebSocket not connected");
+            match g.as_mut() {
+                Some(s) => {
+                    tracing::info!("WuKongIM: RPC {} id={}", method, id);
+                    s.send(WsMsg::Text(msg.into())).await?;
+                    Ok(())
+                }
+                None => anyhow::bail!("WuKongIM: WebSocket not connected"),
             }
+        }
+        .await;
+        if let Err(e) = send_result {
+            self.pending_responses.write().await.remove(&id);
+            return Err(e);
         }
         match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(val)) => {
@@ -278,18 +284,18 @@ impl Channel for WuKongIMChannel {
                     let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
 
                     // Decode content by message type
-                    let content = match msg_type {
-                        2 => {
+                    let content = match msg_type as u32 {
+                        WkMessageType::IMAGE => {
                             let url = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or("");
                             download_image_as_base64(url).await
                                 .unwrap_or_else(|| format!("[图片下载失败]{}\n请直接描述图片内容", url))
                         }
-                        5 => {
+                        WkMessageType::FILE => {
                             let url  = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or("");
                             let name = payload_json.get("name").and_then(|n| n.as_str()).unwrap_or("文件");
                             format!("[文件]{}: {}", name, url)
                         }
-                        14 => {
+                        WkMessageType::MARKDOWN => {
                             let text = payload_json
                                 .get("content").and_then(|c| c.get("text")).and_then(|t| t.as_str())
                                 .unwrap_or("");
@@ -310,7 +316,7 @@ impl Channel for WuKongIMChannel {
                         reply_target: format!("{}:{}", params.channel_type, target_id),
                         content,
                         channel: "wukongim".to_string(),
-                        timestamp: params.timestamp as u64,
+                        timestamp: params.timestamp.max(0) as u64,
                         thread_ts: None,
                         interruption_scope_id: None,
                         attachments: vec![],
@@ -323,8 +329,14 @@ impl Channel for WuKongIMChannel {
     }
 
     async fn health_check(&self) -> bool {
-        let addr = self.ws_url.trim_start_matches("ws://").trim_start_matches("wss://");
-        tokio::net::TcpStream::connect(addr).await.is_ok()
+        let Ok(parsed) = url::Url::parse(&self.ws_url) else {
+            return false;
+        };
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        tokio::net::TcpStream::connect((host, port)).await.is_ok()
     }
 
     async fn request_approval(

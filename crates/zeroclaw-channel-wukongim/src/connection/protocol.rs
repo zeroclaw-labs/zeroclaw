@@ -8,6 +8,7 @@ pub struct WkMessageType;
 impl WkMessageType {
     pub const TEXT: u32 = 1;
     pub const IMAGE: u32 = 2;
+    pub const FILE: u32 = 5;
     pub const MARKDOWN: u32 = 14;
     pub const INTERACTIVE_CARD: u32 = 20;
     pub const INTERACTIVE_RESPONSE: u32 = 21;

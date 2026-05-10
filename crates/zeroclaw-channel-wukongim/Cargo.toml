@@ -19,6 +19,7 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing = { version = "0.1", default-features = false }
+url = { version = "2", default-features = false, features = ["std"] }
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
 [dev-dependencies]
