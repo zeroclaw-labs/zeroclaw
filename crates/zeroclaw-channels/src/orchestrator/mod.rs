@@ -63,7 +63,7 @@ pub use crate::wechat::WeChatChannel;
 pub use crate::wecom::WeComChannel;
 pub use crate::whatsapp::WhatsAppChannel;
 #[cfg(feature = "channel-wukongim")]
-pub use zeroclaw_channel_wukongim::WuKongIMChannel;
+pub use crate::WuKongIMChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
