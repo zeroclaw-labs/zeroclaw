@@ -179,7 +179,7 @@ pub async fn prepare_messages_for_provider(
 
     // When image count exceeds the limit, strip markers from oldest messages
     // first so that the most recent (most relevant) images survive. This
-    // prevents conversations from becoming permanently  stuck once the
+    // prevents conversations from becoming permanently stuck once the
     // cumulative image count crosses the threshold.
     let trimmed = if total_images > max_images {
         trim_old_images(messages, max_images)
