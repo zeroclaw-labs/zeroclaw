@@ -262,11 +262,14 @@ let
           User = instanceCfg.user;
           Group = instanceCfg.group;
 
-          # Stage the rendered config from /nix/store into ${dataDir}/config.toml
-          # so ZeroClaw can read it at a stable path. install -m 0600 keeps
-          # the file out of other users' sight.
+          # Stage the rendered config from /nix/store into
+          # ${dataDir}/config.toml so ZeroClaw can read it at a stable
+          # path. The unit's User= already owns ${dataDir} (set up by
+          # StateDirectory= above), so we don't need to chown — just
+          # install with mode 0600. Avoids needing CAP_CHOWN, which our
+          # CapabilityBoundingSet="" intentionally drops.
           ExecStartPre = [
-            "${pkgs.coreutils}/bin/install -m 0600 -o ${instanceCfg.user} -g ${instanceCfg.group} ${configFile} ${instanceCfg.dataDir}/config.toml"
+            "${pkgs.coreutils}/bin/install -m 0600 ${configFile} ${instanceCfg.dataDir}/config.toml"
           ];
           ExecStart = "${lib.getExe instanceCfg.package} daemon";
           WorkingDirectory = instanceCfg.dataDir;
