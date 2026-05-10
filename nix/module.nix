@@ -74,7 +74,7 @@ let
   # user, group, and dataDir so a caller who only sets `settings` gets
   # sensible, collision-free defaults.
   instanceModule =
-    { name, config, ... }:
+    { name, ... }:
     {
       options = {
         package = mkPackageOption pkgs "zeroclaw" { };
