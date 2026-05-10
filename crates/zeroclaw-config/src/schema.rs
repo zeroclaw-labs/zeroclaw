@@ -7207,6 +7207,10 @@ fn default_channel_approval_timeout_secs() -> u64 {
     300
 }
 
+fn default_wukongim_device_flag() -> i32 {
+    2
+}
+
 fn default_wukongim_approval_timeout_secs() -> u64 {
     300
 }
@@ -8369,6 +8373,11 @@ pub struct WuKongIMConfig {
     /// Auth token
     #[secret]
     pub token: String,
+    /// Device ID (e.g. "web-001")
+    pub device_id: String,
+    /// Device flag: 0=App, 1=Web, 2=Sys. Default: 1 (Web)
+    #[serde(default = "default_wukongim_device_flag")]
+    pub device_flag: i32,
     /// Allowed user IDs (empty = deny all, "*" = allow all)
     #[serde(default)]
     pub allowed_users: Vec<String>,
