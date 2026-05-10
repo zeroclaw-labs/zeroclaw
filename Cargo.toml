@@ -17,7 +17,7 @@ zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.7.5", default-
 zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.7.5" }
 zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.7.5" }
 zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.7.5", default-features = false }
-zeroclaw-channel-wukongim = { path = "crates/zeroclaw-channel-wukongim", version = "0.7.5" }
+zeroclaw-channel-wukongim = { path = "crates/zeroclaw-channel-wukongim", version = "0.7.5", default-features = false }
 zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.7.5" }
 zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.7.5", default-features = false }
 zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.7.5" }
