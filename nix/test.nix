@@ -60,7 +60,7 @@ in
   name = "zeroclaw-module";
 
   nodes.machine =
-    { config, pkgs, ... }:
+    { pkgs, ... }:
     {
       imports = [ moduleUnderTest ];
 
