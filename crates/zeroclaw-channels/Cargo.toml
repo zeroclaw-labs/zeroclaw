@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 zeroclaw-api.workspace = true
+zeroclaw-channel-wukongim = { workspace = true, optional = true }
 zeroclaw-infra.workspace = true
 zeroclaw-config = { workspace = true, default-features = true }
 zeroclaw-memory.workspace = true
@@ -117,7 +118,7 @@ channel-whatsapp-cloud = []
 channel-voice-call = []
 channel-acp-server = []
 channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
-channel-wukongim = []
+channel-wukongim = ["dep:zeroclaw-channel-wukongim"]
 voice-wake = ["dep:cpal", "zeroclaw-config/voice-wake"]
 
 [dev-dependencies]
