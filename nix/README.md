@@ -85,7 +85,13 @@ component names (`[A-Za-z0-9._-]+`).
 | `environmentFile` | `nullOr path` | `null` | systemd `EnvironmentFile=`. Substituted into `settings` strings at start. |
 | `extraConfig` | `lines` | `""` | Raw TOML appended after rendered `settings` (escape hatch). |
 | `bindReadOnlyPaths` | `attrsOf path` | `{}` | `target → source` map → `BindReadOnlyPaths=`. |
-| `extraServiceConfig` | `attrs` | `{}` | `serviceConfig` overrides merged via `mkMerge`. |
+
+If you need to override a `serviceConfig` field (e.g. add `MemoryMax`),
+use the standard NixOS pattern rather than a module-level escape hatch:
+
+```nix
+systemd.services."zeroclaw-me".serviceConfig.MemoryMax = lib.mkForce "1G";
+```
 
 See `module.nix`'s inline option `description` blocks for the full
 contract of each option.

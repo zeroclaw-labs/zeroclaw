@@ -47,7 +47,6 @@ let
     types
     mkOption
     mkIf
-    mkMerge
     mkPackageOption
     mapAttrs'
     mapAttrsToList
@@ -201,19 +200,18 @@ let
           managed read-only assets.
         '';
       };
-
-      extraServiceConfig = mkOption {
-        type = types.attrs;
-        default = { };
-        description = ''
-          Free-form `serviceConfig` overrides merged into the generated
-          systemd unit. Use sparingly — prefer typed options where
-          possible. Attribute values shadow the defaults set by this
-          module (via `lib.mkMerge`).
-        '';
-      };
     };
   };
+
+  # If a caller needs an escape hatch beyond the typed options, the
+  # standard NixOS pattern is:
+  #
+  #   systemd.services."zeroclaw-myinstance".serviceConfig.MemoryMax =
+  #     lib.mkForce "1G";
+  #
+  # We deliberately do NOT expose an `extraServiceConfig` option — it
+  # adds a second way to do the same thing (which always invites
+  # contradictions) and isn't standard nixpkgs shape.
 
   # Render config.toml = formats.toml.generate settings (+ optional extraConfig).
   renderConfigFile = name: instanceCfg:
@@ -256,86 +254,85 @@ let
         ZEROCLAW_WORKSPACE = "${instanceCfg.dataDir}/workspace";
       };
 
-      serviceConfig = mkMerge [
-        {
-          Type = "simple";
-          User = instanceCfg.user;
-          Group = instanceCfg.group;
+      serviceConfig = {
+        Type = "simple";
+        User = instanceCfg.user;
+        Group = instanceCfg.group;
 
-          # Stage the rendered config from /nix/store into
-          # ${dataDir}/config.toml so ZeroClaw can read it at a stable
-          # path. The unit's User= already owns ${dataDir} (set up by
-          # StateDirectory= above), so we don't need to chown — just
-          # install with mode 0600. Avoids needing CAP_CHOWN, which our
-          # CapabilityBoundingSet="" intentionally drops.
-          ExecStartPre = [
-            "${pkgs.coreutils}/bin/install -m 0600 ${configFile} ${instanceCfg.dataDir}/config.toml"
-          ];
-          ExecStart = "${lib.getExe instanceCfg.package} daemon";
-          WorkingDirectory = instanceCfg.dataDir;
-          Restart = "on-failure";
-          RestartSec = "5s";
-          TimeoutStopSec = "15s";
+        # Stage the rendered config from /nix/store into
+        # ${dataDir}/config.toml so ZeroClaw can read it at a stable
+        # path. The unit's User= already owns ${dataDir} (set up by
+        # StateDirectory= above), so we don't need to chown — just
+        # install with mode 0600. Avoids needing CAP_CHOWN, which our
+        # CapabilityBoundingSet="" intentionally drops.
+        ExecStartPre = [
+          "${pkgs.coreutils}/bin/install -m 0600 ${configFile} ${instanceCfg.dataDir}/config.toml"
+        ];
+        ExecStart = "${lib.getExe instanceCfg.package} daemon";
+        WorkingDirectory = instanceCfg.dataDir;
+        Restart = "on-failure";
+        RestartSec = "5s";
+        TimeoutStopSec = "15s";
 
-          # systemd creates ${StateDirectory} under /var/lib at mode
-          # ${StateDirectoryMode}, owned by User:Group. We use the basename
-          # of dataDir so this works for both the default and any
-          # caller-provided path under /var/lib.
-          StateDirectory = baseNameOf instanceCfg.dataDir;
-          StateDirectoryMode = "0750";
+        # systemd creates ${StateDirectory} under /var/lib at mode
+        # ${StateDirectoryMode}, owned by User:Group. We use the basename
+        # of dataDir so this works for both the default and any
+        # caller-provided path under /var/lib.
+        StateDirectory = baseNameOf instanceCfg.dataDir;
+        StateDirectoryMode = "0750";
 
-          EnvironmentFile = mkIf (instanceCfg.environmentFile != null) [ instanceCfg.environmentFile ];
+        EnvironmentFile = mkIf (instanceCfg.environmentFile != null) [ instanceCfg.environmentFile ];
 
-          # Hardening defaults — modelled after `services.atticd` in
-          # nixpkgs (a comparable Rust server). Tuned conservatively;
-          # callers can relax via {option}`extraServiceConfig`.
-          NoNewPrivileges = true;
-          PrivateTmp = true;
-          PrivateDevices = true;
-          # Closed device policy + empty allow-list — matches `atticd`.
-          # ZeroClaw doesn't need /dev/* nodes for normal operation.
-          DeviceAllow = "";
-          DevicePolicy = "closed";
-          ProtectSystem = "strict";
-          ProtectHome = true;
-          ProtectKernelTunables = true;
-          ProtectKernelModules = true;
-          ProtectKernelLogs = true;
-          ProtectControlGroups = true;
-          ProtectClock = true;
-          ProtectHostname = true;
-          ProtectProc = "invisible";
-          ProcSubset = "pid";
-          # MemoryDenyWriteExecute=yes blocks W+X mappings; safe for a
-          # Rust binary with no JIT. ZeroClaw 0.7.x has no JIT path.
-          MemoryDenyWriteExecute = true;
-          # PrivateUsers=yes runs the unit in its own user namespace. The
-          # StateDirectory= bind-mount happens in the host namespace
-          # before the userns remap, so file ownership stays correct from
-          # the host's view. Matches `atticd`.
-          PrivateUsers = true;
-          # RemoveIPC=yes wipes any sysvipc/posix IPC objects the unit
-          # leaves behind on stop. ZeroClaw doesn't use SysV IPC, so this
-          # is essentially a belt-and-braces cleanup.
-          RemoveIPC = true;
-          RestrictNamespaces = true;
-          RestrictRealtime = true;
-          RestrictSUIDSGID = true;
-          RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
-          LockPersonality = true;
-          SystemCallArchitectures = "native";
-          CapabilityBoundingSet = [ "" ];
-          AmbientCapabilities = [ "" ];
-          SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
-          UMask = "0077";
+        # Hardening defaults — modelled after `services.atticd` in
+        # nixpkgs (a comparable Rust server). Tuned conservatively;
+        # callers who need to relax a specific knob should do so via
+        # `systemd.services."zeroclaw-<name>".serviceConfig.X = mkForce ...`
+        # rather than via a module escape hatch.
+        NoNewPrivileges = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
+        # Closed device policy + empty allow-list — matches `atticd`.
+        # ZeroClaw doesn't need /dev/* nodes for normal operation.
+        DeviceAllow = "";
+        DevicePolicy = "closed";
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        ProtectProc = "invisible";
+        ProcSubset = "pid";
+        # MemoryDenyWriteExecute=yes blocks W+X mappings; safe for a
+        # Rust binary with no JIT. ZeroClaw 0.7.x has no JIT path.
+        MemoryDenyWriteExecute = true;
+        # PrivateUsers=yes runs the unit in its own user namespace. The
+        # StateDirectory= bind-mount happens in the host namespace
+        # before the userns remap, so file ownership stays correct from
+        # the host's view. Matches `atticd`.
+        PrivateUsers = true;
+        # RemoveIPC=yes wipes any sysvipc/posix IPC objects the unit
+        # leaves behind on stop. ZeroClaw doesn't use SysV IPC, so this
+        # is essentially a belt-and-braces cleanup.
+        RemoveIPC = true;
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+        LockPersonality = true;
+        SystemCallArchitectures = "native";
+        CapabilityBoundingSet = [ "" ];
+        AmbientCapabilities = [ "" ];
+        SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+        UMask = "0077";
 
-          ReadWritePaths = [ instanceCfg.dataDir ];
+        ReadWritePaths = [ instanceCfg.dataDir ];
 
-          BindReadOnlyPaths = mkIf (instanceCfg.bindReadOnlyPaths != { })
-            (mapAttrsToList (target: source: "${source}:${target}") instanceCfg.bindReadOnlyPaths);
-        }
-        instanceCfg.extraServiceConfig
-      ];
+        BindReadOnlyPaths = mkIf (instanceCfg.bindReadOnlyPaths != { })
+          (mapAttrsToList (target: source: "${source}:${target}") instanceCfg.bindReadOnlyPaths);
+      };
     };
 
 in {
