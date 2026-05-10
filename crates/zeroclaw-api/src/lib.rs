@@ -36,6 +36,6 @@ tokio::task_local! {
     pub static TOOL_CHOICE_OVERRIDE: Option<String>;
 
     /// Session key for the currently active session.
-    /// Set by the gateway WebSocket handler, read by SessionsCurrentTool.
+    /// Scoped by gateway and channel turns, read by SessionsCurrentTool.
     pub static TOOL_LOOP_SESSION_KEY: Option<String>;
 }

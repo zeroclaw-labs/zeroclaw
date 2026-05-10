@@ -1802,22 +1802,32 @@ async fn main() -> Result<()> {
                             .await
                         })
                     })),
-                    mqtt_start: Some(Box::new(|mqtt_config| {
-                        Box::pin(async move {
-                            use std::sync::{Arc, Mutex};
-                            use zeroclaw_config::schema::SopConfig;
-                            use zeroclaw_memory::NoneMemory;
-                            use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
-
-                            let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
+                    mqtt_start: Some(Box::new({
+                        use std::sync::{Arc, Mutex};
+                        use zeroclaw_config::schema::SopConfig;
+                        use zeroclaw_memory::NoneMemory;
+                        use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
+                        let sop_config = current_config.sop.clone();
+                        let workspace_dir = current_config.workspace_dir.clone();
+                        move |mqtt_config| {
+                            let engine = if sop_config.sops_dir.is_some() {
+                                let mut e = SopEngine::new(sop_config.clone());
+                                e.reload(&workspace_dir);
+                                e
+                            } else {
+                                SopEngine::new(SopConfig::default())
+                            };
+                            let engine = Arc::new(Mutex::new(engine));
                             let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory)));
-                            zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
-                                &mqtt_config,
-                                engine,
-                                audit,
-                            )
-                            .await
-                        })
+                            Box::pin(async move {
+                                zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
+                                    &mqtt_config,
+                                    engine,
+                                    audit,
+                                )
+                                .await
+                            })
+                        }
                     })),
                 };
                 let exit = Box::pin(daemon::run(

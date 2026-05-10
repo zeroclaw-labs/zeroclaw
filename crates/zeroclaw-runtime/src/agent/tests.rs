@@ -253,6 +253,58 @@ impl Tool for CountingTool {
     }
 }
 
+struct ToolSpecCaptureProvider {
+    tools_received: Arc<Mutex<Vec<bool>>>,
+    responses: Mutex<Vec<ChatResponse>>,
+}
+
+impl ToolSpecCaptureProvider {
+    fn new(responses: Vec<ChatResponse>) -> (Self, Arc<Mutex<Vec<bool>>>) {
+        let tools_received = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                tools_received: tools_received.clone(),
+                responses: Mutex::new(responses),
+            },
+            tools_received,
+        )
+    }
+}
+
+#[async_trait]
+impl Provider for ToolSpecCaptureProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<String> {
+        Ok("fallback".into())
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<ChatResponse> {
+        self.tools_received
+            .lock()
+            .unwrap()
+            .push(request.tools.is_some());
+        let mut guard = self.responses.lock().unwrap();
+        if guard.is_empty() {
+            return Ok(text_response("done"));
+        }
+        Ok(guard.remove(0))
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+}
+
 fn make_memory() -> Arc<dyn Memory> {
     let cfg = MemoryConfig {
         backend: "none".into(),
@@ -375,6 +427,54 @@ async fn turn_returns_text_when_no_tools_called() {
     assert!(
         !response.is_empty(),
         "Expected non-empty text response from provider"
+    );
+}
+
+#[tokio::test]
+async fn turn_with_no_effective_tools_treats_xml_tool_call_as_text() {
+    let provider = Box::new(ScriptedProvider::new(vec![xml_tool_response(
+        "echo",
+        r#"{"message":"hi"}"#,
+    )]));
+    let mut agent = build_agent_with(provider, vec![], Box::new(XmlToolDispatcher));
+
+    let response = agent.turn("hi").await.unwrap();
+
+    assert!(
+        response.contains("<tool_call>"),
+        "no-tools turns should preserve tool-like text instead of executing it"
+    );
+    assert!(
+        response.contains("\"name\": \"echo\""),
+        "tool-like payload should remain visible as ordinary response text"
+    );
+}
+
+#[tokio::test]
+async fn turn_with_no_effective_tools_still_strips_reasoning_tags() {
+    let provider = Box::new(ScriptedProvider::new(vec![text_response(
+        "<think>hidden scratchpad</think>visible answer",
+    )]));
+    let mut agent = build_agent_with(provider, vec![], Box::new(XmlToolDispatcher));
+
+    let response = agent.turn("hi").await.unwrap();
+
+    assert_eq!(response, "visible answer");
+}
+
+#[tokio::test]
+async fn turn_with_no_effective_tools_does_not_send_empty_native_tool_specs() {
+    let (provider, tools_received) =
+        ToolSpecCaptureProvider::new(vec![text_response("plain response")]);
+    let mut agent = build_agent_with(Box::new(provider), vec![], Box::new(NativeToolDispatcher));
+
+    let response = agent.turn("hi").await.unwrap();
+
+    assert_eq!(response, "plain response");
+    assert_eq!(
+        tools_received.lock().unwrap().as_slice(),
+        &[false],
+        "native providers should receive no tools field when the effective tool list is empty"
     );
 }
 
@@ -1308,6 +1408,15 @@ fn xml_dispatcher_generates_tool_instructions() {
         !instructions.contains("echo"),
         "dispatcher should not duplicate tool listing"
     );
+}
+
+#[test]
+fn xml_dispatcher_omits_tool_instructions_without_tools() {
+    let tools: Vec<Box<dyn Tool>> = vec![];
+    let dispatcher = XmlToolDispatcher;
+    let instructions = dispatcher.prompt_instructions(&tools);
+
+    assert!(instructions.is_empty());
 }
 
 #[test]

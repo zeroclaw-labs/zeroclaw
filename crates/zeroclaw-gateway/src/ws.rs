@@ -333,32 +333,34 @@ async fn handle_socket(
     // Build a persistent Agent for this connection so history is maintained
     // across turns. The session cwd becomes the security sandbox root; config
     // workspace remains the daemon data directory.
-    let mut agent = match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd(
-        &config,
-        Some(&session_cwd),
-    )
-    .await
-    {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!(error = %e, "Agent initialization failed");
-            let err = serde_json::json!({
-                "type": "error",
-                "message": format!("Failed to initialise agent: {e}"),
-                "code": "AGENT_INIT_FAILED"
-            });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
-            let _ = sender
-                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                    code: 1011,
-                    reason: axum::extract::ws::Utf8Bytes::from_static(
-                        "Agent initialization failed",
-                    ),
-                })))
-                .await;
-            return;
-        }
-    };
+    let mut agent =
+        match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd_and_mcp_backchannel(
+            &config,
+            Some(&session_cwd),
+            true,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(error = %e, "Agent initialization failed");
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": format!("Failed to initialise agent: {e}"),
+                    "code": "AGENT_INIT_FAILED"
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                let _ = sender
+                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: 1011,
+                        reason: axum::extract::ws::Utf8Bytes::from_static(
+                            "Agent initialization failed",
+                        ),
+                    })))
+                    .await;
+                return;
+            }
+        };
     agent.set_memory_session_id(Some(memory_session_id));
     if !stored_messages.is_empty() {
         agent.seed_history(&stored_messages);

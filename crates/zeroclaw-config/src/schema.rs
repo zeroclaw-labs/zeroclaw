@@ -9776,6 +9776,13 @@ struct ActiveWorkspaceState {
 }
 
 fn default_config_dir() -> Result<PathBuf> {
+    if let Ok(custom) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+        let custom = custom.trim();
+        if !custom.is_empty() {
+            return Ok(expand_tilde_path(custom));
+        }
+    }
+
     if let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
     {
@@ -11982,7 +11989,9 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[prefix = "sop"]
 pub struct SopConfig {
     /// Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).
-    /// Falls back to `<workspace>/sops` when omitted.
+    /// Required to enable runtime SOP loading. When omitted, no SOPs are loaded
+    /// at runtime; CLI commands (`sop list`, `sop validate`, `sop show`) still
+    /// resolve the default `<workspace>/sops` for offline inspection.
     #[serde(default)]
     pub sops_dir: Option<String>,
 
@@ -15444,6 +15453,25 @@ model = "primary-model"
         assert_eq!(resolved_workspace_dir, default_workspace_dir);
 
         let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    #[test]
+    async fn default_path_under_config_dir_respects_zeroclaw_config_dir() {
+        let _env_guard = env_override_lock().await;
+        let custom_dir = std::env::temp_dir().join("zeroclaw-test-profile");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", &custom_dir) };
+
+        let result = default_path_under_config_dir("knowledge.db");
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") };
+
+        assert_eq!(
+            result,
+            custom_dir.join("knowledge.db").to_string_lossy().as_ref(),
+            "expected path under ZEROCLAW_CONFIG_DIR, got: {result}"
+        );
     }
 
     #[test]

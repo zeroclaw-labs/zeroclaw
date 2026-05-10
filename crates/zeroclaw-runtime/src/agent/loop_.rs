@@ -1,4 +1,4 @@
-use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 
 /// CLI channel factory, injected by the binary. Returns a `Box<dyn Channel>` for interactive mode.
 pub static CLI_CHANNEL_FN: std::sync::OnceLock<
@@ -1276,24 +1276,33 @@ pub async fn run_tool_call_loop(
                     .as_ref()
                     .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage));
 
-                let response_text = resp.text_or_empty().to_string();
+                let response_text = if tool_specs.is_empty() {
+                    strip_think_tags(resp.text_or_empty())
+                } else {
+                    resp.text_or_empty().to_string()
+                };
                 // First try native structured tool calls (OpenAI-format).
                 // Fall back to text-based parsing (XML tags, markdown blocks,
                 // GLM format) only if the provider returned no native calls —
                 // this ensures we support both native and prompt-guided models.
-                let mut calls: Vec<ParsedToolCall> = resp
-                    .tool_calls
-                    .iter()
-                    .map(|call| ParsedToolCall {
-                        name: call.name.clone(),
-                        arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
-                            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-                        tool_call_id: Some(call.id.clone()),
-                    })
-                    .collect();
+                let mut calls: Vec<ParsedToolCall> = if tool_specs.is_empty() {
+                    Vec::new()
+                } else {
+                    resp.tool_calls
+                        .iter()
+                        .map(|call| ParsedToolCall {
+                            name: call.name.clone(),
+                            arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
+                                .unwrap_or_else(|_| {
+                                    serde_json::Value::Object(serde_json::Map::new())
+                                }),
+                            tool_call_id: Some(call.id.clone()),
+                        })
+                        .collect()
+                };
                 let mut parsed_text = String::new();
 
-                if calls.is_empty() {
+                if calls.is_empty() && !tool_specs.is_empty() {
                     let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
                     if !fallback_text.is_empty() {
                         parsed_text = fallback_text;
@@ -1301,7 +1310,11 @@ pub async fn run_tool_call_loop(
                     calls = fallback_calls;
                 }
 
-                let parse_issue = detect_tool_call_parse_issue(&response_text, &calls);
+                let parse_issue = if tool_specs.is_empty() {
+                    None
+                } else {
+                    detect_tool_call_parse_issue(&response_text, &calls)
+                };
                 if let Some(ref issue) = parse_issue {
                     runtime_trace::record_event(
                         "tool_call_parse_issue",
@@ -1593,9 +1606,14 @@ pub async fn run_tool_call_loop(
                 channel_reply_target,
             );
 
+            super::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
+
             // ── Approval hook ────────────────────────────────
+            let mut approval_requirement = approval
+                .map(|mgr| mgr.approval_requirement(&tool_name))
+                .unwrap_or(ApprovalRequirement::NotRequired);
             if let Some(mgr) = approval
-                && mgr.needs_approval(&tool_name)
+                && approval_requirement == ApprovalRequirement::Prompt
             {
                 let request = ApprovalRequest {
                     tool_name: tool_name.clone(),
@@ -1680,7 +1698,16 @@ pub async fn run_tool_call_loop(
                     ));
                     continue;
                 }
+
+                if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
+                    approval_requirement = ApprovalRequirement::Approved;
+                }
             }
+            super::set_runtime_approved_arg(
+                &tool_name,
+                &mut tool_args,
+                approval_requirement == ApprovalRequirement::Approved,
+            );
 
             let signature = {
                 let canonical_args = canonicalize_json_for_tool_signature(&tool_args);
@@ -2060,6 +2087,29 @@ pub async fn run_tool_call_loop(
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
 pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+    build_tool_instructions_for_tools(tools_registry.iter().map(|tool| tool.as_ref()))
+}
+
+/// Build tool instructions for the subset of registered tools that are
+/// effective for the current prompt.
+pub fn build_tool_instructions_for_names(
+    tools_registry: &[Box<dyn Tool>],
+    effective_tool_names: &HashSet<&str>,
+) -> String {
+    build_tool_instructions_for_tools(
+        tools_registry
+            .iter()
+            .map(|tool| tool.as_ref())
+            .filter(|tool| effective_tool_names.contains(tool.name())),
+    )
+}
+
+fn build_tool_instructions_for_tools<'a>(tools: impl IntoIterator<Item = &'a dyn Tool>) -> String {
+    let tools: Vec<&dyn Tool> = tools.into_iter().collect();
+    if tools.is_empty() {
+        return String::new();
+    }
+
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -2074,7 +2124,7 @@ pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
         .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     instructions.push_str("### Available Tools\n\n");
 
-    for tool in tools_registry {
+    for tool in tools {
         let desc = tool.description();
         let _ = writeln!(
             instructions,
@@ -2086,6 +2136,15 @@ pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
     }
 
     instructions
+}
+
+fn retain_registered_tool_descriptions(
+    tool_descs: &mut Vec<(&str, &str)>,
+    tools_registry: &[Box<dyn Tool>],
+) {
+    let registered_tool_names: HashSet<&str> =
+        tools_registry.iter().map(|tool| tool.name()).collect();
+    tool_descs.retain(|(name, _)| registered_tool_names.contains(name));
 }
 
 // ── CLI Entrypoint ───────────────────────────────────────────────────────
@@ -2452,6 +2511,7 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
+    retain_registered_tool_descriptions(&mut tool_descs, &tools_registry);
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -3377,6 +3437,19 @@ pub async fn process_message(
             tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
         }
     }
+    let effective_tool_names: HashSet<&str> = tools_registry
+        .iter()
+        .map(|tool| tool.name())
+        .filter(|name| {
+            config.autonomy.level == AutonomyLevel::Full
+                || !config
+                    .autonomy
+                    .non_cli_excluded_tools
+                    .iter()
+                    .any(|excluded| excluded.as_str() == *name)
+        })
+        .collect();
+    tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -3398,7 +3471,10 @@ pub async fn process_message(
         config.agent.max_system_prompt_chars,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+        system_prompt.push_str(&build_tool_instructions_for_names(
+            &tools_registry,
+            &effective_tool_names,
+        ));
     }
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
@@ -6302,6 +6378,14 @@ mod tests {
     }
 
     #[test]
+    fn build_tool_instructions_empty_registry_returns_empty() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let instructions = build_tool_instructions(&tools);
+
+        assert!(instructions.is_empty());
+    }
+
+    #[test]
     fn tools_to_openai_format_produces_valid_schema() {
         use crate::security::SecurityPolicy;
         let security = Arc::new(SecurityPolicy::from_config(
@@ -6885,20 +6969,20 @@ Let me check the result."#;
     }
 
     /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
-    /// the output must contain ZERO XML protocol artifacts. In the native path
-    /// `build_tool_instructions` is never called, so the system prompt alone
-    /// must be clean of XML tool-call protocol.
+    /// the output must contain ZERO XML protocol artifacts and must not inject
+    /// the duplicate non-native tools summary.
     #[test]
     fn native_tools_system_prompt_contains_zero_xml() {
         use crate::agent::system_prompt::build_system_prompt_with_mode;
 
+        let workspace = tempdir().unwrap();
         let tool_summaries: Vec<(&str, &str)> = vec![
             ("shell", "Execute shell commands"),
             ("file_read", "Read files"),
         ];
 
         let system_prompt = build_system_prompt_with_mode(
-            std::path::Path::new("/tmp"),
+            workspace.path(),
             "test-model",
             &tool_summaries,
             &[],  // no skills
@@ -6931,14 +7015,58 @@ Let me check the result."#;
             "Native prompt must not contain XML protocol header"
         );
 
-        // Positive: native prompt should still list tools and contain task instructions
+        // Positive: native prompt should still contain native-task framing.
         assert!(
-            system_prompt.contains("shell"),
-            "Native prompt must list tool names"
+            !system_prompt.contains("## Tools"),
+            "Native prompt should skip the duplicate tools summary"
         );
         assert!(
             system_prompt.contains("## Your Task"),
             "Native prompt should contain task instructions"
+        );
+    }
+
+    #[test]
+    fn non_native_system_prompt_with_no_tools_contains_zero_tool_protocol() {
+        use crate::agent::system_prompt::build_system_prompt_with_mode;
+
+        let tool_summaries: Vec<(&str, &str)> = vec![];
+
+        let system_prompt = build_system_prompt_with_mode(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            &tool_summaries,
+            &[],
+            None,
+            None,
+            false,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            crate::security::AutonomyLevel::default(),
+        );
+
+        assert!(
+            !system_prompt.contains("## Tools"),
+            "No-tools prompt must not include a Tools section"
+        );
+        assert!(
+            !system_prompt.contains("## Tool Use Protocol"),
+            "No-tools prompt must not include tool protocol"
+        );
+        assert!(
+            !system_prompt.contains("<tool_call>"),
+            "No-tools prompt must not mention XML tool calls"
+        );
+        assert!(
+            !system_prompt.contains("<tool_result>"),
+            "No-tools prompt must not mention XML tool results"
+        );
+        assert!(
+            !system_prompt.contains("Use the tools"),
+            "No-tools prompt must not instruct the model to use unavailable tools"
+        );
+        assert!(
+            system_prompt.contains("No tools are available for this turn"),
+            "No-tools prompt should explicitly describe the current capability boundary"
         );
     }
 
