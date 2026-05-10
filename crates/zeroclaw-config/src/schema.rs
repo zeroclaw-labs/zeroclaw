@@ -20237,6 +20237,75 @@ allowed_users = []
         }
     }
 
+    /// Audit gate: every path emitted by `prop_fields()` must round-trip
+    /// through `get_prop`. The CLI (`zeroclaw config get/set`), the TUI
+    /// onboarding prompts (`prompt_field`), the gateway list endpoint
+    /// (`/api/config/list`), and the dashboard form all derive from
+    /// `prop_fields()`; if a path appears here but `get_prop` rejects
+    /// it, that field is unreachable on every surface.
+    ///
+    /// `init_defaults(None)` populates Option-shaped subsections (memory
+    /// backend specifics, tunnel provider details, etc.) so the walk
+    /// also exercises fields that only materialize once a backend is
+    /// chosen.
+    #[test]
+    async fn every_prop_field_path_is_reachable_via_get_prop() {
+        let mut config = Config::default();
+        config.init_defaults(None);
+        for field in config.prop_fields() {
+            let result = config.get_prop(&field.name);
+            assert!(
+                result.is_ok(),
+                "get_prop('{}') failed: {} \u{2014} prop_fields() advertises a path \
+                 that the CLI / gateway / TUI all expect to be readable. \
+                 Either the macro emits the path but routing is missing, \
+                 or the field shouldn't be in prop_fields().",
+                field.name,
+                result.unwrap_err()
+            );
+        }
+    }
+
+    /// Audit gate: every non-secret scalar prop round-trips through
+    /// `set_prop(get_prop(p))`. The CLI's `zeroclaw config set` and the
+    /// dashboard's PATCH op both rely on this being true so an operator
+    /// can read a value, edit it locally, and write it back. Vec /
+    /// object-array fields are skipped — they pass through serde-JSON
+    /// rather than scalar string parsing.
+    #[test]
+    async fn every_scalar_prop_round_trips_through_set_prop() {
+        let mut config = Config::default();
+        config.init_defaults(None);
+        let fields = config.prop_fields();
+        for field in &fields {
+            if field.is_secret
+                || matches!(
+                    field.kind,
+                    crate::config::PropKind::StringArray
+                        | crate::config::PropKind::ObjectArray
+                )
+            {
+                continue;
+            }
+            let value = match config.get_prop(&field.name) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            // Sentinel for unset Option fields — no round-trip applies.
+            if value == "<unset>" {
+                continue;
+            }
+            let result = config.set_prop(&field.name, &value);
+            assert!(
+                result.is_ok(),
+                "round-trip set_prop('{}', '{}') failed: {}",
+                field.name,
+                value,
+                result.unwrap_err()
+            );
+        }
+    }
+
     /// Every enum field must have a working enum_variants callback, and
     /// set_prop must accept each variant it advertises.
     #[test]
