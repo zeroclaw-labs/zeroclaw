@@ -1339,3 +1339,159 @@ agents = ["researcher"]
     // must not have injected one.
     assert!(group.get("external_peers").is_none());
 }
+
+/// Per-channel-type peer-auth field name regression. The V2 field
+/// name varied per platform (allowed_users, allowed_contacts,
+/// allowed_from, allowed_numbers, allowed_senders, allowed_pubkeys);
+/// every one of them folds into `external_peers` on a synthesized
+/// peer group and the original channel field is REMOVED.
+#[test]
+fn v2_every_inbound_peer_field_folds_and_is_stripped() {
+    let v3 = migrate_v2(
+        r#"
+[channels.imessage]
+enabled = true
+allowed_contacts = ["+15551234567"]
+
+[channels.signal]
+enabled = true
+http_url = "http://localhost:8080"
+account = "+15555550100"
+allowed_from = ["+15551234567"]
+
+[channels.whatsapp]
+enabled = true
+phone_number_id = "id"
+business_account_id = "acct"
+access_token = "tok"
+verify_token = "v"
+allowed_numbers = ["+15551234567"]
+
+[channels.linq]
+enabled = true
+account_sid = "AC"
+auth_token = "tok"
+from_number = "+15555550100"
+allowed_senders = ["+15551234567"]
+
+[channels.nostr]
+enabled = true
+relay_url = "wss://relay.example"
+private_key = "nsec1xxx"
+allowed_pubkeys = ["npub1abc"]
+
+[channels.email]
+enabled = true
+provider = "imap"
+imap_host = "imap.example"
+imap_port = 993
+smtp_host = "smtp.example"
+smtp_port = 587
+username = "bot@example"
+password = "p"
+allowed_senders = ["ops@example"]
+"#,
+    );
+
+    // Helper: assert the synthesized peer group has the expected
+    // username, and that the original field is no longer present on
+    // the channel block.
+    let pg = v3
+        .get("peer_groups")
+        .and_then(toml::Value::as_table)
+        .expect("peer_groups synthesized");
+    let channels = v3
+        .get("channels")
+        .and_then(toml::Value::as_table)
+        .expect("channels exists");
+
+    for (channel_type, field_name, expected_user) in [
+        ("imessage", "allowed_contacts", "+15551234567"),
+        ("signal", "allowed_from", "+15551234567"),
+        ("whatsapp", "allowed_numbers", "+15551234567"),
+        ("linq", "allowed_senders", "+15551234567"),
+        ("nostr", "allowed_pubkeys", "npub1abc"),
+        ("email", "allowed_senders", "ops@example"),
+    ] {
+        let group_name = format!("{channel_type}_default");
+        let group = pg
+            .get(&group_name)
+            .and_then(toml::Value::as_table)
+            .unwrap_or_else(|| panic!("peer_groups.{group_name} synthesized"));
+        let peer = group
+            .get("external_peers")
+            .and_then(toml::Value::as_array)
+            .unwrap()
+            .first()
+            .and_then(|v| v.get("username"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("external_peers[0].username for {channel_type}"));
+        assert_eq!(peer, expected_user, "{channel_type} username");
+
+        let channel_alias = channels
+            .get(channel_type)
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get("default"))
+            .and_then(toml::Value::as_table)
+            .unwrap_or_else(|| panic!("channels.{channel_type}.default present"));
+        assert!(
+            channel_alias.get(field_name).is_none(),
+            "channels.{channel_type}.default.{field_name} must be stripped after fold"
+        );
+    }
+}
+
+#[test]
+fn v2_matrix_allowed_users_folds_and_allowed_rooms_stays() {
+    let v3 = migrate_v2(
+        r#"
+[channels.matrix]
+enabled = true
+homeserver = "https://matrix.org"
+access_token = "tok"
+allowed_users = ["@alice:matrix.org", "@bob:matrix.org"]
+allowed_rooms = ["!ops:matrix.org"]
+"#,
+    );
+
+    // 1. Synthesized peer group with the channel ref and MXIDs.
+    let group = v3
+        .get("peer_groups")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("matrix_default"))
+        .and_then(toml::Value::as_table)
+        .expect("matrix allow-list folds into [peer_groups.matrix_default]");
+    let peers: Vec<&str> = group
+        .get("external_peers")
+        .and_then(toml::Value::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.get("username").and_then(toml::Value::as_str))
+        .collect();
+    assert_eq!(peers, vec!["@alice:matrix.org", "@bob:matrix.org"]);
+
+    // 2. allowed_users is REMOVED from the channel block — peer
+    //    authorization is in peer_groups only.
+    let matrix = v3
+        .get("channels")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("matrix"))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("default"))
+        .and_then(toml::Value::as_table)
+        .expect("channels.matrix.default present after V2→V3");
+    assert!(
+        matrix.get("allowed_users").is_none(),
+        "channel-level allowed_users must be stripped after the fold"
+    );
+
+    // 3. allowed_rooms is container scope (rooms aren't peers); stays.
+    let rooms: Vec<&str> = matrix
+        .get("allowed_rooms")
+        .and_then(toml::Value::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .collect();
+    assert_eq!(rooms, vec!["!ops:matrix.org"]);
+}

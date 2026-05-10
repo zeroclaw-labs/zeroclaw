@@ -368,8 +368,6 @@ pub struct EmailConfig {
     /// capability (RFC 2177). Ignored when IDLE is available.
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
-    #[serde(default)]
-    pub allowed_senders: Vec<String>,
     #[serde(default = "default_subject")]
     pub default_subject: String,
     #[serde(default = "default_max_attachment_bytes")]
@@ -404,7 +402,6 @@ impl Default for EmailConfig {
             from_address: String::new(),
             idle_timeout_secs: default_idle_timeout(),
             poll_interval_secs: default_poll_interval_secs(),
-            allowed_senders: Vec::new(),
             default_subject: default_subject(),
             max_attachment_bytes: default_max_attachment_bytes(),
             excluded_tools: Vec::new(),
@@ -426,8 +423,6 @@ pub struct GmailPushConfig {
     #[serde(default)]
     #[secret]
     pub oauth_token: String,
-    #[serde(default)]
-    pub allowed_senders: Vec<String>,
     #[serde(default)]
     pub webhook_url: String,
     #[serde(default)]
@@ -454,7 +449,6 @@ impl Default for GmailPushConfig {
             topic: String::new(),
             label_filter: default_label_filter(),
             oauth_token: String::new(),
-            allowed_senders: Vec::new(),
             webhook_url: String::new(),
             webhook_secret: String::new(),
             excluded_tools: Vec::new(),

@@ -345,20 +345,28 @@ impl V2Config {
         //     adapters per backend.
         fold_v2_storage_subsystems(&mut passthrough);
 
-        // 7. channels → alias-wrap each channel type, fold discord_history
+        // 7. channels → alias-wrap each channel type, fold
+        //    discord_history, fold per-channel inbound peer-auth
+        //    fields (allowed_users / _contacts / _from / _numbers /
+        //    _senders / _pubkeys) into synthesized `[peer_groups.
+        //    <type>_default]` entries. The peer_groups sink survives
+        //    operator-authored entries through get-or-create so the
+        //    fold is additive at the top level.
         if let Some(channels_value) = channels {
-            let new_channels = alias_wrap_channels(channels_value);
+            let mut peer_groups_for_fold = match passthrough.remove("peer_groups") {
+                Some(toml::Value::Table(t)) => t,
+                _ => toml::Table::new(),
+            };
+            let new_channels = alias_wrap_channels(channels_value, &mut peer_groups_for_fold);
             passthrough.insert("channels".to_string(), toml::Value::Table(new_channels));
-            tracing::info!(target: "migration", "[channels] sections alias-wrapped, discord_history folded");
+            if !peer_groups_for_fold.is_empty() {
+                passthrough.insert(
+                    "peer_groups".to_string(),
+                    toml::Value::Table(peer_groups_for_fold),
+                );
+            }
+            tracing::info!(target: "migration", "[channels] sections alias-wrapped, discord_history folded, inbound peer-auth folded into [peer_groups.*]");
         }
-
-        // 7b. Per-channel `allowed_users` → synthesized
-        //     `[peer_groups.<type>_<alias>]` entries. The channel-level
-        //     allowlist still works (channel impls consult it directly),
-        //     but operators get the V3 peer-group surface populated for
-        //     free, ready to grow into cross-agent routing without
-        //     re-typing every authorized handle.
-        fold_channel_allowed_users_into_peer_groups(&mut passthrough);
 
         // 8. agents → strip inline brain, synthesize provider aliases.
         //    If there are no [agents] blocks but the user had brain config
@@ -921,106 +929,79 @@ fn drop_cost_prices_with_logs(prices: &toml::Table) {
     }
 }
 
-/// Synthesize one `[peer_groups.<type>_<alias>]` per channel that has a
-/// non-empty `allowed_users` array. The synthesized group seeds the V3
-/// peer-group surface with the operator's existing channel-level
-/// allowlist so cross-agent routing works without re-typing every
-/// authorized handle.
+/// Synthesize one `[peer_groups.<channel_type>_<alias>]` entry from a
+/// V2 channel's inbound peer-auth allow-list, and emit an INFO log.
+/// The per-channel arms in [`apply_v2_to_v3_channel_folds`] each:
 ///
-/// - Channels without `allowed_users` (or with only `*`) are skipped:
-///   wildcard allowlists imply "anyone", which a peer group can't
-///   express; the channel-level allowlist stays as the gate.
-/// - The synthesized group's name (`<type>_<alias>`) collides only if
-///   the operator already authored a peer group with that exact name;
-///   in that case the existing group is left untouched.
-/// - The original `allowed_users` field stays on the channel — channel
-///   impls still consult it directly. The peer group is additive: the
-///   operator can grow it into mutual cross-agent routing while the
-///   legacy allowlist remains as the inbound gate.
-fn fold_channel_allowed_users_into_peer_groups(passthrough: &mut toml::Table) {
-    let Some(channels_value) = passthrough.get("channels") else {
+///   1. `instance.remove("<field>")` (V3 has no slot for the field —
+///      strip regardless of whether the fold synthesizes a group).
+///   2. Call this helper with the removed array and the channel's V3
+///      `<type>.<alias>` ref so the synthesized group lands in
+///      `peer_groups`.
+///
+/// Skip rules: empty arrays and any list containing `"*"` produce no
+/// group (a peer group can't express "anyone"). Collisions with an
+/// operator-authored `[peer_groups.<type>_<alias>]` are left
+/// untouched.
+///
+/// V1/V2 had implicit single-agent semantics, so the synthesized
+/// group always binds the migration-bridge `default` agent. That is
+/// the *only* legitimate `default` usage in the V2→V3 fold path —
+/// post-migration the operator owns peer_group membership.
+fn synthesize_peer_group_from_allowlist(
+    peer_groups: &mut toml::Table,
+    channel_type: &str,
+    channel_alias: &str,
+    field_name: &str,
+    allowed: toml::Value,
+) {
+    let toml::Value::Array(allowed) = allowed else {
         return;
     };
-    let Some(channels_table) = channels_value.as_table() else {
-        return;
-    };
-
-    // Collect synthesized groups out-of-band so we don't borrow
-    // passthrough mutably while still reading the channels view.
-    let mut synthesized: Vec<(String, toml::Table)> = Vec::new();
-    for (channel_type, type_value) in channels_table {
-        let Some(type_table) = type_value.as_table() else {
-            continue;
-        };
-        for (alias, alias_value) in type_table {
-            let Some(alias_table) = alias_value.as_table() else {
-                continue;
-            };
-            let Some(allowed) = alias_table.get("allowed_users").and_then(|v| v.as_array()) else {
-                continue;
-            };
-            let usernames: Vec<String> = allowed
-                .iter()
-                .filter_map(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && *s != "*")
-                .map(str::to_string)
-                .collect();
-            if usernames.is_empty() {
-                continue;
-            }
-            let group_name = format!("{channel_type}_{alias}");
-            let mut group_entry = toml::Table::new();
-            group_entry.insert(
-                "channel".to_string(),
-                toml::Value::String(format!("{channel_type}.{alias}")),
-            );
-            let external_peers: Vec<toml::Value> = usernames
-                .into_iter()
-                .map(|u| {
-                    let mut entry = toml::Table::new();
-                    entry.insert("username".to_string(), toml::Value::String(u));
-                    toml::Value::Table(entry)
-                })
-                .collect();
-            group_entry.insert(
-                "external_peers".to_string(),
-                toml::Value::Array(external_peers),
-            );
-            synthesized.push((group_name, group_entry));
-        }
-    }
-
-    if synthesized.is_empty() {
+    let usernames: Vec<String> = allowed
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "*")
+        .map(str::to_string)
+        .collect();
+    if usernames.is_empty() {
         return;
     }
-
-    let groups_value = passthrough
-        .entry("peer_groups".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    let Some(groups_table) = groups_value.as_table_mut() else {
-        // Operator authored `peer_groups` as a non-table; bail rather
-        // than overwrite their (broken) shape — V3 deserialization will
-        // surface the real error.
+    let group_name = format!("{channel_type}_{channel_alias}");
+    if peer_groups.contains_key(&group_name) {
+        // Operator-authored group with the synthesized name wins.
         return;
-    };
-    let mut added = 0usize;
-    for (name, entry) in synthesized {
-        if groups_table.contains_key(&name) {
-            // Operator-authored group with the exact synthesized name
-            // wins; folding would be silent overwrite.
-            continue;
-        }
-        groups_table.insert(name, toml::Value::Table(entry));
-        added += 1;
     }
-    if added > 0 {
-        tracing::info!(
-            target: "migration",
-            "[channels.*.allowed_users] folded into {added} synthesized [peer_groups.<type>_<alias>] entries"
-        );
-    }
+    let mut group_entry = toml::Table::new();
+    group_entry.insert(
+        "channel".to_string(),
+        toml::Value::String(format!("{channel_type}.{channel_alias}")),
+    );
+    // V1/V2 single-agent semantics — bridge alias `default`.
+    group_entry.insert(
+        "agents".to_string(),
+        toml::Value::Array(vec![toml::Value::String("default".to_string())]),
+    );
+    let external_peers: Vec<toml::Value> = usernames
+        .into_iter()
+        .map(|u| {
+            let mut entry = toml::Table::new();
+            entry.insert("username".to_string(), toml::Value::String(u));
+            toml::Value::Table(entry)
+        })
+        .collect();
+    group_entry.insert(
+        "external_peers".to_string(),
+        toml::Value::Array(external_peers),
+    );
+    peer_groups.insert(group_name, toml::Value::Table(group_entry));
+    tracing::info!(
+        target: "migration",
+        "channels.{channel_type}.{channel_alias}.{field_name} folded into [peer_groups.{channel_type}_{channel_alias}]"
+    );
 }
+
 
 /// Wrap V2 `Option<T>` channel sections into V3 `HashMap<String, T>` keyed
 /// by `"default"`. Applies, per channel instance:
@@ -1043,7 +1024,10 @@ fn fold_channel_allowed_users_into_peer_groups(passthrough: &mut toml::Table) {
 ///   the channel type and reason.
 ///
 /// `cli: bool` is preserved at the top-level `channels.cli`, not aliased.
-fn alias_wrap_channels(channels_value: toml::Value) -> toml::Table {
+fn alias_wrap_channels(
+    channels_value: toml::Value,
+    peer_groups: &mut toml::Table,
+) -> toml::Table {
     let mut channels_table = match channels_value {
         toml::Value::Table(t) => t,
         _ => return toml::Table::new(),
@@ -1059,7 +1043,8 @@ fn alias_wrap_channels(channels_value: toml::Value) -> toml::Table {
     // discord_history-only user with `enabled=true` survives into V3.
     fold_discord_history(&mut channels_table);
 
-    // Per-channel-type processing: T3–T6 folds, T7 enabled filter, alias-wrap.
+    // Per-channel-type processing: T3–T6 container folds, peer-auth →
+    // peer_groups, T7 enabled filter, alias-wrap.
     for ct in V3_CHANNEL_TYPES {
         let Some(value) = channels_table.remove(*ct) else {
             continue;
@@ -1077,6 +1062,7 @@ fn alias_wrap_channels(channels_value: toml::Value) -> toml::Table {
             }
         };
         apply_v2_to_v3_channel_folds(ct, &mut instance);
+        fold_channel_peer_auth_into_peer_groups(ct, &mut instance, peer_groups);
         if !drain_enabled_keep(ct, &mut instance) {
             continue;
         }
@@ -1248,6 +1234,53 @@ fn apply_v2_to_v3_channel_folds(channel_type: &str, instance: &mut toml::Table) 
             }
         }
         _ => {}
+    }
+}
+
+/// V2 → V3 inbound peer-auth fold per channel. Each channel that had
+/// a user-allowlist field in V2 strips it from the instance and
+/// synthesizes the V3 peer_group binding `default` agent to this
+/// channel. Field name varies per platform; helper handles wildcard
+/// / empty / collision skip rules uniformly.
+///
+/// Field-name table (the only place this list lives):
+///
+/// - Most channels: `allowed_users`
+/// - iMessage:      `allowed_contacts`
+/// - Signal:        `allowed_from`
+/// - WhatsApp/Wati: `allowed_numbers`
+/// - Linq/Email/GmailPush: `allowed_senders`
+/// - Nostr:         `allowed_pubkeys`
+///
+/// Channels with no inbound peer-auth concept (Webhook, Reddit,
+/// Bluesky, MQTT, voice_*, ClawdTalk, CLI) return `None` and the
+/// function is a no-op.
+fn fold_channel_peer_auth_into_peer_groups(
+    channel_type: &str,
+    instance: &mut toml::Table,
+    peer_groups: &mut toml::Table,
+) {
+    let Some(field_name) = (match channel_type {
+        "telegram" | "discord" | "slack" | "mattermost" | "matrix" | "nextcloud_talk"
+        | "irc" | "lark" | "line" | "feishu" | "dingtalk" | "wecom" | "wechat" | "qq"
+        | "twitter" | "mochat" => Some("allowed_users"),
+        "imessage" => Some("allowed_contacts"),
+        "signal" => Some("allowed_from"),
+        "whatsapp" | "wati" => Some("allowed_numbers"),
+        "linq" | "email" | "gmail_push" => Some("allowed_senders"),
+        "nostr" => Some("allowed_pubkeys"),
+        _ => None,
+    }) else {
+        return;
+    };
+    if let Some(allowed) = instance.remove(field_name) {
+        synthesize_peer_group_from_allowlist(
+            peer_groups,
+            channel_type,
+            "default",
+            field_name,
+            allowed,
+        );
     }
 }
 

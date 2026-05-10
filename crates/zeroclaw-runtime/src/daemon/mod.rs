@@ -989,11 +989,15 @@ fn load_jsonl_messages(path: &std::path::Path) -> Vec<zeroclaw_providers::traits
 /// channels are configured. Returns the first match in priority order.
 fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
     // Priority order: telegram > discord > slack > mattermost
-    if let Some(tg) = config.channels.telegram.values().next() {
-        // Use the first allowed_user as target, or fall back to empty (broadcast)
-        let target = tg.allowed_users.first().cloned().unwrap_or_default();
-        if !target.is_empty() {
-            return Some(("telegram".to_string(), target));
+    // Find the first external peer authorized on a telegram channel
+    // (peer authorization lives in peer_groups in V3, not on the
+    // channel block).
+    if !config.channels.telegram.is_empty() {
+        for alias in config.channels.telegram.keys() {
+            let peers = config.channel_external_peers("telegram", alias);
+            if let Some(target) = peers.into_iter().next() {
+                return Some(("telegram".to_string(), target));
+            }
         }
     }
     if !config.channels.discord.is_empty() {
@@ -1133,7 +1137,6 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
                 bot_token: "token".into(),
-                allowed_users: vec![],
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -1155,7 +1158,6 @@ mod tests {
             zeroclaw_config::schema::DingTalkConfig {
                 client_id: "client_id".into(),
                 client_secret: "client_secret".into(),
-                allowed_users: vec!["*".into()],
                 proxy_url: None,
                 excluded_tools: vec![],
             },
@@ -1174,7 +1176,6 @@ mod tests {
                 login_id: None,
                 password: None,
                 channel_ids: vec!["channel-id".into()],
-                allowed_users: vec!["*".into()],
                 thread_replies: Some(true),
                 mention_only: Some(false),
                 interrupt_on_new_message: false,
@@ -1193,7 +1194,6 @@ mod tests {
             zeroclaw_config::schema::QQConfig {
                 app_id: "app-id".into(),
                 app_secret: "app-secret".into(),
-                allowed_users: vec!["*".into()],
                 proxy_url: None,
                 excluded_tools: vec![],
             },
@@ -1210,7 +1210,6 @@ mod tests {
                 base_url: "https://cloud.example.com".into(),
                 app_token: "app-token".into(),
                 webhook_secret: None,
-                allowed_users: vec!["*".into()],
                 proxy_url: None,
                 bot_name: None,
                 excluded_tools: vec![],
@@ -1301,7 +1300,6 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
                 bot_token: "bot-token".into(),
-                allowed_users: vec![],
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -1324,7 +1322,6 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
                 bot_token: "bot-token".into(),
-                allowed_users: vec!["user123".into()],
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,

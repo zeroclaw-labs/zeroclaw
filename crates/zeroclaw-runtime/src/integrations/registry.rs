@@ -228,7 +228,6 @@ mod tests {
             "default".to_string(),
             TelegramConfig {
                 bot_token: "123:ABC".into(),
-                allowed_users: vec!["user".into()],
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -260,7 +259,6 @@ mod tests {
         config.channels.imessage.insert(
             "default".to_string(),
             IMessageConfig {
-                allowed_contacts: vec!["*".into()],
                 excluded_tools: vec![],
             },
         );
@@ -289,7 +287,6 @@ mod tests {
                 access_token: Some("tok".into()),
                 user_id: None,
                 device_id: None,
-                allowed_users: vec![],
                 allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),

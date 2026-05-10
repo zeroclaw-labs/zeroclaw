@@ -4121,35 +4121,49 @@ fn normalize_telegram_identity(value: &str) -> String {
 }
 
 pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
+    use zeroclaw_config::multi_agent::{PeerExternal, PeerGroupConfig, PeerUsername};
+    use zeroclaw_config::providers::ChannelRef;
+
     let normalized = normalize_telegram_identity(identity);
     if normalized.is_empty() {
         anyhow::bail!("Telegram identity cannot be empty");
     }
 
     let mut updated = config.clone();
-    let Some(telegram) = updated.channels.telegram.get_mut("default") else {
+    if !updated.channels.telegram.contains_key("default") {
         anyhow::bail!(
             "Telegram channel is not configured. Run `zeroclaw onboard --channels-only` first"
         );
-    };
-
-    if telegram.allowed_users.iter().any(|u| u == "*") {
-        println!(
-            "⚠️ Telegram allowlist is currently wildcard (`*`) — binding is unnecessary until you remove '*'."
-        );
     }
 
-    if telegram
-        .allowed_users
+    // Locate (or create) the peer group bound to telegram.default. The
+    // V3 surface puts inbound peer authorization in `peer_groups`,
+    // not on the channel block. Convention: the synthesized group
+    // name is `<type>_<alias>` (matching what the V2→V3 fold uses)
+    // so a hand-bound identity lands in the same group an operator
+    // would inspect after an upgrade.
+    let group_name = "telegram_default".to_string();
+    let channel_ref = ChannelRef::new("telegram.default");
+    let group = updated
+        .peer_groups
+        .entry(group_name.clone())
+        .or_insert_with(|| PeerGroupConfig {
+            channel: channel_ref.clone(),
+            ..PeerGroupConfig::default()
+        });
+
+    if group
+        .external_peers
         .iter()
-        .map(|entry| normalize_telegram_identity(entry))
-        .any(|entry| entry == normalized)
+        .any(|p| normalize_telegram_identity(p.username.as_str()) == normalized)
     {
         println!("✅ Telegram identity already bound: {normalized}");
         return Ok(());
     }
 
-    telegram.allowed_users.push(normalized.clone());
+    group.external_peers.push(PeerExternal {
+        username: PeerUsername::new(normalized.clone()),
+    });
     updated.save().await?;
     println!("✅ Bound Telegram identity: {normalized}");
     println!("   Saved to {}", updated.config_path.display());
@@ -4280,7 +4294,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             Ok(Arc::new(
                 TelegramChannel::new(
                     tg.bot_token.clone(),
-                    tg.allowed_users.clone(),
+                    config.channel_external_peers("telegram", "default"),
                     tg.mention_only,
                 )
                 .with_ack_reactions(ack)
@@ -4301,7 +4315,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 DiscordChannel::new(
                     dc.bot_token.clone(),
                     dc.guild_ids.clone(),
-                    dc.allowed_users.clone(),
+                    config.channel_external_peers("discord", "default"),
                     dc.listen_to_bots,
                     dc.mention_only,
                 )
@@ -4328,7 +4342,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     sl.bot_token.clone(),
                     sl.app_token.clone(),
                     sl.channel_ids.clone(),
-                    sl.allowed_users.clone(),
+                    config.channel_external_peers("slack", "default"),
                 )
                 .with_workspace_dir(config.workspace_dir.clone())
                 .with_markdown_blocks(sl.use_markdown_blocks)
@@ -4350,7 +4364,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 mm.login_id.clone(),
                 mm.password.clone(),
                 mm.channel_ids.clone(),
-                mm.allowed_users.clone(),
+                config.channel_external_peers("mattermost", "default"),
                 mm.thread_replies.unwrap_or(true),
                 mm.mention_only.unwrap_or(false),
             )))
@@ -4367,7 +4381,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     sg.account.clone(),
                     sg.group_ids.clone(),
                     sg.dm_only,
-                    sg.allowed_from.clone(),
+                    config.channel_external_peers("signal", "default"),
                     sg.ignore_attachments,
                     sg.ignore_stories,
                 )
@@ -4416,7 +4430,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     wa.pair_phone.clone(),
                     wa.pair_code.clone(),
                     wa.ws_url.clone(),
-                    wa.allowed_numbers.clone(),
+                    config.channel_external_peers("whatsapp", "default"),
                     wa.mention_only,
                     wa.mode.clone(),
                     wa.dm_policy.clone(),
@@ -4438,7 +4452,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             Ok(Arc::new(QQChannel::new(
                 qq.app_id.clone(),
                 qq.app_secret.clone(),
-                qq.allowed_users.clone(),
+                config.channel_external_peers("qq", "default"),
             )))
         }
         "lark" => {
@@ -4485,7 +4499,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 DingTalkChannel::new(
                     dt.client_id.clone(),
                     dt.client_secret.clone(),
-                    dt.allowed_users.clone(),
+                    config.channel_external_peers("dingtalk", "default"),
                 )
                 .with_proxy_url(dt.proxy_url.clone()),
             ))
@@ -4498,7 +4512,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .context("WeCom channel is not configured")?;
             Ok(Arc::new(WeComChannel::new(
                 wc.webhook_key.clone(),
-                wc.allowed_users.clone(),
+                config.channel_external_peers("wechat", "default"),
             )))
         }
         #[cfg(feature = "channel-wechat")]
@@ -4510,7 +4524,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .context("WeChat channel is not configured")?;
             Ok(Arc::new(
                 WeChatChannel::new(
-                    wc.allowed_users.clone(),
+                    config.channel_external_peers("wechat", "default"),
                     wc.api_base_url.clone(),
                     wc.cdn_base_url.clone(),
                     wc.state_dir.as_ref().map(std::path::PathBuf::from),
@@ -4533,7 +4547,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     nc.base_url.clone(),
                     nc.app_token.clone(),
                     nc.bot_name.clone().unwrap_or_default(),
-                    nc.allowed_users.clone(),
+                    config.channel_external_peers("nextcloud_talk", "default"),
                     nc.proxy_url.clone(),
                 )
                 .with_streaming(nc.stream_mode, nc.draft_update_interval_ms),
@@ -4549,7 +4563,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 wati_cfg.api_token.clone(),
                 wati_cfg.api_url.clone(),
                 wati_cfg.tenant_id.clone(),
-                wati_cfg.allowed_numbers.clone(),
+                config.channel_external_peers("wati", "default"),
                 wati_cfg.proxy_url.clone(),
             )))
         }
@@ -4562,7 +4576,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             Ok(Arc::new(LinqChannel::new(
                 lq.api_token.clone(),
                 lq.from_phone.clone(),
-                lq.allowed_senders.clone(),
+                config.channel_external_peers("linq", "default"),
             )))
         }
         #[cfg(feature = "channel-email")]
@@ -4595,7 +4609,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 nickname: irc_cfg.nickname.clone(),
                 username: irc_cfg.username.clone(),
                 channels: irc_cfg.channels.clone(),
-                allowed_users: irc_cfg.allowed_users.clone(),
+                allowed_users: config.channel_external_peers("irc", "default"),
                 server_password: irc_cfg.server_password.clone(),
                 nickserv_password: irc_cfg.nickserv_password.clone(),
                 sasl_password: irc_cfg.sasl_password.clone(),
@@ -4611,7 +4625,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .context("X/Twitter channel is not configured")?;
             Ok(Arc::new(TwitterChannel::new(
                 tw.bearer_token.clone(),
-                tw.allowed_users.clone(),
+                config.channel_external_peers("twitter", "default"),
             )))
         }
         "mochat" => {
@@ -4623,17 +4637,17 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             Ok(Arc::new(MochatChannel::new(
                 mc.api_url.clone(),
                 mc.api_token.clone(),
-                mc.allowed_users.clone(),
+                config.channel_external_peers("mochat", "default"),
                 mc.poll_interval_secs,
             )))
         }
         "imessage" => {
-            let im = config
-                .channels
-                .imessage
-                .get("default")
-                .context("iMessage channel is not configured")?;
-            Ok(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())))
+            if !config.channels.imessage.contains_key("default") {
+                anyhow::bail!("iMessage channel is not configured");
+            }
+            Ok(Arc::new(IMessageChannel::new(
+                config.channel_external_peers("imessage", "default"),
+            )))
         }
         "line" => {
             #[cfg(feature = "channel-line")]
@@ -4739,7 +4753,7 @@ fn collect_configured_channels(
             channel: Arc::new(
                 TelegramChannel::new(
                     tg.bot_token.clone(),
-                    tg.allowed_users.clone(),
+                    config.channel_external_peers("telegram", "default"),
                     tg.mention_only,
                 )
                 .with_ack_reactions(ack)
@@ -4761,7 +4775,7 @@ fn collect_configured_channels(
         let mut discord_ch = DiscordChannel::new(
             dc.bot_token.clone(),
             dc.guild_ids.clone(),
-            dc.allowed_users.clone(),
+            config.channel_external_peers("discord", "default"),
             dc.listen_to_bots,
             dc.mention_only,
         )
@@ -4803,7 +4817,7 @@ fn collect_configured_channels(
                     sl.bot_token.clone(),
                     sl.app_token.clone(),
                     sl.channel_ids.clone(),
-                    sl.allowed_users.clone(),
+                    config.channel_external_peers("slack", "default"),
                 )
                 .with_thread_replies(sl.thread_replies.unwrap_or(true))
                 .with_group_reply_policy(sl.mention_only, Vec::new())
@@ -4832,7 +4846,7 @@ fn collect_configured_channels(
                     mm.login_id.clone(),
                     mm.password.clone(),
                     mm.channel_ids.clone(),
-                    mm.allowed_users.clone(),
+                    config.channel_external_peers("mattermost", "default"),
                     mm.thread_replies.unwrap_or(true),
                     mm.mention_only.unwrap_or(false),
                 )
@@ -4848,7 +4862,7 @@ fn collect_configured_channels(
         }
         channels.push(ConfiguredChannel {
             display_name: "iMessage",
-            channel: Arc::new(IMessageChannel::new(im.allowed_contacts.clone())),
+            channel: Arc::new(IMessageChannel::new(config.channel_external_peers("imessage", "default"))),
         });
     }
 
@@ -4898,7 +4912,7 @@ fn collect_configured_channels(
                     sig.account.clone(),
                     sig.group_ids.clone(),
                     sig.dm_only,
-                    sig.allowed_from.clone(),
+                    config.channel_external_peers("signal", "default"),
                     sig.ignore_attachments,
                     sig.ignore_stories,
                 )
@@ -4929,7 +4943,7 @@ fn collect_configured_channels(
                                 wa.access_token.clone().unwrap_or_default(),
                                 wa.phone_number_id.clone().unwrap_or_default(),
                                 wa.verify_token.clone().unwrap_or_default(),
-                                wa.allowed_numbers.clone(),
+                                config.channel_external_peers("whatsapp", "default"),
                             )
                             .with_proxy_url(wa.proxy_url.clone())
                             .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
@@ -4955,7 +4969,7 @@ fn collect_configured_channels(
                                 wa.pair_phone.clone(),
                                 wa.pair_code.clone(),
                                 wa.ws_url.clone(),
-                                wa.allowed_numbers.clone(),
+                                config.channel_external_peers("whatsapp", "default"),
                                 wa.mention_only,
                                 wa.mode.clone(),
                                 wa.dm_policy.clone(),
@@ -4999,7 +5013,7 @@ fn collect_configured_channels(
             channel: Arc::new(LinqChannel::new(
                 lq.api_token.clone(),
                 lq.from_phone.clone(),
-                lq.allowed_senders.clone(),
+                config.channel_external_peers("linq", "default"),
             )),
         });
     }
@@ -5012,7 +5026,7 @@ fn collect_configured_channels(
             wati_cfg.api_token.clone(),
             wati_cfg.api_url.clone(),
             wati_cfg.tenant_id.clone(),
-            wati_cfg.allowed_numbers.clone(),
+            config.channel_external_peers("wati", "default"),
             wati_cfg.proxy_url.clone(),
         )
         .with_transcription(config.transcription.clone());
@@ -5032,7 +5046,7 @@ fn collect_configured_channels(
                 nc.base_url.clone(),
                 nc.app_token.clone(),
                 nc.bot_name.clone().unwrap_or_default(),
-                nc.allowed_users.clone(),
+                config.channel_external_peers("nextcloud_talk", "default"),
                 nc.proxy_url.clone(),
             )),
         });
@@ -5072,7 +5086,7 @@ fn collect_configured_channels(
                 nickname: irc.nickname.clone(),
                 username: irc.username.clone(),
                 channels: irc.channels.clone(),
-                allowed_users: irc.allowed_users.clone(),
+                allowed_users: config.channel_external_peers("irc", "default"),
                 server_password: irc.server_password.clone(),
                 nickserv_password: irc.nickserv_password.clone(),
                 sasl_password: irc.sasl_password.clone(),
@@ -5166,7 +5180,7 @@ fn collect_configured_channels(
                 DingTalkChannel::new(
                     dt.client_id.clone(),
                     dt.client_secret.clone(),
-                    dt.allowed_users.clone(),
+                    config.channel_external_peers("dingtalk", "default"),
                 )
                 .with_proxy_url(dt.proxy_url.clone()),
             ),
@@ -5183,7 +5197,7 @@ fn collect_configured_channels(
                 QQChannel::new(
                     qq.app_id.clone(),
                     qq.app_secret.clone(),
-                    qq.allowed_users.clone(),
+                    config.channel_external_peers("qq", "default"),
                 )
                 .with_workspace_dir(config.workspace_dir.clone())
                 .with_proxy_url(qq.proxy_url.clone()),
@@ -5199,7 +5213,7 @@ fn collect_configured_channels(
             display_name: "X/Twitter",
             channel: Arc::new(TwitterChannel::new(
                 tw.bearer_token.clone(),
-                tw.allowed_users.clone(),
+                config.channel_external_peers("twitter", "default"),
             )),
         });
     }
@@ -5213,7 +5227,7 @@ fn collect_configured_channels(
             channel: Arc::new(MochatChannel::new(
                 mc.api_url.clone(),
                 mc.api_token.clone(),
-                mc.allowed_users.clone(),
+                config.channel_external_peers("mochat", "default"),
                 mc.poll_interval_secs,
             )),
         });
@@ -5227,7 +5241,7 @@ fn collect_configured_channels(
             display_name: "WeCom",
             channel: Arc::new(WeComChannel::new(
                 wc.webhook_key.clone(),
-                wc.allowed_users.clone(),
+                config.channel_external_peers("wechat", "default"),
             )),
         });
     }
@@ -5392,10 +5406,11 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
             if !active_nostr.contains(&format!("nostr.{alias}")) {
                 continue;
             }
+            let allowed_pubkeys = config.channel_external_peers("nostr", alias);
             channels.push(ConfiguredChannel {
                 display_name: "Nostr",
                 channel: Arc::new(
-                    NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys)
+                    NostrChannel::new(&ns.private_key, ns.relays.clone(), &allowed_pubkeys)
                         .await?,
                 ),
             });
@@ -5868,9 +5883,10 @@ pub async fn start_channels(
             .collect();
 
     #[cfg(feature = "channel-nostr")]
-    if let Some(ns) = config.channels.nostr.values().next() {
+    if let Some((alias, ns)) = config.channels.nostr.iter().next() {
+        let allowed_pubkeys = config.channel_external_peers("nostr", alias);
         channels.push(Arc::new(
-            NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
+            NostrChannel::new(&ns.private_key, ns.relays.clone(), &allowed_pubkeys).await?,
         ));
     }
     if channels.is_empty() {
@@ -6215,7 +6231,7 @@ pub async fn deliver_announcement(
                 .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
             let ch = TelegramChannel::new(
                 tg.bot_token.clone(),
-                tg.allowed_users.clone(),
+                config.channel_external_peers("telegram", "default"),
                 tg.mention_only,
             );
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
@@ -6230,7 +6246,7 @@ pub async fn deliver_announcement(
             let ch = DiscordChannel::new(
                 dc.bot_token.clone(),
                 dc.guild_ids.clone(),
-                dc.allowed_users.clone(),
+                config.channel_external_peers("discord", "default"),
                 dc.listen_to_bots,
                 dc.mention_only,
             )
@@ -6249,7 +6265,7 @@ pub async fn deliver_announcement(
                 sl.bot_token.clone(),
                 sl.app_token.clone(),
                 sl.channel_ids.clone(),
-                sl.allowed_users.clone(),
+                config.channel_external_peers("slack", "default"),
             )
             .with_workspace_dir(config.workspace_dir.clone());
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
@@ -6266,7 +6282,7 @@ pub async fn deliver_announcement(
                 sg.account.clone(),
                 sg.group_ids.clone(),
                 sg.dm_only,
-                sg.allowed_from.clone(),
+                config.channel_external_peers("signal", "default"),
                 sg.ignore_attachments,
                 sg.ignore_stories,
             );
@@ -6281,7 +6297,7 @@ pub async fn deliver_announcement(
                 .get("default")
                 .ok_or_else(|| anyhow::anyhow!("wechat channel not configured"))?;
             let ch = WeChatChannel::new(
-                wc.allowed_users.clone(),
+                config.channel_external_peers("wechat", "default"),
                 wc.api_base_url.clone(),
                 wc.cdn_base_url.clone(),
                 wc.state_dir.as_ref().map(std::path::PathBuf::from),
@@ -11899,7 +11915,6 @@ This is an example JSON object for profile settings."#;
                 login_id: None,
                 password: None,
                 channel_ids: vec!["channel-1".to_string()],
-                allowed_users: vec![],
                 thread_replies: Some(true),
                 mention_only: Some(false),
                 interrupt_on_new_message: false,
@@ -13126,7 +13141,6 @@ This is an example JSON object for profile settings."#;
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
                 bot_token: "test-token".to_string(),
-                allowed_users: vec![],
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,

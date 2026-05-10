@@ -2,6 +2,70 @@
 
 Cross-tool agent instructions for any AI coding assistant working on this repository.
 
+## ABSOLUTE RULE — SINGLE SOURCE OF TRUTH (NO DRY VIOLATIONS)
+
+**No piece of state lives in two places. Ever. Anywhere in this codebase.**
+
+This is not a guideline. It is not a preference. It is not deferrable to a
+follow-up PR. If a fact already lives somewhere in this codebase, you do NOT
+copy it into a new field, struct, config block, schema entry, runtime cache,
+or anywhere else. You reference it. You resolve it from its source on demand.
+
+**Why this matters more than anything else you're tempted to ship:** every
+duplicate state breeds a drift bug whose symptoms surface months later in
+production — operator edits the canonical location, the cached copy serves
+stale data, the agent silently misbehaves. The previous incarnation of this
+codebase had channel `allowed_users` Vec fields cached inside channel handles
+while the truth lived in config TOML; reloading config didn't refresh the
+channels; an authorized user couldn't talk to the bot until daemon restart.
+Every such field is now banned by this rule.
+
+### Forcing mechanism — what happens when you violate
+
+Adding a duplicate state field is an automatic-revert-on-detect change. The
+pre-push gate runs `dev/ci.sh dry-check`. If it fires, the maintainer will
+`git reset --hard` your branch back to the prior good state, and the time you
+spent is wasted. Save yourself the burn: do not write the duplicate in the
+first place.
+
+### Pre-edit ritual — before any new struct field, channel/handle field, schema field, config entry
+
+State, in your response text, the source of truth for the new data BEFORE you
+write the field. Two valid answers:
+
+  1. **"This is the source of truth — created here."** OK to write the
+     field. State what it represents.
+  2. **"Source of truth is `<path/to/canonical>` — this would be a
+     duplicate."** Do NOT write the field. Resolve from the canonical
+     location at use-time (closure, helper, `&Config` parameter, getter
+     trait, whatever fits — never a cache).
+
+Any third answer ("we'll only refresh on restart", "snapshot is fine",
+"orchestrator passes a Vec in") is a duplicate. Refuse the edit. Find the
+canonical source and resolve from there.
+
+### Examples of patterns that ARE duplicate state (forbidden):
+
+- A channel handle struct holding `Vec<String>` of "authorized users" alongside
+  `peer_groups` in `Config`.
+- A schema enum variant list duplicated across an enum and a `const &[Variant]`
+  table that aren't generated from the same macro.
+- A `ConfigSnapshot` struct that clones live `Config` fields the runtime can
+  already reach through its `Arc<RwLock<Config>>` handle.
+- Re-emitting a model-provider's API key into a runtime struct field when the
+  runtime already has the typed alias config.
+
+### Patterns that are NOT duplicate state (allowed):
+
+- Resolver closures (`Arc<dyn Fn() -> T + Send + Sync>`) that close over
+  `Arc<RwLock<Config>>` and resolve on call.
+- `&Config` / `&AgentConfig` parameters threaded through call sites.
+- Materialized views built ON-DEMAND from canonical state (cached per-call,
+  not stored).
+- Derive macros that emit multiple surfaces from one input table (e.g.
+  enum + const list from one macro invocation — both come from the same
+  source of truth at expansion time).
+
 ## Commands
 
 ```bash

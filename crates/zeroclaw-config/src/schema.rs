@@ -9731,8 +9731,6 @@ pub struct TelegramConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bot_token: String,
-    /// Allowed Telegram user IDs or usernames. Empty = deny all.
-    pub allowed_users: Vec<String>,
     /// Streaming mode for progressive response delivery via message edits.
     #[serde(default)]
     pub stream_mode: StreamMode,
@@ -9802,9 +9800,6 @@ pub struct DiscordConfig {
     /// the legacy `[channels.discord-history]` block.
     #[serde(default)]
     pub archive: bool,
-    /// Allowed Discord user IDs. Empty = deny all.
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
     /// When true, process messages from other bots (not just humans).
     /// The bot still ignores its own messages to prevent feedback loops.
     #[serde(default)]
@@ -9876,9 +9871,6 @@ pub struct SlackConfig {
     /// Migrated from the legacy `channel_id` singular field.
     #[serde(default)]
     pub channel_ids: Vec<String>,
-    /// Allowed Slack user IDs. Empty = deny all.
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
     /// When true, a newer Slack message from the same sender in the same channel
     /// cancels the in-flight request and starts a fresh response with preserved history.
     #[serde(default)]
@@ -9971,9 +9963,6 @@ pub struct MattermostConfig {
     /// field.
     #[serde(default)]
     pub channel_ids: Vec<String>,
-    /// Allowed Mattermost user IDs. Empty = deny all.
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
     /// When true (default), replies thread on the original post.
     /// When false, replies go to the channel root.
     #[serde(default)]
@@ -10053,8 +10042,6 @@ impl ChannelConfig for WebhookConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.imessage"]
 pub struct IMessageConfig {
-    /// Allowed iMessage contacts (phone numbers or email addresses). Empty = deny all.
-    pub allowed_contacts: Vec<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
@@ -10090,8 +10077,6 @@ pub struct MatrixConfig {
     /// Optional Matrix device ID.
     #[serde(default)]
     pub device_id: Option<String>,
-    /// Allowed Matrix user IDs. Empty = deny all.
-    pub allowed_users: Vec<String>,
     /// Allowed Matrix room IDs or aliases. Empty = allow all rooms.
     /// Supports canonical room IDs (`!abc:server`) and aliases (`#room:server`).
     #[serde(default)]
@@ -10171,9 +10156,6 @@ pub struct SignalConfig {
     /// set). Migrated from the legacy `group_id = "dm"` sentinel.
     #[serde(default)]
     pub dm_only: bool,
-    /// Allowed sender phone numbers (E.164) or "*" for all.
-    #[serde(default)]
-    pub allowed_from: Vec<String>,
     /// Skip messages that are attachment-only (no text body).
     #[serde(default)]
     pub ignore_attachments: bool,
@@ -10281,9 +10263,6 @@ pub struct WhatsAppConfig {
     /// default endpoint that ships with `wa-rs`.
     #[serde(default)]
     pub ws_url: Option<String>,
-    /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
-    #[serde(default)]
-    pub allowed_numbers: Vec<String>,
     /// When true, only respond to messages that @-mention the bot in groups (Web mode only).
     /// Direct messages are always processed.
     /// Bot identity is resolved from the wa-rs device at runtime; `pair_phone` seeds it on first connect.
@@ -10356,9 +10335,6 @@ pub struct LinqConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub signing_secret: Option<String>,
-    /// Allowed sender handles (phone numbers) or "*" for all
-    #[serde(default)]
-    pub allowed_senders: Vec<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
@@ -10390,9 +10366,6 @@ pub struct WatiConfig {
     /// Tenant ID for multi-channel setups (optional).
     #[serde(default)]
     pub tenant_id: Option<String>,
-    /// Allowed phone numbers (E.164 format) or "*" for all.
-    #[serde(default)]
-    pub allowed_numbers: Vec<String>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
@@ -10435,9 +10408,6 @@ pub struct NextcloudTalkConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub webhook_secret: Option<String>,
-    /// Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all).
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
@@ -10635,9 +10605,6 @@ pub struct IrcConfig {
     /// Channels to join on connect
     #[serde(default)]
     pub channels: Vec<String>,
-    /// Allowed nicknames (case-insensitive) or "*" for all
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
     /// Server password (for bouncers like ZNC)
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -10711,9 +10678,6 @@ pub struct LarkConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub verification_token: Option<String>,
-    /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages are always processed.
     #[serde(default)]
@@ -10810,10 +10774,6 @@ pub struct LineConfig {
     /// - `disabled` — ignore all group messages
     #[serde(default)]
     pub group_policy: LineGroupPolicy,
-    /// LINE user IDs that are allowed to interact with the bot.
-    /// Used when `dm_policy = allowlist`. `["*"]` accepts everyone.
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
     /// TCP port the embedded webhook server listens on. Default: `8443`.
     #[serde(default = "default_line_webhook_port")]
     pub webhook_port: u16,
@@ -10862,9 +10822,6 @@ pub struct FeishuConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub verification_token: Option<String>,
-    /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages are always processed.
     #[serde(default)]
@@ -11419,9 +11376,6 @@ pub struct DingTalkConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub client_secret: String,
-    /// Allowed user IDs (staff IDs). Empty = deny all, "*" = allow all
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
@@ -11451,9 +11405,6 @@ pub struct WeComConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub webhook_key: String,
-    /// Allowed user IDs. Empty = deny all, "*" = allow all
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
@@ -11479,11 +11430,6 @@ impl ChannelConfig for WeComConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.wechat"]
 pub struct WeChatConfig {
-    /// Allowed WeChat user IDs (e.g. `"xxx@im.wechat"`).
-    /// `"*"` = allow all. Empty = require pairing (`/bind <code>` from WeChat);
-    /// the QR-login user is auto-added at first connect.
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
     /// Override the iLink API base URL. Default: `https://ilinkai.weixin.qq.com`.
     #[serde(default)]
     pub api_base_url: Option<String>,
@@ -11521,9 +11467,6 @@ pub struct QQConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub app_secret: String,
-    /// Allowed user IDs. Empty = deny all, "*" = allow all
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
@@ -11553,9 +11496,6 @@ pub struct TwitterConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bearer_token: String,
-    /// Allowed usernames or user IDs. Empty = deny all, "*" = allow all
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
@@ -11583,9 +11523,6 @@ pub struct MochatConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_token: String,
-    /// Allowed user IDs. Empty = deny all, "*" = allow all
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
     /// Poll interval in seconds for new messages. Default: 5
     #[serde(default = "default_mochat_poll_interval")]
     pub poll_interval_secs: u64,
@@ -11776,9 +11713,6 @@ pub struct NostrConfig {
     /// Relay URLs (wss://). Defaults to popular public relays if omitted.
     #[serde(default = "default_nostr_relays")]
     pub relays: Vec<String>,
-    /// Allowed sender public keys (hex or npub). Empty = deny all, "*" = allow all
-    #[serde(default)]
-    pub allowed_pubkeys: Vec<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.

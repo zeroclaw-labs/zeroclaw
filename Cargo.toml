@@ -400,6 +400,14 @@ path = "tests/test_system.rs"
 name = "live"
 path = "tests/test_live.rs"
 
+# Architecture invariant gates. Fail-on-detect for patterns that
+# violate the workspace's ABSOLUTE RULE (AGENTS.md §1) — duplicate
+# state across the codebase. Run with `cargo test --test architecture`
+# during development; the workspace `cargo test` already includes it.
+[[test]]
+name = "architecture"
+path = "tests/test_architecture.rs"
+
 [[bench]]
 name = "agent_benchmarks"
 harness = false
