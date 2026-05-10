@@ -183,6 +183,7 @@ pub struct WuKongIMChannel {
     uid: String,
     token: String,
     device_id: String,
+    device_flag: i32,
     allowed_users: Vec<String>,
     /// Pending responses: id -> tx
     pending_responses:
@@ -209,7 +210,8 @@ impl WuKongIMChannel {
             ws_url: config.ws_url.clone(),
             uid: config.uid.clone(),
             token: config.token.clone(),
-            device_id: format!("zeroclaw-{}", &Uuid::new_v4().to_string()[..8]),
+            device_id: config.device_id.clone(),
+            device_flag: config.device_flag,
             allowed_users: config.allowed_users.clone(),
             pending_responses: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
@@ -456,7 +458,7 @@ impl Channel for WuKongIMChannel {
                     uid: self.uid.clone(),
                     token: self.token.clone(),
                     device_id: self.device_id.clone(),
-                    device_flag: 1, // Web/Sys
+                    device_flag: self.device_flag, // 0: App, 1: Web, 2: Sys
                     version: Some(2),
                 },
             };
