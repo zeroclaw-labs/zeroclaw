@@ -135,6 +135,7 @@ ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
 MemoryDenyWriteExecute=yes
+PrivateUsers=yes
 RemoveIPC=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes

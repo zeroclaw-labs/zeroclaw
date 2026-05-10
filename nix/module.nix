@@ -306,6 +306,11 @@ let
           # MemoryDenyWriteExecute=yes blocks W+X mappings; safe for a
           # Rust binary with no JIT. ZeroClaw 0.7.x has no JIT path.
           MemoryDenyWriteExecute = true;
+          # PrivateUsers=yes runs the unit in its own user namespace. The
+          # StateDirectory= bind-mount happens in the host namespace
+          # before the userns remap, so file ownership stays correct from
+          # the host's view. Matches `atticd`.
+          PrivateUsers = true;
           # RemoveIPC=yes wipes any sysvipc/posix IPC objects the unit
           # leaves behind on stop. ZeroClaw doesn't use SysV IPC, so this
           # is essentially a belt-and-braces cleanup.
