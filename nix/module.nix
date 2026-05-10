@@ -289,6 +289,10 @@ let
           NoNewPrivileges = true;
           PrivateTmp = true;
           PrivateDevices = true;
+          # Closed device policy + empty allow-list — matches `atticd`.
+          # ZeroClaw doesn't need /dev/* nodes for normal operation.
+          DeviceAllow = "";
+          DevicePolicy = "closed";
           ProtectSystem = "strict";
           ProtectHome = true;
           ProtectKernelTunables = true;
@@ -299,6 +303,13 @@ let
           ProtectHostname = true;
           ProtectProc = "invisible";
           ProcSubset = "pid";
+          # MemoryDenyWriteExecute=yes blocks W+X mappings; safe for a
+          # Rust binary with no JIT. ZeroClaw 0.7.x has no JIT path.
+          MemoryDenyWriteExecute = true;
+          # RemoveIPC=yes wipes any sysvipc/posix IPC objects the unit
+          # leaves behind on stop. ZeroClaw doesn't use SysV IPC, so this
+          # is essentially a belt-and-braces cleanup.
+          RemoveIPC = true;
           RestrictNamespaces = true;
           RestrictRealtime = true;
           RestrictSUIDSGID = true;

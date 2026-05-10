@@ -122,6 +122,8 @@ Per-instance `serviceConfig` defaults (mirroring `services.atticd`):
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
+DeviceAllow=
+DevicePolicy=closed
 ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelTunables=yes
@@ -132,6 +134,8 @@ ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
@@ -145,6 +149,11 @@ StateDirectoryMode=0750
 UMask=0077
 ReadWritePaths=${dataDir}
 ```
+
+`MemoryDenyWriteExecute=yes` is safe because ZeroClaw 0.7.x is a plain
+Rust binary with no JIT; if a future version adopts a JIT (e.g. through a
+WASM plugin host), this single setting will need to flip and that should
+be flagged in the changelog.
 
 Resource caps (`MemoryMax`, `CPUQuota`, etc.) are intentionally **not** set
 in the module — Rust servers have widely varying resource profiles
