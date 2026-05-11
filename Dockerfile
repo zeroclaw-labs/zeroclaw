@@ -1,12 +1,29 @@
 # syntax=docker/dockerfile:1.7-labs
 
 # ── Stage 0: Frontend build ─────────────────────────────────────
-FROM node:22-alpine AS web-builder
-WORKDIR /web
-COPY web/package.json web/package-lock.json* ./
-RUN npm ci --ignore-scripts 2>/dev/null || npm install --ignore-scripts
-COPY web/ .
-RUN npm run build
+FROM node:22-bookworm-slim AS web-node
+
+FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS web-builder
+WORKDIR /app
+COPY --from=web-node /usr/local/bin/node /usr/local/bin/node
+COPY --from=web-node /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y \
+        pkg-config \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && rm -rf /var/lib/apt/lists/*
+COPY web/package.json web/package-lock.json web/
+RUN cd web && npm ci --ignore-scripts
+COPY . .
+RUN mkdir -p apps/tauri/src \
+    && echo "fn main() {}" > apps/tauri/src/main.rs \
+    && echo "fn main() {}" > apps/tauri/build.rs
+RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zeroclaw-web-target,target=/app/target,sharing=locked \
+    cargo web build
 
 # ── Stage 1: Build ────────────────────────────────────────────
 FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS builder
@@ -129,7 +146,7 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=builder /zeroclaw-data /zeroclaw-data
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
-COPY --from=web-builder /web/dist /zeroclaw-data/web/dist
+COPY --from=web-builder /app/web/dist /zeroclaw-data/web/dist
 
 # Overwrite minimal config with DEV template (Ollama defaults)
 COPY dev/config.template.toml /zeroclaw-data/.zeroclaw/config.toml
@@ -162,7 +179,7 @@ FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc7564
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
-COPY --from=web-builder /web/dist /zeroclaw-data/web/dist
+COPY --from=web-builder /app/web/dist /zeroclaw-data/web/dist
 
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly

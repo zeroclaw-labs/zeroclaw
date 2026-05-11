@@ -42,6 +42,13 @@ pub struct ApprovalLogEntry {
     pub channel: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalRequirement {
+    Prompt,
+    Approved,
+    NotRequired,
+}
+
 // ── ApprovalManager ──────────────────────────────────────────────
 
 /// Manages the approval workflow for tool calls.
@@ -56,6 +63,8 @@ pub struct ApprovalLogEntry {
 ///   because there is no interactive operator to approve them. `auto_approve`
 ///   policy is still enforced, and `always_ask` / supervised-default tools are
 ///   denied rather than silently allowed.
+/// - **Non-interactive back-channel** (ACP/WS): tools needing approval are sent
+///   through a client approval channel instead of trusting tool arguments.
 pub struct ApprovalManager {
     /// Tools that never need approval (from config).
     auto_approve: HashSet<String>,
@@ -66,6 +75,9 @@ pub struct ApprovalManager {
     /// When `true`, tools that would require interactive approval are
     /// auto-denied instead. Used for channel-driven (non-CLI) runs.
     non_interactive: bool,
+    /// When `true`, shell calls in non-interactive mode still enter the outer
+    /// approval flow because a real client approval channel exists.
+    non_interactive_shell_requires_approval: bool,
     /// Session-scoped allowlist built from "Always" responses.
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
@@ -80,6 +92,7 @@ impl ApprovalManager {
             always_ask: config.always_ask.iter().cloned().collect(),
             autonomy_level: config.level,
             non_interactive: false,
+            non_interactive_shell_requires_approval: false,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
         }
@@ -96,6 +109,21 @@ impl ApprovalManager {
             always_ask: config.always_ask.iter().cloned().collect(),
             autonomy_level: config.level,
             non_interactive: true,
+            non_interactive_shell_requires_approval: false,
+            session_allowlist: Mutex::new(HashSet::new()),
+            audit_log: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Create a non-interactive manager for direct agents with a human
+    /// approval back-channel, such as ACP and the web dashboard WebSocket.
+    pub fn for_non_interactive_backchannel(config: &AutonomyConfig) -> Self {
+        Self {
+            auto_approve: config.auto_approve.iter().cloned().collect(),
+            always_ask: config.always_ask.iter().cloned().collect(),
+            autonomy_level: config.level,
+            non_interactive: true,
+            non_interactive_shell_requires_approval: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
         }
@@ -111,19 +139,23 @@ impl ApprovalManager {
     ///
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
     pub fn needs_approval(&self, tool_name: &str) -> bool {
+        self.approval_requirement(tool_name) == ApprovalRequirement::Prompt
+    }
+
+    pub fn approval_requirement(&self, tool_name: &str) -> ApprovalRequirement {
         // Full autonomy never prompts.
         if self.autonomy_level == AutonomyLevel::Full {
-            return false;
+            return ApprovalRequirement::Approved;
         }
 
         // ReadOnly blocks everything — handled elsewhere; no prompt needed.
         if self.autonomy_level == AutonomyLevel::ReadOnly {
-            return false;
+            return ApprovalRequirement::NotRequired;
         }
 
         // always_ask overrides everything.
         if self.always_ask.contains("*") || self.always_ask.contains(tool_name) {
-            return true;
+            return ApprovalRequirement::Prompt;
         }
 
         // Channel-driven shell execution is still guarded by the shell tool's
@@ -131,23 +163,26 @@ impl ApprovalManager {
         // gate here lets low-risk allowlisted commands (e.g. `ls`) work in
         // non-interactive channels without silently allowing medium/high-risk
         // commands.
-        if self.non_interactive && tool_name == "shell" {
-            return false;
+        if self.non_interactive
+            && tool_name == "shell"
+            && !self.non_interactive_shell_requires_approval
+        {
+            return ApprovalRequirement::NotRequired;
         }
 
         // auto_approve skips the prompt.
         if self.auto_approve.contains("*") || self.auto_approve.contains(tool_name) {
-            return false;
+            return ApprovalRequirement::Approved;
         }
 
         // Session allowlist (from prior "Always" responses).
         let allowlist = self.session_allowlist.lock();
         if allowlist.contains(tool_name) {
-            return false;
+            return ApprovalRequirement::Approved;
         }
 
         // Default: supervised mode requires approval.
-        true
+        ApprovalRequirement::Prompt
     }
 
     /// Record an approval decision and update session state.
@@ -505,6 +540,13 @@ mod tests {
     fn non_interactive_shell_skips_outer_approval_by_default() {
         let mgr = ApprovalManager::for_non_interactive(&AutonomyConfig::default());
         assert!(!mgr.needs_approval("shell"));
+    }
+
+    #[test]
+    fn non_interactive_backchannel_shell_requires_outer_approval() {
+        let mgr = ApprovalManager::for_non_interactive_backchannel(&AutonomyConfig::default());
+        assert!(mgr.is_non_interactive());
+        assert!(mgr.needs_approval("shell"));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::agent::dispatcher::{
 use crate::agent::eval::AutoClassifyExt;
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
-use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
@@ -19,6 +19,7 @@ use std::time::Instant;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
+use zeroclaw_tool_call_parser::strip_think_tags;
 
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
@@ -421,6 +422,24 @@ impl Agent {
         self.history.clear();
     }
 
+    fn should_send_tool_specs(&self) -> bool {
+        self.tool_dispatcher.should_send_tool_specs() && !self.tool_specs.is_empty()
+    }
+
+    fn parse_response_for_effective_tools(
+        &self,
+        response: &zeroclaw_providers::ChatResponse,
+    ) -> (String, Vec<ParsedToolCall>) {
+        if self.tool_specs.is_empty() {
+            return (
+                strip_think_tags(&response.text.clone().unwrap_or_default()),
+                Vec::new(),
+            );
+        }
+
+        self.tool_dispatcher.parse_response(response)
+    }
+
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
         self.memory_session_id = session_id;
     }
@@ -475,14 +494,55 @@ impl Agent {
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
     ) -> Result<Self> {
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            config,
+            session_cwd,
+            initialize_mcp,
+            false,
+        )
+        .await
+    }
+
+    /// Build an Agent for direct ACP/WS sessions that have a client approval
+    /// back-channel. This keeps shell approval on the runtime-controlled path.
+    pub async fn from_config_with_session_cwd_and_mcp_backchannel(
+        config: &Config,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+    ) -> Result<Self> {
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            config,
+            session_cwd,
+            initialize_mcp,
+            true,
+        )
+        .await
+    }
+
+    async fn from_config_with_session_cwd_and_mcp_approval_mode(
+        config: &Config,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        approval_backchannel: bool,
+    ) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
-        let security = Arc::new(SecurityPolicy::from_config(
-            &config.autonomy,
-            session_cwd.unwrap_or(&config.workspace_dir),
-        ));
+        let security = Arc::new({
+            let mut policy = SecurityPolicy::from_config(
+                &config.autonomy,
+                session_cwd.unwrap_or(&config.workspace_dir),
+            );
+            // When a per-session cwd overrides the sandbox root, ensure the
+            // ZeroClaw workspace (where skills, identity, and config data live)
+            // remains readable. Without this, file_read and search tools are
+            // locked out of the workspace the moment the session cwd differs.
+            if session_cwd.is_some() {
+                policy.allowed_roots.push(config.workspace_dir.clone());
+            }
+            policy
+        });
 
         let fallback_provider_ag = config.providers.fallback_provider();
         let memory: Arc<dyn Memory> =
@@ -676,6 +736,12 @@ impl Agent {
         let skills = crate::skills::load_skills_with_config(&config.workspace_dir, config);
         tools::register_skill_tools(&mut tools, &skills, security.clone());
 
+        let approval_manager = if approval_backchannel {
+            ApprovalManager::for_non_interactive_backchannel(&config.autonomy)
+        } else {
+            ApprovalManager::for_non_interactive(&config.autonomy)
+        };
+
         let mut agent = Agent::builder()
             .provider(provider)
             .tools(tools)
@@ -720,9 +786,7 @@ impl Agent {
             } else {
                 None
             })
-            .approval_manager(Some(Arc::new(ApprovalManager::for_non_interactive(
-                &config.autonomy,
-            ))))
+            .approval_manager(Some(Arc::new(approval_manager)))
             .build()?;
 
         agent.channel_handles = AgentChannelHandles {
@@ -789,6 +853,7 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
+            sends_native_tool_specs: self.tool_dispatcher.should_send_tool_specs(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
         };
@@ -827,12 +892,19 @@ impl Agent {
             }
         }
 
+        super::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
+
         // ── Approval hook ──────────────────────────────────────
         // The ACP/WebSocket Agent path executes tools directly instead of
         // going through run_tool_call_loop. Keep its policy behavior aligned
         // with the shared loop by honoring auto_approve / always_ask here too.
+        let mut approval_requirement = self
+            .approval_manager
+            .as_deref()
+            .map(|mgr| mgr.approval_requirement(&tool_name))
+            .unwrap_or(ApprovalRequirement::NotRequired);
         if let Some(mgr) = self.approval_manager.as_deref()
-            && mgr.needs_approval(&tool_name)
+            && approval_requirement == ApprovalRequirement::Prompt
         {
             let request = ApprovalRequest {
                 tool_name: tool_name.clone(),
@@ -917,7 +989,16 @@ impl Agent {
                     tool_call_id: call.tool_call_id.clone(),
                 };
             }
+
+            if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
+                approval_requirement = ApprovalRequirement::Approved;
+            }
         }
+        super::set_runtime_approved_arg(
+            &tool_name,
+            &mut tool_args,
+            approval_requirement == ApprovalRequirement::Approved,
+        );
 
         // First try to find tool in static registry, then in activated MCP tools.
         let (result, success) =
@@ -1157,7 +1238,7 @@ impl Agent {
                 .chat(
                     ChatRequest {
                         messages: &messages,
-                        tools: if self.tool_dispatcher.should_send_tool_specs() {
+                        tools: if self.should_send_tool_specs() {
                             Some(&self.tool_specs)
                         } else {
                             None
@@ -1172,9 +1253,9 @@ impl Agent {
                 Err(err) => return Err(err),
             };
 
-            let (text, calls) = self.tool_dispatcher.parse_response(&response);
+            let (text, calls) = self.parse_response_for_effective_tools(&response);
             if calls.is_empty() {
-                let final_text = if text.is_empty() {
+                let final_text = if text.is_empty() && !self.tool_specs.is_empty() {
                     response.text.unwrap_or_default()
                 } else {
                     text
@@ -1337,11 +1418,12 @@ impl Agent {
             // forward deltas.  Otherwise fall back to non-streaming chat.
             use futures_util::StreamExt;
 
-            let stream_opts = zeroclaw_providers::traits::StreamOptions::new(true);
+            let stream_opts =
+                zeroclaw_providers::traits::StreamOptions::new(self.provider.supports_streaming());
             let mut stream = self.provider.stream_chat(
                 zeroclaw_providers::ChatRequest {
                     messages: &messages,
-                    tools: if self.tool_dispatcher.should_send_tool_specs() {
+                    tools: if self.should_send_tool_specs() {
                         Some(&self.tool_specs)
                     } else {
                         None
@@ -1479,7 +1561,7 @@ impl Agent {
                 let chat_fut = self.provider.chat(
                     ChatRequest {
                         messages: &messages,
-                        tools: if self.tool_dispatcher.should_send_tool_specs() {
+                        tools: if self.should_send_tool_specs() {
                             Some(&self.tool_specs)
                         } else {
                             None
@@ -1519,9 +1601,9 @@ impl Agent {
                     .await;
             }
 
-            let (text, mut calls) = self.tool_dispatcher.parse_response(&response);
+            let (text, mut calls) = self.parse_response_for_effective_tools(&response);
             if calls.is_empty() {
-                let final_text = if text.is_empty() {
+                let final_text = if text.is_empty() && !self.tool_specs.is_empty() {
                     response.text.unwrap_or_default()
                 } else {
                     text
@@ -1837,6 +1919,38 @@ mod tests {
         }
     }
 
+    struct CapturingApprovalArgTool {
+        name: &'static str,
+        output: &'static str,
+        calls: Arc<AtomicUsize>,
+        last_args: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    }
+
+    #[async_trait]
+    impl Tool for CapturingApprovalArgTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            self.name
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_args.lock().unwrap() = Some(args);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: self.output.into(),
+                error: None,
+            })
+        }
+    }
+
     struct ApprovalChannel {
         response: zeroclaw_api::channel::ChannelApprovalResponse,
         requests: Arc<AtomicUsize>,
@@ -1902,6 +2016,51 @@ mod tests {
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "hello");
+    }
+
+    #[test]
+    fn native_agent_prompt_omits_duplicate_tools_section() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+
+        let native_agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(Arc::clone(&mem))
+            .observer(Arc::clone(&observer))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .build()
+            .expect("agent builder should succeed with valid config");
+        let native_prompt = native_agent.build_system_prompt().unwrap();
+        assert!(!native_prompt.contains("## Tools"));
+        assert!(!native_prompt.contains("echo"));
+
+        let xml_agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .build()
+            .expect("agent builder should succeed with valid config");
+        let xml_prompt = xml_agent.build_system_prompt().unwrap();
+        assert!(xml_prompt.contains("## Tools"));
+        assert!(xml_prompt.contains("echo"));
+        assert!(xml_prompt.contains("## Tool Use Protocol"));
     }
 
     #[tokio::test]
@@ -2016,6 +2175,265 @@ mod tests {
         assert_eq!(result.output, "Denied by user.");
         assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
         assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn direct_agent_shell_does_not_trust_model_supplied_approved_arg() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let captured_args = Arc::new(std::sync::Mutex::new(None));
+        let approval_cfg = zeroclaw_config::schema::AutonomyConfig::default();
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(CapturingApprovalArgTool {
+                name: "shell",
+                output: "shell-out",
+                calls: Arc::clone(&tool_calls),
+                last_args: Arc::clone(&captured_args),
+            })])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .approval_manager(Some(Arc::new(
+                ApprovalManager::for_non_interactive_backchannel(&approval_cfg),
+            )))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
+        let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
+            response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+            requests: Arc::clone(&approval_requests),
+        });
+        handle.write().insert("acp".to_string(), channel);
+
+        let result = agent
+            .execute_tool_call(&ParsedToolCall {
+                name: "shell".into(),
+                arguments: serde_json::json!({
+                    "command": "touch should-not-run",
+                    "approved": true
+                }),
+                tool_call_id: Some("tc1".into()),
+            })
+            .await;
+
+        assert!(!result.success);
+        assert_eq!(result.output, "Denied by user.");
+        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert!(captured_args.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_agent_shell_marks_args_approved_after_backchannel_approval() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let captured_args = Arc::new(std::sync::Mutex::new(None));
+        let approval_cfg = zeroclaw_config::schema::AutonomyConfig::default();
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(CapturingApprovalArgTool {
+                name: "shell",
+                output: "shell-out",
+                calls: Arc::clone(&tool_calls),
+                last_args: Arc::clone(&captured_args),
+            })])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .approval_manager(Some(Arc::new(
+                ApprovalManager::for_non_interactive_backchannel(&approval_cfg),
+            )))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
+        let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
+            response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
+            requests: Arc::clone(&approval_requests),
+        });
+        handle.write().insert("acp".to_string(), channel);
+
+        let result = agent
+            .execute_tool_call(&ParsedToolCall {
+                name: "shell".into(),
+                arguments: serde_json::json!({
+                    "command": "touch should-run-after-human-approval",
+                    "approved": false
+                }),
+                tool_call_id: Some("tc1".into()),
+            })
+            .await;
+
+        assert!(result.success);
+        assert_eq!(result.output, "shell-out");
+        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        let args = captured_args
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("shell tool should capture executed args");
+        assert_eq!(args["approved"], true);
+    }
+
+    #[tokio::test]
+    async fn direct_agent_shell_keeps_runtime_approval_from_always_allowlist() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let captured_args = Arc::new(std::sync::Mutex::new(None));
+        let approval_cfg = zeroclaw_config::schema::AutonomyConfig::default();
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(CapturingApprovalArgTool {
+                name: "shell",
+                output: "shell-out",
+                calls: Arc::clone(&tool_calls),
+                last_args: Arc::clone(&captured_args),
+            })])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .approval_manager(Some(Arc::new(
+                ApprovalManager::for_non_interactive_backchannel(&approval_cfg),
+            )))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let handle: tools::ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
+        let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
+            response: zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
+            requests: Arc::clone(&approval_requests),
+        });
+        handle.write().insert("acp".to_string(), channel);
+
+        let first_result = agent
+            .execute_tool_call(&ParsedToolCall {
+                name: "shell".into(),
+                arguments: serde_json::json!({
+                    "command": "touch should-run-after-always-approval",
+                    "approved": false
+                }),
+                tool_call_id: Some("tc1".into()),
+            })
+            .await;
+        let second_result = agent
+            .execute_tool_call(&ParsedToolCall {
+                name: "shell".into(),
+                arguments: serde_json::json!({
+                    "command": "touch should-run-from-allowlist",
+                    "approved": false
+                }),
+                tool_call_id: Some("tc2".into()),
+            })
+            .await;
+
+        assert!(first_result.success);
+        assert!(second_result.success);
+        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 2);
+        let args = captured_args
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("shell tool should capture executed args");
+        assert_eq!(args["approved"], true);
+    }
+
+    #[tokio::test]
+    async fn direct_agent_cron_add_does_not_trust_model_supplied_approved_arg() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let captured_args = Arc::new(std::sync::Mutex::new(None));
+        let agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(CapturingApprovalArgTool {
+                name: "cron_add",
+                output: "cron-out",
+                calls: Arc::clone(&tool_calls),
+                last_args: Arc::clone(&captured_args),
+            })])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let result = agent
+            .execute_tool_call(&ParsedToolCall {
+                name: "cron_add".into(),
+                arguments: serde_json::json!({
+                    "command": "echo should-not-be-model-approved",
+                    "approved": true
+                }),
+                tool_call_id: Some("tc1".into()),
+            })
+            .await;
+
+        assert!(result.success);
+        assert_eq!(result.output, "cron-out");
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        let args = captured_args
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("cron_add tool should capture executed args");
+        assert_eq!(args["approved"], false);
     }
 
     #[tokio::test]
@@ -2280,6 +2698,40 @@ mod tests {
         assert!(
             agent.tool_specs.is_empty(),
             "No tools should match a non-existent allowlist entry"
+        );
+    }
+
+    /// When a per-session cwd overrides the sandbox root, workspace files must
+    /// stay readable. Regression guard for the `allowed_roots.push` fix in
+    /// `from_config_with_session_cwd` (issue #6516).
+    #[test]
+    fn session_cwd_keeps_workspace_in_allowed_roots() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_session_cwd_workspace");
+        let session = std::env::temp_dir().join("zeroclaw_test_session_cwd_session");
+        let _ = std::fs::create_dir_all(&workspace);
+        let _ = std::fs::create_dir_all(&session);
+
+        let skill_file = workspace.join("SKILL.md");
+        let _ = std::fs::write(&skill_file, "body");
+        // is_resolved_path_allowed expects a canonicalized path (symlinks resolved).
+        let skill_resolved = std::fs::canonicalize(&skill_file).unwrap_or(skill_file);
+
+        let autonomy = zeroclaw_config::schema::AutonomyConfig::default();
+
+        // Policy WITH the fix: workspace pushed into allowed_roots.
+        let mut policy = SecurityPolicy::from_config(&autonomy, &session);
+        policy.allowed_roots.push(workspace.clone());
+        assert!(
+            policy.is_resolved_path_allowed(&skill_resolved),
+            "workspace skills must remain readable when session_cwd differs"
+        );
+
+        // Without the push the same path must be denied, confirming the push
+        // is the load-bearing fix rather than an incidental side-effect.
+        let policy_no_push = SecurityPolicy::from_config(&autonomy, &session);
+        assert!(
+            !policy_no_push.is_resolved_path_allowed(&skill_resolved),
+            "without allowed_roots.push, workspace files must be outside the sandbox"
         );
     }
 

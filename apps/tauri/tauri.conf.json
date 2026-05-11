@@ -4,22 +4,37 @@
   "version": "0.7.5",
   "identifier": "ai.zeroclawlabs.desktop",
   "build": {
-    "devUrl": "http://127.0.0.1:42617/_app/",
-    "frontendDist": "http://127.0.0.1:42617/_app/"
+    "frontendDist": "onboarding"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
+        "label": "main",
+        "url": "http://127.0.0.1:42617/_app/",
         "title": "ZeroClaw",
         "width": 1200,
         "height": 800,
         "resizable": true,
         "fullscreen": false,
         "visible": false
+      },
+      {
+        "label": "onboarding",
+        "url": "index.html",
+        "title": "Welcome to ZeroClaw",
+        "width": 760,
+        "height": 640,
+        "minWidth": 560,
+        "minHeight": 480,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "visible": false
       }
     ],
     "security": {
-      "csp": "default-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; script-src 'self' 'unsafe-inline' http://127.0.0.1:*; style-src 'self' 'unsafe-inline' http://127.0.0.1:*; img-src 'self' http://127.0.0.1:* data:"
+      "csp": "default-src 'self' 'unsafe-inline' http://127.0.0.1:* ws://127.0.0.1:*; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* ipc: http://ipc.localhost; script-src 'self' 'unsafe-inline' http://127.0.0.1:*; style-src 'self' 'unsafe-inline' http://127.0.0.1:*; img-src 'self' http://127.0.0.1:* data:"
     }
   },
   "bundle": {

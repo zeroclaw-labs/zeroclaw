@@ -94,7 +94,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             Ok(Message::Close(_)) => break,
             Ok(Message::Ping(_) | Message::Pong(_)) => {}
             Err(e) => {
-                warn!("ACP WebSocket receive error: {e}");
+                let msg = e.to_string();
+                if msg.contains("Connection reset without closing handshake")
+                    || msg.contains("Connection closed normally")
+                {
+                    debug!("ACP WebSocket closed without handshake");
+                } else {
+                    warn!("ACP WebSocket receive error: {e}");
+                }
                 break;
             }
         }
