@@ -1014,6 +1014,33 @@ fn split_message_for_discord_multi(content: &str, max_len: usize) -> Vec<String>
     }
 }
 
+/// Choose the chunks to deliver for an outbound Discord message.
+///
+/// `split_message_for_discord_multi` returns an empty vec for empty input
+/// (its paragraph splitter has no segments to emit); the non-multi
+/// splitter returns `vec![""]`. When MultiMessage stream mode hands
+/// `send()` a paragraph that collapses to empty text after marker strip,
+/// the chunk loop would iterate zero times and silently skip an attached
+/// file upload. Force a single empty chunk in exactly that case so the
+/// multipart POST fires.
+fn chunks_for_send(
+    content: &str,
+    stream_mode: zeroclaw_config::schema::StreamMode,
+    max_len: usize,
+    has_local_files: bool,
+) -> Vec<String> {
+    let mut chunks = match stream_mode {
+        zeroclaw_config::schema::StreamMode::MultiMessage => {
+            split_message_for_discord_multi(content, max_len)
+        }
+        _ => split_message_for_discord(content),
+    };
+    if chunks.is_empty() && has_local_files {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
 fn pick_uniform_index(len: usize) -> usize {
     debug_assert!(len > 0);
     let upper = len as u64;
@@ -1159,11 +1186,12 @@ impl Channel for DiscordChannel {
         let reactions = decide_failure_reactions(&failures);
 
         let client = self.http_client();
-        let chunks = if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
-            split_message_for_discord_multi(&content, DISCORD_MAX_MESSAGE_LENGTH)
-        } else {
-            split_message_for_discord(&content)
-        };
+        let chunks = chunks_for_send(
+            &content,
+            self.stream_mode,
+            DISCORD_MAX_MESSAGE_LENGTH,
+            !local_files.is_empty(),
+        );
         let inter_chunk_delay_ms =
             if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
                 self.multi_message_delay_ms
@@ -3016,6 +3044,51 @@ mod tests {
     fn split_message_for_discord_multi_empty_input() {
         let chunks = split_message_for_discord_multi("", 2000);
         assert!(chunks.is_empty());
+    }
+
+    // Regression lock for the marker-only paragraph in MultiMessage stream
+    // mode. Before the fix this produced an empty chunk vec and the chunk
+    // loop in send() iterated zero times, silently skipping the file
+    // upload.
+    #[test]
+    fn chunks_for_send_emits_empty_chunk_when_multi_message_paragraph_collapses_to_only_a_file() {
+        use zeroclaw_config::schema::StreamMode;
+
+        let chunks = chunks_for_send("", StreamMode::MultiMessage, 2000, true);
+        assert_eq!(chunks, vec![String::new()]);
+    }
+
+    // Inverse guard: no file to upload means no empty chunk to send, so we
+    // do not accidentally POST an empty Discord message that Discord would
+    // reject for having no content, attachments, or embeds.
+    #[test]
+    fn chunks_for_send_does_not_emit_empty_chunk_when_no_files_to_upload() {
+        use zeroclaw_config::schema::StreamMode;
+
+        let chunks = chunks_for_send("", StreamMode::MultiMessage, 2000, false);
+        assert!(chunks.is_empty());
+    }
+
+    // The normal path with body text is left untouched in both stream
+    // modes, regardless of whether files are attached.
+    #[test]
+    fn chunks_for_send_passes_through_non_empty_content() {
+        use zeroclaw_config::schema::StreamMode;
+
+        for mode in [
+            StreamMode::MultiMessage,
+            StreamMode::Partial,
+            StreamMode::Off,
+        ] {
+            for has_files in [true, false] {
+                let chunks = chunks_for_send("hello", mode, 2000, has_files);
+                assert_eq!(
+                    chunks,
+                    vec!["hello".to_string()],
+                    "mode={mode:?} has_files={has_files}"
+                );
+            }
+        }
     }
 
     fn make_discord_channel() -> DiscordChannel {
