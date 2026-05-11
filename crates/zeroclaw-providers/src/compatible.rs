@@ -650,6 +650,10 @@ struct ResponseMessage {
     /// in `reasoning_content` instead of `content`. Used as automatic fallback.
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// vLLM, OpenRouter, and others use `reasoning` instead of `reasoning_content`.
+    /// Used as fallback when `reasoning_content` is absent.
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
 }
@@ -660,6 +664,14 @@ impl ResponseMessage {
     /// often return their output solely in `reasoning_content`.
     /// Strips `<think>...</think>` blocks that some models (e.g. MiniMax) embed
     /// inline in `content` instead of using a separate field.
+    /// Returns reasoning content, preferring `reasoning_content` and falling back to `reasoning`.
+    fn reasoning(&self) -> Option<String> {
+        self.reasoning_content
+            .as_ref()
+            .or(self.reasoning.as_ref())
+            .cloned()
+    }
+
     fn effective_content(&self) -> String {
         if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
             let stripped = strip_think_tags(content);
@@ -668,7 +680,7 @@ impl ResponseMessage {
             }
         }
 
-        self.reasoning_content
+        self.reasoning()
             .as_ref()
             .map(|c| strip_think_tags(c))
             .filter(|c| !c.is_empty())
@@ -683,7 +695,7 @@ impl ResponseMessage {
             }
         }
 
-        self.reasoning_content
+        self.reasoning()
             .as_ref()
             .map(|c| strip_think_tags(c))
             .filter(|c| !c.is_empty())
@@ -831,6 +843,9 @@ struct StreamDelta {
     /// Reasoning/thinking models may stream output via `reasoning_content`.
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// vLLM, OpenRouter, and others use `reasoning` instead of `reasoning_content`.
+    #[serde(default)]
+    reasoning: Option<String>,
     /// Native tool-calling deltas in OpenAI chat-completions streaming format.
     #[serde(default)]
     tool_calls: Option<Vec<StreamToolCallDelta>>,
@@ -1011,6 +1026,7 @@ fn extract_sse_reasoning_delta(choice: &StreamChoice) -> Option<String> {
         .delta
         .reasoning_content
         .as_ref()
+        .or(choice.delta.reasoning.as_ref())
         .filter(|value| !value.is_empty())
         .cloned()
 }
@@ -1098,8 +1114,12 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<StreamChunk>> {
         {
             return Ok(Some(StreamChunk::delta(content.clone())));
         }
-        if let Some(reasoning) = &choice.delta.reasoning_content
-            && !reasoning.is_empty()
+        if let Some(reasoning) = choice
+            .delta
+            .reasoning_content
+            .as_ref()
+            .or(choice.delta.reasoning.as_ref())
+            .filter(|r| !r.is_empty())
         {
             return Ok(Some(StreamChunk::reasoning(reasoning.clone())));
         }
@@ -1500,6 +1520,7 @@ impl OpenAiCompatibleProvider {
 
                     let reasoning_content = value
                         .get("reasoning_content")
+                        .or(value.get("reasoning"))
                         .and_then(serde_json::Value::as_str)
                         .map(ToString::to_string);
 
@@ -1675,7 +1696,7 @@ impl OpenAiCompatibleProvider {
 
     fn parse_native_response(&self, message: ResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content_optional();
-        let reasoning_content = message.reasoning_content.clone();
+        let reasoning_content = message.reasoning();
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let tool_calls = message
             .tool_calls
@@ -2020,7 +2041,7 @@ impl Provider for OpenAiCompatibleProvider {
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
         let text = choice.message.effective_content_optional();
-        let reasoning_content = choice.message.reasoning_content;
+        let reasoning_content = choice.message.reasoning();
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let tool_calls = choice
             .message
@@ -2978,6 +2999,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            reasoning: None,
         };
 
         let parsed = provider.parse_native_response(message);
