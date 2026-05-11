@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <a href="docs/book/src/introduction.md">Docs</a> ·
+  <a href="https://docs.zeroclawlabs.ai/en/introduction.html">Docs</a> ·
   <a href="docs/book/src/philosophy.md">Philosophy</a> ·
   <a href="docs/book/src/getting-started/quick-start.md">Quick start</a> ·
   <a href="docs/book/src/architecture/overview.md">Architecture</a> ·
@@ -88,7 +88,7 @@ One TOML file at `~/.zeroclaw/config.toml`. Pointers:
 - [Provider configuration](docs/book/src/providers/configuration.md) — the universal `[providers.models.<type>.<alias>]` schema
 - [Channels overview](docs/book/src/channels/overview.md) — per-channel `[channels.<type>.<alias>]` blocks
 - [Security overview](docs/book/src/security/overview.md) — autonomy, sandboxing, tool receipts
-- [Full config reference](docs/book/src/reference/config.md) — generated from the live schema; every key documented
+- [Full config reference](https://docs.zeroclawlabs.ai/en/reference/config.html) — generated from the live schema; every key documented
 
 A V3 config has at minimum four section headers (`<type>.<alias>` shaped) — a provider entry, an agent that references it, and a risk profile the agent gates against. See [Provider Configuration → Minimal working example](docs/book/src/providers/configuration.md#minimal-working-example) for the canonical four-section form with inline type/alias commentary.
 
