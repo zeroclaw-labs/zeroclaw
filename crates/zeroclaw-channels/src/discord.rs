@@ -182,39 +182,43 @@ impl DiscordChannel {
             }
         }
 
+        // Only a successful API response is cached. A transient network blip
+        // or 429 must not poison the cache for the channel's lifetime; the
+        // next message should retry the lookup. Failure paths return `false`
+        // (the safe default) without writing to the cache.
         let url = format!("https://discord.com/api/v10/channels/{channel_id}");
-        let is_thread = match client
+        let resp = match client
             .get(&url)
             .header("Authorization", format!("Bot {}", self.bot_token))
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<serde_json::Value>().await {
-                    Ok(body) => body
-                        .get("type")
-                        .and_then(serde_json::Value::as_u64)
-                        .map(is_thread_channel_type)
-                        .unwrap_or(false),
-                    Err(e) => {
-                        tracing::debug!(channel_id, error = %e, "discord: channel lookup body parse failed");
-                        false
-                    }
-                }
-            }
-            Ok(resp) => {
-                tracing::debug!(
-                    channel_id,
-                    status = %resp.status(),
-                    "discord: channel lookup non-success status"
-                );
-                false
-            }
+            Ok(resp) => resp,
             Err(e) => {
                 tracing::debug!(channel_id, error = %e, "discord: channel lookup request failed");
-                false
+                return false;
             }
         };
+        if !resp.status().is_success() {
+            tracing::debug!(
+                channel_id,
+                status = %resp.status(),
+                "discord: channel lookup non-success status"
+            );
+            return false;
+        }
+        let body: serde_json::Value = match resp.json().await {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::debug!(channel_id, error = %e, "discord: channel lookup body parse failed");
+                return false;
+            }
+        };
+        let is_thread = body
+            .get("type")
+            .and_then(serde_json::Value::as_u64)
+            .map(is_thread_channel_type)
+            .unwrap_or(false);
 
         self.thread_channels
             .lock()
