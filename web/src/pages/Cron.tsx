@@ -668,9 +668,9 @@ export default function Cron() {
                         title="Toggle run history"
                       >
                         {expandedJob === job.id ? (
-                          <ChevronDown className="min-h-3.5 min-w-3.5" />
+                          <ChevronDown className="h-3.5 w-3.5 shrink-0" />
                         ) : (
-                          <ChevronRight className="min-h-3.5 min-w-3.5" />
+                          <ChevronRight className="h-3.5 w-3.5 shrink-0" />
                         )}
                         <span className='truncate'>
                           {job.id}
