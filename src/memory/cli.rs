@@ -221,10 +221,10 @@ async fn handle_clear(
     );
     if matches!(
         classify_memory_backend(&backend),
-        MemoryBackendKind::Markdown
+        MemoryBackendKind::Markdown | MemoryBackendKind::Qdrant
     ) {
         bail!(
-            "memory clear is unsupported for append-only backend 'markdown'; switch to a deletable backend (sqlite, lucid, postgres, or qdrant)"
+            "memory clear is unsupported for append-only backend '{backend}'; switch to a deletable backend (sqlite, lucid, or postgres)"
         );
     }
     let mem = create_cli_memory(config)?;
@@ -406,13 +406,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_does_not_reject_qdrant_backend_constructed_as_markdown() {
+    async fn clear_rejects_qdrant_backend_constructed_as_markdown() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config::default();
         config.workspace_dir = tmp.path().to_path_buf();
         config.memory.backend = "qdrant".into();
 
-        handle_command(
+        let err = handle_command(
             crate::MemoryCommands::Clear {
                 key: None,
                 category: None,
@@ -421,18 +421,22 @@ mod tests {
             &config,
         )
         .await
-        .unwrap();
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("append-only backend 'qdrant'"));
+        assert!(!msg.contains("or qdrant"));
     }
 
     #[tokio::test]
-    async fn clear_does_not_reject_storage_configured_qdrant_backend() {
+    async fn clear_rejects_storage_configured_qdrant_backend() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config::default();
         config.workspace_dir = tmp.path().to_path_buf();
         config.memory.backend = "markdown".into();
         config.storage.provider.config.provider = "qdrant".into();
 
-        handle_command(
+        let err = handle_command(
             crate::MemoryCommands::Clear {
                 key: None,
                 category: None,
@@ -441,6 +445,10 @@ mod tests {
             &config,
         )
         .await
-        .unwrap();
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("append-only backend 'qdrant'"));
+        assert!(!msg.contains("or qdrant"));
     }
 }
