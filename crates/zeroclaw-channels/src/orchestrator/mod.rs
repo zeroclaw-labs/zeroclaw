@@ -456,7 +456,7 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 }
 
 fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
-    msg.thread_ts.clone().or_else(|| Some(msg.id.clone()))
+    msg.thread_ts.clone()
 }
 
 fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
@@ -10615,7 +10615,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn followup_thread_id_falls_back_to_message_id() {
+    fn followup_thread_id_returns_none_when_no_thread_ts() {
         let msg = zeroclaw_api::channel::ChannelMessage {
             id: "msg_abc123".into(),
             sender: "U123".into(),
@@ -10628,7 +10628,7 @@ BTC is currently around $65,000 based on latest tool output."#
             attachments: vec![],
         };
 
-        assert_eq!(followup_thread_id(&msg).as_deref(), Some("msg_abc123"));
+        assert_eq!(followup_thread_id(&msg), None);
     }
 
     #[test]

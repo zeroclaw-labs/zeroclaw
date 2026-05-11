@@ -1497,16 +1497,10 @@ mod inbound {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            // Reply anchor: use the existing thread root when present,
-            // otherwise (when reply_in_thread is on) anchor a brand-new thread
-            // on this very event so the bot's reply opens a thread.
-            thread_ts: thread_id.as_ref().map(|t| t.to_string()).or_else(|| {
-                if ctx.config.reply_in_thread {
-                    Some(ev.event_id.to_string())
-                } else {
-                    None
-                }
-            }),
+            // Reply anchor: only use an existing thread root. Plain root
+            // timeline messages stay root messages so consecutive turns in
+            // the same room share the same conversation history key.
+            thread_ts: thread_id.as_ref().map(|t| t.to_string()),
             // Interruption scope is for cancellation grouping — only set when
             // the inbound is genuinely *inside* a reply thread.
             interruption_scope_id: thread_id.as_ref().map(|t| t.to_string()),
