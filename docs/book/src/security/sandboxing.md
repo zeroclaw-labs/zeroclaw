@@ -91,12 +91,12 @@ Firejail's default profile is fairly permissive; we apply a custom profile bundl
 
 ### Docker
 
-Works anywhere Docker does. Runs each tool invocation in an ephemeral container (the `zeroclawlabs/tool-runner` image).
+Works anywhere Docker does. Runs each tool invocation in an ephemeral container (the `ghcr.io/zeroclaw-labs/zeroclaw` image).
 
 ```toml
 [security.sandbox]
 backend = "docker"
-image = "zeroclawlabs/tool-runner:latest"
+image = "ghcr.io/zeroclaw-labs/zeroclaw:latest"
 ```
 
 Pros: strong isolation, works on any OS. Cons: per-invocation container startup cost (100–500 ms). Best for production deployments where the overhead is acceptable.
