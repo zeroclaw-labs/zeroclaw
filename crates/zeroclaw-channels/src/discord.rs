@@ -185,40 +185,47 @@ impl DiscordChannel {
         // Only a successful API response is cached. A transient network blip
         // or 429 must not poison the cache for the channel's lifetime; the
         // next message should retry the lookup. Failure paths return `false`
-        // (the safe default) without writing to the cache.
+        // (the safe default) without writing to the cache. The whole request
+        // is wrapped in an explicit timeout so a hung Discord API call can
+        // never stall the listener; the shared channel HTTP client may not
+        // carry a request-level timeout.
         let url = format!("https://discord.com/api/v10/channels/{channel_id}");
-        let resp = match client
-            .get(&url)
-            .header("Authorization", format!("Bot {}", self.bot_token))
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::debug!(channel_id, error = %e, "discord: channel lookup request failed");
+        let lookup = async {
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bot {}", self.bot_token))
+                .send()
+                .await
+                .map_err(|e| anyhow!("request failed: {e}"))?;
+            if !resp.status().is_success() {
+                anyhow::bail!("non-success status {}", resp.status());
+            }
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow!("body parse failed: {e}"))?;
+            Ok::<bool, anyhow::Error>(
+                body.get("type")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(is_thread_channel_type)
+                    .unwrap_or(false),
+            )
+        };
+        let is_thread = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => {
+                tracing::debug!(channel_id, error = %e, "discord: channel lookup failed");
+                return false;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    channel_id,
+                    timeout_secs = THREAD_LOOKUP_TIMEOUT.as_secs(),
+                    "discord: channel lookup timed out"
+                );
                 return false;
             }
         };
-        if !resp.status().is_success() {
-            tracing::debug!(
-                channel_id,
-                status = %resp.status(),
-                "discord: channel lookup non-success status"
-            );
-            return false;
-        }
-        let body: serde_json::Value = match resp.json().await {
-            Ok(body) => body,
-            Err(e) => {
-                tracing::debug!(channel_id, error = %e, "discord: channel lookup body parse failed");
-                return false;
-            }
-        };
-        let is_thread = body
-            .get("type")
-            .and_then(serde_json::Value::as_u64)
-            .map(is_thread_channel_type)
-            .unwrap_or(false);
 
         self.thread_channels
             .lock()
@@ -258,6 +265,11 @@ impl DiscordChannel {
 const fn is_thread_channel_type(channel_type: u64) -> bool {
     matches!(channel_type, 10..=12)
 }
+
+/// Hard cap on `GET /channels/{id}` while resolving whether an inbound
+/// channel is a thread. Discord normally responds in under 200 ms; this
+/// is a safety bound so a hung request cannot stall the listener.
+const THREAD_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Process Discord message attachments in a single pass.
 ///
@@ -337,15 +349,7 @@ async fn process_attachments(
             continue;
         }
 
-        let marker_kind = if ct.starts_with("image/") {
-            "IMAGE"
-        } else if is_audio {
-            "AUDIO"
-        } else if ct.starts_with("video/") {
-            "VIDEO"
-        } else {
-            "DOCUMENT"
-        };
+        let marker_kind = marker_kind_for(ct, is_audio);
 
         let bytes = match download_attachment_bytes(client, url, name).await {
             Some(b) => b,
@@ -438,6 +442,22 @@ fn is_discord_audio_attachment(content_type: &str, filename: &str) -> bool {
         return DISCORD_AUDIO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str());
     }
     false
+}
+
+/// Map a Discord attachment's content type plus audio-detection result to
+/// the canonical outbound marker kind. Pulled out of `process_attachments`
+/// so the MIME-to-marker dispatch can be unit-tested without a live HTTP
+/// download.
+fn marker_kind_for(content_type: &str, is_audio: bool) -> &'static str {
+    if content_type.starts_with("image/") {
+        "IMAGE"
+    } else if is_audio {
+        "AUDIO"
+    } else if content_type.starts_with("video/") {
+        "VIDEO"
+    } else {
+        "DOCUMENT"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1093,15 +1113,19 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
     content.contains(&tags[0]) || content.contains(&tags[1])
 }
 
-fn normalize_incoming_content(
+/// Decide whether an inbound Discord message passes the listener gate.
+/// Returns the cleaned text body when admitted, or `None` to drop the
+/// message. Attachment-only messages (empty `content` plus at least one
+/// attachment) are admitted as long as the mention requirement is
+/// satisfied; otherwise a Discord message that contained only an image,
+/// PDF, ZIP, video, or audio with no caption would never reach the
+/// media pipeline.
+fn admit_discord_message(
     content: &str,
+    has_attachments: bool,
     mention_only: bool,
     bot_user_id: &str,
 ) -> Option<String> {
-    if content.is_empty() {
-        return None;
-    }
-
     if mention_only && !contains_bot_mention(content, bot_user_id) {
         return None;
     }
@@ -1112,9 +1136,9 @@ fn normalize_incoming_content(
             normalized = normalized.replace(&tag, " ");
         }
     }
-
     let normalized = normalized.trim().to_string();
-    if normalized.is_empty() {
+
+    if normalized.is_empty() && !has_attachments {
         return None;
     }
 
@@ -1456,18 +1480,22 @@ impl Channel for DiscordChannel {
                     // the mention gate — requiring a @mention in a DM is never correct.
                     let is_dm = d.get("guild_id").is_none();
                     let effective_mention_only = self.mention_only && !is_dm;
-                    let Some(clean_content) =
-                        normalize_incoming_content(content, effective_mention_only, &bot_user_id)
-                    else {
-                        continue;
-                    };
-
-                    let client = self.http_client();
                     let atts = d
                         .get("attachments")
                         .and_then(|a| a.as_array())
                         .cloned()
                         .unwrap_or_default();
+                    let has_attachments = !atts.is_empty();
+                    let Some(clean_content) = admit_discord_message(
+                        content,
+                        has_attachments,
+                        effective_mention_only,
+                        &bot_user_id,
+                    ) else {
+                        continue;
+                    };
+
+                    let client = self.http_client();
                     let (attachment_text, media_attachments) = process_attachments(
                         &atts,
                         &client,
@@ -1526,6 +1554,18 @@ impl Channel for DiscordChannel {
                         });
                     }
 
+                    // Thread context decides `thread_ts` plus `interruption_scope_id`,
+                    // which the orchestrator uses as part of the conversation-history
+                    // key and the cancellation scope. When the lookup fails it falls
+                    // back to `None` and the failure is not cached, so the next
+                    // message in the same Discord thread will retry. The trade-off:
+                    // the first message after a transient lookup miss is keyed
+                    // without the thread suffix; once the cache warms, subsequent
+                    // messages are keyed with it. History for that thread can split
+                    // across two scopes until the warm-up completes. Acceptable
+                    // because the lookup is bounded by `THREAD_LOOKUP_TIMEOUT` and
+                    // the alternative (stalling the listener on a hung Discord call)
+                    // is worse.
                     let thread_ts = if channel_id.is_empty() {
                         None
                     } else if self.is_thread_channel(&client, &channel_id).await {
@@ -2154,21 +2194,57 @@ mod tests {
     }
 
     #[test]
-    fn normalize_incoming_content_requires_mention_when_enabled() {
-        let cleaned = normalize_incoming_content("hello there", true, "12345");
+    fn admit_discord_message_requires_mention_when_enabled() {
+        let cleaned = admit_discord_message("hello there", false, true, "12345");
         assert!(cleaned.is_none());
     }
 
     #[test]
-    fn normalize_incoming_content_strips_mentions_and_trims() {
-        let cleaned = normalize_incoming_content("  <@!12345> run status  ", true, "12345");
+    fn admit_discord_message_strips_mentions_and_trims() {
+        let cleaned = admit_discord_message("  <@!12345> run status  ", false, true, "12345");
         assert_eq!(cleaned.as_deref(), Some("run status"));
     }
 
     #[test]
-    fn normalize_incoming_content_rejects_empty_after_strip() {
-        let cleaned = normalize_incoming_content("<@12345>", true, "12345");
+    fn admit_discord_message_rejects_empty_text_and_no_attachments() {
+        let cleaned = admit_discord_message("<@12345>", false, true, "12345");
         assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn admit_discord_message_attachment_only_in_dm_is_admitted() {
+        // DM (effective_mention_only=false), empty text body, at least one
+        // attachment. Previously dropped at the empty-text gate; now passes
+        // through so process_attachments can run on the media.
+        let cleaned = admit_discord_message("", true, false, "12345");
+        assert_eq!(cleaned.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn admit_discord_message_attachment_only_with_mention_in_guild_is_admitted() {
+        // Guild channel with mention_only=true. Caption is just the @mention
+        // tag with no other text, but the message has a media attachment.
+        // Mention requirement is satisfied; cleaned text is empty but the
+        // attachment alone is enough input.
+        let cleaned = admit_discord_message("<@12345>", true, true, "12345");
+        assert_eq!(cleaned.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn admit_discord_message_attachment_only_without_mention_in_guild_is_rejected() {
+        // Guild channel with mention_only=true, attachment but no mention
+        // anywhere in the caption. The mention gate is orthogonal to
+        // attachment presence: no mention signal means drop.
+        let cleaned = admit_discord_message("", true, true, "12345");
+        assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn admit_discord_message_drops_when_no_text_and_no_attachments() {
+        // Completely empty payload with attachments absent is always dropped,
+        // regardless of mention_only setting.
+        assert!(admit_discord_message("", false, false, "12345").is_none());
+        assert!(admit_discord_message("", false, true, "12345").is_none());
     }
 
     // mention_only DM-bypass tests
@@ -2180,7 +2256,7 @@ mod tests {
         let mention_only = true;
         let is_dm = true;
         let effective = mention_only && !is_dm;
-        let cleaned = normalize_incoming_content("hello without mention", effective, "12345");
+        let cleaned = admit_discord_message("hello without mention", false, effective, "12345");
         assert_eq!(cleaned.as_deref(), Some("hello without mention"));
     }
 
@@ -2191,7 +2267,7 @@ mod tests {
         let mention_only = true;
         let is_dm = false;
         let effective = mention_only && !is_dm;
-        let cleaned = normalize_incoming_content("hello without mention", effective, "12345");
+        let cleaned = admit_discord_message("hello without mention", false, effective, "12345");
         assert!(cleaned.is_none());
     }
 
@@ -2202,7 +2278,7 @@ mod tests {
         let mention_only = true;
         let is_dm = false;
         let effective = mention_only && !is_dm;
-        let cleaned = normalize_incoming_content("<@12345> run status", effective, "12345");
+        let cleaned = admit_discord_message("<@12345> run status", false, effective, "12345");
         assert_eq!(cleaned.as_deref(), Some("run status"));
     }
 
@@ -2622,6 +2698,32 @@ mod tests {
         let (text, media) = process_attachments(&[], &client, None, None).await;
         assert!(text.is_empty());
         assert!(media.is_empty());
+    }
+
+    #[test]
+    fn marker_kind_for_classifies_each_mime_family() {
+        assert_eq!(marker_kind_for("image/png", false), "IMAGE");
+        assert_eq!(marker_kind_for("image/jpeg", false), "IMAGE");
+        assert_eq!(marker_kind_for("video/mp4", false), "VIDEO");
+        assert_eq!(marker_kind_for("application/pdf", false), "DOCUMENT");
+        assert_eq!(marker_kind_for("application/zip", false), "DOCUMENT");
+        assert_eq!(marker_kind_for("", false), "DOCUMENT");
+    }
+
+    #[test]
+    fn marker_kind_for_treats_audio_flag_as_audio_regardless_of_content_type() {
+        // Filename-detected audio with no content_type should still classify
+        // as AUDIO, matching the unified inbound pipeline.
+        assert_eq!(marker_kind_for("", true), "AUDIO");
+        assert_eq!(marker_kind_for("application/octet-stream", true), "AUDIO");
+    }
+
+    #[test]
+    fn marker_kind_for_prefers_image_over_audio_when_content_type_is_image() {
+        // Defensive: if a Discord attachment somehow tripped both heuristics,
+        // image MIME wins so vision-capable providers still receive image
+        // bytes through the MediaAttachment path.
+        assert_eq!(marker_kind_for("image/png", true), "IMAGE");
     }
 
     #[test]
