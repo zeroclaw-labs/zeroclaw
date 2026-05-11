@@ -32,7 +32,6 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "model_provider.openrouter",
     "channel.dingtalk",
     "channel.discord",
-    "channel.feishu",
     "channel.lark",
     "channel.matrix",
     "channel.mattermost",
@@ -9411,10 +9410,6 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub line: HashMap<String, LineConfig>,
-    /// Feishu channel instances (`[channels.feishu.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub feishu: HashMap<String, FeishuConfig>,
     /// DingTalk channel instances (`[channels.dingtalk.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -9570,10 +9565,6 @@ impl ChannelsConfig {
             (
                 Box::new(ConfigWrapper::new(self.lark.get("default"))),
                 !self.lark.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.feishu.get("default"))),
-                !self.feishu.is_empty(),
             ),
             (
                 Box::new(ConfigWrapper::new(self.dingtalk.get("default"))),
@@ -10797,58 +10788,6 @@ impl ChannelConfig for LineConfig {
     }
     fn desc() -> &'static str {
         "connect your LINE bot"
-    }
-}
-
-/// Feishu configuration for messaging integration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.feishu"]
-pub struct FeishuConfig {
-    /// App ID from Feishu developer console
-    pub app_id: String,
-    /// App Secret from Feishu developer console
-    #[secret]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub app_secret: String,
-    /// Encrypt key for webhook message decryption (optional)
-    #[serde(default)]
-    #[secret]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub encrypt_key: Option<String>,
-    /// Verification token for webhook validation (optional)
-    #[serde(default)]
-    #[secret]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub verification_token: Option<String>,
-    /// When true, only respond to messages that @-mention the bot in groups.
-    /// Direct messages are always processed.
-    #[serde(default)]
-    pub mention_only: bool,
-    /// Event receive mode: "websocket" (default) or "webhook"
-    #[serde(default)]
-    pub receive_mode: LarkReceiveMode,
-    /// HTTP port for webhook mode only. Must be set when receive_mode = "webhook".
-    /// Not required (and ignored) for websocket mode.
-    #[serde(default)]
-    pub port: Option<u16>,
-    /// Per-channel proxy URL (http, https, socks5, socks5h).
-    /// Overrides the global `[proxy]` setting for this channel only.
-    #[serde(default)]
-    pub proxy_url: Option<String>,
-
-    /// Tools excluded from this channel's tool spec. When set, these tools
-    /// are not exposed to the model when responding via this channel.
-    #[serde(default)]
-    pub excluded_tools: Vec<String>,
-}
-
-impl ChannelConfig for FeishuConfig {
-    fn name() -> &'static str {
-        "Feishu"
-    }
-    fn desc() -> &'static str {
-        "Feishu Bot"
     }
 }
 
@@ -15486,14 +15425,15 @@ default_temperature = 0.7
                 ..PostgresStorageConfig::default()
             },
         );
-        config.channels.feishu.insert(
-            "default".to_string(),
-            FeishuConfig {
+        config.channels.lark.insert(
+            "feishu".to_string(),
+            LarkConfig {
                 app_id: "cli_feishu_123".into(),
                 app_secret: "feishu-secret".into(),
                 encrypt_key: Some("feishu-encrypt".into()),
                 verification_token: Some("feishu-verify".into()),
                 mention_only: false,
+                use_feishu: true,
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
                 proxy_url: None,
@@ -15584,7 +15524,7 @@ default_temperature = 0.7
             "postgres://user:pw@host/db"
         );
 
-        let feishu = stored.channels.feishu.get("default").unwrap();
+        let feishu = stored.channels.lark.get("feishu").unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(
             &feishu.app_secret
         ));
@@ -17255,14 +17195,15 @@ default_model = "legacy-model"
             ..Default::default()
         };
         config.secrets.encrypt = true;
-        config.channels.feishu.insert(
-            "default".to_string(),
-            FeishuConfig {
+        config.channels.lark.insert(
+            "feishu".to_string(),
+            LarkConfig {
                 app_id: "cli_feishu_123".into(),
                 app_secret: "feishu-secret".into(),
                 encrypt_key: Some("feishu-encrypt".into()),
                 verification_token: Some("feishu-verify".into()),
                 mention_only: false,
+                use_feishu: true,
                 receive_mode: LarkReceiveMode::Websocket,
                 port: None,
                 proxy_url: None,
@@ -17272,7 +17213,7 @@ default_model = "legacy-model"
         config.save().await.unwrap();
 
         let loaded = Box::pin(Config::load_or_init()).await.unwrap();
-        let feishu = loaded.channels.feishu.get("default").unwrap();
+        let feishu = loaded.channels.lark.get("feishu").unwrap();
         assert_eq!(feishu.app_secret, "feishu-secret");
         assert_eq!(feishu.encrypt_key.as_deref(), Some("feishu-encrypt"));
         assert_eq!(feishu.verification_token.as_deref(), Some("feishu-verify"));
@@ -17801,58 +17742,6 @@ allowed_users = ["user_alpha", "user_beta"]
             .map(|p| p.username.as_str())
             .collect();
         assert_eq!(usernames, vec!["user_alpha", "user_beta"]);
-    }
-
-    #[test]
-    async fn feishu_config_serde() {
-        let fc = FeishuConfig {
-            app_id: "cli_feishu_123".into(),
-            app_secret: "secret_abc".into(),
-            encrypt_key: Some("encrypt_key".into()),
-            verification_token: Some("verify_token".into()),
-            mention_only: false,
-            receive_mode: LarkReceiveMode::Websocket,
-            port: None,
-            proxy_url: None,
-            excluded_tools: vec![],
-        };
-        let json = serde_json::to_string(&fc).unwrap();
-        let parsed: FeishuConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.app_id, "cli_feishu_123");
-        assert_eq!(parsed.app_secret, "secret_abc");
-        assert_eq!(parsed.encrypt_key.as_deref(), Some("encrypt_key"));
-        assert_eq!(parsed.verification_token.as_deref(), Some("verify_token"));
-    }
-
-    #[test]
-    async fn feishu_config_toml_roundtrip() {
-        let fc = FeishuConfig {
-            app_id: "cli_feishu_123".into(),
-            app_secret: "secret_abc".into(),
-            encrypt_key: Some("encrypt_key".into()),
-            verification_token: Some("verify_token".into()),
-            mention_only: false,
-            receive_mode: LarkReceiveMode::Webhook,
-            port: Some(9898),
-            proxy_url: None,
-            excluded_tools: vec![],
-        };
-        let toml_str = toml::to_string(&fc).unwrap();
-        let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(parsed.app_id, "cli_feishu_123");
-        assert_eq!(parsed.app_secret, "secret_abc");
-        assert_eq!(parsed.receive_mode, LarkReceiveMode::Webhook);
-        assert_eq!(parsed.port, Some(9898));
-    }
-
-    #[test]
-    async fn feishu_config_deserializes_without_optional_fields() {
-        let json = r#"{"app_id":"cli_123","app_secret":"secret"}"#;
-        let parsed: FeishuConfig = serde_json::from_str(json).unwrap();
-        assert!(parsed.encrypt_key.is_none());
-        assert!(parsed.verification_token.is_none());
-        assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
-        assert!(parsed.port.is_none());
     }
 
     // ── LINE ──────────────────────────────────────────────────

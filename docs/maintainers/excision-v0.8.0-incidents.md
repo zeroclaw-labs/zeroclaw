@@ -34,12 +34,38 @@ Format: site, decision (deleted / kept / kept-with-narrow), reason.
 
 ## Phase 4 — Stale `#[serde(alias)]`
 
-(populated)
+Three `#[serde(alias = ...)]` annotations in `crates/zeroclaw-config/src/schema.rs`. Reviewed; all kept:
+
+- `:3646` `alias = "api_url"` on `TtsProviderConfig.uri` — the V1/V2-era field rename. The `migration.rs` walker doesn't currently rewrite this for TTS configs (only for `ModelProviderConfig`), so the serde alias is the operator-facing fallback for old TOMLs. **Kept** until the migration walker is extended.
+- `:7718` `alias = "dbURL", "database_url", "databaseUrl"` on `PostgresStorageConfig.db_url` — same pattern. Multiple legacy/camelCase forms accepted; migration doesn't rewrite. **Kept**.
+- `:11267` `alias = "sandbox-exec"` on `SandboxBackend::SandboxExec` — the parent enum carries `#[serde(rename_all = "lowercase")]` so the wire form is `sandboxexec`. The alias preserves the natural kebab `sandbox-exec` form for operators. **Kept** as UX, not legacy.
 
 ## Phase 5 — `channels_except_webhook` + `channels` hand-rolled lists
 
-(populated)
+`crates/zeroclaw-config/src/schema.rs:9509-9628` — 120 lines of `(Box::new(ConfigWrapper::new(self.<field>.get("default"))), !self.<field>.is_empty())` per channel field.
+
+Investigated for collapse but **kept**:
+
+- The function `channels()` has 4 real callers (`crates/zeroclaw-gateway/src/api.rs:113,859`, `crates/zeroclaw-runtime/src/daemon/mod.rs:1055`, `crates/zeroclaw-runtime/src/integrations/registry.rs:82,194`).
+- `channels_except_webhook` has exactly one caller: `channels()` itself.
+- Collapsing into a Configurable-derive emit would net ~−80 lines of schema for ~+40 of macro work, but requires the macro to handle `#[cfg(feature = "channel-nostr")]` / `#[cfg(feature = "voice-wake")]` cfg-gated fields. That's risky on a release branch.
+- Inlining `channels_except_webhook` into `channels()` is net-zero and only removes one level of indirection.
+
+Defer to v0.9.0 along with the broader trait/macro consolidation of orchestrator dispatch matches discussed earlier in the excision pass.
 
 ## Phase 6 — FeishuConfig folded into LarkConfig
 
-(populated)
+Followed the DiscordHistory fold pattern:
+
+1. New V2→V3 migration step `fold_feishu_into_lark` in `crates/zeroclaw-config/src/schema/v2.rs` — runs before the channel alias-wrap loop, takes any `[channels.feishu]` block and merges into `[channels.lark]` with `use_feishu = true`. Conflict semantics mirror `fold_discord_history`: differing `app_id` between blocks drops the feishu side with a WARN; matching ids merge with existing lark fields winning. Three new migration tests cover feishu-only, matching-id merge, and conflict-drop.
+2. `FeishuConfig` struct + `impl ChannelConfig for FeishuConfig` deleted from schema.
+3. `pub feishu: HashMap<String, FeishuConfig>` field deleted from `ChannelsConfig`.
+4. `"feishu"` removed from the V3_CHANNEL_TYPES alias-wrap list (the fold has already run by then).
+5. `"channel.feishu"` removed from the schema's TYPE_NAMES const (parallel naming list).
+6. `LarkChannel::from_feishu_config` deleted from the channel impl. `from_lark_config` also deleted — the dispatcher now uses `from_config` everywhere, which respects `use_feishu` correctly so the "explicit-lark, ignore use_feishu" override is redundant.
+7. Orchestrator: removed the `"feishu" =>` dispatcher arm and the `for (alias, fs) in &config.channels.feishu` health-check loop. The lark health-check loop now picks `"Feishu"` vs `"Lark"` for `display_name` based on `lk.use_feishu`.
+8. `channel-feishu = ["channel-lark"]` feature alias removed from root Cargo.toml.
+9. Schema tests using `FeishuConfig` switched to `LarkConfig` with `use_feishu: true` (`channels.lark.feishu` instead of `channels.feishu.default`). Pure FeishuConfig serde/toml tests deleted (orphan after the struct's removal).
+10. `lark_from_feishu_config_*` and `lark_from_lark_config_ignores_legacy_feishu_flag` tests deleted as orphans of the deleted methods. Replaced with one `lark_from_config_with_use_feishu_routes_to_feishu` test that pins the equivalent path.
+11. `channels.feishu.is_empty()` assertion removed from `tests/component/config_schema.rs`.
+12. Stale `channel-feishu` entry stripped from `docs/book/src/foundations/fnd-001-intentional-architecture.md` retire-to-plugin table.

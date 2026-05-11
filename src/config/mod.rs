@@ -14,7 +14,7 @@ pub use schema::{
     ClaudeCodeRunnerConfig, CloudOpsConfig, CodexCliConfig, ComposioConfig, Config,
     ConversationalAiConfig, CostConfig, CronJobDecl, CronScheduleDecl, DEFAULT_GWS_SERVICES,
     DataRetentionConfig, DeepgramSttConfig, DelegateToolConfig, DiscordConfig, DockerRuntimeConfig,
-    EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig, GeminiCliConfig,
+    EmbeddingRouteConfig, EstopConfig, GatewayConfig, GeminiCliConfig,
     GoogleSttConfig, GoogleWorkspaceAllowedOperation, GoogleWorkspaceConfig, HardwareConfig,
     HardwareTransport, HeartbeatConfig, HooksConfig, HttpRequestConfig, IMessageConfig,
     IdentityConfig, ImageGenConfig, ImageProviderDalleConfig, ImageProviderFluxConfig,
@@ -133,18 +133,6 @@ mod tests {
             proxy_url: None,
             excluded_tools: vec![],
         };
-        let feishu = FeishuConfig {
-            app_id: "app-id".into(),
-            app_secret: "app-secret".into(),
-            encrypt_key: None,
-            verification_token: None,
-            mention_only: false,
-            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
-            port: None,
-            proxy_url: None,
-            excluded_tools: vec![],
-        };
-
         let nextcloud_talk = NextcloudTalkConfig {
             base_url: "https://cloud.example.com".into(),
             app_token: "app-token".into(),
@@ -159,7 +147,6 @@ mod tests {
         assert_eq!(telegram.bot_token, "token");
         assert_eq!(discord.guild_ids, vec!["123".to_string()]);
         assert_eq!(lark.app_id, "app-id");
-        assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");
     }
 }

@@ -386,9 +386,9 @@ pub struct LarkChannel {
     app_secret: String,
     verification_token: String,
     port: Option<u16>,
-    /// The alias key under `[channels.lark.<alias>]` (or
-    /// `[channels.feishu.<alias>]`) this handle is bound to. Used to scope
-    /// peer-group writes and resolver lookups.
+    /// The alias key under `[channels.lark.<alias>]` this handle is bound to.
+    /// Used to scope peer-group writes and resolver lookups. (Pre-V3 Feishu
+    /// blocks are folded into `[channels.lark]` with `use_feishu = true`.)
     alias: String,
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
@@ -492,50 +492,6 @@ impl LarkChannel {
             peer_resolver,
             config.mention_only,
             platform,
-        );
-        ch.receive_mode = config.receive_mode.clone();
-        ch.proxy_url = config.proxy_url.clone();
-        ch
-    }
-
-    /// Build from `LarkConfig` forcing `LarkPlatform::Lark`, ignoring the
-    /// legacy `use_feishu` flag.  Used by the channel factory when the config
-    /// section is explicitly `[channels_config.lark]`.
-    pub fn from_lark_config(
-        config: &zeroclaw_config::schema::LarkConfig,
-        alias: impl Into<String>,
-        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    ) -> Self {
-        let mut ch = Self::new_with_platform(
-            config.app_id.clone(),
-            config.app_secret.clone(),
-            config.verification_token.clone().unwrap_or_default(),
-            config.port,
-            alias,
-            peer_resolver,
-            config.mention_only,
-            LarkPlatform::Lark,
-        );
-        ch.receive_mode = config.receive_mode.clone();
-        ch.proxy_url = config.proxy_url.clone();
-        ch
-    }
-
-    /// Build from `FeishuConfig` with `LarkPlatform::Feishu`.
-    pub fn from_feishu_config(
-        config: &zeroclaw_config::schema::FeishuConfig,
-        alias: impl Into<String>,
-        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    ) -> Self {
-        let mut ch = Self::new_with_platform(
-            config.app_id.clone(),
-            config.app_secret.clone(),
-            config.verification_token.clone().unwrap_or_default(),
-            config.port,
-            alias,
-            peer_resolver,
-            config.mention_only,
-            LarkPlatform::Feishu,
         );
         ch.receive_mode = config.receive_mode.clone();
         ch.proxy_url = config.proxy_url.clone();
@@ -3110,11 +3066,11 @@ mod tests {
     }
 
     #[test]
-    fn lark_from_lark_config_ignores_legacy_feishu_flag() {
+    fn lark_from_config_with_use_feishu_routes_to_feishu() {
         use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
 
         let cfg = LarkConfig {
-            app_id: "cli_app123".into(),
+            app_id: "cli_feishu_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
@@ -3126,31 +3082,7 @@ mod tests {
             excluded_tools: vec![],
         };
 
-        let ch =
-            LarkChannel::from_lark_config(&cfg, "lark_test_alias", resolver_from(vec!["*".into()]));
-
-        assert_eq!(ch.api_base(), LARK_BASE_URL);
-        assert_eq!(ch.ws_base(), LARK_WS_BASE_URL);
-        assert_eq!(ch.name(), "lark");
-    }
-
-    #[test]
-    fn lark_from_feishu_config_sets_feishu_platform() {
-        use zeroclaw_config::schema::{FeishuConfig, LarkReceiveMode};
-
-        let cfg = FeishuConfig {
-            app_id: "cli_feishu_app123".into(),
-            app_secret: "secret456".into(),
-            encrypt_key: None,
-            verification_token: Some("vtoken789".into()),
-            mention_only: false,
-            receive_mode: LarkReceiveMode::Webhook,
-            port: Some(9898),
-            proxy_url: None,
-            excluded_tools: vec![],
-        };
-
-        let ch = LarkChannel::from_feishu_config(
+        let ch = LarkChannel::from_config(
             &cfg,
             "feishu_test_alias",
             resolver_from(vec!["*".into()]),
@@ -3159,48 +3091,6 @@ mod tests {
         assert_eq!(ch.api_base(), FEISHU_BASE_URL);
         assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
         assert_eq!(ch.name(), "feishu");
-    }
-
-    #[test]
-    fn lark_from_feishu_config_propagates_mention_only() {
-        use zeroclaw_config::schema::{FeishuConfig, LarkReceiveMode};
-
-        let cfg_true = FeishuConfig {
-            app_id: "cli_feishu_app123".into(),
-            app_secret: "secret456".into(),
-            encrypt_key: None,
-            verification_token: Some("vtoken789".into()),
-            mention_only: true,
-            receive_mode: LarkReceiveMode::Websocket,
-            port: None,
-            proxy_url: None,
-            excluded_tools: vec![],
-        };
-
-        let cfg_false = FeishuConfig {
-            mention_only: false,
-            ..cfg_true.clone()
-        };
-
-        let ch_true = LarkChannel::from_feishu_config(
-            &cfg_true,
-            "feishu_test_alias",
-            resolver_from(vec!["*".into()]),
-        );
-        let ch_false = LarkChannel::from_feishu_config(
-            &cfg_false,
-            "feishu_test_alias",
-            resolver_from(vec!["*".into()]),
-        );
-
-        assert!(
-            ch_true.mention_only,
-            "mention_only = true must propagate through from_feishu_config"
-        );
-        assert!(
-            !ch_false.mention_only,
-            "mention_only = false must propagate through from_feishu_config"
-        );
     }
 
     #[tokio::test]
@@ -3388,18 +3278,19 @@ mod tests {
             "https://open.larksuite.com/open-apis/im/v1/messages/om_test_message_id/reactions"
         );
 
-        let feishu_cfg = zeroclaw_config::schema::FeishuConfig {
+        let feishu_cfg = zeroclaw_config::schema::LarkConfig {
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             mention_only: false,
+            use_feishu: true,
             receive_mode: zeroclaw_config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
         };
-        let ch_feishu = LarkChannel::from_feishu_config(
+        let ch_feishu = LarkChannel::from_config(
             &feishu_cfg,
             "feishu_test_alias",
             resolver_from(vec!["*".into()]),

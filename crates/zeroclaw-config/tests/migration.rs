@@ -984,6 +984,105 @@ channel_ids = ["aaaa"]
 }
 
 // ─────────────────────────────────────────────────────────────
+// Feishu fold — V3 collapses `[channels.feishu]` into
+// `[channels.lark]` with `use_feishu = true` so a single channel type
+// covers both endpoints. Conflicting `app_id` between blocks drops the
+// feishu side with a WARN; matching ids merge.
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn feishu_only_block_folds_into_lark_with_use_feishu_true() {
+    let raw = r#"
+default_provider = "openai"
+default_model = "gpt-4o-mini"
+
+[channels_config.feishu]
+enabled = true
+app_id = "feishu_app_id_123"
+app_secret = "feishu_secret"
+mention_only = true
+"#;
+    let cfg = migrate_to_current(raw).expect("Feishu-only fold migration succeeds");
+    assert!(
+        cfg.channels.lark.contains_key("default"),
+        "[channels.feishu] must surface as [channels.lark.default] after fold"
+    );
+    let lark = &cfg.channels.lark["default"];
+    assert!(
+        lark.use_feishu,
+        "use_feishu must be set true on the folded entry so the runtime routes to open.feishu.cn"
+    );
+    assert_eq!(lark.app_id, "feishu_app_id_123");
+    assert!(lark.mention_only);
+}
+
+#[test]
+fn feishu_and_lark_with_matching_app_id_merges() {
+    let raw = r#"
+default_provider = "openai"
+default_model = "gpt-4o-mini"
+
+[channels_config.lark]
+enabled = true
+app_id = "shared_app_id"
+app_secret = "lark_secret"
+
+[channels_config.feishu]
+enabled = true
+app_id = "shared_app_id"
+encrypt_key = "feishu_encrypt"
+"#;
+    let cfg = migrate_to_current(raw).expect("matching-app_id fold succeeds");
+    let lark = cfg
+        .channels
+        .lark
+        .get("default")
+        .expect("merged lark.default present");
+    assert!(lark.use_feishu, "use_feishu flips to true on the merge");
+    assert_eq!(
+        lark.app_secret, "lark_secret",
+        "existing lark fields win over feishu fields"
+    );
+    assert_eq!(
+        lark.encrypt_key.as_deref(),
+        Some("feishu_encrypt"),
+        "feishu fields fill gaps the lark block did not set"
+    );
+}
+
+#[test]
+fn feishu_and_lark_with_different_app_id_drops_feishu() {
+    let raw = r#"
+default_provider = "openai"
+default_model = "gpt-4o-mini"
+
+[channels_config.lark]
+enabled = true
+app_id = "lark_survives"
+app_secret = "lark_secret"
+
+[channels_config.feishu]
+enabled = true
+app_id = "feishu_dropped"
+app_secret = "feishu_secret"
+"#;
+    let cfg = migrate_to_current(raw).expect("conflict fold succeeds with WARN");
+    let lark = cfg
+        .channels
+        .lark
+        .get("default")
+        .expect("lark.default survives the conflict");
+    assert_eq!(
+        lark.app_id, "lark_survives",
+        "lark wins on app_id conflict"
+    );
+    assert!(
+        !lark.use_feishu,
+        "use_feishu stays false because the feishu block was dropped, not merged"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
 // V1/V2 colon-URL provider strings — `(custom|anthropic-custom):<url>`.
 // Pre-fix the migration used the raw colon-URL string as the V3 outer
 // provider key, then synthesized `model_provider = "<type>:<url>.<alias>"`.

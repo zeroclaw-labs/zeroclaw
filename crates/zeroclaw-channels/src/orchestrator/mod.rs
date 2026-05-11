@@ -4517,7 +4517,7 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
                 };
-                Ok(Arc::new(LarkChannel::from_lark_config(
+                Ok(Arc::new(LarkChannel::from_config(
                     lk,
                     alias,
                     peer_resolver,
@@ -4526,41 +4526,6 @@ fn build_channel_by_id(
             #[cfg(not(feature = "channel-lark"))]
             {
                 anyhow::bail!("Lark channel requires the `channel-lark` feature");
-            }
-        }
-        "feishu" => {
-            #[cfg(feature = "channel-lark")]
-            {
-                if let Some(fs) = config.channels.feishu.values().next() {
-                    let alias = "default".to_string();
-                    let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                        let cfg_arc = config_arc.clone();
-                        let alias = alias.clone();
-                        Arc::new(move || cfg_arc.read().channel_external_peers("feishu", &alias))
-                    };
-                    return Ok(Arc::new(LarkChannel::from_feishu_config(
-                        fs,
-                        alias,
-                        peer_resolver,
-                    )));
-                }
-                // Legacy: [channels_config.lark] with use_feishu = true
-                let lk = config
-                    .channels
-                    .lark
-                    .get("default")
-                    .context("Feishu channel is not configured")?;
-                let alias = "default".to_string();
-                let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                    let cfg_arc = config_arc.clone();
-                    let alias = alias.clone();
-                    Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
-                };
-                Ok(Arc::new(LarkChannel::from_config(lk, alias, peer_resolver)))
-            }
-            #[cfg(not(feature = "channel-lark"))]
-            {
-                anyhow::bail!("Feishu channel requires the `channel-lark` feature");
             }
         }
         "dingtalk" => {
@@ -5377,55 +5342,18 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
         };
-        if lk.use_feishu {
-            if !config.channels.feishu.is_empty() {
-                tracing::warn!(
-                    "Both [channels_config.feishu] and legacy [channels_config.lark].use_feishu=true are configured; ignoring legacy Feishu fallback in lark."
-                );
-            } else {
-                tracing::warn!(
-                    "Using legacy [channels_config.lark].use_feishu=true compatibility path; prefer [channels_config.feishu]."
-                );
-                channels.push(ConfiguredChannel {
-                    display_name: "Feishu",
-                    channel: Arc::new(
-                        LarkChannel::from_config(lk, alias.clone(), peer_resolver)
-                            .with_transcription(config.transcription.clone()),
-                    ),
-                });
-            }
-        } else {
-            channels.push(ConfiguredChannel {
-                display_name: "Lark",
-                channel: Arc::new(
-                    LarkChannel::from_lark_config(lk, alias.clone(), peer_resolver)
-                        .with_transcription(config.transcription.clone()),
-                ),
-            });
-        }
-    }
-
-    #[cfg(feature = "channel-lark")]
-    for (alias, fs) in &config.channels.feishu {
-        if !active_channel_aliases.contains(&format!("feishu.{alias}")) {
-            continue;
-        }
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("feishu", &alias))
-        };
+        let display_name = if lk.use_feishu { "Feishu" } else { "Lark" };
         channels.push(ConfiguredChannel {
-            display_name: "Feishu",
+            display_name,
             channel: Arc::new(
-                LarkChannel::from_feishu_config(fs, alias.clone(), peer_resolver)
+                LarkChannel::from_config(lk, alias.clone(), peer_resolver)
                     .with_transcription(config.transcription.clone()),
             ),
         });
     }
 
     #[cfg(not(feature = "channel-lark"))]
-    if !config.channels.lark.is_empty() || !config.channels.feishu.is_empty() {
+    if !config.channels.lark.is_empty() {
         tracing::warn!(
             "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check."
         );
