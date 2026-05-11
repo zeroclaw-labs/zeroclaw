@@ -18,10 +18,10 @@
 </p>
 
 <p align="center">
-  <a href="docs/book/src/introduction.md">Docs</a> ·
-  <a href="docs/book/src/philosophy.md">Philosophy</a> ·
-  <a href="docs/book/src/getting-started/quick-start.md">Quick start</a> ·
-  <a href="docs/book/src/architecture/overview.md">Architecture</a> ·
+  <a href="https://docs.zeroclawlabs.ai/master/en/introduction.html">Docs</a> ·
+  <a href="https://docs.zeroclawlabs.ai/master/en/philosophy.html">Philosophy</a> ·
+  <a href="https://docs.zeroclawlabs.ai/master/en/getting-started/quick-start.html">Quick start</a> ·
+  <a href="https://docs.zeroclawlabs.ai/master/en/architecture/overview.html">Architecture</a> ·
   <a href="https://discord.com/invite/wDshRVqRjx">Discord</a>
 </p>
 
@@ -29,7 +29,7 @@
 
 ZeroClaw is an agent runtime — a single Rust binary you configure and run. It talks to LLM providers (Anthropic, OpenAI, Ollama, and ~20 others), reaches the world through 30+ channels (Discord, Telegram, Matrix, email, voice, webhooks, your own CLI), and acts through tools (shell, browser, HTTP, hardware, custom MCP servers). Everything runs on your machine, with your keys, in your workspace.
 
-Read the [Philosophy](docs/book/src/philosophy.md) for the four opinions that shape it.
+Read the [Philosophy](docs/book/src/philosophy/index.md) for the four opinions that shape it.
 
 ## Install
 
@@ -69,12 +69,12 @@ zeroclaw service install          # register as systemd/launchctl/Windows Servic
 zeroclaw service start            # run it always-on in the background
 ```
 
-Full walkthrough: [Quick start](docs/book/src/getting-started/quick-start.md) — or skip the safety gates with [YOLO mode](docs/book/src/getting-started/yolo.md) for dev boxes.
+Full walkthrough: [Quick start](docs/book/src/getting-started/quickstart.md) — or skip the safety gates with [YOLO mode](docs/book/src/getting-started/yolo.md) for dev boxes.
 
 ## What ZeroClaw does
 
 - **Multi-channel** — one agent answering you across [every channel you configure](docs/book/src/channels/overview.md). Inbound messages from Discord, Telegram, Matrix, email, webhooks, CLI — all delivered to the same agent loop.
-- **Provider-agnostic** — [model providers](docs/book/src/providers/overview.md) are pluggable. Configure Anthropic, OpenAI, local Ollama, or any OpenAI-compatible endpoint. [Fallback chains and routing](docs/book/src/providers/fallback-and-routing.md) keep the agent running when a provider flakes.
+- **Provider-agnostic** — [model providers](docs/book/src/providers/overview.md) are pluggable. Configure Anthropic, OpenAI, local Ollama, or any OpenAI-compatible endpoint. [Fallback chains and routing](docs/book/src/providers/routing.md) keep the agent running when a provider flakes.
 - **Security-first, with escape hatches** — default autonomy is `supervised`: medium-risk ops require approval, high-risk blocked. Workspace boundaries, command policy, OS-level sandboxes (Landlock / Bubblewrap / Seatbelt / Docker), and cryptographic [tool receipts](docs/book/src/security/tool-receipts.md) on every action. [YOLO mode](docs/book/src/getting-started/yolo.md) exists for trusted dev environments.
 - **Hardware-capable** — GPIO / I2C / SPI / USB on Raspberry Pi, STM32, Arduino, and ESP32 via the `Peripheral` trait. See [Hardware](docs/book/src/hardware/index.md).
 - **Gateway + dashboard** — HTTP / WebSocket gateway for clients, with a web dashboard for chat, memory browsing, config editing, cron management, and tool inspection.
@@ -88,7 +88,7 @@ One TOML file at `~/.zeroclaw/config.toml`. Pointers:
 - [Provider configuration](docs/book/src/providers/configuration.md) — the universal `[providers.models.<type>.<alias>]` schema
 - [Channels overview](docs/book/src/channels/overview.md) — per-channel `[channels.<type>.<alias>]` blocks
 - [Security overview](docs/book/src/security/overview.md) — autonomy, sandboxing, tool receipts
-- [Full config reference](docs/book/src/reference/config.md) — generated from the live schema; every key documented
+- [Full config reference](https://docs.zeroclawlabs.ai/master/en/reference/config.html) — generated from the live schema; every key documented
 
 A V3 config has at minimum four section headers (`<type>.<alias>` shaped) — a provider entry, an agent that references it, and a risk profile the agent gates against. See [Provider Configuration → Minimal working example](docs/book/src/providers/configuration.md#minimal-working-example) for the canonical four-section form with inline type/alias commentary.
 
