@@ -74,10 +74,10 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
 // History management moved to `super::history`.
 pub use super::history::{
-    append_or_merge_system_message, canonicalize_tool_result_media_markers,
-    emergency_history_trim, estimate_history_tokens, fast_trim_tool_results,
-    load_interactive_session_history, normalize_system_messages, save_interactive_session_history,
-    trim_history, truncate_tool_result,
+    append_or_merge_system_message, canonicalize_tool_result_media_markers, emergency_history_trim,
+    estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
+    normalize_system_messages, save_interactive_session_history, trim_history,
+    truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -3941,6 +3941,32 @@ mod tests {
                 .map(|message| message.role.as_str())
                 .collect::<Vec<_>>(),
             vec!["system", "user", "assistant", "user"]
+        );
+    }
+
+    #[test]
+    fn load_interactive_session_replaces_empty_system_messages_with_fallback() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let payload = serde_json::to_string_pretty(&InteractiveSessionState {
+            version: 1,
+            history: vec![
+                ChatMessage::system(""),
+                ChatMessage::user("follow-up"),
+                ChatMessage::system(""),
+            ],
+        })
+        .unwrap();
+        std::fs::write(&path, payload).unwrap();
+
+        let restored = load_interactive_session_history(&path, "fallback system").unwrap();
+
+        assert_eq!(
+            restored
+                .iter()
+                .map(|message| (message.role.as_str(), message.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("system", "fallback system"), ("user", "follow-up")]
         );
     }
 

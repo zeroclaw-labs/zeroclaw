@@ -290,7 +290,7 @@ pub fn normalize_system_messages(history: &mut Vec<ChatMessage>) {
         }
     }
 
-    if saw_system {
+    if saw_system && !system_content.is_empty() {
         history.push(ChatMessage::system(system_content));
     }
     history.extend(non_system);
@@ -298,8 +298,13 @@ pub fn normalize_system_messages(history: &mut Vec<ChatMessage>) {
 
 pub fn append_or_merge_system_message(history: &mut Vec<ChatMessage>, content: impl Into<String>) {
     let content = content.into();
+    if content.is_empty() {
+        normalize_system_messages(history);
+        return;
+    }
+
     if let Some(system_message) = history.iter_mut().find(|message| message.role == "system") {
-        if !system_message.content.is_empty() && !content.is_empty() {
+        if !system_message.content.is_empty() {
             system_message.content.push_str("\n\n");
         }
         system_message.content.push_str(&content);
@@ -362,6 +367,9 @@ pub fn load_interactive_session_history(
         state.history.insert(0, ChatMessage::system(system_prompt));
     }
     normalize_system_messages(&mut state.history);
+    if state.history.first().map(|msg| msg.role.as_str()) != Some("system") {
+        state.history.insert(0, ChatMessage::system(system_prompt));
+    }
 
     // Self-heal persisted sessions that were written with orphaned
     // tool_result messages (e.g. a crash mid-compaction, or a trim that

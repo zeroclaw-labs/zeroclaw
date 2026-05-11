@@ -339,6 +339,10 @@ impl OpenAiCompatibleProvider {
             return messages.to_vec();
         }
 
+        if system_content.is_empty() {
+            return result;
+        }
+
         if !merge {
             result.insert(0, ChatMessage::system(system_content));
             return result;
@@ -3889,6 +3893,21 @@ mod tests {
         );
         assert!(flattened[0].content.contains("System A"));
         assert!(flattened[0].content.contains("System B"));
+    }
+
+    #[test]
+    fn flatten_system_messages_drops_empty_system_messages() {
+        let messages = vec![
+            ChatMessage::system(""),
+            ChatMessage::user("User turn"),
+            ChatMessage::system(""),
+        ];
+
+        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages, false);
+
+        assert_eq!(flattened.len(), 1);
+        assert_eq!(flattened[0].role, "user");
+        assert_eq!(flattened[0].content, "User turn");
     }
 
     #[test]
