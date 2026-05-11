@@ -1,232 +1,91 @@
-# scripts/ — Raspberry Pi Deployment Guide
+# scripts/ — Raspberry Pi 部署脚本说明
 
-This directory contains everything needed to cross-compile QuantClaw and deploy it to a Raspberry Pi over SSH.
+本目录脚本已统一为以下约定：
 
-## Contents
+- 服务名固定使用 `quantclaw-rust`（避免与存量 `quantclaw` 配网服务冲突）
+- 运行根目录固定为 `~/quantclaw_rust_app`
+- 网关通过配置文件启动，不再在 systemd 里传 `--host/--port`
 
-| File | Purpose |
-|------|---------|
-| `deploy-rpi.sh` | One-shot cross-compile and deploy script |
-| `rpi-config.toml` | Production config template deployed to `~/.quantclaw/config.toml` |
-| `quantclaw.service` | systemd unit file installed on the Pi |
-| `99-act-led.rules` | udev rule for ACT LED sysfs access without sudo |
+## 文件清单
 
----
+| 文件 | 作用 |
+|------|------|
+| `build-release-aarch64.ps1` | Windows + Docker Desktop 打包脚本 |
+| `build-release-aarch64.sh` | Linux/macOS 打包脚本 |
+| `deploy-rpi.ps1` | Windows 一键部署脚本（含可选 swapfile） |
+| `deploy-rpi.sh` | Linux/macOS 一键部署脚本 |
+| `quantclaw-rust.service` | 默认 systemd 模板（目标服务名） |
+| `rpi-config.toml` | 树莓派配置模板 |
+| `99-act-led.rules` | ACT LED 权限规则 |
 
-## Prerequisites
+## 默认部署布局
 
-### Cross-compilation toolchain (pick one)
+| 路径 | 说明 |
+|------|------|
+| `~/quantclaw_rust_app/.env` | Provider 密钥等环境变量 |
+| `~/quantclaw_rust_app/.quantclaw/config.toml` | 主配置 |
+| `~/quantclaw_rust_app/current` | 当前运行目录（软链） |
+| `/etc/systemd/system/quantclaw-rust.service` | 服务单元 |
+| `/usr/local/bin/quantclaw` | 可执行文件 |
 
-#### Option A — cargo-zigbuild (recommended for Apple Silicon)
+## Windows 推荐流程
+
+```powershell
+.\scripts\build-release-aarch64.ps1
+.\scripts\deploy-rpi.ps1 -RpiHost raspberrypi.local -RpiUser quant
+```
+
+低内存设备可选：
+
+```powershell
+.\scripts\deploy-rpi.ps1 -RpiHost raspberrypi.local -RpiUser quant -EnsureSwap -SwapSizeMB 1024
+```
+
+`-EnsureSwap` 只管理 `/swapfile`，不会改分区表。
+
+## Bash 推荐流程
 
 ```bash
-brew install zig
-cargo install cargo-zigbuild
-rustup target add aarch64-unknown-linux-gnu
+RPI_HOST=raspberrypi.local RPI_USER=quant ./scripts/deploy-rpi.sh
 ```
 
-#### Option B — cross (Docker-based)
+可选参数：
+
+- `RPI_DIR`：默认 `/home/$RPI_USER/quantclaw_rust_app`
+- `SERVICE_NAME`：默认 `quantclaw-rust`
+- `CROSS_TOOL`：`zigbuild` 或 `cross`
+
+## 首次部署后
+
+编辑密钥：
 
 ```bash
-cargo install cross
-rustup target add aarch64-unknown-linux-gnu
-# Docker must be running
+nano ~/quantclaw_rust_app/.env
 ```
 
-The deploy script auto-detects which tool is available, preferring `cargo-zigbuild`.
-Force a specific tool with `CROSS_TOOL=zigbuild` or `CROSS_TOOL=cross`.
+可设置任一 Provider：
 
-### Optional: passwordless SSH
+```env
+OPENAI_API_KEY=
+# 或
+OPENROUTER_API_KEY=
+```
 
-If you can't use SSH key authentication, install `sshpass` and set the `RPI_PASS` environment variable:
+检查服务：
 
 ```bash
-brew install sshpass       # macOS
-sudo apt install sshpass   # Linux
+sudo systemctl status quantclaw-rust --no-pager
+curl http://127.0.0.1:42617/health
 ```
 
----
-
-## Quick Start
+查看日志：
 
 ```bash
-RPI_HOST=raspberrypi.local RPI_USER=pi ./scripts/deploy-rpi.sh
+journalctl -u quantclaw-rust -f
 ```
 
-After the first deploy, you must set your API key on the Pi (see [First-Time Setup](#first-time-setup)).
+## 历史排障记录
 
----
+完整过程和结果沉淀在：
 
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RPI_HOST` | `raspberrypi.local` | Pi hostname or IP address |
-| `RPI_USER` | `pi` | SSH username |
-| `RPI_PORT` | `22` | SSH port |
-| `RPI_DIR` | `~/quantclaw` | Remote directory for the binary and `.env` |
-| `RPI_PASS` | _(unset)_ | SSH password — uses `sshpass` if set; key auth used otherwise |
-| `CROSS_TOOL` | _(auto-detect)_ | Force `zigbuild` or `cross` |
-
----
-
-## What the Deploy Script Does
-
-1. **Cross-compile** — builds a release binary for `aarch64-unknown-linux-gnu` with `--features hardware,peripheral-rpi`.
-2. **Stop service** — runs `sudo systemctl stop quantclaw` on the Pi (continues if not yet installed).
-3. **Create remote directory** — ensures `$RPI_DIR` exists on the Pi.
-4. **Copy binary** — SCPs the compiled binary to `$RPI_DIR/quantclaw`.
-5. **Create `.env`** — writes an `.env` skeleton with an `ANTHROPIC_API_KEY=` placeholder to `$RPI_DIR/.env` with mode `600`. Skipped if the file already exists so an existing key is not overwritten.
-6. **Deploy config** — copies `rpi-config.toml` to `~/.quantclaw/config.toml`, preserving any `api_key` already present in the file.
-7. **Install systemd service** — copies `quantclaw.service` to `/etc/systemd/system/`, then enables and restarts it.
-8. **Hardware permissions** — adds the deploy user to the `gpio` group, copies `99-act-led.rules` to `/etc/udev/rules.d/`, and resets the ACT LED trigger.
-
----
-
-## First-Time Setup
-
-After the first successful deploy, SSH into the Pi and fill in your API key:
-
-```bash
-ssh pi@raspberrypi.local
-nano ~/quantclaw/.env
-# Set: ANTHROPIC_API_KEY=sk-ant-...
-sudo systemctl restart quantclaw
-```
-
-The `.env` is loaded by the systemd service as an `EnvironmentFile`.
-
----
-
-## Interacting with QuantClaw on the Pi
-
-Once the service is running the gateway listens on port **8080**.
-
-### Health check
-
-```bash
-curl http://raspberrypi.local:8080/health
-```
-
-### Send a message
-
-```bash
-curl -s -X POST http://raspberrypi.local:8080/api/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"message": "What is the CPU temperature?"}' | jq .
-```
-
-### Stream a conversation
-
-```bash
-curl -N -s -X POST http://raspberrypi.local:8080/api/chat \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: text/event-stream' \
-  -d '{"message": "List connected hardware devices", "stream": true}'
-```
-
-### Follow service logs
-
-```bash
-ssh pi@raspberrypi.local 'journalctl -u quantclaw -f'
-```
-
----
-
-## Hardware Features
-
-### GPIO tools
-
-QuantClaw is deployed with the `peripheral-rpi` feature, which enables two LLM-callable tools:
-
-- **`gpio_read`** — reads a GPIO pin value via sysfs (`/sys/class/gpio/...`).
-- **`gpio_write`** — writes a GPIO pin value.
-
-These tools let the agent directly control hardware in response to natural-language instructions.
-
-### ACT LED
-
-The udev rule `99-act-led.rules` grants the `gpio` group write access to:
-
-```
-/sys/class/leds/ACT/trigger
-/sys/class/leds/ACT/brightness
-```
-
-This allows toggling the Pi's green ACT LED without `sudo`.
-
-### Aardvark I2C/SPI adapter
-
-If a Total Phase Aardvark adapter is connected, the `hardware` feature enables I2C/SPI communication with external devices. No extra setup is needed — the device is auto-detected via USB.
-
----
-
-## Files Deployed to the Pi
-
-| Remote path | Source | Description |
-|------------|--------|-------------|
-| `~/quantclaw/quantclaw` | compiled binary | Main agent binary |
-| `~/quantclaw/.env` | created on first deploy | API key and environment variables |
-| `~/.quantclaw/config.toml` | `rpi-config.toml` | Agent configuration |
-| `/etc/systemd/system/quantclaw.service` | `quantclaw.service` | systemd service unit |
-| `/etc/udev/rules.d/99-act-led.rules` | `99-act-led.rules` | ACT LED permissions |
-
----
-
-## Configuration
-
-`rpi-config.toml` is the production config template. Key defaults:
-
-- **Provider**: `anthropic-custom:https://api.z.ai/api/anthropic`
-- **Model**: `claude-3-5-sonnet-20241022`
-- **Autonomy**: `full`
-- **Allowed shell commands**: `git`, `cargo`, `npm`, `mkdir`, `touch`, `cp`, `mv`, `ls`, `cat`, `grep`, `find`, `echo`, `pwd`, `wc`, `head`, `tail`, `date`
-
-To customise, edit `~/.quantclaw/config.toml` directly on the Pi and restart the service.
-
----
-
-## Troubleshooting
-
-### Service won't start
-
-```bash
-ssh pi@raspberrypi.local 'sudo systemctl status quantclaw'
-ssh pi@raspberrypi.local 'journalctl -u quantclaw -n 50 --no-pager'
-```
-
-### GPIO permission denied
-
-Make sure the deploy user is in the `gpio` group and that a fresh login session has been started:
-
-```bash
-ssh pi@raspberrypi.local 'groups'
-# Should include: gpio
-```
-
-If the group was just added, log out and back in, or run `newgrp gpio`.
-
-### Wrong architecture / binary won't run
-
-Re-run the deploy script. Confirm the target:
-
-```bash
-ssh pi@raspberrypi.local 'file ~/quantclaw/quantclaw'
-# Expected: ELF 64-bit LSB pie executable, ARM aarch64
-```
-
-### Force a specific cross-compilation tool
-
-```bash
-CROSS_TOOL=zigbuild RPI_HOST=raspberrypi.local ./scripts/deploy-rpi.sh
-# or
-CROSS_TOOL=cross    RPI_HOST=raspberrypi.local ./scripts/deploy-rpi.sh
-```
-
-### Rebuild locally without deploying
-
-```bash
-cargo zigbuild --release \
-  --target aarch64-unknown-linux-gnu \
-  --features hardware,peripheral-rpi
-```
+- `BUILD_AARCH64_GUIDE.md`

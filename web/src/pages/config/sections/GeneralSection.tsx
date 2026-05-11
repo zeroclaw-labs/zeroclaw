@@ -4,6 +4,7 @@ import FieldRow from '../controls/FieldRow';
 import NumberInput from '../controls/NumberInput';
 import Slider from '../controls/Slider';
 import Select from '../controls/Select';
+import TextInput from '../controls/TextInput';
 import { t } from '@/lib/i18n';
 
 interface Props {
@@ -29,6 +30,8 @@ const PROVIDER_OPTIONS = [
   { value: 'groq', label: 'Groq' },
   { value: 'mistral', label: 'Mistral' },
   { value: 'deepseek', label: 'DeepSeek' },
+  { value: 'minimax', label: 'MiniMax Global' },
+  { value: 'minimax-cn', label: 'MiniMax China' },
   { value: 'xai', label: 'xAI (Grok)' },
   { value: 'together', label: 'Together AI' },
   { value: 'fireworks', label: 'Fireworks AI' },
@@ -39,7 +42,8 @@ const PROVIDER_OPTIONS = [
   { value: 'lmstudio', label: 'LM Studio' },
   { value: 'llamacpp', label: 'llama.cpp' },
   { value: 'vllm', label: 'vLLM' },
-  { value: 'qwen', label: 'Qwen' },
+  { value: 'qwen', label: 'Qwen China' },
+  { value: 'qwen-intl', label: 'Qwen International' },
   { value: 'deepinfra', label: 'DeepInfra' },
   { value: 'huggingface', label: 'Hugging Face' },
   { value: 'nvidia', label: 'NVIDIA NIM' },
@@ -48,6 +52,18 @@ const PROVIDER_OPTIONS = [
 ];
 
 // Models grouped by provider. Newest models listed first.
+const MINIMAX_MODELS = [
+  { value: 'MiniMax-M1', label: 'MiniMax M1' },
+  { value: 'MiniMax-Text-01', label: 'MiniMax Text 01' },
+];
+
+const QWEN_MODELS = [
+  { value: 'qwen-3.6-plus-preview', label: 'Qwen 3.6 Plus Preview' },
+  { value: 'qwen-max', label: 'Qwen Max' },
+  { value: 'qwen-plus', label: 'Qwen Plus' },
+  { value: 'qwen-turbo', label: 'Qwen Turbo' },
+];
+
 const MODELS_BY_PROVIDER: Record<string, { value: string; label: string }[]> = {
   openrouter: [
     { value: 'anthropic/claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
@@ -104,6 +120,9 @@ const MODELS_BY_PROVIDER: Record<string, { value: string; label: string }[]> = {
     { value: 'deepseek-chat', label: 'DeepSeek V3.2 Chat' },
     { value: 'deepseek-reasoner', label: 'DeepSeek R1 Reasoner' },
   ],
+  minimax: MINIMAX_MODELS,
+  'minimax-intl': MINIMAX_MODELS,
+  'minimax-cn': MINIMAX_MODELS,
   xai: [
     { value: 'grok-4.1-fast', label: 'Grok 4.1 Fast' },
     { value: 'grok-3', label: 'Grok 3' },
@@ -132,12 +151,9 @@ const MODELS_BY_PROVIDER: Record<string, { value: string; label: string }[]> = {
     { value: 'gpt-4o', label: 'GPT-4o' },
     { value: 'gpt-4o-mini', label: 'GPT-4o Mini' },
   ],
-  qwen: [
-    { value: 'qwen-3.6-plus-preview', label: 'Qwen 3.6 Plus Preview' },
-    { value: 'qwen-max', label: 'Qwen Max' },
-    { value: 'qwen-plus', label: 'Qwen Plus' },
-    { value: 'qwen-turbo', label: 'Qwen Turbo' },
-  ],
+  qwen: QWEN_MODELS,
+  'qwen-cn': QWEN_MODELS,
+  'qwen-intl': QWEN_MODELS,
   perplexity: [
     { value: 'sonar-pro', label: 'Sonar Pro' },
     { value: 'sonar', label: 'Sonar' },
@@ -152,6 +168,16 @@ export default function GeneralSection({ config, onUpdate }: Props) {
   const provider = (config.default_provider as string) ?? 'openrouter';
   const modelOptions = MODELS_BY_PROVIDER[provider];
   const currentModel = (config.default_model as string) ?? '';
+  const providerKeyHint: Record<string, string> = {
+    deepseek: t('config.field.api_key.hint.deepseek'),
+    qwen: t('config.field.api_key.hint.qwen'),
+    'qwen-cn': t('config.field.api_key.hint.qwen'),
+    'qwen-intl': t('config.field.api_key.hint.qwen'),
+    minimax: t('config.field.api_key.hint.minimax'),
+    'minimax-intl': t('config.field.api_key.hint.minimax'),
+    'minimax-cn': t('config.field.api_key.hint.minimax'),
+  };
+  const apiKeyHint = providerKeyHint[provider] ?? t('config.field.api_key.hint.default');
 
   // When provider changes, auto-select the first model for that provider
   const handleProviderChange = (v: string) => {
@@ -204,6 +230,14 @@ export default function GeneralSection({ config, onUpdate }: Props) {
           min={0}
           max={2}
           step={0.1}
+        />
+      </FieldRow>
+      <FieldRow label={t('config.field.api_key')} description={apiKeyHint}>
+        <TextInput
+          value={String((config.api_key as string) ?? '')}
+          onChange={(v) => onUpdate('api_key', v)}
+          placeholder={t('config.field.api_key.placeholder')}
+          masked
         />
       </FieldRow>
       <FieldRow label={t('config.field.provider_timeout_secs')} description={t('config.field.provider_timeout_secs.desc')}>

@@ -1,237 +1,118 @@
-# QuantClaw aarch64 (树莓派) 编译指南
+# QuantClaw aarch64（树莓派）完整指南
 
-## 方法一：使用 GitHub Actions 自动构建 (推荐)
+本文件沉淀了本次实际排障与上线结果，目标是下次按文档可直接复现。
 
-最简单的办法是将代码推送到 GitHub，使用 GitHub Actions 自动编译 aarch64 版本。
+## 最终可用方案（已验证）
 
-已为你创建了 `.github/workflows/build-aarch64.yml`：
+- 宿主机：Windows 11 + Docker Desktop
+- 目标机：Raspberry Pi aarch64（512MB 可运行，建议按需加 swapfile）
+- 服务名：`quantclaw-rust`（避免和已有 `quantclaw` 配网程序冲突）
+- 运行根目录：`/home/<user>/quantclaw_rust_app`
 
-```yaml
-name: Build aarch64 Release
+## 一键流程
 
-on:
-  push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
+### 1) Windows 编译打包
 
-jobs:
-  build-aarch64:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-      
-      - name: Build aarch64 binary
-        uses: docker/build-push-action@v5
-        with:
-          file: ./Dockerfile.build-aarch64
-          tags: quantclaw:aarch64
-          load: true
-      
-      - name: Extract binary
-        run: |
-          docker create --name extract quantclaw:aarch64
-          docker cp extract:/quantclaw ./quantclaw-aarch64
-          docker rm extract
-      
-      - name: Create Release Package
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          PKG_NAME="quantclaw-${VERSION}-aarch64-linux-gnu"
-          mkdir -p "$PKG_NAME"
-          cp quantclaw-aarch64 "$PKG_NAME/quantclaw"
-          cp -r web/dist "$PKG_NAME/"
-          cp scripts/quantclaw.service "$PKG_NAME/"
-          cat > "$PKG_NAME/install.sh" << 'EOF'
-          #!/bin/bash
-          set -e
-          sudo cp quantclaw /usr/local/bin/
-          sudo chmod +x /usr/local/bin/quantclaw
-          mkdir -p ~/.quantclaw
-          echo "安装完成!"
-          EOF
-          chmod +x "$PKG_NAME/install.sh"
-          tar czf "${PKG_NAME}.tar.gz" "$PKG_NAME"
-      
-      - name: Upload Release
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: quantclaw-*-aarch64-linux-gnu.tar.gz
+在仓库根目录执行：
+
+```powershell
+.\scripts\build-release-aarch64.ps1
 ```
 
-**使用方法：**
-1. 推送代码到 GitHub
-2. 创建一个标签: `git tag v0.1.0 && git push origin v0.1.0`
-3. GitHub Actions 会自动编译并发布
+产物：
 
----
+```text
+dist\quantclaw-<version>-aarch64-linux-gnu.tar.gz
+```
 
-## 方法二：本地交叉编译
+### 2) Windows 一键部署
 
-### macOS 用户
+```powershell
+.\scripts\deploy-rpi.ps1 -RpiHost raspberrypi.local -RpiUser quant
+```
 
-#### 1. 安装交叉编译工具
+可选：512MB 设备加 swapfile（不会改分区）：
+
+```powershell
+.\scripts\deploy-rpi.ps1 -RpiHost raspberrypi.local -RpiUser quant -EnsureSwap -SwapSizeMB 1024
+```
+
+### 3) 部署后验证
 
 ```bash
-# 安装 Homebrew (如果还没有)
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-# 安装 zig (用于交叉编译)
-brew install zig
-
-# 安装 cargo-zigbuild
-cargo install cargo-zigbuild
-
-# 添加 aarch64 目标
-rustup target add aarch64-unknown-linux-gnu
+sudo systemctl status quantclaw-rust --no-pager
+sudo ss -lntp | grep quantclaw
+curl http://127.0.0.1:42617/health
 ```
 
-#### 2. 编译
+### 4) 开机自启检查
 
 ```bash
-cd /Users/shuangdada/Desktop/quantclaw/quantclaw
-
-# 使用 zigbuild 交叉编译
-cargo zigbuild \
-  --target aarch64-unknown-linux-gnu \
-  --features "hardware,peripheral-rpi" \
-  --release
-
-# 输出文件: target/aarch64-unknown-linux-gnu/release/quantclaw
+sudo systemctl is-enabled quantclaw-rust
+sudo systemctl enable --now quantclaw-rust
 ```
 
-#### 3. 创建安装包
+## 首次配置 API Key
 
-```bash
-VERSION=$(grep "^version" Cargo.toml | head -1 | cut -d'"' -f2)
-PKG_NAME="quantclaw-${VERSION}-aarch64-linux-gnu"
-mkdir -p "dist/$PKG_NAME"
+默认 `.env` 在：
 
-cp target/aarch64-unknown-linux-gnu/release/quantclaw "dist/$PKG_NAME/"
-cp -r web/dist "dist/$PKG_NAME/"
-cp scripts/quantclaw.service "dist/$PKG_NAME/"
-
-cd dist
-tar czf "${PKG_NAME}.tar.gz" "$PKG_NAME"
+```text
+/home/<user>/quantclaw_rust_app/.env
 ```
 
----
+示例（OpenAI）：
 
-### Linux 用户
-
-```bash
-# Ubuntu/Debian
-sudo apt-get update
-sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-
-# 添加目标
-rustup target add aarch64-unknown-linux-gnu
-
-# 设置环境变量
-export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-
-# 编译
-cargo build --target aarch64-unknown-linux-gnu --features "hardware,peripheral-rpi" --release
+```env
+OPENAI_API_KEY=你的Key
 ```
 
----
+如果使用 OpenRouter，请改成：
 
-## 方法三：直接在树莓派上编译
-
-如果你有树莓派，可以直接在设备上编译：
-
-```bash
-# 在树莓派上执行
-sudo apt-get update
-sudo apt-get install -y rustc cargo pkg-config libssl-dev
-
-git clone https://github.com/quant-speed/quantclaw.git
-cd quantclaw
-
-cargo build --release --features "hardware,peripheral-rpi"
-
-# 安装
-sudo cp target/release/quantclaw /usr/local/bin/
+```env
+OPENROUTER_API_KEY=你的Key
 ```
 
----
+并确保 `config.toml` 里的 `default_provider` 对应一致，避免 key 前缀不匹配。
 
-## 安装到树莓派
+## 本次排障结论（过程记录）
 
-```bash
-# 1. 复制安装包到树莓派
-scp quantclaw-*-aarch64-linux-gnu.tar.gz pi@raspberrypi.local:~/
+### 构建链路
 
-# 2. SSH 到树莓派
-ssh pi@raspberrypi.local
+- 修复 OpenSSL 交叉编译路径（`pkg-config`/`OPENSSL_*`）；
+- 修复 `Cargo.toml` 与 `Cargo.lock` 不一致导致 `--locked` 失败；
+- 修复 Windows 下 `firmware` 链接退化为文本文件导致 Docker 构建报 `Not a directory`；
+- 统一 aarch64 构建入口到 `Dockerfile.build-aarch64`。
 
-# 3. 安装
-tar xzf quantclaw-*-aarch64-linux-gnu.tar.gz
-cd quantclaw-*-aarch64-linux-gnu
-sudo ./install.sh
+### 部署链路
 
-# 4. 配置 API 密钥
-sudo nano /root/.quantclaw/config.toml
+- 修复旧服务模板里 `gateway --host/--port` 参数不兼容当前 CLI；
+- 改为 `ExecStart=/usr/local/bin/quantclaw gateway`，端口和 host 从 `config.toml` 读取；
+- 服务改名为 `quantclaw-rust`，避免与旧 `quantclaw` 服务冲突；
+- 运行目录固定为 `quantclaw_rust_app`，并采用 `releases/current` 结构便于升级回滚。
 
-# 5. 启动服务
-sudo systemctl start quantclaw
-sudo systemctl enable quantclaw
+## 目录结构（Pi）
+
+```text
+/home/<user>/quantclaw_rust_app/
+  |- releases/
+  |   |- quantclaw-<version>-aarch64-linux-gnu/
+  |- current -> releases/quantclaw-<version>-aarch64-linux-gnu
+  |- .env
+  |- .quantclaw/
+      |- config.toml
+      |- workspace/
 ```
 
----
+## 常见故障速查
 
-## 快速脚本
+- `unexpected argument '--host'`：
+  - 原因：旧服务模板；
+  - 处理：使用 `quantclaw-rust.service` 模板并重载 systemd。
 
-使用项目提供的脚本：
+- `API key prefix mismatch`：
+  - 原因：`default_provider` 与 `.env` key 类型不一致；
+  - 处理：对齐 provider 和环境变量名。
 
-```bash
-# 自动交叉编译并部署到树莓派
-RPI_HOST=raspberrypi.local RPI_USER=pi ./scripts/deploy-rpi.sh
-```
-
----
-
-## 常见问题
-
-### 1. 缺少交叉编译器
-
-**错误:** `failed to find tool "aarch64-linux-gnu-gcc"`
-
-**解决:**
-- macOS: `brew install zig && cargo install cargo-zigbuild`
-- Linux: `sudo apt-get install gcc-aarch64-linux-gnu`
-
-### 2. ring crate 编译失败
-
-**错误:** `error: failed to run custom build command for ring`
-
-**解决:** 使用 zigbuild 替代原生交叉编译
-
-### 3. Docker 构建失败
-
-**解决:** 确保 Docker Desktop 已启动，或改用本地交叉编译
-
----
-
-## 支持的功能
-
-aarch64 版本支持以下特性：
-- `hardware` - 硬件设备支持
-- `peripheral-rpi` - 树莓派外设 (GPIO, I2C, SPI)
-- 所有标准通道和工具
-
----
-
-## 系统要求
-
-- Raspberry Pi 4/5 (64位模式)
-- Raspberry Pi OS (64-bit) 或 Ubuntu Server 22.04/24.04
-- 至少 2GB RAM (建议 4GB)
-- 2GB 可用存储空间
+- `curl 127.0.0.1:42617` 不通：
+  - 原因：服务未起或参数错误；
+  - 处理：先看 `journalctl -u quantclaw-rust -n 120 -l --no-pager`。

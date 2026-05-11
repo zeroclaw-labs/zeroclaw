@@ -1,4 +1,4 @@
-/target
+﻿/target
 /target-*/
 firmware/*/target
 web/dist/*
@@ -61,3 +61,10 @@ rust_out
 
 # Auto-generated Tauri schemas
 apps/tauri/gen/schemas/linux-schema.json
+dist/
+*.tar.gz
+erro.txt
+dist/
+*.tar.gz
+erro.txt
+

@@ -30,7 +30,10 @@ http-body-util = "0.1"
 
 # TLS
 native-tls = { version = "0.2" }
+rustls = "0.22"
+rustls-pemfile = "2"
 tokio-native-tls = { version = "0.3" }
+tokio-rustls = "0.25"
 
 # Frontend asset MIME type detection (dashboard served from filesystem)
 mime_guess = "2"

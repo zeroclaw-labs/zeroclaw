@@ -8,8 +8,8 @@
 # Or set api_key directly below (not recommended for version control).
 
 # api_key = ""
-default_provider = "anthropic-custom:https://api.z.ai/api/anthropic"
-default_model = "claude-3-5-sonnet-20241022"
+default_provider = "openai"
+default_model = "gpt-4o-mini"
 default_temperature = 0.4
 model_routes = []
 embedding_routes = []
@@ -425,7 +425,7 @@ tls = false
 provider = "none"
 
 [gateway]
-port = 8080
+port = 42617
 host = "0.0.0.0"
 require_pairing = false
 trusted_ips = ["0.0.0.0/0"]

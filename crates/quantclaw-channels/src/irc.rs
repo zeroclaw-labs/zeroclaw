@@ -270,8 +270,8 @@ impl IrcChannel {
         let tcp = tokio::net::TcpStream::connect(&addr).await?;
 
         let tls_config = if self.verify_tls {
-            let root_store: rustls::RootCertStore =
-                webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
