@@ -24,37 +24,45 @@ echo "版本: $VERSION"
 echo "包名: $PKG_NAME"
 echo ""
 
-# 确保 web/dist 存在
-if [[ ! -d "web/dist" ]]; then
-    echo "[*] 构建前端..."
-    if [[ -d "web" ]]; then
-        (cd web && npm ci && npm run build)
-    else
-        echo "[!] web 目录不存在"
-        exit 1
-    fi
+if [[ ! -d "firmware" ]]; then
+    echo "[!] 缺少 firmware/ 目录，无法继续构建"
+    exit 1
 fi
 
-# 使用 Docker 构建 aarch64 二进制
-echo "[*] 使用 Docker 交叉编译 aarch64 版本..."
+for p in "crates/quantclaw-hardware/firmware" "crates/quantclaw-runtime/firmware" "crates/quantclaw-runtime/src/firmware"; do
+    if [[ -f "$p" ]]; then
+        target="$(tr -d '\r\n' < "$p")"
+        echo "[!] 检测到 firmware 指针文件: $p -> $target"
+        echo "    Dockerfile 将在构建阶段自动修复为软链接"
+    fi
+done
+
+# 使用 Docker 构建完整 aarch64 发布产物
+echo "[*] 使用 Docker 构建 aarch64 二进制和 Web 资源..."
 echo "    这可能需要几分钟..."
 echo ""
 
 docker build -f Dockerfile.build-aarch64 -t quantclaw-builder:aarch64 . --progress=plain
 
-# 提取二进制文件
+# 提取发布产物
 echo ""
 echo "[*] 提取编译结果..."
 mkdir -p "$PKG_DIR"
+mkdir -p "$PKG_DIR/web"
 
 # 从镜像中提取
+docker rm extract-aarch64 2>/dev/null || true
 docker create --name extract-aarch64 quantclaw-builder:aarch64 2>/dev/null || true
 docker cp extract-aarch64:/quantclaw "$PKG_DIR/quantclaw" 2>/dev/null || {
     # 如果 scratch 镜像无法创建容器，使用 builder 阶段
     docker build -f Dockerfile.build-aarch64 --target builder -t quantclaw-builder:temp .
     docker create --name extract-temp quantclaw-builder:temp
-    docker cp extract-temp:/app/quantclaw "$PKG_DIR/quantclaw"
+    docker cp extract-temp:/out-quantclaw "$PKG_DIR/quantclaw"
     docker rm extract-temp
+}
+docker cp extract-aarch64:/web-dist "$PKG_DIR/web/dist" 2>/dev/null || {
+    echo "[!] 提取 web/dist 失败"
+    exit 1
 }
 docker rm extract-aarch64 2>/dev/null || true
 docker rmi quantclaw-builder:aarch64 2>/dev/null || true
@@ -73,8 +81,8 @@ ls -lh "$PKG_DIR/quantclaw"
 # 复制额外文件
 echo ""
 echo "[*] 准备发布包..."
-cp -r web/dist "$PKG_DIR/" 2>/dev/null || echo "[!] 跳过 web/dist"
-cp scripts/quantclaw.service "$PKG_DIR/" 2>/dev/null || echo "[!] 跳过服务文件"
+cp scripts/quantclaw-rust.service "$PKG_DIR/" 2>/dev/null || echo "[!] 跳过服务文件"
+cp scripts/rpi-config.toml "$PKG_DIR/" 2>/dev/null || echo "[!] 跳过树莓派配置模板"
 cp README.md "$PKG_DIR/" 2>/dev/null || echo "[!] 跳过 README"
 cp LICENSE-MIT "$PKG_DIR/" 2>/dev/null || echo "[!] 跳过 LICENSE"
 
@@ -86,7 +94,13 @@ set -e
 
 INSTALL_DIR="/usr/local/bin"
 SERVICE_DIR="/etc/systemd/system"
-QUANTCLAW_USER="${QUANTCLAW_USER:-root}"
+QUANTCLAW_USER="${QUANTCLAW_USER:-pi}"
+QUANTCLAW_HOME="$(getent passwd "$QUANTCLAW_USER" | cut -d: -f6 2>/dev/null || printf '/home/%s' "$QUANTCLAW_USER")"
+INSTALL_SOURCE_DIR="$(pwd)"
+APP_ROOT="${QUANTCLAW_APP_ROOT:-${QUANTCLAW_HOME}/quantclaw_rust_app}"
+APP_DIR="${QUANTCLAW_APP_DIR:-${APP_ROOT}/current}"
+CONFIG_DIR="${QUANTCLAW_CONFIG_DIR:-${APP_ROOT}/.quantclaw}"
+ENV_FILE="${APP_ROOT}/.env"
 
 echo "=== QuantClaw 树莓派安装 ==="
 echo ""
@@ -111,15 +125,30 @@ echo "[*] 安装 quantclaw..."
 cp quantclaw "$INSTALL_DIR/"
 chmod +x "$INSTALL_DIR/quantclaw"
 
+# 创建运行目录
+echo "[*] 创建运行目录..."
+mkdir -p "$APP_ROOT"
+ln -sfn "$INSTALL_SOURCE_DIR" "$APP_DIR"
+if [[ ! -f "$ENV_FILE" ]]; then
+    cat > "$ENV_FILE" << 'ENVEOF'
+# Provider key (set one)
+OPENAI_API_KEY=
+ENVEOF
+    chmod 600 "$ENV_FILE"
+fi
+
 # 创建配置目录
 echo "[*] 创建配置目录..."
-mkdir -p "/root/.quantclaw"
-mkdir -p "/root/.quantclaw/workspace"
+mkdir -p "$CONFIG_DIR"
+mkdir -p "$CONFIG_DIR/workspace"
 
 # 创建默认配置（如果不存在）
-if [[ ! -f "/root/.quantclaw/config.toml" ]]; then
+if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
     echo "[*] 创建默认配置..."
-    cat > "/root/.quantclaw/config.toml" << 'CONFIGEOF'
+    if [[ -f "rpi-config.toml" ]]; then
+        cp "rpi-config.toml" "$CONFIG_DIR/config.toml"
+    else
+        cat > "$CONFIG_DIR/config.toml" << 'CONFIGEOF'
 api_key = ""
 default_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4-20250514"
@@ -138,7 +167,9 @@ web_dist_dir = "/usr/local/share/quantclaw/web/dist"
 [observability]
 backend = "none"
 CONFIGEOF
+    fi
 fi
+chmod 600 "$CONFIG_DIR/config.toml" 2>/dev/null || true
 
 # 安装 web 资源
 if [[ -d "web/dist" ]]; then
@@ -148,16 +179,28 @@ if [[ -d "web/dist" ]]; then
 fi
 
 # 安装服务
-if [[ -f "quantclaw.service" ]]; then
+if [[ -f "quantclaw-rust.service" ]]; then
     echo "[*] 安装 systemd 服务..."
-    cp quantclaw.service "$SERVICE_DIR/"
-    sed -i "s|/usr/local/bin/quantclaw|$INSTALL_DIR/quantclaw|g" "$SERVICE_DIR/quantclaw.service" 2>/dev/null || true
+    cp quantclaw-rust.service "$SERVICE_DIR/quantclaw-rust.service"
+    systemctl disable quantclaw 2>/dev/null || true
+    rm -f "$SERVICE_DIR/quantclaw.service"
+    sed -i \
+        -e "s|^User=.*|User=${QUANTCLAW_USER}|" \
+        -e "s|^WorkingDirectory=.*|WorkingDirectory=${APP_DIR}|" \
+        -e "s|^ExecStart=.*|ExecStart=${INSTALL_DIR}/quantclaw gateway --config-dir ${CONFIG_DIR}|" \
+        -e "s|^EnvironmentFile=.*|EnvironmentFile=${ENV_FILE}|" \
+        -e "s|^Environment=HOME=.*|Environment=HOME=${QUANTCLAW_HOME}|" \
+        "$SERVICE_DIR/quantclaw-rust.service" 2>/dev/null || true
+    if ! grep -q '^Environment=QUANTCLAW_CONFIG_DIR=' "$SERVICE_DIR/quantclaw-rust.service"; then
+        sed -i "/^Environment=RUST_LOG=.*/a Environment=QUANTCLAW_CONFIG_DIR=${CONFIG_DIR}" "$SERVICE_DIR/quantclaw-rust.service"
+    fi
     systemctl daemon-reload
-    systemctl enable quantclaw
+    systemctl enable quantclaw-rust
 fi
 
 # 设置权限
-chown -R "$QUANTCLAW_USER:$QUANTCLAW_USER" "/root/.quantclaw" 2>/dev/null || true
+chown -R "$QUANTCLAW_USER:$QUANTCLAW_USER" "$APP_DIR" 2>/dev/null || true
+chown -R "$QUANTCLAW_USER:$QUANTCLAW_USER" "$CONFIG_DIR" 2>/dev/null || true
 
 echo ""
 echo "=== 安装完成! ==="
@@ -168,11 +211,11 @@ echo "    quantclaw gateway             # 启动网关服务"
 echo "    quantclaw daemon              # 启动守护进程"
 echo ""
 echo "服务管理:"
-echo "    sudo systemctl start quantclaw   # 启动服务"
-echo "    sudo systemctl stop quantclaw    # 停止服务"
-echo "    sudo systemctl status quantclaw  # 查看状态"
+echo "    sudo systemctl start quantclaw-rust   # 启动服务"
+echo "    sudo systemctl stop quantclaw-rust    # 停止服务"
+echo "    sudo systemctl status quantclaw-rust  # 查看状态"
 echo ""
-echo "配置位置: /root/.quantclaw/config.toml"
+echo "配置位置: ${CONFIG_DIR}/config.toml"
 echo "网关地址: http://$(hostname -I | awk '{print $1}'):42617"
 echo ""
 INSTALLEOF
@@ -193,11 +236,13 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 echo "[*] 停止服务..."
-systemctl stop quantclaw 2>/dev/null || true
+systemctl stop quantclaw-rust 2>/dev/null || true
+systemctl disable quantclaw-rust 2>/dev/null || true
 systemctl disable quantclaw 2>/dev/null || true
 
 echo "[*] 删除文件..."
 rm -f "/usr/local/bin/quantclaw"
+rm -f "/etc/systemd/system/quantclaw-rust.service"
 rm -f "/etc/systemd/system/quantclaw.service"
 rm -rf "/usr/local/share/quantclaw"
 
@@ -207,8 +252,8 @@ systemctl daemon-reload
 echo ""
 echo "=== 卸载完成 ==="
 echo ""
-echo "注意: 配置文件保留在 /root/.quantclaw/"
-echo "      如需完全删除，请手动执行: rm -rf /root/.quantclaw"
+echo "注意: 配置文件和运行目录会被保留"
+echo "      如需完全删除，请手动删除 ~/quantclaw_rust_app"
 echo ""
 UNINSTALLEOF
 
@@ -232,10 +277,10 @@ QuantClaw for Raspberry Pi (aarch64)
    sudo ./install.sh
 
 3. 编辑配置文件设置 API 密钥:
-   sudo nano /root/.quantclaw/config.toml
+   sudo nano ~/.quantclaw/config.toml
 
 4. 启动服务:
-   sudo systemctl start quantclaw
+   sudo systemctl start quantclaw-rust
 
 访问:
 - 网关界面: http://<树莓派IP>:42617
@@ -267,5 +312,5 @@ echo "    2. SSH 到树莓派: ssh pi@raspberrypi.local"
 echo "    3. 解压并安装:"
 echo "         tar xzf ${PKG_NAME}.tar.gz"
 echo "         cd ${PKG_NAME}"
-echo "         sudo ./install.sh"
+echo "         QUANTCLAW_USER=pi sudo ./install.sh"
 echo ""

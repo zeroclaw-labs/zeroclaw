@@ -1,4 +1,4 @@
-/target
+﻿/target
 /target-*/
 firmware/*/target
 web/dist/*
@@ -47,14 +47,6 @@ credentials.json
 # Coverage artifacts
 lcov.info
 
-# Local deployment artifacts
-dist/
-*.tar
-*.tar.gz
-*.tgz
-*.zip
-erro.txt
-
 # IDE's stuff
 .idea
 
@@ -69,3 +61,10 @@ rust_out
 
 # Auto-generated Tauri schemas
 apps/tauri/gen/schemas/linux-schema.json
+dist/
+*.tar.gz
+erro.txt
+dist/
+*.tar.gz
+erro.txt
+

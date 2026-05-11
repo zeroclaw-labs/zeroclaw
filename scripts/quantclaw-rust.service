@@ -1,5 +1,5 @@
 [Unit]
-Description=QuantClaw AI Hardware Agent
+Description=QuantClaw Rust Agent
 Documentation=https://github.com/quantclaw/quantclaw
 After=network-online.target
 Wants=network-online.target
@@ -8,14 +8,12 @@ Wants=network-online.target
 Type=simple
 User=pi
 SupplementaryGroups=gpio spi i2c
-WorkingDirectory=/home/pi/quantclaw
-ExecStart=/usr/local/bin/quantclaw gateway --host 0.0.0.0 --port 42617
+WorkingDirectory=/home/pi/quantclaw_rust_app/current
+ExecStart=/usr/local/bin/quantclaw gateway --config-dir /home/pi/quantclaw_rust_app/.quantclaw
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=/home/pi/quantclaw/.env
+EnvironmentFile=/home/pi/quantclaw_rust_app/.env
 Environment=RUST_LOG=info
-
-# Expand ~ in config path
 Environment=HOME=/home/pi
 
 [Install]
