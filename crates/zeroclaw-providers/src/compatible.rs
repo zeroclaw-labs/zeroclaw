@@ -3026,6 +3026,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            reasoning: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -3053,6 +3054,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            reasoning: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -3080,6 +3082,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            reasoning: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -3121,6 +3124,7 @@ mod tests {
                 },
             ]),
             reasoning_content: None,
+            reasoning: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -4132,6 +4136,7 @@ mod tests {
         let message = ResponseMessage {
             content: Some("answer".to_string()),
             reasoning_content: Some("thinking step".to_string()),
+            reasoning: None,
             tool_calls: Some(vec![ToolCall {
                 id: Some("call_1".to_string()),
                 kind: Some("function".to_string()),
@@ -4158,6 +4163,7 @@ mod tests {
         let message = ResponseMessage {
             content: Some("hello".to_string()),
             reasoning_content: None,
+            reasoning: None,
             tool_calls: None,
         };
 
