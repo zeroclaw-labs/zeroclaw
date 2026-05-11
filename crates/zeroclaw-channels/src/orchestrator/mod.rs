@@ -1587,11 +1587,16 @@ fn build_models_help_response(
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
     let mut response = String::new();
-    let _ = writeln!(
-        response,
-        "Current provider: `{}`\nCurrent model: `{}`",
-        current.provider, current.model
-    );
+    response.push_str(&i18n::get_required_cli_string_with_args(
+        "cli-channel-current-provider",
+        &[("provider", &current.provider)],
+    ));
+    response.push('\n');
+    response.push_str(&i18n::get_required_cli_string_with_args(
+        "cli-channel-current-model",
+        &[("model", &current.model)],
+    ));
+    response.push('\n');
     response.push_str("\nSwitch model with `/model <model-id>` or `/model <hint>`.\n");
 
     if !model_routes.is_empty() {
@@ -1628,14 +1633,20 @@ fn build_models_help_response(
 
 fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     let mut response = String::new();
-    let _ = writeln!(
-        response,
-        "Current provider: `{}`\nCurrent model: `{}`",
-        current.provider, current.model
-    );
+    response.push_str(&i18n::get_required_cli_string_with_args(
+        "cli-channel-current-provider",
+        &[("provider", &current.provider)],
+    ));
+    response.push('\n');
+    response.push_str(&i18n::get_required_cli_string_with_args(
+        "cli-channel-current-model",
+        &[("model", &current.model)],
+    ));
+    response.push('\n');
     response.push_str("\nSwitch provider with `/models <provider>`.\n");
     response.push_str("Switch model with `/model <model-id>`.\n\n");
-    response.push_str("Available providers:\n");
+    response.push_str(&i18n::get_required_cli_string("cli-channel-available-providers"));
+    response.push('\n');
     for provider in zeroclaw_providers::list_providers() {
         if provider.aliases.is_empty() {
             let _ = writeln!(response, "- {}", provider.name);
@@ -1658,12 +1669,19 @@ fn build_config_text_response(
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
     let mut resp = String::new();
-    let _ = writeln!(
-        resp,
-        "Current provider: `{}`\nCurrent model: `{}`",
-        current.provider, current.model
-    );
-    resp.push_str("\nAvailable providers:\n");
+    resp.push_str(&i18n::get_required_cli_string_with_args(
+        "cli-channel-current-provider",
+        &[("provider", &current.provider)],
+    ));
+    resp.push('\n');
+    resp.push_str(&i18n::get_required_cli_string_with_args(
+        "cli-channel-current-model",
+        &[("model", &current.model)],
+    ));
+    resp.push('\n');
+    resp.push('\n');
+    resp.push_str(&i18n::get_required_cli_string("cli-channel-available-providers"));
+    resp.push('\n');
     for p in zeroclaw_providers::list_providers() {
         let _ = writeln!(resp, "- `{}`", p.name);
     }
@@ -1877,9 +1895,9 @@ async fn handle_runtime_command_if_needed(
                 }
                 set_route_selection(ctx, &sender_key, current.clone());
 
-                format!(
-                    "Model switched to `{}` (provider: `{}`). Context preserved.",
-                    current.model, current.provider
+                i18n::get_required_cli_string_with_args(
+                    "cli-channel-model-switched",
+                    &[("model", &current.model), ("provider", &current.provider)],
                 )
             }
         }
@@ -1904,7 +1922,7 @@ async fn handle_runtime_command_if_needed(
                 tracing::warn!("Failed to delete persisted session for {sender_key}: {e}");
             }
             mark_sender_for_new_session(ctx, &sender_key);
-            "Conversation history cleared. Starting fresh.".to_string()
+            i18n::get_required_cli_string("cli-channel-history-cleared")
         }
     };
 
@@ -3978,9 +3996,9 @@ async fn run_message_dispatch_loop(
             };
             let reply = if let Some(state) = previous {
                 state.cancellation.cancel();
-                "Stop signal sent.".to_string()
+                i18n::get_required_cli_string("cli-channel-stop-signal-sent")
             } else {
-                "No in-flight task for this sender scope.".to_string()
+                i18n::get_required_cli_string("cli-channel-no-in-flight-task")
             };
             let channel = ctx
                 .channels_by_name

@@ -305,3 +305,11 @@ channel-whatsapp-web-feature-missing-warning =   ⚠ WhatsApp Web is configured 
 channel-whatsapp-web-feature-missing-build =     Build/run with: cargo build --features whatsapp-web
 channel-whatsapp-web-feature-missing-install =     If installed to PATH, reinstall with: cargo install --path . --force --locked --features whatsapp-web
 channel-whatsapp-web-feature-missing-error = WhatsApp Web channel requires the 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)
+
+cli-channel-history-cleared = Conversation history cleared. Starting fresh.
+cli-channel-stop-signal-sent = Stop signal sent.
+cli-channel-no-in-flight-task = No in-flight task for this sender scope.
+cli-channel-current-provider = Current provider: `{$provider}`
+cli-channel-current-model = Current model: `{$model}`
+cli-channel-available-providers = Available providers:
+cli-channel-model-switched = Model switched to `{$model}` (provider: `{$provider}`). Context preserved.
