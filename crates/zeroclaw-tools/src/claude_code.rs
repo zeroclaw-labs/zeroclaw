@@ -169,7 +169,6 @@ impl Tool for ClaudeCodeTool {
             self.security.workspace_dir.clone()
         };
 
-
         // Build CLI command
         let claude_bin = if cfg!(target_os = "windows") {
             "claude.cmd"

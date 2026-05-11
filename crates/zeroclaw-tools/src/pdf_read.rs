@@ -287,7 +287,11 @@ mod tests {
         let result = tool.execute(json!({"path": target})).await.unwrap();
         assert!(!result.success);
         assert!(
-            result.error.as_deref().unwrap_or("").contains("Path blocked"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked"),
             "expected 'Path blocked' error, got: {:?}",
             result.error
         );
@@ -303,7 +307,11 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(
-            result.error.as_deref().unwrap_or("").contains("Path blocked"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked"),
             "expected 'Path blocked' error, got: {:?}",
             result.error
         );

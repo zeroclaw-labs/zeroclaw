@@ -130,7 +130,6 @@ impl Tool for CodexCliTool {
             self.security.workspace_dir.clone()
         };
 
-
         // Build CLI command
         let codex_bin = if cfg!(target_os = "windows") {
             "codex.cmd"

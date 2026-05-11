@@ -165,5 +165,4 @@ mod tests {
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("read-only"));
     }
-
 }

@@ -136,7 +136,6 @@ impl Tool for FileWriteTool {
             });
         }
 
-
         match tokio::fs::write(&resolved_target, content).await {
             Ok(()) => Ok(ToolResult {
                 success: true,

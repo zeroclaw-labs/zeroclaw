@@ -158,7 +158,6 @@ impl Tool for FileEditTool {
             });
         }
 
-
         // ── 9. Read → match → replace → write ─────────────────────
         let content = match tokio::fs::read_to_string(&resolved_target).await {
             Ok(c) => c,
