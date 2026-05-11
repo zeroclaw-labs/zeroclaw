@@ -664,7 +664,7 @@ export default function Cron() {
                             prev === job.id ? null : job.id,
                           )
                         }
-                        className="flex items-center gap-1 btn-icon max-w-full"
+                        className="flex min-w-0 items-center gap-1 btn-icon max-w-full"
                         title="Toggle run history"
                       >
                         {expandedJob === job.id ? (
@@ -672,7 +672,7 @@ export default function Cron() {
                         ) : (
                           <ChevronRight className="h-3.5 w-3.5 shrink-0" />
                         )}
-                        <span className='truncate'>
+                        <span className='min-w-0 truncate'>
                           {job.id}
                         </span>
                       </button>
