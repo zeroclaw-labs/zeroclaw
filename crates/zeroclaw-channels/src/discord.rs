@@ -226,6 +226,30 @@ impl DiscordChannel {
             .insert(channel_id.to_string(), is_thread);
         is_thread
     }
+
+    /// Apply the trust-boundary / delivery-failure emoji reactions to the
+    /// bot's just-sent message. Best-effort: reaction failures are debug
+    /// logged but never propagated. `message_id` being `None` (e.g. when
+    /// every chunk failed to post) skips the reaction step entirely.
+    async fn apply_failure_reactions(
+        &self,
+        channel_id: &str,
+        message_id: Option<&str>,
+        reactions: &[&'static str],
+    ) {
+        let Some(message_id) = message_id else {
+            return;
+        };
+        for emoji in reactions {
+            if let Err(e) = self.add_reaction(channel_id, message_id, emoji).await {
+                tracing::debug!(
+                    emoji,
+                    error = %e,
+                    "discord: failed to add failure reaction to outgoing message"
+                );
+            }
+        }
+    }
 }
 
 /// Whether a Discord channel type integer identifies a thread.
@@ -506,63 +530,114 @@ enum DiscordMarkerTarget {
     Http(String),
 }
 
+/// Why a marker target was rejected. Drives the user-facing emoji reaction
+/// on the bot's outgoing message: `Refused` (trust-boundary rejection) maps
+/// to 🚫, `NotFound` (path didn't resolve on disk) maps to ⚠️. The
+/// distinction matters because a chatter should see at a glance that the
+/// bot deliberately declined a target rather than tried and failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscordMarkerFailure {
+    /// Trust-boundary refusal: disallowed scheme, relative path, missing
+    /// workspace_dir, or canonicalised path outside the workspace.
+    Refused,
+    /// Path passed scheme/absolute/workspace checks but did not resolve
+    /// to anything on disk.
+    NotFound,
+}
+
+#[derive(Debug)]
+enum DiscordMarkerError {
+    Refused(anyhow::Error),
+    NotFound(anyhow::Error),
+}
+
+impl DiscordMarkerError {
+    fn kind(&self) -> DiscordMarkerFailure {
+        match self {
+            Self::Refused(_) => DiscordMarkerFailure::Refused,
+            Self::NotFound(_) => DiscordMarkerFailure::NotFound,
+        }
+    }
+}
+
+impl std::fmt::Display for DiscordMarkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(e) | Self::NotFound(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// Validate an outbound marker target against Discord's trust-boundary policy.
 ///
-/// The orchestrator system prompt mandates absolute paths for media markers
-/// (`crates/zeroclaw-channels/src/orchestrator/mod.rs`), and the workspace
-/// is the only directory the agent is authorised to expose to chatters:
+/// The orchestrator system prompt mandates absolute paths for media markers,
+/// and the workspace is the only directory the agent is authorised to
+/// expose to chatters:
 ///
 /// * `http`/`https` URLs are accepted and inlined as links.
 /// * Any other URL scheme (`file:`, `data:`, custom `://`) is refused.
 /// * Local paths must be absolute. Relative paths are agent
 ///   misconfiguration and dropped, not silently resolved against cwd.
 /// * Absolute paths are canonicalised and must resolve inside
-///   `workspace_dir`. Anything outside, traversal escapes, or
-///   non-existent files are refused.
+///   `workspace_dir`. Anything outside or any traversal escape is
+///   refused; a path that simply doesn't exist on disk returns
+///   `NotFound`, which the caller renders differently from a refusal.
 /// * When `workspace_dir` is not configured, no local path can be safely
 ///   bounded, so all local targets are refused.
 fn validate_marker_target(
     target: &str,
     workspace_dir: Option<&Path>,
-) -> anyhow::Result<DiscordMarkerTarget> {
+) -> Result<DiscordMarkerTarget, DiscordMarkerError> {
     if target.starts_with("http://") || target.starts_with("https://") {
         return Ok(DiscordMarkerTarget::Http(target.to_string()));
     }
     if target.contains("://") {
         let scheme = target.split("://").next().unwrap_or("?");
-        anyhow::bail!(
+        return Err(DiscordMarkerError::Refused(anyhow!(
             "discord: marker target uses disallowed scheme {scheme:?}; only http/https and absolute workspace paths are accepted"
-        );
+        )));
     }
     if target.starts_with("data:") || target.starts_with("file:") {
-        anyhow::bail!(
+        return Err(DiscordMarkerError::Refused(anyhow!(
             "discord: marker target uses disallowed scheme; only http/https and absolute workspace paths are accepted"
-        );
+        )));
     }
 
     let target_path = Path::new(target);
     if !target_path.is_absolute() {
-        anyhow::bail!(
+        return Err(DiscordMarkerError::Refused(anyhow!(
             "discord: marker target {target} is not an absolute path; the agent must emit absolute paths inside workspace_dir"
-        );
+        )));
     }
 
     let workspace = workspace_dir.ok_or_else(|| {
-        anyhow!(
+        DiscordMarkerError::Refused(anyhow!(
             "discord: marker target {target} is a local path but the channel was started without a workspace_dir, refusing for safety"
-        )
+        ))
     })?;
     let workspace_canon = std::fs::canonicalize(workspace)
-        .with_context(|| format!("canonicalize workspace {}", workspace.display()))?;
-    let target_canon = std::fs::canonicalize(target_path)
-        .with_context(|| format!("canonicalize marker target {target}"))?;
+        .with_context(|| format!("canonicalize workspace {}", workspace.display()))
+        .map_err(DiscordMarkerError::Refused)?;
+    let target_canon = match std::fs::canonicalize(target_path) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(DiscordMarkerError::NotFound(anyhow!(
+                "discord: marker target {target} not found on disk"
+            )));
+        }
+        Err(e) => {
+            return Err(DiscordMarkerError::Refused(
+                anyhow::Error::from(e).context(format!("canonicalize marker target {target}")),
+            ));
+        }
+    };
 
     if !target_canon.starts_with(&workspace_canon) {
-        anyhow::bail!(
+        return Err(DiscordMarkerError::Refused(anyhow!(
             "discord: marker target {target} resolves to {} which is outside workspace_dir {}; refusing",
             target_canon.display(),
             workspace_canon.display(),
-        );
+        )));
     }
     Ok(DiscordMarkerTarget::Local(target_canon))
 }
@@ -570,26 +645,88 @@ fn validate_marker_target(
 fn classify_outgoing_attachments(
     attachments: &[DiscordAttachment],
     workspace_dir: Option<&Path>,
-) -> (Vec<PathBuf>, Vec<String>) {
+) -> (
+    Vec<PathBuf>,
+    Vec<String>,
+    Vec<(String, DiscordMarkerFailure)>,
+) {
     let mut local_files = Vec::new();
     let mut remote_urls = Vec::new();
+    let mut failures = Vec::new();
 
     for attachment in attachments {
         match validate_marker_target(&attachment.target, workspace_dir) {
             Ok(DiscordMarkerTarget::Local(path)) => local_files.push(path),
             Ok(DiscordMarkerTarget::Http(url)) => remote_urls.push(url),
             Err(e) => {
+                let kind_label = match e.kind() {
+                    DiscordMarkerFailure::Refused => "trust boundary",
+                    DiscordMarkerFailure::NotFound => "not found",
+                };
                 tracing::warn!(
                     kind = attachment.kind.marker_name(),
                     target = %attachment.target,
+                    reason = kind_label,
                     error = %e,
                     "discord: dropping unresolved outbound attachment marker"
                 );
+                failures.push((attachment.target.clone(), e.kind()));
             }
         }
     }
 
-    (local_files, remote_urls)
+    (local_files, remote_urls, failures)
+}
+
+/// Build the Matrix-style "(note: I couldn't deliver ...)" tail appended
+/// to the bot's reply when at least one marker was dropped. Returns
+/// `None` when the failure list is empty so callers can keep the body
+/// untouched.
+fn delivery_failure_note(failures: &[(String, DiscordMarkerFailure)]) -> Option<String> {
+    if failures.is_empty() {
+        return None;
+    }
+    let targets: Vec<&str> = failures.iter().map(|(t, _)| t.as_str()).collect();
+    Some(if targets.len() == 1 {
+        format!("(note: I couldn't deliver the file at {}.)", targets[0])
+    } else {
+        format!(
+            "(note: I couldn't deliver these files: {}.)",
+            targets.join(", ")
+        )
+    })
+}
+
+/// Compose the final reply body with the delivery-failure note appended.
+/// When the marker-stripped content is empty the note replaces the body;
+/// otherwise the note follows the content separated by a blank line.
+fn compose_body_with_failure_note(content: &str, note: Option<&str>) -> String {
+    match note {
+        Some(note) if content.trim().is_empty() => note.to_string(),
+        Some(note) => format!("{content}\n\n{note}"),
+        None => content.to_string(),
+    }
+}
+
+/// Emoji reactions applied to the bot's own outgoing message based on which
+/// kinds of marker failures occurred. 🚫 signals a trust-boundary refusal,
+/// ⚠️ signals a post-validation delivery failure. Both can fire on the
+/// same message when a batch mixes refusals and not-found targets.
+fn decide_failure_reactions(failures: &[(String, DiscordMarkerFailure)]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if failures
+        .iter()
+        .any(|(_, k)| matches!(k, DiscordMarkerFailure::Refused))
+    {
+        out.push("🚫");
+    }
+    if failures
+        .iter()
+        .any(|(_, k)| matches!(k, DiscordMarkerFailure::NotFound))
+    {
+        out.push("⚠️");
+    }
+    out
 }
 
 fn with_inline_attachment_urls(content: &str, remote_urls: &[String]) -> String {
@@ -603,12 +740,14 @@ fn with_inline_attachment_urls(content: &str, remote_urls: &[String]) -> String 
     lines.join("\n")
 }
 
+/// POST a plain-text message and return the new message's ID. Callers
+/// that don't need the ID (e.g. non-first chunks) can discard it.
 async fn send_discord_message_json(
     client: &reqwest::Client,
     bot_token: &str,
     recipient: &str,
     content: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
     let body = json!({ "content": content });
 
@@ -628,16 +767,18 @@ async fn send_discord_message_json(
         anyhow::bail!("Discord send message failed ({status}): {err}");
     }
 
-    Ok(())
+    extract_message_id(resp).await
 }
 
+/// POST a message with file attachments via multipart, returning the new
+/// message's ID. Callers that don't need the ID can discard it.
 async fn send_discord_message_with_files(
     client: &reqwest::Client,
     bot_token: &str,
     recipient: &str,
     content: &str,
     files: &[PathBuf],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
 
     let mut form = Form::new().text("payload_json", json!({ "content": content }).to_string());
@@ -676,38 +817,12 @@ async fn send_discord_message_with_files(
         anyhow::bail!("Discord send message with files failed ({status}): {err}");
     }
 
-    Ok(())
+    extract_message_id(resp).await
 }
 
-/// Send a message and return the Discord message ID from the response.
-async fn send_discord_message_json_with_id(
-    client: &reqwest::Client,
-    bot_token: &str,
-    recipient: &str,
-    content: &str,
-) -> anyhow::Result<String> {
-    let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
-    let body = json!({ "content": content });
-
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bot {bot_token}"))
-        .json(&body)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-        anyhow::bail!("Discord send message failed ({status}): {err}");
-    }
-
-    let resp_json: serde_json::Value = resp.json().await?;
-    resp_json
-        .get("id")
+async fn extract_message_id(resp: reqwest::Response) -> anyhow::Result<String> {
+    let body: serde_json::Value = resp.json().await?;
+    body.get("id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow::anyhow!("Discord send response missing 'id' field"))
@@ -1026,7 +1141,7 @@ impl Channel for DiscordChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let raw_content = crate::util::strip_tool_call_tags(&message.content);
         let (cleaned_content, parsed_attachments) = parse_attachment_markers(&raw_content);
-        let (mut local_files, remote_urls) =
+        let (mut local_files, remote_urls, failures) =
             classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
 
         // Discord accepts max 10 files per message.
@@ -1038,59 +1153,27 @@ impl Channel for DiscordChannel {
             local_files.truncate(10);
         }
 
-        let content = with_inline_attachment_urls(&cleaned_content, &remote_urls);
+        let body = with_inline_attachment_urls(&cleaned_content, &remote_urls);
+        let note = delivery_failure_note(&failures);
+        let content = compose_body_with_failure_note(&body, note.as_deref());
+        let reactions = decide_failure_reactions(&failures);
 
-        // MultiMessage mode: split at paragraph boundaries and send each as a
-        // separate message with a configurable delay between them.
-        if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
-            let chunks = split_message_for_discord_multi(&content, DISCORD_MAX_MESSAGE_LENGTH);
-            let client = self.http_client();
-
-            for (i, chunk) in chunks.iter().enumerate() {
-                if i == 0 && !local_files.is_empty() {
-                    send_discord_message_with_files(
-                        &client,
-                        &self.bot_token,
-                        &message.recipient,
-                        chunk,
-                        &local_files,
-                    )
-                    .await?;
-                } else {
-                    send_discord_message_json(&client, &self.bot_token, &message.recipient, chunk)
-                        .await?;
-                }
-
-                if i < chunks.len() - 1 {
-                    // Check cancellation between chunks so interruption stops delivery.
-                    if message
-                        .cancellation_token
-                        .as_ref()
-                        .is_some_and(|t| t.is_cancelled())
-                    {
-                        tracing::debug!(
-                            "MultiMessage delivery interrupted after chunk {}/{}",
-                            i + 1,
-                            chunks.len()
-                        );
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        self.multi_message_delay_ms,
-                    ))
-                    .await;
-                }
-            }
-
-            return Ok(());
-        }
-
-        // Default / Partial fallback: single chunked message delivery.
-        let chunks = split_message_for_discord(&content);
         let client = self.http_client();
+        let chunks = if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
+            split_message_for_discord_multi(&content, DISCORD_MAX_MESSAGE_LENGTH)
+        } else {
+            split_message_for_discord(&content)
+        };
+        let inter_chunk_delay_ms =
+            if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
+                self.multi_message_delay_ms
+            } else {
+                500
+            };
 
+        let mut first_message_id: Option<String> = None;
         for (i, chunk) in chunks.iter().enumerate() {
-            if i == 0 && !local_files.is_empty() {
+            let message_id = if i == 0 && !local_files.is_empty() {
                 send_discord_message_with_files(
                     &client,
                     &self.bot_token,
@@ -1098,16 +1181,34 @@ impl Channel for DiscordChannel {
                     chunk,
                     &local_files,
                 )
-                .await?;
+                .await?
             } else {
                 send_discord_message_json(&client, &self.bot_token, &message.recipient, chunk)
-                    .await?;
+                    .await?
+            };
+            if first_message_id.is_none() {
+                first_message_id = Some(message_id);
             }
 
             if i < chunks.len() - 1 {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if message
+                    .cancellation_token
+                    .as_ref()
+                    .is_some_and(|t| t.is_cancelled())
+                {
+                    tracing::debug!(
+                        "Discord delivery interrupted after chunk {}/{}",
+                        i + 1,
+                        chunks.len()
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(inter_chunk_delay_ms)).await;
             }
         }
+
+        self.apply_failure_reactions(&message.recipient, first_message_id.as_deref(), &reactions)
+            .await;
 
         Ok(())
     }
@@ -1511,7 +1612,7 @@ impl Channel for DiscordChannel {
                 };
 
                 let client = self.http_client();
-                let msg_id = send_discord_message_json_with_id(
+                let msg_id = send_discord_message_json(
                     &client,
                     &self.bot_token,
                     &message.recipient,
@@ -1712,9 +1813,12 @@ impl Channel for DiscordChannel {
 
         let text = &crate::util::strip_tool_call_tags(text);
         let (cleaned_content, parsed_attachments) = parse_attachment_markers(text);
-        let (mut local_files, remote_urls) =
+        let (mut local_files, remote_urls, failures) =
             classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
-        let content = with_inline_attachment_urls(&cleaned_content, &remote_urls);
+        let body = with_inline_attachment_urls(&cleaned_content, &remote_urls);
+        let note = delivery_failure_note(&failures);
+        let content = compose_body_with_failure_note(&body, note.as_deref());
+        let reactions = decide_failure_reactions(&failures);
 
         let client = self.http_client();
 
@@ -1726,8 +1830,9 @@ impl Channel for DiscordChannel {
                 local_files.truncate(10);
             }
             let chunks = split_message_for_discord(&content);
+            let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
-                if i == 0 {
+                let new_id = if i == 0 {
                     send_discord_message_with_files(
                         &client,
                         &self.bot_token,
@@ -1735,14 +1840,19 @@ impl Channel for DiscordChannel {
                         chunk,
                         &local_files,
                     )
-                    .await?;
+                    .await?
                 } else {
-                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?;
+                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?
+                };
+                if first_message_id.is_none() {
+                    first_message_id = Some(new_id);
                 }
                 if i < chunks.len() - 1 {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }
+            self.apply_failure_reactions(recipient, first_message_id.as_deref(), &reactions)
+                .await;
             return Ok(());
         }
 
@@ -1751,23 +1861,41 @@ impl Channel for DiscordChannel {
             let _ = delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
 
             let chunks = split_message_for_discord(&content);
+            let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
-                send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?;
+                let new_id =
+                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?;
+                if first_message_id.is_none() {
+                    first_message_id = Some(new_id);
+                }
                 if i < chunks.len() - 1 {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }
+            self.apply_failure_reactions(recipient, first_message_id.as_deref(), &reactions)
+                .await;
             return Ok(());
         }
 
         // Path 3: simple case — edit in-place; fall back to delete + POST on failure.
-        if let Err(e) =
-            edit_discord_message(&client, &self.bot_token, recipient, message_id, &content).await
-        {
-            tracing::warn!("Discord finalize_draft edit failed: {e}; falling back to delete+send");
-            let _ = delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
-            send_discord_message_json(&client, &self.bot_token, recipient, &content).await?;
-        }
+        // The reaction target is the draft message_id when the edit lands;
+        // when the fallback fires it's the freshly posted message instead.
+        let reaction_target =
+            match edit_discord_message(&client, &self.bot_token, recipient, message_id, &content)
+                .await
+            {
+                Ok(()) => message_id.to_string(),
+                Err(e) => {
+                    tracing::warn!(
+                        "Discord finalize_draft edit failed: {e}; falling back to delete+send"
+                    );
+                    let _ = delete_discord_message(&client, &self.bot_token, recipient, message_id)
+                        .await;
+                    send_discord_message_json(&client, &self.bot_token, recipient, &content).await?
+                }
+            };
+        self.apply_failure_reactions(recipient, Some(&reaction_target), &reactions)
+            .await;
 
         Ok(())
     }
@@ -2522,11 +2650,13 @@ mod tests {
             },
         ];
 
-        let (locals, remotes) = classify_outgoing_attachments(&attachments, Some(temp.path()));
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(temp.path()));
         assert_eq!(locals.len(), 1);
         let canonical_file = std::fs::canonicalize(&file_path).expect("canonicalize fixture");
         assert_eq!(locals[0], canonical_file);
         assert_eq!(remotes, vec!["https://example.com/remote.png".to_string()]);
+        assert!(failures.is_empty());
     }
 
     #[test]
@@ -2541,9 +2671,12 @@ mod tests {
                 .to_string(),
         }];
 
-        let (locals, remotes) = classify_outgoing_attachments(&attachments, Some(temp.path()));
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(temp.path()));
         assert!(locals.is_empty());
         assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].1, DiscordMarkerFailure::NotFound);
     }
 
     #[test]
@@ -2558,12 +2691,15 @@ mod tests {
             target: outside_file.to_string_lossy().to_string(),
         }];
 
-        let (locals, remotes) = classify_outgoing_attachments(&attachments, Some(workspace.path()));
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(workspace.path()));
         assert!(
             locals.is_empty(),
             "absolute paths outside workspace must be refused"
         );
         assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -2574,9 +2710,12 @@ mod tests {
             target: "relative/report.pdf".to_string(),
         }];
 
-        let (locals, remotes) = classify_outgoing_attachments(&attachments, Some(temp.path()));
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(temp.path()));
         assert!(locals.is_empty(), "relative paths must be refused");
         assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -2597,9 +2736,14 @@ mod tests {
             },
         ];
 
-        let (locals, remotes) = classify_outgoing_attachments(&attachments, Some(temp.path()));
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(temp.path()));
         assert!(locals.is_empty());
         assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 3);
+        for (_, kind) in &failures {
+            assert_eq!(*kind, DiscordMarkerFailure::Refused);
+        }
     }
 
     #[test]
@@ -2609,12 +2753,14 @@ mod tests {
             target: "/some/absolute/path.png".to_string(),
         }];
 
-        let (locals, remotes) = classify_outgoing_attachments(&attachments, None);
+        let (locals, remotes, failures) = classify_outgoing_attachments(&attachments, None);
         assert!(
             locals.is_empty(),
             "local paths must be refused without workspace_dir"
         );
         assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -2624,9 +2770,10 @@ mod tests {
             target: "https://example.com/x.png".to_string(),
         }];
 
-        let (locals, remotes) = classify_outgoing_attachments(&attachments, None);
+        let (locals, remotes, failures) = classify_outgoing_attachments(&attachments, None);
         assert!(locals.is_empty());
         assert_eq!(remotes, vec!["https://example.com/x.png".to_string()]);
+        assert!(failures.is_empty());
     }
 
     #[test]
@@ -2642,6 +2789,91 @@ mod tests {
     fn with_inline_attachment_urls_keeps_content_when_no_urls() {
         let rendered = with_inline_attachment_urls("Done", &[]);
         assert_eq!(rendered, "Done");
+    }
+
+    #[test]
+    fn delivery_failure_note_is_none_when_no_failures() {
+        assert!(delivery_failure_note(&[]).is_none());
+    }
+
+    #[test]
+    fn delivery_failure_note_singular_for_one_failure() {
+        let note = delivery_failure_note(&[(
+            "/workspace/missing.png".to_string(),
+            DiscordMarkerFailure::NotFound,
+        )])
+        .expect("one failure should produce a note");
+        assert_eq!(
+            note,
+            "(note: I couldn't deliver the file at /workspace/missing.png.)"
+        );
+    }
+
+    #[test]
+    fn delivery_failure_note_plural_lists_targets_in_order() {
+        let note = delivery_failure_note(&[
+            ("a.png".to_string(), DiscordMarkerFailure::Refused),
+            ("b.pdf".to_string(), DiscordMarkerFailure::NotFound),
+            ("c.mp4".to_string(), DiscordMarkerFailure::Refused),
+        ])
+        .expect("multiple failures should produce a note");
+        assert_eq!(
+            note,
+            "(note: I couldn't deliver these files: a.png, b.pdf, c.mp4.)"
+        );
+    }
+
+    #[test]
+    fn compose_body_with_failure_note_uses_note_alone_when_content_empty() {
+        let composed = compose_body_with_failure_note("", Some("(note: ...)"));
+        assert_eq!(composed, "(note: ...)");
+    }
+
+    #[test]
+    fn compose_body_with_failure_note_appends_note_to_existing_content() {
+        let composed = compose_body_with_failure_note("Hello.", Some("(note: ...)"));
+        assert_eq!(composed, "Hello.\n\n(note: ...)");
+    }
+
+    #[test]
+    fn compose_body_with_failure_note_returns_content_when_no_note() {
+        let composed = compose_body_with_failure_note("Hello.", None);
+        assert_eq!(composed, "Hello.");
+    }
+
+    #[test]
+    fn compose_body_with_failure_note_returns_empty_when_no_content_and_no_note() {
+        let composed = compose_body_with_failure_note("", None);
+        assert_eq!(composed, "");
+    }
+
+    #[test]
+    fn decide_failure_reactions_empty_for_no_failures() {
+        assert!(decide_failure_reactions(&[]).is_empty());
+    }
+
+    #[test]
+    fn decide_failure_reactions_emits_refused_only() {
+        let r = decide_failure_reactions(&[
+            ("a".to_string(), DiscordMarkerFailure::Refused),
+            ("b".to_string(), DiscordMarkerFailure::Refused),
+        ]);
+        assert_eq!(r, vec!["🚫"]);
+    }
+
+    #[test]
+    fn decide_failure_reactions_emits_not_found_only() {
+        let r = decide_failure_reactions(&[("a".to_string(), DiscordMarkerFailure::NotFound)]);
+        assert_eq!(r, vec!["\u{26A0}\u{FE0F}"]);
+    }
+
+    #[test]
+    fn decide_failure_reactions_emits_both_when_mixed() {
+        let r = decide_failure_reactions(&[
+            ("a".to_string(), DiscordMarkerFailure::Refused),
+            ("b".to_string(), DiscordMarkerFailure::NotFound),
+        ]);
+        assert_eq!(r, vec!["🚫", "\u{26A0}\u{FE0F}"]);
     }
 
     // ── Streaming mode tests ──────────────────────────────────────────
