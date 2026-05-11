@@ -1860,7 +1860,7 @@ mod outbound {
                 reaction::ReactionEventContent,
                 relation::Annotation,
                 room::message::{
-                    MessageType, ReplyWithinThread, RoomMessageEventContent,
+                    AddMentions, MessageType, ReplyWithinThread, RoomMessageEventContent,
                     RoomMessageEventContentWithoutRelation, TextMessageEventContent,
                 },
             },
@@ -2314,7 +2314,7 @@ mod outbound {
         ) {
             send_threaded_reply(&room, content, anchor, outbox.threads_seen).await?
         } else {
-            room.send(content).await?.event_id
+            room.send(content).await?.response.event_id
         };
 
         let kinds = delivery.failure_kinds();
@@ -2357,13 +2357,14 @@ mod outbound {
                 Reply {
                     event_id: anchor.clone(),
                     enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
+                    add_mentions: AddMentions::No,
                 },
             )
             .await
             .map_err(|e| anyhow!("make_reply_event failed: {e}"))?;
         ctx_mod::mark_seen(threads_seen, anchor).await;
         let resp = room.send(reply_event).await?;
-        Ok(resp.event_id)
+        Ok(resp.response.event_id)
     }
 
     pub(super) async fn edit(
@@ -2415,7 +2416,7 @@ mod outbound {
                 event_id.clone(),
                 emoji.to_string(),
             ),
-            resp.event_id,
+            resp.response.event_id,
         );
         Ok(())
     }
@@ -2485,6 +2486,7 @@ mod outbound {
             config = config.reply(Some(Reply {
                 event_id: anchor.clone(),
                 enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
+                add_mentions: AddMentions::No,
             }));
         }
         let resp = room
@@ -2538,7 +2540,7 @@ mod outbound {
             );
         }
         let resp = room.send_raw("m.room.message", event).await?;
-        Ok(resp.event_id)
+        Ok(resp.response.event_id)
     }
 
     fn derive_file_name(target: &str) -> String {
