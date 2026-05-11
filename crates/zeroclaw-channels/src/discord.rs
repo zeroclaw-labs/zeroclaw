@@ -1,3 +1,4 @@
+use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -14,6 +15,7 @@ use uuid::Uuid;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
+use zeroclaw_api::media::MediaAttachment;
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
@@ -49,6 +51,11 @@ pub struct DiscordChannel {
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
+    /// Cached `channel_id -> is_thread` lookups. Populated lazily on first
+    /// inbound message from a channel via `GET /channels/{id}`. Thread type
+    /// is stable for the channel's lifetime so the cache lives as long as
+    /// the channel instance.
+    thread_channels: Arc<AsyncMutex<HashMap<String, bool>>>,
 }
 
 impl DiscordChannel {
@@ -79,6 +86,7 @@ impl DiscordChannel {
             stall_timeout_secs: 0,
             pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
             approval_timeout_secs: 300,
+            thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
@@ -159,19 +167,88 @@ impl DiscordChannel {
         let part = token.split('.').next()?;
         base64_decode(part)
     }
+
+    /// Resolve whether `channel_id` is a Discord thread (ANNOUNCEMENT,
+    /// PUBLIC, or PRIVATE thread) via `GET /channels/{id}`. Results are
+    /// cached for the channel instance's lifetime: thread-ness is stable
+    /// for a given channel ID, so one lookup per ID per process. Failures
+    /// (network, 429, missing `type` field) fall through to `false` so a
+    /// transient API hiccup never blocks inbound delivery.
+    async fn is_thread_channel(&self, client: &reqwest::Client, channel_id: &str) -> bool {
+        {
+            let cache = self.thread_channels.lock().await;
+            if let Some(&value) = cache.get(channel_id) {
+                return value;
+            }
+        }
+
+        let url = format!("https://discord.com/api/v10/channels/{channel_id}");
+        let is_thread = match client
+            .get(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(body) => body
+                        .get("type")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(is_thread_channel_type)
+                        .unwrap_or(false),
+                    Err(e) => {
+                        tracing::debug!(channel_id, error = %e, "discord: channel lookup body parse failed");
+                        false
+                    }
+                }
+            }
+            Ok(resp) => {
+                tracing::debug!(
+                    channel_id,
+                    status = %resp.status(),
+                    "discord: channel lookup non-success status"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::debug!(channel_id, error = %e, "discord: channel lookup request failed");
+                false
+            }
+        };
+
+        self.thread_channels
+            .lock()
+            .await
+            .insert(channel_id.to_string(), is_thread);
+        is_thread
+    }
 }
 
-/// Process Discord message attachments and return a string to append to the
-/// agent message context.
+/// Whether a Discord channel type integer identifies a thread.
+/// Discord channel types `10` (ANNOUNCEMENT_THREAD), `11` (PUBLIC_THREAD),
+/// and `12` (PRIVATE_THREAD) per the Channel Types documentation.
+const fn is_thread_channel_type(channel_type: u64) -> bool {
+    matches!(channel_type, 10..=12)
+}
+
+/// Process Discord message attachments in a single pass.
 ///
-/// Only `text/*` MIME types are fetched and inlined. All other types are
-/// silently skipped. Fetch errors are logged as warnings.
+/// Returns the text block appended to the agent's prompt and the structured
+/// `MediaAttachment` list consumed by the media pipeline. Each attachment is
+/// downloaded at most once: text/* is inlined as text, audio is transcribed
+/// inline when a transcription manager is configured (otherwise it goes
+/// through the media pipeline), and image/video/document attachments are
+/// saved to the workspace and emitted as `[KIND:<path>]` markers plus a
+/// `MediaAttachment` for vision-capable providers.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
     workspace_dir: Option<&Path>,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
+    transcription_manager: Option<&super::transcription::TranscriptionManager>,
+) -> (String, Vec<MediaAttachment>) {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut media: Vec<MediaAttachment> = Vec::new();
+
     for att in attachments {
         let ct = att
             .get("content_type")
@@ -185,11 +262,12 @@ async fn process_attachments(
             tracing::warn!(name, "discord: attachment has no url, skipping");
             continue;
         };
+
         if ct.starts_with("text/") {
             match client.get(url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(text) = resp.text().await {
-                        parts.push(format!("[{name}]\n{text}"));
+                        text_parts.push(format!("[{name}]\n{text}"));
                     }
                 }
                 Ok(resp) => {
@@ -199,46 +277,112 @@ async fn process_attachments(
                     tracing::warn!(name, error = %e, "discord attachment fetch error");
                 }
             }
-        } else if ct.starts_with("image/") {
-            let marker = if let Some(workspace) = workspace_dir {
-                match download_discord_attachment_to_workspace(client, workspace, url, name).await {
-                    Ok(local_path) => format!("[IMAGE:{}]", local_path.display()),
-                    Err(e) => {
-                        tracing::warn!(name, error = %e, "discord: image attachment download failed");
-                        format!("[IMAGE:{url}]")
+            continue;
+        }
+
+        let is_audio = is_discord_audio_attachment(ct, name);
+
+        // Audio with channel-level transcription configured: transcribe
+        // inline so the agent receives `[Voice] <transcript>` text rather
+        // than opaque bytes through the media pipeline.
+        if is_audio && let Some(manager) = transcription_manager {
+            let bytes = match download_attachment_bytes(client, url, name).await {
+                Some(b) => b,
+                None => continue,
+            };
+            match manager.transcribe(&bytes, name).await {
+                Ok(text) => {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        tracing::info!(
+                            "Discord: transcribed audio attachment {} ({} chars)",
+                            name,
+                            trimmed.len()
+                        );
+                        text_parts.push(format!("[Voice] {trimmed}"));
                     }
                 }
-            } else {
-                format!("[IMAGE:{url}]")
-            };
-            parts.push(marker);
-        } else {
-            tracing::debug!(
-                name,
-                content_type = ct,
-                "discord: skipping unsupported attachment type"
-            );
+                Err(e) => {
+                    tracing::warn!(name, error = %e, "discord: voice transcription failed");
+                }
+            }
+            continue;
         }
+
+        let marker_kind = if ct.starts_with("image/") {
+            "IMAGE"
+        } else if is_audio {
+            "AUDIO"
+        } else if ct.starts_with("video/") {
+            "VIDEO"
+        } else {
+            "DOCUMENT"
+        };
+
+        let bytes = match download_attachment_bytes(client, url, name).await {
+            Some(b) => b,
+            None => continue,
+        };
+
+        let marker_target = match workspace_dir {
+            Some(dir) => match save_attachment_bytes_to_workspace(dir, name, &bytes).await {
+                Ok(local_path) => local_path.display().to_string(),
+                Err(e) => {
+                    tracing::warn!(name, kind = marker_kind, error = %e, "discord: attachment save failed, falling back to url");
+                    url.to_string()
+                }
+            },
+            None => url.to_string(),
+        };
+        text_parts.push(format!("[{marker_kind}:{marker_target}]"));
+
+        media.push(MediaAttachment {
+            file_name: name.to_string(),
+            data: bytes,
+            mime_type: if ct.is_empty() {
+                None
+            } else {
+                Some(ct.to_string())
+            },
+        });
     }
-    parts.join("\n---\n")
+
+    (text_parts.join("\n---\n"), media)
 }
 
-async fn download_discord_attachment_to_workspace(
+/// Download an attachment URL into memory, with structured warn-logging on
+/// each failure mode. Returns `None` when the attachment should be skipped.
+async fn download_attachment_bytes(
     client: &reqwest::Client,
-    workspace_dir: &Path,
     url: &str,
+    name: &str,
+) -> Option<Vec<u8>> {
+    match client.get(url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(b) => Some(b.to_vec()),
+            Err(e) => {
+                tracing::warn!(name, error = %e, "discord: failed to read attachment bytes");
+                None
+            }
+        },
+        Ok(resp) => {
+            tracing::warn!(name, status = %resp.status(), "discord: attachment download failed");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(name, error = %e, "discord: attachment fetch error");
+            None
+        }
+    }
+}
+
+async fn save_attachment_bytes_to_workspace(
+    workspace_dir: &Path,
     filename: &str,
+    bytes: &[u8],
 ) -> anyhow::Result<PathBuf> {
     let save_dir = workspace_dir.join("discord_files");
     tokio::fs::create_dir_all(&save_dir).await?;
-
-    let bytes = client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
 
     let safe_name = Path::new(filename)
         .file_name()
@@ -248,7 +392,7 @@ async fn download_discord_attachment_to_workspace(
     let local_name = format!("{}_{}", Uuid::new_v4(), safe_name);
     let local_path = save_dir.join(local_name);
 
-    tokio::fs::write(&local_path, &bytes).await?;
+    tokio::fs::write(&local_path, bytes).await?;
     Ok(local_path)
 }
 
@@ -266,72 +410,6 @@ fn is_discord_audio_attachment(content_type: &str, filename: &str) -> bool {
         return DISCORD_AUDIO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str());
     }
     false
-}
-
-/// Download and transcribe audio attachments from a Discord message.
-///
-/// Returns transcribed text blocks for any audio attachments found.
-/// Non-audio attachments and failures are silently skipped.
-async fn transcribe_discord_audio_attachments(
-    attachments: &[serde_json::Value],
-    client: &reqwest::Client,
-    manager: &super::transcription::TranscriptionManager,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for att in attachments {
-        let ct = att
-            .get("content_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let name = att
-            .get("filename")
-            .and_then(|v| v.as_str())
-            .unwrap_or("file");
-
-        if !is_discord_audio_attachment(ct, name) {
-            continue;
-        }
-
-        let Some(url) = att.get("url").and_then(|v| v.as_str()) else {
-            continue;
-        };
-
-        let audio_data = match client.get(url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                Ok(bytes) => bytes.to_vec(),
-                Err(e) => {
-                    tracing::warn!(name, error = %e, "discord: failed to read audio attachment bytes");
-                    continue;
-                }
-            },
-            Ok(resp) => {
-                tracing::warn!(name, status = %resp.status(), "discord: audio attachment download failed");
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(name, error = %e, "discord: audio attachment fetch error");
-                continue;
-            }
-        };
-
-        match manager.transcribe(&audio_data, name).await {
-            Ok(text) => {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    tracing::info!(
-                        "Discord: transcribed audio attachment {} ({} chars)",
-                        name,
-                        trimmed.len()
-                    );
-                    parts.push(format!("[Voice] {trimmed}"));
-                }
-            }
-            Err(e) => {
-                tracing::warn!(name, error = %e, "discord: voice transcription failed");
-            }
-        }
-    }
-    parts.join("\n")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,46 +495,106 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<DiscordAttachment>) {
     (cleaned.trim().to_string(), attachments)
 }
 
-fn classify_outgoing_attachments(
-    attachments: &[DiscordAttachment],
-) -> (Vec<PathBuf>, Vec<String>, Vec<String>) {
-    let mut local_files = Vec::new();
-    let mut remote_urls = Vec::new();
-    let mut unresolved_markers = Vec::new();
-
-    for attachment in attachments {
-        let target = attachment.target.trim();
-        if target.starts_with("https://") || target.starts_with("http://") {
-            remote_urls.push(target.to_string());
-            continue;
-        }
-
-        let path = Path::new(target);
-        if path.exists() && path.is_file() {
-            local_files.push(path.to_path_buf());
-            continue;
-        }
-
-        unresolved_markers.push(format!("[{}:{}]", attachment.kind.marker_name(), target));
-    }
-
-    (local_files, remote_urls, unresolved_markers)
+/// Resolved outbound attachment target after sandbox validation.
+#[derive(Debug)]
+enum DiscordMarkerTarget {
+    Local(PathBuf),
+    Http(String),
 }
 
-fn with_inline_attachment_urls(
-    content: &str,
-    remote_urls: &[String],
-    unresolved_markers: &[String],
-) -> String {
+/// Validate an outbound marker target against Discord's trust-boundary policy.
+///
+/// The orchestrator system prompt mandates absolute paths for media markers
+/// (`crates/zeroclaw-channels/src/orchestrator/mod.rs`), and the workspace
+/// is the only directory the agent is authorised to expose to chatters:
+///
+/// * `http`/`https` URLs are accepted and inlined as links.
+/// * Any other URL scheme (`file:`, `data:`, custom `://`) is refused.
+/// * Local paths must be absolute. Relative paths are agent
+///   misconfiguration and dropped, not silently resolved against cwd.
+/// * Absolute paths are canonicalised and must resolve inside
+///   `workspace_dir`. Anything outside, traversal escapes, or
+///   non-existent files are refused.
+/// * When `workspace_dir` is not configured, no local path can be safely
+///   bounded, so all local targets are refused.
+fn validate_marker_target(
+    target: &str,
+    workspace_dir: Option<&Path>,
+) -> anyhow::Result<DiscordMarkerTarget> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return Ok(DiscordMarkerTarget::Http(target.to_string()));
+    }
+    if target.contains("://") {
+        let scheme = target.split("://").next().unwrap_or("?");
+        anyhow::bail!(
+            "discord: marker target uses disallowed scheme {scheme:?}; only http/https and absolute workspace paths are accepted"
+        );
+    }
+    if target.starts_with("data:") || target.starts_with("file:") {
+        anyhow::bail!(
+            "discord: marker target uses disallowed scheme; only http/https and absolute workspace paths are accepted"
+        );
+    }
+
+    let target_path = Path::new(target);
+    if !target_path.is_absolute() {
+        anyhow::bail!(
+            "discord: marker target {target} is not an absolute path; the agent must emit absolute paths inside workspace_dir"
+        );
+    }
+
+    let workspace = workspace_dir.ok_or_else(|| {
+        anyhow!(
+            "discord: marker target {target} is a local path but the channel was started without a workspace_dir, refusing for safety"
+        )
+    })?;
+    let workspace_canon = std::fs::canonicalize(workspace)
+        .with_context(|| format!("canonicalize workspace {}", workspace.display()))?;
+    let target_canon = std::fs::canonicalize(target_path)
+        .with_context(|| format!("canonicalize marker target {target}"))?;
+
+    if !target_canon.starts_with(&workspace_canon) {
+        anyhow::bail!(
+            "discord: marker target {target} resolves to {} which is outside workspace_dir {}; refusing",
+            target_canon.display(),
+            workspace_canon.display(),
+        );
+    }
+    Ok(DiscordMarkerTarget::Local(target_canon))
+}
+
+fn classify_outgoing_attachments(
+    attachments: &[DiscordAttachment],
+    workspace_dir: Option<&Path>,
+) -> (Vec<PathBuf>, Vec<String>) {
+    let mut local_files = Vec::new();
+    let mut remote_urls = Vec::new();
+
+    for attachment in attachments {
+        match validate_marker_target(&attachment.target, workspace_dir) {
+            Ok(DiscordMarkerTarget::Local(path)) => local_files.push(path),
+            Ok(DiscordMarkerTarget::Http(url)) => remote_urls.push(url),
+            Err(e) => {
+                tracing::warn!(
+                    kind = attachment.kind.marker_name(),
+                    target = %attachment.target,
+                    error = %e,
+                    "discord: dropping unresolved outbound attachment marker"
+                );
+            }
+        }
+    }
+
+    (local_files, remote_urls)
+}
+
+fn with_inline_attachment_urls(content: &str, remote_urls: &[String]) -> String {
     let mut lines = Vec::new();
     if !content.trim().is_empty() {
         lines.push(content.trim().to_string());
     }
     if !remote_urls.is_empty() {
         lines.extend(remote_urls.iter().cloned());
-    }
-    if !unresolved_markers.is_empty() {
-        lines.extend(unresolved_markers.iter().cloned());
     }
     lines.join("\n")
 }
@@ -884,15 +1022,8 @@ impl Channel for DiscordChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let raw_content = crate::util::strip_tool_call_tags(&message.content);
         let (cleaned_content, parsed_attachments) = parse_attachment_markers(&raw_content);
-        let (mut local_files, remote_urls, unresolved_markers) =
-            classify_outgoing_attachments(&parsed_attachments);
-
-        if !unresolved_markers.is_empty() {
-            tracing::warn!(
-                unresolved = ?unresolved_markers,
-                "discord: unresolved attachment markers were sent as plain text"
-            );
-        }
+        let (mut local_files, remote_urls) =
+            classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
 
         // Discord accepts max 10 files per message.
         if local_files.len() > 10 {
@@ -903,8 +1034,7 @@ impl Channel for DiscordChannel {
             local_files.truncate(10);
         }
 
-        let content =
-            with_inline_attachment_urls(&cleaned_content, &remote_urls, &unresolved_markers);
+        let content = with_inline_attachment_urls(&cleaned_content, &remote_urls);
 
         // MultiMessage mode: split at paragraph boundaries and send each as a
         // separate message with a configurable delay between them.
@@ -1199,37 +1329,19 @@ impl Channel for DiscordChannel {
                         continue;
                     };
 
-                    let attachment_text = {
-                        let atts = d
-                            .get("attachments")
-                            .and_then(|a| a.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        let client = self.http_client();
-                        let mut text_parts =
-                            process_attachments(&atts, &client, self.workspace_dir.as_deref())
-                                .await;
-
-                        // Transcribe audio attachments when transcription is configured
-                        if let Some(ref transcription_manager) = self.transcription_manager {
-                            let voice_text = transcribe_discord_audio_attachments(
-                                &atts,
-                                &client,
-                                transcription_manager,
-                            )
-                            .await;
-                            if !voice_text.is_empty() {
-                                if text_parts.is_empty() {
-                                    text_parts = voice_text;
-                                } else {
-                                    text_parts = format!("{text_parts}
-            {voice_text}");
-                                }
-                            }
-                        }
-
-                        text_parts
-                    };
+                    let client = self.http_client();
+                    let atts = d
+                        .get("attachments")
+                        .and_then(|a| a.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let (attachment_text, media_attachments) = process_attachments(
+                        &atts,
+                        &client,
+                        self.workspace_dir.as_deref(),
+                        self.transcription_manager.as_deref(),
+                    )
+                    .await;
                     let final_content = if attachment_text.is_empty() {
                         clean_content
                     } else {
@@ -1281,6 +1393,14 @@ impl Channel for DiscordChannel {
                         });
                     }
 
+                    let thread_ts = if channel_id.is_empty() {
+                        None
+                    } else if self.is_thread_channel(&client, &channel_id).await {
+                        Some(channel_id.clone())
+                    } else {
+                        None
+                    };
+
                     let channel_msg = ChannelMessage {
                         id: if message_id.is_empty() {
                             Uuid::new_v4().to_string()
@@ -1299,9 +1419,9 @@ impl Channel for DiscordChannel {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                        thread_ts: None,
-                        interruption_scope_id: None,
-                    attachments: vec![],
+                        interruption_scope_id: thread_ts.clone(),
+                        thread_ts,
+                        attachments: media_attachments,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -1588,10 +1708,9 @@ impl Channel for DiscordChannel {
 
         let text = &crate::util::strip_tool_call_tags(text);
         let (cleaned_content, parsed_attachments) = parse_attachment_markers(text);
-        let (mut local_files, remote_urls, unresolved_markers) =
-            classify_outgoing_attachments(&parsed_attachments);
-        let content =
-            with_inline_attachment_urls(&cleaned_content, &remote_urls, &unresolved_markers);
+        let (mut local_files, remote_urls) =
+            classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
+        let content = with_inline_attachment_urls(&cleaned_content, &remote_urls);
 
         let client = self.http_client();
 
@@ -2340,35 +2459,24 @@ mod tests {
     #[tokio::test]
     async fn process_attachments_empty_list_returns_empty() {
         let client = reqwest::Client::new();
-        let result = process_attachments(&[], &client, None).await;
-        assert!(result.is_empty());
+        let (text, media) = process_attachments(&[], &client, None, None).await;
+        assert!(text.is_empty());
+        assert!(media.is_empty());
     }
 
-    #[tokio::test]
-    async fn process_attachments_skips_unsupported_types() {
-        let client = reqwest::Client::new();
-        let attachments = vec![serde_json::json!({
-            "url": "https://cdn.discordapp.com/attachments/123/456/doc.pdf",
-            "filename": "doc.pdf",
-            "content_type": "application/pdf"
-        })];
-        let result = process_attachments(&attachments, &client, None).await;
-        assert!(result.is_empty());
-    }
-
-    #[tokio::test]
-    async fn process_attachments_emits_image_marker_without_workspace() {
-        let client = reqwest::Client::new();
-        let attachments = vec![serde_json::json!({
-            "url": "https://cdn.discordapp.com/attachments/123/456/photo.jpg",
-            "filename": "photo.jpg",
-            "content_type": "image/jpeg"
-        })];
-        let result = process_attachments(&attachments, &client, None).await;
-        assert_eq!(
-            result,
-            "[IMAGE:https://cdn.discordapp.com/attachments/123/456/photo.jpg]"
-        );
+    #[test]
+    fn is_thread_channel_type_matches_only_thread_types() {
+        // Thread types per Discord docs: 10/11/12.
+        assert!(is_thread_channel_type(10));
+        assert!(is_thread_channel_type(11));
+        assert!(is_thread_channel_type(12));
+        // Non-thread channel types must not be classified as threads.
+        for non_thread in [0u64, 1, 2, 3, 4, 5, 13, 14, 15, 16] {
+            assert!(
+                !is_thread_channel_type(non_thread),
+                "type {non_thread} must not classify as thread"
+            );
+        }
     }
 
     #[test]
@@ -2394,7 +2502,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_outgoing_attachments_splits_local_remote_and_unresolved() {
+    fn classify_outgoing_attachments_keeps_workspace_locals_and_http() {
         let temp = tempfile::tempdir().expect("tempdir");
         let file_path = temp.path().join("image.png");
         std::fs::write(&file_path, b"fake").expect("write fixture");
@@ -2408,33 +2516,128 @@ mod tests {
                 kind: DiscordAttachmentKind::Image,
                 target: "https://example.com/remote.png".to_string(),
             },
-            DiscordAttachment {
-                kind: DiscordAttachmentKind::Video,
-                target: "/tmp/does-not-exist.mp4".to_string(),
-            },
         ];
 
-        let (locals, remotes, unresolved) = classify_outgoing_attachments(&attachments);
+        let (locals, remotes) = classify_outgoing_attachments(&attachments, Some(temp.path()));
         assert_eq!(locals.len(), 1);
-        assert_eq!(locals[0], file_path);
+        let canonical_file = std::fs::canonicalize(&file_path).expect("canonicalize fixture");
+        assert_eq!(locals[0], canonical_file);
         assert_eq!(remotes, vec!["https://example.com/remote.png".to_string()]);
-        assert_eq!(
-            unresolved,
-            vec!["[VIDEO:/tmp/does-not-exist.mp4]".to_string()]
-        );
     }
 
     #[test]
-    fn with_inline_attachment_urls_appends_urls_and_unresolved_markers() {
+    fn classify_outgoing_attachments_drops_missing_absolute_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Video,
+            target: temp
+                .path()
+                .join("does-not-exist.mp4")
+                .to_string_lossy()
+                .to_string(),
+        }];
+
+        let (locals, remotes) = classify_outgoing_attachments(&attachments, Some(temp.path()));
+        assert!(locals.is_empty());
+        assert!(remotes.is_empty());
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_drops_paths_outside_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let outside_file = outside.path().join("escape.png");
+        std::fs::write(&outside_file, b"fake").expect("write fixture");
+
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Image,
+            target: outside_file.to_string_lossy().to_string(),
+        }];
+
+        let (locals, remotes) = classify_outgoing_attachments(&attachments, Some(workspace.path()));
+        assert!(
+            locals.is_empty(),
+            "absolute paths outside workspace must be refused"
+        );
+        assert!(remotes.is_empty());
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_drops_relative_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Document,
+            target: "relative/report.pdf".to_string(),
+        }];
+
+        let (locals, remotes) = classify_outgoing_attachments(&attachments, Some(temp.path()));
+        assert!(locals.is_empty(), "relative paths must be refused");
+        assert!(remotes.is_empty());
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_drops_disallowed_schemes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let attachments = vec![
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Image,
+                target: "file:///etc/hostname".to_string(),
+            },
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Document,
+                target: "data:text/plain;base64,aGk=".to_string(),
+            },
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Video,
+                target: "ftp://example.com/clip.mp4".to_string(),
+            },
+        ];
+
+        let (locals, remotes) = classify_outgoing_attachments(&attachments, Some(temp.path()));
+        assert!(locals.is_empty());
+        assert!(remotes.is_empty());
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_refuses_local_without_workspace() {
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Image,
+            target: "/some/absolute/path.png".to_string(),
+        }];
+
+        let (locals, remotes) = classify_outgoing_attachments(&attachments, None);
+        assert!(
+            locals.is_empty(),
+            "local paths must be refused without workspace_dir"
+        );
+        assert!(remotes.is_empty());
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_passes_http_without_workspace() {
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Image,
+            target: "https://example.com/x.png".to_string(),
+        }];
+
+        let (locals, remotes) = classify_outgoing_attachments(&attachments, None);
+        assert!(locals.is_empty());
+        assert_eq!(remotes, vec!["https://example.com/x.png".to_string()]);
+    }
+
+    #[test]
+    fn with_inline_attachment_urls_appends_remote_urls_only() {
         let content = "Done";
         let remote_urls = vec!["https://example.com/a.png".to_string()];
-        let unresolved = vec!["[IMAGE:/tmp/missing.png]".to_string()];
 
-        let rendered = with_inline_attachment_urls(content, &remote_urls, &unresolved);
-        assert_eq!(
-            rendered,
-            "Done\nhttps://example.com/a.png\n[IMAGE:/tmp/missing.png]"
-        );
+        let rendered = with_inline_attachment_urls(content, &remote_urls);
+        assert_eq!(rendered, "Done\nhttps://example.com/a.png");
+    }
+
+    #[test]
+    fn with_inline_attachment_urls_keeps_content_when_no_urls() {
+        let rendered = with_inline_attachment_urls("Done", &[]);
+        assert_eq!(rendered, "Done");
     }
 
     // ── Streaming mode tests ──────────────────────────────────────────
