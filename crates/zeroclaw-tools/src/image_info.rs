@@ -229,6 +229,7 @@ impl Tool for ImageInfoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wrappers::{PathGuardedTool, RateLimitedTool};
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
@@ -240,6 +241,29 @@ mod tests {
             forbidden_paths: vec![],
             ..SecurityPolicy::default()
         })
+    }
+
+    /// Security policy with `workspace_only: true` so external absolute paths
+    /// are blocked by the `PathGuardedTool` wrapper.
+    fn workspace_security(workspace: std::path::PathBuf) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace,
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    /// Wraps `ImageInfoTool` with the production `PathGuardedTool` +
+    /// `RateLimitedTool` stack, mirroring the registration in
+    /// `zeroclaw-runtime::tools::mod`.  Use this in tests that exercise
+    /// path-allowlist or rate-limit behavior.
+    fn wrapped_tool(workspace: std::path::PathBuf) -> Box<dyn Tool> {
+        let security = workspace_security(workspace);
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
+            security,
+        ))
     }
 
     #[test]
@@ -461,6 +485,60 @@ mod tests {
 
         // Clean up
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn wrapped_blocks_external_absolute_path() {
+        // Regression for the removed inline path check: when ImageInfoTool is
+        // composed with PathGuardedTool (as it is in production), an external
+        // absolute path must be blocked before the inner tool runs.
+        let workspace = std::env::temp_dir().join("zeroclaw_image_info_wrap");
+        let _ = std::fs::create_dir_all(&workspace);
+        let tool = wrapped_tool(workspace);
+
+        #[cfg(unix)]
+        let target = "/etc/passwd";
+        #[cfg(windows)]
+        let target = {
+            let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+            format!(r"{sysroot}\System32\drivers\etc\hosts")
+        };
+
+        let result = tool.execute(json!({"path": target})).await.unwrap();
+        assert!(!result.success, "external path must be blocked");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_blocks_path_traversal() {
+        // Path-traversal under workspace_only must be blocked by the wrapper,
+        // not pass through to the inner tool.
+        let workspace = std::env::temp_dir().join("zeroclaw_image_info_trav");
+        let _ = std::fs::create_dir_all(&workspace);
+        let tool = wrapped_tool(workspace);
+
+        let result = tool
+            .execute(json!({"path": "../../../etc/passwd"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "path traversal must be blocked");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
+        );
     }
 
     #[tokio::test]
