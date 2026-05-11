@@ -15,11 +15,13 @@ mod tests {
             ws_url: "ws://localhost:5200".to_string(),
             uid: "bot".to_string(),
             token: "tok".to_string(),
+            device_id: "web-001".to_string(),
+            device_flag: 2,
             allowed_users: vec!["*".to_string()],
             mention_only: false,
             approval_timeout_secs: 300,
         };
-        assert_eq!(cfg.approval_timeout_secs, 300);
-        assert!(!cfg.mention_only);
+        assert_eq!(cfg.device_id, "web-001");
+        assert_eq!(cfg.device_flag, 2);
     }
 }
