@@ -300,3 +300,8 @@ cli-desktop-long-about =
 # gateway has no model configured. Used by the gateway crate channel
 # webhook handlers (WhatsApp, Linq, WATI, Nextcloud Talk).
 channel-needs-onboarding-reply = This agent isn't fully set up yet. The operator needs to complete onboarding before I can reply.
+
+channel-whatsapp-web-feature-missing-warning =   ⚠ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled in.
+channel-whatsapp-web-feature-missing-build =     Build/run with: cargo build --features whatsapp-web
+channel-whatsapp-web-feature-missing-install =     If installed to PATH, reinstall with: cargo install --path . --force --locked --features whatsapp-web
+channel-whatsapp-web-feature-missing-error = WhatsApp Web channel requires the 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)

@@ -560,7 +560,7 @@ impl AcpServer {
         // the file/shell sandbox boundary. The agent's data directory
         // (memory DB, identity, scheduled tasks) still lives under
         // `config.workspace_dir`.
-        let agent = Agent::from_config_with_session_cwd_and_mcp(
+        let agent = Agent::from_config_with_session_cwd_and_mcp_backchannel(
             &self.config,
             Some(std::path::Path::new(&workspace_dir)),
             false,

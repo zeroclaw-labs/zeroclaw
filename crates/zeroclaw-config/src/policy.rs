@@ -343,6 +343,24 @@ fn expand_user_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Returns `true` if `path` is exactly the OS null device.
+///
+/// `/dev/null` is unconditionally permitted because redirecting output
+/// there is a common, harmless shell pattern. The rest of `/dev` remains
+/// blocked by the default forbidden-path list.
+fn is_null_device(path: &Path) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    {
+        path == Path::new("/dev/null")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let s = path.to_string_lossy();
+        let lower = s.to_ascii_lowercase();
+        lower == "nul" || lower == r"\\.\nul"
+    }
+}
+
 fn rootless_path(path: &Path) -> Option<PathBuf> {
     let mut relative = PathBuf::new();
 
@@ -1362,6 +1380,12 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
+        // The null device is always permitted regardless of workspace or
+        // forbidden-path config; the rest of /dev remains blocked as usual.
+        if is_null_device(&expanded_path) {
+            return true;
+        }
+
         // When workspace_only is set and the path is absolute, only allow it
         // if it falls within the workspace directory or an explicit allowed
         // root.  The workspace/allowed-root check runs BEFORE the forbidden
@@ -1400,6 +1424,10 @@ impl SecurityPolicy {
     /// Validate that a resolved path is inside the workspace or an allowed root.
     /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
+        if is_null_device(resolved) {
+            return true;
+        }
+
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
         let workspace_root = self

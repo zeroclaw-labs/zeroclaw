@@ -424,7 +424,8 @@ interactive_feature_picker() {
 #
 # When a source build includes the `gateway` feature, the dashboard
 # (`web/dist`) needs to be built so the gateway can serve it. If Node.js
-# is on PATH we run `npm install && npm run build` in `web/`. Without
+# is on PATH we run `cargo web build` from the source root so the
+# generated API client is refreshed before TypeScript compiles. Without
 # Node.js we warn — the gateway still starts but the dashboard route
 # returns 404 until `web/dist` is populated.
 build_web_dashboard() {
@@ -440,11 +441,11 @@ build_web_dashboard() {
   if ! command -v npm >/dev/null 2>&1; then
     warn "npm not found — skipping dashboard build. The gateway will run"
     warn "  in API-only mode until you build the dashboard:"
-    warn "  cd $src_dir/web && npm install && npm run build"
+    warn "  cd $src_dir && cargo web build"
     return 0
   fi
-  info "Building web dashboard (npm install + npm run build)..."
-  (cd "$src_dir/web" && npm install --silent && npm run build --silent) || {
+  info "Building web dashboard (cargo web build)..."
+  (cd "$src_dir" && cargo web build) || {
     warn "Dashboard build failed — gateway will run in API-only mode."
     return 0
   }

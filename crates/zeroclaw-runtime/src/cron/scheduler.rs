@@ -13,6 +13,7 @@ use tokio::process::Command;
 use tokio::time::{self, Duration};
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl};
+use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
 
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
@@ -303,7 +304,7 @@ async fn run_agent_job(
                     if ctx.is_empty() {
                         String::new()
                     } else {
-                        format!("[Memory context]\n{ctx}\n[/Memory context]\n\n")
+                        format!("{MEMORY_CONTEXT_OPEN}\n{ctx}\n{MEMORY_CONTEXT_CLOSE}\n\n")
                     }
                 }
                 _ => String::new(),
