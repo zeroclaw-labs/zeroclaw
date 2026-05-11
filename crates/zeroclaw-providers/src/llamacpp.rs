@@ -226,7 +226,7 @@ impl LlamaCppProvider {
 
     fn should_sanitize_tool_schema(model: &str) -> bool {
         let lower = model.to_ascii_lowercase();
-        lower.contains("gemma-4") || lower.contains("gemma4")
+        model.is_empty() || lower.contains("gemma-4") || lower.contains("gemma4")
     }
 
     fn sanitize_tool_payload_for_model(
@@ -1117,6 +1117,18 @@ mod tool_schema_tests {
         let specs = vec![ref_tool_spec()];
         let tools = LlamaCppProvider::convert_tools(Some(&specs), "gemma4:27b")
             .expect("tools should be present");
+        let params = &tools[0]["parameters"];
+
+        assert!(params.get("$defs").is_none());
+        assert!(params.get("additionalProperties").is_none());
+        assert_eq!(params["properties"]["command"]["type"], "string");
+    }
+
+    #[test]
+    fn empty_model_sanitizes_tool_schema() {
+        let specs = vec![ref_tool_spec()];
+        let tools =
+            LlamaCppProvider::convert_tools(Some(&specs), "").expect("tools should be present");
         let params = &tools[0]["parameters"];
 
         assert!(params.get("$defs").is_none());
