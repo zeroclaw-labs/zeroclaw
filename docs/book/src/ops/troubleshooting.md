@@ -171,6 +171,31 @@ If connection refused: daemon isn't running, or it's bound to a different interf
 
 If 403 / 401: pairing not completed or token expired. Run the pairing flow again.
 
+### Web dashboard: not available
+
+If the gateway logs:
+
+```
+Web dashboard: not available (set gateway.web_dist_dir or ZEROCLAW_WEB_DIST_DIR)
+```
+
+the dashboard static files were not found at runtime. The gateway searches a few default paths (e.g. `web/dist/` next to the binary); if your build output lives elsewhere, point the gateway to it explicitly:
+
+1. **Config file** — add to `config.toml`:
+
+   ```toml
+   [gateway]
+   web_dist_dir = "/path/to/web/dist"
+   ```
+
+2. **Environment variable** — before starting the daemon:
+
+   ```bash
+   ZEROCLAW_WEB_DIST_DIR=/path/to/web/dist zeroclaw daemon
+   ```
+
+If you built from source, run `cargo web build` first to produce `web/dist/`. If you installed a prebuilt binary, the dashboard files may be omitted; set the variable above if you copied them to a custom location.
+
 ---
 
 ## Channels

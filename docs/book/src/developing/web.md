@@ -52,6 +52,29 @@ cargo build --release --features gateway
 
 The gateway loads `web/dist/` from the filesystem at runtime via `static_files.rs`, so the Rust compile and the web build are decoupled. Ship the populated `web/dist/` alongside the binary for installs that should serve the dashboard.
 
+## Serving the dashboard at runtime
+
+By default the gateway looks for `web/dist/` next to the binary and in a few well-known paths. If the dashboard files live elsewhere, tell the gateway where to find them:
+
+1. **Config file** — set `gateway.web_dist_dir` in `config.toml`:
+
+   ```toml
+   [gateway]
+   web_dist_dir = "/path/to/web/dist"
+   ```
+
+2. **Environment variable** — export `ZEROCLAW_WEB_DIST_DIR` before starting the daemon:
+
+   ```bash
+   ZEROCLAW_WEB_DIST_DIR=/path/to/web/dist zeroclaw daemon
+   ```
+
+When the directory is found, the gateway logs `Web dashboard: serving from <path>`. If it is not found, the gateway starts in API-only mode and logs:
+
+```
+Web dashboard: not available (set gateway.web_dist_dir or ZEROCLAW_WEB_DIST_DIR)
+```
+
 ## Required tools
 
 | Tool   | Install                                |
