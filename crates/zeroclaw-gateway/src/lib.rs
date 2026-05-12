@@ -422,6 +422,13 @@ pub struct AppState {
     pub cancel_tokens: Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
     >,
+    /// Flag set whenever a config write (PATCH, init, map-key mutation) lands
+    /// via `persist_and_swap`, cleared on `/admin/reload`. Distinct from disk
+    /// drift (which fires only when an external editor touches the file): this
+    /// signals "the operator changed config in this session, subsystems may
+    /// need to be rebuilt to apply it." The dashboard polls
+    /// `/api/config/reload-status` and surfaces a reload banner when true.
+    pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -1144,6 +1151,7 @@ pub async fn run_gateway(
         web_dist_dir,
         canvas_store,
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -1207,6 +1215,10 @@ pub async fn run_gateway(
         )
         .route("/api/config/list", get(api_config::handle_list))
         .route("/api/config/drift", get(api_config::handle_drift))
+        .route(
+            "/api/config/reload-status",
+            get(api_config::handle_reload_status),
+        )
         .route("/api/config/templates", get(api_config::handle_templates))
         .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
         .route(
@@ -2717,6 +2729,13 @@ async fn handle_admin_reload(
     };
 
     tracing::info!("🔄 Admin reload request received");
+    // Clear the pending-reload flag before the daemon supervisor brings up
+    // the new gateway instance. The fresh instance starts with the flag
+    // already false, matching its "subsystems just-loaded, no pending
+    // changes" state.
+    state
+        .pending_reload
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     // Trigger graceful shutdown of THIS gateway instance's axum::serve so
     // its TcpListener releases the port before the daemon supervisor
     // spawns the new instance. Without this, daemon::run aborts the
@@ -3056,6 +3075,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3130,6 +3150,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3639,6 +3660,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3721,6 +3743,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3815,6 +3838,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3881,6 +3905,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3952,6 +3977,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4028,6 +4054,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4104,6 +4131,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };

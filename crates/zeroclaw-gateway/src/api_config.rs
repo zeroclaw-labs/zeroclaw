@@ -311,6 +311,9 @@ async fn persist_and_swap(
     }
 
     *state.config.write() = new_config;
+    state
+        .pending_reload
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -647,6 +650,32 @@ pub async fn handle_drift(State(state): State<AppState>, headers: HeaderMap) -> 
     let config = state.config.read().clone();
     let drifted = compute_drift(&config).await;
     axum::Json(DriftResponse { drifted }).into_response()
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct ReloadStatusResponse {
+    /// `true` when one or more config writes have landed since the last
+    /// `/admin/reload`. Distinct from disk-vs-memory drift: this fires on
+    /// in-process PATCHes even though `persist_and_swap` updates the
+    /// in-memory config, because some subsystems (channels, providers,
+    /// scheduler) need to be re-instantiated to actually apply the change.
+    pub pending_reload: bool,
+}
+
+/// `GET /api/config/reload-status` — pending-reload flag for the dashboard's
+/// reload banner. Goes true on any config write, false on `/admin/reload`.
+pub async fn handle_reload_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let pending_reload = state
+        .pending_reload
+        .load(std::sync::atomic::Ordering::Relaxed);
+    axum::Json(ReloadStatusResponse { pending_reload }).into_response()
 }
 
 #[derive(Debug, Deserialize)]
