@@ -964,6 +964,7 @@ impl Agent {
                 let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
                     tool_name: request.tool_name.clone(),
                     arguments_summary: crate::approval::summarize_args(&request.arguments),
+                    raw_arguments: Some(request.arguments.clone()),
                 };
                 let mut channel_decision: Option<zeroclaw_api::channel::ChannelApprovalResponse> =
                     None;

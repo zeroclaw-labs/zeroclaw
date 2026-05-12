@@ -63,6 +63,54 @@ impl AcpChannel {
     }
 }
 
+/// Map a tool name to the ACP `kind` field for approval prompts.
+/// `file_edit` / `file_write` are `"edit"` so clients render a diff view;
+/// everything else falls back to `"execute"`.
+fn map_approval_kind(tool_name: &str) -> &'static str {
+    match tool_name {
+        "file_edit" | "file_write" => "edit",
+        _ => "execute",
+    }
+}
+
+/// Build the `rawInput` object for a `session/request_permission` approval.
+///
+/// For `file_edit` and `file_write`, emit the ACP Diff shape (`oldText` /
+/// `newText`) so that IDE clients (Toad, Zed) render a side-by-side diff
+/// instead of raw JSON fields. All other tools fall back to a generic shape
+/// that shows the tool name and the pre-computed summary string.
+fn build_approval_raw_input(
+    tool_name: &str,
+    raw_arguments: &Option<serde_json::Value>,
+) -> serde_json::Value {
+    if let Some(args) = raw_arguments {
+        match tool_name {
+            "file_edit" => {
+                let path = args.get("path").cloned().unwrap_or(serde_json::Value::Null);
+                let old_text = args
+                    .get("old_string")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let new_text = args
+                    .get("new_string")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                return json!({ "path": path, "oldText": old_text, "newText": new_text });
+            }
+            "file_write" => {
+                let path = args.get("path").cloned().unwrap_or(serde_json::Value::Null);
+                let new_text = args
+                    .get("content")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                return json!({ "path": path, "oldText": serde_json::Value::Null, "newText": new_text });
+            }
+            _ => {}
+        }
+    }
+    json!({ "tool": tool_name })
+}
+
 #[async_trait]
 impl Channel for AcpChannel {
     fn name(&self) -> &str {
@@ -232,18 +280,17 @@ impl Channel for AcpChannel {
 
         let tool_call_id = format!("approval-{}", uuid::Uuid::new_v4());
         let title = format!("Approve {}?", request.tool_name);
+        let kind = map_approval_kind(&request.tool_name);
+        let raw_input = build_approval_raw_input(&request.tool_name, &request.raw_arguments);
         let params = json!({
             "sessionId": self.session_id,
             "options": options,
             "toolCall": {
                 "toolCallId": tool_call_id,
                 "title": title,
-                "kind": "execute",
+                "kind": kind,
                 "status": "pending",
-                "rawInput": {
-                    "tool": request.tool_name,
-                    "summary": request.arguments_summary,
-                },
+                "rawInput": raw_input,
                 "content": [{
                     "type": "content",
                     "content": {
@@ -459,6 +506,7 @@ mod tests {
         let request = ChannelApprovalRequest {
             tool_name: "git".to_string(),
             arguments_summary: "git status --short".to_string(),
+            raw_arguments: None,
         };
 
         let task = tokio::spawn(async move { ch.request_approval("", &request).await });
@@ -496,6 +544,7 @@ mod tests {
         let request = ChannelApprovalRequest {
             tool_name: "git".to_string(),
             arguments_summary: "git commit".to_string(),
+            raw_arguments: None,
         };
 
         let task = tokio::spawn(async move { ch.request_approval("", &request).await });
@@ -519,6 +568,7 @@ mod tests {
         let request = ChannelApprovalRequest {
             tool_name: "git".to_string(),
             arguments_summary: "git push".to_string(),
+            raw_arguments: None,
         };
         let task = tokio::spawn(async move { ch.request_approval("", &request).await });
         let line = rx.recv().await.unwrap();

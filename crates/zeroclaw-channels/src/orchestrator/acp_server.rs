@@ -526,7 +526,7 @@ impl AcpServer {
         }
 
         let session_capabilities = if self.store.is_some() {
-            serde_json::json!({ "resume": true, "close": true })
+            serde_json::json!({ "resume": {}, "close": {} })
         } else {
             serde_json::json!({})
         };
@@ -744,7 +744,7 @@ impl AcpServer {
             "Loaded session {session_id} ({} messages)",
             data.messages.len()
         );
-        Ok(Value::Null)
+        Ok(serde_json::json!({}))
     }
 
     async fn handle_session_resume(&self, params: &Value) -> RpcResult {
@@ -1076,11 +1076,25 @@ impl AcpServer {
             Some(Value::Array(arr)) => {
                 let mut joined = String::new();
                 for part in arr {
+                    let mut added = false;
                     if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                         if !joined.is_empty() {
                             joined.push_str("\n\n");
                         }
                         joined.push_str(text);
+                        added = true;
+                    }
+                    // Support ACP resource blocks for @-notation file attachments
+                    // (clients send {"type":"resource","resource":{"uri":"...","text":"..."}})
+                    if let Some(res) = part.get("resource") {
+                        if let Some(text) = res.get("text").and_then(|v| v.as_str()) {
+                            if !added && !joined.is_empty() {
+                                joined.push_str("\n\n");
+                            } else if added {
+                                joined.push_str("\n\n");
+                            }
+                            joined.push_str(text);
+                        }
                     }
                 }
                 if joined.is_empty() {
@@ -1289,6 +1303,30 @@ async fn writer_task(mut rx: mpsc::Receiver<String>) {
     }
 }
 
+/// Translate tool args into the ACP `rawInput` shape.
+///
+/// For file-editing tools, the ACP Diff schema uses `oldText`/`newText` (camelCase).
+/// ZeroClaw's internal tool args use `old_string`/`new_string` (snake_case) for
+/// `file_edit` and `content` for `file_write`. Without this translation, ACP clients
+/// (Toad, Zed) cannot recognise the Diff shape and fall back to rendering the raw JSON
+/// fields as giant strings.
+fn to_acp_raw_input(name: &str, args: &Value) -> Value {
+    match name {
+        "file_edit" => {
+            let path = args.get("path").cloned().unwrap_or(Value::Null);
+            let old_text = args.get("old_string").cloned().unwrap_or(Value::Null);
+            let new_text = args.get("new_string").cloned().unwrap_or(Value::Null);
+            serde_json::json!({ "path": path, "oldText": old_text, "newText": new_text })
+        }
+        "file_write" => {
+            let path = args.get("path").cloned().unwrap_or(Value::Null);
+            let new_text = args.get("content").cloned().unwrap_or(Value::Null);
+            serde_json::json!({ "path": path, "oldText": Value::Null, "newText": new_text })
+        }
+        _ => args.clone(),
+    }
+}
+
 fn map_tool_kind(name: &str) -> &'static str {
     match name {
         "ask_user" | "calculator" | "claude_code" | "claude_code_runner" | "codex_cli"
@@ -1368,7 +1406,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                     "name": name,
                     "title": name,
                     "kind": map_tool_kind(name),
-                    "rawInput": args,
+                    "rawInput": to_acp_raw_input(name, args),
                     "status": "pending"
                 }
             }),
@@ -1466,7 +1504,7 @@ fn history_notifications_for_message(
                             "name": &tc.name,
                             "title": &tc.name,
                             "kind": map_tool_kind(&tc.name),
-                            "rawInput": args,
+                            "rawInput": to_acp_raw_input(&tc.name, &args),
                             "status": "completed"
                         }
                     }),
@@ -1630,11 +1668,11 @@ mod tests {
         assert_eq!(result["agentCapabilities"]["loadSession"], true);
         assert_eq!(
             result["agentCapabilities"]["sessionCapabilities"]["resume"],
-            true
+            serde_json::json!({})
         );
         assert_eq!(
             result["agentCapabilities"]["sessionCapabilities"]["close"],
-            true
+            serde_json::json!({})
         );
     }
 
@@ -1806,10 +1844,16 @@ mod tests {
         let result = AcpServer::parse_prompt(&no_text_params);
         assert!(result.is_err());
 
-        // Missing prompt
-        let missing_params = serde_json::json!({});
-        let result = AcpServer::parse_prompt(&missing_params);
-        assert!(result.is_err());
+        // Array prompt with resource (file @-notation from ACP client)
+        let resource_params = serde_json::json!({
+            "prompt": [
+                {"type": "text", "text": "analyze this file:"},
+                {"type": "resource", "resource": {"uri": "file:///tmp/example.rs", "text": "fn main() { println!(\"hi\"); }", "mimeType": "text/rust"}}
+            ]
+        });
+        let result = AcpServer::parse_prompt(&resource_params).unwrap();
+        assert!(result.contains("analyze this file:"));
+        assert!(result.contains("fn main() { println!(\"hi\"); }"));
     }
 
     #[test]
@@ -1900,6 +1944,50 @@ mod tests {
         assert!(json2.contains("file1.txt"));
         // Verify matching toolCallId across events
         assert!(json1.contains("tc-12345") && json2.contains("tc-12345"));
+    }
+
+    #[test]
+    fn file_edit_raw_input_uses_acp_diff_field_names() {
+        let call = notification_for_turn_event(
+            "sid",
+            &TurnEvent::ToolCall {
+                id: "tc-1".to_string(),
+                name: "file_edit".to_string(),
+                args: serde_json::json!({
+                    "path": "src/foo.rs",
+                    "old_string": "let x = 1;",
+                    "new_string": "let x = 2;"
+                }),
+            },
+        );
+        let v = serde_json::to_value(call.unwrap()).unwrap();
+        let raw = &v["params"]["update"]["rawInput"];
+        assert_eq!(raw["path"], "src/foo.rs");
+        assert_eq!(raw["oldText"], "let x = 1;");
+        assert_eq!(raw["newText"], "let x = 2;");
+        assert!(raw.get("old_string").is_none(), "old_string must not appear in rawInput");
+        assert!(raw.get("new_string").is_none(), "new_string must not appear in rawInput");
+    }
+
+    #[test]
+    fn file_write_raw_input_uses_acp_diff_field_names() {
+        let call = notification_for_turn_event(
+            "sid",
+            &TurnEvent::ToolCall {
+                id: "tc-2".to_string(),
+                name: "file_write".to_string(),
+                args: serde_json::json!({
+                    "path": "src/new.rs",
+                    "content": "fn main() {}"
+                }),
+            },
+        );
+        let v = serde_json::to_value(call.unwrap()).unwrap();
+        let raw = &v["params"]["update"]["rawInput"];
+        assert_eq!(raw["path"], "src/new.rs");
+        assert_eq!(raw["newText"], "fn main() {}");
+        assert!(raw["oldText"].is_null());
+        assert!(raw.get("content").is_none(), "content must not appear in rawInput");
     }
 
     #[test]
@@ -2320,7 +2408,7 @@ mod tests {
             .await
             .expect("session/load must succeed");
 
-        assert!(result.is_null());
+        assert_eq!(result, serde_json::json!({}));
 
         // Session must now be in the in-memory map
         assert!(server.sessions.lock().await.contains_key(session_id));
