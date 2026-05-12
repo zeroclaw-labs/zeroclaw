@@ -188,6 +188,7 @@ impl Tool for ShellTool {
             }
         }
 
+        cmd.stdin(std::process::Stdio::null());
         let timeout_secs = self.timeout_secs;
         let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
 
