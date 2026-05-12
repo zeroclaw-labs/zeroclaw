@@ -412,6 +412,26 @@ extra_args = []              # extra arguments passed to every `podman run`
 
 Auto-detection (`backend = "auto"`) tries Podman before Docker. If the `docker` command is actually the `podman-docker` compatibility shim, a warning is logged recommending explicit Podman configuration.
 
+#### Podman runtime configuration
+
+When using `runtime.kind = "podman"`, all agent shell commands run inside rootless Podman containers instead of going through the Docker CLI. This avoids the `podman-docker` shim entirely, preventing SIGSYS failures under restrictive systemd sandboxes.
+
+```toml
+[runtime]
+kind = "podman"
+
+[runtime.podman]
+image = "ubuntu:24.04"            # OCI image for command execution
+network = "none"                  # "none" (default), "slirp4netns", or "pasta"
+memory_limit_mb = 512             # per-container memory limit in MB
+cpu_limit = 1.0                   # per-container CPU limit
+read_only_rootfs = true           # mount root filesystem as read-only
+mount_workspace = true            # mount workspace into /workspace
+userns = "keep-id"                # rootless UID mapping
+selinux_label = true              # append :Z to volume mounts
+allowed_workspace_roots = []      # optional allowlist for mount validation
+```
+
 ## Subscription Auth (OpenAI Codex / Claude Code / Gemini)
 
 ZeroClaw supports subscription-native auth profiles (multi-account, encrypted at rest).

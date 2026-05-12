@@ -5703,7 +5703,7 @@ impl Default for AutonomyConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "runtime"]
 pub struct RuntimeConfig {
-    /// Runtime kind (`native` | `docker`).
+    /// Runtime kind (`native` | `docker` | `podman`).
     #[serde(default = "default_runtime_kind")]
     pub kind: String,
 
@@ -5711,6 +5711,11 @@ pub struct RuntimeConfig {
     #[serde(default)]
     #[nested]
     pub docker: DockerRuntimeConfig,
+
+    /// Podman runtime settings (used when `kind = "podman"`).
+    #[serde(default)]
+    #[nested]
+    pub podman: PodmanRuntimeConfig,
 
     /// Global reasoning override for providers that expose explicit controls.
     /// - `None`: provider default behavior
@@ -5791,11 +5796,79 @@ impl Default for DockerRuntimeConfig {
     }
 }
 
+/// Podman runtime configuration (`[runtime.podman]` section).
+///
+/// Mirrors Docker runtime capabilities but uses rootless Podman.
+/// Calls `podman` directly — no daemon socket required.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "runtime.podman"]
+pub struct PodmanRuntimeConfig {
+    /// OCI image used to execute shell commands.
+    #[serde(default = "default_podman_runtime_image")]
+    pub image: String,
+
+    /// Network mode (`none`, `slirp4netns`, `pasta`).
+    #[serde(default = "default_podman_runtime_network")]
+    pub network: String,
+
+    /// Optional memory limit in MB (`None` = no explicit limit).
+    #[serde(default = "default_podman_runtime_memory_limit_mb")]
+    pub memory_limit_mb: Option<u64>,
+
+    /// Optional CPU limit (`None` = no explicit limit).
+    #[serde(default = "default_podman_runtime_cpu_limit")]
+    pub cpu_limit: Option<f64>,
+
+    /// Mount root filesystem as read-only.
+    #[serde(default = "default_true")]
+    pub read_only_rootfs: bool,
+
+    /// Mount configured workspace into `/workspace`.
+    #[serde(default = "default_true")]
+    pub mount_workspace: bool,
+
+    /// Optional workspace root allowlist for mount validation.
+    #[serde(default)]
+    pub allowed_workspace_roots: Vec<String>,
+
+    /// Rootless user namespace mode (`keep-id` maps host UID inside container).
+    #[serde(default = "default_podman_runtime_userns")]
+    pub userns: String,
+
+    /// Append `:Z` to volume mounts for SELinux relabeling.
+    #[serde(default = "default_true")]
+    pub selinux_label: bool,
+}
+
+fn default_podman_runtime_image() -> String { "ubuntu:24.04".into() }
+fn default_podman_runtime_network() -> String { "none".into() }
+fn default_podman_runtime_memory_limit_mb() -> Option<u64> { Some(512) }
+fn default_podman_runtime_cpu_limit() -> Option<f64> { Some(1.0) }
+fn default_podman_runtime_userns() -> String { "keep-id".into() }
+
+impl Default for PodmanRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            image: default_podman_runtime_image(),
+            network: default_podman_runtime_network(),
+            memory_limit_mb: default_podman_runtime_memory_limit_mb(),
+            cpu_limit: default_podman_runtime_cpu_limit(),
+            read_only_rootfs: true,
+            mount_workspace: true,
+            allowed_workspace_roots: Vec::new(),
+            userns: default_podman_runtime_userns(),
+            selinux_label: true,
+        }
+    }
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
+            podman: PodmanRuntimeConfig::default(),
             reasoning_enabled: None,
             reasoning_effort: None,
         }

@@ -28,6 +28,17 @@ mod tests {
     }
 
     #[test]
+    fn factory_podman() {
+        let cfg = RuntimeConfig {
+            kind: "podman".into(),
+            ..RuntimeConfig::default()
+        };
+        let rt = create_runtime(&cfg).unwrap();
+        assert_eq!(rt.name(), "podman");
+        assert!(rt.has_shell_access());
+    }
+
+    #[test]
     fn factory_cloudflare_errors() {
         let cfg = RuntimeConfig {
             kind: "cloudflare".into(),
