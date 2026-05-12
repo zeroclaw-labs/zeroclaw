@@ -774,6 +774,124 @@ impl TelegramChannel {
         }
     }
 
+    /// Check whether a voice reply should be queued for the given recipient and
+    /// content. Shared between `send()` and `finalize_draft()` so the TTS
+    /// voice-reply path works regardless of `stream_mode`.
+    ///
+    /// When `immediate` is `true` (called from `finalize_draft`), the 10-second
+    /// debounce is skipped and `synthesize_and_send_voice` is called directly,
+    /// since the text is already the final response.
+    fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool) {
+        let is_voice_chat = self
+            .voice_chats
+            .lock()
+            .map(|vs| vs.contains(recipient))
+            .unwrap_or(false);
+
+        if !is_voice_chat || self.tts_config.is_none() {
+            return;
+        }
+
+        // Only queue substantive natural-language replies for voice.
+        // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
+        let is_substantive = content.len() > 40
+            && !content.starts_with("http")
+            && !content.starts_with('{')
+            && !content.starts_with('[')
+            && !content.starts_with("Error")
+            && !content.contains("```")
+            && !content.contains("tool_call")
+            && !content.contains("wttr.in");
+
+        if !is_substantive {
+            return;
+        }
+
+        let (chat_id, thread_id) = Self::parse_reply_target(recipient);
+        let voice_chats = self.voice_chats.clone();
+        let api_base = self.api_base.clone();
+        let bot_token = self.bot_token.clone();
+        let tts_config = self.tts_config.clone().unwrap();
+
+        if immediate {
+            // Finalize path: text is already the final answer — no debounce.
+            let text = content.to_string();
+            let recipient = recipient.to_string();
+            tokio::spawn(async move {
+                if let Ok(mut vc) = voice_chats.lock() {
+                    vc.remove(&recipient);
+                }
+                match Self::synthesize_and_send_voice(
+                    &api_base,
+                    &bot_token,
+                    &chat_id,
+                    thread_id.as_deref(),
+                    &text,
+                    &tts_config,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!("Telegram: voice reply sent ({} chars)", text.len());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Telegram: TTS voice reply failed: {e}");
+                    }
+                }
+            });
+            return;
+        }
+
+        // Send path: debounce to coalesce multi-part tool-chain responses.
+        if let Ok(mut pv) = self.pending_voice.lock() {
+            pv.insert(
+                recipient.to_string(),
+                (content.to_string(), std::time::Instant::now()),
+            );
+        }
+
+        let pending = self.pending_voice.clone();
+        let recipient = recipient.to_string();
+        tokio::spawn(async move {
+            // Wait 10 seconds — long enough for the agent to finish its
+            // full tool chain and send the final answer.
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+            // Atomic check-and-remove: only one task gets the value
+            let to_voice = pending.lock().ok().and_then(|mut pv| {
+                if let Some((_, ts)) = pv.get(&recipient)
+                    && ts.elapsed().as_secs() >= 8
+                {
+                    return pv.remove(&recipient).map(|(text, _)| text);
+                }
+                None
+            });
+
+            if let Some(text) = to_voice {
+                if let Ok(mut vc) = voice_chats.lock() {
+                    vc.remove(&recipient);
+                }
+                match Self::synthesize_and_send_voice(
+                    &api_base,
+                    &bot_token,
+                    &chat_id,
+                    thread_id.as_deref(),
+                    &text,
+                    &tts_config,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!("Telegram: voice reply sent ({} chars)", text.len());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Telegram: TTS voice reply failed: {e}");
+                    }
+                }
+            }
+        });
+    }
+
     /// Synthesize text to speech and send as a Telegram voice note (static version for spawned tasks).
     async fn synthesize_and_send_voice(
         api_base: &str,
@@ -2674,6 +2792,9 @@ impl Channel for TelegramChannel {
         let text = &strip_tool_call_tags(text);
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
 
+        // Queue TTS voice reply — immediate mode since text is already final
+        self.try_queue_voice_reply(recipient, text, true);
+
         // Clean up rate-limit tracking for this chat
         self.last_draft_edit.lock().remove(&chat_id);
 
@@ -2869,80 +2990,7 @@ impl Channel for TelegramChannel {
 
         // Voice chat mode: send text normally AND queue a voice note of the
         // final answer. Text in → text out. Voice in → text + voice out.
-        let is_voice_chat = self
-            .voice_chats
-            .lock()
-            .map(|vs| vs.contains(&message.recipient))
-            .unwrap_or(false);
-
-        if is_voice_chat && self.tts_config.is_some() {
-            // Only queue substantive natural-language replies for voice.
-            // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-            let is_substantive = content.len() > 40
-                && !content.starts_with("http")
-                && !content.starts_with('{')
-                && !content.starts_with('[')
-                && !content.starts_with("Error")
-                && !content.contains("```")
-                && !content.contains("tool_call")
-                && !content.contains("wttr.in");
-
-            if is_substantive {
-                if let Ok(mut pv) = self.pending_voice.lock() {
-                    pv.insert(
-                        message.recipient.clone(),
-                        (content.clone(), std::time::Instant::now()),
-                    );
-                }
-
-                let pending = self.pending_voice.clone();
-                let voice_chats = self.voice_chats.clone();
-                let api_base = self.api_base.clone();
-                let bot_token = self.bot_token.clone();
-                let chat_id_owned = chat_id.to_string();
-                let thread_id_owned = thread_id.map(str::to_string);
-                let recipient = message.recipient.clone();
-                let tts_config = self.tts_config.clone().unwrap();
-                tokio::spawn(async move {
-                    // Wait 10 seconds — long enough for the agent to finish its
-                    // full tool chain and send the final answer.
-                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-
-                    // Atomic check-and-remove: only one task gets the value
-                    let to_voice = pending.lock().ok().and_then(|mut pv| {
-                        if let Some((_, ts)) = pv.get(&recipient)
-                            && ts.elapsed().as_secs() >= 8
-                        {
-                            return pv.remove(&recipient).map(|(text, _)| text);
-                        }
-                        None
-                    });
-
-                    if let Some(text) = to_voice {
-                        if let Ok(mut vc) = voice_chats.lock() {
-                            vc.remove(&recipient);
-                        }
-                        match Self::synthesize_and_send_voice(
-                            &api_base,
-                            &bot_token,
-                            &chat_id_owned,
-                            thread_id_owned.as_deref(),
-                            &text,
-                            &tts_config,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                tracing::info!("Telegram: voice reply sent ({} chars)", text.len());
-                            }
-                            Err(e) => {
-                                tracing::warn!("Telegram: TTS voice reply failed: {e}");
-                            }
-                        }
-                    }
-                });
-            }
-        }
+        self.try_queue_voice_reply(&message.recipient, &content, false);
 
         // Always send text reply (voice chat gets both text and voice)
         let (text_without_markers, attachments) = parse_attachment_markers(&content);
