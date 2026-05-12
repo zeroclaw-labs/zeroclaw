@@ -24,8 +24,9 @@ pub use traits::{Observer, ObserverEvent};
 pub use verbose::VerboseObserver;
 
 use std::any::Any;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
+use parking_lot::RwLock;
 use traits::ObserverMetric;
 use zeroclaw_config::schema::ObservabilityConfig;
 
@@ -34,6 +35,10 @@ use zeroclaw_config::schema::ObservabilityConfig;
 /// notably the agent loop's `process_message` — also fan out to the SSE
 /// broadcast channel. Without this, observers created per call site stay
 /// isolated and `/api/events` only sees the gateway's own direct emissions.
+///
+/// Uses `parking_lot::RwLock` so the event-recording path never has to handle
+/// lock poisoning: a panic inside a hook would not silently disable the entire
+/// observability channel on subsequent calls.
 static BROADCAST_HOOK: OnceLock<RwLock<Option<Arc<dyn Observer>>>> = OnceLock::new();
 
 fn broadcast_hook_slot() -> &'static RwLock<Option<Arc<dyn Observer>>> {
@@ -44,16 +49,16 @@ fn broadcast_hook_slot() -> &'static RwLock<Option<Arc<dyn Observer>>> {
 /// through observers built by [`create_observer`]. Calling this again replaces
 /// the previous hook.
 pub fn set_broadcast_hook(observer: Arc<dyn Observer>) {
-    *broadcast_hook_slot().write().unwrap() = Some(observer);
+    *broadcast_hook_slot().write() = Some(observer);
 }
 
 /// Remove the broadcast hook, if any. Intended for tests and orderly shutdown.
 pub fn clear_broadcast_hook() {
-    *broadcast_hook_slot().write().unwrap() = None;
+    *broadcast_hook_slot().write() = None;
 }
 
 fn current_broadcast_hook() -> Option<Arc<dyn Observer>> {
-    broadcast_hook_slot().read().unwrap().clone()
+    broadcast_hook_slot().read().clone()
 }
 
 /// Wrapper that forwards every event to a primary observer plus the
