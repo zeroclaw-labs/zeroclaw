@@ -611,6 +611,15 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
              - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
         ),
+        "discord" => Some(
+            "When responding on Discord:\n\
+             - Use Markdown formatting (bold, italic, code blocks)\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<absolute-path>], [DOCUMENT:<absolute-path>], [VIDEO:<absolute-path>], [AUDIO:<absolute-path>], or [VOICE:<absolute-path>]\n\
+             - Paths inside markers MUST be absolute (starting with /) and live inside the configured workspace directory. Never use relative paths.\n\
+             - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
         "telegram" => Some(
             "When responding on Telegram:\n\
              - Include media markers for files or URLs that should be sent as attachments\n\
@@ -11578,6 +11587,32 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn channel_delivery_instructions_for_discord_mandates_absolute_paths() {
+        let block = channel_delivery_instructions("discord")
+            .expect("discord channel must have a delivery-instructions block");
+        assert!(
+            block.contains("When responding on Discord:"),
+            "discord block must identify itself"
+        );
+        assert!(
+            block.contains("For media attachments use markers:"),
+            "discord block must describe marker syntax"
+        );
+        assert!(
+            block.contains("MUST be absolute"),
+            "discord block must mandate absolute paths"
+        );
+        assert!(
+            block.contains("workspace"),
+            "discord block must reference workspace bounds"
+        );
+        assert!(
+            block.contains("[IMAGE:<absolute-path>]"),
+            "discord block must show the absolute-path marker form"
+        );
+    }
+
+    #[test]
     fn extract_tool_context_summary_collects_alias_and_native_tool_calls() {
         let history = vec![
             ChatMessage::system("sys"),
@@ -12982,6 +13017,7 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[cfg(feature = "channel-telegram")]
     #[test]
     fn build_channel_by_id_unconfigured_telegram_returns_error() {
         let config = Config::default();
@@ -12997,6 +13033,7 @@ This is an example JSON object for profile settings."#;
         }
     }
 
+    #[cfg(feature = "channel-telegram")]
     #[test]
     fn build_channel_by_id_configured_telegram_succeeds() {
         let mut config = Config::default();
