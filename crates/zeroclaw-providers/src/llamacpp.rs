@@ -224,11 +224,46 @@ impl LlamaCppProvider {
         })
     }
 
+    fn should_sanitize_tool_schema(model: &str) -> bool {
+        let lower = model.to_ascii_lowercase();
+        model.is_empty() || lower.contains("gemma-4") || lower.contains("gemma4")
+    }
+
+    fn sanitize_tool_payload_for_model(
+        tools: Vec<serde_json::Value>,
+        model: &str,
+    ) -> Vec<serde_json::Value> {
+        if !Self::should_sanitize_tool_schema(model) {
+            return tools;
+        }
+
+        tools
+            .into_iter()
+            .map(|mut tool| {
+                let Some(raw_parameters) = tool.get("parameters").cloned() else {
+                    return tool;
+                };
+
+                let cleaned_parameters = zeroclaw_api::schema::SchemaCleanr::clean(
+                    raw_parameters,
+                    zeroclaw_api::schema::CleaningStrategy::Conservative,
+                );
+
+                if let Some(tool_obj) = tool.as_object_mut() {
+                    tool_obj.insert("parameters".to_string(), cleaned_parameters);
+                }
+
+                tool
+            })
+            .collect()
+    }
+
     fn convert_tools(
         tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
+        model: &str,
     ) -> Option<Vec<serde_json::Value>> {
         tools.map(|items| {
-            items
+            let converted = items
                 .iter()
                 .map(|tool| {
                     let params = zeroclaw_api::schema::SchemaCleanr::clean_for_openai(
@@ -241,7 +276,9 @@ impl LlamaCppProvider {
                         "parameters": params,
                     })
                 })
-                .collect()
+                .collect::<Vec<_>>();
+
+            Self::sanitize_tool_payload_for_model(converted, model)
         })
     }
 
@@ -453,6 +490,7 @@ impl Provider for LlamaCppProvider {
                 }))
             })
             .collect();
+        let converted = Self::sanitize_tool_payload_for_model(converted, model);
         let tools_opt = if converted.is_empty() {
             None
         } else {
@@ -467,7 +505,7 @@ impl Provider for LlamaCppProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let tools = Self::convert_tools(request.tools);
+        let tools = Self::convert_tools(request.tools, model);
         self.do_chat(request.messages, model, temperature, tools)
             .await
     }
@@ -491,7 +529,7 @@ impl Provider for LlamaCppProvider {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
         let messages = request.messages.to_vec();
-        let tools = Self::convert_tools(request.tools);
+        let tools = Self::convert_tools(request.tools, model);
         self.do_stream(messages, model, temperature, tools, options.count_tokens)
     }
 
@@ -1099,6 +1137,82 @@ mod url_tests {
             provider("http://localhost:8080/openai/v1").responses_url(),
             "http://localhost:8080/openai/v1/responses"
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_schema_tests {
+    use super::LlamaCppProvider;
+
+    fn ref_tool_spec() -> zeroclaw_api::tool::ToolSpec {
+        zeroclaw_api::tool::ToolSpec {
+            name: "shell".to_string(),
+            description: "Run shell command".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "$ref": "#/$defs/Cmd" }
+                },
+                "required": ["command"],
+                "additionalProperties": false,
+                "$defs": {
+                    "Cmd": {
+                        "type": "string",
+                        "minLength": 1
+                    }
+                }
+            }),
+        }
+    }
+
+    #[test]
+    fn gemma4_sanitizes_tool_schema() {
+        let specs = vec![ref_tool_spec()];
+        let tools = LlamaCppProvider::convert_tools(Some(&specs), "gemma-4-27b-it")
+            .expect("tools should be present");
+        let params = &tools[0]["parameters"];
+
+        assert!(params.get("$defs").is_none());
+        assert!(params.get("additionalProperties").is_none());
+        assert_eq!(params["properties"]["command"]["type"], "string");
+    }
+
+    #[test]
+    fn gemma4_alias_sanitizes_tool_schema() {
+        let specs = vec![ref_tool_spec()];
+        let tools = LlamaCppProvider::convert_tools(Some(&specs), "gemma4:27b")
+            .expect("tools should be present");
+        let params = &tools[0]["parameters"];
+
+        assert!(params.get("$defs").is_none());
+        assert!(params.get("additionalProperties").is_none());
+        assert_eq!(params["properties"]["command"]["type"], "string");
+    }
+
+    #[test]
+    fn empty_model_sanitizes_tool_schema() {
+        let specs = vec![ref_tool_spec()];
+        let tools =
+            LlamaCppProvider::convert_tools(Some(&specs), "").expect("tools should be present");
+        let params = &tools[0]["parameters"];
+
+        assert!(params.get("$defs").is_none());
+        assert!(params.get("additionalProperties").is_none());
+        assert_eq!(params["properties"]["command"]["type"], "string");
+    }
+
+    #[test]
+    fn non_gemma_models_keep_openai_cleaned_tool_schema() {
+        let specs = vec![ref_tool_spec()];
+        let tools = LlamaCppProvider::convert_tools(Some(&specs), "llama-3.3-70b")
+            .expect("tools should be present");
+        let params = &tools[0]["parameters"];
+
+        let expected =
+            zeroclaw_api::schema::SchemaCleanr::clean_for_openai(specs[0].parameters.clone());
+
+        assert_eq!(params, &expected);
+        assert_eq!(params["additionalProperties"], serde_json::json!(false));
     }
 }
 
