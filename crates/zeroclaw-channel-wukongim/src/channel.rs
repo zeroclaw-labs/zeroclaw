@@ -252,11 +252,39 @@ impl Channel for WuKongIMChannel {
 
                     let decoded = base64::engine::general_purpose::STANDARD.decode(&params.payload)?;
                     let payload_json: serde_json::Value = serde_json::from_slice(&decoded)?;
+                    tracing::info!(channel_id = %params.channel_id, channel_type = %params.channel_type, from_uid = %params.from_uid, payload = %payload_json, "WuKongIM recv");
                     let msg_type = payload_json.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
 
-                    // System command — ack and skip
+                    // System command — handle la_init_helloworld CMD
                     if msg_type == WkMessageType::CMD as u64 || payload_json.get("cmd").is_some() {
                         let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+                        if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("la_init_helloworld") {
+                            if let Some(content) = payload_json.get("content").and_then(|c| c.as_str()) {
+                                // For group messages, only process if bot is mentioned
+                                if params.channel_type == WkChannelType::GROUP
+                                    && !is_mentioned(&self.uid, &payload_json, content)
+                                {
+                                    continue;
+                                }
+                                let target_id = if params.channel_type == WkChannelType::GROUP {
+                                    &params.channel_id
+                                } else {
+                                    &params.from_uid
+                                };
+                                let ch_msg = ChannelMessage {
+                                    id: params.message_id.clone(),
+                                    sender: target_id.clone(),
+                                    reply_target: format!("{}:{}", params.channel_type, target_id),
+                                    content: content.to_string(),
+                                    channel: "wukongim".to_string(),
+                                    timestamp: params.timestamp.max(0) as u64,
+                                    thread_ts: None,
+                                    interruption_scope_id: None,
+                                    attachments: vec![],
+                                };
+                                if tx.send(ch_msg).await.is_err() { break; }
+                            }
+                        }
                         continue;
                     }
 
