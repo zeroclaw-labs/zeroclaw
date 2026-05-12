@@ -46,6 +46,17 @@ type PathExtractor = dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync;
 /// policy, path-allowlist, read-only, and command-validation failures all
 /// surface as `success: false` from the inner tool (or inner wrapper) and do
 /// not consume a slot.
+///
+/// ## Read-tool exception (anti-probing)
+///
+/// `FileReadTool` (`zeroclaw-runtime::tools::file_read`) and `PdfReadTool` in
+/// this crate intentionally call `record_action()` *themselves* on the
+/// post-`PathGuardedTool` `resolve_candidate` / `canonicalize` failure paths.
+/// This prevents an attacker from probing path existence for free: each
+/// attempt — successful or failed — consumes exactly one slot.  The outer
+/// `RateLimitedTool` only records on `success: true`, so the totals stay at
+/// one slot per attempt.  When introducing a new read-style tool, follow the
+/// same pattern.
 pub struct RateLimitedTool<T: Tool> {
     inner: T,
     security: Arc<SecurityPolicy>,

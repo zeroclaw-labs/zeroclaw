@@ -75,15 +75,25 @@ impl Tool for PdfReadTool {
             })
             .unwrap_or(DEFAULT_MAX_CHARS);
 
-        // Rate limiting and path-allowlist checks are applied by the
+        // Cross-cutting rate limiting and path-allowlist checks live in the
         // RateLimitedTool + PathGuardedTool wrappers at registration time
-        // (see zeroclaw-runtime::tools::mod).
+        // (see zeroclaw-runtime::tools::mod).  Successful reads consume one
+        // budget slot via the outer RateLimitedTool.
+        //
+        // Read-tool exception: post-`PathGuardedTool` canonicalize failures
+        // (probing nonexistent files) and post-canonicalization policy
+        // failures (`is_resolved_path_allowed`) also consume one budget slot,
+        // charged here, so that callers cannot probe path existence or
+        // resolved-path policy decisions for free.  The outer wrapper only
+        // records on `success: true`, so these explicit charges total
+        // exactly one slot per attempt — matching the pre-wrapper semantics.
 
         let full_path = self.security.resolve_tool_path(path);
 
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(p) => p,
             Err(e) => {
+                let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -93,6 +103,7 @@ impl Tool for PdfReadTool {
         };
 
         if !self.security.is_resolved_path_allowed(&resolved_path) {
+            let _ = self.security.record_action();
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -219,6 +230,18 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn test_security_with_limit(
+        workspace: std::path::PathBuf,
+        max_actions: u32,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            max_actions_per_hour: max_actions,
             ..SecurityPolicy::default()
         })
     }
@@ -506,6 +529,40 @@ mod tests {
             result.error.as_deref().unwrap_or("").contains("rag-pdf"),
             "expected feature hint in error, got: {:?}",
             result.error
+        );
+    }
+
+    /// Anti-probing regression: a caller cannot probe PDF existence for free.
+    /// Each failed canonicalize must consume one action-budget slot via the
+    /// inner-tool charge, so repeated probes hit the rate limit.
+    #[tokio::test]
+    async fn probing_nonexistent_consumes_rate_limit_budget() {
+        let tmp = TempDir::new().unwrap();
+        let security = test_security_with_limit(tmp.path().to_path_buf(), 2);
+        let tool = PdfReadTool::new(security.clone());
+
+        let r1 = tool.execute(json!({"path": "a.pdf"})).await.unwrap();
+        assert!(!r1.success);
+        assert!(
+            r1.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Failed to resolve")
+        );
+
+        let r2 = tool.execute(json!({"path": "b.pdf"})).await.unwrap();
+        assert!(!r2.success);
+        assert!(
+            r2.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Failed to resolve")
+        );
+
+        // Budget must now be exhausted.
+        assert!(
+            !security.record_action(),
+            "budget must be exhausted after two failed probes"
         );
     }
 }
