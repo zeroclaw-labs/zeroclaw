@@ -308,7 +308,7 @@ React 19 + Vite 6 + Tailwind CSS 4 web dashboard served directly from the Gatewa
 ### Runtime + safety
 
 - **Autonomy levels:** ReadOnly, Supervised (default), Full.
-- **Sandboxing:** workspace isolation, path traversal blocking, command allowlists, forbidden paths, Landlock (Linux), Bubblewrap.
+- **Sandboxing:** workspace isolation, path traversal blocking, command allowlists, forbidden paths, Landlock (Linux), Bubblewrap, Podman (rootless).
 - **Rate limiting:** max actions per hour, max cost per day (configurable).
 - **Approval gating:** interactive approval for medium/high risk operations.
 - **E-stop:** emergency shutdown capability.
@@ -388,8 +388,29 @@ Details: [Channel reference](docs/reference/api/channels-reference.md) · [Confi
 
 - **`native`** (default) — direct process execution, fastest path, ideal for trusted environments.
 - **`docker`** — full container isolation, enforced security policies, requires Docker.
+- **`podman`** — rootless, daemonless container isolation. Preferred over Docker when both are available. No daemon socket required.
 
-Set `runtime.kind = "docker"` for strict sandboxing or network isolation.
+Set `runtime.kind = "docker"` or `runtime.kind = "podman"` for strict sandboxing or network isolation.
+
+#### Podman sandbox configuration
+
+When using `security.sandbox.backend = "podman"`, the following options are available in `config.toml`:
+
+```toml
+[security.sandbox]
+backend = "podman"
+
+[security.sandbox.podman]
+image = "ubuntu:24.04"       # OCI image for sandbox containers
+userns = "keep-id"           # rootless UID mapping (preserves host file ownership)
+network = "none"             # "none" (default), "slirp4netns", or "pasta"
+memory_limit = "512m"        # per-container memory limit
+cpu_limit = "1.0"            # per-container CPU limit
+selinux_label = true         # append :Z to volume mounts (SELinux relabeling)
+extra_args = []              # extra arguments passed to every `podman run`
+```
+
+Auto-detection (`backend = "auto"`) tries Podman before Docker. If the `docker` command is actually the `podman-docker` compatibility shim, a warning is logged recommending explicit Podman configuration.
 
 ## Subscription Auth (OpenAI Codex / Claude Code / Gemini)
 
@@ -534,6 +555,7 @@ Full commands reference: [docs/reference/cli/commands-reference.md](docs/referen
 #### Optional
 
 - **Docker Desktop** — required only if using the [Docker sandboxed runtime](#runtime-support-current) (`runtime.kind = "docker"`). Install via `winget install Docker.DockerDesktop`.
+- **Podman** — alternative to Docker for [rootless sandbox isolation](#podman-sandbox-configuration). Install via `winget install RedHat.Podman`.
 
 </details>
 
@@ -583,6 +605,7 @@ For pre-built binaries, see [GitHub Releases](https://github.com/zeroclaw-labs/z
 #### Optional
 
 - **Docker** — required only if using the [Docker sandboxed runtime](#runtime-support-current) (`runtime.kind = "docker"`). Install via your package manager or [docker.com](https://docs.docker.com/engine/install/).
+- **Podman** — alternative to Docker for [rootless sandbox isolation](#podman-sandbox-configuration). Install via your package manager (`sudo apt install podman` / `sudo dnf install podman`).
 
 > **Note:** The default `cargo build --release` uses `codegen-units=1` to lower peak compile pressure. For faster builds on powerful machines, use `cargo build --profile release-fast`.
 

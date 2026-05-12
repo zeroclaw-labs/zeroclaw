@@ -12,6 +12,7 @@ use zeroclaw_config::schema::{SandboxBackend, SecurityConfig};
 /// the user explicitly opted out of container wrapping.
 pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sandbox> {
     let backend = &config.sandbox.backend;
+    let podman_config = config.sandbox.podman.clone();
 
     // If explicitly disabled, return noop
     if matches!(backend, SandboxBackend::None) || config.sandbox.enabled == Some(false) {
@@ -69,6 +70,26 @@ pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sa
             tracing::warn!("Docker requested but not available, falling back to application-layer");
             Arc::new(super::traits::NoopSandbox)
         }
+        SandboxBackend::Podman => {
+            match super::podman::PodmanSandbox::with_config(podman_config) {
+                Ok(sandbox) if sandbox.is_available() => {
+                    tracing::info!("Podman sandbox enabled (rootless, daemonless)");
+                    return Arc::new(sandbox);
+                }
+                Ok(_) => {
+                    let issues = super::podman::PodmanSandbox::check_rootless_prereqs();
+                    tracing::warn!(
+                        "Podman requested but rootless prerequisites not met: {:?}, \
+                         falling back to application-layer",
+                        issues
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!("Podman requested but not installed, falling back to application-layer");
+                }
+            }
+            Arc::new(super::traits::NoopSandbox)
+        }
         SandboxBackend::SandboxExec => {
             #[cfg(target_os = "macos")]
             {
@@ -83,7 +104,7 @@ pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sa
         }
         SandboxBackend::Auto | SandboxBackend::None => {
             // Auto-detect best available, skipping Docker when native runtime is in use
-            detect_best_sandbox(runtime_kind)
+            detect_best_sandbox(runtime_kind, podman_config)
         }
     }
 }
@@ -93,7 +114,7 @@ pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sa
 /// When `runtime_kind` is `"native"` the caller has explicitly opted out of
 /// container wrapping, so Docker is excluded from consideration even if it is
 /// installed on the host.
-fn detect_best_sandbox(runtime_kind: &str) -> Arc<dyn Sandbox> {
+fn detect_best_sandbox(runtime_kind: &str, podman_config: zeroclaw_config::schema::PodmanSandboxConfig) -> Arc<dyn Sandbox> {
     let skip_docker = runtime_kind == "native";
 
     #[cfg(target_os = "linux")]
@@ -136,14 +157,40 @@ fn detect_best_sandbox(runtime_kind: &str) -> Arc<dyn Sandbox> {
     // Skip it when runtime.kind = "native" — the user explicitly opted out of
     // container wrapping, and forcing Docker would break Python skills (Alpine
     // has no python3) and workspace access on resource-constrained hosts.
+    //
+    // Podman is preferred over Docker when available: it's daemonless,
+    // rootless by default, and avoids the podman-docker shim SIGSYS issue.
     if !skip_docker {
+        // Try Podman first (daemonless, rootless)
+        if let Ok(sandbox) = super::podman::PodmanSandbox::with_config(podman_config) {
+            if sandbox.is_available() {
+                tracing::info!("Podman sandbox enabled (rootless, daemonless)");
+                return Arc::new(sandbox);
+            } else {
+                let issues = super::podman::PodmanSandbox::check_rootless_prereqs();
+                tracing::debug!(
+                    "Podman found but rootless prerequisites not met: {:?}",
+                    issues
+                );
+            }
+        }
+
+        // Warn if docker is actually podman-docker shim
+        if super::podman::PodmanSandbox::is_podman_docker() {
+            tracing::warn!(
+                "'docker' command is podman-docker (compatibility shim). \
+                 Set sandbox.backend = \"podman\" in config.toml for proper support. \
+                 The \"docker\" backend may fail under restrictive systemd sandboxing."
+            );
+        }
+
         if let Ok(sandbox) = super::docker::DockerSandbox::probe() {
             tracing::info!("Docker sandbox enabled");
             return Arc::new(sandbox);
         }
     } else {
         tracing::debug!(
-            "Docker sandbox skipped: runtime.kind = \"native\" overrides auto-detection"
+            "Docker/Podman sandbox skipped: runtime.kind = \"native\" overrides auto-detection"
         );
     }
 
@@ -155,11 +202,11 @@ fn detect_best_sandbox(runtime_kind: &str) -> Arc<dyn Sandbox> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_config::schema::{SandboxConfig, SecurityConfig};
+    use zeroclaw_config::schema::{PodmanSandboxConfig, SandboxConfig, SecurityConfig};
 
     #[test]
     fn detect_best_sandbox_returns_something() {
-        let sandbox = detect_best_sandbox("");
+        let sandbox = detect_best_sandbox("", PodmanSandboxConfig::default());
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
     }
@@ -170,7 +217,7 @@ mod tests {
             sandbox: SandboxConfig {
                 enabled: Some(false),
                 backend: SandboxBackend::None,
-                firejail_args: Vec::new(),
+                ..SandboxConfig::default()
             },
             ..Default::default()
         };
@@ -184,7 +231,7 @@ mod tests {
             sandbox: SandboxConfig {
                 enabled: None, // Auto-detect
                 backend: SandboxBackend::Auto,
-                firejail_args: Vec::new(),
+                ..SandboxConfig::default()
             },
             ..Default::default()
         };
@@ -194,12 +241,13 @@ mod tests {
     }
 
     #[test]
-    fn native_runtime_with_auto_sandbox_never_selects_docker() {
-        // When runtime.kind = "native", Docker must be skipped in auto-detection
-        // even when Docker is installed on the host. The sandbox must be
+    fn native_runtime_with_auto_sandbox_never_selects_docker_or_podman() {
+        // When runtime.kind = "native", Docker/Podman must be skipped in auto-detection
+        // even when they are installed on the host. The sandbox must be
         // NoopSandbox or something OS-native (Landlock, Firejail, Seatbelt).
-        let sandbox = detect_best_sandbox("native");
+        let sandbox = detect_best_sandbox("native", PodmanSandboxConfig::default());
         assert_ne!(sandbox.name(), "docker");
+        assert_ne!(sandbox.name(), "podman");
     }
 
     #[test]
@@ -210,7 +258,7 @@ mod tests {
             sandbox: SandboxConfig {
                 enabled: None,
                 backend: SandboxBackend::Docker,
-                firejail_args: Vec::new(),
+                ..SandboxConfig::default()
             },
             ..Default::default()
         };

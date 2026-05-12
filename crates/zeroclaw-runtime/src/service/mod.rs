@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{Config, SandboxBackend};
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
@@ -726,6 +726,27 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     }
 
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
+
+    // Rootless Podman requires syscalls that @system-service blocks by default.
+    // Inject an extended SystemCallFilter when backend is Podman explicitly, or
+    // when auto-detection will likely pick Podman (i.e. podman binary is present).
+    let needs_podman_filter = match &config.security.sandbox.backend {
+        SandboxBackend::Podman => true,
+        SandboxBackend::Auto => Command::new("podman")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false),
+        _ => false,
+    };
+    let syscall_filter_line = if needs_podman_filter {
+        "# Rootless Podman requires these syscalls beyond @system-service defaults.\n\
+         SystemCallFilter=@system-service clone3 unshare setns pivot_root mount umount2\n\
+         "
+    } else {
+        ""
+    };
+
     let unit = format!(
         "[Unit]\n\
          Description=ZeroClaw daemon\n\
@@ -741,10 +762,11 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
          # Allow inheriting DISPLAY and XDG_RUNTIME_DIR from the user session\n\
          # so graphical/headless browsers can function correctly.\n\
          PassEnvironment=DISPLAY XDG_RUNTIME_DIR\n\
-         \n\
+         {syscall_filter_line}\
          [Install]\n\
          WantedBy=default.target\n",
-        exe = exe.display()
+        exe = exe.display(),
+        syscall_filter_line = syscall_filter_line,
     );
 
     fs::write(&file, unit)?;

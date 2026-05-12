@@ -8274,6 +8274,11 @@ pub struct SandboxConfig {
     /// Custom Firejail arguments (when backend = firejail)
     #[serde(default)]
     pub firejail_args: Vec<String>,
+
+    /// Podman-specific sandbox settings (when backend = podman)
+    #[serde(default)]
+    #[nested]
+    pub podman: PodmanSandboxConfig,
 }
 
 impl Default for SandboxConfig {
@@ -8282,9 +8287,73 @@ impl Default for SandboxConfig {
             enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            podman: PodmanSandboxConfig::default(),
         }
     }
 }
+
+/// Podman-specific sandbox configuration.
+///
+/// Used when `security.sandbox.backend = "podman"`.
+/// Podman is daemonless and rootless by design, so the defaults
+/// are tuned for security (network off, memory/CPU limits applied).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "security.sandbox.podman"]
+pub struct PodmanSandboxConfig {
+    /// OCI image used for ephemeral sandbox containers.
+    /// Must contain the binaries your tool execution needs.
+    #[serde(default = "default_podman_image")]
+    pub image: String,
+
+    /// Rootless user namespace mode. "keep-id" maps the host UID inside
+    /// the container so file ownership is preserved.
+    #[serde(default = "default_podman_userns")]
+    pub userns: String,
+
+    /// Network isolation mode. "none" blocks all network access (default).
+    /// Alternatives: "slirp4netns", "pasta".
+    #[serde(default = "default_podman_network")]
+    pub network: String,
+
+    /// Memory limit per sandbox container (e.g. "512m", "1g").
+    #[serde(default = "default_podman_memory")]
+    pub memory_limit: String,
+
+    /// CPU limit per sandbox container (e.g. "1.0").
+    #[serde(default = "default_podman_cpu")]
+    pub cpu_limit: String,
+
+    /// Automatically append `:Z` to volume mounts for SELinux relabeling.
+    /// Set to false on systems without SELinux.
+    #[serde(default = "default_true")]
+    pub selinux_label: bool,
+
+    /// Extra arguments appended to every `podman run` invocation.
+    /// Use sparingly — this is an escape hatch for unusual environments.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
+impl Default for PodmanSandboxConfig {
+    fn default() -> Self {
+        Self {
+            image: default_podman_image(),
+            userns: default_podman_userns(),
+            network: default_podman_network(),
+            memory_limit: default_podman_memory(),
+            cpu_limit: default_podman_cpu(),
+            selinux_label: default_true(),
+            extra_args: Vec::new(),
+        }
+    }
+}
+
+fn default_podman_image() -> String { "ubuntu:24.04".into() }
+fn default_podman_userns() -> String { "keep-id".into() }
+fn default_podman_network() -> String { "none".into() }
+fn default_podman_memory() -> String { "512m".into() }
+fn default_podman_cpu() -> String { "1.0".into() }
 
 /// Sandbox backend selection
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -8302,6 +8371,8 @@ pub enum SandboxBackend {
     Bubblewrap,
     /// Docker container isolation
     Docker,
+    /// Podman container isolation (rootless, daemonless)
+    Podman,
     /// macOS sandbox-exec (Seatbelt)
     #[serde(alias = "sandbox-exec")]
     SandboxExec,
