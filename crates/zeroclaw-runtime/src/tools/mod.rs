@@ -1434,4 +1434,55 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"read_skill"));
     }
+
+    #[tokio::test]
+    async fn all_tools_workspace_loads_existing_profiles() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let workspaces_dir = tmp.path().join("workspaces");
+        let mut cfg = test_config(&tmp);
+        cfg.workspace.enabled = true;
+        cfg.workspace.workspaces_dir = workspaces_dir.to_string_lossy().to_string();
+
+        let mut manager = zeroclaw_config::workspace::WorkspaceManager::new(workspaces_dir);
+        manager.create("preloaded").await.unwrap();
+
+        let (tools, _, _, _, _, _) = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+
+        let workspace_tool = tools
+            .iter()
+            .find(|tool| tool.name() == "workspace")
+            .expect("workspace tool should be registered");
+        let result = workspace_tool
+            .execute(serde_json::json!({ "action": "list" }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("preloaded"));
+        assert!(!result.output.contains("No workspaces configured."));
+    }
 }

@@ -7,6 +7,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// A single client workspace profile.
@@ -114,17 +115,7 @@ impl WorkspaceManager {
                 continue;
             }
             match tokio::fs::read_to_string(&profile_path).await {
-                Ok(contents) => match toml::from_str::<WorkspaceProfile>(&contents) {
-                    Ok(profile) => {
-                        self.profiles.insert(profile.name.clone(), profile);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "skipping malformed workspace profile {}: {e}",
-                            profile_path.display()
-                        );
-                    }
-                },
+                Ok(contents) => self.load_profile_contents(&profile_path, &contents),
                 Err(e) => {
                     tracing::warn!(
                         "skipping unreadable workspace profile {}: {e}",
@@ -148,12 +139,11 @@ impl WorkspaceManager {
             return Ok(());
         }
 
-        let entries = std::fs::read_dir(dir)
+        let entries = fs::read_dir(dir)
             .with_context(|| format!("reading workspaces directory: {}", dir.display()))?;
 
         for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
+            let path = entry?.path();
             if !path.is_dir() {
                 continue;
             }
@@ -161,18 +151,8 @@ impl WorkspaceManager {
             if !profile_path.exists() {
                 continue;
             }
-            match std::fs::read_to_string(&profile_path) {
-                Ok(contents) => match toml::from_str::<WorkspaceProfile>(&contents) {
-                    Ok(profile) => {
-                        self.profiles.insert(profile.name.clone(), profile);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "skipping malformed workspace profile {}: {e}",
-                            profile_path.display()
-                        );
-                    }
-                },
+            match fs::read_to_string(&profile_path) {
+                Ok(contents) => self.load_profile_contents(&profile_path, &contents),
                 Err(e) => {
                     tracing::warn!(
                         "skipping unreadable workspace profile {}: {e}",
@@ -183,6 +163,20 @@ impl WorkspaceManager {
         }
 
         Ok(())
+    }
+
+    fn load_profile_contents(&mut self, profile_path: &Path, contents: &str) {
+        match toml::from_str::<WorkspaceProfile>(contents) {
+            Ok(profile) => {
+                self.profiles.insert(profile.name.clone(), profile);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "skipping malformed workspace profile {}: {e}",
+                    profile_path.display()
+                );
+            }
+        }
     }
 
     /// Switch to the named workspace. Returns an error if it does not exist.
