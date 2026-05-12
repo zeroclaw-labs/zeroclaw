@@ -300,8 +300,9 @@ impl Provider for RouterProvider {
 
     fn supports_vision(&self) -> bool {
         self.providers
-            .iter()
-            .any(|(_, provider)| provider.supports_vision())
+            .get(self.default_index)
+            .map(|(_, p)| p.supports_vision())
+            .unwrap_or(false)
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -872,6 +873,57 @@ mod tests {
         // With tools required, the basic model (no tools) is filtered out
         let (_, model) = router.resolve_cost_optimized("hint:cost-optimized", &prices, false, true);
         assert_eq!(model, "tools-model");
+    }
+
+    #[test]
+    fn supports_vision_reflects_default_provider_not_any_route() {
+        let providers: Vec<(String, Box<dyn Provider>)> = vec![
+            (
+                "default-no-vision".into(),
+                Box::new(CapableMockProvider::new("default", false, false)),
+            ),
+            (
+                "vision-route".into(),
+                Box::new(CapableMockProvider::new("vision", true, false)),
+            ),
+        ];
+        let routes = vec![(
+            "vision".to_string(),
+            Route {
+                provider_name: "vision-route".into(),
+                model: "vision-model".into(),
+            },
+        )];
+        let router = RouterProvider::new(providers, routes, "default-model".into());
+
+        assert!(
+            !router.supports_vision(),
+            "router-level vision support gates the default request path"
+        );
+    }
+
+    #[test]
+    fn supports_vision_true_when_default_provider_supports_vision() {
+        let providers: Vec<(String, Box<dyn Provider>)> = vec![
+            (
+                "default-vision".into(),
+                Box::new(CapableMockProvider::new("default", true, false)),
+            ),
+            (
+                "no-vision-route".into(),
+                Box::new(CapableMockProvider::new("route", false, false)),
+            ),
+        ];
+        let routes = vec![(
+            "cheap".to_string(),
+            Route {
+                provider_name: "no-vision-route".into(),
+                model: "cheap-model".into(),
+            },
+        )];
+        let router = RouterProvider::new(providers, routes, "default-model".into());
+
+        assert!(router.supports_vision());
     }
 
     #[test]
