@@ -722,6 +722,35 @@ The **ZeroClaw** name and logo are trademarks of ZeroClaw Labs. This license doe
 
 This list is generated from the GitHub contributors graph and updates automatically.
 
+## Fast Dev Builds
+
+The dev build setup uses nightly Rust with the Cranelift codegen backend, mold linker, and sccache for fast iteration. To reconfigure from scratch:
+
+```bash
+# 1. Install Rust nightly (rust-toolchain.toml auto-selects it)
+rustup toolchain install nightly
+rustup component add rustc-codegen-cranelift-preview --toolchain nightly
+
+# 2. Install mold linker
+sudo apt-get install -y mold
+
+# 3. Install sccache
+cargo install sccache --locked
+
+# 4. Update the sccache path in .cargo/config.toml if your cargo bin dir differs
+#    Look for: rustc-wrapper = "/path/to/.cargo/bin/sccache"
+```
+
+Then use `cargo b` (alias for `cargo build -Zcodegen-backend`) for dev builds with Cranelift, or plain `cargo build` for standard LLVM builds. Both use mold+sccache automatically.
+
+| Scenario | LLVM (stable) | Cranelift + mold + sccache |
+|----------|---------------|---------------------------|
+| Clean build (cold) | ~6m 30s | ~4m 10s |
+| Clean build (sccache warm) | ~5m 10s | ~3m 20s |
+| Incremental rebuild | ~6s | ~3.7s |
+
+(Benchmarked on 8-core Xeon / 39GB RAM)
+
 ## Star History
 
 <p align="center">
