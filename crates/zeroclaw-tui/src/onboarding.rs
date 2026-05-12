@@ -440,10 +440,11 @@ impl App {
         Self::extract_code_from_output(&output.stdout)
     }
 
-    /// Run `docker exec <container> zeroclaw gateway get-paircode --new`.
+    /// Run `docker/podman exec <container> zeroclaw gateway get-paircode --new`.
     async fn generate_code_via_docker() -> Option<String> {
+        let cli = container_cli();
         // Find zeroclaw container
-        let ps = tokio::process::Command::new("docker")
+        let ps = tokio::process::Command::new(cli)
             .args([
                 "ps",
                 "--filter",
@@ -461,7 +462,7 @@ impl App {
             .to_string();
         if container.is_empty() {
             // Also try by container name
-            let ps2 = tokio::process::Command::new("docker")
+            let ps2 = tokio::process::Command::new(cli)
                 .args(["ps", "--filter", "name=zeroclaw", "--format", "{{.Names}}"])
                 .output()
                 .await
@@ -474,7 +475,7 @@ impl App {
             if container.is_empty() {
                 return None;
             }
-            let output = tokio::process::Command::new("docker")
+            let output = tokio::process::Command::new(cli)
                 .args([
                     "exec",
                     &container,
@@ -488,7 +489,7 @@ impl App {
                 .ok()?;
             return Self::extract_code_from_output(&output.stdout);
         }
-        let output = tokio::process::Command::new("docker")
+        let output = tokio::process::Command::new(cli)
             .args([
                 "exec",
                 &container,
@@ -1026,15 +1027,34 @@ async fn push_config_to_docker(app: &App) {
         args.push(model.to_string());
     }
 
-    let _ = tokio::process::Command::new("docker")
+    let _ = tokio::process::Command::new(container_cli())
         .args(&args)
         .output()
         .await;
 }
 
+/// Return `"podman"` if podman is installed, otherwise `"docker"`.
+fn container_cli() -> &'static str {
+    use std::sync::OnceLock;
+    static CLI: OnceLock<&str> = OnceLock::new();
+    *CLI.get_or_init(|| {
+        if std::process::Command::new("podman")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            "podman"
+        } else {
+            "docker"
+        }
+    })
+}
+
 async fn find_docker_container() -> Option<String> {
+    let cli = container_cli();
     // Try by image name
-    let ps = tokio::process::Command::new("docker")
+    let ps = tokio::process::Command::new(cli)
         .args([
             "ps",
             "--filter",
@@ -1055,7 +1075,7 @@ async fn find_docker_container() -> Option<String> {
         return Some(name);
     }
     // Try by container name
-    let ps2 = tokio::process::Command::new("docker")
+    let ps2 = tokio::process::Command::new(cli)
         .args(["ps", "--filter", "name=zeroclaw", "--format", "{{.Names}}"])
         .output()
         .await

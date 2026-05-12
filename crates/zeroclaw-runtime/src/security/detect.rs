@@ -112,10 +112,11 @@ pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sa
 /// Auto-detect the best available sandbox.
 ///
 /// When `runtime_kind` is `"native"` the caller has explicitly opted out of
-/// container wrapping, so Docker is excluded from consideration even if it is
-/// installed on the host.
+/// container wrapping, so Docker/Podman sandboxes are excluded. When the
+/// runtime is itself a container (`"docker"` or `"podman"`), container
+/// sandboxes are also skipped to avoid nesting containers.
 fn detect_best_sandbox(runtime_kind: &str, podman_config: zeroclaw_config::schema::PodmanSandboxConfig) -> Arc<dyn Sandbox> {
-    let skip_docker = runtime_kind == "native";
+    let skip_containers = matches!(runtime_kind, "native" | "docker" | "podman");
 
     #[cfg(target_os = "linux")]
     {
@@ -153,14 +154,14 @@ fn detect_best_sandbox(runtime_kind: &str, podman_config: zeroclaw_config::schem
         }
     }
 
-    // Docker is heavy but works everywhere if docker is installed.
-    // Skip it when runtime.kind = "native" — the user explicitly opted out of
-    // container wrapping, and forcing Docker would break Python skills (Alpine
-    // has no python3) and workspace access on resource-constrained hosts.
+    // Container-based sandboxes (Podman, Docker).
+    // Skipped when: runtime.kind = "native" (user opted out of containers),
+    // or runtime.kind = "docker"/"podman" (already inside a container —
+    // nesting would require --privileged and defeat the security purpose).
     //
     // Podman is preferred over Docker when available: it's daemonless,
     // rootless by default, and avoids the podman-docker shim SIGSYS issue.
-    if !skip_docker {
+    if !skip_containers {
         // Try Podman first (daemonless, rootless)
         if let Ok(sandbox) = super::podman::PodmanSandbox::with_config(podman_config) {
             if sandbox.is_available() {
@@ -190,7 +191,8 @@ fn detect_best_sandbox(runtime_kind: &str, podman_config: zeroclaw_config::schem
         }
     } else {
         tracing::debug!(
-            "Docker/Podman sandbox skipped: runtime.kind = \"native\" overrides auto-detection"
+            "Container sandbox skipped: runtime.kind = \"{}\" — not nesting containers",
+            runtime_kind
         );
     }
 
@@ -242,10 +244,21 @@ mod tests {
 
     #[test]
     fn native_runtime_with_auto_sandbox_never_selects_docker_or_podman() {
-        // When runtime.kind = "native", Docker/Podman must be skipped in auto-detection
-        // even when they are installed on the host. The sandbox must be
-        // NoopSandbox or something OS-native (Landlock, Firejail, Seatbelt).
         let sandbox = detect_best_sandbox("native", PodmanSandboxConfig::default());
+        assert_ne!(sandbox.name(), "docker");
+        assert_ne!(sandbox.name(), "podman");
+    }
+
+    #[test]
+    fn docker_runtime_skips_container_sandboxes() {
+        let sandbox = detect_best_sandbox("docker", PodmanSandboxConfig::default());
+        assert_ne!(sandbox.name(), "docker");
+        assert_ne!(sandbox.name(), "podman");
+    }
+
+    #[test]
+    fn podman_runtime_skips_container_sandboxes() {
+        let sandbox = detect_best_sandbox("podman", PodmanSandboxConfig::default());
         assert_ne!(sandbox.name(), "docker");
         assert_ne!(sandbox.name(), "podman");
     }

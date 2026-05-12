@@ -728,17 +728,18 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
 
     // Rootless Podman requires syscalls that @system-service blocks by default.
-    // Inject an extended SystemCallFilter when backend is Podman explicitly, or
-    // when auto-detection will likely pick Podman (i.e. podman binary is present).
-    let needs_podman_filter = match &config.security.sandbox.backend {
-        SandboxBackend::Podman => true,
-        SandboxBackend::Auto => Command::new("podman")
+    // Inject an extended SystemCallFilter when Podman is used at either layer:
+    // runtime.kind = "podman" OR security.sandbox.backend = "podman"/auto.
+    let podman_installed = || {
+        Command::new("podman")
             .arg("--version")
             .output()
             .map(|o| o.status.success())
-            .unwrap_or(false),
-        _ => false,
+            .unwrap_or(false)
     };
+    let needs_podman_filter = config.runtime.kind == "podman"
+        || matches!(&config.security.sandbox.backend, SandboxBackend::Podman)
+        || (matches!(&config.security.sandbox.backend, SandboxBackend::Auto) && podman_installed());
     let syscall_filter_line = if needs_podman_filter {
         "# Rootless Podman requires these syscalls beyond @system-service defaults.\n\
          SystemCallFilter=@system-service clone3 unshare setns pivot_root mount umount2\n\
