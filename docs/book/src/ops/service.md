@@ -113,7 +113,7 @@ Compose:
 ```yaml
 services:
   zeroclaw:
-    image: zeroclawlabs/zeroclaw:latest
+    image: ghcr.io/zeroclaw-labs/zeroclaw:latest
     mem_limit: 2g
     cpus: 2.0
     ulimits:

@@ -770,9 +770,9 @@ pub fn all_tools_with_runtime(
 
     // SOP tools (registered when sops_dir is configured)
     if root_config.sop.sops_dir.is_some() {
-        let sop_engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
-            root_config.sop.clone(),
-        )));
+        let mut engine = crate::sop::SopEngine::new(root_config.sop.clone());
+        engine.reload(workspace_dir);
+        let sop_engine = Arc::new(std::sync::Mutex::new(engine));
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));

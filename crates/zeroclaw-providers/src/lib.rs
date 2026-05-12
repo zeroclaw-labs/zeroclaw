@@ -101,18 +101,15 @@ pub fn is_minimax_intl_alias(name: &str) -> bool {
             | "minimax-portal-global"
     )
 }
-
 pub fn is_minimax_cn_alias(name: &str) -> bool {
     matches!(
         name,
         "minimax-cn" | "minimaxi" | "minimax-oauth-cn" | "minimax-portal-cn"
     )
 }
-
 pub fn is_minimax_alias(name: &str) -> bool {
     is_minimax_intl_alias(name) || is_minimax_cn_alias(name)
 }
-
 pub fn is_glm_global_alias(name: &str) -> bool {
     matches!(name, "glm" | "zhipu" | "glm-global" | "zhipu-global")
 }
@@ -736,6 +733,23 @@ pub struct ProviderRuntimeOptions {
     pub think: Option<bool>,
     /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Override for the Ollama `num_ctx` request option. Only consumed by
+    /// the `ollama` factory arm. `None` falls back to the framework
+    /// default constant.
+    pub ollama_num_ctx: Option<u32>,
+    /// Override for the Ollama `num_predict` request option. Only consumed
+    /// by the `ollama` factory arm. `None` falls back to the framework
+    /// default constant.
+    pub ollama_num_predict: Option<i32>,
+    /// Override the temperature sent on every Ollama `/api/chat` request.
+    /// Only consumed by the `ollama` factory arm. When `None` (default), the
+    /// per-call temperature passed through `Provider::chat_with_system`
+    /// wins — this field is preserved as `None` straight through to
+    /// `OllamaTuning::temperature_override`, and the request builder uses
+    /// `temperature_override.unwrap_or(temperature)`. When `Some(v)`, every
+    /// request to this Ollama provider uses `v` regardless of the per-call
+    /// argument. There is no framework-constant fallback for this field.
+    pub ollama_temperature_override: Option<f64>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -757,6 +771,9 @@ impl Default for ProviderRuntimeOptions {
             wire_api: None,
             think: None,
             chat_template_kwargs: None,
+            ollama_num_ctx: None,
+            ollama_num_predict: None,
+            ollama_temperature_override: None,
         }
     }
 }
@@ -804,6 +821,9 @@ pub fn provider_runtime_options_from_config(
         wire_api: fallback.and_then(|e| e.wire_api.clone()),
         think: fallback.and_then(|e| e.think),
         chat_template_kwargs: fallback.and_then(|e| e.chat_template_kwargs.clone()),
+        ollama_num_ctx: fallback.and_then(|e| e.ollama_num_ctx),
+        ollama_num_predict: fallback.and_then(|e| e.ollama_num_predict),
+        ollama_temperature_override: fallback.and_then(|e| e.ollama_temperature_override),
     }
 }
 
@@ -1269,11 +1289,16 @@ fn create_provider_with_url_and_options(
 
             let api_url = env_url.as_deref().or(api_url);
 
-            Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
-                api_url,
-                key,
-                options.reasoning_enabled,
-            )))
+            let tuning = ollama::OllamaTuning::from_runtime_overrides(
+                options.ollama_num_ctx,
+                options.ollama_num_predict,
+                options.ollama_temperature_override,
+            );
+
+            Ok(Box::new(
+                ollama::OllamaProvider::new_with_reasoning(api_url, key, options.reasoning_enabled)
+                    .with_tuning(tuning),
+            ))
         }
         "gemini" | "google" | "google-gemini" => {
             let state_dir = options.zeroclaw_dir.clone().unwrap_or_else(|| {
@@ -1353,11 +1378,17 @@ fn create_provider_with_url_and_options(
             AuthStyle::ZhipuJwt,
         ))),
         name if glm_base_url(name).is_some() => {
-            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
+            // GLM offers vision-capable models (e.g. `glm-4.5v`). Mark the
+            // provider as vision-capable so multimodal routing accepts it.
+            // The specific model still has to be a vision-capable one;
+            // text-only models will return an API error if given an image,
+            // matching the behaviour of other multi-modal providers.
+            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
                 "GLM",
                 glm_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::ZhipuJwt,
+                true,
             )))
         }
         name if minimax_base_url(name).is_some() => Ok(compat(
@@ -1449,6 +1480,17 @@ fn create_provider_with_url_and_options(
                 AuthStyle::Bearer,
                 true,
             )))
+        }
+        "atomic-chat" | "atomic_chat" | "atomic" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .unwrap_or("http://127.0.0.1:1337/v1");
+
+            Ok(compat(
+                OpenAiCompatibleProvider::new("Atomic Chat", base_url, key, AuthStyle::Bearer)
+                    .without_native_tools(),
+            ))
         }
 
         // ── Extended ecosystem (community favorites) ─────────
@@ -2458,6 +2500,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             activation: ProviderActivation::FallbackKey,
             local: false,
         },
+        ProviderInfo {
+            name: "atomic-chat",
+            display_name: "Atomic Chat",
+            description: "Atomic Chat / Jan local runtime",
+            aliases: &["atomic_chat", "atomic"],
+            activation: ProviderActivation::FallbackKey,
+            local: true,
+        },
         // ── Fast inference ────────────────────────────────────
         ProviderInfo {
             name: "cerebras",
@@ -3142,6 +3192,21 @@ mod tests {
     }
 
     #[test]
+    fn glm_provider_supports_vision() {
+        // GLM exposes vision-capable models (e.g. `glm-4.5v`). The provider
+        // must therefore report `supports_vision()` so multimodal routing
+        // can target it; the model field selects the actual variant.
+        for alias in ["glm", "zhipu", "glm-cn", "zhipu-cn"] {
+            let provider =
+                create_provider(alias, Some("id.secret")).expect("glm provider should build");
+            assert!(
+                provider.supports_vision(),
+                "alias `{alias}` should report vision capability"
+            );
+        }
+    }
+
+    #[test]
     fn factory_lmstudio() {
         assert!(create_provider("lmstudio", Some("key")).is_ok());
         assert!(create_provider("lm-studio", Some("key")).is_ok());
@@ -3249,6 +3314,38 @@ mod tests {
                 "codex alias '{alias}' should produce a provider"
             );
         }
+    }
+
+    #[test]
+    fn factory_atomic_chat_aliases() {
+        assert!(create_provider("atomic-chat", Some("key")).is_ok());
+        assert!(create_provider("atomic_chat", Some("key")).is_ok());
+        assert!(create_provider("atomic", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_atomic_chat_allows_missing_key() {
+        let result = create_provider("atomic-chat", None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn atomic_chat_capabilities() {
+        let provider = create_provider("atomic-chat", Some("key")).expect("provider should exist");
+        assert!(
+            !provider.supports_native_tools(),
+            "atomic chat does not use native tools"
+        );
+    }
+
+    #[test]
+    fn atomic_chat_is_listed_as_local_provider() {
+        let providers = list_providers();
+        let provider = providers
+            .iter()
+            .find(|p| p.name == "atomic-chat")
+            .expect("atomic-chat must be listed");
+        assert!(provider.local, "atomic-chat must be local provider");
     }
 
     // ── Extended ecosystem ───────────────────────────────────
@@ -4110,5 +4207,52 @@ mod tests {
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_PROVIDER_URL") };
+    }
+
+    #[test]
+    fn ollama_runtime_overrides_populate_tuning_struct() {
+        // Mirror the factory's tuning derivation: the same expression used
+        // inside `create_provider_with_url_and_options`'s "ollama" arm.
+        // Asserting on the resulting struct gives us downcast-free coverage
+        // that the three runtime-option fields actually reach the provider.
+        let options = ProviderRuntimeOptions {
+            ollama_num_ctx: Some(16384),
+            ollama_num_predict: Some(4096),
+            ollama_temperature_override: Some(0.5),
+            ..ProviderRuntimeOptions::default()
+        };
+
+        let tuning = ollama::OllamaTuning::from_runtime_overrides(
+            options.ollama_num_ctx,
+            options.ollama_num_predict,
+            options.ollama_temperature_override,
+        );
+        assert_eq!(tuning.num_ctx, 16384);
+        assert_eq!(tuning.num_predict, 4096);
+        assert_eq!(tuning.temperature_override, Some(0.5));
+
+        let provider = ollama::OllamaProvider::new(None, None).with_tuning(tuning);
+        assert_eq!(provider.tuning(), tuning);
+
+        // The factory itself must succeed with the same options.
+        let factory_provider = create_provider_with_url_and_options("ollama", None, None, &options);
+        assert!(factory_provider.is_ok());
+    }
+
+    #[test]
+    fn ollama_runtime_overrides_default_to_none_temperature_override() {
+        // Default options must produce a tuning that leaves
+        // `temperature_override = None` so per-call temperature wins —
+        // the backward-compat guarantee for operators who never set the
+        // override in config.toml.
+        let options = ProviderRuntimeOptions::default();
+        let tuning = ollama::OllamaTuning::from_runtime_overrides(
+            options.ollama_num_ctx,
+            options.ollama_num_predict,
+            options.ollama_temperature_override,
+        );
+        assert!(tuning.temperature_override.is_none());
+        assert_eq!(tuning.num_ctx, ollama::OLLAMA_DEFAULT_NUM_CTX);
+        assert_eq!(tuning.num_predict, ollama::OLLAMA_DEFAULT_NUM_PREDICT);
     }
 }

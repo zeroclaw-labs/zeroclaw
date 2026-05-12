@@ -424,7 +424,8 @@ interactive_feature_picker() {
 #
 # When a source build includes the `gateway` feature, the dashboard
 # (`web/dist`) needs to be built so the gateway can serve it. If Node.js
-# is on PATH we run `npm install && npm run build` in `web/`. Without
+# is on PATH we run `cargo web build` from the source root so the
+# generated API client is refreshed before TypeScript compiles. Without
 # Node.js we warn — the gateway still starts but the dashboard route
 # returns 404 until `web/dist` is populated.
 build_web_dashboard() {
@@ -440,15 +441,41 @@ build_web_dashboard() {
   if ! command -v npm >/dev/null 2>&1; then
     warn "npm not found — skipping dashboard build. The gateway will run"
     warn "  in API-only mode until you build the dashboard:"
-    warn "  cd $src_dir/web && npm install && npm run build"
+    warn "  cd $src_dir && cargo web build"
     return 0
   fi
-  info "Building web dashboard (npm install + npm run build)..."
-  (cd "$src_dir/web" && npm install --silent && npm run build --silent) || {
+  info "Building web dashboard (cargo web build)..."
+  (cd "$src_dir" && cargo web build) || {
     warn "Dashboard build failed — gateway will run in API-only mode."
     return 0
   }
   info "Web dashboard built at $src_dir/web/dist"
+}
+
+# ── Low-memory build heuristic ────────────────────────────────────
+#
+# [profile.release] in Cargo.toml uses fat LTO + codegen-units = 1.
+# With heavy crates in the graph (matrix-sdk-crypto, ruma, vodozemac)
+# a single rustc process can peak past 7 GB RSS during the cross-crate
+# type pass, OOM-ing 8 GB ARM devices. Thin LTO trades a small
+# binary-size hit for a much lower build-time RAM peak. Apply it as
+# a default on Linux hosts with under ~12 GiB MemTotal, but only when
+# the user has not already pinned CARGO_PROFILE_RELEASE_LTO.
+apply_low_mem_lto_default() {
+  [ "$(uname -s)" = "Linux" ] || return 0
+  [ -r /proc/meminfo ] || return 0
+  [ -n "${CARGO_PROFILE_RELEASE_LTO:-}" ] && return 0
+
+  mem_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+  case "$mem_kb" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  # 12 GiB in KiB = 12 * 1024 * 1024
+  if [ "$mem_kb" -lt 12582912 ]; then
+    mem_gib=$((mem_kb / 1048576))
+    export CARGO_PROFILE_RELEASE_LTO=thin
+    info "Low-memory device detected (${mem_gib} GiB RAM): using thin LTO to keep build RAM bounded. Set CARGO_PROFILE_RELEASE_LTO=fat to override."
+  fi
 }
 
 # ── Parse arguments ───────────────────────────────────────────────
@@ -763,6 +790,10 @@ if [ -n "$PATH_BIN" ]; then
   fi
 fi
 
+# ── Build profile RAM heuristic (Linux low-mem hosts) ─────────────
+
+apply_low_mem_lto_default
+
 # ── Dry run ───────────────────────────────────────────────────────
 
 if [ "$DRY_RUN" = true ]; then
@@ -774,6 +805,9 @@ if [ "$DRY_RUN" = true ]; then
   info "Config:   $PREFIX/.zeroclaw/"
   info "Rust:     $CARGO_HOME (CARGO_HOME), $RUSTUP_HOME (RUSTUP_HOME)"
   echo
+  if [ -n "${CARGO_PROFILE_RELEASE_LTO:-}" ]; then
+    info "env:      CARGO_PROFILE_RELEASE_LTO=$CARGO_PROFILE_RELEASE_LTO"
+  fi
   if [ -n "$CARGO_FLAGS" ]; then
     info "cargo install --path . --locked --force $CARGO_FLAGS"
   else

@@ -36,11 +36,11 @@ graph LR
 
 ## 3. Getting Started
 
-1. (Optional) Override the SOP directory in `config.toml`:
+1. Set the SOP directory in `config.toml` (required for runtime SOP loading):
 
    ```toml
    [sop]
-   sops_dir = "sops"  # defaults to <workspace>/sops when omitted
+   sops_dir = "sops"  # omitting this disables runtime SOP execution
    ```
 
 2. Create a SOP directory, for example:

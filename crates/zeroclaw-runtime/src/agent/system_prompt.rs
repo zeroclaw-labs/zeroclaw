@@ -118,28 +118,33 @@ pub fn build_system_prompt_with_mode_and_autonomy(
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
+    let has_tools = !tools.is_empty();
 
     // ── 0. Anti-narration (top priority) ───────────────────────
-    prompt.push_str(
-        "## CRITICAL: No Tool Narration\n\n\
-         NEVER narrate, announce, describe, or explain your tool usage to the user. \
-         Do NOT say things like 'Let me check...', 'I will use http_request to...', \
-         'I'll fetch that for you', 'Searching now...', or 'Using the web_search tool'. \
-         The user must ONLY see the final answer. Tool calls are invisible infrastructure — \
-         never reference them. If you catch yourself starting a sentence about what tool \
-         you are about to use or just used, DELETE it and give the answer directly.\n\n",
-    );
+    if has_tools {
+        prompt.push_str(
+            "## CRITICAL: No Tool Narration\n\n\
+             NEVER narrate, announce, describe, or explain your tool usage to the user. \
+             Do NOT say things like 'Let me check...', 'I will use http_request to...', \
+             'I'll fetch that for you', 'Searching now...', or 'Using the web_search tool'. \
+             The user must ONLY see the final answer. Tool calls are invisible infrastructure — \
+             never reference them. If you catch yourself starting a sentence about what tool \
+             you are about to use or just used, DELETE it and give the answer directly.\n\n",
+        );
+    }
 
     // ── 0b. Tool Honesty ───────────────────────────────────────
-    prompt.push_str(
-        "## CRITICAL: Tool Honesty\n\n\
-         - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
-         - If a tool call fails, report the error — never make up data to fill the gap.\n\
-         - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\n",
-    );
+    if has_tools {
+        prompt.push_str(
+            "## CRITICAL: Tool Honesty\n\n\
+             - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
+             - If a tool call fails, report the error — never make up data to fill the gap.\n\
+             - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\n",
+        );
+    }
 
     // ── 1. Tooling ──────────────────────────────────────────────
-    if !tools.is_empty() {
+    if !tools.is_empty() && !native_tools {
         prompt.push_str("## Tools\n\n");
         if compact_context {
             // Compact mode: tool names only, no descriptions/schemas
@@ -178,7 +183,14 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     }
 
     // ── 1c. Action instruction (avoid meta-summary) ───────────────
-    if native_tools {
+    if !has_tools {
+        prompt.push_str(
+            "## Your Task\n\n\
+             When the user sends a message, respond naturally and answer directly from conversation context.\n\
+             No tools are available for this turn, so do not emit tool calls or describe unavailable actions.\n\
+             Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
+        );
+    } else if native_tools {
         prompt.push_str(
             "## Your Task\n\n\
              When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\

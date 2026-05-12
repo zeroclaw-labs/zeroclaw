@@ -633,6 +633,26 @@ pub struct ModelProviderConfig {
     ///   `chat_template_kwargs = { enable_thinking = false }`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Override the Ollama `num_ctx` (context window, in tokens) sent on
+    /// every `/api/chat` request. Only consulted when this profile resolves
+    /// to the `ollama` provider. Defaults to the framework constant
+    /// (`OLLAMA_DEFAULT_NUM_CTX`) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_num_ctx: Option<u32>,
+    /// Override the Ollama `num_predict` (max output tokens) sent on every
+    /// `/api/chat` request. Only consulted when this profile resolves to
+    /// the `ollama` provider. Defaults to the framework constant
+    /// (`OLLAMA_DEFAULT_NUM_PREDICT`) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_num_predict: Option<i32>,
+    /// Force every Ollama `/api/chat` request to use this temperature,
+    /// overriding the per-call value passed through
+    /// `Provider::chat_with_system(.., temperature)`. When unset
+    /// (`None`, the default), the per-call temperature wins — full
+    /// backward compatibility. Only consulted when this profile
+    /// resolves to the `ollama` provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_temperature_override: Option<f64>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -1911,11 +1931,30 @@ impl Default for PipelineConfig {
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
+///
+/// # Privacy and cost note
+///
+/// Tool results that print real local image paths (e.g. shell tools doing
+/// `ls /pictures` or `find . -name '*.png'`) are canonicalized into
+/// `[IMAGE:...]` markers and base64-inlined into the next provider request.
+/// This means image bytes that previously stayed local will be uploaded to
+/// the configured provider when surfaced by a tool.
+///
+/// `max_images` (and the `trim_old_images` LRU policy) bounds the per-request
+/// image budget, but operators running shell-style tools over directories of
+/// personal or sensitive images should be aware of the upload semantics. See
+/// `docs/book/src/contributing/privacy.md` for the project's privacy stance.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "multimodal"]
 pub struct MultimodalConfig {
     /// Maximum number of image attachments accepted per request.
+    ///
+    /// Caps the total number of `[IMAGE:...]` markers that survive into the
+    /// provider request after multimodal preprocessing. Older images are
+    /// dropped first when the cumulative count exceeds this limit. Acts as
+    /// the upper bound on per-turn upload cost when tool outputs surface
+    /// local image paths.
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
@@ -9691,6 +9730,13 @@ struct ActiveWorkspaceState {
 }
 
 fn default_config_dir() -> Result<PathBuf> {
+    if let Ok(custom) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+        let custom = custom.trim();
+        if !custom.is_empty() {
+            return Ok(expand_tilde_path(custom));
+        }
+    }
+
     if let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
     {
@@ -11897,7 +11943,9 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[prefix = "sop"]
 pub struct SopConfig {
     /// Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).
-    /// Falls back to `<workspace>/sops` when omitted.
+    /// Required to enable runtime SOP loading. When omitted, no SOPs are loaded
+    /// at runtime; CLI commands (`sop list`, `sop validate`, `sop show`) still
+    /// resolve the default `<workspace>/sops` for offline inspection.
     #[serde(default)]
     pub sops_dir: Option<String>,
 
@@ -12442,6 +12490,36 @@ auto_save = true
         let parsed: MemoryConfig = toml::from_str(toml).unwrap();
         assert!(!parsed.postgres.vector_enabled);
         assert_eq!(parsed.postgres.vector_dimensions, 1536);
+    }
+
+    #[test]
+    async fn model_provider_config_ollama_tuning_fields_roundtrip() {
+        let toml = r#"
+            ollama_num_ctx = 16384
+            ollama_num_predict = 4096
+            ollama_temperature_override = 0.5
+        "#;
+        let parsed: ModelProviderConfig = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.ollama_num_ctx, Some(16384));
+        assert_eq!(parsed.ollama_num_predict, Some(4096));
+        assert_eq!(parsed.ollama_temperature_override, Some(0.5));
+
+        let serialized = toml::to_string(&parsed).unwrap();
+        let reparsed: ModelProviderConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.ollama_num_ctx, Some(16384));
+        assert_eq!(reparsed.ollama_num_predict, Some(4096));
+        assert_eq!(reparsed.ollama_temperature_override, Some(0.5));
+    }
+
+    #[test]
+    async fn model_provider_config_ollama_tuning_fields_default_to_none() {
+        let toml = r#"
+            api_key = "sk-test"
+        "#;
+        let parsed: ModelProviderConfig = toml::from_str(toml).unwrap();
+        assert!(parsed.ollama_num_ctx.is_none());
+        assert!(parsed.ollama_num_predict.is_none());
+        assert!(parsed.ollama_temperature_override.is_none());
     }
 
     #[test]
@@ -15326,6 +15404,25 @@ model = "primary-model"
         assert_eq!(resolved_workspace_dir, default_workspace_dir);
 
         let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    #[test]
+    async fn default_path_under_config_dir_respects_zeroclaw_config_dir() {
+        let _env_guard = env_override_lock().await;
+        let custom_dir = std::env::temp_dir().join("zeroclaw-test-profile");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", &custom_dir) };
+
+        let result = default_path_under_config_dir("knowledge.db");
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") };
+
+        assert_eq!(
+            result,
+            custom_dir.join("knowledge.db").to_string_lossy().as_ref(),
+            "expected path under ZEROCLAW_CONFIG_DIR, got: {result}"
+        );
     }
 
     #[test]
