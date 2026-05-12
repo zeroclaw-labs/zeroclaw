@@ -2223,7 +2223,11 @@ async fn classify_channel_reply_intent(
             "assistant" => "assistant",
             _ => "user",
         };
-        let _ = writeln!(convo, "[{role}] {}", msg.content);
+        // Strip media markers — auxiliary classifier does not need image
+        // content, and forwarding `[IMAGE:/local/path]` would reach the
+        // provider as a malformed `image_url.url` and trigger 400 errors.
+        let safe_content = zeroclaw_providers::multimodal::strip_media_markers(&msg.content);
+        let _ = writeln!(convo, "[{role}] {safe_content}");
     }
 
     let response = provider
@@ -12834,6 +12838,7 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[cfg(feature = "channel-telegram")]
     #[test]
     fn build_channel_by_id_unconfigured_telegram_returns_error() {
         let config = Config::default();
@@ -12849,6 +12854,7 @@ This is an example JSON object for profile settings."#;
         }
     }
 
+    #[cfg(feature = "channel-telegram")]
     #[test]
     fn build_channel_by_id_configured_telegram_succeeds() {
         let mut config = Config::default();
