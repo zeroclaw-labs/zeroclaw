@@ -21,7 +21,7 @@ Add the module to your NixOS configuration's `imports` and declare one
 instance:
 
 ```nix
-{ pkgs, ... }: {
+{ config, pkgs, ... }: {
   imports = [ ./path/to/zeroclaw/nix/module.nix ];
 
   # If pkgs.zeroclaw isn't yet in nixpkgs, set the package explicitly:
