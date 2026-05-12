@@ -37,9 +37,11 @@ instance:
 
       channels.telegram = {
         enabled = true;
-        # systemd substitutes $BOT_TOKEN at process start from the
-        # decrypted environmentFile — the rendered TOML in /nix/store
-        # contains the literal string "$BOT_TOKEN".
+        # The unit's ExecStartPre runs `envsubst` over the rendered
+        # TOML. `$BOT_TOKEN` is read from the EnvironmentFile= and
+        # written into ${dataDir}/config.toml (mode 0600, owner =
+        # zeroclaw-me). The world-readable copy in /nix/store keeps
+        # only the literal "$BOT_TOKEN" placeholder.
         bot_token = "$BOT_TOKEN";
         allowed_users = [ "12345" ];
       };
@@ -80,7 +82,7 @@ component names (`[A-Za-z0-9._-]+`).
 | `user` | `str` | `"zeroclaw-<name>"` | System user. |
 | `group` | `str` | `"zeroclaw-<name>"` | System group. |
 | `createUser` | `bool` | `true` | Set `false` to bring your own user. |
-| `dataDir` | `path` | `"/var/lib/zeroclaw-<name>"` | State directory (also `StateDirectory=`). |
+| `dataDir` | `path` | `"/var/lib/zeroclaw-<name>"` | State directory. Created via `systemd-tmpfiles` so any absolute path works (`/var/lib/...`, `/srv/...`, etc.). |
 | `settings` | `submodule { freeformType = (pkgs.formats.toml { }).type; }` | `{}` | Rendered to `${dataDir}/config.toml`. |
 | `environmentFile` | `nullOr path` | `null` | systemd `EnvironmentFile=`. Substituted into `settings` strings at start. |
 | `extraConfig` | `lines` | `""` | Raw TOML appended after rendered `settings` (escape hatch). |
@@ -102,14 +104,26 @@ Two paths, both supported, neither leaks secrets to the world-readable
 Nix store:
 
 1. **`environmentFile` + `$VAR` substitution in `settings` strings**
-   (recommended). Systemd loads the file via `EnvironmentFile=` at unit
-   start; ZeroClaw resolves `${VAR}` references in config strings against
-   its process environment. The rendered TOML in `/nix/store` contains
-   only the literal `$VAR` placeholder.
+   (recommended for channel tokens, webhook secrets, anything ZeroClaw
+   doesn't already resolve from the environment natively). Systemd loads
+   the file via `EnvironmentFile=` at unit start. The unit's
+   `ExecStartPre` then runs `envsubst` over the rendered TOML, expanding
+   `$VAR` and `${VAR}` references against the loaded environment, and
+   writes the result to `${dataDir}/config.toml` mode `0600` owned by the
+   per-instance user. The build-time copy in `/nix/store` only ever
+   contains the literal placeholders.
+
+   The substitution is performed by *this module*, not by ZeroClaw —
+   ZeroClaw reads `config.toml` verbatim. So this path turns
+   `bot_token = "$BOT_TOKEN"` into a working configuration regardless
+   of whether ZeroClaw has a native env-var fallback for that field.
 
 2. **`environmentFile` + ZeroClaw-native env-var lookups** for any config
-   keys ZeroClaw natively resolves from the environment (e.g. provider
-   API keys). Same end result — no secret in the rendered TOML.
+   keys ZeroClaw natively resolves from the environment (e.g.
+   `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ZEROCLAW_PROVIDER`,
+   `ZEROCLAW_MODEL` — see `crates/zeroclaw-config/src/schema.rs`
+   upstream for the full list). Same end result — no secret in the
+   rendered TOML — and you can omit the field from `settings` entirely.
 
 What the module **never** does: render an interpolated string from a
 secret-bearing Nix expression into `settings`. That would put the secret

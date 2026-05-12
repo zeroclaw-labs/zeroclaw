@@ -21,6 +21,16 @@
 #      user, and round-trips through a TOML parser to the input `settings`.
 #   5. The unit's effective hardening profile mentions `ProtectSystem=strict`
 #      (sanity check that the module's defaults actually applied).
+#   6. The `$VAR` secrets path resolves end-to-end: a third instance with
+#      `bot_token = "$BOT_TOKEN"` and an `environmentFile` containing
+#      `BOT_TOKEN=secret-from-env-file` produces a `config.toml` whose
+#      `bot_token` field is the literal `secret-from-env-file`, not the
+#      placeholder.
+#   7. A `dataDir` outside `/var/lib/<basename>` (e.g. `/srv/zeroclaw-srv`
+#      or `/var/lib/zeroclaw/nested`) is created at the configured path
+#      with the correct ownership, and the unit starts cleanly. Regression
+#      guard for the previous `StateDirectory = baseNameOf dataDir` shape
+#      that silently created the wrong directory.
 #
 # A no-op stub binary stands in for the real `zeroclaw daemon` so the test
 # does not depend on a working ZeroClaw build. The stub validates everything
@@ -86,7 +96,41 @@ in
         };
       };
 
-      # `yq-go -p toml` parses the rendered TOML for the round-trip check.
+      # Third instance exercises the `$VAR` secret path: `bot_token` is
+      # the literal placeholder in `settings`; an `environmentFile`
+      # provides `BOT_TOKEN=...`; the unit's ExecStartPre envsubst step
+      # is expected to expand it on disk under `/var/lib/zeroclaw-secret/`.
+      environment.etc."zeroclaw-secret-env".text = ''
+        BOT_TOKEN=secret-from-env-file
+      '';
+
+      services.zeroclaw.instances.secret = {
+        package = stubPackage;
+        environmentFile = "/etc/zeroclaw-secret-env";
+        settings = {
+          default_provider = "anthropic";
+          channels.telegram = {
+            enabled = true;
+            bot_token = "$BOT_TOKEN";
+            allowed_users = [ "12345" ];
+          };
+        };
+      };
+
+      # Fourth instance exercises a non-`/var/lib/<basename>` `dataDir`.
+      # Under the previous `StateDirectory = baseNameOf dataDir` shape
+      # systemd would have created `/var/lib/srv-test` and the unit's
+      # WorkingDirectory= would have pointed at the absent `/srv/zeroclaw-srv`.
+      services.zeroclaw.instances.srv-test = {
+        package = stubPackage;
+        dataDir = "/srv/zeroclaw-srv";
+        settings = {
+          default_provider = "anthropic";
+        };
+      };
+
+      # `yq -p toml` (binary name from `pkgs.yq-go`) parses the rendered
+      # TOML for the round-trip check.
       environment.systemPackages = [
         pkgs.yq-go
         pkgs.coreutils
@@ -122,19 +166,52 @@ in
 
     with subtest("rendered TOML round-trips through a parser"):
         model = machine.succeed(
-            "yq-go -p toml -o json '.default_model' /var/lib/zeroclaw-test/config.toml"
+            "yq -p toml -o json '.default_model' /var/lib/zeroclaw-test/config.toml"
         ).strip().strip('"')
         assert model == "claude-sonnet-4-6", f"expected claude-sonnet-4-6, got {model}"
 
         other_model = machine.succeed(
-            "yq-go -p toml -o json '.default_model' /var/lib/zeroclaw-other/config.toml"
+            "yq -p toml -o json '.default_model' /var/lib/zeroclaw-other/config.toml"
         ).strip().strip('"')
         assert other_model == "claude-haiku-4-6", f"expected claude-haiku-4-6, got {other_model}"
 
     with subtest("hardening defaults applied (ProtectSystem=strict)"):
-        out = machine.succeed("systemd-analyze security zeroclaw-test.service")
-        assert "ProtectSystem=strict" in out or "Protect system" in out, (
-            f"hardening defaults not applied: {out}"
+        out = machine.succeed(
+            "systemctl show -p ProtectSystem zeroclaw-test.service"
+        ).strip()
+        assert out == "ProtectSystem=strict", (
+            f"hardening defaults not applied: {out!r}"
         )
+
+    with subtest("$VAR secret expansion: bot_token resolved from environmentFile"):
+        machine.wait_for_unit("zeroclaw-secret.service", timeout=30)
+        rendered = machine.succeed(
+            "yq -p toml -o json '.channels.telegram.bot_token' "
+            "/var/lib/zeroclaw-secret/config.toml"
+        ).strip().strip('"')
+        assert rendered == "secret-from-env-file", (
+            f"envsubst did not resolve $BOT_TOKEN — config.toml has {rendered!r}"
+        )
+        # The build-time copy in /nix/store must still contain the literal
+        # placeholder; otherwise the secret would be world-readable.
+        nix_store_copy = machine.succeed(
+            "systemctl show -p ExecStartPre zeroclaw-secret.service"
+        )
+        assert "/nix/store/" in nix_store_copy, (
+            "ExecStartPre is not pointing at a /nix/store source"
+        )
+
+    with subtest("non-/var/lib dataDir: directory created at the configured path"):
+        machine.wait_for_unit("zeroclaw-srv-test.service", timeout=30)
+        machine.succeed("test -d /srv/zeroclaw-srv")
+        owner_srv = machine.succeed("stat -c '%U:%G' /srv/zeroclaw-srv").strip()
+        assert owner_srv == "zeroclaw-srv-test:zeroclaw-srv-test", (
+            f"unexpected owner {owner_srv}"
+        )
+        # Regression guard: the old StateDirectory=baseNameOf shape would
+        # have created /var/lib/zeroclaw-srv (matching the basename) instead
+        # of the configured /srv/zeroclaw-srv path.
+        machine.fail("test -d /var/lib/zeroclaw-srv")
+        machine.succeed("test -f /srv/zeroclaw-srv/config.toml")
   '';
 }

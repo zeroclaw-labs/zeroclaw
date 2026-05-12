@@ -15,9 +15,16 @@
 #   - `settings` is a TOML-typed attrset rendered via `pkgs.formats.toml`
 #     per RFC-42. `extraConfig` (raw TOML) is the documented escape hatch.
 #   - Secrets travel through `environmentFile` (systemd `EnvironmentFile=`),
-#     never through `settings`. ZeroClaw's `${VAR}` substitution in config
-#     strings resolves at process start, not at Nix eval time — keeping
-#     secrets out of the world-readable Nix store.
+#     never through `settings`. The unit's `ExecStartPre` runs `envsubst`
+#     against the rendered TOML so `$VAR` / `${VAR}` references in `settings`
+#     strings expand to the values loaded from `environmentFile` at unit
+#     start. The world-readable copy in `/nix/store` only ever contains the
+#     literal placeholders; the resolved file lives at `${dataDir}/config.toml`
+#     mode `0600`, owned by the per-instance user.
+#     This substitution is a property of *this module*, not of ZeroClaw —
+#     ZeroClaw itself reads `config.toml` verbatim plus a handful of named
+#     env-var overrides documented in `crates/zeroclaw-config/src/schema.rs`
+#     (e.g. `OPENROUTER_API_KEY`, `ZEROCLAW_PROVIDER`).
 #
 # Single-instance usage (laptop / single-host case):
 #
@@ -116,8 +123,12 @@ let
           description = ''
             State directory. Holds `config.toml`, the workspace at
             `''${dataDir}/workspace`, and ZeroClaw's SQLite databases.
-            Created by systemd's `StateDirectory=` with mode `0750` owned by
-            {option}`user`:{option}`group`.
+
+            Created by `systemd-tmpfiles` at activation time with mode `0750`
+            owned by {option}`user`:{option}`group`, so any absolute path is
+            valid — `/var/lib/zeroclaw-me`, `/srv/zeroclaw-me`, or a nested
+            location like `/var/lib/zeroclaw/me` all work and are created
+            on a fresh machine before the unit's `ExecStartPre` runs.
           '';
         };
 
@@ -143,14 +154,26 @@ let
             }
           '';
           description = ''
-            ZeroClaw configuration as a Nix attrset. Rendered to TOML at
-            `''${dataDir}/config.toml` via `(pkgs.formats.toml { }).generate`.
+            ZeroClaw configuration as a Nix attrset. Rendered to TOML in the
+            Nix store at build time, then `envsubst`'d into
+            `''${dataDir}/config.toml` (mode `0600`) by the unit's
+            `ExecStartPre`.
 
-            String values may contain `$VAR` or `''${VAR}` references which
-            ZeroClaw resolves at process start against its environment
-            (populated by {option}`environmentFile`). This is the recommended
-            path for secrets — the rendered TOML in the world-readable
-            `/nix/store` should never contain a real credential.
+            String values may contain `$VAR` or `''${VAR}` references — they
+            expand against the environment loaded from
+            {option}`environmentFile` at unit start. This is the recommended
+            path for secrets: the build-time copy in the world-readable
+            `/nix/store` only ever contains the literal placeholders; the
+            resolved file in `''${dataDir}/config.toml` is locked to
+            {option}`user`:{option}`group` mode `0600`.
+
+            The substitution is performed by this module, not by ZeroClaw.
+            ZeroClaw reads `config.toml` verbatim and overlays a handful of
+            named environment-variable overrides on top (e.g.
+            `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ZEROCLAW_PROVIDER`,
+            `ZEROCLAW_MODEL`); any other secret-bearing field — Telegram
+            `bot_token`, Discord `bot_token`, etc. — needs the
+            `envsubst` path to avoid living in `/nix/store`.
 
             See ZeroClaw's `config.toml.example` upstream for the full key
             surface; only the shape we render here is module-contractual.
@@ -243,6 +266,28 @@ let
     name: instanceCfg:
     let
       configFile = renderConfigFile name instanceCfg;
+
+      # Wrap the envsubst step in a `writeShellApplication` rather than a
+      # raw `bash -c '…'` ExecStartPre: systemd parses ExecStartPre with
+      # shell-style quoting that doesn't tolerate literal newlines inside
+      # a single quoted argument, and a multi-line script keeps the
+      # readable error-handling around the empty-output guard.
+      configResolveScript = pkgs.writeShellApplication {
+        name = "zeroclaw-${name}-resolve-config";
+        runtimeInputs = [ pkgs.envsubst ];
+        text = ''
+          set -euo pipefail
+          tmp="${instanceCfg.dataDir}/.config.toml.tmp"
+          envsubst < ${configFile} > "$tmp"
+          if [ ! -s "$tmp" ]; then
+            echo "zeroclaw-${name}: rendered config.toml is empty after envsubst" >&2
+            rm -f "$tmp"
+            exit 1
+          fi
+          chmod 0600 "$tmp"
+          mv -f "$tmp" "${instanceCfg.dataDir}/config.toml"
+        '';
+      };
     in
     nameValuePair "zeroclaw-${name}" {
       description = "ZeroClaw agent (instance ${name})";
@@ -268,27 +313,30 @@ let
         User = instanceCfg.user;
         Group = instanceCfg.group;
 
-        # Stage the rendered config from /nix/store into
-        # ${dataDir}/config.toml so ZeroClaw can read it at a stable
-        # path. The unit's User= already owns ${dataDir} (set up by
-        # StateDirectory= above), so we don't need to chown — just
-        # install with mode 0600. Avoids needing CAP_CHOWN, which our
-        # CapabilityBoundingSet="" intentionally drops.
-        ExecStartPre = [
-          "${pkgs.coreutils}/bin/install -m 0600 ${configFile} ${instanceCfg.dataDir}/config.toml"
-        ];
+        # Resolve the rendered config from /nix/store into
+        # ${dataDir}/config.toml so ZeroClaw reads it at a stable path
+        # *and* `$VAR` / `${VAR}` references inside `settings` strings
+        # expand against the unit environment (populated by
+        # `EnvironmentFile=`). We use a tiny shell wrapper rather than
+        # raw `envsubst` so we can fail fast if the substitution leaves
+        # the file empty. `dataDir` is created up-front by
+        # `systemd.tmpfiles` in the host config block below; the unit's
+        # User= owns that directory, so no chown is needed (which is
+        # important — our `CapabilityBoundingSet=""` drops CAP_CHOWN).
+        ExecStartPre = [ (lib.getExe configResolveScript) ];
         ExecStart = "${lib.getExe instanceCfg.package} daemon";
         WorkingDirectory = instanceCfg.dataDir;
         Restart = "on-failure";
         RestartSec = "5s";
         TimeoutStopSec = "15s";
 
-        # systemd creates ${StateDirectory} under /var/lib at mode
-        # ${StateDirectoryMode}, owned by User:Group. We use the basename
-        # of dataDir so this works for both the default and any
-        # caller-provided path under /var/lib.
-        StateDirectory = baseNameOf instanceCfg.dataDir;
-        StateDirectoryMode = "0750";
+        # `dataDir` is created by `systemd.tmpfiles.settings` (see the
+        # host config block below) so that arbitrary paths — not just
+        # the `/var/lib/zeroclaw-<name>` default — are valid. We deliberately
+        # don't use `StateDirectory=`: it derives the on-disk path from
+        # the unit's basename under `/var/lib/`, so a caller-supplied
+        # `dataDir = "/srv/zeroclaw-me"` would create `/var/lib/zeroclaw-me`
+        # (wrong) instead of the path the rest of the unit references.
 
         EnvironmentFile = mkIf (instanceCfg.environmentFile != null) [ instanceCfg.environmentFile ];
 
@@ -407,6 +455,24 @@ in
 
     # One systemd unit per instance.
     systemd.services = mapAttrs' mkInstanceService cfg.instances;
+
+    # Create each instance's dataDir at activation time, owned by the
+    # per-instance user/group, mode 0750. We do this via systemd-tmpfiles
+    # (rather than systemd's `StateDirectory=`) because `StateDirectory=`
+    # forces the directory under `/var/lib/<basename>`; a caller who sets
+    # `dataDir = "/srv/zeroclaw-me"` would otherwise see `/var/lib/zeroclaw-me`
+    # created and the unit would then fail at `WorkingDirectory=/srv/...`.
+    # tmpfiles handles arbitrary absolute paths uniformly.
+    systemd.tmpfiles.settings."10-zeroclaw" = mapAttrs' (
+      _: instanceCfg:
+      nameValuePair instanceCfg.dataDir {
+        d = {
+          mode = "0750";
+          user = instanceCfg.user;
+          group = instanceCfg.group;
+        };
+      }
+    ) cfg.instances;
 
     # Eval-time guards so misconfiguration fails fast with a useful message.
     assertions =
