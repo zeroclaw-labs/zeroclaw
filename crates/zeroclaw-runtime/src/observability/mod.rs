@@ -110,7 +110,7 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
         "prometheus" => {
             #[cfg(feature = "observability-prometheus")]
             {
-                Box::new(PrometheusObserver::new())
+                Box::new(PrometheusObserver::shared())
             }
             #[cfg(not(feature = "observability-prometheus"))]
             {

@@ -2,6 +2,7 @@ use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use prometheus::{
     Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder,
 };
+use std::sync::{Arc, OnceLock};
 
 /// Prometheus-backed observer — exposes metrics for scraping via `/metrics`.
 pub struct PrometheusObserver {
@@ -307,6 +308,19 @@ impl PrometheusObserver {
         let mut buf = Vec::new();
         encoder.encode(&families, &mut buf).unwrap_or_default();
         String::from_utf8(buf).unwrap_or_default()
+    }
+
+    /// Process-wide singleton handle. All call sites that obtain a Prometheus
+    /// observer through this function share the same `Registry` and the same
+    /// underlying counters, so events recorded by the channel orchestrator and
+    /// events recorded by the gateway accumulate into the same time series and
+    /// are visible on a single `/metrics` scrape.
+    ///
+    /// `PrometheusObserver::new()` still returns a fresh, isolated instance —
+    /// kept for tests so parallel test cases don't see each other's counts.
+    pub fn shared() -> Arc<Self> {
+        static SINGLETON: OnceLock<Arc<PrometheusObserver>> = OnceLock::new();
+        SINGLETON.get_or_init(|| Arc::new(Self::new())).clone()
     }
 }
 
@@ -849,5 +863,54 @@ mod tests {
         obs.record_event(&ObserverEvent::RecoveryCompleted {
             deploy_id: "d1".into(),
         });
+    }
+
+    #[test]
+    fn shared_returns_the_same_registry_across_calls() {
+        let a = PrometheusObserver::shared();
+        let b = PrometheusObserver::shared();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "PrometheusObserver::shared() must hand out the same underlying \
+             instance to every caller, otherwise the gateway's /metrics scrape \
+             cannot see counters incremented by the channel orchestrator"
+        );
+    }
+
+    #[test]
+    fn arc_blanket_observer_impl_routes_to_inner() {
+        let shared_a = PrometheusObserver::shared();
+        let shared_b = PrometheusObserver::shared();
+
+        Observer::record_event(
+            &shared_a,
+            &ObserverEvent::ChannelMessage {
+                channel: "test-channel".into(),
+                direction: "inbound".into(),
+            },
+        );
+
+        let output = shared_b.encode();
+        assert!(
+            output.contains(
+                r#"zeroclaw_channel_messages_total{channel="test-channel",direction="inbound"} 1"#
+            ),
+            "an event recorded through one Arc handle must be visible when \
+             scraping through any other handle — output was: {output}"
+        );
+    }
+
+    #[test]
+    fn arc_blanket_observer_impl_preserves_downcast() {
+        let shared: Arc<PrometheusObserver> = PrometheusObserver::shared();
+        let observer: &dyn Observer = &shared;
+        assert!(
+            observer
+                .as_any()
+                .downcast_ref::<PrometheusObserver>()
+                .is_some(),
+            "the /metrics resolver downcasts through `as_any` — Arc<T> must \
+             surface the inner T, not the Arc wrapper"
+        );
     }
 }
