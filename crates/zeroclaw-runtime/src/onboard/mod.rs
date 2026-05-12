@@ -2147,6 +2147,9 @@ mod tests {
             // are None. An empty-string answer lets prompt_field's
             // is-set-guard skip the persist, leaving the field None.
             .with("proxy-url", "")
+            // Vec<String> with #[serde(default)]; empty answer keeps the
+            // default empty list. Same shape as proxy-url above.
+            .with("excluded-tools", "")
             .with_sequence("Channel", ["telegram", "Done"]);
         run(&mut cfg, &mut ui, Some(Section::Channels), &flags)
             .await
@@ -2179,6 +2182,9 @@ mod tests {
         let mut ui = QuickUi::new()
             .with("api-url", "http://mochat-test:8080/v1")
             .with("api-token", "stub-mochat-token")
+            // Vec<String> with #[serde(default)]; empty answer keeps the
+            // default empty list.
+            .with("excluded-tools", "")
             .with_sequence("Channel", ["mochat", "Done"]);
         run(&mut cfg, &mut ui, Some(Section::Channels), &flags)
             .await
