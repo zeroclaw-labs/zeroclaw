@@ -1,13 +1,19 @@
 use crate::agent::history_pruner::remove_orphaned_tool_messages;
 use anyhow::Result;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::LazyLock;
 use zeroclaw_providers::ChatMessage;
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
+
+static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"/[^\s<>'"`\]\)]+?\.(?i:png|jpe?g|webp|gif|bmp)"#).expect("valid image path regex")
+});
 
 /// Find the largest byte index `<= i` that is a valid char boundary.
 /// MSRV-compatible replacement for `str::floor_char_boundary` (stable in 1.91).
@@ -22,9 +28,70 @@ pub fn floor_char_boundary(s: &str, i: usize) -> usize {
     pos
 }
 
+/// Indicates which side of a truncated string a boundary belongs to when
+/// nudging it away from a half-cut `[IMAGE:...]` marker.
+#[derive(Clone, Copy)]
+enum TruncationSide {
+    /// Boundary is the end of the kept head; nudge backward (out of the marker).
+    Head,
+    /// Boundary is the start of the kept tail; nudge forward (out of the marker).
+    Tail,
+}
+
+/// If `boundary` falls inside an `[IMAGE:...]` marker (i.e. between an
+/// unclosed `[IMAGE:` and its closing `]`), nudge it onto the nearest
+/// complete-marker boundary. The malformed half-marker is dropped into the
+/// truncated middle rather than emitted to the regex, which would otherwise
+/// silently fail to match and quietly lose the image.
+fn nudge_around_image_marker(s: &str, boundary: usize, side: TruncationSide) -> usize {
+    const OPEN: &str = "[IMAGE:";
+    if boundary == 0 || boundary >= s.len() {
+        return boundary;
+    }
+
+    // Walk forward to find the most recent `[IMAGE:` whose `[` is strictly
+    // before `boundary`. Searching forward (rather than `rfind` on a prefix)
+    // correctly handles the case where `boundary` itself splits the literal
+    // `[IMAGE:` token.
+    let mut search_from = 0usize;
+    let mut last_open: Option<usize> = None;
+    while let Some(rel) = s[search_from..].find(OPEN) {
+        let open_idx = search_from + rel;
+        if open_idx >= boundary {
+            break;
+        }
+        last_open = Some(open_idx);
+        search_from = open_idx + OPEN.len();
+    }
+    let Some(open_idx) = last_open else {
+        return boundary;
+    };
+
+    // First `]` after the opener closes the marker (canonicalize regex
+    // forbids `]` inside paths, so this is unambiguous in practice).
+    let close_idx = match s[open_idx..].find(']') {
+        Some(rel) => open_idx + rel,
+        None => return boundary, // malformed input — leave the boundary alone
+    };
+
+    if close_idx < boundary {
+        return boundary; // marker fully closed before boundary — safe
+    }
+
+    match side {
+        TruncationSide::Head => open_idx,
+        TruncationSide::Tail => (close_idx + 1).min(s.len()),
+    }
+}
+
 /// Truncate a tool result to `max_chars`, keeping head (2/3) + tail (1/3)
 /// with a marker in the middle. Returns input unchanged if within limit or
 /// `max_chars == 0` (disabled).
+///
+/// Boundaries are nudged inward when they would split an `[IMAGE:...]`
+/// marker, so the multimodal regex never sees a half-marker in the
+/// surviving head/tail. This matches the canonicalization step that runs
+/// immediately before truncation in `run_tool_call_loop`.
 pub fn truncate_tool_result(output: &str, max_chars: usize) -> String {
     if max_chars == 0 || output.len() <= max_chars {
         return output.to_string();
@@ -43,6 +110,13 @@ pub fn truncate_tool_result(output: &str, max_chars: usize) -> String {
         }
         pos
     };
+
+    // Step boundaries away from any `[IMAGE:...]` marker they would bisect.
+    // `[IMAGE:` and `]` are pure ASCII, so the adjusted indices land on
+    // valid UTF-8 char boundaries.
+    let head_end = nudge_around_image_marker(output, head_end, TruncationSide::Head);
+    let tail_start = nudge_around_image_marker(output, tail_start, TruncationSide::Tail);
+
     // Guard against overlap when max_chars is very small
     if head_end >= tail_start {
         return output[..floor_char_boundary(output, max_chars)].to_string();
@@ -54,6 +128,60 @@ pub fn truncate_tool_result(output: &str, max_chars: usize) -> String {
         truncated_chars,
         &output[tail_start..]
     )
+}
+
+fn is_existing_local_image_path(path: &str) -> bool {
+    let candidate = Path::new(path);
+    candidate.is_absolute()
+        && candidate.is_file()
+        && candidate
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
+                )
+            })
+}
+
+/// Rewrite real local image file paths in tool output into `[IMAGE:...]`
+/// markers so the multimodal pipeline can normalize them before the next
+/// provider call. This targets shell/skill outputs that print filesystem
+/// paths directly rather than returning explicit media markers.
+pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
+    let mut rewritten = String::with_capacity(output.len());
+    let mut cursor = 0usize;
+    let mut changed = false;
+
+    for mat in LOCAL_IMAGE_PATH_RE.find_iter(output) {
+        let start = mat.start();
+        let end = mat.end();
+        let path = &output[start..end];
+
+        // Skip paths that are already part of an explicit media marker.
+        if output[..start].ends_with("[IMAGE:") {
+            continue;
+        }
+
+        if !is_existing_local_image_path(path) {
+            continue;
+        }
+
+        rewritten.push_str(&output[cursor..start]);
+        rewritten.push_str("[IMAGE:");
+        rewritten.push_str(path);
+        rewritten.push(']');
+        cursor = end;
+        changed = true;
+    }
+
+    if !changed {
+        return output.to_string();
+    }
+
+    rewritten.push_str(&output[cursor..]);
+    rewritten
 }
 
 /// Truncate a tool message's content, preserving JSON structure when the
@@ -214,4 +342,98 @@ pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) ->
     let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
     std::fs::write(path, payload)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonicalize_tool_result_media_markers_wraps_existing_local_image_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("generated.png");
+        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+
+        let input = format!("Image generated successfully.\nFile: {}", image.display());
+        let output = canonicalize_tool_result_media_markers(&input);
+
+        assert!(output.contains("[IMAGE:"));
+        assert!(output.contains(&format!("[IMAGE:{}]", image.display())));
+    }
+
+    #[test]
+    fn canonicalize_tool_result_media_markers_ignores_missing_paths() {
+        let input = "File: /tmp/definitely-missing-zeroclaw-image.png";
+        let output = canonicalize_tool_result_media_markers(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn canonicalize_tool_result_media_markers_preserves_existing_markers() {
+        let input = "Already tagged [IMAGE:/tmp/already-tagged.png]";
+        let output = canonicalize_tool_result_media_markers(input);
+        assert_eq!(output, input);
+    }
+
+    /// Regression: when `truncate_tool_result`'s head boundary fell inside an
+    /// `[IMAGE:...]` marker, the head ended up containing a half-marker like
+    /// `[IMAGE:/very/long/pa` that the multimodal regex would silently fail
+    /// to match. The boundary now rewinds to the marker opener so the broken
+    /// half is dropped into the truncated middle. See PR #6183 review.
+    #[test]
+    fn truncate_tool_result_does_not_split_image_marker_at_head_boundary() {
+        // 200-byte path → marker length 207 bytes. With max_chars=80 the
+        // naive head_end (= 80 * 2 / 3 = 53) falls inside the marker.
+        let path = format!("/tmp/{}.png", "a".repeat(200));
+        let marker = format!("[IMAGE:{path}]");
+        let output = format!("prefix-text {marker} trailing-text padding-padding");
+
+        let truncated = truncate_tool_result(&output, 80);
+
+        assert!(
+            truncated.contains("[... ") && truncated.contains("characters truncated ...]"),
+            "expected truncation marker in output, got: {truncated}"
+        );
+        // No half-`[IMAGE:` marker should leak into the surviving content.
+        let stripped = truncated.replace(&marker, "");
+        assert!(
+            !stripped.contains("[IMAGE:"),
+            "half-`[IMAGE:` marker leaked into truncated output: {truncated}"
+        );
+    }
+
+    /// Regression: tail boundary previously could land inside an
+    /// `[IMAGE:...]` marker, leaving a stray closing `...png]` fragment in
+    /// the surviving tail. The boundary now advances past the closing `]`.
+    #[test]
+    fn truncate_tool_result_does_not_split_image_marker_at_tail_boundary() {
+        // Marker placed near the end so tail_start (~max_chars / 3 from the
+        // end) lands inside it.
+        let path = format!("/tmp/{}.png", "b".repeat(200));
+        let marker = format!("[IMAGE:{path}]");
+        let output = format!("{} preamble-content-line {marker} ending", "x".repeat(400));
+
+        let truncated = truncate_tool_result(&output, 90);
+
+        let stripped = truncated.replace(&marker, "");
+        assert!(
+            !stripped.contains("[IMAGE:") && !stripped.contains(".png]"),
+            "half-`[IMAGE:` marker leaked into truncated output: {truncated}"
+        );
+    }
+
+    /// When a complete `[IMAGE:...]` marker fits naturally inside the
+    /// retained head, truncation must not damage it.
+    #[test]
+    fn truncate_tool_result_keeps_complete_marker_in_head() {
+        let marker = "[IMAGE:/tmp/short.png]";
+        let output = format!("{marker} {}", "y".repeat(500));
+
+        let truncated = truncate_tool_result(&output, 200);
+
+        assert!(
+            truncated.starts_with(marker),
+            "expected head to retain full marker, got: {truncated}"
+        );
+    }
 }

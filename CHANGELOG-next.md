@@ -329,6 +329,36 @@ this config.)
 
 ---
 
+## Behavior Changes
+
+### Tool outputs that mention local image paths are now uploaded to the provider
+
+Tool results — including `shell` and skill output — that print real local
+image paths (e.g. `ls /pictures`, `find . -name '*.png'`, an image-generation
+tool that prints the saved file path) are now canonicalized into
+`[IMAGE:...]` markers before history replay and base64-inlined into the next
+provider request. This is the fix for #6097 (local image reading failed) and
+#5453 (WebSocket `/ws/chat` did not process `[IMAGE:]` markers), and brings
+the agent and provider sides of the multimodal pipeline back into parity.
+
+The behavior shift is real and worth flagging: image bytes that previously
+stayed on the local filesystem when surfaced by a shell-style tool are now
+uploaded to whichever provider the next turn dispatches to. Only paths where
+`Path::is_file()` returns `true` and the extension is one of `png`, `jpg`,
+`jpeg`, `webp`, `gif`, `bmp` are wrapped, and existing `[IMAGE:...]` markers
+are not double-wrapped, but operators running shell tools over directories
+of personal or sensitive images should be aware.
+
+The per-request image budget (`max_images`, default `4`) and the LRU
+`trim_old_images` policy bound the cumulative upload cost — older images are
+dropped before the cap is exceeded — but the privacy posture has shifted.
+See `docs/book/src/contributing/privacy.md` and the new doc note on
+`MultimodalConfig.max_images` for the current upload semantics. Operators
+who do not want this behavior can keep tool outputs free of literal image
+paths, or scope shell tools away from image-bearing directories. (#6183)
+
+---
+
 ## Contributors
 
 - @abhinavmathur-atlan
