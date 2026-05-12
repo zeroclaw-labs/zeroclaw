@@ -5,7 +5,10 @@
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
 use crate::auth::AuthService;
-use crate::traits::{ChatMessage, Provider, TokenUsage};
+use crate::traits::{
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
+    Provider, TokenUsage, ToolsPayload,
+};
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;
@@ -283,9 +286,15 @@ impl GenerateContentResponse {
     fn into_effective_response(self) -> Self {
         match self {
             Self {
-                response: Some(inner),
+                response: Some(mut inner),
+                usage_metadata,
                 ..
-            } => *inner,
+            } => {
+                if inner.usage_metadata.is_none() {
+                    inner.usage_metadata = usage_metadata;
+                }
+                *inner
+            }
             other => other,
         }
     }
@@ -983,6 +992,75 @@ impl GeminiProvider {
 }
 
 impl GeminiProvider {
+    fn build_chat_contents(
+        messages: &[ChatMessage],
+        tool_instructions: Option<&str>,
+    ) -> (Vec<Content>, Option<Content>) {
+        let mut system_parts: Vec<&str> = Vec::new();
+        let mut contents: Vec<Content> = Vec::new();
+
+        for msg in messages {
+            match msg.role.as_str() {
+                "system" => {
+                    system_parts.push(&msg.content);
+                }
+                "user" => {
+                    contents.push(Content {
+                        role: Some("user".to_string()),
+                        parts: build_parts(&msg.content),
+                    });
+                }
+                "assistant" => {
+                    contents.push(Content {
+                        role: Some("model".to_string()),
+                        parts: vec![Part::text(&msg.content)],
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(instructions) = tool_instructions {
+            system_parts.push(instructions);
+        }
+
+        let system_instruction = if system_parts.is_empty() {
+            None
+        } else {
+            Some(Content {
+                role: None,
+                parts: vec![Part::text(system_parts.join("\n\n"))],
+            })
+        };
+
+        (contents, system_instruction)
+    }
+
+    async fn chat_with_history_full(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<(String, Option<TokenUsage>)> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
+        let (contents, system_instruction) = Self::build_chat_contents(messages, None);
+
+        self.send_generate_content(contents, system_instruction, model, temperature)
+            .await
+    }
+
+    fn token_usage_from_metadata(usage: GeminiUsageMetadata) -> Option<TokenUsage> {
+        if usage.prompt_token_count.is_none() && usage.candidates_token_count.is_none() {
+            return None;
+        }
+
+        Some(TokenUsage {
+            input_tokens: usage.prompt_token_count,
+            output_tokens: usage.candidates_token_count,
+            cached_input_tokens: None,
+        })
+    }
+
     async fn send_generate_content(
         &self,
         contents: Vec<Content>,
@@ -1177,11 +1255,9 @@ impl GeminiProvider {
             anyhow::bail!("Gemini API error: {}", err.message);
         }
 
-        let usage = result.usage_metadata.map(|u| TokenUsage {
-            input_tokens: u.prompt_token_count,
-            output_tokens: u.candidates_token_count,
-            cached_input_tokens: None,
-        });
+        let usage = result
+            .usage_metadata
+            .and_then(Self::token_usage_from_metadata);
 
         let text = result
             .candidates
@@ -1239,45 +1315,46 @@ impl Provider for GeminiProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
-        let mut system_parts: Vec<&str> = Vec::new();
-        let mut contents: Vec<Content> = Vec::new();
-
-        for msg in messages {
-            match msg.role.as_str() {
-                "system" => {
-                    system_parts.push(&msg.content);
-                }
-                "user" => {
-                    contents.push(Content {
-                        role: Some("user".to_string()),
-                        parts: build_parts(&msg.content),
-                    });
-                }
-                "assistant" => {
-                    // Gemini API uses "model" role instead of "assistant"
-                    contents.push(Content {
-                        role: Some("model".to_string()),
-                        parts: vec![Part::text(&msg.content)],
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        let system_instruction = if system_parts.is_empty() {
-            None
-        } else {
-            Some(Content {
-                role: None,
-                parts: vec![Part::text(system_parts.join("\n\n"))],
-            })
-        };
-
         let (text, _usage) = self
-            .send_generate_content(contents, system_instruction, model, temperature)
+            .chat_with_history_full(messages, model, temperature)
             .await?;
         Ok(text)
+    }
+
+    async fn chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let tool_instructions = if let Some(tools) = request.tools
+            && !tools.is_empty()
+            && !self.supports_native_tools()
+        {
+            Some(match self.convert_tools(tools) {
+                ToolsPayload::PromptGuided { instructions } => instructions,
+                payload => {
+                    anyhow::bail!(
+                        "Provider returned non-prompt-guided tools payload ({payload:?}) while supports_native_tools() is false"
+                    )
+                }
+            })
+        } else {
+            None
+        };
+
+        let temperature = temperature.unwrap_or(self.default_temperature());
+        let (contents, system_instruction) =
+            Self::build_chat_contents(request.messages, tool_instructions.as_deref());
+        let (text, usage) = self
+            .send_generate_content(contents, system_instruction, model, temperature)
+            .await?;
+        Ok(ProviderChatResponse {
+            text: Some(text),
+            tool_calls: Vec::new(),
+            usage,
+            reasoning_content: None,
+        })
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -2102,6 +2179,66 @@ mod tests {
     }
 
     #[test]
+    fn response_usage_metadata_maps_to_token_usage() {
+        let usage = GeminiUsageMetadata {
+            prompt_token_count: Some(120),
+            candidates_token_count: Some(40),
+        };
+
+        let token_usage =
+            GeminiProvider::token_usage_from_metadata(usage).expect("usage counts should map");
+
+        assert_eq!(token_usage.input_tokens, Some(120));
+        assert_eq!(token_usage.output_tokens, Some(40));
+        assert_eq!(token_usage.cached_input_tokens, None);
+    }
+
+    #[test]
+    fn empty_usage_metadata_maps_to_none() {
+        let usage = GeminiUsageMetadata {
+            prompt_token_count: None,
+            candidates_token_count: None,
+        };
+
+        assert!(GeminiProvider::token_usage_from_metadata(usage).is_none());
+    }
+
+    #[test]
+    fn wrapped_response_preserves_outer_usage_metadata() {
+        let json = r#"{
+            "usageMetadata": {"promptTokenCount": 120, "candidatesTokenCount": 40},
+            "response": {
+                "candidates": [{"content": {"parts": [{"text": "Hello"}]}}]
+            }
+        }"#;
+
+        let resp: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let effective = resp.into_effective_response();
+        let usage = effective.usage_metadata.unwrap();
+
+        assert_eq!(usage.prompt_token_count, Some(120));
+        assert_eq!(usage.candidates_token_count, Some(40));
+    }
+
+    #[test]
+    fn wrapped_response_prefers_inner_usage_metadata() {
+        let json = r#"{
+            "usageMetadata": {"promptTokenCount": 120, "candidatesTokenCount": 40},
+            "response": {
+                "candidates": [{"content": {"parts": [{"text": "Hello"}]}}],
+                "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 2}
+            }
+        }"#;
+
+        let resp: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let effective = resp.into_effective_response();
+        let usage = effective.usage_metadata.unwrap();
+
+        assert_eq!(usage.prompt_token_count, Some(5));
+        assert_eq!(usage.candidates_token_count, Some(2));
+    }
+
+    #[test]
     fn response_parses_without_usage_metadata() {
         let json = r#"{"candidates": [{"content": {"parts": [{"text": "Hello"}]}}]}"#;
         let resp: GenerateContentResponse = serde_json::from_str(json).unwrap();
@@ -2274,21 +2411,59 @@ mod tests {
 
     #[test]
     fn chat_with_history_maps_roles_correctly() {
-        // Verify the message→Content mapping logic directly by checking
-        // that the provider constructs the right Content structures.
-        // We can't call chat_with_history without a real API, but we can
-        // verify the Part construction used in each role branch.
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello [IMAGE:data:image/png;base64,AA==]"),
+            ChatMessage::assistant("I see the image"),
+        ];
 
-        // User messages should go through build_parts (supports images)
-        let user_parts = build_parts("Hello [IMAGE:data:image/png;base64,AA==]");
-        assert!(user_parts.iter().any(|p| matches!(p, Part::Inline { .. })));
+        let (contents, system_instruction) = GeminiProvider::build_chat_contents(&messages, None);
 
-        // Assistant messages should use Part::text (no image parsing)
-        let assistant_part = Part::text("I see the image");
-        assert!(matches!(assistant_part, Part::Text { .. }));
+        let system_instruction = system_instruction.expect("system prompt should be separated");
+        assert_eq!(system_instruction.role, None);
+        assert!(
+            matches!(&system_instruction.parts[0], Part::Text { text } if text == "You are helpful")
+        );
 
-        // System messages should use Part::text
-        let system_part = Part::text("You are helpful");
-        assert!(matches!(system_part, Part::Text { .. }));
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0].role.as_deref(), Some("user"));
+        assert!(
+            contents[0]
+                .parts
+                .iter()
+                .any(|p| matches!(p, Part::Inline { .. }))
+        );
+        assert_eq!(contents[1].role.as_deref(), Some("model"));
+        assert!(matches!(&contents[1].parts[0], Part::Text { text } if text == "I see the image"));
+    }
+
+    #[test]
+    fn chat_contents_append_tool_instructions_to_system_prompt() {
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello"),
+        ];
+
+        let (_contents, system_instruction) =
+            GeminiProvider::build_chat_contents(&messages, Some("Use tools carefully"));
+
+        let system_instruction = system_instruction.expect("system prompt should include tools");
+        assert!(
+            matches!(&system_instruction.parts[0], Part::Text { text } if text == "You are helpful\n\nUse tools carefully")
+        );
+    }
+
+    #[test]
+    fn chat_contents_create_system_prompt_from_tool_instructions() {
+        let messages = vec![ChatMessage::user("Hello")];
+
+        let (_contents, system_instruction) =
+            GeminiProvider::build_chat_contents(&messages, Some("Use tools carefully"));
+
+        let system_instruction =
+            system_instruction.expect("tool instructions should be system prompt");
+        assert!(
+            matches!(&system_instruction.parts[0], Part::Text { text } if text == "Use tools carefully")
+        );
     }
 }

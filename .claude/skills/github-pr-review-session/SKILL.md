@@ -23,7 +23,7 @@ Read these files at the start of every session. They are authoritative.
 
 - `AGENTS.md` — risk tiers, high-risk paths, anti-patterns, commands
 - `docs/book/src/contributing/pr-review-protocol.md` — **the full review protocol**;
-  follow it exactly for every PR
+  follow it exactly for every PR, including the review-body Markdown format
 - `.github/pull_request_template.md` — required PR body sections; used to
   check template completeness
 - `docs/book/src/foundations/fnd-003-governance.md` — label taxonomy, tracking
@@ -93,8 +93,13 @@ The protocol specifies:
   `docs/book/src/foundations/fnd-005-contribution-culture.md`
 - **How to cross-check** the diff against local source files
 - **The take-stock checkpoint** before writing anything
+- **Label hygiene** — fix obvious label mismatches yourself when the active
+  reviewer has label permissions, after approval for the public-state mutation;
+  do not ask authors to update labels they may not be allowed to edit
 - **The verdict decision tree** — which flag to use based on review state
-- **The feedback taxonomy** (🔴 / 🟡 / ✅ / 🔵 / 🟢) and how to apply it
+- **The feedback taxonomy** (🔴 / 🟡 / ✅ / 🔵 / 🟢), including the required
+  H3 review-body heading format that starts each formal finding with the
+  taxonomy emoji
 - **The posting convention** (write to `tmp/review-<number>.md`, post with
   `--body-file`)
 
@@ -104,13 +109,19 @@ fetches sequentially wastes time and the results are independent.
 ### Phase 3 — Write and post
 
 1. Write the review body to `tmp/review-<number>.md`.
-2. Post using the verdict flag from the decision tree:
+2. Before showing or posting, confirm the context intro is present, formal
+   finding headings are H3 headings that start with taxonomy emoji, prose is not
+   accidentally hard-wrapped, and the review has had a plain-language pass.
+3. Show the draft to the active reviewer before posting. Prefer a link to
+   `tmp/review-<number>.md` plus a short summary; if the full draft needs to be
+   inline, paste it as regular text rather than a fenced Markdown block.
+4. Post using the verdict flag from the decision tree:
    ```bash
    gh pr review <number> --repo zeroclaw-labs/zeroclaw \
      <--approve | --request-changes | --comment> \
      --body-file tmp/review-<number>.md
    ```
-3. Confirm the post succeeded.
+5. Confirm the post succeeded.
 
 ### Phase 3.5 — Milestone alignment
 
@@ -233,13 +244,20 @@ These norms are documented in
 4. **Always write to `tmp/review-<number>.md` before posting.** The tmp file
    is the source of truth for what was posted. It also lets you inspect before
    posting if the user asks.
-5. **Always run milestone alignment after posting**, unless the PR is a
+5. **Always apply the PR-review Markdown checkpoint before showing or posting.**
+   Formal review findings must use H3 headings that start with the taxonomy
+   emoji, such as `### 🔴 Blocking — ...`; headings such as
+   `### Blocking — ...` or numbered findings do not satisfy the protocol.
+6. **Always show drafts to the active reviewer as a file link or regular text by default.**
+   Do not wrap an entire public review/comment/PR draft in a fenced Markdown
+   block unless the active reviewer explicitly asks for that format.
+7. **Always run milestone alignment after posting**, unless the PR is a
    documented no-milestone type (`chore:`/`deps:` prefix or deps-only diff).
    Note the skip reason in the handoff when bypassing.
-6. **Always update `tmp/handoff.md` after posting.** The handoff is useless if
+8. **Always update `tmp/handoff.md` after posting.** The handoff is useless if
    it's not current. Include the milestone alignment outcome.
-7. **Never merge.** Never push to contributor branches.
-8. **Never approve over another reviewer's active CHANGES_REQUESTED.**
+9. **Never merge.** Never push to contributor branches.
+10. **Never approve over another reviewer's active CHANGES_REQUESTED.**
    Check the reviews API output before choosing a verdict flag.
-9. **Never post a review that re-raises a settled point** without explicitly
+11. **Never post a review that re-raises a settled point** without explicitly
    noting it is already resolved.

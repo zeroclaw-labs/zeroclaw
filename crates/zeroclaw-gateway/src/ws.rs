@@ -325,35 +325,42 @@ async fn handle_socket(
         }
     };
 
+    if let Some(err) = needs_onboarding_ws_error(&config) {
+        let _ = sender.send(Message::Text(err.to_string().into())).await;
+        return;
+    }
+
     // Build a persistent Agent for this connection so history is maintained
     // across turns. The session cwd becomes the security sandbox root; config
     // workspace remains the daemon data directory.
-    let mut agent = match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd(
-        &config,
-        Some(&session_cwd),
-    )
-    .await
-    {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!(error = %e, "Agent initialization failed");
-            let err = serde_json::json!({
-                "type": "error",
-                "message": format!("Failed to initialise agent: {e}"),
-                "code": "AGENT_INIT_FAILED"
-            });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
-            let _ = sender
-                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                    code: 1011,
-                    reason: axum::extract::ws::Utf8Bytes::from_static(
-                        "Agent initialization failed",
-                    ),
-                })))
-                .await;
-            return;
-        }
-    };
+    let mut agent =
+        match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd_and_mcp_backchannel(
+            &config,
+            Some(&session_cwd),
+            true,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(error = %e, "Agent initialization failed");
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": format!("Failed to initialise agent: {e}"),
+                    "code": "AGENT_INIT_FAILED"
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                let _ = sender
+                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: 1011,
+                        reason: axum::extract::ws::Utf8Bytes::from_static(
+                            "Agent initialization failed",
+                        ),
+                    })))
+                    .await;
+                return;
+            }
+        };
     agent.set_memory_session_id(Some(memory_session_id));
     if !stored_messages.is_empty() {
         agent.seed_history(&stored_messages);
@@ -606,6 +613,20 @@ fn resolve_session_cwd(
         .unwrap_or_else(|| default_workspace.to_path_buf());
     std::fs::canonicalize(&cwd)
         .map_err(|e| anyhow::anyhow!("cwd is not a usable directory ({}): {e}", cwd.display()))
+}
+
+fn needs_onboarding_ws_error(
+    config: &zeroclaw_config::schema::Config,
+) -> Option<serde_json::Value> {
+    let model = config.providers.resolve_default_model().unwrap_or_default();
+    crate::needs_onboarding_for(&model)?;
+    Some(serde_json::json!({
+        "type": "error",
+        "error": "needs_onboarding",
+        "code": "NEEDS_ONBOARDING",
+        "message": crate::needs_onboarding_channel_reply(),
+        "url": "/onboard",
+    }))
 }
 
 /// Process a single chat message through the agent and send the response.
@@ -1198,5 +1219,45 @@ mod tests {
             .expect_err("missing cwd should be rejected");
 
         assert!(err.to_string().contains("cwd is not a usable directory"));
+    }
+
+    #[test]
+    fn needs_onboarding_ws_error_points_to_onboard() {
+        let config = zeroclaw_config::schema::Config::default();
+        let frame = needs_onboarding_ws_error(&config)
+            .expect("empty model must produce a WS onboarding error");
+
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["error"], "needs_onboarding");
+        assert_eq!(frame["code"], "NEEDS_ONBOARDING");
+        assert_eq!(frame["url"], "/onboard");
+        let message = frame["message"]
+            .as_str()
+            .expect("onboarding WS error must include a message");
+        assert!(
+            !message.starts_with('{') && !message.ends_with('}'),
+            "missing Fluent key fallback leaked into WS error message: {message:?}"
+        );
+        assert!(
+            message.to_lowercase().contains("onboarding"),
+            "WS onboarding message must explain the setup gap: {message:?}"
+        );
+    }
+
+    #[test]
+    fn needs_onboarding_ws_error_uses_current_configured_model() {
+        let mut config = zeroclaw_config::schema::Config {
+            providers: zeroclaw_config::providers::ProvidersConfig {
+                fallback: Some("openai".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.ensure_fallback_provider().model = Some("openai/gpt-4o-mini".to_string());
+
+        assert!(
+            needs_onboarding_ws_error(&config).is_none(),
+            "current configured model must allow WebSocket agent construction to continue"
+        );
     }
 }

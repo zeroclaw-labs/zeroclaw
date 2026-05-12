@@ -11,13 +11,14 @@ Last verified: **May 2026** (v0.7.4 cycle).
 
 ---
 
-## The process in five steps
+## The process in six steps
 
 1. Generate `CHANGELOG-next.md` using the changelog skill
 2. Open and merge a version bump PR
-3. Trigger the `Release Stable` workflow via manual dispatch
-4. Approve the three environment gates when prompted
-5. Verify the release exists and assets are downloadable
+3. Dry-run the release workflows locally with `act`
+4. Trigger the `Release Stable` workflow via manual dispatch
+5. Approve the three environment gates when prompted
+6. Verify the release exists and assets are downloadable
 
 That is the entire process. Everything else (Docker, crates.io, Scoop, AUR,
 Homebrew, Discord, tweet) runs automatically as downstream jobs. You do not
@@ -78,7 +79,152 @@ git show origin/master:Cargo.toml | grep '^version'
 
 ---
 
-## Step 3 — Trigger the release
+## Step 3 — Dry-run the release workflows locally with `act`
+
+The `Release Stable` workflow is a GitHub Actions job graph that consumes
+your environment-gate approval window the moment you click **Run workflow**.
+If a workflow step is broken — a missing build artifact, a stale path, a
+codegen step that someone removed without updating CI — the failure surfaces
+*after* you have committed to a release window, with the version PR already
+merged and master at the new version. Recovery means landing an emergency
+fix branch, re-running CI, and shipping under time pressure on a tree that
+already advertises itself as a fully-released version.
+
+The cheap insurance against this is to run the same job graph locally first,
+on the exact merged master commit, before opening the GitHub Actions form.
+[`act`](https://nektosact.com/) executes GitHub Actions workflows inside
+Docker containers using the same `actions/*` ecosystem GitHub does. It does
+not perfectly mirror the cloud runner — it cannot reach the artifact upload
+runtime, GitHub-issued OIDC tokens, environment secrets, or jobs that depend
+on a real release tag — but it does run the build and test steps that
+account for nearly every release-time CI failure we have ever hit.
+
+This step is a 15–20 minute investment per release. It has caught real
+defects that the regular per-PR CI did not surface (because the failing
+workflow only runs on `workflow_dispatch`, not on `push`).
+
+### One-time setup
+
+`act` runs the workflows. The cleanest install path is the GitHub CLI
+extension, because it inherits your `gh` authentication and exposes a
+real `GITHUB_TOKEN` to every workflow run:
+
+1. Install the GitHub CLI from <https://cli.github.com> (Linux, macOS,
+   Windows). Authenticate once: `gh auth login`.
+2. Install the `act` extension:
+
+   ```bash
+   gh extension install nektos/gh-act
+   ```
+
+3. Install Docker Engine or Docker Desktop from
+   <https://docs.docker.com/engine/install/>. On Linux, add yourself to
+   the `docker` group so you don't need `sudo`. `act` also works with
+   Podman and Colima — see the
+   [act runners documentation](https://nektosact.com/usage/runners.html).
+
+That's the whole setup. The repository's `.actrc` and
+`scripts/dev/act-local.sh` handle everything else (runner image, secrets
+file, artifact server, action SHA pre-fetching).
+
+### Per-release dry-run
+
+Make sure your working tree matches the merged master tip from step 2:
+
+```bash
+git fetch upstream
+git checkout upstream/master
+```
+
+List what's runnable across every workflow file:
+
+```bash
+./scripts/dev/act-local.sh --list
+```
+
+Run a specific job, pick interactively, or run every dry-run-safe
+job:
+
+```bash
+./scripts/dev/act-local.sh release-stable-manual:web   # one job
+./scripts/dev/act-local.sh                              # interactive picker
+./scripts/dev/act-local.sh --all                        # every dry-run-safe job
+```
+
+The first run pulls the runner image (~1.5 GB) and primes the Rust build
+cache via `Swatinem/rust-cache`; subsequent runs are much faster. The
+script auto-creates the gitignored `.secrets` file, pre-fetches every
+pinned action SHA into `~/.cache/act/` (act's shallow clone can't
+resolve arbitrary commits otherwise), threads `GITHUB_TOKEN` from your
+`gh` auth into the run via the parent process environment (the token
+value never lands in argv), and sets `--artifact-server-path` so
+`actions/upload-artifact` and `actions/download-artifact` work between
+jobs. All of that is plain `act` underneath — the script just removes
+the flag soup.
+
+### `--all` only runs jobs on a dry-run-safe allowlist
+
+`act` does **not** honor GitHub's environment-protection gates. With
+the maintainer's real `GITHUB_TOKEN` threaded into the run, a
+successful local invocation of a job that writes to GitHub (a `publish`
+that calls `gh release create`, a `docker` job that pushes to GHCR, a
+`docs-deploy` that force-pushes `gh-pages`, a `daily-audit` that opens
+an issue, a `tweet-release` or `discord-release` that posts to a
+webhook) could perform the real-world side effect on first try.
+
+`--all` therefore enforces a hardcoded allowlist of jobs proven safe
+to run locally — currently the artifact-only build steps in
+`release-stable-manual.yml` and `cross-platform-build-manual.yml`
+(`validate`, `web`, `release-notes`, `build`, `build-desktop`).
+Everything else is skipped with a logged reason:
+
+```
+==> skip release-stable-manual:publish (not on dry-run-safe allowlist)
+==> skip release-stable-manual:docker (not on dry-run-safe allowlist)
+==> skip release-stable-manual:redeploy-website (not on dry-run-safe allowlist)
+==> skip docs-deploy:deploy (not on dry-run-safe allowlist)
+==> skip daily-audit:audit (not on dry-run-safe allowlist)
+==> skip tweet-release:tweet (not on dry-run-safe allowlist)
+```
+
+The allowlist is **fail-closed**: a new workflow added to the repo is
+treated as potentially mutating until a maintainer reviews it and adds
+the safe job IDs to `DRY_RUN_SAFE_JOBS` in
+`scripts/dev/act-local.sh`. This matters because `discover_jobs` walks
+every `.github/workflows/*.yml`, not just the release workflows — a
+denylist would silently let a future write-surface workflow through.
+
+Two escape hatches exist for the rare case where you have a reason to
+attempt a non-allowlisted job locally:
+
+- `./scripts/dev/act-local.sh release-stable-manual:publish` — the
+  explicit `<wf>:<job>` form runs what you ask for and prints a loud
+  warning before invoking `act` if the target isn't on the allowlist.
+- `./scripts/dev/act-local.sh --all --no-allowlist` — disables the
+  allowlist filter for an entire `--all` run (used only when you've
+  already verified the workflow steps will not reach a mutation
+  surface, e.g. on a fork with no real registry credentials and an
+  empty `.secrets` file).
+
+### What's expected to fail under `act` (and is fine)
+
+`act` cannot simulate a few GitHub-only surfaces. These failures are
+not real defects:
+
+- Jobs that depend on a real release tag (`publish` creating a GitHub
+  Release).
+- Environment-gated jobs (`crates-io`, `docker`, `publish`) — the
+  approval UI doesn't exist locally.
+- OIDC-based federated identity tokens.
+
+Everything else — a `tsc` error, a missing file, a Rust compile
+failure, a `cargo` lockfile mismatch — is a real defect. Do not click
+**Run workflow** on the GitHub Actions form until those are fixed via a
+standard PR off master.
+
+---
+
+## Step 4 — Trigger the release
 
 Go to:
 
@@ -99,7 +245,7 @@ re-trigger. Do not try to work around it.
 
 ---
 
-## Step 4 — Approve the environment gates
+## Step 5 — Approve the environment gates
 
 Three jobs are gated by GitHub environment protection rules. When each becomes
 pending you will see a **"Waiting for review"** banner in the workflow run.
@@ -117,7 +263,7 @@ job from the workflow run page — you do not need to restart from scratch.
 
 ---
 
-## Step 5 — Verify the release
+## Step 6 — Verify the release
 
 Once `publish` completes, confirm:
 
