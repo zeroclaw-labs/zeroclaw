@@ -1378,11 +1378,17 @@ fn create_provider_with_url_and_options(
             AuthStyle::ZhipuJwt,
         ))),
         name if glm_base_url(name).is_some() => {
-            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
+            // GLM offers vision-capable models (e.g. `glm-4.5v`). Mark the
+            // provider as vision-capable so multimodal routing accepts it.
+            // The specific model still has to be a vision-capable one;
+            // text-only models will return an API error if given an image,
+            // matching the behaviour of other multi-modal providers.
+            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
                 "GLM",
                 glm_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::ZhipuJwt,
+                true,
             )))
         }
         name if minimax_base_url(name).is_some() => Ok(compat(
@@ -3183,6 +3189,21 @@ mod tests {
         let oauth_provider =
             create_provider("qwen-code", Some("key")).expect("qwen oauth provider should build");
         assert!(oauth_provider.supports_vision());
+    }
+
+    #[test]
+    fn glm_provider_supports_vision() {
+        // GLM exposes vision-capable models (e.g. `glm-4.5v`). The provider
+        // must therefore report `supports_vision()` so multimodal routing
+        // can target it; the model field selects the actual variant.
+        for alias in ["glm", "zhipu", "glm-cn", "zhipu-cn"] {
+            let provider =
+                create_provider(alias, Some("id.secret")).expect("glm provider should build");
+            assert!(
+                provider.supports_vision(),
+                "alias `{alias}` should report vision capability"
+            );
+        }
     }
 
     #[test]
