@@ -2806,15 +2806,21 @@ async fn process_channel_message(
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
-    let reply_intent = classify_channel_reply_intent(
-        active_provider.as_ref(),
-        history[0].content.as_str(),
-        &history,
-        route.model.as_str(),
-        runtime_defaults.temperature,
-    )
-    .await
-    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+    // Skip the precheck LLM call for DMs — the answer is always REPLY
+    // and the extra inference adds ~7s of latency per message.
+    let reply_intent = if is_group_chat {
+        classify_channel_reply_intent(
+            active_provider.as_ref(),
+            history[0].content.as_str(),
+            &history,
+            route.model.as_str(),
+            runtime_defaults.temperature,
+        )
+        .await
+        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
+    } else {
+        AssistantChannelOutcome::Reply(String::new())
+    };
 
     if let AssistantChannelOutcome::NoReply { reason } = reply_intent {
         let history_response = AssistantChannelOutcome::NoReply {
@@ -8766,7 +8772,7 @@ BTC is currently around $65,000 based on latest tool output."#
             zeroclaw_api::channel::ChannelMessage {
                 id: "typing-fast-msg".to_string(),
                 sender: "alice".to_string(),
-                reply_target: "chat-typing".to_string(),
+                reply_target: "group:chat-typing".to_string(),
                 content: "hello".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
@@ -8779,7 +8785,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let starts = channel_impl.start_typing_calls.load(Ordering::SeqCst);
-        assert_eq!(starts, 0, "no-reply precheck should not show typing");
+        assert_eq!(starts, 0, "no-reply precheck should not show typing in group chats");
     }
 
     #[tokio::test]
