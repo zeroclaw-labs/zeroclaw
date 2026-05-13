@@ -17,6 +17,10 @@ path = "src/bin/fluent.rs"
 name = "web"
 path = "src/bin/web.rs"
 
+[[bin]]
+name = "gen-openapi"
+path = "src/bin/gen-openapi.rs"
+
 [dependencies]
 anyhow = "1.0"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }

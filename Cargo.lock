@@ -13357,6 +13357,7 @@ name = "zeroclaw-gateway"
 version = "0.7.5"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "chrono",
@@ -13441,6 +13442,7 @@ dependencies = [
  "parking_lot",
  "portable-atomic",
  "rusqlite",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "tempfile",

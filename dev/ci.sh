@@ -50,6 +50,7 @@ Commands:
   lint-strict   Run rustfmt + full clippy warnings gate (container only)
   lint-delta    Run strict lint delta gate on changed Rust lines (container only)
   test          Run cargo test (container only)
+  openapi-check Verify committed openapi.json is in sync with handlers
   test-component  Run component tests only
   test-integration Run integration tests only
   test-system     Run system tests only
@@ -137,9 +138,14 @@ case "$1" in
     docker run --rm zeroclaw-local-smoke:latest --version
     ;;
 
+  openapi-check)
+    run_in_ci "cargo run -p xtask --bin gen-openapi -- --check"
+    ;;
+
   all)
     run_in_ci "./scripts/ci/rust_quality_gate.sh"
     run_in_ci "cargo test --locked --verbose"
+    run_in_ci "cargo run -p xtask --bin gen-openapi -- --check"
     run_in_ci "bash tests/manual/test_dockerignore.sh"
     run_in_ci "cargo build --release --locked --verbose"
     run_in_ci "cargo deny check licenses sources"

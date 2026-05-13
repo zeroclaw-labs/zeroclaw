@@ -6,12 +6,14 @@ pub mod debounce;
 pub mod session_backend;
 pub mod session_sqlite;
 pub mod session_store;
+pub mod slot;
 pub mod stall_watchdog;
 
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::session_backend::SessionBackend;
+use crate::slot::SlotStore;
 
 /// Construct the configured session-persistence backend.
 ///
@@ -43,6 +45,19 @@ pub fn make_session_backend(
             Ok(Arc::new(open_sqlite_with_jsonl_import(workspace_dir)?))
         }
     }
+}
+
+/// Construct the slot persistence store for the dashboard.
+///
+/// Slots are backed by SQLite regardless of the configured `session_backend`.
+/// When `session_backend = "jsonl"` the sessions still use JSONL files, but
+/// slots live in their own `sessions.db` under the same `sessions/`
+/// directory. Reusing `SqliteSessionBackend` avoids a parallel DB file and
+/// keeps the schema migration path single-sourced.
+pub fn make_slot_store(workspace_dir: &Path) -> std::io::Result<Arc<dyn SlotStore>> {
+    let backend = session_sqlite::SqliteSessionBackend::new(workspace_dir)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(Arc::new(backend))
 }
 
 /// Open the SQLite backend and, on first open, import any pre-existing

@@ -102,6 +102,26 @@ struct ConnectParams {
     cwd: Option<String>,
 }
 
+/// Dashboard subscribe handshake (M2+).
+///
+/// Dashboard clients open `/ws/chat` and send this as their very first
+/// frame to switch the socket into read-only broadcast-forwarding mode.
+/// The connection never constructs an `Agent` and never accepts
+/// `message` frames — mutations go through `POST /api/slots/:id/*`
+/// instead. See `multi-session-dashboard.md §4.3`.
+///
+/// Supported channels:
+///   - `"slots"` — slot-sidebar updates (list + per-slot state)
+///   - `"dashboard"` — system-metric pushes (uptime, cpu, etc.)
+///   - `"chat:<slot_id>"` — per-slot chat deltas + permission requests
+#[derive(Debug, Deserialize)]
+struct SubscribeFrame {
+    #[serde(rename = "type")]
+    msg_type: String,
+    #[serde(default)]
+    channels: Vec<String>,
+}
+
 /// The sub-protocol we support for the chat WebSocket.
 const WS_PROTOCOL: &str = "zeroclaw.v1";
 
@@ -215,6 +235,43 @@ async fn handle_socket(
 ) {
     let (mut sender, mut receiver) = socket.split();
 
+    // ── Dashboard subscribe-mode detection ─────────────────────────
+    //
+    // The dashboard (M3+) connects to `/ws/chat` and IMMEDIATELY sends
+    // `{"type":"subscribe","channels":[...]}` before any session_start
+    // handshake. When we see that shape on the very first frame, we
+    // route to the read-only broadcast forwarder and never build an
+    // Agent for this connection. Legacy clients that send a `connect`
+    // or `message` frame first fall through to the existing flow
+    // unchanged.
+    //
+    // We peek at the first frame without consuming it on the legacy
+    // path: if parsing as SubscribeFrame fails or the type isn't
+    // `"subscribe"`, we feed the text back into the existing
+    // handshake via `first_text_fallback`.
+    let mut first_text_fallback: Option<String> = None;
+    if let Some(first) = receiver.next().await {
+        match first {
+            Ok(Message::Text(text)) => {
+                if let Ok(frame) = serde_json::from_str::<SubscribeFrame>(&text)
+                    && frame.msg_type == "subscribe"
+                {
+                    debug!(
+                        channels = ?frame.channels,
+                        "WebSocket dashboard-subscribe mode engaged"
+                    );
+                    handle_dashboard_subscribe(sender, receiver, state, frame.channels).await;
+                    return;
+                }
+                // Not a subscribe frame — feed it back into the legacy
+                // handshake below so `connect` / `message` still work.
+                first_text_fallback = Some(text.to_string());
+            }
+            Ok(Message::Close(_)) | Err(_) => return,
+            _ => {}
+        }
+    }
+
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
@@ -271,7 +328,17 @@ async fn handle_socket(
     let mut first_msg_fallback: Option<String> = None;
     let mut requested_cwd = session_cwd;
 
-    if let Some(first) = receiver.next().await {
+    // If the subscribe-mode peek above consumed a non-subscribe text frame,
+    // honour it here instead of blocking on a fresh `receiver.next()` call
+    // that would deadlock against a single-frame client.
+    let first_text_for_handshake: Option<Result<Message, _>> =
+        if let Some(text) = first_text_fallback.take() {
+            Some(Ok(Message::Text(text.into())))
+        } else {
+            receiver.next().await
+        };
+
+    if let Some(first) = first_text_for_handshake {
         match first {
             Ok(Message::Text(text)) => {
                 if let Ok(cp) = serde_json::from_str::<ConnectParams>(&text) {
@@ -1088,6 +1155,117 @@ fn record_turn_cost(
     Some(cost_usd)
 }
 
+/// Dashboard subscribe-mode socket loop.
+///
+/// Read-only forwarder: subscribes to `AppState.event_tx` and pushes
+/// every event whose derived channel (see
+/// `slot_events::event_channel`) is in the client's subscribed set.
+/// Also accepts `{"type":"subscribe","channels":[...]}` and
+/// `{"type":"unsubscribe","channels":[...]}` frames to mutate the
+/// subscription without re-connecting.
+///
+/// This handler NEVER calls `Agent::from_config` and NEVER consumes
+/// `message` frames. All slot mutations land via
+/// `POST /api/slots/:id/*`.
+async fn handle_dashboard_subscribe(
+    mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
+    mut receiver: futures_util::stream::SplitStream<WebSocket>,
+    state: AppState,
+    initial_channels: Vec<String>,
+) {
+    use std::collections::HashSet;
+
+    let mut subscribed: HashSet<String> = initial_channels.into_iter().collect();
+
+    let ack = serde_json::json!({
+        "type": "subscribed",
+        "channels": subscribed.iter().cloned().collect::<Vec<_>>(),
+    });
+    if sender
+        .send(Message::Text(ack.to_string().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let mut rx = state.event_tx.subscribe();
+
+    loop {
+        tokio::select! {
+            // Broadcast bus: forward events whose channel is subscribed.
+            bcast = rx.recv() => {
+                match bcast {
+                    Ok(event) => {
+                        let matched = match crate::slot_events::event_channel(&event) {
+                            Some(channel) => subscribed.contains(&channel),
+                            None => false,
+                        };
+                        if matched {
+                            let text = event.to_string();
+                            if sender.send(Message::Text(text.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    // Lagged broadcasts are silently dropped; subscribers can
+                    // request a full refresh via REST.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+
+            // Client frames: subscribe/unsubscribe mutations only.
+            msg = receiver.next() => {
+                let Some(msg) = msg else { break };
+                let Ok(msg) = msg else { break };
+                match msg {
+                    Message::Text(text) => {
+                        if let Ok(frame) = serde_json::from_str::<SubscribeFrame>(&text) {
+                            match frame.msg_type.as_str() {
+                                "subscribe" => {
+                                    for c in frame.channels {
+                                        subscribed.insert(c);
+                                    }
+                                    let ack = serde_json::json!({
+                                        "type": "subscribed",
+                                        "channels": subscribed.iter().cloned().collect::<Vec<_>>(),
+                                    });
+                                    if sender.send(Message::Text(ack.to_string().into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                "unsubscribe" => {
+                                    for c in &frame.channels {
+                                        subscribed.remove(c);
+                                    }
+                                    let ack = serde_json::json!({
+                                        "type": "unsubscribed",
+                                        "channels": frame.channels,
+                                    });
+                                    if sender.send(Message::Text(ack.to_string().into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                _ => {
+                                    // Unknown type in dashboard mode — ignore.
+                                    debug!(msg_type = %frame.msg_type, "dashboard-subscribe: ignoring unknown frame type");
+                                }
+                            }
+                        }
+                    }
+                    Message::Ping(_) | Message::Pong(_) => { /* handled by transport */ }
+                    Message::Close(_) => break,
+                    Message::Binary(_) => {
+                        // Binary frames are not part of the dashboard
+                        // protocol; drop them.
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,5 +1376,48 @@ mod tests {
             .expect_err("missing cwd should be rejected");
 
         assert!(err.to_string().contains("cwd is not a usable directory"));
+    }
+
+    // ── SubscribeFrame + dashboard subscribe-mode wiring (M2) ────────
+
+    #[test]
+    fn subscribe_frame_parses_subscribe_with_channels() {
+        let text = r#"{"type":"subscribe","channels":["slots","dashboard","chat:slot-1"]}"#;
+        let frame: SubscribeFrame = serde_json::from_str(text).expect("subscribe frame must parse");
+        assert_eq!(frame.msg_type, "subscribe");
+        assert_eq!(frame.channels.len(), 3);
+        assert!(frame.channels.iter().any(|c| c == "slots"));
+        assert!(frame.channels.iter().any(|c| c == "chat:slot-1"));
+    }
+
+    #[test]
+    fn subscribe_frame_parses_unsubscribe_with_channels() {
+        let text = r#"{"type":"unsubscribe","channels":["chat:slot-1"]}"#;
+        let frame: SubscribeFrame = serde_json::from_str(text).unwrap();
+        assert_eq!(frame.msg_type, "unsubscribe");
+        assert_eq!(frame.channels, vec!["chat:slot-1".to_string()]);
+    }
+
+    #[test]
+    fn subscribe_frame_rejects_connect_shape() {
+        // A legacy `connect` frame must NOT parse as a SubscribeFrame with
+        // msg_type == "subscribe", so the dispatch branch in handle_socket
+        // correctly routes it to the legacy path. We verify that the
+        // `msg_type` field, once parsed, is explicitly "connect" (not
+        // "subscribe"), which is the discriminator used at dispatch.
+        let text = r#"{"type":"connect","session_id":"s"}"#;
+        let frame: SubscribeFrame = serde_json::from_str(text).expect("permissive parse");
+        assert_ne!(
+            frame.msg_type, "subscribe",
+            "connect frame must not be treated as subscribe"
+        );
+    }
+
+    #[test]
+    fn subscribe_frame_treats_missing_channels_as_empty() {
+        let text = r#"{"type":"subscribe"}"#;
+        let frame: SubscribeFrame = serde_json::from_str(text).expect("channels is optional");
+        assert_eq!(frame.msg_type, "subscribe");
+        assert!(frame.channels.is_empty());
     }
 }

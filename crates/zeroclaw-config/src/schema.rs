@@ -2356,6 +2356,15 @@ pub struct GatewayConfig {
     #[serde(default)]
     #[nested]
     pub tls: Option<GatewayTlsConfig>,
+
+    /// Multi-session dashboard slot limits (`[gateway.slots]`).
+    ///
+    /// Caps on how many slots a user can create. Soft limit warns (Warning
+    /// response header); hard limit rejects creation with 429. Defaults
+    /// match the multi-session dashboard plan (soft 50 / hard 200).
+    #[serde(default)]
+    #[nested]
+    pub slots: SlotsConfig,
 }
 
 fn default_gateway_port() -> u16 {
@@ -2414,6 +2423,43 @@ impl Default for GatewayConfig {
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
+            slots: SlotsConfig::default(),
+        }
+    }
+}
+
+/// Multi-session dashboard slot limits (`[gateway.slots]`).
+///
+/// Slots are the primary entity of the dashboard UI (one slot = one
+/// parallel conversation). These caps limit creation to prevent
+/// runaway resource use.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "gateway.slots"]
+pub struct SlotsConfig {
+    /// Warn (Warning header) when a user creates beyond this many slots.
+    /// Default: 50.
+    #[serde(default = "default_slot_soft_limit")]
+    pub soft_limit: u32,
+    /// Reject (429 Too Many Requests) when a user tries to create beyond
+    /// this many slots. Default: 200.
+    #[serde(default = "default_slot_hard_limit")]
+    pub hard_limit: u32,
+}
+
+fn default_slot_soft_limit() -> u32 {
+    50
+}
+
+fn default_slot_hard_limit() -> u32 {
+    200
+}
+
+impl Default for SlotsConfig {
+    fn default() -> Self {
+        Self {
+            soft_limit: default_slot_soft_limit(),
+            hard_limit: default_slot_hard_limit(),
         }
     }
 }
@@ -14203,6 +14249,7 @@ bot_token = "xoxb-tok"
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
+            slots: SlotsConfig::default(),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -14218,6 +14265,38 @@ bot_token = "xoxb-tok"
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
         assert_eq!(parsed.idempotency_max_keys, 4096);
+        assert_eq!(parsed.slots.soft_limit, 50);
+        assert_eq!(parsed.slots.hard_limit, 200);
+    }
+
+    #[test]
+    async fn checklist_slots_config_defaults_when_section_absent() {
+        // Old configs without [gateway.slots] must pick up soft=50 / hard=200
+        // defaults so existing workspaces continue to deserialize.
+        let minimal = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+"#;
+        let parsed = parse_test_config(minimal);
+        assert_eq!(parsed.gateway.slots.soft_limit, 50);
+        assert_eq!(parsed.gateway.slots.hard_limit, 200);
+    }
+
+    #[test]
+    async fn checklist_slots_config_respects_explicit_values() {
+        let toml_text = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+
+[gateway.slots]
+soft_limit = 10
+hard_limit = 25
+"#;
+        let parsed = parse_test_config(toml_text);
+        assert_eq!(parsed.gateway.slots.soft_limit, 10);
+        assert_eq!(parsed.gateway.slots.hard_limit, 25);
     }
 
     #[test]

@@ -1,9 +1,16 @@
-//! Per-session actor queue for serializing concurrent access.
+//! Per-key actor queue for serializing concurrent access.
 //!
-//! Each session gets at most one concurrent turn. Additional requests queue up
-//! (bounded by `max_queue_depth`) and proceed in FIFO order. This prevents
-//! SQLite history corruption from overlapping writes and ensures consistent
-//! session state transitions.
+//! Each key (session id or slot id) gets at most one concurrent turn.
+//! Additional requests queue up (bounded by `max_queue_depth`) and proceed in
+//! FIFO order. This prevents SQLite history corruption from overlapping writes
+//! and ensures consistent session state transitions.
+//!
+//! Two type aliases are exported over the same implementation:
+//! - [`SessionActorQueue`] — legacy `/ws/chat` path, keyed on `session_id`.
+//! - [`SlotActorQueue`] — dashboard path, keyed on `slot_id` (M1+).
+//!
+//! The name `slots` on the internal `HashMap` predates the dashboard
+//! "slot" concept and refers to serialization slots in the queue.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,60 +20,77 @@ use std::time::Duration;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
-/// Per-session serialization queue.
-pub struct SessionActorQueue {
-    slots: Mutex<HashMap<String, Arc<SessionSlot>>>,
+/// Per-session serialization queue (legacy `/ws/chat`, session-keyed).
+pub type SessionActorQueue = ActorQueue;
+/// Per-slot serialization queue (dashboard, slot-keyed).
+///
+/// Slot turns acquire on `slot_id` rather than `session_id` so that two
+/// slots sharing a memory session do not serialize unnecessarily, and a
+/// slot's per-slot agent state is guarded against concurrent turns.
+pub type SlotActorQueue = ActorQueue;
+
+/// Per-key serialization queue. Internal type shared by
+/// [`SessionActorQueue`] and [`SlotActorQueue`].
+pub struct ActorQueue {
+    slots: Mutex<HashMap<String, Arc<QueueSlot>>>,
     max_queue_depth: usize,
     lock_timeout: Duration,
     idle_ttl: Duration,
 }
 
-struct SessionSlot {
+struct QueueSlot {
     semaphore: Arc<Semaphore>,
     last_active: Mutex<Instant>,
     pending: AtomicUsize,
 }
 
-/// RAII guard that releases the session permit on drop.
-pub struct SessionGuard {
-    slot: Arc<SessionSlot>,
+/// RAII guard that releases the permit on drop.
+pub type SessionGuard = QueueGuard;
+/// RAII guard that releases the slot permit on drop.
+pub type SlotGuard = QueueGuard;
+
+/// RAII guard returned by [`ActorQueue::acquire`].
+pub struct QueueGuard {
+    slot: Arc<QueueSlot>,
     _permit: OwnedSemaphorePermit,
 }
 
-impl Drop for SessionGuard {
+impl Drop for QueueGuard {
     fn drop(&mut self) {
         self.slot.pending.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-/// Errors from the session queue.
+/// Errors from an actor queue.
+pub type SessionQueueError = ActorQueueError;
+/// Errors from the slot actor queue. Alias for [`ActorQueueError`].
+pub type SlotQueueError = ActorQueueError;
+
+/// Errors from [`ActorQueue::acquire`].
 #[derive(Debug)]
-pub enum SessionQueueError {
-    /// Too many requests queued for this session.
-    QueueFull { session_id: String, depth: usize },
-    /// Timed out waiting for the session lock.
-    Timeout { session_id: String },
+pub enum ActorQueueError {
+    /// Too many requests queued for this key.
+    QueueFull { key: String, depth: usize },
+    /// Timed out waiting for the lock.
+    Timeout { key: String },
 }
 
-impl std::fmt::Display for SessionQueueError {
+impl std::fmt::Display for ActorQueueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::QueueFull { session_id, depth } => {
-                write!(
-                    f,
-                    "Session {session_id} queue full ({depth} pending requests)"
-                )
+            Self::QueueFull { key, depth } => {
+                write!(f, "Key {key} queue full ({depth} pending requests)")
             }
-            Self::Timeout { session_id } => {
-                write!(f, "Timed out waiting for session {session_id}")
+            Self::Timeout { key } => {
+                write!(f, "Timed out waiting for key {key}")
             }
         }
     }
 }
 
-impl std::error::Error for SessionQueueError {}
+impl std::error::Error for ActorQueueError {}
 
-impl SessionActorQueue {
+impl ActorQueue {
     /// Create a new queue with the given limits.
     pub fn new(max_queue_depth: usize, lock_timeout_secs: u64, idle_ttl_secs: u64) -> Self {
         Self {
@@ -77,15 +101,15 @@ impl SessionActorQueue {
         }
     }
 
-    /// Acquire exclusive access to a session. Blocks until the session is free
+    /// Acquire exclusive access for `key`. Blocks until the key is free
     /// or the timeout expires. Returns a guard that releases on drop.
-    pub async fn acquire(&self, session_id: &str) -> Result<SessionGuard, SessionQueueError> {
+    pub async fn acquire(&self, key: &str) -> Result<QueueGuard, ActorQueueError> {
         let slot = {
             let mut slots = self.slots.lock().await;
             slots
-                .entry(session_id.to_string())
+                .entry(key.to_string())
                 .or_insert_with(|| {
-                    Arc::new(SessionSlot {
+                    Arc::new(QueueSlot {
                         semaphore: Arc::new(Semaphore::new(1)),
                         last_active: Mutex::new(Instant::now()),
                         pending: AtomicUsize::new(0),
@@ -98,8 +122,8 @@ impl SessionActorQueue {
         let current = slot.pending.fetch_add(1, Ordering::Relaxed);
         if current >= self.max_queue_depth {
             slot.pending.fetch_sub(1, Ordering::Relaxed);
-            return Err(SessionQueueError::QueueFull {
-                session_id: session_id.to_string(),
+            return Err(ActorQueueError::QueueFull {
+                key: key.to_string(),
                 depth: current,
             });
         }
@@ -109,30 +133,30 @@ impl SessionActorQueue {
         match tokio::time::timeout(self.lock_timeout, sem.acquire_owned()).await {
             Ok(Ok(permit)) => {
                 *slot.last_active.lock().await = Instant::now();
-                Ok(SessionGuard {
+                Ok(QueueGuard {
                     slot,
                     _permit: permit,
                 })
             }
             Ok(Err(_)) | Err(_) => {
                 slot.pending.fetch_sub(1, Ordering::Relaxed);
-                Err(SessionQueueError::Timeout {
-                    session_id: session_id.to_string(),
+                Err(ActorQueueError::Timeout {
+                    key: key.to_string(),
                 })
             }
         }
     }
 
-    /// Get the number of pending requests for a session.
-    pub async fn queue_depth(&self, session_id: &str) -> usize {
+    /// Get the number of pending requests for `key`.
+    pub async fn queue_depth(&self, key: &str) -> usize {
         let slots = self.slots.lock().await;
         slots
-            .get(session_id)
+            .get(key)
             .map(|s| s.pending.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
 
-    /// Remove idle session slots that haven't been accessed within the TTL.
+    /// Remove idle slots that haven't been accessed within the TTL.
     pub async fn evict_idle(&self) -> usize {
         let mut slots = self.slots.lock().await;
         let now = Instant::now();
@@ -192,7 +216,7 @@ mod tests {
 
         // Third request should be rejected (pending=2 >= max=2)
         let result = queue.acquire("s1").await;
-        assert!(matches!(result, Err(SessionQueueError::QueueFull { .. })));
+        assert!(matches!(result, Err(ActorQueueError::QueueFull { .. })));
 
         drop(guard);
         let _ = handle.await;
@@ -205,7 +229,7 @@ mod tests {
 
         let start = Instant::now();
         let result = queue.acquire("s1").await;
-        assert!(matches!(result, Err(SessionQueueError::Timeout { .. })));
+        assert!(matches!(result, Err(ActorQueueError::Timeout { .. })));
         assert!(start.elapsed() >= Duration::from_millis(900));
     }
 
@@ -230,5 +254,28 @@ mod tests {
 
         drop(guard);
         assert_eq!(queue.queue_depth("s1").await, 0);
+    }
+
+    // ── SlotActorQueue (alias) tests ─────────────────────────────────
+    //
+    // SlotActorQueue is a type alias over the same `ActorQueue` impl, so
+    // behavioral guarantees are identical. The tests below pin the
+    // slot-keyed API shape so renaming or separating the types later
+    // surfaces compile errors at call sites rather than silent drift.
+
+    #[tokio::test]
+    async fn slot_queue_serializes_same_slot() {
+        let queue = SlotActorQueue::new(8, 5, 600);
+        let g1 = queue.acquire("slot-1").await.unwrap();
+        drop(g1);
+        let _g2: SlotGuard = queue.acquire("slot-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn slot_queue_parallelizes_different_slots() {
+        let queue = SlotActorQueue::new(8, 5, 600);
+        let _g1 = queue.acquire("slot-a").await.unwrap();
+        let _g2 = queue.acquire("slot-b").await.unwrap();
+        // Two different slots can hold guards concurrently.
     }
 }
