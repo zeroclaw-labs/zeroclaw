@@ -77,6 +77,13 @@ impl ImageGenTool {
         let short_id = &Uuid::new_v4().to_string()[..6];
         let safe_name = format!("{prefix}_{short_id}");
 
+        tracing::info!(
+            "Image generation request: prompt='{}', provider={:?}, size={:?}",
+            prompt,
+            self.config.provider,
+            args.get("size")
+        );
+
         match self.config.provider {
             ImageGenProviderType::FalAi => self.generate_fal_ai(args, &prompt, &safe_name).await,
             ImageGenProviderType::ComfyuiRunpod => {
@@ -344,21 +351,31 @@ impl ImageGenTool {
 
         // Inject width/height into any node that has both in its inputs.
         // This targets nodes like EmptyLatentImage.
-        fn inject_dimensions(val: &mut serde_json::Value, w: u32, h: u32) {
+        fn inject_dimensions(val: &mut serde_json::Value, w: u32, h: u32) -> usize {
+            let mut count = 0;
             if let Some(obj) = val.as_object_mut() {
                 if let Some(inputs) = obj.get_mut("inputs").and_then(|i| i.as_object_mut()) {
                     if inputs.contains_key("width") && inputs.contains_key("height") {
                         inputs.insert("width".into(), json!(w));
                         inputs.insert("height".into(), json!(h));
+                        count += 1;
                     }
                 }
                 for (_, v) in obj.iter_mut() {
-                    inject_dimensions(v, w, h);
+                    count += inject_dimensions(v, w, h);
                 }
             }
+            count
         }
 
-        inject_dimensions(&mut workflow, w, h);
+        let injected_count = inject_dimensions(&mut workflow, w, h);
+        tracing::info!(
+            "ComfyUI RunPod: size='{}' -> dimensions={}x{} (injected into {} nodes)",
+            size,
+            w,
+            h,
+            injected_count
+        );
 
         // ── Inject prompt ──────────────────────────────────────────
         let node_id = &self.config.runpod_prompt_node_id;
