@@ -273,6 +273,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9dbc3a507a82b17ba0d98f6ce8fd6954ea0c8152e98009d36a40d8dcc8ce078a"
 
 [[package]]
+name = "aspect-core"
+version = "0.1.0"
+source = "git+https://github.com/yijunyu/aspect-rs?rev=239ba1d#239ba1d0089dfac61fdc85319d63f20b704885b8"
+
+[[package]]
+name = "aspect-std"
+version = "0.1.0"
+source = "git+https://github.com/yijunyu/aspect-rs?rev=239ba1d#239ba1d0089dfac61fdc85319d63f20b704885b8"
+dependencies = [
+ "aspect-core",
+ "log",
+ "parking_lot",
+]
+
+[[package]]
 name = "assert-json-diff"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13165,6 +13180,7 @@ version = "0.7.5"
 dependencies = [
  "aes",
  "anyhow",
+ "aspect-std",
  "async-imap",
  "async-trait",
  "axum",

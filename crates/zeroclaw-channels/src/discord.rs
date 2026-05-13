@@ -1,4 +1,5 @@
 use anyhow::{Context as _, anyhow};
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -21,7 +22,11 @@ use zeroclaw_api::media::MediaAttachment;
 pub struct DiscordChannel {
     bot_token: String,
     guild_id: Option<String>,
-    allowed_users: Vec<String>,
+    /// Who is allowed to talk to this bot. Wildcard `"*"` admits everyone;
+    /// an empty list denies everyone. Backed by `aspect-std`'s
+    /// `AllowlistAspect` so the check is centralized and reusable across
+    /// channels rather than re-implemented per-module.
+    allowlist: AllowlistAspect,
     listen_to_bots: bool,
     mention_only: bool,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
@@ -66,10 +71,30 @@ impl DiscordChannel {
         listen_to_bots: bool,
         mention_only: bool,
     ) -> Self {
+        Self::with_allowlist(
+            bot_token,
+            guild_id,
+            AllowlistAspect::new(allowed_users),
+            listen_to_bots,
+            mention_only,
+        )
+    }
+
+    /// Construct from an existing `AllowlistAspect`. Used internally when
+    /// spawning a reaction-worker `DiscordChannel` so the worker shares the
+    /// parent's allowlist `Arc<Inner>` (cheap clone, no `Vec` allocation,
+    /// and runtime allowlist changes propagate to the worker).
+    fn with_allowlist(
+        bot_token: String,
+        guild_id: Option<String>,
+        allowlist: AllowlistAspect,
+        listen_to_bots: bool,
+        mention_only: bool,
+    ) -> Self {
         Self {
             bot_token,
             guild_id,
-            allowed_users,
+            allowlist,
             listen_to_bots,
             mention_only,
             typing_handles: Mutex::new(HashMap::new()),
@@ -153,13 +178,6 @@ impl DiscordChannel {
             "channel.discord",
             self.proxy_url.as_deref(),
         )
-    }
-
-    /// Check if a Discord user ID is in the allowlist.
-    /// Empty list means deny everyone until explicitly configured.
-    /// `"*"` means allow everyone.
-    fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
     fn bot_user_id_from_token(token: &str) -> Option<String> {
@@ -1459,7 +1477,7 @@ impl Channel for DiscordChannel {
                     }
 
                     // Sender validation
-                    if !self.is_user_allowed(author_id) {
+                    if !self.allowlist.is_allowed(author_id) {
                         tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
                         continue;
                     }
@@ -1528,10 +1546,10 @@ impl Channel for DiscordChannel {
                         .to_string();
 
                     if !message_id.is_empty() && !channel_id.is_empty() {
-                        let reaction_channel = DiscordChannel::new(
+                        let reaction_channel = DiscordChannel::with_allowlist(
                             self.bot_token.clone(),
                             self.guild_id.clone(),
-                            self.allowed_users.clone(),
+                            self.allowlist.clone(),
                             self.listen_to_bots,
                             self.mention_only,
                         );
@@ -2107,15 +2125,15 @@ mod tests {
     #[test]
     fn empty_allowlist_denies_everyone() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
-        assert!(!ch.is_user_allowed("12345"));
-        assert!(!ch.is_user_allowed("anyone"));
+        assert!(!ch.allowlist.is_allowed("12345"));
+        assert!(!ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_everyone() {
         let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()], false, false);
-        assert!(ch.is_user_allowed("12345"));
-        assert!(ch.is_user_allowed("anyone"));
+        assert!(ch.allowlist.is_allowed("12345"));
+        assert!(ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
@@ -2127,24 +2145,24 @@ mod tests {
             false,
             false,
         );
-        assert!(ch.is_user_allowed("111"));
-        assert!(ch.is_user_allowed("222"));
-        assert!(!ch.is_user_allowed("333"));
-        assert!(!ch.is_user_allowed("unknown"));
+        assert!(ch.allowlist.is_allowed("111"));
+        assert!(ch.allowlist.is_allowed("222"));
+        assert!(!ch.allowlist.is_allowed("333"));
+        assert!(!ch.allowlist.is_allowed("unknown"));
     }
 
     #[test]
     fn allowlist_is_exact_match_not_substring() {
         let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
-        assert!(!ch.is_user_allowed("1111"));
-        assert!(!ch.is_user_allowed("11"));
-        assert!(!ch.is_user_allowed("0111"));
+        assert!(!ch.allowlist.is_allowed("1111"));
+        assert!(!ch.allowlist.is_allowed("11"));
+        assert!(!ch.allowlist.is_allowed("0111"));
     }
 
     #[test]
     fn allowlist_empty_string_user_id() {
         let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
-        assert!(!ch.is_user_allowed(""));
+        assert!(!ch.allowlist.is_allowed(""));
     }
 
     #[test]
@@ -2156,16 +2174,57 @@ mod tests {
             false,
             false,
         );
-        assert!(ch.is_user_allowed("111"));
-        assert!(ch.is_user_allowed("anyone_else"));
+        assert!(ch.allowlist.is_allowed("111"));
+        assert!(ch.allowlist.is_allowed("anyone_else"));
     }
 
     #[test]
     fn allowlist_case_sensitive() {
         let ch = DiscordChannel::new("fake".into(), None, vec!["ABC".into()], false, false);
-        assert!(ch.is_user_allowed("ABC"));
-        assert!(!ch.is_user_allowed("abc"));
-        assert!(!ch.is_user_allowed("Abc"));
+        assert!(ch.allowlist.is_allowed("ABC"));
+        assert!(!ch.allowlist.is_allowed("abc"));
+        assert!(!ch.allowlist.is_allowed("Abc"));
+    }
+
+    /// Parity test for the AllowlistAspect migration. Asserts that the
+    /// post-migration `allowlist.is_allowed(...)` returns byte-identical
+    /// results to the pre-migration shape
+    /// `allowed.iter().any(|u| u == "*" || u == id)` for a fixed truth table
+    /// covering the wildcard, empty-list, case-sensitivity, and substring
+    /// edge cases. If any reviewer worries the aspect drifted from the
+    /// original Boolean semantics, this test is the regression guard.
+    #[test]
+    fn allowlist_parity_with_pre_aspect_shape() {
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec![], "alice"),
+            (vec![], ""),
+            (vec!["*"], "alice"),
+            (vec!["*"], ""),
+            (vec!["111"], "111"),
+            (vec!["111"], "112"),
+            (vec!["111", "222"], "222"),
+            (vec!["111", "*"], "anyone"),
+            (vec!["*", "111"], "anyone"),
+            (vec!["111"], "1111"), // substring rejected
+            (vec!["111"], "11"),   // prefix rejected
+            (vec!["ABC"], "abc"),  // case-sensitive
+            (vec!["ABC"], "Abc"),
+        ];
+        for (entries, identity) in cases {
+            let baseline = entries.iter().any(|u| *u == "*" || *u == identity);
+            let ch = DiscordChannel::new(
+                "fake".into(),
+                None,
+                entries.iter().map(|s| (*s).to_string()).collect(),
+                false,
+                false,
+            );
+            assert_eq!(
+                ch.allowlist.is_allowed(identity),
+                baseline,
+                "aspect drift for entries={entries:?} identity={identity:?}",
+            );
+        }
     }
 
     #[test]
