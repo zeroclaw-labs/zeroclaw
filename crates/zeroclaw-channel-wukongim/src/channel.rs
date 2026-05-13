@@ -39,10 +39,16 @@ pub struct WuKongIMChannel {
     pub(crate) pending_approvals: Arc<PendingApprovals>,
     pub(crate) ws_sink: Arc<RwLock<Option<WsSink>>>,
     pub(crate) workspace_dir: PathBuf,
+    pub(crate) downloads_dir: PathBuf,
 }
 
 impl WuKongIMChannel {
     pub fn from_config(config: &WuKongIMConfig, workspace_dir: &Path) -> Self {
+        let downloads_dir = if config.downloads_dir.starts_with('/') {
+            PathBuf::from(&config.downloads_dir)
+        } else {
+            workspace_dir.join(&config.downloads_dir)
+        };
         Self {
             ws_url: config.ws_url.clone(),
             uid: config.uid.clone(),
@@ -56,6 +62,7 @@ impl WuKongIMChannel {
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             ws_sink: Arc::new(RwLock::new(None)),
             workspace_dir: workspace_dir.to_path_buf(),
+            downloads_dir,
         }
     }
 
@@ -298,13 +305,17 @@ impl Channel for WuKongIMChannel {
                                 .unwrap_or_else(|| format!("[图片下载失败]{}\n请直接描述图片内容", url))
                         }
                         WkMessageType::FILE => {
-                            let url = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                            let raw_url = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                            let url = raw_url.split_whitespace().next().unwrap_or(raw_url);
                             let name = payload_json.get("name").and_then(|n| n.as_str()).unwrap_or("文件");
-                            match download_file_to_workspace(url, &self.workspace_dir).await {
+                            tracing::info!("WuKongIM FILE: downloading {} (name={}) to downloads_dir={}", url, name, self.downloads_dir.display());
+                            match download_file_to_workspace(url, &self.downloads_dir, Some(name)).await {
                                 Ok(local_path) => {
+                                    tracing::info!("WuKongIM FILE: downloaded successfully to {}", local_path);
                                     format!("[文件]{}: {}", name, local_path)
                                 }
                                 Err(err_msg) => {
+                                    tracing::warn!("WuKongIM FILE: download failed: {}", err_msg);
                                     format!("[文件]{}: {} [下载失败: {}]", name, url, err_msg)
                                 }
                             }
@@ -313,7 +324,10 @@ impl Channel for WuKongIMChannel {
                             let text = payload_json
                                 .get("content").and_then(|c| c.get("text")).and_then(|t| t.as_str())
                                 .unwrap_or("");
-                            process_markdown_resources(text, &self.workspace_dir).await
+                            tracing::info!("WuKongIM MARKDOWN: processing with downloads_dir={}, text_len={}", self.downloads_dir.display(), text.len());
+                            let result = process_markdown_resources(text, &self.downloads_dir).await;
+                            tracing::info!("WuKongIM MARKDOWN: processed result_len={}", result.len());
+                            result
                         }
                         _ => payload_json.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string(),
                     };

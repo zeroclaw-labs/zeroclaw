@@ -95,8 +95,10 @@ pub async fn download_image_as_base64(url: &str) -> Option<String> {
 
 pub async fn download_file_to_workspace(
     url: &str,
-    workspace_dir: &std::path::Path,
+    downloads_dir: &std::path::Path,
+    filename_hint: Option<&str>,
 ) -> Result<String, String> {
+    tracing::debug!("download_file_to_workspace: url={}, downloads_dir={}, filename_hint={:?}", url, downloads_dir.display(), filename_hint);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -116,6 +118,7 @@ pub async fn download_file_to_workspace(
     if let Some(cl) = resp.content_length()
         && cl > FILE_MAX_BYTES as u64
     {
+        tracing::warn!("download_file_to_workspace: file too large {} > {} bytes", cl, FILE_MAX_BYTES);
         return Err("文件超过 100MB 限制".to_string());
     }
 
@@ -130,29 +133,51 @@ pub async fn download_file_to_workspace(
         return Err("文件为空或超过大小限制".to_string());
     }
 
-    let filename = url
-        .rsplit('/')
-        .next()
-        .unwrap_or("download")
-        .split('?')
-        .next()
-        .unwrap_or("download");
+    let filename = if let Some(hint) = filename_hint {
+        let is_high_entropy = hint.len() >= 32
+            && hint.chars().filter(|&c| c == '-').count() <= 4
+            && hint.chars().all(|c| c == '-' || c.is_alphanumeric());
+        if is_high_entropy {
+            tracing::debug!("download_file_to_workspace: hint {:?} looks like high-entropy, using URL filename", hint);
+            url
+                .rsplit('/')
+                .next()
+                .unwrap_or("download")
+                .split('?')
+                .next()
+                .unwrap_or("download")
+                .to_string()
+        } else {
+            hint.to_string()
+        }
+    } else {
+        url
+            .rsplit('/')
+            .next()
+            .unwrap_or("download")
+            .split('?')
+            .next()
+            .unwrap_or("download")
+            .to_string()
+    };
 
-    if is_blocked_extension(filename) {
+    if is_blocked_extension(&filename) {
+        tracing::warn!("download_file_to_workspace: blocked extension for filename={}", filename);
         return Err("不允许的文件类型".to_string());
     }
 
-    let downloads_dir = workspace_dir.join("downloads");
+    tracing::debug!("download_file_to_workspace: creating dir {:?}", downloads_dir);
     if let Err(e) = tokio::fs::create_dir_all(&downloads_dir).await {
         return Err(format!("无法创建下载目录: {}", e));
     }
 
-    let mut target_path = downloads_dir.join(filename);
+    let mut target_path = downloads_dir.join(&filename);
     let mut counter = 1;
     while target_path.exists() {
-        let stem = filename.rsplit('.').next().unwrap_or(filename);
-        let ext = if filename.contains('.') {
-            format!(".{}", filename.rsplit('.').next().unwrap_or(""))
+        let filename_str = filename.as_str();
+        let stem = filename_str.rsplit('.').next().unwrap_or(filename_str);
+        let ext = if filename_str.contains('.') {
+            format!(".{}", filename_str.rsplit('.').next().unwrap_or(""))
         } else {
             String::new()
         };
@@ -165,10 +190,9 @@ pub async fn download_file_to_workspace(
         return Err(format!("写入文件失败: {}", e));
     }
 
-    Ok(format!(
-        "/workspace/downloads/{}",
-        target_path.file_name().unwrap().to_str().unwrap()
-    ))
+    let result_path = target_path.to_str().unwrap().to_string();
+    tracing::info!("download_file_to_workspace: success, saved to {:?}, result_path={}", target_path, result_path);
+    Ok(result_path)
 }
 
 pub fn extract_markdown_links(text: &str) -> Vec<(String, String, bool)> {
@@ -176,7 +200,6 @@ pub fn extract_markdown_links(text: &str) -> Vec<(String, String, bool)> {
     let mut rest = text;
 
     while let Some(start) = rest.find("![") {
-        // Image link: ![alt](url)
         let after = &rest[start + 2..];
         if let Some(cb) = after.find(']') {
             let alt = after[..cb].to_string();
@@ -184,7 +207,8 @@ pub fn extract_markdown_links(text: &str) -> Vec<(String, String, bool)> {
             if let Some(inner) = tail.strip_prefix('(')
                 && let Some(pe) = inner.find(')')
             {
-                links.push((alt, inner[..pe].to_string(), true));
+                let url = inner[..pe].split_whitespace().next().unwrap_or(&inner[..pe]);
+                links.push((alt, url.to_string(), true));
                 rest = &tail[pe + 1..];
                 continue;
             }
@@ -195,12 +219,10 @@ pub fn extract_markdown_links(text: &str) -> Vec<(String, String, bool)> {
     rest = text;
     while let Some(start) = rest.find('[') {
         if start > 0 && &rest[start - 1..start] == "!" {
-            // Skip image links
             rest = &rest[start + 1..];
             continue;
         }
 
-        // Regular link: [text](url)
         let after = &rest[start + 1..];
         if let Some(cb) = after.find(']') {
             let text_content = after[..cb].to_string();
@@ -208,7 +230,8 @@ pub fn extract_markdown_links(text: &str) -> Vec<(String, String, bool)> {
             if let Some(inner) = tail.strip_prefix('(')
                 && let Some(pe) = inner.find(')')
             {
-                links.push((text_content, inner[..pe].to_string(), false));
+                let url = inner[..pe].split_whitespace().next().unwrap_or(&inner[..pe]);
+                links.push((text_content, url.to_string(), false));
                 rest = &tail[pe + 1..];
                 continue;
             }
@@ -248,7 +271,7 @@ pub fn is_blocked_extension(filename: &str) -> bool {
     }
 }
 
-pub async fn process_markdown_resources(text: &str, workspace_dir: &std::path::Path) -> String {
+pub async fn process_markdown_resources(text: &str, downloads_dir: &std::path::Path) -> String {
     let links = extract_markdown_links(text);
     let mut result = text.to_string();
 
@@ -266,7 +289,7 @@ pub async fn process_markdown_resources(text: &str, workspace_dir: &std::path::P
                 );
             }
         } else {
-            match download_file_to_workspace(&url, workspace_dir).await {
+            match download_file_to_workspace(&url, downloads_dir, Some(&alt)).await {
                 Ok(local_path) => {
                     result = result.replace(
                         &format!("[{}]({})", alt, url),

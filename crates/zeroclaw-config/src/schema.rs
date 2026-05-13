@@ -8388,6 +8388,14 @@ pub struct WuKongIMConfig {
     /// How long (seconds) to wait for the operator to approve a tool call. Default: 300.
     #[serde(default = "default_wukongim_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// Directory for downloaded files (relative to workspace or absolute path).
+    /// Default: "downloads" (i.e., {workspace_dir}/downloads)
+    #[serde(default = "default_wukongim_downloads_dir")]
+    pub downloads_dir: String,
+}
+
+fn default_wukongim_downloads_dir() -> String {
+    "downloads".to_string()
 }
 
 impl ChannelConfig for WuKongIMConfig {
