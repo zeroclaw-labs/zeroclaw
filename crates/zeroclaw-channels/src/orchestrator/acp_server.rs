@@ -1086,15 +1086,13 @@ impl AcpServer {
                     }
                     // Support ACP resource blocks for @-notation file attachments
                     // (clients send {"type":"resource","resource":{"uri":"...","text":"..."}})
-                    if let Some(res) = part.get("resource") {
-                        if let Some(text) = res.get("text").and_then(|v| v.as_str()) {
-                            if !added && !joined.is_empty() {
-                                joined.push_str("\n\n");
-                            } else if added {
-                                joined.push_str("\n\n");
-                            }
-                            joined.push_str(text);
+                    if let Some(res) = part.get("resource")
+                        && let Some(text) = res.get("text").and_then(|v| v.as_str())
+                    {
+                        if added || !joined.is_empty() {
+                            joined.push_str("\n\n");
                         }
+                        joined.push_str(text);
                     }
                 }
                 if joined.is_empty() {
@@ -1429,10 +1427,11 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                 "rawInput": to_acp_raw_input(name, args),
                 "status": "pending"
             });
-            if let serde_json::Value::Array(ref items) = acp_content {
-                if !items.is_empty() {
-                    update["content"] = acp_content;
-                }
+            if acp_content
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+            {
+                update["content"] = acp_content;
             }
             JsonRpcNotification {
                 jsonrpc: "2.0",
@@ -1535,10 +1534,11 @@ fn history_notifications_for_message(
                     "rawInput": to_acp_raw_input(&tc.name, &args),
                     "status": "completed"
                 });
-                if let serde_json::Value::Array(ref items) = acp_content {
-                    if !items.is_empty() {
-                        update["content"] = acp_content;
-                    }
+                if acp_content
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty())
+                {
+                    update["content"] = acp_content;
                 }
                 JsonRpcNotification {
                     jsonrpc: "2.0",
@@ -2004,8 +2004,14 @@ mod tests {
         assert_eq!(raw["path"], "src/foo.rs");
         assert_eq!(raw["oldText"], "let x = 1;");
         assert_eq!(raw["newText"], "let x = 2;");
-        assert!(raw.get("old_string").is_none(), "old_string must not appear in rawInput");
-        assert!(raw.get("new_string").is_none(), "new_string must not appear in rawInput");
+        assert!(
+            raw.get("old_string").is_none(),
+            "old_string must not appear in rawInput"
+        );
+        assert!(
+            raw.get("new_string").is_none(),
+            "new_string must not appear in rawInput"
+        );
 
         let content = &v["params"]["update"]["content"];
         assert!(content.is_array(), "file_edit must emit a content array");
@@ -2033,8 +2039,14 @@ mod tests {
         let raw = &v["params"]["update"]["rawInput"];
         assert_eq!(raw["path"], "src/new.rs");
         assert_eq!(raw["newText"], "fn main() {}");
-        assert!(raw.get("oldText").is_none(), "oldText must not appear in file_write rawInput");
-        assert!(raw.get("content").is_none(), "content must not appear in rawInput");
+        assert!(
+            raw.get("oldText").is_none(),
+            "oldText must not appear in file_write rawInput"
+        );
+        assert!(
+            raw.get("content").is_none(),
+            "content must not appear in rawInput"
+        );
 
         let content = &v["params"]["update"]["content"];
         assert!(content.is_array(), "file_write must emit a content array");
@@ -2042,7 +2054,10 @@ mod tests {
         assert_eq!(diff["type"], "diff");
         assert_eq!(diff["path"], "src/new.rs");
         assert_eq!(diff["newText"], "fn main() {}");
-        assert!(diff.get("oldText").is_none(), "oldText must be absent for file_write diff");
+        assert!(
+            diff.get("oldText").is_none(),
+            "oldText must be absent for file_write diff"
+        );
     }
 
     #[test]

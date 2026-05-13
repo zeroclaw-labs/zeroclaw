@@ -337,8 +337,11 @@ impl Channel for AcpChannel {
         let title = format!("Approve {}?", request.tool_name);
         let kind = map_approval_kind(&request.tool_name);
         let raw_input = build_approval_raw_input(&request.tool_name, &request.raw_arguments);
-        let content =
-            build_approval_content(&request.tool_name, &request.raw_arguments, &request.arguments_summary);
+        let content = build_approval_content(
+            &request.tool_name,
+            &request.raw_arguments,
+            &request.arguments_summary,
+        );
         let params = json!({
             "sessionId": self.session_id,
             "options": options,
@@ -660,7 +663,10 @@ mod tests {
 
         // content must carry a Diff item, not a plain text fallback
         let content = &req["params"]["toolCall"]["content"];
-        assert_eq!(content[0]["type"], "diff", "file_edit approval must emit a diff content item");
+        assert_eq!(
+            content[0]["type"], "diff",
+            "file_edit approval must emit a diff content item"
+        );
         assert_eq!(content[0]["path"], "src/foo.rs");
         assert_eq!(content[0]["oldText"], "let x = 1;");
         assert_eq!(content[0]["newText"], "let x = 2;");
