@@ -29,8 +29,13 @@ pub fn chat_channel(slot_id: &str) -> String {
 
 /// Build a `slots` full-list event payload.
 ///
-/// Emitted on initial subscribe (dashboard mode) so the client can hydrate
-/// its sidebar in one round-trip. `slots` is the full authoritative list.
+/// This is the payload shape for a full sidebar hydration event. M2's
+/// `ws::handle_dashboard_subscribe` intentionally does NOT push this on
+/// connect — clients hydrate via `GET /api/slots` and then receive
+/// incremental `slot_updated` / `chat_delta` events over the broadcast
+/// bus. M2.5 may promote this to an auto-emission on subscribe once the
+/// warm-agent refactor lands and full-list events are cheap to build on
+/// the hot path.
 pub fn slots_full(slots: &[SlotResponse]) -> Value {
     json!({
         "type": "slots",

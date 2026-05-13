@@ -6,8 +6,9 @@
 //! dashboard plan.
 //!
 //! Auth: every handler requires the gateway's bearer token via
-//! `require_auth`. When the slot store is missing (`session_backend` is
-//! disabled) the gateway returns 503 — the dashboard is a stateful
+//! `require_auth`. When the slot store is unavailable (either
+//! `[gateway] session_persistence` is `false`, or SQLite initialization
+//! failed) the gateway returns 503 — the dashboard is a stateful
 //! feature and cannot operate without persistence.
 //!
 //! Slot limits: creation is gated by `[gateway.slots]`
@@ -53,7 +54,7 @@ fn get_store(state: &AppState) -> StoreAccess<'_> {
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(SlotError::new(
                     "slot_store_unavailable",
-                    "Slot persistence is disabled — enable a session backend to use /api/slots",
+                    "Slot persistence is unavailable — set `[gateway] session_persistence = true` and ensure workspace_dir is writable to use /api/slots",
                 )),
             )
                 .into_response(),
@@ -84,8 +85,16 @@ fn resolve_title(requested: Option<String>) -> String {
     }
 }
 
+/// Mint a new gateway-scoped session id.
+///
+/// The `gw_` prefix is load-bearing: the session REST surface in
+/// `api.rs` filters `GET /api/sessions` results via
+/// `strip_prefix("gw_")` and synthesizes storage keys as
+/// `format!("gw_{id}")` on load/save/delete. Minting without the prefix
+/// would make slot-backed sessions invisible to `/api/sessions` and
+/// break `/api/sessions/{id}/messages` lookups.
 fn mint_session_id() -> String {
-    uuid::Uuid::new_v4().to_string()
+    format!("gw_{}", uuid::Uuid::new_v4())
 }
 
 /// Outcome of a pre-create slot-limit check. Callers proceed for `Below`
@@ -183,10 +192,14 @@ pub async fn handle_api_slots_list(State(state): State<AppState>, headers: Heade
 
 /// `POST /api/slots` — create a slot. Returns 200 (with `Warning` header
 /// above soft-limit) or 429 (above hard-limit).
+///
+/// The request body is optional (`required: false` in the OpenAPI spec);
+/// omitting it mints a slot with default title, a fresh `session_id`,
+/// and no agent-config overrides.
 pub async fn handle_api_slots_create(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<SlotCreateRequest>,
+    body: Option<Json<SlotCreateRequest>>,
 ) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -201,6 +214,7 @@ pub async fn handle_api_slots_create(
         c => c,
     };
 
+    let req = body.map(|Json(r)| r).unwrap_or_default();
     let now = Utc::now().timestamp();
     let id = uuid::Uuid::new_v4().to_string();
     let session_id = req.session_id.unwrap_or_else(mint_session_id);
@@ -307,11 +321,14 @@ pub async fn handle_api_slots_delete(
 /// Re-enforces the hard limit (duplicating is effectively creation).
 /// `include_history: true` means the duplicate shares the source slot's
 /// `session_id`; otherwise a fresh session id is minted.
+///
+/// The request body is optional; omitting it defaults to
+/// `include_history: false` and appends `" (copy)"` to the source title.
 pub async fn handle_api_slots_duplicate(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(req): Json<SlotDuplicateRequest>,
+    body: Option<Json<SlotDuplicateRequest>>,
 ) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -338,6 +355,7 @@ pub async fn handle_api_slots_duplicate(
         c => c,
     };
 
+    let req = body.map(|Json(r)| r).unwrap_or_default();
     let now = Utc::now().timestamp();
     let new_id = uuid::Uuid::new_v4().to_string();
     let new_session_id = if req.include_history {
@@ -841,13 +859,13 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     }
 
-    fn create_body(title: &str) -> Json<SlotCreateRequest> {
-        Json(SlotCreateRequest {
+    fn create_body(title: &str) -> Option<Json<SlotCreateRequest>> {
+        Some(Json(SlotCreateRequest {
             title: Some(title.into()),
             session_id: None,
             agent_config: None,
             workspace: None,
-        })
+        }))
     }
 
     #[tokio::test]
@@ -1039,10 +1057,10 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Path(source_id.clone()),
-            Json(SlotDuplicateRequest {
+            Some(Json(SlotDuplicateRequest {
                 title: None,
                 include_history: false,
-            }),
+            })),
         )
         .await;
         assert_eq!(dup.status(), StatusCode::OK);
@@ -1074,10 +1092,10 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Path(source_id),
-            Json(SlotDuplicateRequest {
+            Some(Json(SlotDuplicateRequest {
                 title: Some("Copy with history".into()),
                 include_history: true,
-            }),
+            })),
         )
         .await;
         assert_eq!(dup.status(), StatusCode::OK);
@@ -1323,5 +1341,143 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Optional-body + workspace-clear coverage (Copilot review #1/#2/#5) ──
+
+    #[tokio::test]
+    async fn slots_rest_create_accepts_missing_body() {
+        // OpenAPI declares the body optional — a `POST /api/slots` with no
+        // JSON body must yield a default slot instead of 400.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = slot_test_state(tmp.path());
+
+        let resp = handle_api_slots_create(State(state), HeaderMap::new(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp).await;
+        assert_eq!(json["title"], "Untitled");
+        assert_eq!(json["state"], "idle");
+        assert!(
+            json["session_id"].as_str().unwrap().starts_with("gw_"),
+            "default-bodied slot must still mint a gw_-prefixed session id"
+        );
+    }
+
+    #[tokio::test]
+    async fn slots_rest_duplicate_accepts_missing_body() {
+        // `POST /api/slots/:id/duplicate` body is also optional — omitting
+        // it must default to `include_history=false` and "(copy)" suffix.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = slot_test_state(tmp.path());
+
+        let source = handle_api_slots_create(
+            State(state.clone()),
+            HeaderMap::new(),
+            create_body("Parent"),
+        )
+        .await;
+        let source_json = body_to_json(source).await;
+        let source_id = source_json["id"].as_str().unwrap().to_string();
+        let source_session = source_json["session_id"].as_str().unwrap().to_string();
+
+        let dup = handle_api_slots_duplicate(
+            State(state),
+            HeaderMap::new(),
+            Path(source_id.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(dup.status(), StatusCode::OK);
+        let dup_json = body_to_json(dup).await;
+        assert_eq!(dup_json["title"], "Parent (copy)");
+        assert_ne!(
+            dup_json["session_id"], source_session,
+            "default duplicate must mint a fresh session id"
+        );
+        assert_ne!(dup_json["id"], source_id);
+    }
+
+    #[tokio::test]
+    async fn slots_rest_patch_clear_workspace_nulls_the_label() {
+        // Create a slot with a workspace label, then PATCH with
+        // `clear_workspace: true` and verify the label is null on GET.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = slot_test_state(tmp.path());
+
+        let create_resp = handle_api_slots_create(
+            State(state.clone()),
+            HeaderMap::new(),
+            Some(Json(SlotCreateRequest {
+                title: Some("Labeled".into()),
+                workspace: Some("home-lab".into()),
+                ..SlotCreateRequest::default()
+            })),
+        )
+        .await;
+        let slot_id = body_to_json(create_resp).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let patch_resp = handle_api_slots_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(slot_id.clone()),
+            Json(SlotPatchRequest {
+                clear_workspace: true,
+                ..SlotPatchRequest::default()
+            }),
+        )
+        .await;
+        assert_eq!(patch_resp.status(), StatusCode::OK);
+        let patched = body_to_json(patch_resp).await;
+        assert!(
+            patched["workspace"].is_null(),
+            "clear_workspace:true must null the label, got {}",
+            patched["workspace"]
+        );
+
+        // Round-trip through GET to confirm persistence.
+        let get_resp =
+            handle_api_slots_get(State(state), HeaderMap::new(), Path(slot_id)).await;
+        let got = body_to_json(get_resp).await;
+        assert!(got["workspace"].is_null());
+    }
+
+    #[tokio::test]
+    async fn slots_rest_patch_clear_workspace_wins_over_workspace_field() {
+        // When a caller sends both `clear_workspace: true` and
+        // `workspace: "something"`, the clear signal wins.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = slot_test_state(tmp.path());
+
+        let create_resp = handle_api_slots_create(
+            State(state.clone()),
+            HeaderMap::new(),
+            Some(Json(SlotCreateRequest {
+                title: Some("Both".into()),
+                workspace: Some("original".into()),
+                ..SlotCreateRequest::default()
+            })),
+        )
+        .await;
+        let slot_id = body_to_json(create_resp).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let patch_resp = handle_api_slots_patch(
+            State(state),
+            HeaderMap::new(),
+            Path(slot_id),
+            Json(SlotPatchRequest {
+                workspace: Some("ignored".into()),
+                clear_workspace: true,
+                ..SlotPatchRequest::default()
+            }),
+        )
+        .await;
+        let patched = body_to_json(patch_resp).await;
+        assert!(patched["workspace"].is_null());
     }
 }

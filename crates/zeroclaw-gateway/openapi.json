@@ -8839,6 +8839,10 @@
               }
             ]
           },
+          "clear_workspace": {
+            "description": "When `true`, clear the slot's workspace label. Takes precedence\nover `workspace` — a request with both `clear_workspace: true`\nand `workspace: \"foo\"` clears the label. `Option<String>` alone\ncannot represent an explicit null, so this flag is how the API\ndistinguishes \"absent\" from \"clear\".",
+            "type": "boolean"
+          },
           "state": {
             "anyOf": [
               {
@@ -8950,7 +8954,7 @@
       },
       "SlotUpdate": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Partial update for a slot applied via PATCH.",
+        "description": "Partial update for a slot applied via PATCH.\n\n`Option<String>` can't distinguish \"field absent\" from \"explicit\nnull\" in JSON, so workspace clearing is signaled out-of-band via\n`clear_workspace: true`. When set, `workspace` is nulled and any\nvalue passed in `workspace` is ignored.",
         "properties": {
           "agent_config": {
             "anyOf": [
@@ -8961,6 +8965,10 @@
                 "type": "null"
               }
             ]
+          },
+          "clear_workspace": {
+            "description": "Explicit signal to clear the workspace label. Takes precedence\nover `workspace` when `true`.",
+            "type": "boolean"
           },
           "dirty": {
             "type": [

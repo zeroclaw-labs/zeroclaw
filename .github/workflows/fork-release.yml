@@ -1,6 +1,8 @@
 name: Fork Release
 
-# Triggers on version tags pushed to the stealinglight branch.
+# Triggers on any `v*` tag pushed to this fork. Tags are global refs,
+# not branch-scoped — this workflow fires regardless of which branch the
+# tagged commit sits on.
 # Usage: git tag v0.6.9-sl.1 && git push origin v0.6.9-sl.1
 on:
   push:

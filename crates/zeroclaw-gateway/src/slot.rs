@@ -54,6 +54,13 @@ pub struct SlotPatchRequest {
     pub state: Option<SlotState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// When `true`, clear the slot's workspace label. Takes precedence
+    /// over `workspace` — a request with both `clear_workspace: true`
+    /// and `workspace: "foo"` clears the label. `Option<String>` alone
+    /// cannot represent an explicit null, so this flag is how the API
+    /// distinguishes "absent" from "clear".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_workspace: bool,
 }
 
 impl From<SlotPatchRequest> for SlotUpdate {
@@ -63,6 +70,7 @@ impl From<SlotPatchRequest> for SlotUpdate {
             agent_config: req.agent_config,
             state: req.state,
             workspace: req.workspace,
+            clear_workspace: req.clear_workspace,
             dirty: None,
             message_count: None,
         }

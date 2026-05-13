@@ -849,7 +849,12 @@ impl SlotStore for SqliteSessionBackend {
         if let Some(state) = update.state {
             existing.state = state;
         }
-        if let Some(ws) = &update.workspace {
+        // `clear_workspace` takes precedence so callers can send
+        // `{"clear_workspace": true}` and null out the label. JSON's
+        // lack of tri-state for `Option<String>` is why this flag exists.
+        if update.clear_workspace {
+            existing.workspace = None;
+        } else if let Some(ws) = &update.workspace {
             existing.workspace = Some(ws.clone());
         }
         if let Some(dirty) = update.dirty {

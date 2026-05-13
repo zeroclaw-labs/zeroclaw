@@ -1235,7 +1235,7 @@ async fn handle_dashboard_subscribe(
                                     }
                                     let ack = serde_json::json!({
                                         "type": "subscribed",
-                                        "channels": subscribed.iter().cloned().collect::<Vec<_>>(),
+                                        "channels": sorted_channels(&subscribed),
                                     });
                                     if sender.send(Message::Text(ack.to_string().into())).await.is_err() {
                                         break;

@@ -130,6 +130,11 @@ impl Slot {
 }
 
 /// Partial update for a slot applied via PATCH.
+///
+/// `Option<String>` can't distinguish "field absent" from "explicit
+/// null" in JSON, so workspace clearing is signaled out-of-band via
+/// `clear_workspace: true`. When set, `workspace` is nulled and any
+/// value passed in `workspace` is ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(JsonSchema))]
 pub struct SlotUpdate {
@@ -141,6 +146,10 @@ pub struct SlotUpdate {
     pub state: Option<SlotState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// Explicit signal to clear the workspace label. Takes precedence
+    /// over `workspace` when `true`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_workspace: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dirty: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
