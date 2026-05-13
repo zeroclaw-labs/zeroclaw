@@ -193,6 +193,13 @@ pub fn dispatch_family_factory(
     macro_rules! emit_dispatch {
         ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
             match family {
+                "openai-compatible" | "openai_compatible" => {
+                    let default_cfg = zeroclaw_config::schema::ModelProviderConfig::default();
+                    let cfg = config
+                        .and_then(|c| c.providers.models.find("openai", alias))
+                        .unwrap_or(&default_cfg);
+                    cfg.create_provider(alias, key, api_url, opts)
+                }
                 $(
                     $type_str => {
                         let default_cfg: $cfg_ty;
@@ -1162,6 +1169,35 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
         let mut p = OpenAiCompatibleModelProvider::new_with_vision(
             alias,
             "Custom",
+            base_url,
+            key,
+            AuthStyle::Bearer,
+            true,
+        );
+        if opts.merge_system_into_user {
+            p = p.with_merge_system_into_user();
+        }
+        Ok(apply_compat_options(p, opts))
+    }
+}
+
+impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        let base_url = api_url.ok_or_else(|| {
+            anyhow::Error::msg(
+                "OpenAI-compatible model_provider requires `uri`: set \
+                 `[model_providers.<family>.<alias>] uri = \"https://your-api.com\"` in config.toml.",
+            )
+        })?;
+        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+            alias,
+            "OpenAI Compatible",
             base_url,
             key,
             AuthStyle::Bearer,
