@@ -182,6 +182,32 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         );
     }
 
+    // ── 1d. Tool Authorization (Full autonomy) ──────────────────────
+    // At Full autonomy the user has explicitly opted into letting the model
+    // act without per-call approval. The generic Safety block alone isn't
+    // enough to overcome model safety-priors that produce simulated
+    // refusal text without ever dispatching a tool call (see issue #6434).
+    // Name the power tools that the autonomy policy authorizes and tell
+    // the model directly that they are not blocked.
+    if has_tools && autonomy_config.map(|cfg| cfg.level) == Some(AutonomyLevel::Full) {
+        let power_tools: Vec<&str> = ["shell", "file_write", "file_edit"]
+            .into_iter()
+            .filter(|name| tools.iter().any(|(t, _)| t == name))
+            .collect();
+        if !power_tools.is_empty() {
+            prompt.push_str(
+                "## Tool Authorization\n\n\
+                 The runtime autonomy policy is set to `full`. The user has explicitly granted the agent permission to act without per-call approval. The following tools are AUTHORIZED and NOT blocked by any security policy: ",
+            );
+            prompt.push_str(&power_tools.join(", "));
+            prompt.push_str(
+                ".\n\
+                 When the user asks you to run a shell command, write or edit a file, or otherwise act through these tools, CALL the tool directly — do NOT respond with simulated refusal text such as \"blocked by security policy\" or \"restricted in this environment\".\n\
+                 If a real runtime error or policy block occurs, it will be reported as a tool error in the conversation; only then should you explain what was blocked. Never invent a block that did not happen.\n\n",
+            );
+        }
+    }
+
     // ── 1c. Action instruction (avoid meta-summary) ───────────────
     if !has_tools {
         prompt.push_str(
@@ -397,5 +423,90 @@ fn inject_workspace_file(
             // Missing-file marker (matches OpenClaw behavior)
             let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_config::schema::SkillsPromptInjectionMode;
+
+    fn build_with_autonomy(tools: &[(&str, &str)], level: AutonomyLevel) -> String {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let autonomy = zeroclaw_config::schema::AutonomyConfig {
+            level,
+            ..Default::default()
+        };
+        build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "test-model",
+            tools,
+            &[],
+            None,
+            Some(512),
+            Some(&autonomy),
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            0,
+        )
+    }
+
+    #[test]
+    fn full_autonomy_authorizes_shell_when_registered() {
+        let tools = [
+            ("shell", "Run a shell command"),
+            ("file_read", "Read a file"),
+        ];
+        let prompt = build_with_autonomy(&tools, AutonomyLevel::Full);
+        assert!(
+            prompt.contains("## Tool Authorization"),
+            "expected Tool Authorization section at Full autonomy when shell is registered"
+        );
+        assert!(prompt.contains("shell"));
+        assert!(prompt.contains("AUTHORIZED"));
+        assert!(prompt.contains("simulated refusal"));
+    }
+
+    #[test]
+    fn full_autonomy_authorization_lists_only_registered_power_tools() {
+        let tools = [("shell", "Run a shell command")];
+        let prompt = build_with_autonomy(&tools, AutonomyLevel::Full);
+        let auth_section = prompt
+            .split("## Tool Authorization")
+            .nth(1)
+            .expect("Tool Authorization section present");
+        let auth_section = auth_section.split("## ").next().unwrap_or(auth_section);
+        assert!(auth_section.contains("shell"));
+        assert!(
+            !auth_section.contains("file_write"),
+            "file_write should not be named when it isn't registered"
+        );
+        assert!(
+            !auth_section.contains("file_edit"),
+            "file_edit should not be named when it isn't registered"
+        );
+    }
+
+    #[test]
+    fn non_full_autonomy_skips_tool_authorization_block() {
+        let tools = [("shell", "Run a shell command")];
+        for level in [AutonomyLevel::Supervised, AutonomyLevel::ReadOnly] {
+            let prompt = build_with_autonomy(&tools, level);
+            assert!(
+                !prompt.contains("## Tool Authorization"),
+                "Tool Authorization should not appear at {level:?} autonomy"
+            );
+        }
+    }
+
+    #[test]
+    fn full_autonomy_skips_block_when_no_power_tools_registered() {
+        let tools = [("file_read", "Read a file"), ("calculator", "Math")];
+        let prompt = build_with_autonomy(&tools, AutonomyLevel::Full);
+        assert!(
+            !prompt.contains("## Tool Authorization"),
+            "Tool Authorization should be skipped when no power tools (shell/file_write/file_edit) are registered"
+        );
     }
 }
