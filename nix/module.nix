@@ -444,7 +444,7 @@ in
         isSystemUser = true;
         group = instanceCfg.group;
         home = instanceCfg.dataDir;
-        createHome = false; # systemd's StateDirectory= owns home creation.
+        createHome = false; # dataDir is created by systemd-tmpfiles.
         description = "ZeroClaw instance ${name}";
       }
     ) (filterAttrs (_: i: i.createUser) cfg.instances);

@@ -166,7 +166,6 @@ SystemCallArchitectures=native
 CapabilityBoundingSet=
 AmbientCapabilities=
 SystemCallFilter=@system-service ~@privileged ~@resources
-StateDirectoryMode=0750
 UMask=0077
 ReadWritePaths=${dataDir}
 ```
@@ -191,7 +190,7 @@ systemd.services."zeroclaw-me".serviceConfig = {
 ## Running the test
 
 The module ships with a NixOS test (`nix/test.nix`) that boots a VM with
-two instances, validates unit generation, file rendering, multi-instance
+multiple instances, validates unit generation, file rendering, multi-instance
 isolation, and the hardening profile.
 
 ```bash
