@@ -413,7 +413,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         continue;
                     };
                     let delivery_fut = crate::cron::scheduler::deliver_announcement(
-                        &dm_config, &channel, &target, &alert,
+                        &dm_config, &channel, &target, None, &alert,
                     );
                     match tokio::time::timeout(Duration::from_secs(30), delivery_fut).await {
                         Ok(Err(e)) => {
@@ -681,6 +681,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                                 &config,
                                 channel,
                                 target,
+                                None,
                                 &announcement,
                             ),
                         )
