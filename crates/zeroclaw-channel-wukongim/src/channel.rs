@@ -1,5 +1,6 @@
 // src/channel.rs
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,10 +40,11 @@ pub struct WuKongIMChannel {
         Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
     pub(crate) pending_approvals: Arc<PendingApprovals>,
     pub(crate) ws_sink: Arc<RwLock<Option<WsSink>>>,
+    pub(crate) workspace_dir: PathBuf,
 }
 
 impl WuKongIMChannel {
-    pub fn from_config(config: &WuKongIMConfig) -> Self {
+    pub fn from_config(config: &WuKongIMConfig, workspace_dir: &Path) -> Self {
         Self {
             ws_url: config.ws_url.clone(),
             uid: config.uid.clone(),
@@ -55,6 +57,7 @@ impl WuKongIMChannel {
             pending_responses: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             ws_sink: Arc::new(RwLock::new(None)),
+            workspace_dir: workspace_dir.to_path_buf(),
         }
     }
 
@@ -406,19 +409,22 @@ mod tests {
 
     #[test]
     fn from_config_maps_fields() {
-        let ch = WuKongIMChannel::from_config(&make_config(vec!["*".to_string()], true));
+        let workspace = std::path::PathBuf::from("/tmp/test");
+        let ch = WuKongIMChannel::from_config(&make_config(vec!["*".to_string()], true), &workspace);
         assert_eq!(ch.ws_url, "ws://localhost:5200");
         assert_eq!(ch.uid, "bot001");
         assert_eq!(ch.device_id, "web-001");
         assert_eq!(ch.device_flag, 2);
         assert!(ch.mention_only);
         assert_eq!(ch.approval_timeout_secs, 300);
+        assert_eq!(ch.workspace_dir, workspace);
     }
 
     #[test]
     fn channel_name_is_wukongim() {
         use zeroclaw_api::channel::Channel;
-        let ch = WuKongIMChannel::from_config(&make_config(vec![], false));
+        let workspace = std::path::PathBuf::from("/tmp/test");
+        let ch = WuKongIMChannel::from_config(&make_config(vec![], false), &workspace);
         assert_eq!(ch.name(), "wukongim");
     }
 }
