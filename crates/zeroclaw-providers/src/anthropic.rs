@@ -71,12 +71,11 @@ struct NativeChatRequest<'a> {
     stream: Option<bool>,
 }
 
-/// Some Anthropic models (the Claude opus-4-7 family) may reject `temperature`
-/// the way Bedrock does for the same family (see #6095 / #6144 for the
-/// Bedrock-side carve-out). Until the native API behavior is confirmed by a
-/// live repro (#6147), defensively omit `temperature` for opus-4-7 so the
-/// shape change is backward-compatible and forward-safe. Substring match
-/// covers any future inference-profile or version-suffix variants.
+/// Claude opus-4-7 rejects `temperature` with a 400 on the native Anthropic API,
+/// matching the Bedrock behavior fixed in #6144. Omit `temperature` for the
+/// opus-4-7 family so that confirmed #6147 requests use the model default.
+/// Substring match covers any future inference-profile or version-suffix
+/// variants.
 fn anthropic_model_omits_temperature(model: &str) -> bool {
     model.contains("claude-opus-4-7")
 }
