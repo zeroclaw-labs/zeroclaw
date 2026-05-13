@@ -4,6 +4,13 @@ use std::time::Duration;
 
 const IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 
+const FILE_MAX_BYTES: usize = 100 * 1024 * 1024;
+
+const BLOCKED_EXTENSIONS: &[&str] = &[
+    "exe", "dll", "bat", "sh", "app", "dmg",
+    "js", "py", "rb", "php", "pl",
+];
+
 const SUPPORTED_IMAGE_MIMES: &[&str] = &[
     "image/png",
     "image/jpeg",
@@ -108,6 +115,14 @@ pub fn extract_markdown_images(text: &str) -> Vec<(String, String)> {
     images
 }
 
+pub fn is_blocked_extension(filename: &str) -> bool {
+    if let Some(ext) = filename.rsplit('.').next() {
+        BLOCKED_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+    } else {
+        false
+    }
+}
+
 pub async fn process_markdown_with_images(text: &str) -> String {
     let mut result = text.to_string();
     for (alt, url) in extract_markdown_images(text) {
@@ -170,5 +185,14 @@ mod tests {
     #[test]
     fn detect_non_image_returns_none() {
         assert!(detect_image_mime(Some("application/json"), &[0u8; 4]).is_none());
+    }
+
+    #[test]
+    fn test_is_blocked_extension() {
+        assert!(is_blocked_extension("script.exe"));
+        assert!(is_blocked_extension("malware.js"));
+        assert!(!is_blocked_extension("document.pdf"));
+        assert!(!is_blocked_extension("data.txt"));
+        assert!(!is_blocked_extension("no_extension"));
     }
 }
