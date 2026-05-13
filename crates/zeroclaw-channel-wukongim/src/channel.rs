@@ -22,7 +22,7 @@ use crate::connection::{
     WkChannelType, WkMessageType, WsSink,
 };
 use crate::filter::{is_mentioned, is_user_allowed, parse_recipient};
-use crate::messaging::{download_image_as_base64, encode_text_payload, process_markdown_resources};
+use crate::messaging::{download_image_as_base64, download_file_to_workspace, encode_text_payload, process_markdown_resources};
 
 #[derive(Clone)]
 pub struct WuKongIMChannel {
@@ -298,9 +298,16 @@ impl Channel for WuKongIMChannel {
                                 .unwrap_or_else(|| format!("[图片下载失败]{}\n请直接描述图片内容", url))
                         }
                         WkMessageType::FILE => {
-                            let url  = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                            let url = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or("");
                             let name = payload_json.get("name").and_then(|n| n.as_str()).unwrap_or("文件");
-                            format!("[文件]{}: {}", name, url)
+                            match download_file_to_workspace(url, &self.workspace_dir).await {
+                                Ok(local_path) => {
+                                    format!("[文件]{}: {}", name, local_path)
+                                }
+                                Err(err_msg) => {
+                                    format!("[文件]{}: {} [下载失败: {}]", name, url, err_msg)
+                                }
+                            }
                         }
                         WkMessageType::MARKDOWN => {
                             let text = payload_json
