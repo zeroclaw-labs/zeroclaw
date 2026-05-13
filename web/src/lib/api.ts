@@ -455,6 +455,93 @@ export async function putPersonalityFile(
   return (await response.json()) as PersonalityPutResult;
 }
 
+// ── Skills (api_skills.rs) ───────────────────────────────────────────
+
+export interface SkillFrontmatter {
+  name: string;
+  description: string;
+  license?: string | null;
+  author?: string | null;
+  version?: string | null;
+  category?: string | null;
+}
+
+export interface SkillBundleEntry {
+  alias: string;
+  directory: string;
+  include: string[];
+  exclude: string[];
+}
+
+export interface SkillEntry {
+  bundle: string;
+  name: string;
+  directory: string;
+  frontmatter: SkillFrontmatter;
+}
+
+export interface SkillDocument {
+  bundle: string;
+  name: string;
+  frontmatter: SkillFrontmatter;
+  body: string;
+}
+
+export interface SkillCreateRequest {
+  name: string;
+  frontmatter: SkillFrontmatter;
+  body?: string;
+  no_scaffold?: boolean;
+}
+
+export function listSkillBundles(): Promise<{ bundles: SkillBundleEntry[] }> {
+  return apiFetch('/api/skills/bundles');
+}
+
+export function listSkillsInBundle(alias: string): Promise<{ skills: SkillEntry[] }> {
+  return apiFetch(`/api/skills/bundles/${encodeURIComponent(alias)}/skills`);
+}
+
+export function readSkill(bundle: string, name: string): Promise<SkillDocument> {
+  return apiFetch(
+    `/api/skills/bundles/${encodeURIComponent(bundle)}/skills/${encodeURIComponent(name)}`,
+  );
+}
+
+export function writeSkill(
+  bundle: string,
+  name: string,
+  body: { frontmatter: SkillFrontmatter; body: string },
+): Promise<void> {
+  return apiFetch(
+    `/api/skills/bundles/${encodeURIComponent(bundle)}/skills/${encodeURIComponent(name)}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+export function createSkill(
+  bundle: string,
+  body: SkillCreateRequest,
+): Promise<{ bundle: string; name: string; directory: string }> {
+  return apiFetch(`/api/skills/bundles/${encodeURIComponent(bundle)}/skills`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export function deleteSkill(bundle: string, name: string, purge = false): Promise<void> {
+  const q = purge ? '?purge=true' : '';
+  return apiFetch(
+    `/api/skills/bundles/${encodeURIComponent(bundle)}/skills/${encodeURIComponent(name)}${q}`,
+    { method: 'DELETE' },
+  );
+}
+
 // ── Config schema descriptions ───────────────────────────────────────
 //
 // `OPTIONS /api/config` returns the schemars-derived JSON Schema for the

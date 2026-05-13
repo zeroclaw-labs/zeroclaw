@@ -8,7 +8,7 @@
 
 import { useEffect, useState } from 'react';
 import { Save, X } from 'lucide-react';
-import { ApiError, getSections, type SectionInfo, type ValidationWarning } from '@/lib/api';
+import { ApiError, getSections, type ValidationWarning } from '@/lib/api';
 import {
   useConfigDirtyCount,
   useConfigDirtySections,

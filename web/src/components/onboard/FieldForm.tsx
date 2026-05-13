@@ -978,7 +978,7 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
             placeholder="Optional. Prefer placing prose in agents/<alias>/AGENTS.md."
           />
         ) : agentSingleAliasKind && agentOptions ? (
-          agentOptions[agentSingleAliasKind].length === 0 ? (
+          (agentOptions[agentSingleAliasKind] ?? []).length === 0 ? (
             <AgentEmptyAliasFallback fieldKind={agentSingleAliasKind} />
           ) : (
             <div className="flex items-center gap-2">
@@ -989,7 +989,7 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
                 className="input-electric flex-1 px-3 py-2 text-sm appearance-none cursor-pointer"
               >
                 <option value="">— (none)</option>
-                {agentOptions[agentSingleAliasKind].map((a) => (
+                {(agentOptions[agentSingleAliasKind] ?? []).map((a) => (
                   <option key={a} value={a}>
                     {a}
                   </option>
@@ -1007,7 +1007,7 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
             </div>
           )
         ) : agentMultiAliasKind && agentOptions ? (
-          agentOptions[agentMultiAliasKind].length === 0 ? (
+          (agentOptions[agentMultiAliasKind] ?? []).length === 0 ? (
             <AgentEmptyAliasFallback fieldKind={agentMultiAliasKind} />
           ) : (
             <ArrayFieldEditor

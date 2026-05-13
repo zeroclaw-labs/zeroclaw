@@ -28,6 +28,7 @@ import {
 } from '../lib/api';
 import FieldForm from '../components/onboard/FieldForm';
 import PersonalityEditor from '../components/onboard/PersonalityEditor';
+import SkillsBundleEditor from '../components/onboard/SkillsBundleEditor';
 import ReloadDaemonButton from '../components/onboard/ReloadDaemonButton';
 import SectionPicker from '../components/onboard/SectionPicker';
 import SectionTabs, { type SectionTabSpec } from '../components/onboard/SectionTabs';
@@ -257,6 +258,7 @@ export default function Config() {
     if (typeParam && isOneTierAliasSection) {
       const fieldsPrefix = `${activeSection.key}.${typeParam}`;
       const isAgent = activeSection.key === 'agents';
+      const isSkillBundle = activeSection.key === 'skill-bundles';
       const settingsTab = (
         <FieldForm
           key={`${reloadKey}-${fieldsPrefix}`}
@@ -277,6 +279,22 @@ export default function Config() {
                 <PersonalityEditor
                   key={`${reloadKey}-${typeParam}-personality`}
                   agent={typeParam}
+                />
+              ),
+            },
+          ]}
+        />
+      ) : isSkillBundle ? (
+        <SectionTabs
+          tabs={[
+            { key: 'settings', label: 'Settings', render: () => settingsTab },
+            {
+              key: 'skills',
+              label: 'Skills',
+              render: () => (
+                <SkillsBundleEditor
+                  key={`${reloadKey}-${typeParam}-skills`}
+                  bundle={typeParam}
                 />
               ),
             },
