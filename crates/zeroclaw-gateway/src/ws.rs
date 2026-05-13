@@ -1175,11 +1175,17 @@ async fn handle_dashboard_subscribe(
 ) {
     use std::collections::HashSet;
 
+    fn sorted_channels(subscribed: &HashSet<String>) -> Vec<String> {
+        let mut channels = subscribed.iter().cloned().collect::<Vec<_>>();
+        channels.sort();
+        channels
+    }
+
     let mut subscribed: HashSet<String> = initial_channels.into_iter().collect();
 
     let ack = serde_json::json!({
         "type": "subscribed",
-        "channels": subscribed.iter().cloned().collect::<Vec<_>>(),
+        "channels": sorted_channels(&subscribed),
     });
     if sender
         .send(Message::Text(ack.to_string().into()))
