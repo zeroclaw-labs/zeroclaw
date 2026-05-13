@@ -1,7 +1,7 @@
 // src/messaging/mod.rs
 pub mod media;
 
-pub use media::{download_image_as_base64, extract_markdown_images, process_markdown_with_images};
+pub use media::{download_image_as_base64, extract_markdown_images, process_markdown_resources};
 
 use base64::Engine;
 

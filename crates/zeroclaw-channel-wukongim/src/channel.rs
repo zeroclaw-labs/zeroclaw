@@ -22,7 +22,7 @@ use crate::connection::{
 };
 use crate::filter::{is_mentioned, is_user_allowed, parse_recipient};
 use crate::messaging::{
-    download_image_as_base64, encode_text_payload, process_markdown_with_images,
+    download_image_as_base64, encode_text_payload, process_markdown_resources,
 };
 
 #[derive(Clone)]
@@ -305,7 +305,7 @@ impl Channel for WuKongIMChannel {
                             let text = payload_json
                                 .get("content").and_then(|c| c.get("text")).and_then(|t| t.as_str())
                                 .unwrap_or("");
-                            process_markdown_with_images(text).await
+                            process_markdown_resources(text, std::path::Path::new(".")).await
                         }
                         _ => payload_json.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string(),
                     };

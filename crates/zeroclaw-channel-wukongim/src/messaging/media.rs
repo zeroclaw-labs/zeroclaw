@@ -242,16 +242,41 @@ pub fn is_blocked_extension(filename: &str) -> bool {
     }
 }
 
-pub async fn process_markdown_with_images(text: &str) -> String {
+pub async fn process_markdown_resources(text: &str, workspace_dir: &std::path::Path) -> String {
+    let links = extract_markdown_links(text);
     let mut result = text.to_string();
-    for (alt, url) in extract_markdown_images(text) {
-        if let Some(marker) = download_image_as_base64(&url).await {
-            result = result.replace(
-                &format!("![{}]({})", alt, url),
-                &format!("![{}]({})", alt, marker),
-            );
+
+    for (alt, url, is_image) in links {
+        if is_image {
+            if let Some(marker) = download_image_as_base64(&url).await {
+                result = result.replace(
+                    &format!("![{}]({})", alt, url),
+                    &format!("![{}]({})", alt, marker),
+                );
+            } else {
+                result = result.replace(
+                    &format!("![{}]({})", alt, url),
+                    &format!("![图片下载失败]({})", url),
+                );
+            }
+        } else {
+            match download_file_to_workspace(&url, workspace_dir).await {
+                Ok(local_path) => {
+                    result = result.replace(
+                        &format!("[{}]({})", alt, url),
+                        &format!("[{}]({})", alt, local_path),
+                    );
+                }
+                Err(err_msg) => {
+                    result = result.replace(
+                        &format!("[{}]({})", alt, url),
+                        &format!("[{}]({}) [下载失败: {}]", alt, url, err_msg),
+                    );
+                }
+            }
         }
     }
+
     result
 }
 
@@ -344,6 +369,31 @@ mod tests {
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].2, true);
         assert_eq!(links[1].2, false);
+    }
+
+    fn create_test_workspace() -> tempfile::TempDir {
+        tempfile::TempDir::new().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_process_markdown_resources_mixed() {
+        let workspace = create_test_workspace();
+
+        let text = "See ![image](img.png) and [file](doc.pdf)";
+        let result = process_markdown_resources(text, workspace.path()).await;
+
+        // Image download should fail (network), file download should fail (network)
+        // Both should be processed, just with different markers
+        assert!(result.contains("图片下载失败") || result.contains("下载失败"));
+        assert!(result.contains("img.png") || result.contains("doc.pdf"));
+    }
+
+    #[tokio::test]
+    async fn test_process_markdown_resources_no_links() {
+        let workspace = create_test_workspace();
+        let text = "Just plain text with no links";
+        let result = process_markdown_resources(text, workspace.path()).await;
+        assert_eq!(result, text);
     }
 
     #[cfg(test)]
