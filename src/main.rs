@@ -43,6 +43,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
+use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
 /// Decorate the value at `path` in `config.toml` with a leading `# {comment}`
 /// line, preserving any non-comment whitespace. Mirrors the gateway's
@@ -79,6 +80,44 @@ fn json_value_to_setprop_string(
         .map(|f| f.kind);
     zeroclaw_config::typed_value::coerce_for_set_prop(value, kind)
         .map_err(|e| anyhow::anyhow!("{}", e.message))
+}
+
+fn config_patch_prop_kind(config: &Config, path: &str) -> Option<crate::config::PropKind> {
+    config
+        .prop_fields()
+        .into_iter()
+        .find(|f| f.name == path)
+        .map(|f| f.kind)
+}
+
+fn config_patch_map_prop_error(err: anyhow::Error, path: &str, op_index: usize) -> ConfigApiError {
+    let msg = err.to_string();
+    if msg.starts_with("Unknown property") {
+        ConfigApiError::path_not_found(path).with_op_index(op_index)
+    } else {
+        ConfigApiError::from_validation(err)
+            .with_path(path)
+            .with_op_index(op_index)
+    }
+}
+
+fn config_patch_json_error(err: &ConfigApiError) -> Result<()> {
+    eprintln!("{}", serde_json::to_string_pretty(err)?);
+    std::process::exit(1);
+}
+
+fn config_patch_fail_json_or_human<T>(
+    json: bool,
+    err: ConfigApiError,
+    human: impl Into<String>,
+) -> Result<T>
+where
+    T: Sized,
+{
+    if json {
+        config_patch_json_error(&err)?;
+    }
+    anyhow::bail!("{}", human.into())
 }
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
@@ -2628,15 +2667,43 @@ async fn main() -> Result<()> {
 
                     let result_entry: serde_json::Value = match op_name {
                         "add" | "replace" => {
-                            let value = op.get("value").ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "op[{idx}] `{op_name}` on `{path}`: missing `value` field"
-                                )
-                            })?;
-                            let value_str = json_value_to_setprop_string(value, &config, &path)?;
-                            config.set_prop(&path, &value_str).with_context(|| {
-                                format!("op[{idx}] `{op_name}` on `{path}` failed")
-                            })?;
+                            let value = match op.get("value") {
+                                Some(value) => value,
+                                None => {
+                                    let message =
+                                        format!("JSON Patch `{op_name}` op requires `value` field");
+                                    let err = ConfigApiError::new(
+                                        ConfigApiCode::ValueTypeMismatch,
+                                        message,
+                                    )
+                                    .with_path(&path)
+                                    .with_op_index(idx);
+                                    let human = format!(
+                                        "op[{idx}] `{op_name}` on `{path}`: missing `value` field"
+                                    );
+                                    config_patch_fail_json_or_human(json, err, human)?
+                                }
+                            };
+                            let value_str = match zeroclaw_config::typed_value::coerce_for_set_prop(
+                                value,
+                                config_patch_prop_kind(&config, &path),
+                            ) {
+                                Ok(value_str) => value_str,
+                                Err(err) => {
+                                    let err = err.with_path(&path).with_op_index(idx);
+                                    config_patch_fail_json_or_human(
+                                        json,
+                                        err.clone(),
+                                        err.message.clone(),
+                                    )?
+                                }
+                            };
+                            if let Err(err) = config.set_prop(&path, &value_str) {
+                                let human =
+                                    format!("op[{idx}] `{op_name}` on `{path}` failed: {err}");
+                                let api_err = config_patch_map_prop_error(err, &path, idx);
+                                config_patch_fail_json_or_human(json, api_err, human)?;
+                            }
                             if is_secret {
                                 serde_json::json!({
                                     "op": op_name,
@@ -2652,9 +2719,11 @@ async fn main() -> Result<()> {
                             }
                         }
                         "remove" => {
-                            config.set_prop(&path, "").with_context(|| {
-                                format!("op[{idx}] `remove` on `{path}` failed")
-                            })?;
+                            if let Err(err) = config.set_prop(&path, "") {
+                                let human = format!("op[{idx}] `remove` on `{path}` failed: {err}");
+                                let api_err = config_patch_map_prop_error(err, &path, idx);
+                                config_patch_fail_json_or_human(json, api_err, human)?;
+                            }
                             if is_secret {
                                 serde_json::json!({
                                     "op": "remove",
@@ -2671,28 +2740,66 @@ async fn main() -> Result<()> {
                         }
                         "test" => {
                             if is_secret {
-                                anyhow::bail!(
+                                let err =
+                                    ConfigApiError::secret_test_forbidden(&path).with_op_index(idx);
+                                let human = format!(
                                     "op[{idx}] `test` on `{path}`: secret_test_forbidden \
                                      \u{2014} test ops are not allowed against secret paths"
                                 );
+                                config_patch_fail_json_or_human(json, err, human)?;
                             }
-                            let want = op.get("value").ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "op[{idx}] `test` on `{path}`: missing `value` field"
-                                )
-                            })?;
-                            let actual = config.get_prop(&path).with_context(|| {
-                                format!("op[{idx}] `test` on `{path}` failed to read current value")
-                            })?;
-                            let want_str = match want {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => other.to_string(),
+                            let want = match op.get("value") {
+                                Some(value) => value,
+                                None => {
+                                    let err = ConfigApiError::new(
+                                        ConfigApiCode::ValueTypeMismatch,
+                                        "JSON Patch `test` op requires `value` field",
+                                    )
+                                    .with_path(&path)
+                                    .with_op_index(idx);
+                                    let human = format!(
+                                        "op[{idx}] `test` on `{path}`: missing `value` field"
+                                    );
+                                    config_patch_fail_json_or_human(json, err, human)?
+                                }
+                            };
+                            let actual = match config.get_prop(&path) {
+                                Ok(actual) => actual,
+                                Err(err) => {
+                                    let human = format!(
+                                        "op[{idx}] `test` on `{path}` failed to read current value: {err}"
+                                    );
+                                    let api_err = config_patch_map_prop_error(err, &path, idx);
+                                    config_patch_fail_json_or_human(json, api_err, human)?
+                                }
+                            };
+                            let want_str = match zeroclaw_config::typed_value::coerce_for_set_prop(
+                                want,
+                                config_patch_prop_kind(&config, &path),
+                            ) {
+                                Ok(want_str) => want_str,
+                                Err(err) => {
+                                    let err = err.with_path(&path).with_op_index(idx);
+                                    config_patch_fail_json_or_human(
+                                        json,
+                                        err.clone(),
+                                        err.message.clone(),
+                                    )?
+                                }
                             };
                             if actual != want_str {
-                                anyhow::bail!(
-                                    "op[{idx}] `test` on `{path}` failed: \
-                                     expected {want_str}, got {actual}"
+                                let err = ConfigApiError::new(
+                                    ConfigApiCode::ValidationFailed,
+                                    format!(
+                                        "`test` op failed: expected {want_str:?}, got {actual:?}"
+                                    ),
+                                )
+                                .with_path(&path)
+                                .with_op_index(idx);
+                                let human = format!(
+                                    "op[{idx}] `test` on `{path}` failed: expected {want_str}, got {actual}"
                                 );
+                                config_patch_fail_json_or_human(json, err, human)?;
                             }
                             serde_json::json!({
                                 "op": "test",
@@ -2701,13 +2808,24 @@ async fn main() -> Result<()> {
                             })
                         }
                         "move" | "copy" => {
-                            anyhow::bail!(
+                            let err = ConfigApiError::op_not_supported(op_name)
+                                .with_path(&path)
+                                .with_op_index(idx);
+                            let human = format!(
                                 "op[{idx}] `{op_name}` on `{path}`: op_not_supported \
                                  \u{2014} move/copy require a reference graph that is not built yet"
                             );
+                            config_patch_fail_json_or_human(json, err, human)?
                         }
                         other => {
-                            anyhow::bail!("op[{idx}] unknown JSON Patch operation `{other}`");
+                            let err = ConfigApiError::new(
+                                ConfigApiCode::OpNotSupported,
+                                format!("unknown JSON Patch operation `{other}`"),
+                            )
+                            .with_path(&path)
+                            .with_op_index(idx);
+                            let human = format!("op[{idx}] unknown JSON Patch operation `{other}`");
+                            config_patch_fail_json_or_human(json, err, human)?
                         }
                     };
                     results.push(result_entry);
