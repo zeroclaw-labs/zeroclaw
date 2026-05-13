@@ -643,19 +643,50 @@ fn strip_think_tags(s: &str) -> String {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(from = "RawResponseMessage")]
 struct ResponseMessage {
-    #[serde(default)]
     content: Option<String>,
     /// Reasoning/thinking models (e.g. Qwen3, GLM-4) may return their output
     /// in `reasoning_content` instead of `content`. Used as automatic fallback.
     ///
     /// OpenRouter and vLLM (>= v0.16.0) emit reasoning under `reasoning`
-    /// rather than `reasoning_content`; serde's `alias` accepts both names
-    /// on deserialization. See #6584.
-    #[serde(default, alias = "reasoning")]
+    /// rather than `reasoning_content`. Both keys are accepted on deserialization
+    /// via `RawResponseMessage`; when both appear in the same payload, the
+    /// canonical `reasoning_content` wins. See #6584.
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// Intermediate shape for `ResponseMessage` that accepts both
+/// `reasoning_content` (canonical) and `reasoning` (OpenRouter / vLLM alias)
+/// as distinct fields. `#[serde(alias)]` cannot be used here because serde
+/// rejects payloads carrying both keys as a duplicate-field error before any
+/// precedence rule can run. By naming the two keys to separate destination
+/// fields we let the precedence rule live in `From<RawResponseMessage>`. See
+/// #6584 and review feedback on PR #6615.
+#[derive(Debug, Deserialize)]
+struct RawResponseMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
+}
+
+impl From<RawResponseMessage> for ResponseMessage {
+    fn from(raw: RawResponseMessage) -> Self {
+        // Canonical field wins when both are present; the alias fills in only
+        // when the canonical name is absent or null.
+        let reasoning_content = raw.reasoning_content.or(raw.reasoning);
+        ResponseMessage {
+            content: raw.content,
+            reasoning_content,
+            tool_calls: raw.tool_calls,
+        }
+    }
 }
 
 impl ResponseMessage {
@@ -828,18 +859,48 @@ struct StreamChoice {
     finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Default)]
 struct StreamDelta {
-    #[serde(default)]
     content: Option<String>,
     /// Reasoning/thinking models may stream output via `reasoning_content`.
     /// OpenRouter and vLLM (>= v0.16.0) emit reasoning deltas under
-    /// `reasoning`; serde's `alias` accepts both names. See #6584.
-    #[serde(default, alias = "reasoning")]
+    /// `reasoning`. Both keys are accepted via `RawStreamDelta`; when both
+    /// appear in the same delta, the canonical `reasoning_content` wins. See
+    /// #6584 and review feedback on PR #6615.
     reasoning_content: Option<String>,
     /// Native tool-calling deltas in OpenAI chat-completions streaming format.
+    tool_calls: Option<Vec<StreamToolCallDelta>>,
+}
+
+/// Intermediate shape for `StreamDelta` — same rationale as
+/// `RawResponseMessage`: serde rejects payloads that carry both
+/// `reasoning_content` and `reasoning` when they target one field via
+/// `#[serde(alias)]`, so the two keys must deserialize into separate fields
+/// and a precedence rule must merge them.
+#[derive(Debug, Deserialize, Default)]
+struct RawStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<StreamToolCallDelta>>,
+}
+
+impl<'de> Deserialize<'de> for StreamDelta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawStreamDelta::deserialize(deserializer)?;
+        Ok(StreamDelta {
+            content: raw.content,
+            reasoning_content: raw.reasoning_content.or(raw.reasoning),
+            tool_calls: raw.tool_calls,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -4039,6 +4100,44 @@ mod tests {
         let json = r#"{"content":null,"reasoning_content":"canonical thought","tool_calls":null}"#;
         let msg: ResponseMessage = serde_json::from_str(json).unwrap();
         assert_eq!(msg.reasoning_content.as_deref(), Some("canonical thought"));
+    }
+
+    // Review feedback on PR #6615 (Audacity88): when a payload carries BOTH
+    // `reasoning_content` and `reasoning`, the previous `#[serde(alias)]`
+    // version raised `duplicate field reasoning_content` at the deserializer.
+    // The replacement `#[serde(from = "RawResponseMessage")]` shape must
+    // accept the payload AND apply the documented precedence rule: canonical
+    // `reasoning_content` wins, `reasoning` is dropped.
+    #[test]
+    fn response_message_with_both_keys_prefers_canonical_reasoning_content() {
+        let json = r#"{"content":null,"reasoning_content":"canonical","reasoning":"alias","tool_calls":null}"#;
+        let msg: ResponseMessage = serde_json::from_str(json)
+            .expect("payload with both reasoning_content and reasoning must deserialize");
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("canonical"),
+            "canonical reasoning_content must win when both fields are present",
+        );
+    }
+
+    #[test]
+    fn response_message_with_only_alias_populates_canonical_field() {
+        // Sanity: when only the alias is present, it still flows into the
+        // canonical reasoning_content field.
+        let json = r#"{"content":null,"reasoning":"alias only","tool_calls":null}"#;
+        let msg: ResponseMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.reasoning_content.as_deref(), Some("alias only"));
+    }
+
+    #[test]
+    fn stream_delta_with_both_keys_prefers_canonical_reasoning_content() {
+        // The streaming-SSE shape used the same `#[serde(alias)]` and had the
+        // same duplicate-field error mode. Pin the precedence here too.
+        let chunk = r#"data: {"choices":[{"delta":{"reasoning_content":"canonical","reasoning":"alias"}}]}"#;
+        let result = parse_sse_line(chunk)
+            .expect("parse must succeed")
+            .expect("non-empty chunk");
+        assert_eq!(result.reasoning.as_deref(), Some("canonical"));
     }
 
     // The round-trip path at to_native_messages reconstructs reasoning_content
