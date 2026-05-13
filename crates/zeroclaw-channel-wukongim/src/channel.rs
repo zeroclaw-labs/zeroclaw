@@ -308,7 +308,7 @@ impl Channel for WuKongIMChannel {
                             let text = payload_json
                                 .get("content").and_then(|c| c.get("text")).and_then(|t| t.as_str())
                                 .unwrap_or("");
-                            process_markdown_resources(text, std::path::Path::new(".")).await
+                            process_markdown_resources(text, &self.workspace_dir).await
                         }
                         _ => payload_json.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string(),
                     };
