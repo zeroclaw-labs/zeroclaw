@@ -1865,6 +1865,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 })
             } else {
                 Ok(ChatResponse {
@@ -1877,6 +1878,7 @@ mod tests {
                     }],
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 })
             }
         }
@@ -1924,6 +1926,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             })
         }
     }
@@ -2654,6 +2657,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 })
             } else {
                 Ok(ChatResponse {
@@ -2666,6 +2670,7 @@ mod tests {
                     }],
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 })
             }
         }

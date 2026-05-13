@@ -291,6 +291,7 @@ impl ModelProvider for GeminiCliModelProvider {
             tool_calls: Vec::new(),
             usage: Some(TokenUsage::default()),
             reasoning_content: None,
+            reasoning_field: None,
         })
     }
 }

@@ -79,6 +79,11 @@ pub struct ChatResponse {
     /// sent back in subsequent API requests — some model_providers reject tool-call
     /// history that omits this field.
     pub reasoning_content: Option<String>,
+    /// Provider response field that carried `reasoning_content`.
+    ///
+    /// Most providers use `reasoning_content`; some OpenAI-compatible
+    /// endpoints use `reasoning` and require the same field on replay.
+    pub reasoning_field: Option<String>,
 }
 
 impl ChatResponse {
@@ -120,6 +125,9 @@ pub enum ConversationMessage {
         /// Raw reasoning content from thinking models, preserved for round-trip
         /// fidelity with model_provider APIs that require it.
         reasoning_content: Option<String>,
+        /// Original provider field used for the reasoning payload.
+        #[serde(default)]
+        reasoning_field: Option<String>,
     },
     /// Results of tool executions, fed back to the LLM.
     ToolResults(Vec<ToolResultMessage>),
@@ -132,6 +140,8 @@ pub struct StreamChunk {
     pub delta: String,
     /// Reasoning/thinking delta (chain-of-thought from thinking models).
     pub reasoning: Option<String>,
+    /// Provider field name used for this reasoning delta.
+    pub reasoning_field: Option<String>,
     /// Whether this is the final chunk.
     pub is_final: bool,
     /// Approximate token count for this chunk (estimated).
@@ -144,6 +154,7 @@ impl StreamChunk {
         Self {
             delta: text.into(),
             reasoning: None,
+            reasoning_field: None,
             is_final: false,
             token_count: 0,
         }
@@ -151,9 +162,15 @@ impl StreamChunk {
 
     /// Create a reasoning/thinking chunk.
     pub fn reasoning(text: impl Into<String>) -> Self {
+        Self::reasoning_with_field(text, "reasoning_content")
+    }
+
+    /// Create a reasoning/thinking chunk with the provider's source field name.
+    pub fn reasoning_with_field(text: impl Into<String>, field: impl Into<String>) -> Self {
         Self {
             delta: String::new(),
             reasoning: Some(text.into()),
+            reasoning_field: Some(field.into()),
             is_final: false,
             token_count: 0,
         }
@@ -164,6 +181,7 @@ impl StreamChunk {
         Self {
             delta: String::new(),
             reasoning: None,
+            reasoning_field: None,
             is_final: true,
             token_count: 0,
         }
@@ -174,6 +192,7 @@ impl StreamChunk {
         Self {
             delta: message.into(),
             reasoning: None,
+            reasoning_field: None,
             is_final: true,
             token_count: 0,
         }
@@ -471,6 +490,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             });
         }
 
@@ -482,6 +502,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
+            reasoning_field: None,
         })
     }
 
@@ -515,6 +536,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
+            reasoning_field: None,
         })
     }
 

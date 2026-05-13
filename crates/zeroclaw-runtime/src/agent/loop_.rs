@@ -493,6 +493,7 @@ fn build_native_assistant_history(
     text: &str,
     tool_calls: &[ToolCall],
     reasoning_content: Option<&str>,
+    reasoning_field: Option<&str>,
 ) -> String {
     let calls_json: Vec<serde_json::Value> = tool_calls
         .iter()
@@ -517,10 +518,10 @@ fn build_native_assistant_history(
     });
 
     if let Some(rc) = reasoning_content {
-        obj.as_object_mut().unwrap().insert(
-            "reasoning_content".to_string(),
-            serde_json::Value::String(rc.to_string()),
-        );
+        let field = reasoning_field.unwrap_or("reasoning_content");
+        obj.as_object_mut()
+            .unwrap()
+            .insert(field.to_string(), serde_json::Value::String(rc.to_string()));
     }
 
     obj.to_string()
@@ -601,6 +602,7 @@ struct StreamedChatOutcome {
     /// prior `reasoning_content` is missing from replayed tool-call turns
     ///.
     reasoning_content: String,
+    reasoning_field: Option<String>,
     tool_calls: Vec<ToolCall>,
     forwarded_live_deltas: bool,
     suppressed_protocol: bool,
@@ -1058,6 +1060,9 @@ async fn consume_provider_streaming_response(
                     && !reasoning.is_empty()
                 {
                     outcome.reasoning_content.push_str(reasoning);
+                    if outcome.reasoning_field.is_none() {
+                        outcome.reasoning_field = chunk.reasoning_field.clone();
+                    }
                 }
 
                 if chunk.delta.is_empty() {
@@ -1594,11 +1599,13 @@ pub async fn run_tool_call_loop(
                     } else {
                         Some(streamed.reasoning_content)
                     };
+                    let reasoning_field = streamed.reasoning_field;
                     Ok(zeroclaw_providers::ChatResponse {
                         text: Some(streamed.response_text),
                         tool_calls: streamed.tool_calls,
                         usage: streamed.usage,
                         reasoning_content,
+                        reasoning_field,
                     })
                 }
                 Err(stream_err) => {
@@ -1831,12 +1838,14 @@ pub async fn run_tool_call_loop(
                 // Preserve native tool call IDs in assistant history so role=tool
                 // follow-up messages can reference the exact call id.
                 let reasoning_content = resp.reasoning_content.clone();
+                let reasoning_field = resp.reasoning_field.clone();
                 let assistant_history_content = if resp.tool_calls.is_empty() {
                     if use_native_tools {
                         build_native_assistant_history_from_parsed_calls(
                             &response_text,
                             &calls,
                             reasoning_content.as_deref(),
+                            reasoning_field.as_deref(),
                         )
                         .unwrap_or_else(|| response_text.clone())
                     } else {
@@ -1847,6 +1856,7 @@ pub async fn run_tool_call_loop(
                         &response_text,
                         &resp.tool_calls,
                         reasoning_content.as_deref(),
+                        reasoning_field.as_deref(),
                     )
                 };
 
@@ -5250,6 +5260,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             })
         }
     }
@@ -5280,6 +5291,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 })
                 .collect();
             Self {
@@ -7195,6 +7207,105 @@ mod tests {
                 .any(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]")),
             "history should include internal parser feedback for the model"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_relays_native_tool_call_text_via_on_delta() {
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+                ChatResponse {
+                    text: Some("Task started. Waiting 30 seconds before checking status.".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_wait".into(),
+                        name: "count_tool".into(),
+                        arguments: r#"{"value":"A"}"#.into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                    reasoning_field: None,
+                },
+                ChatResponse {
+                    text: Some("Final answer".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                    reasoning_field: None,
+                },
+            ]))),
+            capabilities: ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            },
+        };
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "telegram",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("native tool-call text should be relayed through on_delta");
+
+        let mut deltas: Vec<DraftEvent> = Vec::new();
+        while let Some(delta) = rx.recv().await {
+            deltas.push(delta);
+        }
+
+        assert!(
+            deltas.iter().any(
+                |delta| matches!(delta, StreamDelta::Text(t) if t == "Task started. Waiting 30 seconds before checking status.\n")
+            ),
+            "native assistant text should be relayed to on_delta"
+        );
+        assert!(
+            deltas
+                .iter()
+                .any(|delta| matches!(delta, StreamDelta::Status(t) if t.starts_with("💬 Got 1 tool call(s)"))),
+            "tool-call progress line should still be relayed"
+        );
+        assert!(
+            result.ends_with("Final answer"),
+            "accumulated result should end with final answer, got: {result}"
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -10424,7 +10535,7 @@ Let me check the result."#;
             arguments: "{}".into(),
             extra_content: None,
         }];
-        let result = build_native_assistant_history("answer", &calls, Some("thinking step"));
+        let result = build_native_assistant_history("answer", &calls, Some("thinking step"), None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert_eq!(parsed["reasoning_content"].as_str(), Some("thinking step"));
@@ -10439,7 +10550,7 @@ Let me check the result."#;
             arguments: "{}".into(),
             extra_content: None,
         }];
-        let result = build_native_assistant_history("answer", &calls, None);
+        let result = build_native_assistant_history("answer", &calls, None, None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
@@ -10456,6 +10567,7 @@ Let me check the result."#;
             "answer",
             &calls,
             Some("deep thought"),
+            None,
         );
         assert!(result.is_some());
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
@@ -10471,7 +10583,7 @@ Let me check the result."#;
             arguments: serde_json::json!({"command": "pwd"}),
             tool_call_id: Some("call_2".into()),
         }];
-        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
+        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None, None);
         assert!(result.is_some());
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
@@ -10606,6 +10718,76 @@ Let me check the result."#;
 
         assert_eq!(outcome.response_text, "Hello there.");
         assert_eq!(outcome.reasoning_content, "Step 1: consider options.");
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_preserves_reasoning_field() {
+        struct ReasoningFieldProvider;
+
+        #[async_trait]
+        impl Provider for ReasoningFieldProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used in this test")
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                anyhow::bail!("not used in this test")
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::reasoning_with_field(
+                        "alias reasoning",
+                        "reasoning",
+                    ))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta("visible"))),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+
+        let provider = ReasoningFieldProvider;
+        let messages = vec![ChatMessage::user("hi")];
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            None,
+            "vllm-model",
+            0.2,
+            None,
+            None,
+        )
+        .await
+        .expect("streaming should succeed");
+
+        assert_eq!(outcome.response_text, "visible");
+        assert_eq!(outcome.reasoning_content, "alias reasoning");
+        assert_eq!(outcome.reasoning_field.as_deref(), Some("reasoning"));
     }
 
     // ── glob_match tests ──────────────────────────────────────────────────────
@@ -10914,6 +11096,7 @@ Let me check the result."#;
                     cached_input_tokens: None,
                 }),
                 reasoning_content: None,
+                reasoning_field: None,
             }]))),
             capabilities: ProviderCapabilities::default(),
         };
@@ -11140,6 +11323,7 @@ Let me check the result."#;
                     cached_input_tokens: None,
                 }),
                 reasoning_content: None,
+                reasoning_field: None,
             }]))),
             capabilities: ProviderCapabilities::default(),
         };

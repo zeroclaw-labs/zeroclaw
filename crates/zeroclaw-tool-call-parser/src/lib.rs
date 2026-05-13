@@ -2089,6 +2089,7 @@ pub fn build_native_assistant_history_from_parsed_calls(
     text: &str,
     tool_calls: &[ParsedToolCall],
     reasoning_content: Option<&str>,
+    reasoning_field: Option<&str>,
 ) -> Option<String> {
     // Strict provider validators (DeepSeek V4, NVIDIA NIM, ...) reject
     // assistant messages that carry `tool_calls: []`. When there are no
@@ -2121,10 +2122,10 @@ pub fn build_native_assistant_history_from_parsed_calls(
     });
 
     if let Some(rc) = reasoning_content {
-        obj.as_object_mut().unwrap().insert(
-            "reasoning_content".to_string(),
-            serde_json::Value::String(rc.to_string()),
-        );
+        let field = reasoning_field.unwrap_or("reasoning_content");
+        obj.as_object_mut()
+            .unwrap()
+            .insert(field.to_string(), serde_json::Value::String(rc.to_string()));
     }
 
     Some(obj.to_string())
@@ -3664,11 +3665,33 @@ Let me check the result."#;
             "answer",
             &calls,
             Some("deep thought"),
+            None,
         );
         assert!(result.is_some());
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert_eq!(parsed["reasoning_content"].as_str(), Some("deep thought"));
+        assert!(parsed["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn build_native_assistant_history_from_parsed_calls_preserves_reasoning_field() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_2".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls(
+            "answer",
+            &calls,
+            Some("deep thought"),
+            Some("reasoning"),
+        );
+        assert!(result.is_some());
+        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert_eq!(parsed["reasoning"].as_str(), Some("deep thought"));
+        assert!(parsed.get("reasoning_content").is_none());
         assert!(parsed["tool_calls"].is_array());
     }
 
@@ -3679,7 +3702,7 @@ Let me check the result."#;
             arguments: serde_json::json!({"command": "pwd"}),
             tool_call_id: Some("call_2".into()),
         }];
-        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
+        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None, None);
         assert!(result.is_some());
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));

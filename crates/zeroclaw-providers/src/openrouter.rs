@@ -392,6 +392,9 @@ impl OpenRouterModelProvider {
             text: message.content,
             tool_calls,
             usage: None,
+            reasoning_field: reasoning_content
+                .as_ref()
+                .map(|_| "reasoning_content".to_string()),
             reasoning_content,
         }
     }

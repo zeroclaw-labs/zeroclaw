@@ -730,6 +730,8 @@ struct ResponseMessage {
     /// via `RawResponseMessage`; when both appear in the same payload, the
     /// canonical `reasoning_content` wins. See #6584.
     reasoning_content: Option<String>,
+    #[serde(skip)]
+    reasoning_field: Option<&'static str>,
     tool_calls: Option<Vec<ToolCall>>,
 }
 
@@ -756,10 +758,15 @@ impl From<RawResponseMessage> for ResponseMessage {
     fn from(raw: RawResponseMessage) -> Self {
         // Canonical field wins when both are present; the alias fills in only
         // when the canonical name is absent or null.
-        let reasoning_content = raw.reasoning_content.or(raw.reasoning);
+        let (reasoning_content, reasoning_field) = match (raw.reasoning_content, raw.reasoning) {
+            (Some(value), _) => (Some(value), Some("reasoning_content")),
+            (None, Some(value)) => (Some(value), Some("reasoning")),
+            (None, None) => (None, None),
+        };
         ResponseMessage {
             content: raw.content,
             reasoning_content,
+            reasoning_field,
             tool_calls: raw.tool_calls,
         }
     }
@@ -779,8 +786,7 @@ impl ResponseMessage {
             }
         }
 
-        self.reasoning_content
-            .as_ref()
+        self.reasoning_text()
             .map(|c| strip_think_tags(c))
             .filter(|c| !c.is_empty())
             .unwrap_or_default()
@@ -794,10 +800,27 @@ impl ResponseMessage {
             }
         }
 
-        self.reasoning_content
-            .as_ref()
+        self.reasoning_text()
             .map(|c| strip_think_tags(c))
             .filter(|c| !c.is_empty())
+    }
+
+    fn reasoning_text(&self) -> Option<&str> {
+        self.reasoning_content
+            .as_deref()
+            .filter(|value| !value.is_empty())
+    }
+
+    fn reasoning_text_owned(&self) -> Option<String> {
+        self.reasoning_text().map(ToString::to_string)
+    }
+
+    fn reasoning_field(&self) -> Option<&'static str> {
+        self.reasoning_field
+    }
+
+    fn reasoning_field_owned(&self) -> Option<String> {
+        self.reasoning_field().map(ToString::to_string)
     }
 }
 
@@ -910,6 +933,9 @@ struct NativeMessage {
     /// that require it in assistant tool-call history messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
+    /// Alternate raw reasoning field used by some OpenAI-compatible providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<String>,
 }
 
 // ---------------------------------------------------------------
@@ -944,6 +970,7 @@ struct StreamDelta {
     /// appear in the same delta, the canonical `reasoning_content` wins. See
     /// #6584 and review feedback on PR #6615.
     reasoning_content: Option<String>,
+    reasoning_field: Option<&'static str>,
     /// Native tool-calling deltas in OpenAI chat-completions streaming format.
     tool_calls: Option<Vec<StreamToolCallDelta>>,
 }
@@ -971,9 +998,15 @@ impl<'de> Deserialize<'de> for StreamDelta {
         D: serde::Deserializer<'de>,
     {
         let raw = RawStreamDelta::deserialize(deserializer)?;
+        let (reasoning_content, reasoning_field) = match (raw.reasoning_content, raw.reasoning) {
+            (Some(value), _) => (Some(value), Some("reasoning_content")),
+            (None, Some(value)) => (Some(value), Some("reasoning")),
+            (None, None) => (None, None),
+        };
         Ok(StreamDelta {
             content: raw.content,
-            reasoning_content: raw.reasoning_content.or(raw.reasoning),
+            reasoning_content,
+            reasoning_field,
             tool_calls: raw.tool_calls,
         })
     }
@@ -1155,13 +1188,18 @@ fn extract_sse_text_delta(choice: &StreamChoice) -> Option<String> {
     None
 }
 
-fn extract_sse_reasoning_delta(choice: &StreamChoice) -> Option<String> {
+fn extract_sse_reasoning_delta(choice: &StreamChoice) -> Option<(&str, &'static str)> {
     choice
         .delta
         .reasoning_content
-        .as_ref()
+        .as_deref()
         .filter(|value| !value.is_empty())
-        .cloned()
+        .map(|value| {
+            (
+                value,
+                choice.delta.reasoning_field.unwrap_or("reasoning_content"),
+            )
+        })
 }
 
 fn is_valid_mistral_tool_call_id(id: &str) -> bool {
@@ -1247,10 +1285,11 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<StreamChunk>> {
         {
             return Ok(Some(StreamChunk::delta(content.clone())));
         }
-        if let Some(reasoning) = &choice.delta.reasoning_content
-            && !reasoning.is_empty()
-        {
-            return Ok(Some(StreamChunk::reasoning(reasoning.clone())));
+        if let Some((reasoning, field)) = extract_sse_reasoning_delta(choice) {
+            return Ok(Some(StreamChunk::reasoning_with_field(
+                reasoning.to_string(),
+                field,
+            )));
         }
     }
 
@@ -1430,8 +1469,11 @@ fn sse_bytes_to_events_for_contract(
 
                         let mut should_emit_tool_calls = false;
                         for choice in &chunk.choices {
-                            if let Some(reasoning_delta) = extract_sse_reasoning_delta(choice) {
-                                let reasoning_chunk = StreamChunk::reasoning(reasoning_delta);
+                            if let Some((reasoning_delta, field)) =
+                                extract_sse_reasoning_delta(choice)
+                            {
+                                let reasoning_chunk =
+                                    StreamChunk::reasoning_with_field(reasoning_delta, field);
                                 if tx
                                     .send(Ok(StreamEvent::TextDelta(reasoning_chunk)))
                                     .await
@@ -1726,6 +1768,13 @@ impl OpenAiCompatibleModelProvider {
                         .get("reasoning_content")
                         .or_else(|| value.get("reasoning"))
                         .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string);
+
+                    let reasoning = value
+                        .get("reasoning")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
                         .map(ToString::to_string);
 
                     return NativeMessage {
@@ -1734,6 +1783,7 @@ impl OpenAiCompatibleModelProvider {
                         tool_call_id: None,
                         tool_calls: Some(tool_calls),
                         reasoning_content,
+                        reasoning,
                     };
                 }
 
@@ -1766,6 +1816,7 @@ impl OpenAiCompatibleModelProvider {
                         tool_call_id,
                         tool_calls: None,
                         reasoning_content: None,
+                        reasoning: None,
                     };
                 }
 
@@ -1779,6 +1830,7 @@ impl OpenAiCompatibleModelProvider {
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
+                    reasoning: None,
                 }
             })
             .collect()
@@ -1900,7 +1952,8 @@ impl OpenAiCompatibleModelProvider {
 
     fn parse_native_response(&self, message: ResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content_optional();
-        let reasoning_content = message.reasoning_content.clone();
+        let reasoning_content = message.reasoning_text_owned();
+        let reasoning_field = message.reasoning_field_owned();
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let tool_calls = message
             .tool_calls
@@ -1939,6 +1992,7 @@ impl OpenAiCompatibleModelProvider {
             tool_calls,
             usage: None,
             reasoning_content,
+            reasoning_field,
         }
     }
 
@@ -2308,6 +2362,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 });
             }
         };
@@ -2335,7 +2390,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         })?;
 
         let text = choice.message.effective_content_optional();
-        let reasoning_content = choice.message.reasoning_content;
+        let reasoning_content = choice.message.reasoning_text_owned();
+        let reasoning_field = choice.message.reasoning_field_owned();
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let tool_calls = choice
             .message
@@ -2360,6 +2416,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             tool_calls,
             usage,
             reasoning_content,
+            reasoning_field,
         })
     }
 
@@ -2425,6 +2482,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 });
             }
 
@@ -2944,6 +3002,7 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
                 reasoning_content: None,
+                reasoning: None,
             }],
             temperature: 0.7,
             stream: Some(true),
@@ -3391,6 +3450,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            reasoning_field: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -3417,6 +3477,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            reasoning_field: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -3444,6 +3505,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            reasoning_field: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -3471,6 +3533,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            reasoning_field: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -3512,6 +3575,7 @@ mod tests {
                 },
             ]),
             reasoning_content: None,
+            reasoning_field: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -4430,6 +4494,35 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_fallback_when_content_empty() {
+        let json = r#"{"choices":[{"message":{"content":"","reasoning":"Thinking output here"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content(), "Thinking output here");
+        assert_eq!(msg.reasoning_text(), Some("Thinking output here"));
+    }
+
+    #[test]
+    fn reasoning_content_empty_falls_back_to_reasoning() {
+        let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"","reasoning":"Fallback reasoning"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content(), "");
+        assert_eq!(msg.reasoning_text(), None);
+        assert_eq!(msg.reasoning_field(), Some("reasoning_content"));
+    }
+
+    #[test]
+    fn reasoning_content_preferred_when_both_reasoning_fields_present() {
+        let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"Existing field","reasoning":"Alternate field"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.effective_content(), "Existing field");
+        assert_eq!(msg.reasoning_text(), Some("Existing field"));
+        assert_eq!(msg.reasoning_field(), Some("reasoning_content"));
+    }
+
+    #[test]
     fn reasoning_content_used_when_content_only_think_tags() {
         let json = r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Fallback text"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
@@ -4481,6 +4574,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_sse_line_with_reasoning() {
+        let line = r#"data: {"choices":[{"delta":{"reasoning":"thinking..."}}]}"#;
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert!(result.delta.is_empty());
+        assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
+    }
+
+    #[test]
     fn parse_sse_line_with_both_prefers_content() {
         let line = r#"data: {"choices":[{"delta":{"content":"real answer","reasoning_content":"thinking..."}}]}"#;
         let result = parse_sse_line(line).unwrap().unwrap();
@@ -4506,6 +4607,7 @@ mod tests {
         let result = parse_sse_line(line).unwrap().unwrap();
         assert!(result.delta.is_empty());
         assert_eq!(result.reasoning.as_deref(), Some("thinking via vllm..."));
+        assert_eq!(result.reasoning_field.as_deref(), Some("reasoning"));
     }
 
     #[test]
@@ -4514,6 +4616,7 @@ mod tests {
         let result = parse_sse_line(line).unwrap().unwrap();
         assert!(result.delta.is_empty());
         assert_eq!(result.reasoning.as_deref(), Some("vllm thought"));
+        assert_eq!(result.reasoning_field.as_deref(), Some("reasoning"));
     }
 
     #[test]
@@ -4527,6 +4630,7 @@ mod tests {
             Some("chain-of-thought via vllm"),
             "the `reasoning` alias must populate the canonical reasoning_content field",
         );
+        assert_eq!(msg.reasoning_field(), Some("reasoning"));
         // effective_content should also surface the reasoning when content is missing.
         assert_eq!(msg.effective_content(), "chain-of-thought via vllm");
     }
@@ -4537,6 +4641,7 @@ mod tests {
         let json = r#"{"content":null,"reasoning_content":"canonical thought","tool_calls":null}"#;
         let msg: ResponseMessage = serde_json::from_str(json).unwrap();
         assert_eq!(msg.reasoning_content.as_deref(), Some("canonical thought"));
+        assert_eq!(msg.reasoning_field(), Some("reasoning_content"));
     }
 
     // Review feedback on PR #6615 (Audacity88): when a payload carries BOTH
@@ -4555,6 +4660,7 @@ mod tests {
             Some("canonical"),
             "canonical reasoning_content must win when both fields are present",
         );
+        assert_eq!(msg.reasoning_field(), Some("reasoning_content"));
     }
 
     #[test]
@@ -4564,6 +4670,7 @@ mod tests {
         let json = r#"{"content":null,"reasoning":"alias only","tool_calls":null}"#;
         let msg: ResponseMessage = serde_json::from_str(json).unwrap();
         assert_eq!(msg.reasoning_content.as_deref(), Some("alias only"));
+        assert_eq!(msg.reasoning_field(), Some("reasoning"));
     }
 
     #[test]
@@ -4575,6 +4682,7 @@ mod tests {
             .expect("parse must succeed")
             .expect("non-empty chunk");
         assert_eq!(result.reasoning.as_deref(), Some("canonical"));
+        assert_eq!(result.reasoning_field.as_deref(), Some("reasoning_content"));
     }
 
     // The round-trip path at to_native_messages reconstructs reasoning_content
@@ -4604,6 +4712,15 @@ mod tests {
         // behavior for providers that emit `reasoning_content` plus a stray
         // `reasoning` field.
         assert_eq!(extract_reasoning(&both).as_deref(), Some("canonical"));
+    }
+
+    #[test]
+    fn parse_sse_line_with_empty_reasoning_content_falls_back_to_reasoning() {
+        let line =
+            r#"data: {"choices":[{"delta":{"reasoning_content":"","reasoning":"thinking..."}}]}"#;
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert!(result.delta.is_empty());
+        assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
     }
 
     #[test]
@@ -4726,6 +4843,7 @@ mod tests {
         let message = ResponseMessage {
             content: Some("answer".to_string()),
             reasoning_content: Some("thinking step".to_string()),
+            reasoning_field: Some("reasoning_content"),
             tool_calls: Some(vec![ToolCall {
                 id: Some("call_1".to_string()),
                 kind: Some("function".to_string()),
@@ -4742,8 +4860,53 @@ mod tests {
 
         let parsed = provider.parse_native_response(message);
         assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
+        assert_eq!(parsed.reasoning_field.as_deref(), Some("reasoning_content"));
         assert_eq!(parsed.text.as_deref(), Some("answer"));
         assert_eq!(parsed.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn parse_native_response_captures_reasoning() {
+        let provider = make_provider("test", "https://example.com", None);
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: Some("thinking step".to_string()),
+            reasoning_field: Some("reasoning"),
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_1".to_string()),
+                kind: Some("function".to_string()),
+                function: Some(Function {
+                    name: Some("shell".to_string()),
+                    arguments: Some(r#"{"cmd":"ls"}"#.to_string()),
+                }),
+                name: None,
+                arguments: None,
+                parameters: None,
+                extra_content: None,
+            }]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
+        assert_eq!(parsed.reasoning_field.as_deref(), Some("reasoning"));
+        assert_eq!(parsed.text.as_deref(), Some("answer"));
+        assert_eq!(parsed.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn parse_native_response_omits_empty_reasoning_content() {
+        let provider = make_provider("test", "https://example.com", None);
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: Some(String::new()),
+            reasoning_field: Some("reasoning_content"),
+            tool_calls: None,
+        };
+
+        let parsed = provider.parse_native_response(message);
+        assert!(parsed.reasoning_content.is_none());
+        assert_eq!(parsed.reasoning_field.as_deref(), Some("reasoning_content"));
+        assert_eq!(parsed.text.as_deref(), Some("answer"));
     }
 
     #[test]
@@ -4752,6 +4915,7 @@ mod tests {
         let message = ResponseMessage {
             content: Some("hello".to_string()),
             reasoning_content: None,
+            reasoning_field: None,
             tool_calls: None,
         };
 
@@ -4782,12 +4946,47 @@ mod tests {
             native[0].reasoning_content.as_deref(),
             Some("Let me think about this...")
         );
+        assert!(native[0].reasoning.is_none());
         assert!(native[0].tool_calls.is_some());
     }
 
     #[test]
-    fn convert_messages_for_native_no_reasoning_content_when_absent() {
-        // Normal model history without reasoning_content key
+    fn convert_messages_for_native_round_trips_reasoning_field() {
+        // Preserve the original provider field name when replaying assistant history.
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}"
+            }],
+            "reasoning": "Let me think about this..."
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let provider = make_provider("test", "https://example.com", None);
+        let native = provider.convert_messages_for_native(&messages, true);
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].role, "assistant");
+        assert!(native[0].reasoning_content.is_none());
+        assert_eq!(
+            native[0].reasoning.as_deref(),
+            Some("Let me think about this...")
+        );
+        let serialized = serde_json::to_value(&native[0]).unwrap();
+        assert_eq!(
+            serialized
+                .get("reasoning")
+                .and_then(serde_json::Value::as_str),
+            Some("Let me think about this...")
+        );
+        assert!(serialized.get("reasoning_content").is_none());
+        assert!(native[0].tool_calls.is_some());
+    }
+
+    #[test]
+    fn convert_messages_for_native_no_reasoning_fields_when_absent() {
+        // Normal model history without reasoning keys
         let history_json = serde_json::json!({
             "content": "I will check",
             "tool_calls": [{
@@ -4802,22 +5001,28 @@ mod tests {
         let native = provider.convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
+        assert!(native[0].reasoning.is_none());
     }
 
     #[test]
-    fn convert_messages_for_native_reasoning_content_serialized_only_when_present() {
-        // Verify skip_serializing_if works: reasoning_content omitted from JSON when None
+    fn convert_messages_for_native_reasoning_fields_serialized_only_when_present() {
+        // Verify skip_serializing_if works: reasoning fields omitted from JSON when None
         let msg_without = NativeMessage {
             role: "assistant".to_string(),
             content: Some(MessageContent::Text("hi".to_string())),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
+            reasoning: None,
         };
         let json = serde_json::to_string(&msg_without).unwrap();
         assert!(
             !json.contains("reasoning_content"),
             "reasoning_content should be omitted when None"
+        );
+        assert!(
+            !json.contains("\"reasoning\""),
+            "reasoning should be omitted when None"
         );
 
         let msg_with = NativeMessage {
@@ -4826,13 +5031,19 @@ mod tests {
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),
+            reasoning: Some("alternate...".to_string()),
         };
         let json = serde_json::to_string(&msg_with).unwrap();
         assert!(
             json.contains("reasoning_content"),
             "reasoning_content should be present when Some"
         );
+        assert!(
+            json.contains("\"reasoning\""),
+            "reasoning should be present when Some"
+        );
         assert!(json.contains("thinking..."));
+        assert!(json.contains("alternate..."));
     }
 
     #[test]

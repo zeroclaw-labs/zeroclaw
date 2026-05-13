@@ -1398,12 +1398,17 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let response = self
             .send_responses_request(input, instructions, convert_tools(request.tools), model)
             .await?;
+        let reasoning_field = response
+            .reasoning_content
+            .as_ref()
+            .map(|_| "reasoning_content".to_string());
 
         Ok(ProviderChatResponse {
             text: response.text,
             tool_calls: response.tool_calls,
             usage: None,
             reasoning_content: response.reasoning_content,
+            reasoning_field,
         })
     }
 

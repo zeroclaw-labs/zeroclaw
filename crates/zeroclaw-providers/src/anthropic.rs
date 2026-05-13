@@ -582,6 +582,7 @@ impl AnthropicModelProvider {
             tool_calls,
             usage,
             reasoning_content: None,
+            reasoning_field: None,
         }
     }
 

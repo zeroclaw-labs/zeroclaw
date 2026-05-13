@@ -231,13 +231,15 @@ impl ToolDispatcher for NativeToolDispatcher {
                     text,
                     tool_calls,
                     reasoning_content,
+                    reasoning_field,
                 } => {
                     let mut payload = serde_json::json!({
                         "content": text,
                         "tool_calls": tool_calls,
                     });
                     if let Some(rc) = reasoning_content {
-                        payload["reasoning_content"] = serde_json::json!(rc);
+                        let field = reasoning_field.as_deref().unwrap_or("reasoning_content");
+                        payload[field] = serde_json::json!(rc);
                     }
                     vec![ChatMessage::assistant(payload.to_string())]
                 }
@@ -276,6 +278,7 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+                    reasoning_field: None,
         };
         let dispatcher = XmlToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);
@@ -293,6 +296,7 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+                    reasoning_field: None,
         };
         let dispatcher = XmlToolDispatcher;
         let (text, calls) = dispatcher.parse_response(&response);
@@ -311,6 +315,7 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            reasoning_field: None,
         };
         let dispatcher = XmlToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);
@@ -329,6 +334,7 @@ mod tests {
             }],
             usage: None,
             reasoning_content: None,
+            reasoning_field: None,
         };
         let dispatcher = NativeToolDispatcher;
         let (_, calls) = dispatcher.parse_response(&response);
@@ -402,6 +408,7 @@ mod tests {
                 extra_content: None,
             }],
             reasoning_content: Some("thinking step".into()),
+            reasoning_field: None,
         }];
 
         let messages = dispatcher.to_provider_messages(&history);
@@ -426,6 +433,7 @@ mod tests {
                 extra_content: None,
             }],
             reasoning_content: None,
+            reasoning_field: None,
         }];
 
         let messages = dispatcher.to_provider_messages(&history);
@@ -447,6 +455,7 @@ mod tests {
                 extra_content: None,
             }],
             reasoning_content: Some("should be ignored".into()),
+            reasoning_field: None,
         }];
 
         let messages = dispatcher.to_provider_messages(&history);

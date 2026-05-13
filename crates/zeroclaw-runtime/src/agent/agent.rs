@@ -1461,6 +1461,7 @@ impl Agent {
                 text: response.text.clone(),
                 tool_calls: response.tool_calls.clone(),
                 reasoning_content: response.reasoning_content.clone(),
+                reasoning_field: response.reasoning_field.clone(),
             });
 
             let results = self.execute_tools(&calls).await;
@@ -1742,6 +1743,7 @@ impl Agent {
                     tool_calls: streamed_tool_calls,
                     usage: streamed_usage.clone(),
                     reasoning_content: None,
+                    reasoning_field: None,
                 }
             } else {
                 // Fall back to non-streaming chat, with cancellation guard
@@ -1847,6 +1849,7 @@ impl Agent {
                 text: response.text.clone(),
                 tool_calls: response.tool_calls.clone(),
                 reasoning_content: response.reasoning_content.clone(),
+                reasoning_field: response.reasoning_field.clone(),
             };
             new_msgs.push(tool_call_msg.clone());
             self.history.push(tool_call_msg);
@@ -2039,6 +2042,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 });
             }
             Ok(guard.remove(0))
@@ -2088,6 +2092,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 });
             }
             Ok(guard.remove(0))
@@ -2137,6 +2142,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             })
         }
 
@@ -2162,6 +2168,7 @@ mod tests {
                         delta: "stream-done".into(),
                         is_final: false,
                         reasoning: None,
+                        reasoning_field: None,
                         token_count: 0,
                     },
                 );
@@ -2328,6 +2335,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             }]),
         });
 
@@ -2787,12 +2795,14 @@ mod tests {
                     }],
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 },
                 zeroclaw_providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 },
             ]),
         });
@@ -2836,6 +2846,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             }]),
             seen_models: seen_models.clone(),
         });
@@ -3255,6 +3266,7 @@ mod tests {
                     }],
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 })
             } else {
                 Ok(zeroclaw_providers::ChatResponse {
@@ -3262,6 +3274,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 })
             }
         }
@@ -3304,6 +3317,7 @@ mod tests {
                         delta: "stream-done".into(),
                         is_final: false,
                         reasoning: None,
+                        reasoning_field: None,
                         token_count: 0,
                     },
                 );
@@ -3460,6 +3474,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             })
         }
 
@@ -3741,6 +3756,7 @@ mod tests {
                     extra_content: None,
                 }],
                 reasoning_content: None,
+                reasoning_field: None,
             });
             // Skip the trailing ToolResults for the last AssistantToolCalls
             // so the entry count is 5, not 6, and the drop boundary lands
@@ -3813,6 +3829,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             }]),
         });
 
@@ -3875,6 +3892,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             })
         }
 
@@ -3902,6 +3920,7 @@ mod tests {
                             delta: "I will echo the message.".into(),
                             is_final: false,
                             reasoning: None,
+                            reasoning_field: None,
                             token_count: 0,
                         },
                     )),
@@ -3923,6 +3942,7 @@ mod tests {
                             delta: "done".into(),
                             is_final: false,
                             reasoning: None,
+                            reasoning_field: None,
                             token_count: 0,
                         },
                     )),

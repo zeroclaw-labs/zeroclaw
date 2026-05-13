@@ -960,6 +960,7 @@ impl ModelProvider for OllamaModelProvider {
                 tool_calls,
                 usage,
                 reasoning_content: None,
+                reasoning_field: None,
             });
         }
 
@@ -984,6 +985,7 @@ impl ModelProvider for OllamaModelProvider {
             tool_calls: vec![],
             usage,
             reasoning_content: None,
+            reasoning_field: None,
         })
     }
 
@@ -1036,6 +1038,7 @@ impl ModelProvider for OllamaModelProvider {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            reasoning_field: None,
         })
     }
 

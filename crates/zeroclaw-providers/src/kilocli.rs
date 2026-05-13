@@ -280,6 +280,7 @@ impl ModelProvider for KiloCliModelProvider {
             tool_calls: Vec::new(),
             usage: Some(TokenUsage::default()),
             reasoning_content: None,
+            reasoning_field: None,
         })
     }
 }

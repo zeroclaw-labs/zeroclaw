@@ -780,6 +780,7 @@ mod tests {
                         tool_calls: vec![],
                         usage: None,
                         reasoning_content: None,
+                        reasoning_field: None,
                     });
                 }
                 Ok(guard.remove(0))
@@ -853,6 +854,7 @@ mod tests {
                 }],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             },
             // Turn 1 continued: model_provider sees tool result and answers
             ChatResponse {
@@ -860,6 +862,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             },
         ]);
 
@@ -947,12 +950,14 @@ mod tests {
                 }],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             },
             ChatResponse {
                 text: Some("The file appears to be binary data.".into()),
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             },
         ]);
 

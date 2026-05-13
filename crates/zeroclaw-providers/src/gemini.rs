@@ -1449,6 +1449,7 @@ impl ModelProvider for GeminiModelProvider {
             tool_calls: Vec::new(),
             usage,
             reasoning_content: None,
+            reasoning_field: None,
         })
     }
 
