@@ -243,7 +243,7 @@ impl Memory for AgentScopedMemory {
         // rows by guessed key.
         let entry = self.inner.get(key).await?;
         Ok(entry.filter(|e| {
-            e.agent_id
+            e.agent_alias
                 .as_deref()
                 .is_some_and(|aid| self.allowed_agent_ids.contains(aid))
         }))
@@ -262,7 +262,7 @@ impl Memory for AgentScopedMemory {
         Ok(entries
             .into_iter()
             .filter(|e| {
-                e.agent_id
+                e.agent_alias
                     .as_deref()
                     .is_some_and(|aid| self.allowed_agent_ids.contains(aid))
             })
@@ -277,7 +277,7 @@ impl Memory for AgentScopedMemory {
         let Some(entry) = self.inner.get(key).await? else {
             return Ok(false);
         };
-        match entry.agent_id.as_deref() {
+        match entry.agent_alias.as_deref() {
             Some(aid) if aid == self.agent_id => self.inner.forget(key).await,
             Some(other) => Err(anyhow!(
                 "AgentScopedMemory refuses to forget key {key:?}: row is attributed to agent {other:?}, \
@@ -298,7 +298,7 @@ impl Memory for AgentScopedMemory {
         Ok(entries
             .into_iter()
             .filter(|e| {
-                e.agent_id
+                e.agent_alias
                     .as_deref()
                     .is_some_and(|aid| self.allowed_agent_ids.contains(aid))
             })
@@ -325,7 +325,7 @@ impl Memory for AgentScopedMemory {
         let candidates = self.inner.list(None, Some(session_id)).await?;
         let mut purged = 0;
         for entry in candidates {
-            if entry.agent_id.as_deref() == Some(self.agent_id.as_str())
+            if entry.agent_alias.as_deref() == Some(self.agent_id.as_str())
                 && self.inner.forget(&entry.key).await?
             {
                 purged += 1;

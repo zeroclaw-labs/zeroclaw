@@ -33,13 +33,17 @@ export default function Memory() {
   const [showForm, setShowForm] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
-  // Memory entries don't yet carry the agent alias that owns the
-  // captured session, so we can't perfectly restore the transcript in
-  // the new per-agent chat. Route to the agents list; the user picks
-  // the agent and starts (or resumes its own) session from there.
-  // Follow-up: stamp agent_alias on MemoryEntry so this can deep-link.
-  const handleOpenChat = (_sessionId: string) => {
-    navigate('/agents');
+  // SQL-backed memory entries carry `agent_alias` (the HashMap key in
+  // `config.agents` that owned the captured session). Deep-link to
+  // that agent's chat when known; fall back to the agents list when
+  // the entry comes from a backend that doesn't attribute (Markdown,
+  // Lucid, legacy rows).
+  const handleOpenChat = (agentAlias: string | null) => {
+    if (agentAlias) {
+      navigate(`/agent/${encodeURIComponent(agentAlias)}`);
+    } else {
+      navigate('/agents');
+    }
   };
 
   // Form state
@@ -271,9 +275,13 @@ export default function Memory() {
                       <div className="flex items-center justify-end gap-1">
                         {entry.session_id && (
                           <button
-                            onClick={() => handleOpenChat(entry.session_id!)}
+                            onClick={() => handleOpenChat(entry.agent_alias)}
                             className="btn-icon"
-                            title={`Open chat session ${entry.session_id.slice(0, 8)}…`}
+                            title={
+                              entry.agent_alias
+                                ? `Open chat with ${entry.agent_alias}`
+                                : 'Pick an agent to open chat with'
+                            }
                           >
                             <MessageSquare className="h-4 w-4" />
                           </button>

@@ -85,6 +85,11 @@ export interface MemoryEntry {
   timestamp: string;
   session_id: string | null;
   score: number | null;
+  /** Alias of the agent this entry was captured for (HashMap key in
+   * `config.agents`). Populated by SQL-backed memory stores when the
+   * agent is known at write time; `null` for older entries or backends
+   * without per-agent attribution. */
+  agent_alias: string | null;
 }
 
 export interface CostSummary {

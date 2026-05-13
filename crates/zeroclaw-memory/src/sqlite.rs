@@ -836,7 +836,7 @@ impl SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
-                    agent_id: row.get(9)?,
+                    agent_alias: row.get(9)?,
                 })
             })?;
 
@@ -1018,7 +1018,7 @@ impl Memory for SqliteMemory {
                             namespace: ns.unwrap_or_else(|| "default".into()),
                             importance: imp,
                             superseded_by: sup,
-                            agent_id: aid,
+                            agent_alias: aid,
                         };
                         if let Some(filter_sid) = session_ref
                             && entry.session_id.as_deref() != Some(filter_sid) {
@@ -1106,7 +1106,7 @@ impl Memory for SqliteMemory {
                             namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                             importance: row.get(7)?,
                             superseded_by: row.get(8)?,
-                            agent_id: row.get(9)?,
+                            agent_alias: row.get(9)?,
                         })
                     })?;
                     for row in rows {
@@ -1159,7 +1159,7 @@ impl Memory for SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
-                    agent_id: row.get(9)?,
+                    agent_alias: row.get(9)?,
                 })
             })?;
 
@@ -1199,7 +1199,7 @@ impl Memory for SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
-                    agent_id: row.get(9)?,
+                    agent_alias: row.get(9)?,
                 })
             };
 
@@ -1420,7 +1420,7 @@ impl Memory for SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
-                    agent_id: row.get(9)?,
+                    agent_alias: row.get(9)?,
                 })
             })?;
 

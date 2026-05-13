@@ -44,15 +44,17 @@ pub struct MemoryEntry {
     /// If this entry was superseded by a newer conflicting entry.
     #[serde(default)]
     pub superseded_by: Option<String>,
-    /// The UUID of the agent this row is attributed to, when the
-    /// backend tracks per-agent attribution. Backends without per-agent
-    /// columns (Markdown, Qdrant payload-less variants, None) leave
-    /// this `None`; SQL-backed stores populate it from the
-    /// `memories.agent_id` column. `AgentScopedMemory` uses this field
-    /// to enforce the bound + allowlist boundary on read paths the
-    /// trait does not expose an agent-aware form for (`get`, `list`).
-    #[serde(default)]
-    pub agent_id: Option<String>,
+    /// Alias of the agent this row is attributed to (the HashMap key in
+    /// `Config::agents`, e.g. `"default"` or `"research_agent"`).
+    /// Backends without per-agent columns (Markdown, Qdrant payload-less
+    /// variants, None) leave this `None`; SQL-backed stores populate it
+    /// from the `memories.agent_id` column (DB column name stays `agent_id`
+    /// per SQL FK convention; the value has always been the alias string).
+    /// `AgentScopedMemory` enforces the bound + allowlist boundary on read
+    /// paths the trait does not expose an agent-aware form for
+    /// (`get`, `list`).
+    #[serde(default, alias = "agent_id")]
+    pub agent_alias: Option<String>,
 }
 
 fn default_namespace() -> String {
@@ -70,7 +72,7 @@ impl std::fmt::Debug for MemoryEntry {
             .field("score", &self.score)
             .field("namespace", &self.namespace)
             .field("importance", &self.importance)
-            .field("agent_id", &self.agent_id)
+            .field("agent_alias", &self.agent_alias)
             .finish_non_exhaustive()
     }
 }
@@ -411,7 +413,7 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: None,
-            agent_id: None,
+            agent_alias: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();

@@ -388,7 +388,7 @@ mod tests {
             namespace: "default".into(),
             importance: None,
             superseded_by: None,
-            agent_id: None,
+            agent_alias: None,
         }];
 
         let conflicts = conflict::find_text_conflicts(&entries, "User prefers Go", 0.3);
@@ -411,7 +411,7 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: Some("newer_id".into()), // already superseded
-            agent_id: None,
+            agent_alias: None,
         }];
 
         let conflicts =
@@ -435,7 +435,7 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: None,
-            agent_id: None,
+            agent_alias: None,
         }];
 
         // Exact same content should not be a conflict
@@ -1042,7 +1042,7 @@ mod tests {
             namespace: "my-namespace".into(),
             importance: Some(0.7),
             superseded_by: Some("newer-id".into()),
-            agent_id: None,
+            agent_alias: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
