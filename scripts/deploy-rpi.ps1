@@ -1,6 +1,6 @@
 param(
     [string]$RpiHost,
-    [string]$RpiUser = "pi",
+    [string]$RpiUser = "quant",
     [int]$RpiPort = 22,
     [string]$RpiDir,
     [string]$PackagePath,
@@ -71,13 +71,13 @@ Write-Host "Package: $PackagePath"
 Write-Host ""
 
 Write-Host "[*] Checking Raspberry Pi resources..."
-$resourceScript = @"
+$resourceScript = @'
 set -e
-echo "ARCH=\$(uname -m)"
-echo "MEM_AVAILABLE_KB=\$(awk '/MemAvailable/ {print \$2}' /proc/meminfo)"
-echo "SWAP_TOTAL_KB=\$(awk '/SwapTotal/ {print \$2}' /proc/meminfo)"
-echo "ROOT_AVAIL_KB=\$(df --output=avail / | tail -n 1 | tr -d ' ')"
-"@
+echo "ARCH=$(uname -m)"
+echo "MEM_AVAILABLE_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
+echo "SWAP_TOTAL_KB=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)"
+echo "ROOT_AVAIL_KB=$(df --output=avail / | tail -n 1 | tr -d ' ')"
+'@
 $resourceOutput = & ssh -p $RpiPort -o StrictHostKeyChecking=no -o ConnectTimeout=10 $sshTarget $resourceScript
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to connect to the Raspberry Pi for preflight checks."

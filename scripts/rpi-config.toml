@@ -146,7 +146,7 @@ gated_actions = [
 ]
 gated_domains = []
 gated_domain_categories = []
-challenge_delivery = "dm"
+method = "dm"
 challenge_timeout_secs = 120
 challenge_max_attempts = 3
 
@@ -427,6 +427,7 @@ provider = "none"
 [gateway]
 port = 42617
 host = "0.0.0.0"
+web_dist_dir = "/usr/local/share/quantclaw/web/dist"
 require_pairing = false
 trusted_ips = ["0.0.0.0/0"]
 allow_public_bind = true

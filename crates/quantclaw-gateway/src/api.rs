@@ -8,7 +8,10 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path as FsPath;
+use quantclaw_infra::channel_stats::{ChannelStatsSnapshot, ChannelStatsStore};
 
 const MASKED_SECRET: &str = "***MASKED***";
 
@@ -90,6 +93,144 @@ pub struct CronPatchBody {
     pub prompt: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ChannelConfigRow {
+    name: &'static str,
+    channel_type: &'static str,
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiChannelDetail {
+    name: String,
+    #[serde(rename = "type")]
+    channel_type: String,
+    enabled: bool,
+    status: &'static str,
+    message_count: u64,
+    last_message_at: Option<String>,
+    health: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiChannelsResponse {
+    channels: Vec<ApiChannelDetail>,
+}
+
+fn configured_channel_rows(config: &quantclaw_config::schema::Config) -> Vec<ChannelConfigRow> {
+    let channels = &config.channels_config;
+    let mut rows = Vec::new();
+
+    macro_rules! push_channel {
+        ($field:expr, $name:literal, $kind:literal) => {
+            if let Some(cfg) = $field.as_ref() {
+                rows.push(ChannelConfigRow {
+                    name: $name,
+                    channel_type: $kind,
+                    enabled: cfg.enabled,
+                });
+            }
+        };
+    }
+
+    push_channel!(channels.telegram, "telegram", "telegram bot");
+    push_channel!(channels.discord, "discord", "discord bot");
+    push_channel!(channels.discord_history, "discord_history", "discord history");
+    push_channel!(channels.slack, "slack", "slack bot");
+    push_channel!(channels.mattermost, "mattermost", "mattermost bot");
+    push_channel!(channels.webhook, "webhook", "http endpoint");
+    push_channel!(channels.imessage, "imessage", "imessage");
+    push_channel!(channels.matrix, "matrix", "matrix bot");
+    push_channel!(channels.signal, "signal", "signal");
+    push_channel!(channels.whatsapp, "whatsapp", "whatsapp");
+    push_channel!(channels.linq, "linq", "linq api");
+    push_channel!(channels.wati, "wati", "wati api");
+    push_channel!(channels.nextcloud_talk, "nextcloud_talk", "nextcloud talk");
+    push_channel!(channels.email, "email", "email");
+    push_channel!(channels.gmail_push, "gmail_push", "gmail push");
+    push_channel!(channels.irc, "irc", "irc");
+    push_channel!(channels.lark, "lark", "lark");
+    push_channel!(channels.line, "line", "line");
+    push_channel!(channels.feishu, "feishu", "feishu");
+    push_channel!(channels.dingtalk, "dingtalk", "dingtalk");
+    push_channel!(channels.wecom, "wecom", "wecom");
+    push_channel!(channels.qq, "qq", "qq");
+    push_channel!(channels.twitter, "twitter", "twitter");
+    push_channel!(channels.mochat, "mochat", "mochat");
+    #[cfg(feature = "channel-nostr")]
+    push_channel!(channels.nostr, "nostr", "nostr");
+    push_channel!(channels.clawdtalk, "clawdtalk", "voice");
+    push_channel!(channels.reddit, "reddit", "reddit");
+    push_channel!(channels.bluesky, "bluesky", "bluesky");
+    push_channel!(channels.voice_call, "voice_call", "voice call");
+    #[cfg(feature = "voice-wake")]
+    push_channel!(channels.voice_wake, "voice_wake", "voice wake");
+    push_channel!(channels.mqtt, "mqtt", "mqtt");
+
+    rows
+}
+
+fn load_channel_stats(
+    workspace_dir: &FsPath,
+) -> HashMap<String, ChannelStatsSnapshot> {
+    let Ok(store) = ChannelStatsStore::new(workspace_dir) else {
+        return HashMap::new();
+    };
+
+    match store.snapshot_all() {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| (row.channel_name.clone(), row))
+            .collect(),
+        Err(err) => {
+            tracing::warn!("Failed to load channel stats: {err}");
+            HashMap::new()
+        }
+    }
+}
+
+fn map_channel_state(enabled: bool, component_status: Option<&str>) -> (&'static str, &'static str) {
+    if !enabled {
+        return ("inactive", "down");
+    }
+
+    match component_status {
+        Some("ok") => ("active", "healthy"),
+        Some("error") => ("error", "degraded"),
+        Some("starting") => ("inactive", "degraded"),
+        _ => ("inactive", "down"),
+    }
+}
+
+fn build_channel_details(
+    config: &quantclaw_config::schema::Config,
+    health: &quantclaw_runtime::health::HealthSnapshot,
+    stats: &HashMap<String, ChannelStatsSnapshot>,
+) -> Vec<ApiChannelDetail> {
+    configured_channel_rows(config)
+        .into_iter()
+        .map(|row| {
+            let component_name = format!("channel:{}", row.name);
+            let component_status = health
+                .components
+                .get(&component_name)
+                .map(|component| component.status.as_str());
+            let snapshot = stats.get(row.name);
+            let (status, health_state) = map_channel_state(row.enabled, component_status);
+
+            ApiChannelDetail {
+                name: row.name.to_string(),
+                channel_type: row.channel_type.to_string(),
+                enabled: row.enabled,
+                status,
+                message_count: snapshot.map(|item| item.message_count).unwrap_or(0),
+                last_message_at: snapshot.and_then(|item| item.last_message_at.clone()),
+                health: health_state,
+            }
+        })
+        .collect()
+}
+
 // ── Handlers ────────────────────────────────────────────────────
 
 /// GET /api/status — system status overview
@@ -131,6 +272,23 @@ pub async fn handle_api_status(
     });
 
     Json(body).into_response()
+}
+
+/// GET /api/channels — detailed channel status for the dashboard
+pub async fn handle_api_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let health = quantclaw_runtime::health::snapshot();
+    let stats = load_channel_stats(&config.workspace_dir);
+    let channels = build_channel_details(&config, &health, &stats);
+
+    Json(ApiChannelsResponse { channels }).into_response()
 }
 
 /// GET /api/config — current config (api_key masked)
@@ -1551,6 +1709,7 @@ mod tests {
     use parking_lot::Mutex;
     use std::sync::Arc;
     use std::time::Duration;
+    use tempfile::TempDir;
     use quantclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use quantclaw_providers::Provider;
     use quantclaw_runtime::security::pairing::PairingGuard;
@@ -1673,6 +1832,55 @@ mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    #[tokio::test]
+    async fn api_channels_returns_aggregated_channel_stats() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = quantclaw_config::schema::Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        config.channels_config.webhook = Some(quantclaw_config::schema::WebhookConfig {
+            enabled: true,
+            port: 8080,
+            ..Default::default()
+        });
+        config.channels_config.wati = Some(quantclaw_config::schema::WatiConfig {
+            enabled: false,
+            ..Default::default()
+        });
+
+        let store = ChannelStatsStore::new(tmp.path()).unwrap();
+        store.record_inbound("webhook").unwrap();
+        store.record_outbound("webhook").unwrap();
+        quantclaw_runtime::health::mark_component_ok("channel:webhook");
+
+        let response = handle_api_channels(State(test_state(config)), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let payload = response_json(response).await;
+        let channels = payload["channels"].as_array().expect("channels array");
+        assert_eq!(channels.len(), 2);
+
+        let webhook = channels
+            .iter()
+            .find(|item| item["name"] == "webhook")
+            .expect("webhook channel present");
+        assert_eq!(webhook["enabled"], true);
+        assert_eq!(webhook["status"], "active");
+        assert_eq!(webhook["health"], "healthy");
+        assert_eq!(webhook["message_count"], 2);
+        assert!(webhook["last_message_at"].as_str().is_some());
+
+        let wati = channels
+            .iter()
+            .find(|item| item["name"] == "wati")
+            .expect("wati channel present");
+        assert_eq!(wati["enabled"], false);
+        assert_eq!(wati["status"], "inactive");
+        assert_eq!(wati["health"], "down");
+        assert_eq!(wati["message_count"], 0);
     }
 
     #[test]

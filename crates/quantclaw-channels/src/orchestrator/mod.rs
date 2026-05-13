@@ -68,6 +68,7 @@ pub use crate::matrix::MatrixChannel;
 pub use crate::telegram::TelegramChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use crate::whatsapp_web::WhatsAppWebChannel;
+pub use quantclaw_infra::channel_stats::ChannelStatsStore;
 pub use quantclaw_infra::debounce::MessageDebouncer;
 pub use quantclaw_infra::session_backend::SessionBackend;
 pub use quantclaw_infra::session_sqlite::SqliteSessionBackend;
@@ -81,7 +82,7 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 use quantclaw_config::schema::Config;
@@ -204,8 +205,47 @@ const PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 400_000;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
+static CHANNEL_STATS_STORE: LazyLock<RwLock<Option<Arc<ChannelStatsStore>>>> =
+    LazyLock::new(|| RwLock::new(None));
+
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
+
+fn set_channel_stats_store(store: Option<Arc<ChannelStatsStore>>) {
+    let mut guard = CHANNEL_STATS_STORE
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = store;
+}
+
+fn get_channel_stats_store() -> Option<Arc<ChannelStatsStore>> {
+    CHANNEL_STATS_STORE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn record_channel_stat(observer: &dyn Observer, channel_name: &str, direction: &str) {
+    let normalized = quantclaw_infra::channel_stats::normalize_channel_name(channel_name);
+    observer.record_event(&ObserverEvent::ChannelMessage {
+        channel: normalized.to_string(),
+        direction: direction.to_string(),
+    });
+
+    let Some(store) = get_channel_stats_store() else {
+        return;
+    };
+
+    let result = match direction {
+        "inbound" => store.record_inbound(normalized),
+        "outbound" => store.record_outbound(normalized),
+        _ => return,
+    };
+
+    if let Err(err) = result {
+        tracing::warn!(channel = normalized, direction, "Failed to update channel stats: {err}");
+    }
+}
 
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
@@ -1829,6 +1869,8 @@ async fn handle_runtime_command_if_needed(
             "Failed to send runtime command response on {}: {err}",
             channel.name()
         );
+    } else {
+        record_channel_stat(ctx.observer.as_ref(), &msg.channel, "outbound");
     }
 
     true
@@ -2461,6 +2503,7 @@ async fn process_channel_message(
             "content_preview": truncate_with_ellipsis(&msg.content, 160),
         }),
     );
+    record_channel_stat(ctx.observer.as_ref(), &msg.channel, "inbound");
 
     // ── Hook: on_message_received (modifying) ────────────
     let mut msg = if let Some(hooks) = &ctx.hooks {
@@ -3320,17 +3363,25 @@ async fn process_channel_message(
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
+                    let mut outbound_delivered = false;
                     if let Err(e) = channel
                         .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
                         .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                        let _ = channel
+                        outbound_delivered = channel
                             .send(
                                 &SendMessage::new(&delivered_response, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
-                            .await;
+                            .await
+                            .is_ok();
+                    } else {
+                        outbound_delivered = true;
+                    }
+
+                    if outbound_delivered {
+                        record_channel_stat(ctx.observer.as_ref(), &msg.channel, "outbound");
                     }
                 } else if let Err(e) = channel
                     .send(
@@ -3341,6 +3392,8 @@ async fn process_channel_message(
                     .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                } else {
+                    record_channel_stat(ctx.observer.as_ref(), &msg.channel, "outbound");
                 }
             }
         }
@@ -3637,10 +3690,16 @@ async fn run_message_dispatch_loop(
             if let Some(channel) = channel {
                 let reply_target = msg.reply_target.clone();
                 let thread_ts = msg.thread_ts.clone();
+                let observer = Arc::clone(&ctx.observer);
+                let channel_name = msg.channel.clone();
                 tokio::spawn(async move {
-                    let _ = channel
+                    if channel
                         .send(&SendMessage::new(reply, &reply_target).in_thread(thread_ts))
-                        .await;
+                        .await
+                        .is_ok()
+                    {
+                        record_channel_stat(observer.as_ref(), &channel_name, "outbound");
+                    }
                 });
             } else {
                 tracing::warn!(
@@ -5427,6 +5486,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .matrix
         .as_ref()
         .is_some_and(|mx| mx.interrupt_on_new_message);
+
+    let channel_stats_store = match ChannelStatsStore::new(&config.workspace_dir) {
+        Ok(store) => Some(Arc::new(store)),
+        Err(err) => {
+            tracing::warn!("Channel statistics disabled: {err}");
+            None
+        }
+    };
+    set_channel_stats_store(channel_stats_store);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,

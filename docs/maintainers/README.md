@@ -6,6 +6,10 @@ Time-bound project status snapshots for planning documentation and operations wo
 
 - [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)
 
+## Recent Worklogs
+
+- [worklog-2026-05-13-channel-dashboard-and-rpi.md](worklog-2026-05-13-channel-dashboard-and-rpi.md)
+
 ## Scope
 
 Project snapshots are time-bound assessments of open PRs, issues, and documentation health. Use these to:

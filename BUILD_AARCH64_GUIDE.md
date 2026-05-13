@@ -116,3 +116,33 @@ OPENROUTER_API_KEY=你的Key
 - `curl 127.0.0.1:42617` 不通：
   - 原因：服务未起或参数错误；
   - 处理：先看 `journalctl -u quantclaw-rust -n 120 -l --no-pager`。
+
+## 2026-05-11 对照记录（本次实战）
+
+### 场景与结论
+
+- `~/quantclaw` 是配网服务目录（`quantclaw-net`），Rust 服务必须运行在 `~/quantclaw_rust_app`。
+- 仅重启不能解决旧配置字段不兼容；需按当前二进制支持字段修正 `config.toml`。
+- Web 面板资源路径最终统一为：`/usr/local/share/quantclaw/web/dist`，并由 `gateway.web_dist_dir` 指向。
+
+### 本次验证通过的关键命令
+
+```bash
+sudo -u quant /usr/local/bin/quantclaw gateway --config-dir /home/quant/quantclaw_rust_app/.quantclaw
+sudo systemctl restart quantclaw-rust
+sudo systemctl status quantclaw-rust --no-pager -l
+sudo journalctl -u quantclaw-rust -n 120 --no-pager
+```
+
+### 配置兼容迁移要点
+
+- 旧字段 `challenge_delivery` 已不支持，改为 `method`（同一段落只能有一条 `method`）。
+- 旧字段 `challenge_timeout_secs` 已不支持，使用 `token_ttl_secs` 与 `cache_valid_secs`。
+- 若出现 `duplicate key`，优先检查同段落是否存在重复 `method`。
+
+### 验收标准（双方对照）
+
+- `systemctl status quantclaw-rust` 显示 `active (running)`。
+- 日志包含 `QuantClaw Gateway listening on http://0.0.0.0:42617`。
+- `grep -n "web_dist_dir" /home/quant/quantclaw_rust_app/.quantclaw/config.toml` 指向 `/usr/local/share/quantclaw/web/dist`。
+- 页面强刷后，`配置 -> 常规` 可见 `API Key` 输入框。

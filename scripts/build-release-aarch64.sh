@@ -94,7 +94,7 @@ set -e
 
 INSTALL_DIR="/usr/local/bin"
 SERVICE_DIR="/etc/systemd/system"
-QUANTCLAW_USER="${QUANTCLAW_USER:-pi}"
+QUANTCLAW_USER="${QUANTCLAW_USER:-quant}"
 QUANTCLAW_HOME="$(getent passwd "$QUANTCLAW_USER" | cut -d: -f6 2>/dev/null || printf '/home/%s' "$QUANTCLAW_USER")"
 INSTALL_SOURCE_DIR="$(pwd)"
 APP_ROOT="${QUANTCLAW_APP_ROOT:-${QUANTCLAW_HOME}/quantclaw_rust_app}"
@@ -174,8 +174,9 @@ chmod 600 "$CONFIG_DIR/config.toml" 2>/dev/null || true
 # 安装 web 资源
 if [[ -d "web/dist" ]]; then
     echo "[*] 安装 web 资源..."
-    mkdir -p "/usr/local/share/quantclaw"
-    cp -r web/dist "/usr/local/share/quantclaw/"
+    mkdir -p "/usr/local/share/quantclaw/web"
+    rm -rf "/usr/local/share/quantclaw/web/dist"
+    cp -r web/dist "/usr/local/share/quantclaw/web/"
 fi
 
 # 安装服务
@@ -307,10 +308,10 @@ echo "发布包: dist/${PKG_NAME}.tar.gz"
 ls -lh "${PKG_NAME}.tar.gz"
 echo ""
 echo "使用方法:"
-echo "    1. 复制到树莓派: scp dist/${PKG_NAME}.tar.gz pi@raspberrypi.local:~"
-echo "    2. SSH 到树莓派: ssh pi@raspberrypi.local"
+echo "    1. 复制到树莓派: scp dist/${PKG_NAME}.tar.gz quant@raspberrypi.local:~"
+echo "    2. SSH 到树莓派: ssh quant@raspberrypi.local"
 echo "    3. 解压并安装:"
 echo "         tar xzf ${PKG_NAME}.tar.gz"
 echo "         cd ${PKG_NAME}"
-echo "         QUANTCLAW_USER=pi sudo ./install.sh"
+echo "         QUANTCLAW_USER=quant sudo ./install.sh"
 echo ""
